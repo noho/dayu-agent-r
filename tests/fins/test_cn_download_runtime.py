@@ -13,8 +13,12 @@ from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.fins.domain.document_models import FinsSourceProvider, ProcessedCreateRequest
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.download_contract import (
+    FinsDownloadDateRange,
+    FinsDownloadSource,
+    build_fins_download_request,
+)
 from dayu.fins.ingestion_runtime import (
-    FinsDownloadRequest,
     FinsIngestionExecutor,
     FinsIngestionJobStatus,
     FinsIngestionRuntime,
@@ -240,6 +244,7 @@ class _RecordingPipeline(CnPipeline):
         rebuild: bool = False,
         ticker_aliases: list[str] | None = None,
         *,
+        start_is_explicit: bool,
         cancel_checker: Callable[[], bool] | None = None,
     ) -> CnPipelineDownloadResult:
         """记录 rebuild 参数并返回确定性结果。
@@ -252,6 +257,7 @@ class _RecordingPipeline(CnPipeline):
             overwrite: 是否覆盖。
             rebuild: OLD 本地 rebuild 标记。
             ticker_aliases: ticker aliases。
+            start_is_explicit: 起始日期是否来自调用方显式输入。
             cancel_checker: 可选取消检查器。
 
         Returns:
@@ -261,7 +267,15 @@ class _RecordingPipeline(CnPipeline):
             无。
         """
 
-        del form_type, start_date, end_date, overwrite, ticker_aliases, cancel_checker
+        del (
+            form_type,
+            start_date,
+            end_date,
+            overwrite,
+            ticker_aliases,
+            start_is_explicit,
+            cancel_checker,
+        )
         self.recorded_rebuild_values.append(rebuild)
         return {
             "pipeline": "cn",
@@ -294,6 +308,7 @@ class _RecordingPipeline(CnPipeline):
         rebuild: bool = False,
         ticker_aliases: list[str] | None = None,
         *,
+        start_is_explicit: bool,
         cancel_checker: Callable[[], bool] | None = None,
     ) -> AsyncIterator[DownloadEvent]:
         """记录 rebuild 参数并返回确定性完成事件流。
@@ -306,6 +321,7 @@ class _RecordingPipeline(CnPipeline):
             overwrite: 是否覆盖。
             rebuild: OLD 本地 rebuild 标记。
             ticker_aliases: ticker aliases。
+            start_is_explicit: 起始日期是否来自调用方显式输入。
             cancel_checker: 可选取消检查器。
 
         Yields:
@@ -323,6 +339,7 @@ class _RecordingPipeline(CnPipeline):
             overwrite=overwrite,
             rebuild=rebuild,
             ticker_aliases=ticker_aliases,
+            start_is_explicit=start_is_explicit,
             cancel_checker=cancel_checker,
         )
         yield DownloadEvent(
@@ -361,12 +378,11 @@ def test_start_download_cninfo_persists_summary_and_source_document(tmp_path: Pa
     runtime, cn_discovery, _hk_discovery, converter = _build_runtime_with_cn_hk_adapters(tmp_path)
 
     start = runtime.start_download(
-        FinsDownloadRequest(
+        build_fins_download_request(
             ticker="600519",
-            source=CN_DOWNLOAD_SOURCE,
             form_types=("FY",),
-            filed_after="2025-01-01",
-            filed_before="2026-12-31",
+            start="2025-01-01",
+            end="2026-12-31",
             overwrite_existing=True,
         )
     )
@@ -390,8 +406,8 @@ def test_start_download_cninfo_persists_summary_and_source_document(tmp_path: Pa
     ).source_provider is FinsSourceProvider.CNINFO
 
 
-def test_start_download_auto_hk_uses_hkexnews_adapter(tmp_path: Path) -> None:
-    """``source=auto`` 且 market=HK 应确定性走 HKEXNews adapter。
+def test_start_download_hk_uses_ticker_resolved_hkexnews_adapter(tmp_path: Path) -> None:
+    """HK ticker 应由 request owner 确定性解析到 HKEXNews adapter。
 
     Args:
         tmp_path: 临时目录。
@@ -406,12 +422,11 @@ def test_start_download_auto_hk_uses_hkexnews_adapter(tmp_path: Path) -> None:
     runtime, _cn_discovery, hk_discovery, converter = _build_runtime_with_cn_hk_adapters(tmp_path)
 
     start = runtime.start_download(
-        FinsDownloadRequest(
+        build_fins_download_request(
             ticker="0700",
-            source="auto",
             form_types=("FY",),
-            filed_after="2024-01-01",
-            filed_before="2025-12-31",
+            start="2024-01-01",
+            end="2025-12-31",
             overwrite_existing=True,
         )
     )
@@ -509,8 +524,8 @@ def test_cn_hk_adapter_factories_use_source_specific_downloader_defaults(
     assert hk_adapter._pipeline.max_retries == hk_max_retries
 
 
-def test_cn_adapter_receives_rebuild_processed_without_old_rebuild(tmp_path: Path) -> None:
-    """adapter 应单独消费 NEW rebuild_processed，并保持 OLD download rebuild=False。
+def test_cn_adapter_routes_local_rebuild_to_existing_pipeline(tmp_path: Path) -> None:
+    """adapter 应把 local rebuild 传给现有 ``CnPipeline`` host。
 
     Args:
         tmp_path: 临时目录。
@@ -528,17 +543,141 @@ def test_cn_adapter_receives_rebuild_processed_without_old_rebuild(tmp_path: Pat
     adapter.download(
         FinsSourceDownloadAdapterRequest(
             normalized_ticker=NormalizedTicker(canonical="600519", market="CN", exchange="SSE", raw="600519"),
-            source=CN_DOWNLOAD_SOURCE,
+            source=FinsDownloadSource.CNINFO,
             form_types=("FY",),
-            filed_after=None,
-            filed_before=None,
+            date_range=FinsDownloadDateRange(None, None, False, False),
             overwrite_existing=False,
-            rebuild_processed=True,
+            rebuild_local_artifacts=True,
             cancellation_checker=lambda: False,
         )
     )
 
-    assert pipeline.recorded_rebuild_values == [False]
+    assert pipeline.recorded_rebuild_values == [True]
+
+
+def test_cn_adapter_rejects_invalid_binding_and_request_identity(tmp_path: Path) -> None:
+    """CN/HK adapter 必须拒绝非法装配、market 与 source 错配。
+
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法 adapter identity 未 fail closed 时抛出。
+    """
+
+    pipeline = _RecordingPipeline(workspace_root=tmp_path)
+    with pytest.raises(ValueError, match="非法 CN/HK 下载 adapter 组合"):
+        CnDownloadAdapter(pipeline=pipeline, source="sec", market="CN")
+
+    adapter = CnDownloadAdapter(pipeline=pipeline, source=CN_DOWNLOAD_SOURCE, market="CN")
+    with pytest.raises(ValueError, match="market 不匹配"):
+        adapter.download(
+            FinsSourceDownloadAdapterRequest(
+                normalized_ticker=NormalizedTicker(
+                    canonical="0700",
+                    market="HK",
+                    exchange="HKEX",
+                    raw="0700.HK",
+                ),
+                source=FinsDownloadSource.HKEXNEWS,
+                form_types=(),
+                date_range=FinsDownloadDateRange(None, None, False, False),
+                overwrite_existing=False,
+                rebuild_local_artifacts=False,
+                cancellation_checker=lambda: False,
+            )
+        )
+    with pytest.raises(ValueError, match="来源不匹配"):
+        adapter.download(
+            FinsSourceDownloadAdapterRequest(
+                normalized_ticker=NormalizedTicker(
+                    canonical="600519",
+                    market="CN",
+                    exchange="SSE",
+                    raw="600519",
+                ),
+                source=FinsDownloadSource.HKEXNEWS,
+                form_types=(),
+                date_range=FinsDownloadDateRange(None, None, False, False),
+                overwrite_existing=False,
+                rebuild_local_artifacts=False,
+                cancellation_checker=lambda: False,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("result", "error_pattern"),
+    [
+        ({"filings": "invalid"}, "filings 字段必须是列表"),
+        ({"filings": [], "summary": {"total": []}}, "summary.total 不是整数"),
+        ({"filings": [], "summary": {"total": "invalid"}}, "summary.total 不是整数"),
+        ({"filings": [], "summary": {"total": -1}}, "summary.total 不能为负数"),
+    ],
+)
+def test_cn_adapter_summary_projection_rejects_invalid_shapes(
+    result: dict[str, JsonValue],
+    error_pattern: str,
+) -> None:
+    """CN/HK adapter summary projection 必须拒绝非法结果 shape。
+
+    Args:
+        result: source workflow 返回的非法结果。
+        error_pattern: 预期错误文本。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法结果未 fail closed 时抛出。
+    """
+
+    with pytest.raises(ValueError, match=error_pattern):
+        cn_pipeline_module._summary_from_pipeline_result(result)
+
+
+def test_cn_adapter_empty_forms_and_non_mapping_filing_projection() -> None:
+    """空 form 与非 mapping filing 应按 adapter contract 稳定投影。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: adapter projection 发生语义漂移时抛出。
+    """
+
+    assert cn_pipeline_module._form_type_from_adapter_request(()) is None
+    assert cn_pipeline_module._summary_int({"summary": []}, "total") == 0
+    summary = cn_pipeline_module._summary_from_pipeline_result(
+        {
+            "filings": ["not-a-filing"],
+            "summary": {"total": 0, "downloaded": 0, "skipped": 0, "failed": 0},
+        }
+    )
+    assert summary.discovered_count == 0
+    assert summary.written_document_ids == ()
+
+
+def test_cn_pipeline_upload_status_preserves_non_uploaded_state() -> None:
+    """CN pipeline 上传状态投影应保留非 uploaded 终态。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非 uploaded 状态被意外改写时抛出。
+    """
+
+    assert cn_pipeline_module._resolve_upload_status("cancelled") == "cancelled"
 
 
 @pytest.mark.parametrize(
@@ -548,14 +687,14 @@ def test_cn_adapter_receives_rebuild_processed_without_old_rebuild(tmp_path: Pat
         (HK_DOWNLOAD_SOURCE, "HK", "0700", "HKEX"),
     ],
 )
-def test_cn_hk_adapter_marks_processed_rebuild_for_written_documents(
+def test_cn_hk_adapter_local_rebuild_does_not_mutate_processed_documents(
     tmp_path: Path,
     source: str,
     market: CnMarketKind,
     ticker: str,
     exchange: Exchange,
 ) -> None:
-    """CN/HK adapter 应消费 rebuild_processed 并标记已写入文档的 processed。"""
+    """CN/HK local rebuild 应只改 source，不得标记 processed 重处理。"""
 
     pipeline = _RecordingPipeline(workspace_root=tmp_path)
     document_id = "fil_cn_rebuild"
@@ -577,24 +716,26 @@ def test_cn_hk_adapter_marks_processed_rebuild_for_written_documents(
     )
     pipeline.batching_repository.commit_batch(setup_batch)
     adapter = CnDownloadAdapter(pipeline=pipeline, source=source, market=market)
+    request_source = (
+        FinsDownloadSource.CNINFO if market == "CN" else FinsDownloadSource.HKEXNEWS
+    )
 
     adapter.download(
         FinsSourceDownloadAdapterRequest(
             normalized_ticker=NormalizedTicker(canonical=ticker, market=market, exchange=exchange, raw=ticker),
-            source=source,
+            source=request_source,
             form_types=("FY",),
-            filed_after=None,
-            filed_before=None,
+            date_range=FinsDownloadDateRange(None, None, False, False),
             overwrite_existing=False,
-            rebuild_processed=True,
+            rebuild_local_artifacts=True,
             cancellation_checker=lambda: False,
         )
     )
 
     processed_meta = pipeline.processed_repository.get_processed_meta(ticker, document_id)
 
-    assert pipeline.recorded_rebuild_values == [False]
-    assert processed_meta["reprocess_required"] is True
+    assert pipeline.recorded_rebuild_values == [True]
+    assert processed_meta["reprocess_required"] is False
 
 
 def _build_runtime_with_cn_hk_adapters(

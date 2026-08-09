@@ -19,7 +19,6 @@ from dayu.fins.domain.enums import SourceKind
 from dayu.fins.domain.filing_semantics import normalize_sec_form_type_for_matching
 from dayu.fins.storage import (
     BatchingRepositoryProtocol,
-    ProcessedDocumentRepositoryProtocol,
     SourceDocumentRepositoryProtocol,
 )
 
@@ -47,12 +46,6 @@ class SecRebuildWorkflowHost(Protocol):
     @property
     def _source_repository(self) -> SourceDocumentRepositoryProtocol:
         """返回 source 仓储。"""
-
-        ...
-
-    @property
-    def _processed_repository(self) -> ProcessedDocumentRepositoryProtocol:
-        """返回 processed 仓储。"""
 
         ...
 
@@ -178,7 +171,6 @@ def rebuild_download_artifacts(
         filing_result = rebuild_single_local_filing(
             batching_repository=host._batching_repository,
             source_repository=host._source_repository,
-            processed_repository=host._processed_repository,
             ticker=ticker,
             document_id=document_id,
             previous_meta=previous_meta,
@@ -294,7 +286,6 @@ def rebuild_single_local_filing(
     *,
     batching_repository: BatchingRepositoryProtocol,
     source_repository: SourceDocumentRepositoryProtocol,
-    processed_repository: ProcessedDocumentRepositoryProtocol,
     ticker: str,
     document_id: str,
     previous_meta: dict[str, JsonValue],
@@ -306,7 +297,6 @@ def rebuild_single_local_filing(
     Args:
         batching_repository: batch lifecycle 唯一仓储。
         source_repository: source 仓储。
-        processed_repository: processed 仓储。
         ticker: 股票代码。
         document_id: 文档 ID。
         previous_meta: 当前完成态 source meta。
@@ -418,12 +408,6 @@ def rebuild_single_local_filing(
     except (FileNotFoundError, OSError):
         has_xbrl = None
     meta_payload["has_xbrl"] = has_xbrl
-    try:
-        processed_repository.get_processed_meta(ticker, document_id)
-    except FileNotFoundError:
-        has_processed_document = False
-    else:
-        has_processed_document = True
     batch = batching_repository.begin_batch(ticker)
     try:
         source_repository.update_source_document(
@@ -439,13 +423,6 @@ def rebuild_single_local_filing(
             source_kind=SourceKind.FILING,
             batch=batch,
         )
-        if has_processed_document:
-            processed_repository.mark_processed_reprocess_required(
-                ticker,
-                document_id,
-                True,
-                batch=batch,
-            )
     except BaseException as operation_error:
         try:
             batching_repository.rollback_batch(batch)

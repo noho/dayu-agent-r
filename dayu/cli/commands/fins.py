@@ -54,6 +54,7 @@ from dayu.fins.direct_events import (
     FinsResultSummary,
 )
 from dayu.fins.direct_events import ValidatedFinsEventStream
+from dayu.fins.download_contract import FinsDownloadRequest, FinsDownloadUsageError
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.domain.filing_semantics import FiscalPeriod
 from dayu.fins.resolver import FmpCompanyInfoResolver
@@ -71,7 +72,7 @@ from dayu.fins.upload_batch import (
 )
 from dayu.service.fins_direct import (
     FinsDirectCommandService,
-    FinsDirectUsageError,
+    build_direct_download_request,
 )
 
 _BASE_OPTION: Final[str] = "--base"
@@ -204,7 +205,7 @@ def run_fins_direct_command(args: ParsedCliArgs) -> int:
     except UploadBatchPlanEmptyError as exc:
         render_cli_error(f"dayu-cli {args.command_name}: {exc}")
         return EXIT_FAILURE
-    except FinsDirectUsageError as exc:
+    except FinsDownloadUsageError as exc:
         render_cli_error(f"dayu-cli {args.command_name}: {exc}")
         return EXIT_USAGE_ERROR
     except FinsDirectStreamProtocolError as exc:
@@ -233,6 +234,7 @@ async def _run_fins_direct_command_async(args: ParsedCliArgs) -> int:
     )
     if args.command_name == COMMAND_UPLOAD_FILINGS_FROM:
         return _run_upload_filings_from(args)
+    download_request = _prevalidate_download_request(args)
     workspace_root = _resolve_workspace_root(args.workspace_root)
     service = FINS_DIRECT_SERVICE_FACTORY(workspace_root)
     cancellation_token = _CliFinsCancellationToken()
@@ -240,6 +242,7 @@ async def _run_fins_direct_command_async(args: ParsedCliArgs) -> int:
         args=args,
         service=service,
         cancellation_token=cancellation_token,
+        download_request=download_request,
     )
     try:
         runtime_log.log_verbose(
@@ -530,19 +533,27 @@ def _open_direct_stream(
     args: ParsedCliArgs,
     service: FinsDirectCommandService,
     cancellation_token: _CliFinsCancellationToken,
+    download_request: FinsDownloadRequest | None,
 ) -> ValidatedFinsEventStream:
     """按命令名打开 direct event stream。
 
     :param args: argparse 已解析的 Fins direct 命令参数。
     :param service: Fins direct Service helper。
     :param cancellation_token: 当前 operation 的取消 token。
+    :param download_request: download 命令预先校验完成的请求；其它命令为 ``None``。
     :returns: Fins owner 已验证的 direct 事件流。
     :raises CliFinsUsageError: 命令或用户输入非法时抛出。
     :raises Exception: Service 打开 stream 失败时向上抛出。
     """
 
     if args.command_name == COMMAND_DOWNLOAD:
-        return _download_stream(args=args, service=service, cancellation_token=cancellation_token)
+        if download_request is None:
+            raise AssertionError("download command 缺少预校验请求")
+        return _download_stream(
+            request=download_request,
+            service=service,
+            cancellation_token=cancellation_token,
+        )
     if args.command_name == COMMAND_UPLOAD_FILING:
         return _upload_filing_stream(
             args=args,
@@ -573,28 +584,49 @@ def _open_direct_stream(
 
 def _download_stream(
     *,
-    args: ParsedCliArgs,
+    request: FinsDownloadRequest,
     service: FinsDirectCommandService,
     cancellation_token: _CliFinsCancellationToken,
 ) -> ValidatedFinsEventStream:
     """打开 download direct stream。
 
-    :param args: argparse 已解析的 download 参数。
+    :param request: workspace resolution 前完成校验的下载请求。
     :param service: Fins direct Service helper。
     :param cancellation_token: 当前 operation 的取消 token。
     :returns: Fins owner 已验证的 direct 事件流。
-    :raises CliFinsUsageError: ticker 或 forms 输入非法时抛出。
+    :raises Exception: Service 打开 stream 失败时由底层抛出。
     """
 
-    ticker = _parse_ticker_csv(args.ticker)
     return service.download(
-        ticker=ticker.canonical,
-        form_types=_normalized_text_tuple(args.forms, field_name="--forms"),
-        filed_after=_optional_stripped_text(args.start),
-        filed_before=_optional_stripped_text(args.end),
-        overwrite_existing=args.overwrite,
-        rebuild_processed=args.rebuild,
+        request,
         cancellation_token=cancellation_token,
+    )
+
+
+def _prevalidate_download_request(args: ParsedCliArgs) -> FinsDownloadRequest | None:
+    """在 workspace resolution 前校验 download 静态输入。
+
+    Args:
+        args: argparse 已解析的 direct command 参数。
+
+    Returns:
+        download 命令返回 typed request；其它 direct command 返回 ``None``。
+
+    Raises:
+        FinsDownloadUsageError: download 参数违反公开调用契约时抛出。
+    """
+
+    if args.command_name != COMMAND_DOWNLOAD:
+        return None
+    if args.ticker is None:
+        raise FinsDownloadUsageError("--ticker 不能为空，请提供一个公司代码")
+    return build_direct_download_request(
+        ticker=args.ticker,
+        form_types=tuple(args.forms or ()),
+        start=args.start,
+        end=args.end,
+        overwrite_existing=args.overwrite,
+        rebuild_local_artifacts=args.rebuild,
     )
 
 

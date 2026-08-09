@@ -44,6 +44,11 @@ from dayu.fins.direct_events import (
     FinsResultSummary,
 )
 from dayu.fins.direct_events import ValidatedFinsEventStream
+from dayu.fins.download_contract import (
+    FinsDownloadDateRange,
+    FinsDownloadRequest,
+    FinsDownloadSource,
+)
 from dayu.fins.direct_event_text import (
     direct_download_no_source_documents_message,
     direct_failure_message,
@@ -92,7 +97,6 @@ from dayu.fins.ticker_normalization import Market as NormalizedTickerMarket
 from dayu.fins.ticker_normalization import NormalizedTicker
 from dayu.runtime.filelock import file_lock
 
-_DEFAULT_DOWNLOAD_SOURCE: Final[str] = "auto"
 _DOWNLOAD_INGEST_METHOD: Final[FinsIngestMethod] = FinsIngestMethod.DOWNLOAD
 _DOWNLOAD_REJECTION_CLASSIFICATION_VERSION: Final[str] = "fins-download-runtime-v1"
 _JOB_ID_PREFIX: Final[str] = "finsjob_"
@@ -282,31 +286,6 @@ class FinsIngestionStartCancelledError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class FinsDownloadRequest:
-    """下载任务请求。
-
-    Attributes:
-        ticker: 用户提供的 ticker 文本，运行时会先调用公共 ticker 归一化 API。
-        source: 下载来源标识；S1 仅持久化摘要，不选择真实 adapter。
-        form_types: 可选财报表单过滤条件。
-        filed_after: 可选起始披露日期字符串。
-        filed_before: 可选结束披露日期字符串。
-        overwrite_existing: 是否允许覆盖已存在源文档。
-        rebuild_processed: 下载后是否要求后续重建 processed 产物；source-specific
-            adapter 必须按自身仓储语义处理该治理标记，不得假设它等同于来源侧
-            下载工作流的本地重建开关。
-    """
-
-    ticker: str
-    source: str = _DEFAULT_DOWNLOAD_SOURCE
-    form_types: tuple[str, ...] = ()
-    filed_after: str | None = None
-    filed_before: str | None = None
-    overwrite_existing: bool = False
-    rebuild_processed: bool = False
-
-
-@dataclass(frozen=True)
 class FinsDownloadedFile:
     """下载 adapter 返回的单个业务文件。
 
@@ -420,23 +399,21 @@ class FinsSourceDownloadAdapterRequest:
 
     Attributes:
         normalized_ticker: 已由公共 API 归一化的 ticker。
-        source: 已归一化的来源标识。
+        source: 由 ticker 市场解析的来源。
         form_types: 表单过滤条件。
-        filed_after: 可选起始披露日期字符串。
-        filed_before: 可选结束披露日期字符串。
+        date_range: 已展开的 inclusive 日期边界与显式性。
         overwrite_existing: 是否允许覆盖已存在源文档。
-        rebuild_processed: 下载后是否要求后续重建 processed 产物。
+        rebuild_local_artifacts: 是否只基于本地 source 重建下载产物。
         cancellation_checker: runtime 提供的协作式取消检查器。
         progress_sink: 可选同步进度回调；adapter 仅用它上报业务进度，不负责 CLI 渲染。
     """
 
     normalized_ticker: NormalizedTicker
-    source: str
+    source: FinsDownloadSource
     form_types: tuple[str, ...]
-    filed_after: str | None
-    filed_before: str | None
+    date_range: FinsDownloadDateRange
     overwrite_existing: bool
-    rebuild_processed: bool
+    rebuild_local_artifacts: bool
     cancellation_checker: FinsJobCancellationChecker
     progress_sink: FinsDownloadProgressSink | None = None
 
@@ -2162,8 +2139,8 @@ class FinsIngestionRuntime:
             OSError: 仓储读写失败时由底层实现抛出。
         """
 
-        normalized = ticker_normalization.normalize_ticker(request.ticker)
-        source = _normalize_download_source(request.source)
+        normalized = request.normalized_ticker
+        source = request.source.value
         return ValidatedFinsEventStream(
             self._run_direct_stream(
                 operation_kind=FinsIngestionOperationKind.DOWNLOAD,
@@ -2175,7 +2152,7 @@ class FinsIngestionRuntime:
                 producer=_DirectDownloadProducer(
                     runtime=self,
                     normalized=normalized,
-                    request=replace(request, source=source),
+                    request=request,
                 ),
             ),
             operation_kind=FinsOperationKind.DOWNLOAD,
@@ -2305,8 +2282,8 @@ class FinsIngestionRuntime:
         """
 
         _raise_if_start_cancelled(cancellation_token)
-        normalized = ticker_normalization.normalize_ticker(request.ticker)
-        source = _normalize_download_source(request.source)
+        normalized = request.normalized_ticker
+        source = request.source.value
         return self._prepare_observed_stream(
             direct_operation_kind=FinsOperationKind.DOWNLOAD,
             operation_kind=FinsIngestionOperationKind.DOWNLOAD,
@@ -2317,7 +2294,7 @@ class FinsIngestionRuntime:
             producer=_DirectDownloadProducer(
                 runtime=self,
                 normalized=normalized,
-                request=replace(request, source=source),
+                request=request,
             ),
         )
 
@@ -2831,7 +2808,7 @@ class FinsIngestionRuntime:
             payload={
                 _PAYLOAD_TICKER: context.normalized_ticker,
                 _PAYLOAD_MARKET: context.market,
-                _PAYLOAD_SOURCE: request.source,
+                _PAYLOAD_SOURCE: request.source.value,
             },
         )
         if context.cancellation_checker():
@@ -3022,16 +2999,16 @@ class FinsIngestionRuntime:
             OSError: job record 持久化失败，或 create 后取消桥接落盘失败时抛出。
         """
 
-        normalized = ticker_normalization.normalize_ticker(request.ticker)
-        source = _normalize_download_source(request.source)
+        normalized = request.normalized_ticker
+        source = request.source.value
         request_summary: dict[str, JsonValue] = {
             "form_types": list(
                 _bounded_text_tuple(request.form_types, "form_types", reject_path_separators=False)
             ),
-            "filed_after": _optional_bounded_text(request.filed_after, "filed_after"),
-            "filed_before": _optional_bounded_text(request.filed_before, "filed_before"),
+            "filed_after": request.date_range.start_text,
+            "filed_before": request.date_range.end_text,
             "overwrite_existing": request.overwrite_existing,
-            "rebuild_processed": request.rebuild_processed,
+            "rebuild_local_artifacts": request.rebuild_local_artifacts,
         }
         _raise_if_start_cancelled(cancellation_token)
         with self._start_lock:
@@ -3049,7 +3026,7 @@ class FinsIngestionRuntime:
                 lambda: self._run_download_job(
                     job_id=start.job_id,
                     normalized=normalized,
-                    request=replace(request, source=source),
+                    request=request,
                 ),
             )
             return start
@@ -3674,15 +3651,14 @@ class FinsIngestionRuntime:
             OSError: 仓储读取或写入失败时抛出。
         """
 
-        adapter = self._select_download_adapter(source=request.source, market=normalized.market)
+        adapter = self._select_download_adapter(source=request.source.value, market=normalized.market)
         adapter_request = FinsSourceDownloadAdapterRequest(
             normalized_ticker=normalized,
             source=request.source,
             form_types=_bounded_text_tuple(request.form_types, "form_types", reject_path_separators=False),
-            filed_after=_optional_bounded_text(request.filed_after, "filed_after"),
-            filed_before=_optional_bounded_text(request.filed_before, "filed_before"),
+            date_range=request.date_range,
             overwrite_existing=request.overwrite_existing,
-            rebuild_processed=request.rebuild_processed,
+            rebuild_local_artifacts=request.rebuild_local_artifacts,
             cancellation_checker=context.cancellation_checker,
             progress_sink=_DownloadProgressEmitter(self, context),
         )
@@ -3717,7 +3693,6 @@ class FinsIngestionRuntime:
                 ticker=normalized.canonical,
                 document=document,
                 overwrite_existing=request.overwrite_existing,
-                rebuild_processed=request.rebuild_processed,
             ):
                 downloaded_ids.append(document.document_id)
             else:
@@ -3779,7 +3754,6 @@ class FinsIngestionRuntime:
         ticker: str,
         document: FinsDownloadedSourceDocument,
         overwrite_existing: bool,
-        rebuild_processed: bool,
     ) -> bool:
         """保存单个下载文档。
 
@@ -3787,7 +3761,6 @@ class FinsIngestionRuntime:
             ticker: 标准化 ticker。
             document: adapter 返回的源文档。
             overwrite_existing: 是否覆盖已有源文档。
-            rebuild_processed: 是否标记已有 processed 产物需重处理。
 
         Returns:
             写入时返回 ``True``；已有且不覆盖时返回 ``False``。
@@ -3844,13 +3817,6 @@ class FinsIngestionRuntime:
                 document.source_kind,
                 batch=token,
             )
-            if rebuild_processed:
-                _mark_processed_reprocess_required_if_present(
-                    self.processed_repository,
-                    ticker,
-                    document_id,
-                    batch=token,
-                )
             # commit_batch 调用开始即由 storage owner 消费 token；提交失败后
             # caller 不得尝试二次 rollback。
             commit_started = True
@@ -5544,66 +5510,6 @@ def _source_document_exists(
     return True
 
 
-def _mark_processed_reprocess_required_if_present(
-    repository: ProcessedDocumentRepositoryProtocol,
-    ticker: str,
-    document_id: str,
-    *,
-    batch: BatchToken,
-) -> None:
-    """若 processed 文档存在，则标记需要重处理。
-
-    Args:
-        repository: processed 仓储协议。
-        ticker: 标准化 ticker。
-        document_id: 文档 ID。
-        batch: caller 显式传入的 batch capability。
-
-    Returns:
-        无。
-
-    Raises:
-        OSError: 底层仓储写入失败时抛出。
-        ValueError: 元数据格式非法时抛出。
-    """
-
-    if not _processed_exists(repository, ticker, document_id):
-        return
-    repository.mark_processed_reprocess_required(ticker, document_id, True, batch=batch)
-
-
-def mark_downloaded_processed_rebuild_required(
-    repository: ProcessedDocumentRepositoryProtocol,
-    *,
-    ticker: str,
-    summary: FinsDownloadResultSummary,
-    batch: BatchToken,
-) -> None:
-    """按下载摘要标记已写入文档的 processed 产物需要重处理。
-
-    Args:
-        repository: processed 仓储协议。
-        ticker: 标准化 ticker。
-        summary: 下载 adapter 持久化摘要。
-        batch: caller 显式传入的 batch capability。
-
-    Returns:
-        无。
-
-    Raises:
-        OSError: 底层仓储写入失败时抛出。
-        ValueError: processed 元数据格式或文档 ID 非法时抛出。
-    """
-
-    for document_id in summary.written_document_ids:
-        _mark_processed_reprocess_required_if_present(
-            repository,
-            ticker,
-            document_id,
-            batch=batch,
-        )
-
-
 def _download_document_meta(meta: Mapping[str, JsonValue]) -> DocumentMeta:
     """构建下载源文档 meta。
 
@@ -5622,22 +5528,6 @@ def _download_document_meta(meta: Mapping[str, JsonValue]) -> DocumentMeta:
     result["ingest_method"] = _DOWNLOAD_INGEST_METHOD.to_storage_value()
     result["ingest_complete"] = True
     return result
-
-
-def _normalize_download_source(source: str) -> str:
-    """归一化下载来源标识。
-
-    Args:
-        source: 原始来源标识。
-
-    Returns:
-        小写后的来源标识。
-
-    Raises:
-        ValueError: 来源标识为空、过长或包含路径分隔符时抛出。
-    """
-
-    return _bounded_text(source, "source").lower()
 
 
 def _normalize_upload_request(request: FinsUploadRequest) -> FinsUploadRequest:
@@ -5973,7 +5863,7 @@ def _download_context_request_progress_payload(
     return {
         _PAYLOAD_TICKER: context.normalized_ticker,
         _PAYLOAD_MARKET: context.market,
-        _PAYLOAD_SOURCE: _bounded_text(request.source, _PAYLOAD_SOURCE),
+        _PAYLOAD_SOURCE: request.source.value,
         _PAYLOAD_FORM_TYPES: list(
             _bounded_text_tuple(
                 request.form_types,
@@ -6891,7 +6781,6 @@ def _job_start_from_record(record: FinsIngestionJobRecord) -> FinsIngestionJobSt
 __all__ = [
     "FinsDownloadedFile",
     "FinsDownloadedSourceDocument",
-    "FinsDownloadRequest",
     "FinsDownloadProgressEvent",
     "FinsDownloadProgressSink",
     "FinsDownloadResultSummary",

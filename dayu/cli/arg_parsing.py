@@ -902,7 +902,11 @@ def _register_download_command(
     parser.add_argument("--start", help="最早 filing 日期。")
     parser.add_argument("--end", help="最晚 filing 日期。")
     parser.add_argument("--overwrite", action="store_true", help="覆盖已有原始文档。")
-    parser.add_argument("--rebuild", action="store_true", help="重建已处理结果。")
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="仅基于本地源文件重建下载元数据，不访问远端来源。",
+    )
 
 
 def _register_upload_filing_command(

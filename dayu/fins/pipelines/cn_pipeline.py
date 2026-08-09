@@ -31,6 +31,7 @@ from dayu.fins.downloaders.hkexnews_downloader import (
     DEFAULT_USER_AGENT as HKEXNEWS_DEFAULT_USER_AGENT,
     HkexnewsDiscoveryClient,
 )
+from dayu.fins.download_contract import FinsDownloadSource
 from dayu.fins.ingestion_runtime import (
     FinsDownloadProgressEvent,
     FinsDownloadProgressSink,
@@ -38,7 +39,6 @@ from dayu.fins.ingestion_runtime import (
     FinsSourceDownloadAdapter,
     FinsSourceDownloadAdapterRequest,
     FinsSourceDownloadAdapterResult,
-    mark_downloaded_processed_rebuild_required,
 )
 from dayu.fins.domain.document_models import FinsIngestMethod
 from dayu.fins.domain.enums import SourceKind
@@ -640,6 +640,7 @@ class CnPipeline:
         rebuild: bool = False,
         ticker_aliases: Optional[list[str]] = None,
         *,
+        start_is_explicit: bool,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> CnPipelineDownloadResult:
         """执行 CN/HK 下载并同步返回聚合结果。
@@ -652,6 +653,7 @@ class CnPipeline:
             overwrite: 是否强制覆盖。
             rebuild: 是否仅基于本地已下载数据重建 meta。
             ticker_aliases: 可选 ticker alias。
+            start_is_explicit: 起始日期是否来自调用方显式输入。
             cancel_checker: 可选协作式取消检查器。
 
         Returns:
@@ -672,6 +674,7 @@ class CnPipeline:
                     overwrite=overwrite,
                     rebuild=rebuild,
                     ticker_aliases=ticker_aliases,
+                    start_is_explicit=start_is_explicit,
                     cancel_checker=cancel_checker,
                 )
             )
@@ -687,6 +690,7 @@ class CnPipeline:
         rebuild: bool = False,
         ticker_aliases: Optional[list[str]] = None,
         *,
+        start_is_explicit: bool,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> AsyncIterator[DownloadEvent]:
         """执行 CN/HK 下载并流式产出事件。
@@ -699,6 +703,7 @@ class CnPipeline:
             overwrite: 是否强制覆盖。
             rebuild: 是否仅基于本地已下载数据重建 meta。
             ticker_aliases: 可选 ticker alias。
+            start_is_explicit: 起始日期是否来自调用方显式输入。
             cancel_checker: 可选协作式取消检查器。
 
         Yields:
@@ -718,6 +723,7 @@ class CnPipeline:
             overwrite=overwrite,
             rebuild=rebuild,
             ticker_aliases=ticker_aliases,
+            start_is_explicit=start_is_explicit,
             cancel_checker=cancel_checker,
             module=self.MODULE,
             pipeline_name=pipeline_name,
@@ -1342,11 +1348,8 @@ class CnDownloadAdapter(FinsSourceDownloadAdapter):
     def download(self, request: FinsSourceDownloadAdapterRequest) -> FinsSourceDownloadAdapterResult:
         """执行 CN/HK 下载并返回已持久化摘要。
 
-        CN/HK adapter 是 persisted-summary adapter：迁移的 OLD workflow 已经
-        通过 NEW storage repositories 完成 company/source/blob 副作用。
-        ``request.rebuild_processed`` 只代表 NEW processed 重处理治理语义；
-        adapter 在下载摘要确认后按 ``written_document_ids`` 标记既有 processed
-        需要重处理，不映射为 OLD ``CnPipeline.download(rebuild=...)``。
+        CN/HK adapter 是 persisted-summary adapter：现有 ``CnPipeline`` host
+        负责 company/source/blob 与 local-only rebuild 副作用。
 
         Args:
             request: runtime 传入的已归一化下载请求。
@@ -1363,38 +1366,30 @@ class CnDownloadAdapter(FinsSourceDownloadAdapter):
             raise ValueError(
                 f"CN/HK 下载 market 不匹配: expected={self._market} actual={request.normalized_ticker.market}"
             )
-        if request.source not in {self._source, "auto"}:
-            raise ValueError(f"CN/HK 下载来源不匹配: expected={self._source} actual={request.source}")
+        expected_source = (
+            FinsDownloadSource.CNINFO if self._market == "CN" else FinsDownloadSource.HKEXNEWS
+        )
+        if request.source is not expected_source:
+            raise ValueError(
+                f"CN/HK 下载来源不匹配: expected={expected_source.value} "
+                f"actual={request.source.value}"
+            )
         result = _run_async_download_sync(
             collect_cn_download_result_from_events(
                 self._pipeline.download_stream(
                     ticker=request.normalized_ticker.canonical,
                     form_type=_form_type_from_adapter_request(request.form_types),
-                    start_date=request.filed_after,
-                    end_date=request.filed_before,
+                    start_date=request.date_range.start_text,
+                    end_date=request.date_range.end_text,
                     overwrite=request.overwrite_existing,
-                    rebuild=False,
+                    rebuild=request.rebuild_local_artifacts,
+                    start_is_explicit=request.date_range.start_is_explicit,
                     cancel_checker=request.cancellation_checker,
                 ),
                 progress_sink=request.progress_sink,
             )
         )
         persisted_summary = _summary_from_pipeline_result(result)
-        if request.rebuild_processed:
-            batch = self._pipeline.batching_repository.begin_batch(
-                request.normalized_ticker.canonical
-            )
-            try:
-                mark_downloaded_processed_rebuild_required(
-                    self._pipeline.processed_repository,
-                    ticker=request.normalized_ticker.canonical,
-                    summary=persisted_summary,
-                    batch=batch,
-                )
-            except BaseException:
-                self._pipeline.batching_repository.rollback_batch(batch)
-                raise
-            self._pipeline.batching_repository.commit_batch(batch)
         return FinsSourceDownloadAdapterResult(
             discovered_count=_summary_int(result, "total"),
             persisted_summary=persisted_summary,

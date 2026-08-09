@@ -58,8 +58,8 @@ from dayu.fins.ingestion import (
     FinsObservationSnapshot,
     FinsObservationStatus,
 )
+from dayu.fins.download_contract import FinsDownloadRequest
 from dayu.fins.ingestion_runtime import (
-    FinsDownloadRequest,
     FinsPreprocessRequest,
     FinsUploadRequest,
 )

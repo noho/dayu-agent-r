@@ -38,7 +38,7 @@ from dayu.fins.pipelines.cn_download_models import (
     DownloadedReportAsset,
 )
 from dayu.fins.pipelines.cn_download_pdf_gate import CnDownloadPdfGateProtocol
-from dayu.fins.pipelines.cn_form_utils import build_cn_filing_ids
+from dayu.fins.pipelines.cn_form_utils import build_cn_filing_ids, resolve_target_periods
 from dayu.fins.pipelines.cn_pipeline import CnPipeline
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.storage import FsBatchingRepository, FsCompanyMetaRepository, FsDocumentBlobRepository
@@ -48,6 +48,41 @@ from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_
 
 _PDF_BYTES = b"%PDF-1.7\n" + b"0" * 2048
 _DOCLING_BYTES = b'{"document": "ok"}'
+
+
+def test_cn_form_resolution_reuses_domain_alias_owner_for_defaults_and_tuple() -> None:
+    """CN/HK form resolution 应复用 domain alias，并保留各市场默认值。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: alias 或默认财期 contract 漂移时抛出。
+    """
+
+    assert resolve_target_periods(None, "CN").target_periods == (
+        "FY",
+        "H1",
+        "Q1",
+        "Q2",
+        "Q3",
+        "Q4",
+    )
+    assert resolve_target_periods(None, "HK").target_periods == (
+        "FY",
+        "H1",
+        "Q1",
+        "Q2",
+        "Q3",
+        "Q4",
+    )
+    assert resolve_target_periods(("annual", "二季报", "FY"), "CN").target_periods == (
+        "FY",
+        "Q2",
+    )
 
 
 class _BatchIdentityCnBatchingRepository(FsBatchingRepository):
@@ -619,6 +654,7 @@ def _build_pipeline(
 def _collect_events(
     pipeline: CnPipeline,
     *,
+    start_is_explicit: bool,
     form_type: str = "FY",
     overwrite: bool = False,
     cancel_checker: Callable[[], bool] | None = None,
@@ -627,6 +663,7 @@ def _collect_events(
 
     Args:
         pipeline: 待执行 pipeline。
+        start_is_explicit: 起始日期是否来自调用方显式输入。
         form_type: form 过滤。
         overwrite: 是否覆盖。
         cancel_checker: 可选取消检查函数。
@@ -646,6 +683,7 @@ def _collect_events(
             start_date="2024",
             end_date="2026",
             overwrite=overwrite,
+            start_is_explicit=start_is_explicit,
             cancel_checker=cancel_checker,
         )
     )
@@ -659,6 +697,7 @@ async def _collect_events_async(
     start_date: str,
     end_date: str,
     overwrite: bool,
+    start_is_explicit: bool,
     cancel_checker: Callable[[], bool] | None = None,
 ) -> list[DownloadEvent]:
     """异步收集 download_stream 事件。
@@ -670,6 +709,7 @@ async def _collect_events_async(
         start_date: 开始日期。
         end_date: 结束日期。
         overwrite: 是否覆盖。
+        start_is_explicit: 起始日期是否来自调用方显式输入。
         cancel_checker: 可选取消检查函数。
 
     Returns:
@@ -686,6 +726,7 @@ async def _collect_events_async(
         start_date=start_date,
         end_date=end_date,
         overwrite=overwrite,
+        start_is_explicit=start_is_explicit,
         cancel_checker=cancel_checker,
     ):
         events.append(event)
@@ -727,7 +768,7 @@ def test_cn_download_workflow_commits_pdf_and_docling(tmp_path: Path) -> None:
     converter = _FakeConverter()
     pipeline = _build_pipeline(tmp_path=tmp_path, discovery=discovery, converter=converter)
 
-    events = _collect_events(pipeline)
+    events = _collect_events(pipeline, start_is_explicit=True)
 
     assert [event.event_type for event in events] == [
         DownloadEventType.PIPELINE_STARTED,
@@ -776,7 +817,7 @@ def test_cn_company_publication_failure_rolls_back_once(tmp_path: Path) -> None:
         ),
     )
 
-    result = _final_result(_collect_events(pipeline))
+    result = _final_result(_collect_events(pipeline, start_is_explicit=True))
 
     assert result["status"] == "failed"
     assert result["reason_code"] == "cn_download_failed"
@@ -941,14 +982,16 @@ def test_cn_replacement_separates_company_and_document_transactions(
         blob_repository=blob_repository,
         processed_repository=processed_repository,
     )
-    _collect_events(pipeline)
+    _collect_events(pipeline, start_is_explicit=True)
     batching_repository.phases.clear()
     begin_calls = batching_repository.begin_calls
     commit_calls = batching_repository.commit_calls
     rollback_calls = batching_repository.rollback_calls
     discovery.pdf_bytes = _PDF_BYTES + b"replacement"
 
-    result = _final_result(_collect_events(pipeline, overwrite=True))
+    result = _final_result(
+        _collect_events(pipeline, start_is_explicit=True, overwrite=True)
+    )
 
     phases = [phase for phase, _ in batching_repository.phases]
     batch_ids = {batch_id for _, batch_id in batching_repository.phases}
@@ -991,13 +1034,13 @@ def test_cn_pdf_sha_skip_final_meta_uses_one_caller_batch(tmp_path: Path) -> Non
         source_repository=source_repository,
         blob_repository=blob_repository,
     )
-    _collect_events(pipeline)
+    _collect_events(pipeline, start_is_explicit=True)
     batching_repository.phases.clear()
     begin_calls = batching_repository.begin_calls
     commit_calls = batching_repository.commit_calls
     discovery.candidates = (_candidate(source_id="A2", etag='"v2"'),)
 
-    result = _final_result(_collect_events(pipeline))
+    result = _final_result(_collect_events(pipeline, start_is_explicit=True))
 
     phases = [phase for phase, _ in batching_repository.phases]
     batch_ids = {batch_id for _, batch_id in batching_repository.phases}
@@ -1032,7 +1075,7 @@ def test_cn_replacement_final_failure_restores_old_source_and_blobs(tmp_path: Pa
         source_repository=source_repository,
         blob_repository=blob_repository,
     )
-    _collect_events(pipeline)
+    _collect_events(pipeline, start_is_explicit=True)
     document_id, _ = build_cn_filing_ids(
         ticker="600519",
         form_type="FY",
@@ -1047,7 +1090,9 @@ def test_cn_replacement_final_failure_restores_old_source_and_blobs(tmp_path: Pa
     source_repository.fail_final = True
     discovery.pdf_bytes = _PDF_BYTES + b"replacement"
 
-    result = _final_result(_collect_events(pipeline, overwrite=True))
+    result = _final_result(
+        _collect_events(pipeline, start_is_explicit=True, overwrite=True)
+    )
 
     summary = result["summary"]
     assert isinstance(summary, dict)
@@ -1069,7 +1114,7 @@ def test_cn_replacement_success_exposes_source_blobs_and_processed_marker_togeth
         discovery=discovery,
         converter=_FakeConverter(),
     )
-    _collect_events(pipeline)
+    _collect_events(pipeline, start_is_explicit=True)
     document_id, internal_document_id = build_cn_filing_ids(
         ticker="600519",
         form_type="FY",
@@ -1096,7 +1141,7 @@ def test_cn_replacement_success_exposes_source_blobs_and_processed_marker_togeth
     discovery.pdf_bytes = replacement_pdf
     discovery.candidates = (_candidate(source_id="A2", etag='"v2"'),)
 
-    result = _final_result(_collect_events(pipeline))
+    result = _final_result(_collect_events(pipeline, start_is_explicit=True))
 
     source_meta = pipeline.source_repository.get_source_meta(
         "600519",
@@ -1112,8 +1157,8 @@ def test_cn_replacement_success_exposes_source_blobs_and_processed_marker_togeth
     assert processed_meta["reprocess_required"] is True
 
 
-def test_cn_rebuild_updates_source_and_processed_in_one_batch(tmp_path: Path) -> None:
-    """CN rebuild 必须在一个短事务内更新 source 与既有 processed marker。"""
+def test_cn_rebuild_updates_only_source_in_one_batch(tmp_path: Path) -> None:
+    """CN rebuild 必须在一个短事务内只更新 source，不读写 processed。"""
 
     repository_set = build_fs_repository_set(workspace_root=tmp_path)
     batching_repository = _BatchIdentityCnBatchingRepository(tmp_path, repository_set)
@@ -1138,7 +1183,7 @@ def test_cn_rebuild_updates_source_and_processed_in_one_batch(tmp_path: Path) ->
         blob_repository=blob_repository,
         processed_repository=processed_repository,
     )
-    _collect_events(pipeline)
+    _collect_events(pipeline, start_is_explicit=True)
     document_id, internal_document_id = build_cn_filing_ids(
         ticker="600519",
         form_type="FY",
@@ -1165,6 +1210,12 @@ def test_cn_rebuild_updates_source_and_processed_in_one_batch(tmp_path: Path) ->
     begin_calls = batching_repository.begin_calls
     commit_calls = batching_repository.commit_calls
     rollback_calls = batching_repository.rollback_calls
+    source_handle = source_repository.get_source_handle("600519", document_id, SourceKind.FILING)
+    source_pdf_before = blob_repository.read_file_bytes(source_handle, f"{document_id}.pdf")
+    source_docling_before = blob_repository.read_file_bytes(
+        source_handle,
+        f"{document_id}_docling.json",
+    )
 
     result = pipeline.download(
         ticker="600519",
@@ -1173,6 +1224,7 @@ def test_cn_rebuild_updates_source_and_processed_in_one_batch(tmp_path: Path) ->
         end_date="2026",
         overwrite=False,
         rebuild=True,
+        start_is_explicit=True,
     )
 
     phase_names = [phase for phase, _ in batching_repository.phases]
@@ -1183,12 +1235,17 @@ def test_cn_rebuild_updates_source_and_processed_in_one_batch(tmp_path: Path) ->
         document_id,
     )
     assert result["status"] == "ok"
-    assert phase_names == ["begin", "final_meta", "processed_marker", "commit"]
+    assert phase_names == ["begin", "final_meta", "commit"]
     assert len(transaction_ids) == 1
     assert batching_repository.begin_calls == begin_calls + 1
     assert batching_repository.commit_calls == commit_calls + 1
     assert batching_repository.rollback_calls == rollback_calls
-    assert processed_meta["reprocess_required"] is True
+    assert processed_meta["reprocess_required"] is False
+    assert blob_repository.read_file_bytes(source_handle, f"{document_id}.pdf") == source_pdf_before
+    assert (
+        blob_repository.read_file_bytes(source_handle, f"{document_id}_docling.json")
+        == source_docling_before
+    )
 
 
 def test_cn_active_batch_sync_cancelled_error_rolls_back_once(tmp_path: Path) -> None:
@@ -1276,7 +1333,7 @@ def test_cn_commit_failure_does_not_trigger_caller_rollback_or_success(tmp_path:
         blob_repository=blob_repository,
     )
 
-    events = _collect_events(pipeline)
+    events = _collect_events(pipeline, start_is_explicit=True)
     result = _final_result(events)
     summary = result["summary"]
 
@@ -1314,7 +1371,7 @@ def test_cn_download_pdf_gate_does_not_cover_docling_convert(tmp_path: Path) -> 
         pdf_download_gate=gate,
     )
 
-    result = _final_result(_collect_events(pipeline))
+    result = _final_result(_collect_events(pipeline, start_is_explicit=True))
 
     summary = result["summary"]
     assert isinstance(summary, dict)
@@ -1339,7 +1396,7 @@ def test_cn_pdf_download_failure_leaves_document_absent(tmp_path: Path) -> None:
         converter=_FakeConverter(),
     )
 
-    result = _final_result(_collect_events(pipeline))
+    result = _final_result(_collect_events(pipeline, start_is_explicit=True))
     document_id, _ = build_cn_filing_ids(
         ticker="600519",
         form_type="FY",
@@ -1374,7 +1431,7 @@ def test_cn_docling_conversion_failure_leaves_document_absent(tmp_path: Path) ->
         converter=fail_conversion,
     )
 
-    result = _final_result(_collect_events(pipeline))
+    result = _final_result(_collect_events(pipeline, start_is_explicit=True))
     document_id, _ = build_cn_filing_ids(
         ticker="600519",
         form_type="FY",
@@ -1423,6 +1480,7 @@ def test_cn_download_cancel_after_pdf_download_does_not_start_docling(
             start_date="2024",
             end_date="2026",
             overwrite=False,
+            start_is_explicit=True,
             cancel_checker=cancel_state,
         ):
             events.append(event)
@@ -1465,6 +1523,7 @@ def test_cn_outer_generator_close_before_conversion_leaves_no_document(tmp_path:
                 start_date="2024",
                 end_date="2026",
                 overwrite=False,
+                start_is_explicit=True,
             ),
         )
         async for event in stream:
@@ -1558,7 +1617,9 @@ def test_cn_download_cancel_after_docling_convert_skips_source_commit(
     converter = _CancelAfterConvertConverter(cancel_state=cancel_state)
     pipeline = _build_pipeline(tmp_path=tmp_path, discovery=discovery, converter=converter)
 
-    events = _collect_events(pipeline, cancel_checker=cancel_state)
+    events = _collect_events(
+        pipeline, start_is_explicit=True, cancel_checker=cancel_state
+    )
     result = _final_result(events)
     summary = result["summary"]
     document_id, _ = build_cn_filing_ids(
@@ -1626,7 +1687,9 @@ def test_cn_workflow_maps_bool_true_inside_single_owned_checkpoint(
         raw_calls += 1
         return raw_calls == 4
 
-    events = _collect_events(pipeline, cancel_checker=cancel_checker)
+    events = _collect_events(
+        pipeline, start_is_explicit=True, cancel_checker=cancel_checker
+    )
     result = _final_result(events)
 
     assert result["status"] == "cancelled"
@@ -1667,7 +1730,9 @@ def test_cn_workflow_preserves_caller_cancel_object_through_checkpoint(
             raise expected
         return False
 
-    result = _final_result(_collect_events(pipeline, cancel_checker=cancel_checker))
+    result = _final_result(
+        _collect_events(pipeline, start_is_explicit=True, cancel_checker=cancel_checker)
+    )
 
     assert result["status"] == "cancelled"
     assert discovery.checkpoint_errors == [expected]
@@ -1691,7 +1756,9 @@ def test_cn_workflow_cancel_before_first_candidate_suppresses_download(
         raw_calls += 1
         return raw_calls == 6
 
-    events = _collect_events(pipeline, cancel_checker=cancel_checker)
+    events = _collect_events(
+        pipeline, start_is_explicit=True, cancel_checker=cancel_checker
+    )
     result = _final_result(events)
 
     assert result["status"] == "cancelled"
@@ -1721,7 +1788,9 @@ def test_cn_workflow_wraps_checkpoint_non_cancel_failure_with_direct_cause(
             raise expected
         return False
 
-    result = _final_result(_collect_events(pipeline, cancel_checker=cancel_checker))
+    result = _final_result(
+        _collect_events(pipeline, start_is_explicit=True, cancel_checker=cancel_checker)
+    )
 
     assert result["status"] == "failed"
     assert len(discovery.checkpoint_errors) == 1
@@ -1749,8 +1818,8 @@ def test_cn_download_fast_skip_uses_remote_fingerprint(tmp_path: Path) -> None:
     converter = _FakeConverter()
     pipeline = _build_pipeline(tmp_path=tmp_path, discovery=discovery, converter=converter)
 
-    _collect_events(pipeline)
-    second_events = _collect_events(pipeline)
+    _collect_events(pipeline, start_is_explicit=True)
+    second_events = _collect_events(pipeline, start_is_explicit=True)
 
     result = _final_result(second_events)
     summary = result["summary"]
@@ -1760,8 +1829,8 @@ def test_cn_download_fast_skip_uses_remote_fingerprint(tmp_path: Path) -> None:
     assert converter.calls == 1
 
 
-def test_cn_download_marks_missing_independent_quarter_skipped(tmp_path: Path) -> None:
-    """主源没有独立季度候选时 workflow 应标记 skipped，不折叠到相邻累计期间。
+def test_cn_download_reports_missing_independent_quarter_outside_document_counts(tmp_path: Path) -> None:
+    """主源缺少独立季度时应单独报告，不伪装成 skipped 文档。
 
     Args:
         tmp_path: 临时目录。
@@ -1777,17 +1846,21 @@ def test_cn_download_marks_missing_independent_quarter_skipped(tmp_path: Path) -
     converter = _FakeConverter()
     pipeline = _build_pipeline(tmp_path=tmp_path, discovery=discovery, converter=converter)
 
-    events = _collect_events(pipeline, form_type="Q2")
+    events = _collect_events(pipeline, start_is_explicit=True, form_type="Q2")
 
     result = _final_result(events)
     summary = result["summary"]
     filings = result["filings"]
     assert isinstance(summary, dict)
     assert isinstance(filings, list)
-    assert summary["skipped"] == 1
+    assert summary["total"] == 0
+    assert summary["downloaded"] == 0
+    assert summary["skipped"] == 0
+    assert summary["failed"] == 0
+    assert result["missing_periods"] == ["Q2"]
+    assert filings == []
     assert discovery.download_calls == 0
     assert converter.calls == 0
-    first = filings[0]
-    assert isinstance(first, dict)
-    assert first["form_type"] == "Q2"
-    assert first["skip_reason"] == "candidate_not_found"
+    assert DownloadEventType.FILING_COMPLETED not in {
+        event.event_type for event in events
+    }

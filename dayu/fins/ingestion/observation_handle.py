@@ -23,8 +23,8 @@ from dayu.fins.direct_events import (
 )
 
 if TYPE_CHECKING:
+    from dayu.fins.download_contract import FinsDownloadRequest
     from dayu.fins.ingestion_runtime import (
-        FinsDownloadRequest,
         FinsPreprocessRequest,
         FinsUploadRequest,
     )

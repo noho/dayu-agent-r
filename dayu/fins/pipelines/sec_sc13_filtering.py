@@ -27,10 +27,8 @@ from .sec_download_state import (
     _browse_edgar_filings_to_dicts,
     _dicts_to_browse_edgar_filings,
     _is_rejected as _is_rejected_impl,
-    _read_sec_cache,
     _read_sec_cache_async,
     _record_rejection as _record_rejection_impl,
-    _write_sec_cache,
     _write_sec_cache_async,
 )
 
@@ -646,15 +644,40 @@ async def retry_sc13_if_empty(
     form_windows: dict[str, dt.date],
     end_date: dt.date,
     target_cik: str,
+    start_is_explicit: bool,
     sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
     rejection_registry: Optional[DownloadRejectionRegistry] = None,
     overwrite: bool = False,
     cancel_checker: Optional[Callable[[], bool]] = None,
 ) -> list[Sc13FilingRecordProtocol]:
-    """在 SC13 初始为空时逐次扩大窗口重试。"""
+    """在未显式给出起点且 SC13 初始为空时逐次扩大窗口重试。
+
+    Args:
+        host: SC13 workflow host。
+        ticker: canonical ticker。
+        filings: 当前已选 filing。
+        filenums: submissions 已发现的 filing number。
+        submissions: SEC submissions payload。
+        form_windows: canonical form 到 inclusive 起点的映射。
+        end_date: inclusive 结束日期。
+        target_cik: 当前目标公司的 CIK。
+        start_is_explicit: 用户是否显式提供起始日期。
+        sc13_direction_cache: SC13 方向判断缓存。
+        rejection_registry: 下载拒绝注册表。
+        overwrite: 是否覆盖已有 source document。
+        cancel_checker: 可选协作式取消检查器。
+
+    Returns:
+        原始或补齐后的 filing 列表。
+
+    Raises:
+        RuntimeError: SEC provider 或方向判断失败时由底层抛出。
+    """
 
     requested_sc13 = SC13_FORMS.intersection(form_windows.keys())
     if not requested_sc13:
+        return list(filings)
+    if start_is_explicit:
         return list(filings)
 
     for retry in range(1, SC13_RETRY_MAX + 1):

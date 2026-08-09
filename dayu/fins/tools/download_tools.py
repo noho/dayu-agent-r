@@ -22,8 +22,11 @@ from dayu.contracts.tool_outcome import (
 )
 from dayu.contracts.tool_result import ToolResultMeta
 from dayu.contracts.tool_schema import ToolFunctionSchema, ToolParametersSchema, ToolSchema
-from dayu.fins.ingestion_runtime import (
+from dayu.fins.download_contract import (
     FinsDownloadRequest,
+    build_fins_download_request,
+)
+from dayu.fins.ingestion_runtime import (
     FinsIngestionRuntime,
     FinsIngestionStartCancelledError,
 )
@@ -32,7 +35,6 @@ from dayu.fins.tools._ingestion_tool_helpers import (
     _failed_outcome,
     _optional_bool,
     _optional_nullable_text,
-    _optional_text,
     _optional_text_tuple,
     _required_text,
 )
@@ -40,7 +42,6 @@ from dayu.fins.tools._ingestion_tool_helpers import (
 DOWNLOAD_TOOL_NAME: Final[str] = "start_fins_download"
 _ERROR_INVALID_ARGUMENT: Final[str] = "invalid_argument"
 _ERROR_JOB_START_FAILED: Final[str] = "fins_download_start_failed"
-_DEFAULT_SOURCE: Final[str] = "auto"
 _CANCELLED_MESSAGE: Final[str] = "财报下载任务启动已停止。"
 _CANCELLED_HINT: Final[str] = "当前工具调用已停止；如仍需要该结果，请等待用户确认后再重新发起。"
 
@@ -193,14 +194,9 @@ def _download_parameters_schema() -> ToolParametersSchema:
             "type": "string",
             "description": "要下载财报的股票代码，可包含交易所后缀，例如 AAPL 或 00700.HK。",
         },
-        "source": {
-            "type": "string",
-            "description": "财报来源。除非用户明确指定来源，否则使用 auto。",
-            "default": _DEFAULT_SOURCE,
-        },
         "form_types": {
             "type": "array",
-            "description": "可选表单过滤条件，例如 10-K、10-Q 或 annual-report；省略或传空数组表示不过滤。",
+            "description": "可选表单过滤条件；美股使用 10-K、10-Q 等 SEC form，A/H 股使用 FY、H1、Q1 等财期；省略或传空数组表示不过滤。",
             "items": {"type": "string"},
         },
         "filed_after": {
@@ -216,9 +212,9 @@ def _download_parameters_schema() -> ToolParametersSchema:
             "description": "是否允许新下载的源文件替换本地同一文档的已有源文件。",
             "default": False,
         },
-        "rebuild_processed": {
+        "rebuild_local_artifacts": {
             "type": "boolean",
-            "description": "替换源文件后，是否要求后续重新处理对应文档。",
+            "description": "是否只基于本地已有源文件重建下载元数据；启用时不访问远端来源。",
             "default": False,
         },
     }
@@ -243,12 +239,15 @@ def _download_request_from_arguments(arguments: Mapping[str, JsonValue]) -> Fins
         ValueError: 参数类型或取值非法时抛出。
     """
 
-    return FinsDownloadRequest(
+    return build_fins_download_request(
         ticker=_required_text(arguments, "ticker"),
-        source=_optional_text(arguments, "source", default=_DEFAULT_SOURCE),
         form_types=_optional_text_tuple(arguments, "form_types"),
-        filed_after=_optional_nullable_text(arguments, "filed_after"),
-        filed_before=_optional_nullable_text(arguments, "filed_before"),
+        start=_optional_nullable_text(arguments, "filed_after"),
+        end=_optional_nullable_text(arguments, "filed_before"),
         overwrite_existing=_optional_bool(arguments, "overwrite_existing", default=False),
-        rebuild_processed=_optional_bool(arguments, "rebuild_processed", default=False),
+        rebuild_local_artifacts=_optional_bool(
+            arguments,
+            "rebuild_local_artifacts",
+            default=False,
+        ),
     )

@@ -200,12 +200,6 @@ def _rebuild_single_cn_download_document(
             reason_message="重建失败：CN/HK 下载完成态缺少 primary_document",
         )
     source_fingerprint = _resolve_source_fingerprint(previous_meta=previous_meta, file_entries=file_entries)
-    try:
-        host.processed_repository.get_processed_meta(ticker, document_id)
-    except FileNotFoundError:
-        has_processed_document = False
-    else:
-        has_processed_document = True
     meta_payload = dict(previous_meta)
     file_values: list[JsonValue] = [item for item in file_entries]
     update_payload: JsonObject = {
@@ -237,13 +231,6 @@ def _rebuild_single_cn_download_document(
             source_kind=SourceKind.FILING,
             batch=batch,
         )
-        if has_processed_document:
-            host.processed_repository.mark_processed_reprocess_required(
-                ticker,
-                document_id,
-                True,
-                batch=batch,
-            )
     except BaseException:
         host.batching_repository.rollback_batch(batch)
         raise

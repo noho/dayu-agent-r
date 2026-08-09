@@ -30,47 +30,19 @@ import re
 from dataclasses import dataclass
 from typing import Final
 
+from dayu.fins.domain.filing_semantics import parse_fiscal_period_filter_value
 from dayu.fins.pipelines.cn_download_models import CnFiscalPeriod, CnMarketKind
 
 DEFAULT_FORMS_CN: Final[tuple[CnFiscalPeriod, ...]] = ("FY", "H1", "Q1", "Q2", "Q3", "Q4")
 """A 股默认下载 form 集合。"""
 
 DEFAULT_FORMS_HK: Final[tuple[CnFiscalPeriod, ...]] = ("FY", "H1", "Q1", "Q2", "Q3", "Q4")
-"""港股默认下载 form 集合。HK 主板季度报告缺失视为 skipped 而非 failed。"""
+"""港股默认下载 form 集合；主源缺失财期通过独立 ``missing_periods`` 报告。"""
 
 # 窗口默认值与 SEC 链路的业务意图对齐：年报 5 年，季报/半年报 2 年。
 _ANNUAL_LOOKBACK_YEARS: Final[int] = 5
 _INTERIM_LOOKBACK_YEARS: Final[int] = 2
 _LOOKBACK_GRACE_DAYS: Final[int] = 60
-
-# CLI ``--forms`` 输入的 token 拼写到 ``CnFiscalPeriod`` 字面量的归一化映射。
-# 源覆盖：英文大写、拼音首字母、纯数字 + Q 后缀、中文"X 季报/年报/半年报"。
-_TOKEN_TO_PERIOD: Final[dict[str, CnFiscalPeriod]] = {
-    "FY": "FY",
-    "ANNUAL": "FY",
-    "年报": "FY",
-    "年度报告": "FY",
-    "H1": "H1",
-    "1H": "H1",
-    "半年报": "H1",
-    "中报": "H1",
-    "Q1": "Q1",
-    "1Q": "Q1",
-    "一季报": "Q1",
-    "一季度报告": "Q1",
-    "Q2": "Q2",
-    "2Q": "Q2",
-    "二季报": "Q2",
-    "二季度报告": "Q2",
-    "Q3": "Q3",
-    "3Q": "Q3",
-    "三季报": "Q3",
-    "三季度报告": "Q3",
-    "Q4": "Q4",
-    "4Q": "Q4",
-    "四季报": "Q4",
-    "四季度报告": "Q4",
-}
 
 # form 输入分隔符：英文逗号 / 中文全角逗号 / 任意空白。
 _FORM_INPUT_SEPARATOR_PATTERN: Final[re.Pattern[str]] = re.compile(r"[,，\s]+")
@@ -202,8 +174,8 @@ def resolve_target_periods(
     - 输入为空 / ``None`` / 全空白 -> 返回 :data:`DEFAULT_FORMS_CN` 或
       :data:`DEFAULT_FORMS_HK`。
     - 字符串输入按 :func:`split_cn_form_input` 规则切分；tuple 输入直接消费。
-    - 输入 token 经 :data:`_TOKEN_TO_PERIOD` 归一，``Q2``/``Q4`` 保留为独立
-      季度期间，不折叠到 ``H1``/``FY``。
+    - 输入 token 经 domain 财期 parser 归一，``Q2``/``Q4`` 保留为独立季度期间，
+      不折叠到 ``H1``/``FY``。
     - 输出按字面量稳定顺序去重：``FY`` / ``H1`` / ``Q1`` / ``Q2`` /
       ``Q3`` / ``Q4``。
 
@@ -226,18 +198,9 @@ def resolve_target_periods(
 
     seen: set[CnFiscalPeriod] = set()
     notes: list[str] = []
-    invalid: list[str] = []
     for raw in tokens:
-        token = raw.strip().upper()
-        if not token:
-            continue
-        period = _TOKEN_TO_PERIOD.get(token)
-        if period is None:
-            invalid.append(raw)
-            continue
+        period = parse_fiscal_period_filter_value(raw, field_name="form 输入")
         seen.add(period)
-    if invalid:
-        raise ValueError(f"不支持的 form 输入: {invalid!r}")
     if not seen:
         raise ValueError("form 输入解析后为空")
 

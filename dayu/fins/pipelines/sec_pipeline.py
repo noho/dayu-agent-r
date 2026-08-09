@@ -32,6 +32,7 @@ from dayu.fins.downloaders.sec_downloader import (
     SecDownloader,
     StoreDownloadedFile,
 )
+from dayu.fins.download_contract import FinsDownloadSource
 from dayu.fins.ingestion_runtime import (
     FinsDownloadProgressEvent,
     FinsDownloadProgressSink,
@@ -39,7 +40,6 @@ from dayu.fins.ingestion_runtime import (
     FinsSourceDownloadAdapter,
     FinsSourceDownloadAdapterRequest,
     FinsSourceDownloadAdapterResult,
-    mark_downloaded_processed_rebuild_required,
 )
 from dayu.fins.pipelines.docling_upload_service import DoclingUploadService, UploadCancellationChecker
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
@@ -553,6 +553,7 @@ class SecPipeline:
         rebuild: bool = False,
         ticker_aliases: Optional[list[str]] = None,
         *,
+        start_is_explicit: bool,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> SecPipelineDownloadResult:
         """执行 SEC 下载并同步返回聚合结果。
@@ -565,6 +566,7 @@ class SecPipeline:
             overwrite: 是否强制覆盖。
             rebuild: 是否仅基于本地已下载数据重建 meta。
             ticker_aliases: 可选 ticker alias。
+            start_is_explicit: 起始日期是否来自调用方显式输入。
             cancel_checker: 可选协作式取消检查器。
 
         Returns:
@@ -585,6 +587,7 @@ class SecPipeline:
                     overwrite=overwrite,
                     rebuild=rebuild,
                     ticker_aliases=ticker_aliases,
+                    start_is_explicit=start_is_explicit,
                     cancel_checker=cancel_checker,
                 )
             )
@@ -600,6 +603,7 @@ class SecPipeline:
         rebuild: bool = False,
         ticker_aliases: Optional[list[str]] = None,
         *,
+        start_is_explicit: bool,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> AsyncIterator[DownloadEvent]:
         """执行 SEC 下载并流式产出事件。
@@ -612,6 +616,7 @@ class SecPipeline:
             overwrite: 是否强制覆盖。
             rebuild: 是否仅基于本地已下载数据重建 meta。
             ticker_aliases: 可选 ticker alias。
+            start_is_explicit: 起始日期是否来自调用方显式输入。
             cancel_checker: 可选协作式取消检查器。
 
         Yields:
@@ -629,6 +634,7 @@ class SecPipeline:
             overwrite=overwrite,
             rebuild=rebuild,
             ticker_aliases=ticker_aliases,
+            start_is_explicit=start_is_explicit,
             cancel_checker=cancel_checker,
         ):
             yield event
@@ -643,6 +649,7 @@ class SecPipeline:
         rebuild: bool = False,
         ticker_aliases: Optional[list[str]] = None,
         *,
+        start_is_explicit: bool,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> AsyncIterator[DownloadEvent]:
         """执行 OLD SEC 下载主工作流。
@@ -655,6 +662,7 @@ class SecPipeline:
             overwrite: 是否强制覆盖。
             rebuild: 是否仅基于本地已下载数据重建 meta。
             ticker_aliases: 可选 ticker alias。
+            start_is_explicit: 起始日期是否来自调用方显式输入。
             cancel_checker: 可选协作式取消检查器。
 
         Yields:
@@ -673,6 +681,7 @@ class SecPipeline:
             overwrite=overwrite,
             rebuild=rebuild,
             ticker_aliases=ticker_aliases,
+            start_is_explicit=start_is_explicit,
             cancel_checker=cancel_checker,
             parse_date=parse_date,
             extract_sec_ticker_aliases=extract_sec_ticker_aliases,
@@ -682,7 +691,6 @@ class SecPipeline:
             should_warn_missing_sc13=should_warn_missing_sc13,
             warn_insufficient_filings=warn_insufficient_filings,
             warn_xbrl_missing_filings=warn_xbrl_missing_filings,
-            cleanup_stale_filing_dirs=_cleanup_stale_filing_dirs,
             build_download_filing_event_payload=build_download_filing_event_payload,
         ):
             yield event
@@ -1283,6 +1291,7 @@ class SecPipeline:
         form_windows: dict[str, dt.date],
         end_date: dt.date,
         target_cik: str,
+        start_is_explicit: bool,
         sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
         rejection_registry: Optional[DownloadRejectionRegistry] = None,
         overwrite: bool = False,
@@ -1298,6 +1307,7 @@ class SecPipeline:
             form_windows: form 到起始日期映射。
             end_date: 下载结束日期。
             target_cik: 目标 CIK。
+            start_is_explicit: 起始日期是否由调用方显式提供。
             sc13_direction_cache: SC13 方向缓存。
             rejection_registry: 拒绝注册表。
             overwrite: 是否覆盖。
@@ -1321,6 +1331,7 @@ class SecPipeline:
                 form_windows=form_windows,
                 end_date=end_date,
                 target_cik=target_cik,
+                start_is_explicit=start_is_explicit,
                 sc13_direction_cache=sc13_direction_cache,
                 rejection_registry=rejection_registry,
                 overwrite=overwrite,
@@ -1789,11 +1800,8 @@ class SecDownloadAdapter(FinsSourceDownloadAdapter):
     def download(self, request: FinsSourceDownloadAdapterRequest) -> FinsSourceDownloadAdapterResult:
         """执行 SEC 下载并返回已持久化摘要。
 
-        SEC adapter 是 persisted-summary adapter：迁移的 SEC workflow 已经通过
-        NEW storage repositories 完成 source/rejected 相关副作用。`request.rebuild_processed`
-        只代表 NEW processed 重处理治理语义；adapter 在下载摘要确认后按
-        `written_document_ids` 标记既有 processed 需要重处理，不映射为 OLD
-        `SecPipeline.download(rebuild=...)`。
+        SEC adapter 是 persisted-summary adapter：SEC workflow 通过同一个
+        ``SecPipeline`` host 完成 source/rejected 与 local-only rebuild 副作用。
 
         Args:
             request: runtime 传入的已归一化下载请求。
@@ -1808,36 +1816,24 @@ class SecDownloadAdapter(FinsSourceDownloadAdapter):
 
         if request.normalized_ticker.market != "US":
             raise ValueError(f"SEC 下载仅支持 US market，当前 market={request.normalized_ticker.market}")
+        if request.source is not FinsDownloadSource.SEC:
+            raise ValueError(f"SEC 下载来源不匹配: source={request.source.value}")
         result = _run_async_download_sync(
             collect_download_result_from_events(
                 self._pipeline.download_stream(
                     ticker=request.normalized_ticker.canonical,
                     form_type=_form_type_from_adapter_request(request.form_types),
-                    start_date=request.filed_after,
-                    end_date=request.filed_before,
+                    start_date=request.date_range.start_text,
+                    end_date=request.date_range.end_text,
                     overwrite=request.overwrite_existing,
-                    rebuild=False,
+                    rebuild=request.rebuild_local_artifacts,
+                    start_is_explicit=request.date_range.start_is_explicit,
                     cancel_checker=request.cancellation_checker,
                 ),
                 progress_sink=request.progress_sink,
             )
         )
         persisted_summary = _summary_from_pipeline_result(result)
-        if request.rebuild_processed:
-            batch = self._pipeline._batching_repository.begin_batch(
-                request.normalized_ticker.canonical
-            )
-            try:
-                mark_downloaded_processed_rebuild_required(
-                    self._pipeline._processed_repository,
-                    ticker=request.normalized_ticker.canonical,
-                    summary=persisted_summary,
-                    batch=batch,
-                )
-            except BaseException:
-                self._pipeline._batching_repository.rollback_batch(batch)
-                raise
-            self._pipeline._batching_repository.commit_batch(batch)
         return FinsSourceDownloadAdapterResult(
             discovered_count=persisted_summary.discovered_count,
             persisted_summary=persisted_summary,
@@ -1987,45 +1983,6 @@ def build_sec_download_adapter(
         max_retries=max_retries,
     )
     return SecDownloadAdapter(pipeline=pipeline)
-
-
-def _cleanup_stale_filing_dirs(
-    repository: FilingMaintenanceRepositoryProtocol,
-    ticker: str,
-    form_windows: dict[str, dt.date],
-    filing_results: list[dict[str, JsonValue]],
-    *,
-    batch: BatchToken,
-) -> int:
-    """删除 filings 目录中多余的文档目录。
-
-    Args:
-        repository: filing 维护仓储。
-        ticker: 股票代码。
-        form_windows: form 到开始日期映射。
-        filing_results: 本次下载 filing 结果。
-        batch: caller 显式传入的 batch capability。
-
-    Returns:
-        被清理的目录数量。
-
-    Raises:
-        OSError: 仓储清理失败时由底层抛出。
-    """
-
-    valid_doc_ids: set[str] = {
-        str(result["document_id"])
-        for result in filing_results
-        if result.get("status") in {"downloaded", "skipped"}
-    }
-    if not valid_doc_ids:
-        return 0
-    return repository.cleanup_stale_filing_documents(
-        ticker,
-        active_form_types=set(form_windows.keys()),
-        valid_document_ids=valid_doc_ids,
-        batch=batch,
-    )
 
 
 __all__ = [

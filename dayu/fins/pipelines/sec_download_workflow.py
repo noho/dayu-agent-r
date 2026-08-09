@@ -89,37 +89,6 @@ class _SaveRejectionRegistry(Protocol):
         ...
 
 
-class _CleanupStaleFilingDirs(Protocol):
-    """SEC stale filing 清理回调边界。"""
-
-    def __call__(
-        self,
-        repository: FilingMaintenanceRepositoryProtocol,
-        ticker: str,
-        form_windows: dict[str, dt.date],
-        filing_results: list[dict[str, JsonValue]],
-        *,
-        batch: BatchToken,
-    ) -> int:
-        """清理不再有效的 filing。
-
-        Args:
-            repository: filing 维护仓储。
-            ticker: 股票代码。
-            form_windows: 当前 form 窗口。
-            filing_results: 本次 filing 结果。
-            batch: invocation-time 显式 batch capability。
-
-        Returns:
-            清理数量。
-
-        Raises:
-            OSError: 仓储写入失败时抛出。
-            ValueError: batch capability 非法时抛出。
-        """
-
-        ...
-
 class SecDownloadWorkflowHost(Protocol):
     """Sec download 工作流所需的最小宿主边界。"""
 
@@ -276,12 +245,13 @@ class SecDownloadWorkflowHost(Protocol):
         form_windows: dict[str, dt.date],
         end_date: dt.date,
         target_cik: str,
+        start_is_explicit: bool,
         sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
         rejection_registry: Optional[DownloadRejectionRegistry] = None,
         overwrite: bool = False,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> Awaitable[list[FilingRecord]]:
-        """在 SC13 为空时执行渐进式回溯。"""
+        """仅在未显式给出起点且 SC13 为空时执行渐进式回溯。"""
 
         ...
 
@@ -307,6 +277,7 @@ async def run_download_stream_impl(
     overwrite: bool = False,
     rebuild: bool = False,
     ticker_aliases: Optional[list[str]] = None,
+    start_is_explicit: bool,
     cancel_checker: Optional[Callable[[], bool]] = None,
     parse_date: Callable[[str, bool], dt.date],
     extract_sec_ticker_aliases: Callable[..., list[str]],
@@ -322,7 +293,6 @@ async def run_download_stream_impl(
         list[str],
     ],
     warn_xbrl_missing_filings: Callable[[list[dict[str, JsonValue]]], list[str]],
-    cleanup_stale_filing_dirs: _CleanupStaleFilingDirs,
     build_download_filing_event_payload: Callable[[dict[str, JsonValue]], dict[str, JsonValue]],
 ) -> AsyncIterator[DownloadEvent]:
     """执行 SecPipeline 下载主工作流。
@@ -336,6 +306,7 @@ async def run_download_stream_impl(
         overwrite: 是否强制覆盖。
         rebuild: 是否仅基于本地已下载数据重建 `meta/manifest`。
         ticker_aliases: CLI 侧传入的 alias 列表。
+        start_is_explicit: 起始日期是否来自调用方显式输入。
         cancel_checker: 可选协作式取消检查函数。
         parse_date: 日期解析 helper。
         extract_sec_ticker_aliases: SEC alias 提取 helper。
@@ -345,7 +316,6 @@ async def run_download_stream_impl(
         should_warn_missing_sc13: SC13 缺失 warning helper。
         warn_insufficient_filings: form 数量检查 helper。
         warn_xbrl_missing_filings: XBRL 缺失检查 helper。
-        cleanup_stale_filing_dirs: 清理过期 filing 目录 helper。
         build_download_filing_event_payload: 构建 filing 事件 payload helper。
 
     Yields:
@@ -523,6 +493,12 @@ async def run_download_stream_impl(
             overwrite=overwrite,
             cancel_checker=cancel_checker,
         )
+        filings = _filter_filings_to_windows(
+            filings=filings,
+            form_windows=form_windows,
+            end_date=download_end_date,
+            parse_date=parse_date,
+        )
         filings = await host._retry_sc13_if_empty(
             ticker=normalized_ticker,
             filings=filings,
@@ -531,10 +507,17 @@ async def run_download_stream_impl(
             form_windows=form_windows,
             end_date=download_end_date,
             target_cik=cik,
+            start_is_explicit=start_is_explicit,
             sc13_direction_cache=sc13_direction_cache,
             rejection_registry=rejection_registry,
             overwrite=overwrite,
             cancel_checker=cancel_checker,
+        )
+        filings = _filter_filings_to_windows(
+            filings=filings,
+            form_windows=form_windows,
+            end_date=download_end_date,
+            parse_date=parse_date,
         )
     except SecDownloadCancelledError:
         Log.info(
@@ -623,13 +606,6 @@ async def run_download_stream_impl(
             rejection_registry,
             batch=maintenance_batch,
         )
-        cleaned = cleanup_stale_filing_dirs(
-            repository=host._filing_maintenance_repository,
-            ticker=normalized_ticker,
-            form_windows=form_windows,
-            filing_results=filing_results,
-            batch=maintenance_batch,
-        )
     except BaseException:
         host._batching_repository.rollback_batch(maintenance_batch)
         raise
@@ -644,11 +620,6 @@ async def run_download_stream_impl(
     for warning in warn_xbrl_missing_filings(filing_results):
         warnings.append(warning)
         Log.warn(warning, module=host.MODULE)
-    if cleaned:
-        Log.info(
-            f"清理过期 filing 目录: ticker={normalized_ticker} cleaned={cleaned}",
-            module=host.MODULE,
-        )
     elapsed_ms = int((time.perf_counter() - started_at) * 1000)
     rejected_count = sum(1 for item in filing_results if _is_rejected_filing_result(item))
     skipped_count = sum(
@@ -788,3 +759,36 @@ def _is_rejected_filing_result(item: dict[str, JsonValue]) -> bool:
     skip_reason = str(item.get("skip_reason", "")).strip()
     reason_code = str(item.get("reason_code", "")).strip()
     return skip_reason == _FILING_REASON_6K_FILTERED or reason_code == _FILING_REASON_6K_FILTERED
+
+
+def _filter_filings_to_windows(
+    *,
+    filings: list[FilingRecord],
+    form_windows: dict[str, dt.date],
+    end_date: dt.date,
+    parse_date: Callable[[str, bool], dt.date],
+) -> list[FilingRecord]:
+    """在产生 filing outcome 前执行统一 inclusive 窗口终检。
+
+    Args:
+        filings: submissions、browse 与 SC13 retry 合并后的候选。
+        form_windows: 每个 canonical form 的 inclusive 起始日期。
+        end_date: 所有 form 共享的 inclusive 结束日期。
+        parse_date: SEC 日期解析 owner。
+
+    Returns:
+        仍处于各自 form inclusive 窗口内的候选。
+
+    Raises:
+        ValueError: 候选 filing date 非法时由日期 owner 抛出。
+    """
+
+    selected: list[FilingRecord] = []
+    for filing in filings:
+        lower_bound = form_windows.get(filing.form_type)
+        if lower_bound is None:
+            continue
+        filing_date = parse_date(filing.filing_date, False)
+        if lower_bound <= filing_date <= end_date:
+            selected.append(filing)
+    return selected

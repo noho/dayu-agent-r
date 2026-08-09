@@ -53,6 +53,7 @@ async def run_cn_download_stream_impl(
     overwrite: bool,
     rebuild: bool,
     ticker_aliases: list[str] | None,
+    start_is_explicit: bool,
     cancel_checker: Callable[[], bool] | None,
     module: str,
     pipeline_name: str,
@@ -68,6 +69,7 @@ async def run_cn_download_stream_impl(
         overwrite: 是否强制覆盖。
         rebuild: 是否仅基于本地已下载数据重建 `meta/manifest`。
         ticker_aliases: 可选 ticker alias。
+        start_is_explicit: 起始日期是否来自调用方显式输入。
         cancel_checker: 可选取消检查函数。
         module: 日志模块名。
         pipeline_name: pipeline 名称。
@@ -211,6 +213,7 @@ async def run_cn_download_stream_impl(
     warnings: list[str] = []
     notes = list(periods.notes)
     company_info: JsonObject = {}
+    missing_periods: tuple[str, ...] = ()
     try:
         _raise_if_cancelled(module=module, ticker=normalized_ticker, document_id="", cancel_checker=cancel_checker)
         profile = discovery.resolve_company(query)
@@ -249,22 +252,9 @@ async def run_cn_download_stream_impl(
         selected = _select_candidates_for_a4(
             candidates,
             period_windows=period_windows,
-            use_default_business_limits=start_date is None,
+            use_default_business_limits=not start_is_explicit,
         )
         missing_periods = _resolve_missing_periods(periods.target_periods, selected)
-        for period in missing_periods:
-            skipped = _build_missing_period_result(period=period)
-            filings.append(skipped)
-            _log_filing_download_result(
-                module=module,
-                ticker=normalized_ticker,
-                filing_result=skipped,
-            )
-            yield DownloadEvent(
-                event_type=DownloadEventType.FILING_COMPLETED,
-                ticker=normalized_ticker,
-                payload=_filing_event_payload(skipped),
-            )
         cancelled = False
         for candidate in selected:
             if cancel_checker is not None and cancel_checker():
@@ -347,6 +337,7 @@ async def run_cn_download_stream_impl(
             reason_code=_reason_code_from_exception(exc),
             message=str(exc),
             filings=filings,
+            missing_periods=missing_periods,
         )
         yield DownloadEvent(
             event_type=DownloadEventType.PIPELINE_COMPLETED,
@@ -365,6 +356,7 @@ async def run_cn_download_stream_impl(
             reason_code=_reason_code_from_exception(exc),
             message=str(exc),
             filings=filings,
+            missing_periods=missing_periods,
         )
         yield DownloadEvent(
             event_type=DownloadEventType.PIPELINE_COMPLETED,
@@ -389,6 +381,7 @@ async def run_cn_download_stream_impl(
         warnings=warnings,
         notes=notes,
         filings=filings,
+        missing_periods=missing_periods,
         summary=summary,
     )
     Log.info(
@@ -556,25 +549,6 @@ def _resolve_missing_periods(
 
     found = {item.fiscal_period for item in selected}
     return tuple(period for period in requested if period not in found)
-
-
-def _build_missing_period_result(*, period: str) -> JsonObject:
-    """构建 period 缺失 skipped 结果。"""
-
-    return {
-        "document_id": "",
-        "status": "skipped",
-        "form_type": period,
-        "filing_date": None,
-        "report_date": None,
-        "downloaded_files": 0,
-        "skipped_files": 0,
-        "failed_files": [],
-        "has_xbrl": False,
-        "reason_code": "candidate_not_found",
-        "reason_message": "主源未返回对应财期报告",
-        "skip_reason": "candidate_not_found",
-    }
 
 
 def _build_candidate_failed_result(
@@ -754,9 +728,31 @@ def _build_result(
     warnings: list[str] | None = None,
     notes: list[str] | None = None,
     filings: list[JsonObject] | None = None,
+    missing_periods: tuple[str, ...] = (),
     summary: JsonObject | None = None,
 ) -> JsonObject:
-    """构建 pipeline download 结果。"""
+    """构建 pipeline download 结果。
+
+    Args:
+        pipeline_name: 来源 pipeline 名称。
+        status: pipeline 终态。
+        ticker: canonical ticker。
+        reason_code: 可选失败原因码。
+        message: 可选失败说明。
+        company_info: 公司业务事实。
+        filters: 生效筛选条件。
+        warnings: 用户可读 warning。
+        notes: pipeline notes。
+        filings: 真实 provider candidates 的结果。
+        missing_periods: 主源没有候选的请求财期；不属于 document outcome。
+        summary: 从真实 filing 结果计算的计数。
+
+    Returns:
+        统一 pipeline download 结果。
+
+    Raises:
+        无。
+    """
 
     warning_values: list[JsonValue] = list(warnings or [])
     note_values: list[JsonValue] = list(notes or [])
@@ -773,6 +769,7 @@ def _build_result(
         "warnings": warning_values,
         "notes": note_values,
         "filings": filing_values,
+        "missing_periods": list(missing_periods),
         "summary": summary or {
             "total": 0,
             "downloaded": 0,

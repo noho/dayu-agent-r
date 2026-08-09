@@ -23,6 +23,7 @@ from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.source import Source
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.fins import ticker_normalization
+import dayu.fins.download_contract as download_contract
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins import ingestion_runtime
 from dayu.fins.direct_events import (
@@ -43,6 +44,10 @@ from dayu.fins.direct_event_text import (
     wait_cancelled_hint,
     wait_cancelled_message,
     wait_failed_hint,
+)
+from dayu.fins.download_contract import (
+    FinsDownloadSource,
+    build_fins_download_request,
 )
 from dayu.fins.ingestion_events import (
     FinsIngestionJobEventAppend,
@@ -68,7 +73,6 @@ from dayu.fins.ingestion_runtime import (
     FinsDownloadedFile,
     FinsDownloadedSourceDocument,
     FinsDownloadProgressEvent,
-    FinsDownloadRequest,
     FinsDownloadResultSummary,
     FinsJobCancellationChecker,
     FinsIngestionExecutor,
@@ -1368,9 +1372,8 @@ def test_default_runtime_instances_share_workspace_job_store_without_singleton(t
     second_ingestion = _build_ingestion_runtime(workspace_root, executor=second_executor)
 
     start = first_ingestion.start_download(
-        FinsDownloadRequest(
+        build_fins_download_request(
             ticker="AAPL",
-            source="sec",
             form_types=("10-K",),
         )
     )
@@ -1412,18 +1415,16 @@ def test_start_download_persists_queued_record_and_uses_public_ticker_normalizat
         calls.append(raw)
         return original_normalize(raw)
 
-    monkeypatch.setattr(ticker_normalization, "normalize_ticker", normalize_spy)
+    monkeypatch.setattr(download_contract, "normalize_ticker", normalize_spy)
 
-    start = runtime.start_download(
-        FinsDownloadRequest(
-            ticker="aapl.us",
-            source="sec",
-            form_types=("10-K", "10-Q"),
-            filed_after="2024-01-01",
-            filed_before="2024-12-31",
-            overwrite_existing=True,
-        )
+    request = build_fins_download_request(
+        ticker="aapl.us",
+        form_types=("10-K", "10-Q"),
+        start="2024-01-01",
+        end="2024-12-31",
+        overwrite_existing=True,
     )
+    start = runtime.start_download(request)
     record = runtime.read_job(start.job_id)
 
     assert calls == ["aapl.us"]
@@ -1476,7 +1477,6 @@ def test_store_downloaded_document_overwrite_failure_rolls_back_target_scope(tmp
             ticker="AAPL",
             document=document,
             overwrite_existing=True,
-            rebuild_processed=False,
         )
 
     assert runtime.source_repository.get_source_meta("AAPL", "aapl-2024-10k", SourceKind.FILING) == old_meta
@@ -1507,7 +1507,6 @@ def test_store_downloaded_document_create_failure_leaves_document_absent(tmp_pat
             ticker="AAPL",
             document=document,
             overwrite_existing=False,
-            rebuild_processed=False,
         )
 
     with pytest.raises(FileNotFoundError):
@@ -1561,7 +1560,6 @@ def test_store_downloaded_document_commit_failure_does_not_caller_rollback(tmp_p
             ticker="AAPL",
             document=document,
             overwrite_existing=False,
-            rebuild_processed=False,
         )
 
     assert batching_repository.caller_rollback_calls == 0
@@ -1697,7 +1695,9 @@ def test_start_download_allows_sec_amended_form_type(tmp_path: Path) -> None:
     executor = _HoldingExecutor()
     runtime = _build_ingestion_runtime(workspace_root, executor=executor)
 
-    start = runtime.start_download(FinsDownloadRequest(ticker="AAPL", form_types=("10-K/A",)))
+    start = runtime.start_download(
+        build_fins_download_request(ticker="AAPL", form_types=("10-K/A",))
+    )
     record = runtime.read_job(start.job_id)
 
     assert record.status is FinsIngestionJobStatus.QUEUED
@@ -1714,7 +1714,10 @@ def test_download_start_cancel_between_create_and_submit_marks_job_cancelled_and
     runtime = _build_ingestion_runtime(workspace_root, executor=executor)
     token = _CancelOnSecondCheckToken()
 
-    start = runtime.start_download(FinsDownloadRequest(ticker="AAPL"), cancellation_token=token)
+    start = runtime.start_download(
+        build_fins_download_request(ticker="AAPL"),
+        cancellation_token=token,
+    )
     record = runtime.read_job(start.job_id)
 
     assert start.status is FinsIngestionJobStatus.CANCELLED
@@ -1723,14 +1726,14 @@ def test_download_start_cancel_between_create_and_submit_marks_job_cancelled_and
     assert executor.operations == []
 
 
-def test_start_download_still_rejects_path_separator_in_source(tmp_path: Path) -> None:
-    """下载来源标识仍应拒绝路径分隔符，避免 source-like 字段被当作路径片段。"""
+def test_download_request_rejects_csv_ticker_before_runtime(tmp_path: Path) -> None:
+    """下载 request owner 应在 runtime 前拒绝 CSV ticker。"""
 
     workspace_root = tmp_path / "fins-workspace"
-    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+    with pytest.raises(ValueError, match="只接受一个公司代码"):
+        build_fins_download_request(ticker="AAPL,MSFT")
 
-    with pytest.raises(ValueError, match="source 不得包含路径分隔符"):
-        runtime.start_download(FinsDownloadRequest(ticker="AAPL", source="../sec"))
+    assert not workspace_root.exists()
 
 
 def test_start_download_fake_adapter_writes_source_document_through_storage(tmp_path: Path) -> None:
@@ -1742,10 +1745,12 @@ def test_start_download_fake_adapter_writes_source_document_through_storage(tmp_
     ingestion = _build_ingestion_runtime(
         workspace_root,
         executor=executor,
-        download_adapters={("fake", "US"): adapter},
+        download_adapters={("sec", "US"): adapter},
     )
 
-    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="FAKE", form_types=("10-K",)))
+    start = ingestion.start_download(
+        build_fins_download_request(ticker="AAPL", form_types=("10-K",))
+    )
     executor.run_all()
     record = ingestion.read_job(start.job_id)
     progress_events = _progress_events(ingestion, start.job_id)
@@ -1770,7 +1775,7 @@ def test_start_download_fake_adapter_writes_source_document_through_storage(tmp_
         "download.completed",
     ]
     assert progress_events[0].payload["ticker"] == "AAPL"
-    assert progress_events[0].payload["source"] == "fake"
+    assert progress_events[0].payload["source"] == "sec"
     assert progress_events[0].payload["form_types"] == ["10-K"]
     assert progress_events[1].payload["downloaded_count"] == 1
     assert progress_events[1].payload["written_document_count"] == 1
@@ -1788,11 +1793,11 @@ async def test_direct_download_stream_writes_storage_and_does_not_create_job_rec
     ingestion = _build_ingestion_runtime(
         workspace_root,
         executor=executor,
-        download_adapters={("fake", "US"): adapter},
+        download_adapters={("sec", "US"): adapter},
     )
 
     events = await _collect_direct_events(
-        ingestion.download(FinsDownloadRequest(ticker="AAPL", source="FAKE", form_types=("10-K",)))
+        ingestion.download(build_fins_download_request(ticker="AAPL", form_types=("10-K",)))
     )
     runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
     source_meta = runtime.source_repository.get_source_meta("AAPL", "aapl-fake-10k", SourceKind.FILING)
@@ -1824,11 +1829,11 @@ async def test_direct_download_projects_adapter_file_progress_events(
     ingestion = _build_ingestion_runtime(
         workspace_root,
         executor=_HoldingExecutor(),
-        download_adapters={("fake", "US"): adapter},
+        download_adapters={("sec", "US"): adapter},
     )
 
     events = await _collect_direct_events(
-        ingestion.download(FinsDownloadRequest(ticker="AAPL", source="FAKE"))
+        ingestion.download(build_fins_download_request(ticker="AAPL"))
     )
     progress_events = [event for event in events if event.event_type is FinsEventType.PROGRESS]
     file_progress = [
@@ -1875,11 +1880,11 @@ async def test_direct_download_result_details_preserve_exclusive_skipped_count(
     ingestion = _build_ingestion_runtime(
         workspace_root,
         executor=_HoldingExecutor(),
-        download_adapters={("fake", "US"): adapter},
+        download_adapters={("sec", "US"): adapter},
     )
 
     events = await _collect_direct_events(
-        ingestion.download(FinsDownloadRequest(ticker="FUTU", source="FAKE"))
+        ingestion.download(build_fins_download_request(ticker="FUTU"))
     )
     result_event = events[-1]
 
@@ -1895,14 +1900,18 @@ async def test_direct_download_result_details_preserve_exclusive_skipped_count(
 
 
 @pytest.mark.asyncio
-async def test_direct_download_unsupported_source_returns_failure_result(tmp_path: Path) -> None:
-    """direct download adapter 失败应收口为 FAILURE RESULT，不得静默结束。"""
+async def test_direct_download_missing_adapter_returns_failure_result(tmp_path: Path) -> None:
+    """direct download 缺少目标 adapter 时应收口为 FAILURE RESULT。"""
 
     workspace_root = tmp_path / "fins-workspace"
-    ingestion = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+    ingestion = _build_ingestion_runtime(
+        workspace_root,
+        executor=_HoldingExecutor(),
+        download_adapters={},
+    )
 
     events = await _collect_direct_events(
-        ingestion.download(FinsDownloadRequest(ticker="AAPL", source="unknown"))
+        ingestion.download(build_fins_download_request(ticker="AAPL"))
     )
 
     assert events[0].event_type is FinsEventType.PROGRESS
@@ -1923,13 +1932,13 @@ async def test_direct_download_uses_operation_scoped_cancellation_token(tmp_path
     ingestion = _build_ingestion_runtime(
         workspace_root,
         executor=executor,
-        download_adapters={("cancel", "US"): _CancellationAwareDownloadAdapter()},
+        download_adapters={("sec", "US"): _CancellationAwareDownloadAdapter()},
     )
     token = _CancelOnSecondCheckToken()
 
     events = await _collect_direct_events(
         ingestion.download(
-            FinsDownloadRequest(ticker="AAPL", source="cancel"),
+            build_fins_download_request(ticker="AAPL"),
             cancellation_token=token,
         )
     )
@@ -1963,10 +1972,10 @@ async def test_direct_consumer_abort_closes_raw_bridge_and_requests_cancellation
     ingestion = _build_ingestion_runtime(
         workspace_root,
         executor=_HoldingExecutor(),
-        download_adapters={("abort", "US"): adapter},
+        download_adapters={("sec", "US"): adapter},
     )
     stream = ingestion.download(
-        FinsDownloadRequest(ticker="AAPL", source="abort")
+        build_fins_download_request(ticker="AAPL")
     )
 
     first_event = await anext(stream)
@@ -2012,7 +2021,7 @@ def test_start_download_production_adapter_boundary_emits_progress_events(
         """
 
         del adapter
-        assert request.source == "sec"
+        assert request.source is FinsDownloadSource.SEC
         return FinsSourceDownloadAdapterResult(
             discovered_count=1,
             persisted_summary=FinsDownloadResultSummary(
@@ -2024,7 +2033,7 @@ def test_start_download_production_adapter_boundary_emits_progress_events(
 
     monkeypatch.setattr(SecDownloadAdapter, "download", fake_sec_download)
 
-    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="sec"))
+    start = ingestion.start_download(build_fins_download_request(ticker="AAPL"))
     record = _wait_terminal(ingestion, start.job_id)
     progress_events = _progress_events(ingestion, start.job_id)
 
@@ -2057,10 +2066,10 @@ def test_start_download_failed_count_emits_completed_with_failures_progress(tmp_
     ingestion = _build_ingestion_runtime(
         workspace_root,
         executor=executor,
-        download_adapters={("persisted", "US"): adapter},
+        download_adapters={("sec", "US"): adapter},
     )
 
-    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="persisted"))
+    start = ingestion.start_download(build_fins_download_request(ticker="AAPL"))
     executor.run_all()
     record = ingestion.read_job(start.job_id)
     progress_events = _progress_events(ingestion, start.job_id)
@@ -2075,19 +2084,24 @@ def test_start_download_failed_count_emits_completed_with_failures_progress(tmp_
     assert progress_events[1].payload["downloaded_count"] == 1
 
 
-def test_start_download_unsupported_source_writes_failed_terminal_record(tmp_path: Path) -> None:
-    """无 adapter 的 market/source 应返回明确 unsupported-source 失败。"""
+def test_start_download_missing_adapter_writes_failed_terminal_record(tmp_path: Path) -> None:
+    """无目标 adapter 时应返回明确 unsupported-source 失败。"""
 
     workspace_root = tmp_path / "fins-workspace"
-    ingestion = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
-
-    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="unknown"))
-    record = _wait_terminal(ingestion, start.job_id)
+    executor = _HoldingExecutor()
+    ingestion = _build_ingestion_runtime(
+        workspace_root,
+        executor=executor,
+        download_adapters={},
+    )
+    start = ingestion.start_download(build_fins_download_request(ticker="AAPL"))
+    executor.run_all()
+    record = ingestion.read_job(start.job_id)
 
     assert record.status is FinsIngestionJobStatus.FAILED
     assert record.result_summary["failed_count"] == 1
     assert "不支持的下载来源" in str(record.failure_summary["message"])
-    assert "source=unknown" in str(record.failure_summary["message"])
+    assert "source=sec" in str(record.failure_summary["message"])
     assert "market=US" in str(record.failure_summary["message"])
 
 
@@ -2120,13 +2134,13 @@ def test_start_download_repeated_request_skips_existing_source_document(tmp_path
     ingestion = _build_ingestion_runtime(
         workspace_root,
         executor=executor,
-        download_adapters={("fake", "US"): adapter},
+        download_adapters={("sec", "US"): adapter},
     )
 
-    first = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="fake"))
+    first = ingestion.start_download(build_fins_download_request(ticker="AAPL"))
     executor.run_all()
     first_record = ingestion.read_job(first.job_id)
-    second = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="fake"))
+    second = ingestion.start_download(build_fins_download_request(ticker="AAPL"))
     executor.run_all()
     second_record = ingestion.read_job(second.job_id)
 
@@ -2147,10 +2161,10 @@ def test_start_download_persists_rejected_filing_artifact(tmp_path: Path) -> Non
     ingestion = _build_ingestion_runtime(
         workspace_root,
         executor=executor,
-        download_adapters={("fake", "US"): adapter},
+        download_adapters={("sec", "US"): adapter},
     )
 
-    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="fake"))
+    start = ingestion.start_download(build_fins_download_request(ticker="AAPL"))
     executor.run_all()
     record = ingestion.read_job(start.job_id)
     runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
@@ -2175,8 +2189,18 @@ def test_start_download_persists_rejected_filing_artifact(tmp_path: Path) -> Non
     assert content == b"<html>rejected</html>"
 
 
-def test_start_download_persisted_summary_adapter_receives_rebuild_processed(tmp_path: Path) -> None:
-    """persisted-summary adapter 应接收 NEW rebuild_processed 治理标记并记录请求。"""
+def test_start_download_persisted_summary_adapter_receives_local_rebuild(tmp_path: Path) -> None:
+    """下载 adapter 应接收 local rebuild 标记并记录请求。
+
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 断言失败时抛出。
+    """
 
     workspace_root = tmp_path / "fins-workspace"
     adapter = _PersistedSummaryDownloadAdapter()
@@ -2184,24 +2208,23 @@ def test_start_download_persisted_summary_adapter_receives_rebuild_processed(tmp
     ingestion = _build_ingestion_runtime(
         workspace_root,
         executor=executor,
-        download_adapters={("persisted", "US"): adapter},
+        download_adapters={("sec", "US"): adapter},
     )
 
     start = ingestion.start_download(
-        FinsDownloadRequest(
+        build_fins_download_request(
             ticker="AAPL",
-            source="persisted",
-            rebuild_processed=True,
+            rebuild_local_artifacts=True,
         )
     )
     executor.run_all()
     record = ingestion.read_job(start.job_id)
 
     assert record.status is FinsIngestionJobStatus.SUCCEEDED
-    assert record.request_summary["rebuild_processed"] is True
+    assert record.request_summary["rebuild_local_artifacts"] is True
     assert record.result_summary["skipped_count"] == 1
     assert len(adapter.requests) == 1
-    assert adapter.requests[0].rebuild_processed is True
+    assert adapter.requests[0].rebuild_local_artifacts is True
 
 
 def test_start_preprocess_persists_queued_record_and_uses_public_ticker_normalization(
@@ -2856,7 +2879,7 @@ def test_prepare_observed_operations_do_not_submit_until_activation(tmp_path: Pa
     runtime = _build_ingestion_runtime(workspace_root, executor=executor)
 
     download = runtime.prepare_observed_download(
-        FinsDownloadRequest(ticker="AAPL"),
+        build_fins_download_request(ticker="AAPL"),
         cancellation_token=_NeverCancelledToken(),
     )
     preprocess = runtime.prepare_observed_preprocess(
@@ -2884,7 +2907,7 @@ def test_activate_observation_is_idempotent_for_same_handle(tmp_path: Path) -> N
     executor = _HoldingExecutor()
     runtime = _build_ingestion_runtime(workspace_root, executor=executor)
     handle = runtime.prepare_observed_download(
-        FinsDownloadRequest(ticker="AAPL"),
+        build_fins_download_request(ticker="AAPL"),
         cancellation_token=_NeverCancelledToken(),
     )
 
@@ -2935,7 +2958,7 @@ def test_abandon_cancelled_prepared_observation_releases_handle_before_activatio
     executor = _HoldingExecutor()
     runtime = _build_ingestion_runtime(workspace_root, executor=executor)
     handle = runtime.prepare_observed_download(
-        FinsDownloadRequest(ticker="AAPL"),
+        build_fins_download_request(ticker="AAPL"),
         cancellation_token=_NeverCancelledToken(),
     )
 
@@ -2960,10 +2983,10 @@ def test_abandoned_observation_does_not_pollute_repeat_download_observation(
     runtime = _build_ingestion_runtime(
         workspace_root,
         executor=executor,
-        download_adapters={("fake", "US"): adapter},
+        download_adapters={("sec", "US"): adapter},
     )
     first = runtime.prepare_observed_download(
-        FinsDownloadRequest(ticker="AAPL", source="fake"),
+        build_fins_download_request(ticker="AAPL"),
         cancellation_token=_NeverCancelledToken(),
     )
 
@@ -2971,7 +2994,7 @@ def test_abandoned_observation_does_not_pollute_repeat_download_observation(
     first_cancelled = asyncio.run(runtime.cancel_observation(first))
     asyncio.run(runtime.abandon_observation(first))
     second = runtime.prepare_observed_download(
-        FinsDownloadRequest(ticker="AAPL", source="fake"),
+        build_fins_download_request(ticker="AAPL"),
         cancellation_token=_NeverCancelledToken(),
     )
     runtime.activate_observation(second)
@@ -2984,7 +3007,7 @@ def test_abandoned_observation_does_not_pollute_repeat_download_observation(
     assert second_polled.status is FinsObservationStatus.SUCCEEDED
     assert second_polled.result is not None
     assert second_polled.result.status is FinsResultStatus.SUCCESS
-    assert [request.source for request in adapter.requests] == ["fake"]
+    assert [request.source for request in adapter.requests] == [FinsDownloadSource.SEC]
 
 
 def test_abandon_submitted_observation_cancels_and_keeps_storage_artifacts(
@@ -3104,7 +3127,7 @@ def test_activation_submit_failure_terminalizes_prepared_observation(
         executor=_FailingSubmitExecutor(OSError("submit unavailable")),
     )
     handle = runtime.prepare_observed_download(
-        FinsDownloadRequest(ticker="AAPL"),
+        build_fins_download_request(ticker="AAPL"),
         cancellation_token=_NeverCancelledToken(),
     )
 
@@ -3252,10 +3275,10 @@ def test_job_events_record_queued_running_and_terminal_sequence(tmp_path: Path) 
     ingestion = _build_ingestion_runtime(
         workspace_root,
         executor=executor,
-        download_adapters={("fake", "US"): adapter},
+        download_adapters={("sec", "US"): adapter},
     )
 
-    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="fake"))
+    start = ingestion.start_download(build_fins_download_request(ticker="AAPL"))
     queued_events = ingestion.read_job_events(start.job_id)
     executor.run_all()
     record = ingestion.read_job(start.job_id)
@@ -3334,7 +3357,7 @@ def test_job_event_store_concurrent_append_allocates_unique_monotonic_sequences(
     workspace_root = tmp_path / "fins-workspace"
     executor = _HoldingExecutor()
     ingestion = _build_ingestion_runtime(workspace_root, executor=executor)
-    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL"))
+    start = ingestion.start_download(build_fins_download_request(ticker="AAPL"))
     append_count = 40
 
     def append_progress(index: int) -> int:
@@ -3388,7 +3411,7 @@ def test_job_event_sidecar_skips_corrupted_rows_and_append_continues(
     workspace_root = tmp_path / "fins-workspace"
     executor = _HoldingExecutor()
     ingestion = _build_ingestion_runtime(workspace_root, executor=executor)
-    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL"))
+    start = ingestion.start_download(build_fins_download_request(ticker="AAPL"))
     event_path = _job_event_file(workspace_root, start.job_id)
     leaked_payload_value = "SHOULD_NOT_APPEAR_IN_WARNING"
     original_text = event_path.read_text(encoding="utf-8")
@@ -3437,7 +3460,7 @@ def test_job_event_sidecar_still_rejects_non_monotonic_valid_records(tmp_path: P
     workspace_root = tmp_path / "fins-workspace"
     executor = _HoldingExecutor()
     ingestion = _build_ingestion_runtime(workspace_root, executor=executor)
-    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL"))
+    start = ingestion.start_download(build_fins_download_request(ticker="AAPL"))
     event_path = _job_event_file(workspace_root, start.job_id)
     queued_event_text = event_path.read_text(encoding="utf-8")
     event_path.write_text(f"{queued_event_text}{queued_event_text}", encoding="utf-8")
@@ -3452,7 +3475,7 @@ def test_job_event_append_rejects_non_json_compatible_payload(tmp_path: Path) ->
     workspace_root = tmp_path / "fins-workspace"
     executor = _HoldingExecutor()
     ingestion = _build_ingestion_runtime(workspace_root, executor=executor)
-    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL"))
+    start = ingestion.start_download(build_fins_download_request(ticker="AAPL"))
 
     with pytest.raises(ValueError, match="不是 JSON-compatible"):
         ingestion.job_store.append_job_event(
@@ -3484,9 +3507,9 @@ def test_non_terminal_event_append_failure_warns_and_job_still_succeeds(
     ingestion = _build_ingestion_runtime(
         workspace_root,
         executor=executor,
-        download_adapters={("fake", "US"): adapter},
+        download_adapters={("sec", "US"): adapter},
     )
-    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="fake"))
+    start = ingestion.start_download(build_fins_download_request(ticker="AAPL"))
     original_append = ingestion_runtime.FsFinsIngestionJobStore.append_job_event
 
     def raise_for_running_event(
@@ -3553,9 +3576,9 @@ def test_terminal_event_append_failure_warns_without_rolling_back_terminal_recor
     ingestion = _build_ingestion_runtime(
         workspace_root,
         executor=executor,
-        download_adapters={("fake", "US"): adapter},
+        download_adapters={("sec", "US"): adapter},
     )
-    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="fake"))
+    start = ingestion.start_download(build_fins_download_request(ticker="AAPL"))
     original_append = ingestion_runtime.FsFinsIngestionJobStore.append_job_event
 
     def raise_for_terminal_event(
@@ -4177,7 +4200,7 @@ def test_start_download_cancel_immediately_before_success_terminalization_writes
     ingestion = _build_ingestion_runtime(
         workspace_root,
         executor=executor,
-        download_adapters={("fake", "US"): adapter},
+        download_adapters={("sec", "US"): adapter},
     )
     original_save = ingestion.job_store.save_succeeded_or_cancelled
 
@@ -4215,7 +4238,7 @@ def test_start_download_cancel_immediately_before_success_terminalization_writes
         cancel_before_success_terminalization,
     )
 
-    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="fake"))
+    start = ingestion.start_download(build_fins_download_request(ticker="AAPL"))
     executor.run_all()
     record = ingestion.read_job(start.job_id)
 
@@ -4237,9 +4260,11 @@ def test_runners_return_for_preterminalized_jobs_without_executing(
     download_ingestion = _build_ingestion_runtime(
         download_workspace,
         executor=download_executor,
-        download_adapters={("fake", "US"): download_adapter},
+        download_adapters={("sec", "US"): download_adapter},
     )
-    download_start = download_ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="fake"))
+    download_start = download_ingestion.start_download(
+        build_fins_download_request(ticker="AAPL")
+    )
     download_ingestion.job_store.save_job(
         replace(
             download_start.record,
@@ -4489,7 +4514,7 @@ def test_job_store_removes_temp_file_when_atomic_replace_fails(
     monkeypatch.setattr(ingestion_runtime.os, "replace", raise_replace)
 
     with pytest.raises(OSError, match="replace failed"):
-        runtime.start_download(FinsDownloadRequest(ticker="AAPL"))
+        runtime.start_download(build_fins_download_request(ticker="AAPL"))
 
     assert jobs_dir.is_dir()
     assert tuple(jobs_dir.glob(".*.tmp")) == ()

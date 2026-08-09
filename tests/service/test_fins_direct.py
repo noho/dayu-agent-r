@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -25,8 +25,17 @@ from dayu.fins.direct_events import (
 )
 from dayu.fins.direct_events import ValidatedFinsEventStream
 from dayu.fins.domain.enums import SourceKind
-from dayu.fins.ingestion_runtime import (
+from dayu.fins.download_contract import (
+    FINS_DOWNLOAD_MAX_FORM_CHARS,
+    FINS_DOWNLOAD_MAX_FORM_ITEMS,
+    FINS_DOWNLOAD_MAX_TICKER_CHARS,
+    FinsDownloadDateRange,
+    FinsDownloadSource,
+    FinsDownloadUsageError,
     FinsDownloadRequest,
+    build_fins_download_request,
+)
+from dayu.fins.ingestion_runtime import (
     FinsPreprocessRequest,
     FinsUploadFilingRequest,
     FinsUploadMaterialRequest,
@@ -280,35 +289,29 @@ async def _consume_until_cancelled(events: AsyncIterator[FinsEvent]) -> None:
 
 
 @pytest.mark.asyncio
-async def test_download_stream_builds_request_and_yields_progress_result() -> None:
-    """download 必须构造请求并产出 progress -> result。"""
+async def test_download_stream_accepts_typed_request_and_yields_progress_result() -> None:
+    """download 必须透传 owner 构造的 typed request 并产出 progress -> result。"""
 
     token = ControllableCancellationToken()
     runtime = _FakeIngestionRuntime((_progress_event(), _result_event()))
     service = FinsDirectCommandService(runtime)
+    request = build_fins_download_request(
+        ticker="AAPL",
+        form_types=("10-K", "10-Q"),
+        start="2024-01-01",
+        end="2024-12-31",
+        overwrite_existing=True,
+        rebuild_local_artifacts=True,
+    )
 
     events = await _collect_events(
         service.download(
-            ticker="AAPL",
-            form_types=("10-K", "10-Q"),
-            filed_after="2024-01-01",
-            filed_before="2024-12-31",
-            overwrite_existing=True,
-            rebuild_processed=True,
+            request,
             cancellation_token=token,
         )
     )
 
-    assert runtime.download_requests == [
-        FinsDownloadRequest(
-            ticker="AAPL",
-            form_types=("10-K", "10-Q"),
-            filed_after="2024-01-01",
-            filed_before="2024-12-31",
-            overwrite_existing=True,
-            rebuild_processed=True,
-        )
-    ]
+    assert runtime.download_requests == [request]
     assert runtime.cancellation_tokens == [token]
     assert [event.event_type for event in events] == [
         FinsEventType.PROGRESS,
@@ -316,6 +319,199 @@ async def test_download_stream_builds_request_and_yields_progress_result() -> No
     ]
     assert events[-1].result is not None
     assert events[-1].result.exit_code == FINS_DIRECT_EXIT_SUCCESS
+
+
+def test_download_request_builder_owns_canonical_ticker_forms_source_and_dates() -> None:
+    """builder 应一次性产生下游可直接消费的 US canonical 业务事实。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: canonical contract 与显式日期语义不符时抛出。
+    """
+
+    request = build_fins_download_request(
+        ticker=" aapl.us ",
+        form_types=("10k", "10-K", "SC13D/G"),
+        start="2024-02",
+        end="2024",
+    )
+
+    assert request.normalized_ticker.canonical == "AAPL"
+    assert request.source is FinsDownloadSource.SEC
+    assert request.form_types == ("10-K", "SC 13D/G")
+    assert request.date_range.start_bound == date(2024, 2, 1)
+    assert request.date_range.end_bound == date(2024, 12, 31)
+    assert request.date_range.start_is_explicit
+    assert request.date_range.end_is_explicit
+
+
+@pytest.mark.parametrize(
+    ("start_bound", "end_bound", "start_is_explicit", "end_is_explicit", "expected_message"),
+    (
+        (None, None, True, False, "显式起始日期必须提供 start_bound"),
+        (None, None, False, True, "显式结束日期必须提供 end_bound"),
+        (
+            date(2025, 1, 1),
+            date(2024, 12, 31),
+            False,
+            False,
+            "--start 不能晚于 --end",
+        ),
+    ),
+)
+def test_download_date_range_rejects_invalid_contract_combinations(
+    start_bound: date | None,
+    end_bound: date | None,
+    start_is_explicit: bool,
+    end_is_explicit: bool,
+    expected_message: str,
+) -> None:
+    """日期契约 owner 应拒绝显式标记缺边界与倒序边界。
+
+    Args:
+        start_bound: 起始日期边界。
+        end_bound: 结束日期边界。
+        start_is_explicit: 起始日期是否显式。
+        end_is_explicit: 结束日期是否显式。
+        expected_message: 预期中文错误文本。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法组合未由日期契约 owner 拒绝时抛出。
+    """
+
+    with pytest.raises(FinsDownloadUsageError, match=expected_message):
+        FinsDownloadDateRange(
+            start_bound=start_bound,
+            end_bound=end_bound,
+            start_is_explicit=start_is_explicit,
+            end_is_explicit=end_is_explicit,
+        )
+
+
+def test_download_date_range_allows_non_explicit_nonempty_bounds() -> None:
+    """日期契约应允许未来默认边界携带非空日期而保持非显式。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 合法的未来默认边界被拒绝时抛出。
+    """
+
+    date_range = FinsDownloadDateRange(
+        start_bound=date(2024, 1, 1),
+        end_bound=date(2024, 12, 31),
+        start_is_explicit=False,
+        end_is_explicit=False,
+    )
+
+    assert date_range.start_text == "2024-01-01"
+    assert date_range.end_text == "2024-12-31"
+
+
+@pytest.mark.parametrize(
+    ("ticker", "forms", "start", "end", "expected_message"),
+    (
+        (" ", (), None, None, "--ticker 不能为空"),
+        ("AAPL,MSFT", (), None, None, "只接受一个公司代码"),
+        ("A" * (FINS_DOWNLOAD_MAX_TICKER_CHARS + 1), (), None, None, "--ticker 过长"),
+        ("INVALID!", (), None, None, "--ticker 无法识别"),
+        ("AAPL", ("",), None, None, "第 1 项不能为空"),
+        ("AAPL", ("UNKNOWN",), None, None, "--forms 不支持"),
+        (
+            "AAPL",
+            tuple("10-K" for _ in range(FINS_DOWNLOAD_MAX_FORM_ITEMS + 1)),
+            None,
+            None,
+            "--forms 最多允许",
+        ),
+        (
+            "AAPL",
+            ("X" * (FINS_DOWNLOAD_MAX_FORM_CHARS + 1),),
+            None,
+            None,
+            "第 1 项过长",
+        ),
+        ("AAPL", (), "2024-13", None, "--start 不是有效日期"),
+        ("AAPL", (), "2024/01/01", None, "--start 格式错误"),
+        ("AAPL", (), "2025", "2024", "--start 不能晚于 --end"),
+    ),
+)
+def test_download_request_builder_rejects_static_usage_errors(
+    ticker: str,
+    forms: tuple[str, ...],
+    start: str | None,
+    end: str | None,
+    expected_message: str,
+) -> None:
+    """builder 应把全部静态非法输入归一为中文 actionable usage error。
+
+    Args:
+        ticker: 测试 ticker。
+        forms: 测试 form tuple。
+        start: 测试起始日期。
+        end: 测试结束日期。
+        expected_message: 预期中文错误片段。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 错误类型或中文诊断不符合 contract 时抛出。
+    """
+
+    with pytest.raises(FinsDownloadUsageError, match=expected_message):
+        build_fins_download_request(
+            ticker=ticker,
+            form_types=forms,
+            start=start,
+            end=end,
+        )
+
+
+@pytest.mark.parametrize(
+    ("ticker", "forms", "expected_source", "expected_forms"),
+    (
+        ("600519.SH", ("年度报告", "Q1"), FinsDownloadSource.CNINFO, ("FY", "Q1")),
+        ("700.HK", ("中报", "4Q"), FinsDownloadSource.HKEXNEWS, ("H1", "Q4")),
+    ),
+)
+def test_download_request_builder_reuses_domain_period_alias_owner(
+    ticker: str,
+    forms: tuple[str, ...],
+    expected_source: FinsDownloadSource,
+    expected_forms: tuple[str, ...],
+) -> None:
+    """CN/HK 请求应复用 domain alias owner 并由市场解析唯一来源。
+
+    Args:
+        ticker: 带市场语义的 ticker。
+        forms: CN/HK 财期别名。
+        expected_source: 预期下载来源。
+        expected_forms: 预期 canonical 财期。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 来源或财期 canonicalization 漂移时抛出。
+    """
+
+    request = build_fins_download_request(ticker=ticker, form_types=forms)
+
+    assert request.source is expected_source
+    assert request.form_types == expected_forms
 
 
 @pytest.mark.asyncio
@@ -469,7 +665,9 @@ async def test_failure_result_is_passed_through() -> None:
     runtime = _FakeIngestionRuntime((_result_event(status=FinsResultStatus.FAILURE),))
     service = FinsDirectCommandService(runtime)
 
-    events = await _collect_events(service.download(ticker="AAPL"))
+    events = await _collect_events(
+        service.download(build_fins_download_request(ticker="AAPL"))
+    )
 
     assert len(events) == 1
     assert events[0].result is not None
@@ -488,7 +686,9 @@ async def test_stream_exception_is_propagated_without_synthetic_result() -> None
     service = FinsDirectCommandService(runtime)
 
     with pytest.raises(RuntimeError, match="provider failed"):
-        await _collect_events(service.download(ticker="AAPL"))
+        await _collect_events(
+            service.download(build_fins_download_request(ticker="AAPL"))
+        )
 
 
 @pytest.mark.asyncio
@@ -515,7 +715,7 @@ async def test_fins_owned_protocol_error_fields_and_object_are_propagated_by_ide
         stream_error=owner_error,
     )
     service = FinsDirectCommandService(runtime)
-    stream = service.download(ticker="AAPL")
+    stream = service.download(build_fins_download_request(ticker="AAPL"))
 
     assert stream is runtime.returned_streams[-1]
     with pytest.raises(FinsDirectStreamProtocolError) as captured:
@@ -599,7 +799,11 @@ async def test_task_cancellation_closes_runtime_stream() -> None:
     )
     service = FinsDirectCommandService(runtime)
 
-    task = asyncio.create_task(_consume_until_cancelled(service.download(ticker="AAPL")))
+    task = asyncio.create_task(
+        _consume_until_cancelled(
+            service.download(build_fins_download_request(ticker="AAPL"))
+        )
+    )
     await runtime.first_event_yielded.wait()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):

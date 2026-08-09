@@ -563,6 +563,8 @@ class _BlobFirstSecBlobRepository(FsDocumentBlobRepository):
 async def _collect_events(
     pipeline: SecPipeline,
     ticker: str,
+    *,
+    start_is_explicit: bool,
     cancel_checker: Optional[Callable[[], bool]] = None,
 ) -> list[DownloadEvent]:
     """收集异步下载事件。
@@ -570,6 +572,7 @@ async def _collect_events(
     Args:
         pipeline: 待执行的 SEC pipeline。
         ticker: 下载 ticker。
+        start_is_explicit: 起始日期是否来自调用方显式输入。
         cancel_checker: 可选取消检查函数。
 
     Returns:
@@ -583,6 +586,7 @@ async def _collect_events(
     async for event in pipeline.download_stream(
         ticker=ticker,
         overwrite=False,
+        start_is_explicit=start_is_explicit,
         cancel_checker=cancel_checker,
     ):
         events.append(event)
@@ -606,7 +610,9 @@ def test_download_stream_emits_ordered_events(tmp_path: Path) -> None:
     )
     import asyncio
 
-    events = asyncio.run(_collect_events(pipeline, ticker="AAPL"))
+    events = asyncio.run(
+        _collect_events(pipeline, ticker="AAPL", start_is_explicit=False)
+    )
     event_types = [event.event_type for event in events]
     assert event_types[0] == "pipeline_started"
     assert "company_resolved" in event_types
@@ -643,7 +649,9 @@ def test_download_stream_writes_blob_before_single_complete_source(tmp_path: Pat
     )
     import asyncio
 
-    events = asyncio.run(_collect_events(pipeline, ticker="AAPL"))
+    events = asyncio.run(
+        _collect_events(pipeline, ticker="AAPL", start_is_explicit=False)
+    )
     final_result = _event_pipeline_result(events[-1])
     meta = source_repository.get_source_meta("AAPL", "fil_0000000000-25-000001", SourceKind.FILING)
 
@@ -678,7 +686,9 @@ def test_failed_sec_download_rolls_back_and_retry_publishes_complete_source(tmp_
     )
     import asyncio
 
-    failed_events = asyncio.run(_collect_events(failing_pipeline, ticker="AAPL"))
+    failed_events = asyncio.run(
+        _collect_events(failing_pipeline, ticker="AAPL", start_is_explicit=False)
+    )
     failed_result = _event_pipeline_result(failed_events[-1])
     failed_handle = SourceHandle(ticker="AAPL", document_id=document_id, source_kind=SourceKind.FILING.value)
     assert failed_result["summary"]["failed"] == 1
@@ -701,7 +711,9 @@ def test_failed_sec_download_rolls_back_and_retry_publishes_complete_source(tmp_
         ),
         processor_registry=build_fins_processor_registry(),
     )
-    retry_events = asyncio.run(_collect_events(retry_pipeline, ticker="AAPL"))
+    retry_events = asyncio.run(
+        _collect_events(retry_pipeline, ticker="AAPL", start_is_explicit=False)
+    )
     retry_result = _event_pipeline_result(retry_events[-1])
     completed_meta = source_repository.get_source_meta("AAPL", document_id, SourceKind.FILING)
 
@@ -746,6 +758,7 @@ def test_download_stream_final_status_does_not_recheck_cancel_token(
         _collect_events(
             pipeline,
             ticker="AAPL",
+            start_is_explicit=False,
             cancel_checker=_cancel_on_second_call,
         )
     )
@@ -773,6 +786,7 @@ def test_download_stream_cancel_stops_during_collection_before_filing_requests(
         _collect_events(
             pipeline,
             ticker="AAPL",
+            start_is_explicit=False,
             cancel_checker=lambda: True,
         )
     )
@@ -791,7 +805,7 @@ def test_download_sync_wrapper_aggregates_stream_result(tmp_path: Path) -> None:
         downloader=StreamStubDownloader(),
         processor_registry=build_fins_processor_registry(),
     )
-    result = pipeline.download(ticker="AAPL", overwrite=False)
+    result = pipeline.download(ticker="AAPL", overwrite=False, start_is_explicit=False)
     assert result["action"] == "download"
     assert result["summary"]["downloaded"] == 1
 
@@ -810,7 +824,11 @@ def test_adapter_progress_sink_uses_filing_granularity(tmp_path: Path) -> None:
 
     result = asyncio.run(
         collect_download_result_from_events(
-            pipeline.download_stream(ticker="AAPL", overwrite=False),
+            pipeline.download_stream(
+                ticker="AAPL",
+                overwrite=False,
+                start_is_explicit=False,
+            ),
             progress_sink=progress_events.append,
         )
     )
@@ -897,9 +915,13 @@ def test_download_stream_filing_skip_event_exposes_reason_fields(tmp_path: Path)
 
     import asyncio
 
-    first_events = asyncio.run(_collect_events(pipeline, ticker="AAPL"))
+    first_events = asyncio.run(
+        _collect_events(pipeline, ticker="AAPL", start_is_explicit=False)
+    )
     assert _event_pipeline_result(first_events[-1])["summary"]["downloaded"] == 1
-    events = asyncio.run(_collect_events(pipeline, ticker="AAPL"))
+    events = asyncio.run(
+        _collect_events(pipeline, ticker="AAPL", start_is_explicit=False)
+    )
     filing_event = next(event for event in events if event.event_type == "filing_completed")
     assert filing_event.payload["skip_reason"] == "already_downloaded_complete"
     assert filing_event.payload["reason_code"] == "already_downloaded_complete"
@@ -930,7 +952,9 @@ def test_download_stream_resolves_has_xbrl_from_complete_file_entries(tmp_path: 
 
     import asyncio
 
-    events = asyncio.run(_collect_events(pipeline, ticker="AAPL"))
+    events = asyncio.run(
+        _collect_events(pipeline, ticker="AAPL", start_is_explicit=False)
+    )
     filing_event = next(event for event in events if event.event_type == "filing_completed")
     published_meta = source_repository.get_source_meta(
         "AAPL",

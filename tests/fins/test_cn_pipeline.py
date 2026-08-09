@@ -50,6 +50,7 @@ class _PipelineDownloadFakeDiscoveryClient:
     """CnPipeline wrapper 测试用 CN fake discovery client。"""
 
     temp_dir: Path
+    candidates: tuple[CnReportCandidate, ...] | None = None
     download_calls: int = 0
     cancellation_checkpoints: list[Callable[[], None] | None] = field(default_factory=list)
 
@@ -98,7 +99,7 @@ class _PipelineDownloadFakeDiscoveryClient:
         self.cancellation_checkpoints.append(cancellation_checkpoint)
         if cancellation_checkpoint is not None:
             cancellation_checkpoint()
-        return (
+        default_candidates = (
             CnReportCandidate(
                 provider="cninfo",
                 source_id="A1",
@@ -114,6 +115,7 @@ class _PipelineDownloadFakeDiscoveryClient:
                 last_modified="Wed, 01 Apr 2026 00:00:00 GMT",
             ),
         )
+        return self.candidates if self.candidates is not None else default_candidates
 
     def download_report_pdf(self, candidate: CnReportCandidate) -> DownloadedReportAsset:
         """返回内存 PDF 资产。
@@ -340,6 +342,7 @@ def test_download_runs_cn_workflow_with_injected_discovery_client(tmp_path: Path
         start_date="2025-01-01",
         end_date="2026-12-31",
         overwrite=True,
+        start_is_explicit=True,
         cancel_checker=cancel_checker,
     )
 
@@ -405,6 +408,7 @@ def test_download_runs_hk_workflow_with_injected_discovery_client(tmp_path: Path
         start_date="2024-01-01",
         end_date="2025-12-31",
         overwrite=True,
+        start_is_explicit=True,
         cancel_checker=cancel_checker,
     )
 
@@ -457,6 +461,7 @@ async def test_download_stream_runs_cn_workflow_with_injected_discovery_client(
             start_date="2025-01-01",
             end_date="2026-12-31",
             overwrite=False,
+            start_is_explicit=True,
         )
     ]
 
@@ -478,6 +483,63 @@ async def test_download_stream_runs_cn_workflow_with_injected_discovery_client(
     assert summary["downloaded"] == 1
     assert discovery.download_calls == 1
     assert converter.calls == 1
+
+
+def test_download_non_explicit_nonempty_start_keeps_default_business_limit(tmp_path: Path) -> None:
+    """未来默认起点非空时，CN pipeline 仍须启用默认 FY 五年限制。
+
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: workflow 从日期非空错误反推显式性时抛出。
+    """
+
+    candidates = tuple(
+        CnReportCandidate(
+            provider="cninfo",
+            source_id=f"A{fiscal_year}",
+            source_url=f"https://static.cninfo.test/A{fiscal_year}.pdf",
+            title=f"平安银行：{fiscal_year}年年度报告",
+            language="zh",
+            filing_date=f"{fiscal_year + 1}-04-01",
+            fiscal_year=fiscal_year,
+            fiscal_period="FY",
+            amended=False,
+            content_length=len(_PDF_BYTES),
+            etag=f'"v{fiscal_year}"',
+            last_modified=f"Wed, 01 Apr {fiscal_year + 1} 00:00:00 GMT",
+        )
+        for fiscal_year in range(2025, 2019, -1)
+    )
+    discovery = _PipelineDownloadFakeDiscoveryClient(
+        temp_dir=tmp_path,
+        candidates=candidates,
+    )
+    converter = _PipelineDownloadFakeConverter()
+    pipeline = CnPipeline(
+        workspace_root=tmp_path,
+        cn_discovery_client=discovery,
+        convert_pdf_to_docling_json=converter,
+    )
+
+    result = pipeline.download(
+        ticker="000001",
+        form_type="FY",
+        start_date="2020-01-01",
+        end_date="2026-12-31",
+        overwrite=False,
+        start_is_explicit=False,
+    )
+
+    summary = result["summary"]
+    assert isinstance(summary, dict)
+    assert summary["downloaded"] == 5
+    assert discovery.download_calls == 5
+    assert converter.calls == 5
 
 
 @pytest.mark.asyncio
