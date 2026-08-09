@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "registry_status": "calibration",
+  "registry_status": "ready",
   "scenarios": [
     {
       "scenario_id": "init.INIT-001-help",
@@ -112610,30 +112610,30 @@
       ],
       "observed_evidence": {
         "bundle_ids": [
-          "interactive-memory-closure-20260804T5X59S8"
+          "f13-postfix-20260806T-W7W4JX"
         ],
         "report_ids": [
-          "interactive-memory-closure-20260804T5X59S8/observed-behavior"
+          "docs/reviews/pr-190-interactive-summary-null-observed-20260809.md"
         ],
         "report_sha256": [
-          "ad64315116c3940d9b0e7354c9e2a38aeff75fa179af723a82e696ff55658263"
+          "b561e01a4b31ae9267479a70c72a388079299e3111d1be80f7463edd575de5db"
         ],
         "relative_refs": [
-          "evidence/interactive.MC14-forced-summary-null-repair"
+          "evidence/interactive.F13O02-first-compact",
+          "evidence/interactive.F13O04-rolling-compact",
+          "evidence/interactive.F13O05-reconnect-view",
+          "evidence/final-dayu-host.sqlite3#event_sequence=133,165,166,177"
         ],
         "execution_outcome": "success",
         "exit_codes": [
           0
         ],
-        "evidence_status": "missing",
-        "gap_kind": "not-run",
-        "conformance_at_observation": "implementation-finding",
-        "implementation_finding_refs": [
-          "F08-meaningless-session-summary"
-        ]
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle"
       },
-      "user_adjudication_identity": "cli.interactive.core-execution@1:user-adjudication:2026-08-04",
-      "applicable_from": "next-interactive-conformance-run-after-F08-F10",
+      "user_adjudication_identity": "interactive.interactive.g06.summary-null@1:user-adjudication:2026-08-09",
+      "applicable_from": "2026-08-09",
       "supersedes": null,
       "superseded_by": null
     },
@@ -113254,7 +113254,7 @@
       "scenario_id": "interactive.interactive.g06.cap-constrained-memory-replacement",
       "source_scenario_id": null,
       "version": 1,
-      "status": "unadjudicated",
+      "status": "accepted",
       "command": "interactive",
       "path_kind": "state-chain",
       "coverage_claims": {
@@ -113330,21 +113330,24 @@
       ],
       "observed_evidence": {
         "bundle_ids": [
-          "interactive-memory-v3-20260805T-s4-restart-uOZytY"
+          "interactive-cap-gap-r2-20260808-JdukC2",
+          "g06-postfix-r2-20260809-rFNfAA"
         ],
         "report_ids": [
-          "/Users/leo/workspace/.dayu-cli-ci/interactive-memory-v3-20260805T-s4-restart-uOZytY/observed-report.md"
+          "docs/reviews/pr-190-interactive-cap-constrained-memory-observed-20260808.md",
+          "docs/reviews/pr-190-g06-fallback-grounding-postfix-observed-20260809.md"
         ],
         "report_sha256": [
-          "bbaa52a04100932c09e0a8e20d19c81ed6d865378db502bc6d4f1936c9694411"
+          "54ca13f273402915f1657a95b0d3e50c2ba79ae84b4545ea7ace8e2d09376dce",
+          "f4cefda475ebc0c6bf9b31d0b7a11cf12116eda4a7bd6d18236b648d19a881d4"
         ],
         "relative_refs": [
-          "evidence/05-deepseek-replacement-constrained",
-          "evidence/06-deepseek-bounded-repair",
-          "evidence/07-deepseek-reconnect",
-          "evidence/03-mimo-exhausted-fallback",
-          "evidence/08-deepseek-exhausted-fallback",
-          "digest.json#sha256=38f0b01f12c2ab55ce1af3c16080b71013d1a19512d65051f5532b747f71da0d"
+          "interactive-cap-gap-r2-20260808-JdukC2/evidence/operation-1-rejection-and-fallback",
+          "interactive-cap-gap-r2-20260808-JdukC2/evidence/operation-2-repair-and-accepted-replacement",
+          "interactive-cap-gap-r2-20260808-JdukC2/evidence/reconnect-same-truth",
+          "g06-postfix-r2-20260809-rFNfAA/evidence/run-input-actual.json",
+          "g06-postfix-r2-20260809-rFNfAA/evidence/host-projection.json",
+          "g06-postfix-r2-20260809-rFNfAA/evidence/terminal.txt"
         ],
         "execution_outcome": "success",
         "exit_codes": [
@@ -113352,15 +113355,15 @@
         ],
         "evidence_status": "sufficient",
         "gap_kind": "none",
-        "conformance_at_observation": "oracle-review-pending"
+        "conformance_at_observation": "matches-accepted-oracle"
       },
-      "user_adjudication_identity": "pending-oracle-controller-adjudication",
-      "applicable_from": "after-oracle-controller-adjudication",
+      "user_adjudication_identity": "cli.interactive.core-execution@2:user-adjudication:2026-08-09",
+      "applicable_from": "2026-08-09",
       "supersedes": "interactive.interactive.g06.drop-policy-limit@1",
       "superseded_by": null
     }
   ],
-  "readiness_proof": {
+  "readiness_proof_history_20260802": {
     "proof_version": 1,
     "generated_at": "2026-08-02T07:31:42.352549Z",
     "prompt": {
@@ -114309,5 +114312,169 @@
         }
       ]
     }
+  },
+  "readiness_proof": {
+    "proof_version": 3,
+    "generated_at": "2026-08-09T05:14:27Z",
+    "target_commit": "473e66b972e7e7a3e028ca1e9f4b2798ecb2b100",
+    "registry_scope": [
+      "init",
+      "prompt",
+      "interactive"
+    ],
+    "validation_result": "ready",
+    "counting_basis": "每条current non-superseded formal scenario计为一个mandatory scenario obligation；parser与动态coverage inventory分别以identity/digest验证，不重复计入scenario obligation总数。",
+    "root_parser_inventory": {
+      "inventory_id": "dayu.cli.arg_parsing.build_parser:root",
+      "inventory_version": 3,
+      "source_commit": "473e66b972e7e7a3e028ca1e9f4b2798ecb2b100",
+      "parameter_count": 13,
+      "sha256": "b6696252b7e7c2895e758264e1656030c51f884673d9f5802f5e783bb5210be1"
+    },
+    "removed_option_absence": {
+      "root_config_absent": true,
+      "prompt_config_absent": true,
+      "interactive_config_absent": true,
+      "interactive_ticker_absent": true
+    },
+    "commands": {
+      "init": {
+        "validation_result": "ready",
+        "parser_inventory": {
+          "inventory_id": "dayu.cli.arg_parsing.build_parser:init",
+          "inventory_version": 3,
+          "source_commit": "473e66b972e7e7a3e028ca1e9f4b2798ecb2b100",
+          "parameter_count": 15,
+          "sha256": "c75f31e5af807a0527bd9bcbe788f03885fa69a9bbce10394d7bc3ce73eda969"
+        },
+        "mandatory_scenario_obligation_count": 59,
+        "covered_scenario_obligation_count": 59,
+        "accepted_scenario_count": 59,
+        "superseded_scenario_count": 0,
+        "unadjudicated_scenario_count": 0,
+        "gap_count": 0,
+        "distinct_coverage_id_counts": {
+          "command_parameter_ids": 9,
+          "precondition_state_ids": 33,
+          "interactive_branch_option_ids": 46,
+          "input_class_ids": 19,
+          "combination_high_risk_ids": 7,
+          "cross_command_assertion_ids": 6
+        },
+        "coverage_inventory_sha256": "9f87265a8a1d14efc9eb009e1962f46eb3d0ea1bc4d6a3a772394eb5f313b786",
+        "frozen_report_digest_entry_count": 1,
+        "frozen_report_digest_set_sha256": "20b2684028dd540db97efa06d6d0e52c417eea25405f9227b7b7d059370d768d",
+        "user_adjudication_identity_count": 1,
+        "user_adjudication_identity_set_sha256": "2fcb772249b0b656c85560fead497b899ddbd7afe762f60fa5aedeea65185dca",
+        "accepted_oracle_refs": [
+          "cli.init.workspace-initialization@1"
+        ]
+      },
+      "prompt": {
+        "validation_result": "ready",
+        "parser_inventory": {
+          "inventory_id": "dayu.cli.arg_parsing.build_parser:prompt",
+          "inventory_version": 3,
+          "source_commit": "473e66b972e7e7a3e028ca1e9f4b2798ecb2b100",
+          "parameter_count": 27,
+          "sha256": "b7739eb2fa46f3199e76adc316fc41dbdd9afacec2ef0bdb4d37b04a8c3fe5d9"
+        },
+        "mandatory_scenario_obligation_count": 388,
+        "covered_scenario_obligation_count": 388,
+        "accepted_scenario_count": 388,
+        "superseded_scenario_count": 0,
+        "unadjudicated_scenario_count": 0,
+        "gap_count": 0,
+        "distinct_coverage_id_counts": {
+          "command_parameter_ids": 60,
+          "precondition_state_ids": 14,
+          "interactive_branch_option_ids": 24,
+          "input_class_ids": 12,
+          "combination_high_risk_ids": 64,
+          "cross_command_assertion_ids": 9
+        },
+        "coverage_inventory_sha256": "d2f32ec7ade7cd92f6b27d2097b251a2d4aa4d37b0c04a76d1713e444aef3c92",
+        "frozen_report_digest_entry_count": 6,
+        "frozen_report_digest_set_sha256": "874a1ac46e1c324771a555ce53a02c8bf3e0a3e5afa253517ad12c670f605048",
+        "user_adjudication_identity_count": 2,
+        "user_adjudication_identity_set_sha256": "afd03ac3ad18a03675c52b7570023227cbcecf9302c5edfe6f4ba1e3a835e8de",
+        "accepted_oracle_refs": [
+          "cli.prompt.core-execution@1"
+        ]
+      },
+      "interactive": {
+        "validation_result": "ready",
+        "parser_inventory": {
+          "inventory_id": "dayu.cli.arg_parsing.build_parser:interactive",
+          "inventory_version": 3,
+          "source_commit": "473e66b972e7e7a3e028ca1e9f4b2798ecb2b100",
+          "parameter_count": 25,
+          "sha256": "1953fd5ea3699c6a940628cc0b4f855bd89fb7dd3d9d2e39d9ef2a6764c36407"
+        },
+        "mandatory_scenario_obligation_count": 609,
+        "covered_scenario_obligation_count": 609,
+        "accepted_scenario_count": 609,
+        "superseded_scenario_count": 3,
+        "unadjudicated_scenario_count": 0,
+        "gap_count": 0,
+        "distinct_coverage_id_counts": {
+          "command_parameter_ids": 63,
+          "precondition_state_ids": 44,
+          "interactive_branch_option_ids": 132,
+          "input_class_ids": 14,
+          "combination_high_risk_ids": 320,
+          "cross_command_assertion_ids": 57
+        },
+        "coverage_inventory_sha256": "23eb7e95103d5e8b8be3e6d79daa4dcced9e1272ad5becea172f5f6c1c6ffd54",
+        "frozen_report_digest_entry_count": 8,
+        "frozen_report_digest_set_sha256": "28a4b1861919b85f34595cbfbd8a9b6760e75e12299daf9ca150bde227688558",
+        "user_adjudication_identity_count": 6,
+        "user_adjudication_identity_set_sha256": "0ecfb2df0bfc328e3776c1948d7a3c8db3db19e91083229b29c8daf542d7c3ae",
+        "accepted_oracle_refs": [
+          "cli.interactive.core-execution@2"
+        ],
+        "latest_user_adjudication_identities": [
+          "cli.interactive.core-execution@2:user-adjudication:2026-08-09",
+          "interactive.interactive.g06.summary-null@1:user-adjudication:2026-08-09"
+        ]
+      }
+    },
+    "reference_validation": {
+      "missing_exact_oracle_refs": 0,
+      "unresolved_current_oracles": 0,
+      "unresolved_predicates": 0,
+      "unresolved_evidence_gaps": 0,
+      "unresolved_user_adjudications": 0,
+      "uncovered_correctness_surfaces": 0,
+      "dangling_local_report_refs": 0,
+      "local_report_digest_mismatches": 0
+    },
+    "post_fix_conformance_refresh": {
+      "status": "complete",
+      "remaining_required_refreshes": [],
+      "last_user_adjudication_date": "2026-08-09"
+    },
+    "global": {
+      "validation_result": "ready",
+      "ready_command_scopes": [
+        "init",
+        "prompt",
+        "interactive"
+      ],
+      "out_of_scope_command_scopes": [
+        "download",
+        "upload_filing",
+        "upload_material",
+        "upload_filings_from",
+        "process",
+        "process_filing",
+        "process_material",
+        "session",
+        "tool_trace"
+      ],
+      "reason": "init、prompt、interactive第一轮真实运行、逐项用户裁决、accepted oracle/scenario及post-fix证据已闭合；其它命令不属于本readiness proof。"
+    },
+    "registry_digest_basis": "202f4c81037b72b642cfc15ee0d1fb19a6d346f82e8c217cbff4d0df02c3e123",
+    "accepted_oracle_registry_digest_basis": "316d7ba4b06cc642df54d989bb0078d389eb04f6f809e4bc96124f770e6654cd"
   }
 }

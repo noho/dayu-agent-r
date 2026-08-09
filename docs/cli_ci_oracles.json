@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "registry_status": "calibration",
+  "registry_status": "ready",
   "oracles": [
     {
       "oracle_id": "cli.init.workspace-initialization",
@@ -1872,6 +1872,7 @@
             "当前冻结的compactor initial request必须包含immutable input、真实output caps、nullable summary语义、previous EvidenceFact immutable atoms与同源完整结构；模型对previous EvidenceFact只能按label keep/omit，新EvidenceFact只能选择当前evidence material，canonical refs由Host计算。strict parser拒绝missing/unknown/duplicate keys、错误nested shape与旧schema字段，Host拒绝全空、无有效provenance、重复semantic item或超过同源cap的candidate。",
             "无效proposal形成bounded attempt rejection；后续whole-candidate repair绑定同一Host内部request/source boundary，收到脱敏、有界、自解释的validation issues与同源完整结构后重产整个candidate，不合并rejected partial patch。",
             "无效candidate不得写compact artifact、CONTEXT_COMPACTED或进入Conversation Memory；attempt budget耗尽后只写一个CONTEXT_COMPACTION_FAILED，再进入既有tier 1-3/tier 4-5 deterministic fallback或fail closed。",
+            "compaction失败后若policy允许fallback继续主Run，Host必须在本次RunnerInput中投影自解释的grounding边界：只有当前输入中直接支持的用户材料、accepted tool evidence与已接受Semantic Memory可作为事实依据；缺失的历史、先前assistant陈述和模型常识都不是证据。当前材料不足且本Run不能或未获授权检索时，final answer必须明确说明无法据此回答，并提示用户提供材料或授权检索。",
             "accepted candidate、represented/omitted coverage、policy usage audit、compact artifact、Memory、RunInput、canonical terminal与public Tool Trace必须从同一CompactAcceptedTruth派生；Memory不得在accept后再次按cap静默裁剪。"
           ],
           "forbidden": [
@@ -1879,7 +1880,8 @@
             "从prompt常量、provider/model分支、repair message或accepted candidate反推output caps。",
             "把session_summary=null且所有semantic集合为空的candidate记为quality accepted或CONTEXT_COMPACTED。",
             "把request/source-boundary digest或其治理字段暴露到LLM-facing initial/repair文本。",
-            "接受rejected partial patch、在Memory投影层补救超cap内容，或让迟到结果产生第二个canonical terminal。"
+            "接受rejected partial patch、在Memory投影层补救超cap内容，或让迟到结果产生第二个canonical terminal。",
+            "fallback后的模型用未进入实际RunnerInput的历史、先前回答、一般知识或虚构数字补齐证据缺口，或在当前材料不足时生成未经支持的事实、结论或风险。"
           ]
         },
         {
@@ -2000,6 +2002,16 @@
           "kind": "user-decision",
           "date": "2026-08-08",
           "summary": "用户接受F18 B1总控建议并裁决tool-trace-formal@2正确：public Host Tool Trace resolver/analysis response identity与canonical terminal六字段6/6 exact match，secret scan完整；cold analyzer compactor_responses=0与provider-native request id unavailable保留为limitation，不是mandatory gap。cap-constrained-memory-replacement@1仍待单独裁决。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-08-09",
+          "summary": "用户根据F19 cap-constrained真实运行与G06 post-fix真实MiMo运行，裁决cap-constrained-memory-replacement@1正确：Host cap/repair/fallback及durable replacement同源成立；compaction失败fallback后的实际RunnerInput明确grounding边界，证据不足时final answer明确无法从当前材料回答而不补写未经支持的风险。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-08-09",
+          "summary": "用户根据F13 production evidence补档裁决summary-null@1正确：已有非空摘要后，accepted session_summary=null只清除旧摘要，保留同一replacement中的其它Semantic Memory，post-compact Run与跨进程reconnect消费同一状态。"
         }
       ],
       "observed_behavior": {
@@ -2027,6 +2039,18 @@
           {
             "report_id": "f15-f16-postfix-rerun-vNMkeVul/oracle-rerun-observed-behavior",
             "sha256": "cbac55f151ec3091dbe7fd7872353d1ba21b7adf609393b82a3b90e88cd4b702"
+          },
+          {
+            "report_id": "docs/reviews/pr-190-interactive-cap-constrained-memory-observed-20260808.md",
+            "sha256": "54ca13f273402915f1657a95b0d3e50c2ba79ae84b4545ea7ace8e2d09376dce"
+          },
+          {
+            "report_id": "docs/reviews/pr-190-g06-fallback-grounding-postfix-observed-20260809.md",
+            "sha256": "f4cefda475ebc0c6bf9b31d0b7a11cf12116eda4a7bd6d18236b648d19a881d4"
+          },
+          {
+            "report_id": "docs/reviews/pr-190-interactive-summary-null-observed-20260809.md",
+            "sha256": "b561e01a4b31ae9267479a70c72a388079299e3111d1be80f7463edd575de5db"
           }
         ],
         "scenario_refs": [
@@ -2038,20 +2062,55 @@
           "真实running/queue/steer恢复、cancel non-resurrection、cross-entry label、财报grounding、compaction失败fallback、真实CONTEXT_COMPACTED/provider identity及compact后follow-up均已观察。",
           "用户已裁决#48至#52的五类Semantic Memory、成功compact连续性、材料指令边界、rolling修正/drop及repair/fallback为正确行为。",
           "#53至#55分别登记为无意义summary、compactor Tool Trace identity与completed Run原子性实现finding；后续F13至F17完成previous EvidenceFact provenance、coverage frontier、canonical renderer、逐Run observation与init publication digest修复。",
-          "F15/F16 fresh production observation已支持rolling-correction-replacement@1 accepted；F18 B1 fresh production MiMo evidence以public Host Tool Trace与canonical terminal六字段6/6 exact match支持tool-trace-formal@2 accepted。cold analyzer compactor_responses=0与provider-native request id unavailable保留为limitation，不构成mandatory gap。cap-constrained-memory-replacement@1仍待裁决，registry保持calibration且overall readiness不得标ready。"
+          "F15/F16 fresh production observation已支持rolling-correction-replacement@1 accepted；F18 B1 fresh production MiMo evidence以public Host Tool Trace与canonical terminal六字段6/6 exact match支持tool-trace-formal@2 accepted。cold analyzer compactor_responses=0与provider-native request id unavailable保留为limitation，不构成mandatory gap。2026-08-09用户根据F19 cap-constrained replacement证据与G06 post-fix fallback grounding证据裁决cap-constrained-memory-replacement@1正确；同日根据F13 production evidence补档裁决summary-null@1正确。"
         ]
       },
       "user_adjudication": {
         "decision": "accepted",
-        "date": "2026-08-05",
-        "notes": "用户明确接受F11/F12及后续F13-F17收口后的current compaction contract；rolling-correction-replacement@1与tool-trace-formal@2已于2026-08-08裁决为accepted。tool-trace-formal@2的cold analyzer compactor_responses=0与provider-native request id unavailable保留为limitation；cap-constrained-memory-replacement@1仍待Oracle controller单独裁决，当前不得标ready。"
+        "date": "2026-08-09",
+        "notes": "用户明确接受F11/F12及后续F13-F17收口后的current compaction contract；rolling-correction-replacement@1与tool-trace-formal@2已于2026-08-08裁决为accepted。tool-trace-formal@2的cold analyzer compactor_responses=0与provider-native request id unavailable保留为limitation。cap-constrained-memory-replacement@1已于2026-08-09根据F19与G06 post-fix复合证据裁决为accepted；summary-null@1同日根据F13 production evidence补档裁决为accepted。"
       },
       "applicable_from": {
-        "date": "2026-08-05",
-        "target": "f13-f17-current-compaction-contract"
+        "date": "2026-08-09",
+        "target": "pr190-init-prompt-interactive-ready-contract"
       },
       "supersedes": "cli.interactive.core-execution@1",
       "superseded_by": null
     }
-  ]
+  ],
+  "readiness_proof": {
+    "proof_version": 3,
+    "generated_at": "2026-08-09T05:14:27Z",
+    "target_commit": "473e66b972e7e7a3e028ca1e9f4b2798ecb2b100",
+    "registry_scope": [
+      "init",
+      "prompt",
+      "interactive"
+    ],
+    "validation_result": "ready",
+    "accepted_oracle_count": 3,
+    "superseded_oracle_count": 1,
+    "accepted_predicate_count": 66,
+    "current_accepted_oracle_refs": [
+      "cli.init.workspace-initialization@1",
+      "cli.prompt.core-execution@1",
+      "cli.interactive.core-execution@2"
+    ],
+    "reference_validation": {
+      "missing_exact_oracle_refs": 0,
+      "unresolved_current_oracles": 0,
+      "unresolved_predicates": 0,
+      "unresolved_evidence_gaps": 0,
+      "unresolved_user_adjudications": 0,
+      "uncovered_correctness_surfaces": 0
+    },
+    "latest_user_adjudication_identities": [
+      "cli.init.workspace-initialization@1:user-adjudication:2026-07-30",
+      "cli.prompt.core-execution@1:user-adjudication:2026-08-02",
+      "cli.interactive.core-execution@2:user-adjudication:2026-08-09",
+      "interactive.interactive.g06.summary-null@1:user-adjudication:2026-08-09"
+    ],
+    "scenario_registry_digest_basis": "202f4c81037b72b642cfc15ee0d1fb19a6d346f82e8c217cbff4d0df02c3e123",
+    "registry_digest_basis": "316d7ba4b06cc642df54d989bb0078d389eb04f6f809e4bc96124f770e6654cd"
+  }
 }

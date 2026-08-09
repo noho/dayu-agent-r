@@ -538,22 +538,27 @@ evidence、但尚待 Oracle controller 裁决的 replacement scenario 可以登�
 `accepted`。`tool-trace-formal@2` 也已由用户在 2026-08-08 根据 F18 fresh production MiMo evidence 裁决为
 `accepted`；mandatory evidence 是 public Host Tool Trace resolver/analysis response identity、canonical terminal 六字段
 6/6 exact match 与 secret scan。cold analyzer `compactor_responses=0` 与 provider-native request id unavailable 保留为
-limitation，不是 mandatory gap。F18 对 `cap-constrained-memory-replacement@1` 完成fixed-profile calibration、material setup
-correction与两次canonical success但non-covering的真实观察；没有观察到compactor operation，最终 verdict 为
-`needs-more-evidence`。F18冻结publication另有cross-file material digest不一致、summary缺少per-chain budget/count/terminal
-refs，且缺少plan要求的per-attempt public Tool Trace/resolver analysis与execution index，publication verdict为
-`nonconforming`，不得作为readiness proof。F19随后以fresh workspace、新deadline与新publication root执行两条fixed-profile
-候选链：5个真实MiMo segment均由Host记录为canonical `RUN_SUCCEEDED`，但12次ordinary runner input之后仍没有产生
-`CONTEXT_COMPACTED`或compactor response，因此replacement、repair/fallback与reconnect前置均未到达，real observation继续为
-`needs-more-evidence`。F19 publication补齐了count/terminal refs、每条attempted chain的path-redacted public Tool Trace analysis
-与execution index，最终scan和独立digest复算也均通过；但冻结的`observation-summary.json`三个chain entries都缺少plan要求的
-逐链budget与deadline owner ref/SHA，顶层统一cap及另一文件的逐segment wrapper budget不能替代该owner record。因此F19
-publication verdict仍为`nonconforming`，不得作为readiness proof。B2仍为`unadjudicated`，registry继续保持`calibration`，
-overall readiness不得标为ready。
+limitation，不是 mandatory gap。F18/F19 早期未触发compaction或publication不完整的runs继续作为历史
+`needs-more-evidence`/`nonconforming`证据保留，不得重标PASS。后续fresh production cap campaign使用真实MiMo、production
+interactive与真实AAPL corpus，实际观察到同一operation五次candidate rejection后的budget-exhausted deterministic fallback、
+另一operation的invalid JSON后bounded repair accepted、真实output caps、represented/omitted精确分区、compact artifact、Memory、
+RunInput与跨进程reconnect同源。该run还观察到fallback final answer使用实际RunnerInput之外的材料生成未经支持的风险，因此先冻结为
+implementation finding；G06 root fix后的fresh production MiMo run再次触发同一fallback，实际RunnerInput明确只允许使用当前可见且
+直接支持的材料，final answer在缺少研发费用证据时明确说明无法回答并请求检索/提供材料。用户于2026-08-09据此前后复合证据裁决
+`cap-constrained-memory-replacement@1`为`accepted`。`summary-null@1`的F13既有production evidence证明已有非空摘要后接受null只清除
+session summary，保留5条EvidenceFact与1条AnswerAnchor，post-compact Run和跨进程reconnect继续消费同一状态；用户于2026-08-09
+裁决该行为正确。至此interactive replacement scenarios的真实观察和用户裁决全部闭合。
 
 Registry-level readiness proof 至少记录 inventories identity/version/digest、mandatory obligation 总数、covered
 数、gap 数、按 coverage dimension 的明细、用户裁决 identity、frozen report digests、dangling/uncovered 检查和最终
 validation result。`registry_status=ready` 只能由该 result 派生，禁止手工翻转 status 绕过校验。
+
+2026-08-09 的version 3 readiness proof以实现commit `473e66b972e7e7a3e028ca1e9f4b2798ecb2b100`为运行真源，
+重新导出root/init/prompt/interactive parser inventory，并对1056条current accepted scenarios逐条复核oracle/predicate、
+correctness surface、frozen report digest、evidence status与用户裁决identity。init为59/59、prompt为388/388、interactive为
+609/609，三者gap、unadjudicated、unresolved evidence和dangling refs均为0；`registry_status=ready`只适用于这三个命令。
+`download`、`upload_*`、`process*`、`session`与`tool_trace`仍在本proof scope之外，不得借此宣称它们已完成第一轮。
+`readiness_proof_history_20260802`只保存早期校准历史，当前第二轮入口唯一使用顶层`readiness_proof`。
 
 当前 Agent CLI capability inventory 还必须遵守这些 parser/source-of-truth 规则：`prompt` 与
 `interactive` leaf 都不包含 `--config`，root 前置 `--config` 也不能绕过 command-aware
