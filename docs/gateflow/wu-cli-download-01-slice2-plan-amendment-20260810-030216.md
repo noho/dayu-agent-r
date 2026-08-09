@@ -9,18 +9,18 @@
 | Baseline HEAD | `c6829400a5e37892464a614590062511554f9633` |
 | Branch | `codex/download-oracle` |
 | Date | 2026-08-10 |
-| Inputs | 两份 code review、`docs/reviews/plan-review-20260810-031151.md`、`docs/reviews/plan-review-20260810-031203.md`、controller adjudication |
+| Inputs | 两份 code review、四份先前 plan review、`docs/reviews/plan-review-20260810-slice2-cn-owner-mimo.md`、`docs/reviews/plan-review-20260810-slice2-cn-owner-ds.md`、controller adjudication |
 | Scope of this pass | Direct call-chain analysis and this amendment artifact only |
 | Product/test changes in this pass | None |
-| Next gate | 原两位 reviewer 独立 re-review；implementation remains paused |
+| Next gate | Controller 确认本轮 doc-only 澄清后恢复 review-fix implementation；当前仍暂停产品/测试修改 |
 
-The worktree already contains the reviewed Slice 2 implementation. This artifact does not reinterpret those changes as a clean baseline and does not authorize edits outside the amended allowlist below.
+The worktree already contains the reviewed Slice 2 implementation and part of the accepted review-fix. This artifact does not reinterpret those changes as a clean baseline and does not authorize edits outside the amended allowlist below. 下文的 owner 规则描述最终必须满足的状态；凡当前 dirty diff 已实现的部分，恢复 implementation 后只做验证，并仅在对应测试或静态检查真实失败时做最小修正，不得为了重新执行计划而无效重写。
 
 ## 2. First-principles judgment
 
 The accepted follow-up is necessary and correctly rated medium for R02, R06, and C01:
 
-- R02 is not merely an imprecise `UNKNOWN` category. CN/HK operation failure provenance is destroyed before the adapter sees it: `run_cn_download_stream_impl` catches provider, storage, and execution exceptions, writes `message=str(exc)` into a JSON result with `status="failed"`, and `CnDownloadAdapter.download` then labels every such result as a retryable provider failure. The adapter cannot recover facts that the workflow erased.
+- R02 was not merely an imprecise `UNKNOWN` category. At the review-trigger baseline, CN/HK operation failure provenance was destroyed before the adapter saw it: `run_cn_download_stream_impl` caught provider, storage, and execution exceptions, wrote `message=str(exc)` into a JSON result with `status="failed"`, and `CnDownloadAdapter.download` then labeled every such result as a retryable provider failure. The current dirty diff already addresses this operation path；§§3.1/5/6 record what remains to verify or implement.
 - R06 is not only a missing test. `cn_pipeline._summary_from_pipeline_result` explicitly accepts an absent required field only for rebuild, so the consumer compensates for an incomplete producer contract. `rebuild_cn_download_artifacts` is the producer that omits `missing_periods`; it must always emit the field and the adapter fallback must be deleted.
 - C01 is real. SEC fallback/auxiliary paths catch typed provider errors through their `RuntimeError` base, log URL or raw exception text, and return `None`, `[]`, or a business filter classification. A transport failure can therefore be observed as ticker-not-found, missing auxiliary files, SC13 direction rejection, or 6-K business rejection instead of a provider failure.
 
@@ -36,11 +36,11 @@ Normal operation call chain:
 
 `真实异常 owner -> run_cn_download_stream_impl async generator -> CnPipeline.download_stream async-for（无 catch） -> collect_cn_download_result_from_events async-for（无 catch） -> CnDownloadAdapter.download（无 catch/重分类） -> Fins runtime producer catch -> _download_public_failure_from_exception`
 
-Direct evidence:
+Direct evidence（前述 review trigger 与当前 dirty diff 状态必须区分）：
 
-1. `dayu/fins/downloaders/cninfo_downloader.py` and `hkexnews_downloader.py` own `httpx` request/retry exhaustion, JSON/protocol validation, and PDF validation. They currently raise generic `RuntimeError`, frequently embedding `url` and `last_exc`; their HEAD warnings also log `url={url} error={exc}`.
-2. `dayu/fins/pipelines/cn_download_workflow.py` catches exceptions from `resolve_company`, company publication, candidate discovery, rebuild, and cancellation checks. Its `_build_result(status="failed", reason_code=..., message=str(exc))` converts all operation-terminal exceptions to untyped JSON text.
-3. `dayu/fins/pipelines/cn_pipeline.py::CnDownloadAdapter.download` sees only `status="failed"` and constructs `FinsDownloadProviderError(UNKNOWN, retryable=True)`, regardless of whether the original exception was provider transport, `OSError`, or execution.
+1. Review trigger 时，`dayu/fins/downloaders/cninfo_downloader.py` and `hkexnews_downloader.py` 在自己的 `httpx` request/retry exhaustion、JSON/protocol 与 PDF validation owner 处抛 generic `RuntimeError` 并泄漏 `url` / `last_exc`。当前 dirty diff 已有 closed `_cninfo_http_failure` / `_hkexnews_http_failure` 与分离后的 retry/parser boundaries；恢复后验证分类、调用次数与泄漏扫描，只有真实失败才修正，不从零重写。
+2. Review trigger 时，`dayu/fins/pipelines/cn_download_workflow.py` 把 operation-terminal exceptions 转成 `_build_result(status="failed", message=str(exc))`。当前 dirty diff 已删除这类 operation-terminal catch，并已把 `_is_cancel_requested` 变为无 catch 的直接调用；该部分只保留回归验证。仍待实施的是 §3.2 指定的 child-owner helper 迁移与父 leak catch 直接复用。
+3. Review trigger 时，`dayu/fins/pipelines/cn_pipeline.py::CnDownloadAdapter.download` 把任何 `status="failed"` 猜成 `FinsDownloadProviderError(UNKNOWN, retryable=True)`。当前 dirty diff 已改为 strict terminal projection；恢复后只验证 legacy failed mapping 继续 fail closed。
 4. `CnPipeline.download_stream` 只 `async for` 转发 workflow event，`collect_cn_download_result_from_events` 也只迭代直到 `PIPELINE_COMPLETED`；两处均没有 `try/except`。Python async-generator 异常会按上述链条原样越过两层。
 5. `dayu/fins/ingestion_runtime.py::_download_public_failure_from_exception` already has the correct closed terminal mapping: `FinsDownloadProviderError -> provider/configuration`, `OSError -> storage`, all other exceptions -> execution. It needs the original typed exception, not another downstream parser.
 
@@ -55,9 +55,22 @@ Owner decision:
 
 ### 3.2 CN/HK single-document failures are a distinct owner
 
-`cn_download_filing_workflow.py` catches PDF/conversion failures and emits a `FILING_FAILED` row so other selected documents may continue. That is document-outcome semantics, not the operation-terminal `status="failed"` path adjudicated in R02.
+`cn_download_filing_workflow.py` catches PDF/conversion failures and emits a `FILING_FAILED` row so other selected documents may continue. That is document-outcome semantics, not the operation-terminal `status="failed"` path adjudicated in R02；但 stop-condition implementation 证明该文件正是文档级失败的真实异常 owner，不能继续排除。
 
-Therefore `cn_download_filing_workflow.py` is explicitly excluded from this amendment. The newly typed downloader exception has a fixed safe message when that filing workflow converts it to a row, so it does not leak URL/raw payload. In the in-scope `cn_download_workflow.py` per-candidate catch, provider errors use `safe_message`; `OSError` uses a fixed storage-safe reason; all other exceptions use a fixed execution-safe reason. No document row writes `str(exc)`. Adding a new per-row transport field would change the public row schema and still requires a separate amendment.
+Direct evidence:
+
+1. `run_cn_download_single_filing_stream` 的 PDF catch（当前约 184 行）在 `discovery_client.download_report_pdf` 的真实异常边界捕获 `Exception`，随后同时向 `FILE_FAILED` 和 `FILING_FAILED` 写入 `reason_message=str(exc)`，并把原因固定成 `pdf_download_failed`。这里会丢失 `FinsDownloadProviderError`、path-bearing `OSError` 与 execution failure 的类别，而且会公开 raw URL/contact/path 文本。
+2. 同一函数的 Docling catch（当前约 316 行）也把 `str(exc)` 写入 `FILING_FAILED`，具有相同 provenance 与泄漏问题。
+3. 父 `cn_download_workflow.py` 只会看到子 workflow 已产出的终态事件；对于上述两条正常 document-local failure 路径，异常不会再到达父模块的 per-candidate `except Exception`。父模块无法从 `pdf_download_failed`、row 文本或日志恢复原 typed provenance，也不得下游重猜。
+4. Stop-condition 聚焦测试得到 `450 passed / 6 failed`：其中四个失败直接显示真实 PDF owner 仍输出 `pdf_download_failed`，没有使用父模块的 closed helper；另外两个失败来自 unknown-`httpx` 测试构造，属于恢复 implementation 后继续收敛的独立测试问题，不改变 owner 裁决。
+
+Owner decision:
+
+- 将 `dayu/fins/pipelines/cn_download_filing_workflow.py` 列为 additional in-scope production owner。该模块作为 document-local failure owner，定义唯一公开 typed direct helper：`project_cn_filing_failure(error: Exception) -> tuple[str, str]`。它不是 compatibility wrapper，也不透传调用；它直接承诺现有 row 字段使用的 `(reason_code, safe_message)` 语义。
+- helper 的封闭映射唯一为：`FinsDownloadProviderError -> (f"provider_{transport_category.value}", safe_message)`；`OSError -> ("storage_failed", "下载产物读写失败")`；其它 `Exception -> ("filing_execution_failed", "财报文档执行失败")`。`CnDownloadCancelledError` 必须在进入 helper 前继续原样传播到 cancelled state。
+- **PDF catch 必须只调用 helper 一次；`FILE_FAILED` 与 `FILING_FAILED` 的 `reason_code` 和 `reason_message` 两个字段都必须逐值复用这同一个返回 pair。** 不得保留 `FILE_FAILED.reason_code="pdf_download_failed"` 或只共享 message。Docling catch 的 `FILING_FAILED` 也调用该 helper。任何 row/event 均不得写 `str(exc)`。
+- 父 `cn_download_workflow.py` 直接公开导入并调用同一个 `project_cn_filing_failure`，处理真正漏出子 workflow 的 document-local exception。删除父模块自己的重复 helper；不得保留第二份 `isinstance` 映射、private cross-module import、透传 facade 或 raw-dict/string parser。
+- 继续使用现有 `reason_code` / `reason_message` row contract，不新增 per-row transport 字段或 public schema。category-derived reason 已保留精确来源类别，fixed safe message 保证 URL/contact/raw payload/绝对路径不泄漏。
 
 ### 3.3 Rebuild `missing_periods`
 
@@ -77,15 +90,15 @@ Owner decision: local rebuild has no provider discovery, so its owner always emi
 
 Call chains with direct semantic impact:
 
-- Ticker map miss -> `_resolve_company_via_browse_edgar_ticker` -> `_http_get_bytes` / `fetch_submissions`. Typed provider failures are currently caught as `RuntimeError`, logged with raw exception text, and returned as `None`; the caller then reports ticker not found.
-- SC13 direction -> `fetch_sc13_party_roles` -> `_http_get_bytes`. Network failure currently returns `None`; the direction evaluator may record a business rejection.
-- Filing file discovery -> `_try_fetch_index_items`, `_try_fetch_index_header_documents`, `_try_fetch_primary_linked_html_files`. Provider failure currently returns `[]`; downstream 6-K/XBRL selection can treat unavailable evidence as `NO_MATCH` or another business rejection.
-- Historical submissions -> `sec_pipeline._collect_filings` -> `fetch_json`. Provider failure is logged with the full history URL and raw exception, then skipped, reducing discovered filings.
-- 6-K preview -> `sec_pipeline._filter_6k_filing` -> `classify_6k_remote_candidates` -> `fetch_file_bytes`. Provider failure is logged raw and converted to the existing `DOWNLOAD_FAILED` filing-failure category; the state transition is correct, only the diagnostic is unsafe.
+- Ticker map miss -> `_resolve_company_via_browse_edgar_ticker` -> `_http_get_bytes` / `fetch_submissions`. Review trigger 时 typed provider failures 被 `RuntimeError` catch、记录 raw exception text 并返回 `None`；caller 随后误报 ticker not found。
+- SC13 direction -> `fetch_sc13_party_roles` -> `_http_get_bytes`. Review trigger 时 network failure 返回 `None`；direction evaluator 可能记录 business rejection。
+- Filing file discovery -> `_try_fetch_index_items`, `_try_fetch_index_header_documents`, `_try_fetch_primary_linked_html_files`. Review trigger 时 provider failure 返回 `[]`；downstream 6-K/XBRL selection 可能把 unavailable evidence 当作 `NO_MATCH` 或其它 business rejection。
+- Historical submissions -> `sec_pipeline._collect_filings` -> `fetch_json`. Review trigger 时 provider failure 被完整 history URL/raw exception 日志后跳过，减少 discovered filings。
+- 6-K preview -> `sec_pipeline._filter_6k_filing` -> `classify_6k_remote_candidates` -> `fetch_file_bytes`. Review trigger 时 provider failure 被 raw log 后转成既有 `DOWNLOAD_FAILED` filing-failure category；state transition 本来正确，只有 diagnostic 不安全。
 
-逐 helper owner 裁决：
+逐 helper owner 裁决（“review-trigger behavior” 记录触发 amendment 的基线问题；“修订后”是 binding terminal state，其中当前 dirty diff 已完成的部分按 §§5/6.5 只验证）：
 
-| Helper / call site | 当前误行为 | 修订后 owner 与结果 |
+| Helper / call site | Review-trigger behavior | 修订后 owner 与结果 |
 |---|---|---|
 | `_resolve_company_via_browse_edgar_ticker` HTTP | typed error 被 catch 后 `None` | downloader 原样传播；company resolution operation-fatal |
 | browse-edgar XML parse | `RuntimeError` 后 `None` | downloader 映射 `PROTOCOL/non-retryable` 并传播；operation-fatal |
@@ -137,17 +150,28 @@ Planreview revision dispositions:
 | DS F06 | Rejected with reason: defensive `discovered_count` is retained and impossible combinations assert. |
 | DS F07 | Accepted: 6-K preview remains per-filing FAILED, with safe typed diagnostics. |
 
+Stop-condition owner re-review adjudication:
+
+| Review finding | Final disposition | Clarification in this revision |
+|---|---|---|
+| MiMo F01 | Resolved | CNINFO/HKEX closed retry loops are already present in the current dirty diff. §§3.1/5.2/6.2 now require verification and failure-driven correction only, not a from-zero rewrite. |
+| MiMo F02 | Resolved | `_is_cancel_requested` is already a no-catch pass-through in the current dirty diff. §§3.1/5.2/6.3 retain its tests solely as regression protection. |
+| MiMo F03 | Resolved | `sec_download_filing_workflow` already contains the approved typed filing-local catch. §§5.2/6.5 mark it implemented-and-pending-verification rather than a new production change. |
+| DS F01 | Resolved | §5 now distinguishes additional in-scope owners from new work and records the state of every such owner; already-correct SEC/CN dirty code must not be rewritten without a failing check. |
+| DS F02 | Resolved by policy clarification | §6.2 states that CN/HK 4xx fail-fast is this WU's non-retryable policy. The SEC retry-policy difference is deliberately unchanged and outside this owner amendment. |
+| DS F03 | Resolved as already specified | §3.2 and §§6.3/8.2 now make the existing decision visually explicit: one helper invocation supplies both `reason_code` and `reason_message` to both PDF terminal events. No owner, schema, or scope change is introduced. |
+
 ## 5. Amended file allowlist
 
 Only the following production/test files may be modified during the review-fix implementation. Documentation artifact updates remain under `docs/gateflow/` only.
 
-### 5.1 Existing dirty production files permitted for review-fix only
+### 5.1 Existing dirty production owners permitted for review-fix only
 
-- `dayu/fins/download_contract.py` — R01 and R07 only.
-- `dayu/fins/direct_events.py` — R07 public-contract explanation only; no schema/validator change.
-- `dayu/fins/downloaders/sec_downloader.py` — C01 auxiliary propagation and safe diagnostics only.
-- `dayu/fins/pipelines/sec_pipeline.py` — C01 historical-submissions operation propagation plus 6-K per-filing safe diagnostics only.
-- `dayu/fins/pipelines/cn_pipeline.py` — R02 blanket-classification removal/strict terminal validation and R06 fallback removal only.
+- `dayu/fins/download_contract.py` — current dirty diff 已完成 R01 defensive assertion 与 R07 contract behavior；恢复后验证，必要时只修对应失败。
+- `dayu/fins/direct_events.py` — current dirty diff 已完成 R07 public-contract explanation；恢复后验证，不改 schema/validator。
+- `dayu/fins/downloaders/sec_downloader.py` — current dirty diff 已包含 C01 auxiliary propagation 与 safe diagnostics；恢复后按 §8.4 验证，必要时只修对应失败。
+- `dayu/fins/pipelines/sec_pipeline.py` — current dirty diff 已包含 C01 historical-submissions propagation 与 6-K safe diagnostics；恢复后按 §8.4 验证既有 filing-local state transition。
+- `dayu/fins/pipelines/cn_pipeline.py` — current dirty diff 已完成 R02 strict terminal projection 与 R06 fallback removal；恢复后只做 regression verification / failure-driven correction。
 
 The following existing dirty production files are frozen in this review-fix because the accepted findings do not belong to them:
 
@@ -160,13 +184,16 @@ The following existing dirty production files are frozen in this review-fix beca
 
 They remain part of the underlying Slice 2 diff and validation union, but no follow-up edit is authorized.
 
-### 5.2 New production additions proved necessary by the call chain
+### 5.2 Additional in-scope production owners proved necessary by the call chain
 
-- `dayu/fins/downloaders/cninfo_downloader.py` — CNINFO HTTP/protocol/PDF error owner and safe logging.
-- `dayu/fins/downloaders/hkexnews_downloader.py` — HKEX HTTP/protocol/PDF error owner and safe logging.
-- `dayu/fins/pipelines/cn_download_workflow.py` — operation-terminal exception preservation; the current provenance-loss owner.
-- `dayu/fins/pipelines/cn_download_rebuild.py` — required `missing_periods` producer owner.
-- `dayu/fins/pipelines/sec_download_filing_workflow.py` — `list_filing_files` typed provider failure to exactly one FAILED filing row; no operation-fatal conversion.
+“Additional in-scope” 表示 call chain 证明这些 owner 可在本 review-fix 中修改，不表示每个文件都还有待新增实现。当前状态逐项如下：
+
+- `dayu/fins/downloaders/cninfo_downloader.py` — **已实现，待验证/必要时仅修失败**：current dirty diff 已有 CNINFO closed HTTP/protocol/PDF mapping、retry/parser separation 与 safe logging；保留 unknown-`httpx` 测试收敛，不得无效重写 retry loop。
+- `dayu/fins/downloaders/hkexnews_downloader.py` — **已实现，待验证/必要时仅修失败**：current dirty diff 已有 HKEX closed mapping、retry/parser separation 与 safe logging；同样只做矩阵验证和 failure-driven correction。
+- `dayu/fins/pipelines/cn_download_filing_workflow.py` — **尚待实施的 owner 修复**：PDF/Docling document-local failure 的真实异常 owner；新增唯一公开 closed projection helper，并让 PDF 两个事件复用同一次 pair。
+- `dayu/fins/pipelines/cn_download_workflow.py` — **部分已实现，剩余 owner 迁移**：operation-terminal exception preservation 与 `_is_cancel_requested` pass-through 已在 current dirty diff；只剩直接导入 filing owner helper、替换 parent leak catch 调用并删除父模块重复 helper。
+- `dayu/fins/pipelines/cn_download_rebuild.py` — **已实现，待验证/必要时仅修失败**：current dirty diff 已由 producer 发出 required `missing_periods`。
+- `dayu/fins/pipelines/sec_download_filing_workflow.py` — **已实现，待验证/必要时仅修失败**：current dirty diff 已把 `list_filing_files` typed provider failure 投影为恰好一个 FAILED filing row；本 amendment 不要求再次改写该 catch。
 
 ### 5.3 Existing dirty test files permitted for review-fix only
 
@@ -177,16 +204,17 @@ They remain part of the underlying Slice 2 diff and validation union, but no fol
 
 The existing dirty `tests/cli/test_output.py` and `tests/service/test_fins_wait_adapter.py` are frozen; they are regression-run only because CLI/wait mechanical projection is unchanged.
 
-### 5.4 New test additions proved necessary by owner placement
+### 5.4 Additional in-scope test owners proved necessary by owner placement
+
+这些测试文件的 current dirty assertions 必须保留；恢复后先运行既有矩阵，仅补齐 owner 迁移所需的 child PDF/Docling 与 parent same-source assertions，并收敛已知 unknown-`httpx` 构造失败，不机械重写已通过用例。
 
 - `tests/fins/test_cninfo_downloader.py` — CNINFO transport category/retryability/safe-log owner tests.
 - `tests/fins/test_hkexnews_downloader.py` — HKEX transport/protocol category/retryability/safe-log owner tests.
-- `tests/fins/test_cn_download_workflow.py` — exact provider/storage/execution propagation and rebuild producer contract.
+- `tests/fins/test_cn_download_workflow.py` — exact provider/storage/execution propagation、rebuild producer contract，以及直接子 workflow PDF/Docling closed projection 与父 workflow 同源复用测试。
 - `tests/fins/test_sec_pipeline_download_stream.py` — historical-submissions provider failure propagation at the actual collection workflow boundary.
 
 ### 5.5 Explicitly excluded after evaluation
 
-- `dayu/fins/pipelines/cn_download_filing_workflow.py`: document-local continuation owner; not the operation failure provenance bug.
 - `dayu/fins/pipelines/cn_download_protocols.py` and `cn_download_models.py`: no new error envelope/model is needed when exceptions retain their type.
 - `dayu/fins/pipelines/sec_sc13_filtering.py`: the accepted mis-modeling is fixed upstream by making `fetch_sc13_party_roles` propagate provider failures. The later rejection-artifact fallback occurs only after an independently established business direction mismatch and is not the cause of that rejection.
 - `dayu/fins/pipelines/sec_download_workflow.py`: ticker-level workflow already allows operation-fatal typed provider exceptions to escape and already continues after a filing terminal row.
@@ -203,7 +231,7 @@ The existing dirty `tests/cli/test_output.py` and `tests/service/test_fins_wait_
 
 ### 6.2 CNINFO/HKEX provider owners
 
-This is an explicit from-zero retry-loop refactor in both synchronous downloaders, not a helper-only patch. `_http_get_json`, CNINFO `_http_post_form`, and `_http_download_bytes` must separate request transport from response parsing/validation:
+The accepted change was an explicit from-zero retry-loop refactor in both synchronous downloaders, not a helper-only patch；**the current dirty diff already contains that refactor**. 恢复 implementation 后以本节分类表验证 `_http_get_json`、CNINFO `_http_post_form` 与 `_http_download_bytes`；只有测试、类型检查或静态扫描证明偏离时才做最小修正，不得重新改写已满足下列边界的 loop：
 
 1. Validate method inputs and provider/API preconditions before entering the retry loop. Those `ValueError` instances remain API misuse and are never converted to provider failure.
 2. Inside the loop, perform only the HTTP request plus `raise_for_status`. Catch `httpx` transport/status exceptions, classify them, log only operation/attempt/category, and retry only when the classification says retryable.
@@ -224,14 +252,21 @@ Closed classification table:
 | other captured `httpx.HTTPError` | `UNKNOWN` | yes | Bounded retry; fixed safe message |
 | pre-request argument/API misuse `ValueError` | not provider | n/a | Preserve `ValueError` unchanged |
 
+CN/HK 对 4xx 的“一次请求后立即停止”是本 WU 明确采用的 fail-fast non-retryable policy，不是从 SEC retry loop 推导出的共享规则。SEC 当前对 4xx 的既有 retry-policy 差异不在这次 CN filing-owner amendment 中扩张或统一；如需改变 SEC policy，必须由另一个明确授权的 plan amendment 处理。
+
 Retry exhaustion raises `FinsDownloadProviderError` with the correct source, closed category/retryability, and a fixed source-specific message. Retry/HEAD diagnostics contain only operation kind, attempt count, and category/fixed event; no URL, request params, raw exception, response body, contact, or absolute path.
 
 ### 6.3 CN/HK workflow and adapter owners
 
+Current dirty diff 已完成 operation-terminal typed propagation、`_is_cancel_requested` no-catch pass-through、adapter strict projection 与 rebuild strict consumption；这些行为恢复后只验证。尚待代码实现的是把既有 parent-local document failure mapping 移到 `cn_download_filing_workflow.py` 的正确 owner，并让 child/parent 直接复用。
+
 - In rebuild, company/discovery, outer operation, and final cancel-check paths, `CnDownloadCancelledError` alone follows the existing cancelled state. Every other `Exception` propagates unchanged instead of becoming `status="failed"`.
 - `CnPipeline.download_stream` and `collect_cn_download_result_from_events` remain no-catch pass-through layers. `CnDownloadAdapter.download` also does not catch or rebuild those exceptions; it removes the `UNKNOWN/retryable=True` construction and strictly validates only actual result mappings.
 - `_is_cancel_requested` does not wrap exception text. `CnDownloadCancelledError` preserves cancellation; `FinsDownloadProviderError` and `OSError` preserve provider/storage; every other exception propagates to runtime's execution classification.
-- The in-scope per-candidate catch remains document-local, but replaces `_reason_code_from_exception`/`str(exc)` with one closed helper: provider -> category-derived stable reason plus `safe_message`; `OSError` -> `storage_failed` plus fixed safe text; other -> `filing_execution_failed` plus fixed safe text. Then delete `_reason_code_from_exception` and prove no references remain.
+- `cn_download_filing_workflow.py` owns one public direct helper `project_cn_filing_failure(error: Exception) -> tuple[str, str]`. It directly maps provider -> category-derived stable reason plus `safe_message`; `OSError` -> `storage_failed` plus fixed safe text；other -> `filing_execution_failed` plus fixed safe text。朴素 tuple 返回值足以对应现有两个 row 字段，不引入 dataclass、callback、facade、新 schema 或共享模块。
+- **PDF exception boundary calls the helper exactly once；both `FILE_FAILED` and `FILING_FAILED` must copy both values of that single `(reason_code, reason_message)` pair without override or recomputation.** Docling exception boundary uses the same helper for `FILING_FAILED`. `CnDownloadCancelledError` remains an earlier explicit branch and never becomes a failed row.
+- `cn_download_workflow.py` imports that public helper directly for only the document-local exceptions that escape the child generator. Delete the parent-local `_candidate_failure_facts` and obsolete `_reason_code_from_exception`; prove there is exactly one mapping definition and no duplicate `isinstance` classification across the two modules.
+- The helper is intentionally public at the same pipeline layer because two direct producers consume the same row semantics. A private cross-module import would hide a real dependency；a forwarding wrapper in the parent would create a second apparent owner without adding semantics。
 - Business document failures already represented by filing rows continue to be aggregated; this amendment does not turn every failed row into operation failure.
 - Runtime production code remains unchanged because its current typed mapping is already the correct owner; tests prove that all three exception families reach it.
 
@@ -241,6 +276,8 @@ Retry exhaustion raises `FinsDownloadProviderError` with the correct source, clo
 - The adapter requires the key and exact list-of-non-empty-text type on every path. No `request.rebuild_local_artifacts` missing-key special case remains.
 
 ### 6.5 SEC provider/pipeline owners
+
+Current dirty diff 已包含本节的 SEC auxiliary typed propagation、`sec_download_filing_workflow` filing-local catch、historical-submissions propagation、6-K safe diagnostic 与 HEAD optional behavior。恢复后以 §8.4 direct-owner tests 验证；只有真实失败才在原 allowlist owner 内最小修正，不得把已正确行为当作待新增功能重写。
 
 - Browse company, browse XML/submissions, SC13 role, and historical-submissions failures propagate as operation-level typed provider errors.
 - The three `_try_fetch_*` file-evidence helpers propagate typed provider errors through `list_filing_files`; they never return `[]` for unavailable evidence.
@@ -281,8 +318,10 @@ For each provider, inject timeout, a non-timeout network failure, client/server 
 - Rebuild provider/storage/execution failures each propagate through generator -> pipeline stream -> collector -> adapter; the exact object/cause is not replaced by a failed result.
 - Cancellation checker raising `CnDownloadCancelledError` remains cancelled; raising `FinsDownloadProviderError` or `OSError` preserves the exact object; raising another exception reaches runtime as execution without its text entering public output.
 - A fake/legacy workflow result containing `status="failed"` without a typed exception fails strict projection as `ValueError`; adapter must not guess provider. This test was already present in the original amendment and remains binding.
-- A document-local provider failure uses `safe_message`; a path-bearing `OSError` and raw execution exception each produce fixed safe failed-row text, exactly one failed row, and permit other candidates to proceed.
-- `rg`/AST proves no operation-terminal `_build_result(status="failed", message=str(exc))`, no per-candidate `reason_message=str(exc)`, and no remaining `_reason_code_from_exception` definition/reference.
+- Directly call `run_cn_download_single_filing_stream` at the child owner. For both PDF and Docling boundaries, inject separately: a preconstructed `FinsDownloadProviderError`, a path-bearing `OSError`, and a raw execution exception containing URL/contact/payload canaries. Assert exact category-derived/fixed reason, fixed safe message, exactly one filing terminal, and absence of raw exception text；**PDF additionally asserts one helper call and exact equality of both `reason_code` and `reason_message` across `FILE_FAILED` and `FILING_FAILED`—neither field may retain a PDF-specific override.**
+- For the provider cases, assert the typed error's `safe_message` is used and `transport_category` appears only through the category-derived reason. For path-bearing `OSError` and raw execution exceptions, assert absolute path、URL、contact、payload marker 与 traceback 均不出现在 event/row/log serialization。
+- Exercise the parent workflow leak catch with the same three preconstructed exception families and assert its `(reason_code, reason_message)` exactly equals direct `project_cn_filing_failure` output；a later candidate must still complete。This proves same-source reuse instead of duplicated behavior。
+- `rg`/AST proves no operation-terminal `_build_result(status="failed", message=str(exc))`, no PDF/Docling/per-candidate `reason_message=str(exc)`, exactly one `project_cn_filing_failure` definition, parent direct import/use with no forwarding wrapper, and no remaining `_candidate_failure_facts` / `_reason_code_from_exception` definition or reference.
 
 ### 8.3 Rebuild strictness
 
@@ -333,13 +372,13 @@ python -m compileall dayu tests
 git diff --check
 ```
 
-Generate one affected-union coverage data set, then run `coverage report --include=<production-file> --fail-under=80` separately for every production file modified by the review-fix, including the five newly allowlisted production files. `sec_download_filing_workflow.py` must be covered by direct owner tests, not only indirectly by the ticker pipeline. Do not use aggregate percentage to hide a low file.
+Generate one affected-union coverage data set, then run `coverage report --include=<production-file> --fail-under=80` separately for every production file modified by the review-fix, including all six additional in-scope production owners whose current dirty or resumed implementation changes remain in the Slice 2 diff. Both `cn_download_filing_workflow.py` and `sec_download_filing_workflow.py` must be covered by direct owner tests, not only indirectly by their ticker pipelines. Do not use aggregate percentage to hide a low file.
 
 Static scans must prove:
 
-- Before editing, inventory existing assertions with `rg -n 'url=|error=|str\(exc\)|RuntimeError' tests/fins/test_cninfo_downloader.py tests/fins/test_hkexnews_downloader.py tests/fins/test_sec_downloader.py tests/fins/test_sec_pipeline_download.py tests/fins/test_sec_pipeline_download_stream.py`; update only assertions whose old raw diagnostic/error type contradicts the accepted typed contract.
+- Before editing, inventory existing assertions with `rg -n 'url=|error=|str\(exc\)|RuntimeError' tests/fins/test_cninfo_downloader.py tests/fins/test_hkexnews_downloader.py tests/fins/test_cn_download_workflow.py tests/fins/test_sec_downloader.py tests/fins/test_sec_pipeline_download.py tests/fins/test_sec_pipeline_download_stream.py`; update only assertions whose old raw diagnostic/error type contradicts the accepted typed contract.
 - no `url=`, `error={exc}`, raw exception interpolation, contact canary, raw/provider payload marker, traceback, or absolute workspace path in changed logging/public projection lines;
-- CN/HK operation-terminal code has no `message=str(exc)` result construction, per-candidate rows have no `reason_message=str(exc)`, `_reason_code_from_exception` is absent, and adapter has no blanket `status="failed"` provider guess;
+- CN/HK operation-terminal code has no `message=str(exc)` result construction；PDF、Docling 与 parent per-candidate rows/events have no `reason_message=str(exc)`；`project_cn_filing_failure` has exactly one definition in `cn_download_filing_workflow.py` and one direct parent import/use；`_candidate_failure_facts` / `_reason_code_from_exception` are absent；adapter has no blanket `status="failed"` provider guess;
 - rebuild producer always emits `missing_periods` and adapter contains no rebuild missing-key fallback;
 - SEC browse/history/SC13 provider catches do not return `None`, continue, or create a business outcome; the three file-evidence helpers do not return `[]`; `sec_download_filing_workflow` and 6-K preview each have exactly the approved filing-local FAILED projection and no rejection/skip fallback;
 - CLI/wait have no filesystem scan, raw dict failure parsing, or private storage import;
@@ -349,7 +388,7 @@ Static scans must prove:
 
 Stop implementation and request another plan amendment before any out-of-scope edit if:
 
-1. Correctness requires modifying `cn_download_filing_workflow.py`, CN protocols/models, `sec_sc13_filtering.py`, any SEC workflow file other than the newly allowlisted `sec_download_filing_workflow.py`, runtime production code, CLI/service/storage code, or adding a shared provider-error module.
+1. `cn_download_filing_workflow.py` is now explicitly authorized only for the owner changes in §§3.2/6.3. Stop if correctness additionally requires CN protocols/models、任何其它 CN workflow、`sec_sc13_filtering.py`、任何 SEC workflow file other than the allowlisted `sec_download_filing_workflow.py`、runtime production code、CLI/service/storage code，或新增 shared failure module。若 `project_cn_filing_failure` 的最小直接接口不足，也必须再次 amendment，不得增加 private import、wrapper 或 duplicate mapper。
 2. A stream consumer contract requires `PIPELINE_COMPLETED(status="failed")` rather than typed exception propagation; do not invent a string/JSON compatibility envelope.
 3. Correctness requires a new per-document transport field or another public row schema change. Category-derived use of the existing `reason_category` is allowed; a new schema is not.
 4. An SEC failure cannot be placed into exactly one approved class: operation-fatal (browse company/SC13/history), filing-local FAILED (three file-evidence helpers/6-K preview), or metadata-only optional (HEAD). Do not substitute empty evidence or widen a filing failure to operation-fatal.
@@ -360,13 +399,16 @@ Stop implementation and request another plan amendment before any out-of-scope e
 
 ## 11. Docs, residual risks, and completion state
 
-- Docs decision: no README or accepted base-plan edit in this gate. This standalone amendment is the only new file.
+- Docs decision: no README or accepted base-plan edit in this gate. This pass revises only this already committed standalone amendment；no other artifact、production file or test file is authorized before re-review acceptance。
 - R03/R04/R05/R08/R09 are closed as rejected with the controller's reasons and create no implementation scope.
-- Document-local provider category granularity remains represented by category-derived `reason_category` plus fixed safe row text, not the operation public failure envelope. This is fixed in current Slice 2 review-follow-up and needs no schema expansion.
+- CN/HK document-local provider category granularity is owned by `cn_download_filing_workflow.project_cn_filing_failure` and remains represented by category-derived existing reason field plus fixed safe row text, not the operation public failure envelope. PDF、Docling 与 parent leak catch all consume that one source of truth；no schema expansion is needed。
+- Stop-condition trigger evidence is `450 passed / 6 failed` from the focused implementation run. Four failures proved the previously excluded child owner still emitted `pdf_download_failed` instead of the intended closed projection；this revision fixes the plan scope/owner error。The remaining two failures are unknown-`httpx` test-construction issues and are classified `fixed in current slice` once implementation resumes；they do not authorize production scope expansion。
+- CN/HK filing-local continuation has one explicit owner: `cn_download_filing_workflow` produces the safe PDF/Docling failed events/rows，while `cn_download_workflow` directly reuses its public helper only for exceptions that actually escape the child generator。
 - Filing-local continuation has two explicit SEC owners: file-list evidence failure at `sec_download_filing_workflow`, and 6-K preview `DOWNLOAD_FAILED` at `sec_pipeline`; tests must prove unique terminal row and later-filing continuation for both.
 - Optional HEAD degradation remains a deliberate metadata-only behavior; tests must prove it cannot alter disposition.
 - Historical submissions are operation-fatal even after earlier history payloads were collected; because candidate collection precedes filing mutation, this avoids publishing a silently incomplete selection. It remains a fixed-in-current-slice risk covered by owner tests.
 - Retry-loop refactor risk is fixed in current slice by call-count/category/inheritance tests; no compatibility path is retained.
-- Completion status: amendment revision drafted; not accepted until both original reviewers re-review. No product/test implementation may resume before that gate.
+- Stop-condition re-review adjudication is complete with no blocker: MiMo F01/F02/F03 are respectively resolved by the no-rewrite retry-loop status、the already-pass-through cancel-check status、and the already-implemented SEC filing-owner status；DS F01 is resolved by per-owner implementation-state labels，DS F02 is resolved by the explicit CN/HK-only 4xx fail-fast policy with no SEC expansion，and DS F03 is resolved as already specified by the single helper-pair requirement for both PDF terminal events。No finding changes owner、allowlist、schema or stop-condition scope。
+- Completion status: `plan-review-20260810-slice2-cn-owner-mimo.md` is PASS and `plan-review-20260810-slice2-cn-owner-ds.md` is PASS-WITH-RISKS with no blocking finding；their six findings are adjudicated in §4 and clarified here。Product/test implementation remains paused under the current doc-only instruction until controller authorizes resume。
 
 Artifact path: `docs/gateflow/wu-cli-download-01-slice2-plan-amendment-20260810-030216.md`
