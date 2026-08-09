@@ -79,9 +79,9 @@ OLD `/Users/leo/workspace/dayu-agent` 对照结论：OLD 已把 SEC/CN `rebuild`
 核心 contract：
 
 - `FinsDownloadSource`：`SEC | CNINFO | HKEXNEWS`，由 canonical ticker market 唯一解析；公开 CLI 不接收 source。
-- `FinsDownloadDateRange`：`start_bound: date | None`、`end_bound: date | None`、`start_is_explicit: bool`、`end_is_explicit: bool`。year/year-month/full-date 在此一次性展开为 inclusive bound；source workflow 不再反解析字符串或从日期值猜 explicitness。
+- `FinsDownloadDateRange`：`start_bound: date | None`、`end_bound: date | None`、`start_is_explicit: bool`、`end_is_explicit: bool`。year/year-month/full-date 在此一次性展开为 inclusive bound；`__post_init__`拥有explicit要求对应bound非空与`start_bound <= end_bound`不变量，允许非空default bound对应explicit=False；source workflow不再反解析字符串或从日期值猜explicitness。
 - `FinsDownloadRequest`：`normalized_ticker`、resolved source、canonical explicit forms、date range、`overwrite_existing`、`rebuild_local_artifacts`。不含 `rebuild_processed`。
-- `build_fins_download_request(...)`：download 专用、唯一 Fins request parser。先做长度/数量/空项/CSV ticker/start-after-end 校验，再调用 ticker/domain form owner；错误抛 `FinsDownloadUsageError`，携带中文 actionable message。`dayu.service.fins_direct.build_direct_download_request(...)` 是不构造 runtime 的 product boundary：它把 CLI 显式参数映射给该 parser并返回typed request，CLI只调用Service API并机械映射exit 2，保持 `UI -> Service -> Fins` 依赖方向。
+- `build_fins_download_request(...)`：download 专用、唯一 Fins request parser。先做长度/数量/空项/CSV ticker校验，再调用ticker/domain form/date-range owner；`start > end`与explicit/bound不变量由`FinsDownloadDateRange`统一校验，builder不保留重复判断。错误抛 `FinsDownloadUsageError`，携带中文 actionable message，并保持当前builder可观察文本。`dayu.service.fins_direct.build_direct_download_request(...)` 是不构造 runtime 的 product boundary：它把 CLI 显式参数映射给该 parser并返回typed request，CLI只调用Service API并机械映射exit 2，保持 `UI -> Service -> Fins` 依赖方向。
 - forms/date/ticker 边界使用命名常量，不使用魔法数。当前 parser 没有 public `--limit`；计划不新增该 option。DL-F01 中的 limit 落为 ticker/date 单值长度、form item 长度与 form item count（最多 100）的 invocation bounds。
 - CN/HK fiscal-period alias 归一从 `cn_form_utils.py::_TOKEN_TO_PERIOD` 迁到 `dayu/fins/domain/filing_semantics.py` 的公共业务值 parser；迁移后删除该私有 mapping，`cn_form_utils.resolve_target_periods` 与 download request builder 都调用同一 domain parser。SEC 复用现有 domain SEC form parser。这样 request validation 与 workflow 不维护两套集合。
 
@@ -229,7 +229,7 @@ Slice 1仍是一个Gateflow slice，但实施顺序不可交换，并设置独�
 - `tests/service/test_fins_direct.py`、`tests/service/test_fins_wait_adapter.py`、`tests/fins/test_fins_ingestion_tools.py`：CLI/awaiting入口复用同一个typed builder并从新真源import。
 - `tests/fins/test_fins_ingestion_runtime.py`：request/adapter schema、counts invariant、rebuild无processed mutation。
 - `tests/fins/test_sec_pipeline_download.py`、`tests/fins/test_sec_pipeline_download_stream.py`：显式SC13边界、non-deletion、SEC local rebuild。
-- `tests/fins/test_cn_download_runtime.py`、`tests/fins/test_cn_download_workflow.py`：CN/HK local rebuild与missing-period分类。
+- `tests/fins/test_cn_pipeline.py`、`tests/fins/test_cn_download_runtime.py`、`tests/fins/test_cn_download_workflow.py`：CN/HK local rebuild与missing-period分类；`test_cn_pipeline.py` 仅用于更新 required `start_is_explicit` 的真实 `CnPipeline.download/download_stream` call sites，并验证 `start_date` 非空但 `start_is_explicit=False` 时仍启用默认业务限制，不扩大production scope或其它测试职责。
 
 **Stop condition**
 
@@ -435,6 +435,7 @@ pytest tests/cli/test_arg_parsing.py \
   tests/fins/test_sec_downloader.py \
   tests/fins/test_sec_pipeline_download.py \
   tests/fins/test_sec_pipeline_download_stream.py \
+  tests/fins/test_cn_pipeline.py \
   tests/fins/test_cn_download_runtime.py \
   tests/fins/test_cn_download_workflow.py \
   tests/fins/test_cn_docling_process.py \
@@ -460,6 +461,7 @@ git diff --check
 - production download path无 `rebuild_processed`，但preprocess/upload现有同名字段保留；
 - download专用builder拒绝CSV ticker，`_parse_ticker_csv` body与upload/preprocess alias调用保持；`cn_form_utils.py`无 `_TOKEN_TO_PERIOD`；
 - SEC普通download无stale cleanup调用；
+- `FinsDownloadDateRange.start_is_explicit` 从adapter经SEC/CN pipeline穿透到workflow；下层使用required boolean，不从 `start_date is not None` 反推；pipeline-layer direct owner tests绕过builder覆盖 `start_date` 非空但 `start_is_explicit=False` 时SEC仍可按policy扩窗且CN仍启用默认业务限制；date-range owner tests断言explicit=True要求对应bound非空、双bound要求start<=end、非空bound+explicit=False合法，非法组合抛`FinsDownloadUsageError`；
 - Docling production path无 `asyncio.to_thread(convert_pdf...)`；
 - AST证明runner调用 `InterruptibleProcessHandle.start()`且production无 `.spawn()` wrapper/call；`dayu/runtime/interruptible_process.py`未修改；
 - `rg`穷举 `SourceDocumentRepositoryProtocol` implementation、`FsSourceDocumentRepository` composition subclass/test spy；wrapper/core均实现published+staged classification且无 `getattr`/compat shim；
@@ -590,6 +592,29 @@ DL-G01～G04合法终态后，按`docs/cli_ci.md` download mandatory inventory�
 ### 14.6 Revision verification gate
 
 本次revision必须满足：只修改本plan artifact；两份review artifact与产品代码零diff；`git diff --check`通过；read-only `rg`验证plan内API名、真实rebuild签名、FinsDownloadRequest callsite清单、Protocol实现/测试subclass清单、runtime文件“可用不可改”及四slice/allowed files自洽。若rereview发现新correctness/stability finding，继续在本节追加disposition/revision，不删除历史裁决。
+
+### 14.7 Slice 1 code-review test-only amendment disposition
+
+本 amendment 只解除 DL-R01 required boolean 迁移的测试 call-site blocker，不恢复产品修复，也不扩大 Slice 1 production scope。
+
+| 项目 | Disposition | 直接证据与约束 |
+|---|---|---|
+| Scope expansion | **接受：仅增加 `tests/fins/test_cn_pipeline.py`** | `rg -n "pipeline\\.download\\(|pipeline\\.download_stream\\(" tests/fins/test_cn_pipeline.py` 的真实调用点为 `337`、`402`、`454`；三处均已显式传入非空 `start_date`，迁移时必须分别传 `start_is_explicit=True`。`CnPipeline.download/download_stream` 改为required boolean后，这三个调用点必须同步，否则全量pyright/tests失败。该文件只允许迁移这三处调用和增加pipeline-layer direct contract test，不允许顺带重构或扩展其它CN测试行为。 |
+| Pipeline-layer反例 | **接受并限定语义** | `start_date`非空且`start_is_explicit=False`只用于绕过当前builder、直接调用pipeline的owner contract test，证明SEC/CN下游消费typed fact而非从日期值反推；它不是公开端到端合法输入示例，也不得据此放宽builder observable behavior。SEC应仍可按policy扩窗，CN应仍启用默认业务限制。 |
+| Default / compatibility | **拒绝** | 给 `start_is_explicit` 默认值、从 `start_date is not None` 反推，或增加兼容overload/wrapper，都会重新丢失typed explicitness真源并违反§5.1、§5.3及DL-R01主控裁决；因此必须使用下层朴素required boolean并更新全部真实调用点。 |
+| Typed contract invariant | **接受OQ-1并归还owner** | 当前`FinsDownloadDateRange`没有`__post_init__`。恢复实现时必须由该typed contract owner校验：`start_is_explicit=True`要求`start_bound`非空；`end_is_explicit=True`要求`end_bound`非空；两个bound均存在时要求`start_bound <= end_bound`。允许bound非空且对应explicit为False，以表达未来默认bound和pipeline direct owner test。非法组合抛`FinsDownloadUsageError`，不得把校验下放到builder之外的adapter/pipeline/workflow；builder删除自身重复的`start > end`判断，改为构造date range并由owner抛出同类型、同可观察中文错误，保持当前builder行为。对应owner tests使用既有Slice 1 allowed test files，不扩scope。 |
+| Upload test freeze | **接受并设hard stop** | `tests/fins/test_cn_pipeline.py`中所有现有`test_upload_*`测试函数及其fixture/helper区域必须零diff；code rereview必须用该文件的unified diff逐hunk核对，任何upload测试区域变更均视为scope violation并退回。 |
+| Production scope | **不变** | 既有Slice 1 allowed production files保持不变；不引入上层request、compat shim或新production facade。 |
+| Gate state | **plan amendment fix待原reviewer rereview/acceptance** | 当前未提交产品/test diff保持冻结。两位原reviewer rereview通过并形成accepted amendment commit之前，不得恢复DL-R01/DL-R02产品或测试修复。review artifacts、首版implementation artifact保持不可修改。 |
+
+Implementation checklist：
+
+1. `tests/fins/test_cn_pipeline.py:337`、`:402`、`:454` 三个现有显式日期调用均传 `start_is_explicit=True`；另增的False反例必须标为pipeline-layer direct contract test，不经builder。
+2. `tests/fins/test_cn_download_runtime.py::_RecordingPipeline.download` 同步required boolean签名；`tests/fins/test_cn_download_workflow.py::_collect_events`、该文件直接`pipeline.download`及全部相关调用同步显式boolean。两文件已在allowlist内，不再扩scope；全量pyright负责兜底遗漏。
+3. `FinsDownloadDateRange.__post_init__`在owner处实现explicit/bound与range不变量，builder删除重复range判断并委托owner；在既有allowed tests覆盖合法默认bound及三类非法组合，builder现有错误类型与中文可观察行为保持。
+4. `tests/fins/test_cn_pipeline.py`的upload测试区域零diff；code rereview逐hunk检查。
+
+Amendment验证只允许检查plan/artifact diff、上述direct rg证据与 `git diff --check`；不得借plan gate运行真实CLI或修改产品/test。
 
 ## 15. 当前 plan gate 结论
 
