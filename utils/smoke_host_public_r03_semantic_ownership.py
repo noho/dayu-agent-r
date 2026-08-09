@@ -53,10 +53,15 @@ from dayu.host.accepted_result_projection import (
 from dayu.host.compact_material import (
     build_compact_material_pack,
     build_pre_dispatch_compact_material_view,
-    conversation_compact_input_vnext_from_material_pack,
     select_compact_segment,
 )
-from dayu.host.compaction import CompactSegmentTrigger
+from dayu.host.compaction import (
+    CompactSegmentTrigger,
+    CompactSourceKindV4,
+    CompactionRequest,
+)
+from dayu.host.context_budget import BudgetEstimate
+from dayu.host.context_policy import ContextCompactionTriggerSource
 from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.connection import open_host_durable_store
 from dayu.host.durable.event_log import EventClass, EventLogRow, EventLogStore
@@ -75,8 +80,10 @@ from dayu.host.durable.tool_trace import (
 from dayu.host.durable.transaction import HostTransaction
 from dayu.host.memory import (
     CONVERSATION_MEMORY_CONSUMER_ID,
+    default_memory_projection_policy,
     digest_memory_projection_policy,
 )
+from dayu.host.context_governance import compact_output_caps_v4_from_memory_policy
 from dayu.host.memory_repair import catch_up_conversation_memory_projection
 from dayu.host.open_host import _tool_trace_sink_options_from_open_host_options
 from dayu.host.payload_resolution import (
@@ -1274,11 +1281,41 @@ def _compact_source_notes(
         previous_compacted_view=view.previous_compacted_view,
         previous_compacted_readable_view=view.previous_compacted_readable_view,
     )
-    compact_input = conversation_compact_input_vnext_from_material_pack(pack)
+    compact_request = CompactionRequest(
+        trigger_source=ContextCompactionTriggerSource.PROACTIVE,
+        session_id=run.session_id,
+        run_id=run.run_id,
+        attempt_id=None,
+        execution_id=None,
+        memory_snapshot_cursor=None,
+        material_pack=pack,
+        segment_selection=selection,
+        evidence_backed_fact_refs=(),
+        recent_raw_turn_refs=(run.input_event_id,),
+        older_raw_turn_refs=(),
+        existing_episode_summary_refs=(),
+        budget_before_compact=BudgetEstimate(
+            estimated_input_tokens=100,
+            input_budget_tokens=4096,
+            soft_threshold_tokens=3200,
+            hard_threshold_tokens=3900,
+            safety_margin_tokens=200,
+            estimator_digest=sha256_digest_json(
+                {"owner": "r03-smoke-compact-input"}
+            ),
+            overage_reason=None,
+        ),
+        output_caps=compact_output_caps_v4_from_memory_policy(
+            default_memory_projection_policy()
+        ),
+    )
+    compact_input = compact_request.compact_input
     notes = tuple(
-        item.source_note
-        for item in compact_input.evidence_material
-        if item.source_note is not None
+        source_line.removeprefix("来源：")
+        for item in compact_input.source_boundary
+        if item.source_kind is CompactSourceKindV4.EVIDENCE_MATERIAL
+        for source_line in item.readable_text.splitlines()
+        if source_line.startswith("来源：")
     )
     if len(notes) == 0:
         raise RuntimeError("compactor evidence source notes are missing")

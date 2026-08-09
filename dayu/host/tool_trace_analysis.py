@@ -19,6 +19,7 @@ from dayu.host.tool_trace_analysis_contracts import (
     ToolTraceAnalysisReport,
     ToolTraceAnalysisSource,
     ToolTraceAnalysisSummary,
+    ToolTraceCompactorResponseSummary,
     ToolTraceEvidence,
     ToolTraceFinding,
     ToolTraceLimitation,
@@ -47,6 +48,7 @@ _MARKDOWN_SECTIONS = (
     "Run / attempt / tool-call chain",
     "Limitations",
     "Recommended next actions",
+    "Compactor responses",
 )
 
 
@@ -58,7 +60,7 @@ def analyze_tool_trace(
 
     :param source: 已由 public boundary 校验的显式输入来源。
     :param policy: 本次实际诊断阈值。
-    :returns: immutable schema version 1 report。
+    :returns: immutable fresh schema version 2 report。
     :raises TypeError: 参数类型错误时抛出。
     :raises ToolTraceAnalysisInputError: 输入读取、hot schema 或 cold snapshot
         无法建立可信边界时抛出。
@@ -125,6 +127,7 @@ def render_tool_trace_analysis_markdown(
         _render_vendor_debugging(report.vendor_debugging),
         _render_payload_rankings(report.payload_rankings),
         _render_runs(report.runs),
+        _render_compactor_responses(report.compactor_responses),
         _render_limitations(report.limitations),
         _render_recommended_actions(report.findings),
     ]
@@ -162,6 +165,10 @@ def _report_json(report: ToolTraceAnalysisReport) -> Mapping[str, JsonValue]:
             _signal_coverage_json(item) for item in report.signal_coverage
         ],
         "runs": [_run_json(item) for item in report.runs],
+        "compactor_responses": [
+            _compactor_response_json(item)
+            for item in report.compactor_responses
+        ],
         "payload_rankings": [
             _payload_measure_json(item) for item in report.payload_rankings
         ],
@@ -171,6 +178,57 @@ def _report_json(report: ToolTraceAnalysisReport) -> Mapping[str, JsonValue]:
         "findings": [_finding_json(item) for item in report.findings],
         "limitations": [
             _limitation_json(item) for item in report.limitations
+        ],
+    }
+
+
+def _compactor_response_json(
+    item: ToolTraceCompactorResponseSummary,
+) -> Mapping[str, JsonValue]:
+    """按安全白名单投影 compactor response summary。
+
+    :param item: typed compactor response summary。
+    :returns: 不含 header、credential、endpoint 或 raw payload 的 JSON object。
+    :raises: 无。
+    """
+
+    request_identity = item.runner_request_identity
+    return {
+        "parent_host_run_id": item.parent_host_run_id,
+        "disposition": item.disposition.value,
+        "terminal_event_id": item.terminal_event_id,
+        "terminal_event_sequence": item.terminal_event_sequence,
+        "compaction_operation_id": item.compaction_operation_id,
+        "compaction_attempt_number": item.compaction_attempt_number,
+        "proposal_manifest_ref": item.proposal_manifest_ref,
+        "proposal_manifest_digest": item.proposal_manifest_digest,
+        "effective_provider": item.effective_provider,
+        "effective_model": item.effective_model,
+        "runner_request_identity": (
+            None
+            if request_identity is None
+            else {
+                "run_id": request_identity.run_id,
+                "attempt_id": request_identity.attempt_id,
+                "execution_id": request_identity.execution_id,
+                "iteration_id": request_identity.iteration_id,
+                "iteration_index": request_identity.iteration_index,
+                "runner_call_index": request_identity.runner_call_index,
+                "client_correlation_id": request_identity.client_correlation_id,
+            }
+        ),
+        "provider_request_id_availability": (
+            None
+            if item.provider_request_id_availability is None
+            else item.provider_request_id_availability.value
+        ),
+        "provider_request_id": item.provider_request_id,
+        "accepted_evidence_facts": [
+            {
+                "claim": fact.claim,
+                "canonical_evidence_refs": list(fact.canonical_evidence_refs),
+            }
+            for fact in item.accepted_evidence_facts
         ],
     }
 
@@ -583,6 +641,79 @@ def _render_runs(runs: tuple[ToolTraceRunSummary, ...]) -> str:
             f"tool awaiting={item.tool_awaiting_count}, "
             f"run waiting={item.run_waiting_count}"
         )
+    return "\n".join(lines)
+
+
+def _render_compactor_responses(
+    responses: tuple[ToolTraceCompactorResponseSummary, ...],
+) -> str:
+    """从 typed summaries 渲染 compactor response identity。
+
+    :param responses: canonical terminal 同源 response summaries。
+    :returns: 只含安全白名单字段的 Markdown section。
+    :raises: 无。
+    """
+
+    lines = [f"## {_MARKDOWN_SECTIONS[-1]}", ""]
+    if not responses:
+        lines.append("- 无已解析的 compactor response terminal。")
+        return "\n".join(lines)
+    for item in responses:
+        request_identity = item.runner_request_identity
+        request_identity_text = (
+            "null"
+            if request_identity is None
+            else (
+                f"run={request_identity.run_id}, "
+                f"attempt={request_identity.attempt_id or 'null'}, "
+                f"execution={request_identity.execution_id or 'null'}, "
+                f"iteration={request_identity.iteration_id}, "
+                f"iteration_index={request_identity.iteration_index}, "
+                f"runner_call_index={request_identity.runner_call_index}, "
+                f"client_correlation_id={request_identity.client_correlation_id}"
+            )
+        )
+        availability = (
+            "null"
+            if item.provider_request_id_availability is None
+            else item.provider_request_id_availability.value
+        )
+        lines.append(
+            "- "
+            f"parent_run=`{_markdown_escape(item.parent_host_run_id)}`, "
+            f"operation=`{_markdown_escape(item.compaction_operation_id)}`, "
+            f"attempt={item.compaction_attempt_number}, "
+            f"disposition=`{item.disposition.value}`, "
+            f"terminal_sequence={item.terminal_event_sequence}"
+        )
+        lines.append(
+            "  - response："
+            f"provider=`{_markdown_escape(item.effective_provider or 'null')}`, "
+            f"model=`{_markdown_escape(item.effective_model or 'null')}`, "
+            f"provider_request_id_availability=`{availability}`, "
+            f"provider_request_id=`{_markdown_escape(item.provider_request_id or 'null')}`"
+        )
+        lines.append(
+            "  - runner_request_identity："
+            f"`{_markdown_escape(request_identity_text)}`"
+        )
+        lines.append(
+            "  - binding："
+            f"terminal_event_id=`{_markdown_escape(item.terminal_event_id)}`, "
+            f"manifest_ref=`{_markdown_escape(item.proposal_manifest_ref)}`, "
+            f"manifest_digest=`{_markdown_escape(item.proposal_manifest_digest)}`"
+        )
+        for fact in item.accepted_evidence_facts:
+            refs_text = json.dumps(
+                fact.canonical_evidence_refs,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            lines.append(
+                "  - accepted_evidence_fact："
+                f"claim=`{_markdown_escape(fact.claim)}`, "
+                f"canonical_evidence_refs=`{_markdown_escape(refs_text)}`"
+            )
     return "\n".join(lines)
 
 

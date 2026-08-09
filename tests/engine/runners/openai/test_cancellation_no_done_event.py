@@ -107,7 +107,7 @@ async def test_cancel_mid_stream_no_done_event() -> None:
 
     msgs = [UserMessage(role=AgentMessageRole.USER, content="hi")]
     events: list[RunnerEvent] = []
-    async for ev in runner.call(msgs, make_options(stream=True), []):
+    async for ev in runner.call(msgs, make_options(stream=True), [], structured_output=None):
         events.append(ev)
     await runner.close()
 

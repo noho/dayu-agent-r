@@ -16,6 +16,14 @@ from pathlib import Path
 from typing import TypeVar
 
 from dayu.contracts.json_value import JsonValue
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    RunnerRequestIdentity,
+)
+from dayu.host.durable.tool_trace import (
+    CompactorResponseDisposition,
+    ResolvedCompactorEvidenceFact,
+)
 
 DEFAULT_TOOL_TRACE_LARGE_PAYLOAD_THRESHOLD_BYTES = 131_072
 """默认 large payload 诊断阈值。"""
@@ -435,6 +443,138 @@ class ToolTraceRunSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class ToolTraceCompactorResponseSummary:
+    """Tool Trace analysis 的安全 compactor response 摘要。
+
+    :param parent_host_run_id: compactor manifest 绑定的 parent Host Run id。
+    :param disposition: accepted 或 attempt-rejected terminal。
+    :param terminal_event_id: canonical terminal event id。
+    :param terminal_event_sequence: canonical terminal sequence。
+    :param compaction_operation_id: compaction operation id。
+    :param compaction_attempt_number: proposal attempt 序号。
+    :param proposal_manifest_ref: exact proposal manifest ref。
+    :param proposal_manifest_digest: exact proposal manifest digest。
+    :param effective_provider: 实际成功 response provider；no-success rejection
+        时为 ``None``。
+    :param effective_model: 实际成功 response model；no-success rejection 时为
+        ``None``。
+    :param runner_request_identity: 实际终结调用 request identity；no-success
+        rejection 时为 ``None``。
+    :param provider_request_id_availability: provider request id availability；
+        no-success rejection 时为 ``None``。
+    :param provider_request_id: provider-native request id；不可用或 no-success
+        rejection 时为 ``None``。
+    :param accepted_evidence_facts: resolver 公开 tuple 的 exact pass-through；
+        每项只含 accepted claim 与该事实的 canonical evidence refs。
+    """
+
+    parent_host_run_id: str
+    disposition: CompactorResponseDisposition
+    terminal_event_id: str
+    terminal_event_sequence: int
+    compaction_operation_id: str
+    compaction_attempt_number: int
+    proposal_manifest_ref: str
+    proposal_manifest_digest: str
+    effective_provider: str | None
+    effective_model: str | None
+    runner_request_identity: RunnerRequestIdentity | None
+    provider_request_id_availability: ProviderRequestIdAvailability | None
+    provider_request_id: str | None
+    accepted_evidence_facts: tuple[ResolvedCompactorEvidenceFact, ...]
+
+    def __post_init__(self) -> None:
+        """校验 response summary 的 binding 与 nullable identity cohesion。
+
+        :returns: 无返回值。
+        :raises TypeError: enum、identity 或字段类型非法时抛出。
+        :raises ValueError: binding 为空、数值非正或 nullable identity 分裂时抛出。
+        """
+
+        for field_name, value in (
+            ("parent_host_run_id", self.parent_host_run_id),
+            ("terminal_event_id", self.terminal_event_id),
+            ("compaction_operation_id", self.compaction_operation_id),
+            ("proposal_manifest_ref", self.proposal_manifest_ref),
+            ("proposal_manifest_digest", self.proposal_manifest_digest),
+        ):
+            _require_non_empty_text(value, field_name=field_name)
+        if not isinstance(self.disposition, CompactorResponseDisposition):
+            raise TypeError("disposition must be CompactorResponseDisposition")
+        _require_positive_int(
+            self.terminal_event_sequence,
+            field_name="terminal_event_sequence",
+        )
+        _require_positive_int(
+            self.compaction_attempt_number,
+            field_name="compaction_attempt_number",
+        )
+        _require_contract_tuple(
+            self.accepted_evidence_facts,
+            ResolvedCompactorEvidenceFact,
+            field_name="accepted_evidence_facts",
+        )
+        if (
+            self.disposition is CompactorResponseDisposition.ATTEMPT_REJECTED
+            and self.accepted_evidence_facts
+        ):
+            raise ValueError("attempt-rejected compactor response facts must be empty")
+        identity_values = (
+            self.effective_provider,
+            self.effective_model,
+            self.runner_request_identity,
+            self.provider_request_id_availability,
+        )
+        if self.runner_request_identity is None:
+            if self.disposition is CompactorResponseDisposition.ACCEPTED:
+                raise ValueError(
+                    "accepted compactor response summary requires successful identity"
+                )
+            if any(value is not None for value in identity_values):
+                raise ValueError(
+                    "no-success compactor response identity fields must all be null"
+                )
+            if self.provider_request_id is not None:
+                raise ValueError(
+                    "no-success compactor provider_request_id must be null"
+                )
+            return
+        if not isinstance(self.runner_request_identity, RunnerRequestIdentity):
+            raise TypeError(
+                "runner_request_identity must be RunnerRequestIdentity or None"
+            )
+        _require_optional_non_empty_text(
+            self.effective_provider,
+            field_name="effective_provider",
+        )
+        _require_optional_non_empty_text(
+            self.effective_model,
+            field_name="effective_model",
+        )
+        if self.effective_provider is None or self.effective_model is None:
+            raise ValueError("successful compactor provider/model must be present")
+        if not isinstance(
+            self.provider_request_id_availability,
+            ProviderRequestIdAvailability,
+        ):
+            raise TypeError(
+                "provider_request_id_availability must be ProviderRequestIdAvailability"
+            )
+        if (
+            self.provider_request_id_availability
+            is ProviderRequestIdAvailability.PRESENT
+        ):
+            _require_optional_non_empty_text(
+                self.provider_request_id,
+                field_name="provider_request_id",
+            )
+            if self.provider_request_id is None:
+                raise ValueError("present provider request id must have value")
+        elif self.provider_request_id is not None:
+            raise ValueError("unavailable provider request id must be null")
+
+
+@dataclass(frozen=True, slots=True)
 class ToolTraceVendorDebuggingBlock:
     """Provider/vendor 报障所需的最终冻结 block shape。
 
@@ -680,14 +820,15 @@ class ToolTraceAnalysisSummary:
 
 @dataclass(frozen=True, slots=True)
 class ToolTraceAnalysisReport:
-    """Tool Trace Analyzer schema version 1 的 immutable structured report。
+    """Tool Trace Analyzer fresh schema version 2 structured report。
 
-    :param schema_version: Analyzer report schema；固定为 ``1``。
+    :param schema_version: Analyzer report schema；固定为 ``2``。
     :param input: 本次输入快照说明。
     :param policy: 本次实际诊断阈值。
     :param summary: 顶层计数摘要。
     :param signal_coverage: 各类 typed signal coverage。
     :param runs: direct identity 聚合摘要。
+    :param compactor_responses: canonical terminal 同源的 compactor response 摘要。
     :param payload_rankings: verified byte measures top ranking。
     :param vendor_debugging: vendor debugging blocks；S2 合法值为空元组。
     :param findings: confirmed diagnostics。
@@ -700,6 +841,7 @@ class ToolTraceAnalysisReport:
     summary: ToolTraceAnalysisSummary
     signal_coverage: tuple[ToolTraceSignalCoverage, ...]
     runs: tuple[ToolTraceRunSummary, ...]
+    compactor_responses: tuple[ToolTraceCompactorResponseSummary, ...]
     payload_rankings: tuple[ToolTracePayloadMeasure, ...]
     vendor_debugging: tuple[ToolTraceVendorDebuggingBlock, ...]
     findings: tuple[ToolTraceFinding, ...]
@@ -713,8 +855,8 @@ class ToolTraceAnalysisReport:
         :raises ValueError: schema version 或 summary count 不一致时抛出。
         """
 
-        if self.schema_version != 1:
-            raise ValueError("analysis report schema_version must be 1")
+        if self.schema_version != 2:
+            raise ValueError("analysis report schema_version must be 2")
         if not isinstance(self.input, ToolTraceAnalysisInputSummary):
             raise TypeError("input must be ToolTraceAnalysisInputSummary")
         if not isinstance(self.policy, ToolTraceAnalysisPolicy):
@@ -727,6 +869,11 @@ class ToolTraceAnalysisReport:
             field_name="signal_coverage",
         )
         _require_contract_tuple(self.runs, ToolTraceRunSummary, field_name="runs")
+        _require_contract_tuple(
+            self.compactor_responses,
+            ToolTraceCompactorResponseSummary,
+            field_name="compactor_responses",
+        )
         _require_contract_tuple(
             self.payload_rankings,
             ToolTracePayloadMeasure,
@@ -753,6 +900,19 @@ class ToolTraceAnalysisReport:
             raise ValueError("summary finding_count must match findings")
         if self.summary.limitation_count != len(self.limitations):
             raise ValueError("summary limitation_count must match limitations")
+        response_keys = tuple(
+            (
+                item.parent_host_run_id,
+                item.compaction_operation_id,
+                item.compaction_attempt_number,
+                item.terminal_event_sequence,
+            )
+            for item in self.compactor_responses
+        )
+        if response_keys != tuple(sorted(response_keys)):
+            raise ValueError("compactor_responses must use stable owner ordering")
+        if len(set(response_keys)) != len(response_keys):
+            raise ValueError("compactor_responses must be unique")
         finding_ids = tuple(finding.finding_id for finding in self.findings)
         if any(finding_id == "" for finding_id in finding_ids):
             raise ValueError("report finding ids must be non-empty")
@@ -1111,6 +1271,7 @@ __all__ = [
     "ToolTraceAnalysisReport",
     "ToolTraceAnalysisSource",
     "ToolTraceAnalysisSummary",
+    "ToolTraceCompactorResponseSummary",
     "ToolTraceEvidence",
     "ToolTraceEvidenceKind",
     "ToolTraceFinding",

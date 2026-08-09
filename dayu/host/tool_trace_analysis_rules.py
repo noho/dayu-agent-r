@@ -17,6 +17,7 @@ from pathlib import Path
 from dayu.contracts.json_value import JsonValue
 from dayu.host.tool_trace_analysis_contracts import (
     ToolTraceAnalysisCapabilities,
+    ToolTraceCompactorResponseSummary,
     ToolTraceAnalysisInputSummary,
     ToolTraceAnalysisLayer,
     ToolTraceAnalysisPolicy,
@@ -48,7 +49,7 @@ from dayu.host.tool_trace_analysis_input import (
 from dayu.host.tool_trace import _tool_trace_cold_lock_path
 from dayu.host.tooling import FrameworkToolName
 
-_REPORT_SCHEMA_VERSION = 1
+_REPORT_SCHEMA_VERSION = 2
 _EVENT_TOOL_CALL_REQUESTED = "TOOL_CALL_REQUESTED"
 _EVENT_TOOL_CALL_GOVERNED = "TOOL_CALL_GOVERNED"
 _EVENT_TOOL_RESULT_ACCEPTED = "TOOL_RESULT_ACCEPTED"
@@ -203,7 +204,7 @@ def build_tool_trace_analysis_report(
     :param dataset: Slice 1 strict loader 产生的 immutable dataset。
     :param source: 与 dataset 同一显式输入来源。
     :param policy: 本次实际诊断阈值。
-    :returns: schema version 1 structured report。
+    :returns: fresh schema version 2 structured report。
     :raises TypeError: 参数类型错误时抛出。
     :raises ValueError: dataset/source identity 不一致时抛出。
     """
@@ -245,6 +246,7 @@ def build_tool_trace_analysis_report(
     ordered_findings = _order_and_assign_finding_ids(tuple(findings))
     ordered_limitations = _order_limitations(tuple(limitations))
     runs = _run_summaries(records)
+    compactor_responses = _compactor_response_summaries(dataset)
     input_summary = _input_summary(dataset, source)
     summary = ToolTraceAnalysisSummary(
         valid_record_count=len(dataset.cold_records),
@@ -272,11 +274,78 @@ def build_tool_trace_analysis_report(
             vendor_debugging,
         ),
         runs=runs,
+        compactor_responses=compactor_responses,
         payload_rankings=payload_rankings,
         vendor_debugging=vendor_debugging,
         findings=ordered_findings,
         limitations=ordered_limitations,
     )
+
+
+def _compactor_response_summaries(
+    dataset: ToolTraceAnalysisDataset,
+) -> tuple[ToolTraceCompactorResponseSummary, ...]:
+    """从 joined typed resolver projection 构造安全 response summaries。
+
+    :param dataset: strict input owner 产生的 immutable dataset。
+    :returns: 按 parent Run、operation、attempt、terminal sequence 稳定排序的
+        compactor response summaries。
+    :raises ValueError: compactor projection 缺 parent Run identity 或同一 owner
+        key 出现冲突时抛出。
+    """
+
+    summaries: dict[
+        tuple[str, str, int, int],
+        ToolTraceCompactorResponseSummary,
+    ] = {}
+    for joined in dataset.joined_records:
+        projection = joined.runner_call_projection
+        if projection is None or projection.compactor_response_identity is None:
+            continue
+        parent_host_run_id = projection.signal.run_id
+        if parent_host_run_id is None:
+            raise ValueError("compactor runner-call projection requires parent run id")
+        response = projection.compactor_response_identity
+        successful = response.successful_response_identity
+        summary = ToolTraceCompactorResponseSummary(
+            parent_host_run_id=parent_host_run_id,
+            disposition=response.disposition,
+            terminal_event_id=response.terminal_event_id,
+            terminal_event_sequence=response.terminal_event_sequence,
+            compaction_operation_id=response.compaction_operation_id,
+            compaction_attempt_number=response.compaction_attempt_number,
+            proposal_manifest_ref=response.proposal_manifest_ref,
+            proposal_manifest_digest=response.proposal_manifest_digest,
+            effective_provider=(
+                None if successful is None else successful.effective_provider
+            ),
+            effective_model=(
+                None if successful is None else successful.effective_model
+            ),
+            runner_request_identity=(
+                None if successful is None else successful.runner_request_identity
+            ),
+            provider_request_id_availability=(
+                None
+                if successful is None
+                else successful.provider_request_id_availability
+            ),
+            provider_request_id=(
+                None if successful is None else successful.provider_request_id
+            ),
+            accepted_evidence_facts=response.accepted_evidence_facts,
+        )
+        key = (
+            summary.parent_host_run_id,
+            summary.compaction_operation_id,
+            summary.compaction_attempt_number,
+            summary.terminal_event_sequence,
+        )
+        existing = summaries.get(key)
+        if existing is not None and existing != summary:
+            raise ValueError("conflicting compactor response summaries")
+        summaries[key] = summary
+    return tuple(summaries[key] for key in sorted(summaries))
 
 
 def _rule_records(dataset: ToolTraceAnalysisDataset) -> tuple[_RuleRecord, ...]:

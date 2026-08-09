@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from dayu.engine.contracts.structured_output import StructuredOutputRequest
+
+from dayu.engine.contracts.structured_output import StructuredOutputCapability
+
 import asyncio
 import logging
 from collections.abc import AsyncIterator, Sequence
@@ -60,7 +64,6 @@ from dayu.engine.contracts.messages import (
     AgentMessageRole,
     UserMessage,
 )
-from dayu.engine.contracts.runner import AsyncRunner
 from dayu.engine.contracts.runner_events import (
     ContextOverflowDetection,
     ContextOverflowDetectionKind,
@@ -81,7 +84,10 @@ from dayu.engine.contracts.runner_events import (
     RunnerToolCallsCompletedData,
     RunnerUsageRecordedData,
 )
-from dayu.engine.contracts.runner_identity import RunnerRequestIdentity
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    RunnerRequestIdentity,
+)
 from dayu.engine.contracts.runner_spec import (
     ClientCorrelationPolicy,
     RunnerCallOptions,
@@ -212,6 +218,7 @@ class _ScriptedRunner:
         options: RunnerCallOptions,
         tools: Sequence[ToolSchema],
         *,
+        structured_output: StructuredOutputRequest | None,
         request_identity: RunnerRequestIdentity | None,
     ) -> AsyncIterator[RunnerEvent]:
         """返回脚本化 RunnerEvent 流。
@@ -219,6 +226,7 @@ class _ScriptedRunner:
         :param messages: Agent 消息。
         :param options: Runner 调用选项。
         :param tools: 暴露给模型的工具 schema。
+        :param structured_output: 本次调用的 structured-output 请求。
         :param request_identity: 本次逻辑 Runner 调用的请求身份。
         :returns: RunnerEvent 异步流。
         :raises RuntimeError: 配置 ``raise_on_call`` 时抛出。
@@ -299,6 +307,7 @@ class _MalformedPairingRunner:
         options: RunnerCallOptions,
         tools: Sequence[ToolSchema],
         *,
+        structured_output: StructuredOutputRequest | None,
         request_identity: RunnerRequestIdentity | None,
     ) -> AsyncIterator[RunnerEvent]:
         """返回会在迭代时构造非法 RunnerEvent 的事件流。
@@ -306,6 +315,7 @@ class _MalformedPairingRunner:
         :param messages: Agent 消息。
         :param options: Runner 调用选项。
         :param tools: 暴露给模型的工具 schema。
+        :param structured_output: 本次调用的 structured-output 请求。
         :param request_identity: 本次逻辑 Runner 调用的请求身份。
         :returns: RunnerEvent 异步流。
         :raises ValueError: 迭代时由 RunnerEvent 构造边界抛出。
@@ -379,6 +389,7 @@ class _PublicEntryDefaultRunner:
         options: RunnerCallOptions,
         tools: Sequence[ToolSchema],
         *,
+        structured_output: StructuredOutputRequest | None,
         request_identity: RunnerRequestIdentity | None,
     ) -> AsyncIterator[RunnerEvent]:
         """返回空 RunnerEvent 流。
@@ -386,6 +397,7 @@ class _PublicEntryDefaultRunner:
         :param messages: Agent 消息。
         :param options: Runner 调用选项。
         :param tools: 暴露给模型的工具 schema。
+        :param structured_output: 本次调用的 structured-output 请求。
         :param request_identity: 本次逻辑 Runner 调用的请求身份。
         :returns: 空 RunnerEvent 异步流。
         :raises Exception: 不主动抛出异常。
@@ -491,6 +503,7 @@ def _request(
             supports_tool_calling=True,
             supports_streaming=True,
             supports_stream_usage=False,
+            structured_output_capability=StructuredOutputCapability.NONE,
             default_timeout_seconds=30.0,
             max_retries=0,
             provider_request=None,
@@ -592,6 +605,7 @@ def _assert_single_terminal_at_end(events: Sequence[EngineEvent]) -> None:
 async def test_success_run_lifts_runner_events_and_agent_final() -> None:
     """无工具成功 run 会提升 RunnerEvent 并由 Agent 产出 final_answer。"""
 
+    request = _request()
     runner = _ScriptedRunner(
         events=(
             _event(
@@ -621,12 +635,13 @@ async def test_success_run_lifts_runner_events_and_agent_final() -> None:
             _event(
                 RunnerEventType.RUNNER_DONE,
                 RunnerDoneData(
-                    finish_reason=FinishReason.STOP, provider_request_id=None
+                    finish_reason=FinishReason.STOP,
+                    provider_request_id="req-final",
                 ),
             ),
         )
     )
-    events = await _collect(_AsyncAgent(request=_request(), runner=runner))
+    events = await _collect(_AsyncAgent(request=request, runner=runner))
 
     assert [event.type for event in events] == [
         EngineEventType.ITERATION_STARTED,
@@ -654,6 +669,16 @@ async def test_success_run_lifts_runner_events_and_agent_final() -> None:
     assert request_identity.iteration_index == 0
     assert request_identity.runner_call_index == 1
     assert request_identity.client_correlation_id.startswith("dayu-")
+    assert final.data.response_identity.effective_provider == (
+        request.runner_spec.provider
+    )
+    assert final.data.response_identity.effective_model == request.runner_spec.model
+    assert final.data.response_identity.runner_request_identity == request_identity
+    assert final.data.response_identity.provider_request_id_availability is (
+        ProviderRequestIdAvailability.PRESENT
+    )
+    assert final.data.response_identity.provider_request_id == "req-final"
+    assert final.data.response_identity.provider_request_id != "req-usage"
     iteration_completed = [
         event for event in events if event.type is EngineEventType.ITERATION_COMPLETED
     ]
@@ -1913,6 +1938,7 @@ async def test_length_and_content_filter_final_boundaries() -> None:
     """LENGTH 无续写预算时降级 final；CONTENT_FILTER 不消费 continuation。"""
 
     for finish_reason in (FinishReason.LENGTH, FinishReason.CONTENT_FILTER):
+        request = _request()
         runner = _ScriptedRunner(
             events=(
                 _event(
@@ -1930,7 +1956,7 @@ async def test_length_and_content_filter_final_boundaries() -> None:
                 ),
             )
         )
-        events = await _collect(_AsyncAgent(request=_request(), runner=runner))
+        events = await _collect(_AsyncAgent(request=request, runner=runner))
         assert _final_event(events).type is EngineEventType.FINAL_ANSWER
         assert isinstance(events[-1].data, FinalAnswerData)
         assert events[-1].data.finish_reason is finish_reason
@@ -1939,6 +1965,21 @@ async def test_length_and_content_filter_final_boundaries() -> None:
         )
         assert events[-1].data.degraded is True
         assert runner.call_count == 1
+        assert runner.request_identities_seen[0] is not None
+        assert (
+            events[-1].data.response_identity.runner_request_identity
+            == runner.request_identities_seen[0]
+        )
+        assert events[-1].data.response_identity.effective_provider == (
+            request.runner_spec.provider
+        )
+        assert events[-1].data.response_identity.effective_model == (
+            request.runner_spec.model
+        )
+        assert events[-1].data.response_identity.provider_request_id_availability is (
+            ProviderRequestIdAvailability.UNAVAILABLE
+        )
+        assert events[-1].data.response_identity.provider_request_id is None
 
 
 @pytest.mark.asyncio
@@ -2176,6 +2217,12 @@ async def test_run_agent_and_wait_maps_final_failed_cancelled(
         )
         result = await agent_module.run_agent_and_wait(current_request)
         assert isinstance(result, expected_type)
+        if isinstance(result, EngineRunOutcomeFinalAnswer):
+            assert runner.request_identities_seen[0] is not None
+            assert (
+                result.response_identity.runner_request_identity
+                == runner.request_identities_seen[0]
+            )
 
 
 @pytest.mark.asyncio

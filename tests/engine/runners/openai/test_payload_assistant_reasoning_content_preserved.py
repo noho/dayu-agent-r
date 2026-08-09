@@ -39,6 +39,7 @@ def test_reasoning_content_roundtrips_when_present() -> None:
         options=make_options(stream=False),
         tools=[],
         spec=make_spec(),
+        structured_output=None,
     )
     messages = payload.get("messages")
     assert messages is not None
@@ -65,6 +66,7 @@ def test_reasoning_content_roundtrips_for_thinking_tool_call_providers() -> None
             options=make_options(stream=False),
             tools=[],
             spec=make_spec(provider_request=provider_request),
+            structured_output=None,
         )
         messages = payload.get("messages")
         assert messages is not None
@@ -85,6 +87,7 @@ def test_reasoning_content_absent_when_none() -> None:
         options=make_options(stream=False),
         tools=[],
         spec=make_spec(),
+        structured_output=None,
     )
     messages = payload.get("messages")
     assert messages is not None
@@ -111,6 +114,7 @@ def test_assistant_tool_calls_extra_content_roundtrip() -> None:
         options=make_options(stream=False),
         tools=[],
         spec=make_spec(),
+        structured_output=None,
     )
     messages = payload.get("messages")
     assert messages is not None
@@ -141,6 +145,7 @@ def test_assistant_tool_calls_no_extra_content_when_state_none() -> None:
         options=make_options(stream=False),
         tools=[],
         spec=make_spec(),
+        structured_output=None,
     )
     messages = payload.get("messages")
     assert messages is not None
@@ -158,6 +163,7 @@ def test_user_message_serialization() -> None:
         options=make_options(stream=False),
         tools=[],
         spec=make_spec(),
+        structured_output=None,
     )
     messages = payload.get("messages")
     assert messages is not None

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dayu.engine.contracts.structured_output import StructuredOutputCapability
+
 import asyncio
 import json
 import logging
@@ -32,6 +34,11 @@ from dayu.engine.contracts.engine_events import (
 )
 from dayu.engine.contracts.finish_reason import FinishReason
 from dayu.engine.contracts.messages import AgentMessage, AgentMessageRole, SystemMessage, UserMessage
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.host.queue_policy import RunQueuePolicy
 from dayu.contracts.json_value import JsonValue
@@ -79,40 +86,40 @@ from dayu.host.api import (
     RunStatus,
 )
 from dayu.host.compaction import (
-    AnswerAnchorCandidateVNext,
-    AnswerAnchorChildVNext,
+    CompactAnswerAnchorV4,
     CompactMaterialBlockKind,
     CompactMaterialSection,
-    CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
-    CompactCandidateDiagnosticVNext,
-    CompactQualityCheckResultVNext,
+    COMPACT_OUTPUT_SCHEMA_V4,
+    CompactRepairFeedbackV4,
     CompactionRequest,
+    CompactorProposal,
     ContextCompactor,
-    ConversationCompactOutputVNext,
-    EvidenceBackedFactCandidateVNext,
-    ForwardIntentCandidateVNext,
-    ForwardIntentStatusVNext,
-    ForwardIntentTypeVNext,
-    ReferenceContinuityCandidateVNext,
-    ReferenceContinuityReasonVNext,
-    SessionSummaryCandidateVNext,
+    CompactCandidateV4,
+    CompactEvidenceFactV4,
+    CompactForwardIntentV4,
+    CompactForwardIntentStatusV4,
+    CompactReferenceContinuityV4,
+    CompactSessionSummaryV4,
+    CompactValidationIssueCodeV4,
 )
 from dayu.host.compact_material import (
     CompactMaterialSourceBoundary,
     PreDispatchCompactMaterialView,
     build_pre_dispatch_compact_material_view,
-    conversation_compact_input_vnext_from_material_pack,
     run_input_material_block,
+    selected_material_view_digest,
 )
 from dayu.host.compact_pipeline import (
     CompactPipelineSourceSnapshot,
     build_fallback_decision_input,
 )
 from dayu.host.compaction_operation import (
-    CompactorProposalManifestReference,
+    CompactionOperationResult,
     CompactorProposalRunInput,
     DurableCompactorProposalManifestRecorder,
 )
+from dayu.host.context_event_payload import resolve_context_compacted_payload
+from dayu.host.context_events import CompactorProposalManifestReference
 from dayu.host.context_budget import (
     ContextBudgetDecision,
     ContextEstimateMethod,
@@ -132,8 +139,12 @@ from dayu.host.context_events import (
     CONTEXT_COMPACTION_REQUESTED,
     build_context_compaction_attempt_rejected_payload,
     build_context_compacted_payload,
+    build_context_compaction_failed_payload,
     build_context_compaction_requested_payload,
     parse_context_budget_evaluated_payload,
+)
+from dayu.host.compaction_terminal import (
+    COMPACTION_TERMINAL_INVALID_MULTIPLE_ERROR,
 )
 from dayu.host.context_policy import (
     ContextBudgetPolicy,
@@ -150,6 +161,7 @@ from dayu.host.terminal_post_commit import (
     TerminalPostCommitNotice,
     TerminalPostCommitPort,
 )
+from dayu.host.session_attachment import SessionWorkLease
 from dayu.host.tool_duplicate_governance import (
     DuplicateDecisionKind,
     DuplicateGovernancePolicy,
@@ -186,6 +198,7 @@ from dayu.host.memory import (
     default_memory_projection_policy,
     digest_memory_projection_policy,
 )
+from tests.host.fake_compaction import accepted_truth_for_candidate
 from dayu.host.memory_repair import (
     ConversationMemoryProjectionRepairResult,
     catch_up_conversation_memory_projection,
@@ -202,8 +215,6 @@ from dayu.host.run_input import (
 )
 from dayu.host._runner_call_manifest import (
     RunnerCallSizingUnavailableReason,
-    parse_runner_call_hot_payload,
-    parse_runner_call_manifest,
     unavailable_runner_call_sizing_snapshot,
 )
 from dayu.host.proactive_compaction import (
@@ -213,6 +224,7 @@ from dayu.host.proactive_compaction import (
     ProactiveCompactionProjection,
     read_proactive_compaction_projection,
 )
+from dayu.host.durable.artifact import LocalArtifactRef, read_artifact_bytes
 from dayu.host.durable.codec import canonical_json_dumps, sha256_digest_json
 from dayu.host.durable.connection import HostDurableStore, open_host_durable_store
 from dayu.host.durable.errors import (
@@ -230,8 +242,8 @@ from dayu.host.durable.options import (
     HostSQLiteStoragePolicy,
     PayloadStoragePolicy,
 )
-from dayu.host.durable.payload import PayloadStore
-from dayu.host.payload_resolution import sqlite_payload_object
+from dayu.host.durable.memory import read_latest_memory_snapshot
+from dayu.host.durable.payload import PayloadKind, PayloadStore
 from dayu.host.durable.projection import read_projection_checkpoint
 from dayu.host.durable.schema import (
     TABLE_EVENT_LOG,
@@ -243,12 +255,10 @@ from dayu.host.durable.schema import (
 from dayu.host.durable.run_transition import (
     CancelPredispatchStartingInput,
     CreateAcceptedRunInput,
-    CreateRunningRunInput,
     _attempt_terminal_event_type,
     _run_terminal_event_type,
     cancel_predispatch_starting_in_transaction,
     create_accepted_run_in_transaction,
-    create_running_run_with_starting_attempt_in_transaction,
     FailUnstartedRunInput,
     RunTransitionResult,
     fail_unstarted_run_in_transaction,
@@ -281,10 +291,19 @@ from dayu.host.durable.transaction import (
     HostTransaction,
     HostTransactionRunner,
 )
+from dayu.host.durable.tool_trace import (
+    CompactorResponseResolutionError,
+    read_runner_call_reconstruction_signals_by_run,
+    resolve_runner_call_projection_from_signal,
+)
 from dayu.host.local_proxy import DefaultLocalEngineWorkerFactory
 from dayu.host.projection import ProjectionCatchupPort
 from dayu.host.read_api import _host_event_from_row
 from dayu.host.run_input import PreparedRunnerCallCandidate
+from dayu.host.tool_trace import (
+    ToolTraceSinkOptions,
+    catch_up_tool_trace_projection,
+)
 from dayu.runtime.lane import (
     LaneAcquired,
     LaneAcquireOutcome,
@@ -298,6 +317,69 @@ from dayu.runtime.lane import (
 
 _NOW = datetime(2026, 5, 15, 1, 2, 3, tzinfo=UTC)
 _CALL_CONTEXT_DIGEST = sha256_digest_json({"context": "dispatch-test"})
+_COMPACTOR_PROPOSAL_DESCRIPTOR_COUNT = 2
+_COMPACTOR_RUNNER_CALL_KIND = "compactor_proposal"
+_ACCEPTED_ATTEMPT_NUMBER_FIELD = "accepted_attempt_number"
+_ATTEMPT_NUMBER_FIELD = "attempt_number"
+_ACCEPTED_MANIFEST_REF_FIELD = "accepted_proposal_manifest_ref"
+_ACCEPTED_MANIFEST_DIGEST_FIELD = "accepted_proposal_manifest_digest"
+_REJECTED_MANIFEST_REF_FIELD = "proposal_manifest_ref"
+_REJECTED_MANIFEST_DIGEST_FIELD = "proposal_manifest_digest"
+
+
+def _successful_response_identity_for_agent_request(
+    request: AgentRunRequest,
+) -> SuccessfulRunnerResponseIdentity:
+    """构造与 dispatch fixture 的 Engine request 同源的成功响应身份。
+
+    :param request: 当前 worker/compactor 实际收到的 Engine request。
+    :returns: provider request id 明确不可用的成功响应身份。
+    :raises ValueError: request identity 字段非法时抛出。
+    """
+
+    return SuccessfulRunnerResponseIdentity(
+        effective_provider=request.runner_spec.provider,
+        effective_model=request.runner_spec.model,
+        runner_request_identity=build_runner_request_identity(
+            run_id=request.run_id,
+            attempt_id=request.attempt_id,
+            execution_id=request.execution_id,
+            iteration_id=f"{request.run_id}:dispatch-final",
+            iteration_index=0,
+            runner_call_index=1,
+        ),
+        provider_request_id_availability=ProviderRequestIdAvailability.UNAVAILABLE,
+        provider_request_id=None,
+    )
+
+
+def _proposal_manifest_reference(
+    *,
+    operation_id: str,
+    attempt_number: int,
+    compactor_engine_run_id: str,
+) -> CompactorProposalManifestReference:
+    """构造 dispatch durable fixture 的 typed manifest reference。
+
+    :param operation_id: 当前 compaction operation id。
+    :param attempt_number: 当前 proposal attempt number。
+    :param compactor_engine_run_id: 当前 manifest 显式绑定的 Engine run id。
+    :returns: 与 operation/attempt/run 同源的 manifest reference。
+    :raises ValueError: manifest binding 字段非法时抛出。
+    """
+
+    return CompactorProposalManifestReference(
+        manifest_event_id=f"manifest-event:{operation_id}:{attempt_number}",
+        manifest_payload_ref=f"runner-call-manifest:{operation_id}:{attempt_number}",
+        manifest_digest=_CALL_CONTEXT_DIGEST,
+        compactor_input_projection_ref=f"projection:{operation_id}:{attempt_number}",
+        compactor_input_projection_digest=_CALL_CONTEXT_DIGEST,
+        compaction_operation_id=operation_id,
+        compaction_attempt_number=attempt_number,
+        compactor_engine_run_id=compactor_engine_run_id,
+    )
+
+
 _LANE_NAME = "llm"
 
 
@@ -398,6 +480,8 @@ class _FailingTerminalPortFactory(_RecordingTerminalPortFactory):
         if self._fail_create:
             raise RuntimeError("injected terminal coordinator construction failure")
         return self.port
+
+
 _SOFT_THRESHOLD_PROMPT_CHAR_COUNT = 120
 _HARD_THRESHOLD_PROMPT_CHAR_COUNT = 240
 _SOFT_CONTEXT_WINDOW_SIZE = 200
@@ -637,6 +721,7 @@ class _PreparedManifestProactiveCompactor(FakeContextCompactor):
         :returns: ``None``。
         """
 
+        super().__init__()
         self.fail_run = fail_run
         self.calls = 0
         self.prepared_requests: list[CompactionRequest] = []
@@ -650,6 +735,7 @@ class _PreparedManifestProactiveCompactor(FakeContextCompactor):
         *,
         compaction_operation_id: str | None,
         compaction_attempt_number: int,
+        repair_feedback: CompactRepairFeedbackV4 | None,
     ) -> CompactorProposalRunInput:
         """构造可持久化 manifest 的 deterministic proposal runner input。
 
@@ -657,14 +743,13 @@ class _PreparedManifestProactiveCompactor(FakeContextCompactor):
         :param cancellation_token: Host 注入的取消 token。
         :param compaction_operation_id: Host compaction operation id。
         :param compaction_attempt_number: operation 内 proposal attempt 序号。
+        :param repair_feedback: 前次 semantic validation feedback。
         :returns: prepared proposal runner input。
         """
 
         self.prepared_requests.append(request)
         self._prepared_request = request
-        compact_input = conversation_compact_input_vnext_from_material_pack(
-            request.material_pack
-        )
+        compact_input = request.compact_input
         agent_request = _proposal_compactor_agent_request(
             request,
             cancellation_token=cancellation_token,
@@ -675,6 +760,7 @@ class _PreparedManifestProactiveCompactor(FakeContextCompactor):
         projection: Mapping[str, JsonValue] = {
             "projection_kind": "proactive_compactor_input_projection",
             "compaction_request_digest": request.digest(),
+            "repair_feedback": (None if repair_feedback is None else repair_feedback.to_json()),
         }
         prepared_input = CompactorProposalRunInput(
             compact_input=compact_input,
@@ -688,6 +774,7 @@ class _PreparedManifestProactiveCompactor(FakeContextCompactor):
             user_prompt_digest=sha256_digest_json({"user_prompt": "proactive"}),
             compactor_input_projection=projection,
             compactor_input_projection_digest=sha256_digest_json(projection),
+            repair_feedback=repair_feedback,
         )
         self.prepared_inputs.append(prepared_input)
         return prepared_input
@@ -695,7 +782,7 @@ class _PreparedManifestProactiveCompactor(FakeContextCompactor):
     async def run_prepared_compactor_proposal(
         self,
         prepared_input: CompactorProposalRunInput,
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """执行 prepared proposal。
 
         :param prepared_input: 已准备且可记录 manifest 的 proposal input。
@@ -707,9 +794,16 @@ class _PreparedManifestProactiveCompactor(FakeContextCompactor):
         self.calls += 1
         if self.fail_run:
             raise RuntimeError("prepared proposal failed")
-        return await super().compact(
+        proposal = await super().compact(
             self._latest_prepared_request(),
             prepared_input.agent_request.cancellation_token,
+            repair_feedback=prepared_input.repair_feedback,
+        )
+        return CompactorProposal(
+            candidate=proposal.candidate,
+            successful_response_identity=(
+                _successful_response_identity_for_agent_request(prepared_input.agent_request)
+            ),
         )
 
     def _latest_prepared_request(self) -> CompactionRequest:
@@ -733,6 +827,7 @@ class _TransactionReadableCompactor(_PreparedManifestProactiveCompactor):
 
         :param transaction_runner: Host transaction runner。
         :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
         """
 
         super().__init__()
@@ -741,7 +836,7 @@ class _TransactionReadableCompactor(_PreparedManifestProactiveCompactor):
     async def run_prepared_compactor_proposal(
         self,
         prepared_input: CompactorProposalRunInput,
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """执行 prepared proposal 并验证当前不在外层 write transaction 内。
 
         :param prepared_input: 已准备且可记录 manifest 的 proposal input。
@@ -764,12 +859,17 @@ class _StaleMutatingCompactor(FakeContextCompactor):
         :returns: ``None``。
         """
 
+        super().__init__()
         self._transaction_runner = transaction_runner
         self._fake = FakeContextCompactor()
 
     async def compact(
-        self, request: CompactionRequest, cancellation_token: CancellationToken
-    ) -> ConversationCompactOutputVNext:
+        self,
+        request: CompactionRequest,
+        cancellation_token: CancellationToken,
+        *,
+        repair_feedback: CompactRepairFeedbackV4 | None,
+    ) -> CompactorProposal:
         """先把源 Run 失败收口，再返回 candidate。
 
         :param request: compaction request。
@@ -797,7 +897,94 @@ class _StaleMutatingCompactor(FakeContextCompactor):
             )
 
         self._transaction_runner.run_write(_operation)
-        return await self._fake.compact(request, cancellation_token)
+        return await self._fake.compact(
+            request,
+            cancellation_token,
+            repair_feedback=repair_feedback,
+        )
+
+
+class _TerminalWinningProactiveCompactor(FakeContextCompactor):
+    """在 proactive provider await 内先提交同 operation failed terminal。"""
+
+    def __init__(self, transaction_runner: HostTransactionRunner) -> None:
+        """初始化 first-terminal winner compactor。
+
+        :param transaction_runner: Host transaction runner。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        super().__init__()
+        self._transaction_runner = transaction_runner
+
+    async def compact(
+        self,
+        request: CompactionRequest,
+        cancellation_token: CancellationToken,
+        *,
+        repair_feedback: CompactRepairFeedbackV4 | None,
+    ) -> CompactorProposal:
+        """先提交 failed first truth，再返回 late accepted candidate。
+
+        :param request: proactive compaction request。
+        :param cancellation_token: Host cancellation token。
+        :returns: late accepted fake candidate。
+        :raises AssertionError: request canonical fact 不存在时抛出。
+        """
+
+        def _operation(transaction: HostTransaction) -> None:
+            """在独立 write transaction 内提交 first terminal truth。
+
+            :param transaction: 当前 Host write transaction。
+            :returns: ``None``。
+            :raises AssertionError: request canonical fact 不存在时抛出。
+            """
+
+            requested = EventLogStore().read_latest_run_event_by_type(
+                transaction,
+                run_id=request.run_id,
+                event_type=CONTEXT_COMPACTION_REQUESTED,
+            )
+            assert requested is not None
+            EventLogStore().append_event(
+                transaction,
+                EventLogAppendRequest(
+                    event_id="event-proactive-first-terminal-failed",
+                    event_class=EventClass.CANONICAL_FACT,
+                    session_id=request.session_id,
+                    run_id=request.run_id,
+                    attempt_id=None,
+                    execution_id=None,
+                    event_type=CONTEXT_COMPACTION_FAILED,
+                    occurred_at=_NOW,
+                    actor="tester",
+                    source="pytest",
+                    client_request_id=None,
+                    idempotency_key=None,
+                    policy_decision=None,
+                    reason=None,
+                    payload_json=build_context_compaction_failed_payload(
+                        operation_id=requested.event_id,
+                        failure_reason="concurrent_governance_winner",
+                        policy_decision="fail_closed",
+                        retryable=False,
+                        attempt_count=0,
+                        retry_repair_budget_exhausted=False,
+                        diagnostic_refs=("diagnostic:first-winner",),
+                        budget_after_attempted_compact=None,
+                    ),
+                    payload_ref=None,
+                    payload_digest=None,
+                ),
+            )
+
+        self._transaction_runner.run_write(_operation)
+        return await super().compact(
+            request,
+            cancellation_token,
+            repair_feedback=repair_feedback,
+        )
 
 
 class _RaisingCompactor(_PreparedManifestProactiveCompactor):
@@ -826,26 +1013,72 @@ class _QualityRejectOnceCompactor(_PreparedManifestProactiveCompactor):
     async def run_prepared_compactor_proposal(
         self,
         prepared_input: CompactorProposalRunInput,
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """构造一次可修复 quality rejection。
 
         :param prepared_input: 已准备且可记录 manifest 的 proposal input。
         :returns: compaction candidate。
         """
 
-        candidate = await super().run_prepared_compactor_proposal(prepared_input)
+        proposal = await super().run_prepared_compactor_proposal(prepared_input)
         if self.calls == 1:
-            return replace(
-                candidate,
-                diagnostics=(
-                    CompactCandidateDiagnosticVNext(
-                        code="invalid-current-anchor",
-                        text="invalid current anchor citation",
-                        source_labels=("C1",),
-                    ),
+            return CompactorProposal(
+                candidate=replace(
+                    proposal.candidate,
+                    session_summary=None,
+                    retained_previous_evidence_fact_labels=(),
+                    evidence_facts=(),
+                    answer_anchors=(),
+                    forward_intents=(),
+                    reference_continuity=(),
                 ),
+                successful_response_identity=(proposal.successful_response_identity),
             )
-        return candidate
+        return proposal
+
+
+class _AlwaysQualityRejectingCompactor(_PreparedManifestProactiveCompactor):
+    """每次 runner call 成功但 candidate 都被 quality contract 拒绝的 compactor。"""
+
+    async def run_prepared_compactor_proposal(
+        self,
+        prepared_input: CompactorProposalRunInput,
+    ) -> CompactorProposal:
+        """返回携带同源成功响应身份的无效 candidate。
+
+        :param prepared_input: 已准备且可记录 manifest 的 proposal input。
+        :returns: 必然触发 quality rejection 的 compaction proposal。
+        :raises Exception: 基类 fake proposal 执行失败时透传。
+        """
+
+        proposal = await super().run_prepared_compactor_proposal(prepared_input)
+        return CompactorProposal(
+            candidate=replace(
+                proposal.candidate,
+                session_summary=None,
+                retained_previous_evidence_fact_labels=(),
+                evidence_facts=(),
+                answer_anchors=(),
+                forward_intents=(),
+                reference_continuity=(),
+            ),
+            successful_response_identity=proposal.successful_response_identity,
+        )
+
+
+def _retain_feedback_without_binding_for_defensive_test(
+    feedback: CompactRepairFeedbackV4 | None,
+    request: CompactionRequest,
+) -> CompactRepairFeedbackV4 | None:
+    """绕过 dispatcher 正常清理，仅用于验证 operation defensive guard。
+
+    :param feedback: 前一 attempt feedback。
+    :param request: 当前 attempt request；测试 seam 故意不校验。
+    :returns: 原 feedback。
+    """
+
+    del request
+    return feedback
 
 
 class _BlockingAfterManifestCompactor(_PreparedManifestProactiveCompactor):
@@ -861,11 +1094,12 @@ class _BlockingAfterManifestCompactor(_PreparedManifestProactiveCompactor):
         super().__init__()
         self.provider_entered = asyncio.Event()
         self.provider_release = asyncio.Event()
+        self.provider_calls = 0
 
     async def run_prepared_compactor_proposal(
         self,
         prepared_input: CompactorProposalRunInput,
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """进入 provider 后等待测试释放。
 
         :param prepared_input: 已提交 manifest 的 proposal input。
@@ -873,6 +1107,7 @@ class _BlockingAfterManifestCompactor(_PreparedManifestProactiveCompactor):
         :raises asyncio.CancelledError: caller 模拟 crash 时透传。
         """
 
+        self.provider_calls += 1
         self.provider_entered.set()
         await self.provider_release.wait()
         return await super().run_prepared_compactor_proposal(prepared_input)
@@ -902,7 +1137,7 @@ class _CrashAtPreparedAttemptCompactor(_PreparedManifestProactiveCompactor):
     async def run_prepared_compactor_proposal(
         self,
         prepared_input: CompactorProposalRunInput,
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """前序 attempts 模拟 proposal failure，目标 attempt 触发进程级 crash。
 
         :param prepared_input: 已提交 manifest 的 proposal input。
@@ -930,7 +1165,7 @@ class _MinimalSummaryCompactor(_RequestCapturingCompactor):
     async def run_prepared_compactor_proposal(
         self,
         prepared_input: CompactorProposalRunInput,
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """构造短 summary，避免测试 fixture 触发 compact 后预算拒绝。
 
         :param prepared_input: 已准备且可记录 manifest 的 proposal input。
@@ -938,18 +1173,25 @@ class _MinimalSummaryCompactor(_RequestCapturingCompactor):
         :raises AssertionError: 测试输入缺少 trace material 时抛出。
         """
 
-        source_label = _first_citable_compact_input_label(prepared_input)
-        return ConversationCompactOutputVNext(
-            schema_version=CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
-            session_summary=SessionSummaryCandidateVNext(
-                summary_text="rolled",
-                source_labels=(source_label,),
+        source_labels = prepared_input.compact_input.source_labels
+        if len(source_labels) == 0:
+            raise AssertionError("compact input has no citable label")
+        return CompactorProposal(
+            candidate=CompactCandidateV4(
+                schema=COMPACT_OUTPUT_SCHEMA_V4,
+                session_summary=CompactSessionSummaryV4(
+                    text="rolled",
+                    source_labels=source_labels,
+                ),
+                retained_previous_evidence_fact_labels=(),
+                evidence_facts=(),
+                answer_anchors=(),
+                forward_intents=(),
+                reference_continuity=(),
             ),
-            evidence_backed_facts=(),
-            answer_anchors=(),
-            forward_intents=(),
-            reference_continuity_items=(),
-            diagnostics=(),
+            successful_response_identity=(
+                _successful_response_identity_for_agent_request(prepared_input.agent_request)
+            ),
         )
 
 
@@ -979,7 +1221,7 @@ class _RecoveryScenarioCompactor(_PreparedManifestProactiveCompactor):
     async def run_prepared_compactor_proposal(
         self,
         prepared_input: CompactorProposalRunInput,
-    ) -> ConversationCompactOutputVNext:
+    ) -> CompactorProposal:
         """按调用序号失败或返回最小 accepted summary。
 
         :param prepared_input: 已准备且可记录 manifest 的 proposal input。
@@ -995,18 +1237,25 @@ class _RecoveryScenarioCompactor(_PreparedManifestProactiveCompactor):
             )
         if self.calls != self._accept_call:
             raise RuntimeError("recovery scenario proposal failed")
-        label = _first_citable_compact_input_label(prepared_input)
-        return ConversationCompactOutputVNext(
-            schema_version=CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
-            session_summary=SessionSummaryCandidateVNext(
-                summary_text=f"recovery summary {self.calls}",
-                source_labels=(label,),
+        source_labels = prepared_input.compact_input.source_labels
+        if len(source_labels) == 0:
+            raise AssertionError("compact input has no citable label")
+        return CompactorProposal(
+            candidate=CompactCandidateV4(
+                schema=COMPACT_OUTPUT_SCHEMA_V4,
+                session_summary=CompactSessionSummaryV4(
+                    text=f"recovery summary {self.calls}",
+                    source_labels=source_labels,
+                ),
+                retained_previous_evidence_fact_labels=(),
+                evidence_facts=(),
+                answer_anchors=(),
+                forward_intents=(),
+                reference_continuity=(),
             ),
-            evidence_backed_facts=(),
-            answer_anchors=(),
-            forward_intents=(),
-            reference_continuity_items=(),
-            diagnostics=(),
+            successful_response_identity=(
+                _successful_response_identity_for_agent_request(prepared_input.agent_request)
+            ),
         )
 
 
@@ -1021,22 +1270,8 @@ def _first_citable_compact_input_label(
     """
 
     compact_input = prepared_input.compact_input
-    for item in compact_input.trace_material:
-        return item.source_label
-    for item in compact_input.evidence_material:
-        return item.source_label
-    for item in compact_input.answer_material:
-        return item.source_label
-    previous_view = compact_input.previous_compacted_view
-    if previous_view is not None:
-        for item in previous_view.evidence_backed_facts:
-            return item.source_label
-        for item in previous_view.reference_continuity_items:
-            return item.source_label
-        for item in previous_view.answer_anchors:
-            return item.source_label
-        for item in previous_view.forward_intents:
-            return item.source_label
+    if compact_input.source_boundary:
+        return compact_input.source_boundary[0].source_label
     raise AssertionError("compact input has no citable label")
 
 
@@ -1064,9 +1299,7 @@ def _fail_unstarted_for_stale_test(
             FailUnstartedRunInput(
                 run_id=request.run_id,
                 expected_status=run.status,
-                run_failed_event_id=(
-                    f"event-stale-run-failed-{request.run_id}-{request.digest()}"
-                ),
+                run_failed_event_id=(f"event-stale-run-failed-{request.run_id}-{request.digest()}"),
                 occurred_at=datetime.now(UTC),
                 actor="pytest",
                 source="pytest",
@@ -1799,6 +2032,7 @@ class _ReactiveRecoveryWorker:
                     filtered=False,
                     degraded=False,
                     finish_reason=FinishReason.STOP,
+                    response_identity=(_successful_response_identity_for_agent_request(request)),
                 ),
                 metadata=None,
             )
@@ -2005,9 +2239,7 @@ class _RepeatedReactiveOverflowWorkerFactory:
         """
 
         async with self._accepted_condition:
-            await self._accepted_condition.wait_for(
-                lambda: len(self.accepted_snapshots) >= expected_count
-            )
+            await self._accepted_condition.wait_for(lambda: len(self.accepted_snapshots) >= expected_count)
 
     async def _wait_for_closed_count(self, expected_count: int) -> None:
         """在 condition 上等待 handle close 次数达标。
@@ -2017,9 +2249,7 @@ class _RepeatedReactiveOverflowWorkerFactory:
         """
 
         async with self._closed_condition:
-            await self._closed_condition.wait_for(
-                lambda: self.closed_count >= expected_count
-            )
+            await self._closed_condition.wait_for(lambda: self.closed_count >= expected_count)
 
 
 class _FinalAnswerWorker:
@@ -2056,6 +2286,7 @@ class _FinalAnswerWorker:
                     filtered=False,
                     degraded=False,
                     finish_reason=FinishReason.STOP,
+                    response_identity=(_successful_response_identity_for_agent_request(request)),
                 ),
                 metadata=None,
             ),
@@ -2315,9 +2546,7 @@ class _LevelTriggeredActiveCancelWatchdogScheduler(HostDispatchScheduler):
         assert session_id == "session-watchdog-probe"
         _ = now
         self._tick_count += 1
-        self._event_states_before_tick.append(
-            self._active_cancel_watchdog_event.is_set()
-        )
+        self._event_states_before_tick.append(self._active_cancel_watchdog_event.is_set())
         if self._tick_count == 1:
             self._first_tick_seen.set()
             if self._wake_during_first_tick:
@@ -2363,9 +2592,7 @@ async def test_scheduler_terminal_port_failure_closes_each_owner_once_without_ta
 ) -> None:
     """factory/bind failure 在零 critical task 状态各清理 coordinator 与 lane 一次。"""
 
-    terminal_factory = _FailingTerminalPortFactory(
-        fail_create=failure_stage == "factory"
-    )
+    terminal_factory = _FailingTerminalPortFactory(fail_create=failure_stage == "factory")
     lane_close_calls = 0
     original_lane_close = LaneController.close
 
@@ -2725,9 +2952,7 @@ async def test_dispatch_checkpoint_covered_catchup_accepts_ordinary_run_input(
             batch_size=32,
             max_event_sequence=required_event_sequence,
         )
-        checkpoint_before_dispatch = _read_memory_checkpoint_sequence(
-            store.transaction_runner
-        )
+        checkpoint_before_dispatch = _read_memory_checkpoint_sequence(store.transaction_runner)
 
         def _observed_catch_up(
             transaction_runner: HostTransactionRunner,
@@ -2777,19 +3002,14 @@ async def test_dispatch_checkpoint_covered_catchup_accepts_ordinary_run_input(
             result = await scheduler.drain_once()
 
             run, attempt, dispatch_record = _read_rows(store.transaction_runner, seeded)
-            checkpoint_after_dispatch = _read_memory_checkpoint_sequence(
-                store.transaction_runner
-            )
+            checkpoint_after_dispatch = _read_memory_checkpoint_sequence(store.transaction_runner)
             assert len(observed_catchups) == 1
             assert len(factory.accepted_snapshots) == 1
             assert len(factory.accepted_requests) == 1
             dispatch_catchup = observed_catchups[0]
             accepted_contents = tuple(
                 content
-                for content in (
-                    _message_text(message)
-                    for message in factory.accepted_requests[0].messages
-                )
+                for content in (_message_text(message) for message in factory.accepted_requests[0].messages)
                 if content is not None
             )
             assert result.dispatched == 1
@@ -3602,10 +3822,7 @@ async def test_scheduler_uses_toolruntime_when_tooling_is_configured(
             store,
             session_id=session_id,
             agent_policy=tool_policy,
-            tool_schemas=tuple(
-                definition.to_tool_schema()
-                for definition in tooling.business_tool_bundle.definitions
-            ),
+            tool_schemas=tuple(definition.to_tool_schema() for definition in tooling.business_tool_bundle.definitions),
             tooling_options=tooling,
         )
         scheduler = await _open_scheduler(
@@ -3660,7 +3877,12 @@ async def test_drain_loop_continues_when_dispatch_arrives_during_empty_window(
     factory = _FakeWorkerFactory()
     with open_host_durable_store(_options(tmp_path)) as store:
         seeded = _seed_current_run(store)
-        scheduler = await _open_scheduler(tmp_path, store, factory)
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            lane_default_timeout_seconds=1.0,
+        )
         scheduler._queue = _EnqueueOnSecondEmptyQueue(_pending_dispatch(seeded))
         scheduler._drain_task = asyncio.create_task(scheduler._drain_loop())
         try:
@@ -3867,7 +4089,9 @@ async def test_worker_startup_timeout_closes_starting_attempt_failed(
             assert run.status == RunStatus.FAILED
             assert attempt.status == AttemptStatus.FAILED
             assert dispatch_record.status == DispatchRecordStatus.CANCELLED
-            assert json.loads(_require_text(event.reason_json))["reason"] == ("worker_startup_timeout")
+            assert json.loads(_require_text(event.reason_json)) == {
+                "reason": "worker_startup_timeout"
+            }
         finally:
             await scheduler.close()
 
@@ -4139,7 +4363,9 @@ async def test_lane_acquire_timeout_closes_starting_attempt_failed(
             assert run.status == RunStatus.FAILED
             assert attempt.status == AttemptStatus.FAILED
             assert dispatch_record.status == DispatchRecordStatus.CANCELLED
-            assert json.loads(_require_text(event.reason_json))["reason"] == ("worker_startup_timeout")
+            assert json.loads(_require_text(event.reason_json)) == {
+                "reason": "worker_startup_timeout"
+            }
         finally:
             await scheduler.close()
             await claim.token.release()
@@ -4170,7 +4396,9 @@ async def test_worker_clean_eof_closes_run_failed_from_scheduler(
             assert run.status == RunStatus.FAILED
             assert attempt.status == AttemptStatus.FAILED
             event = _read_event_by_type(store.transaction_runner, "RUN_FAILED")
-            assert json.loads(_require_text(event.reason_json))["reason"] == ("stream_ended_without_terminal")
+            assert json.loads(_require_text(event.reason_json)) == {
+                "reason": "stream_ended_without_terminal"
+            }
         finally:
             await scheduler.close()
 
@@ -4192,6 +4420,7 @@ async def test_worker_stream_exception_closes_run_lost_from_scheduler(
             store,
             factory,
             lane_db_path=lane_db_path,
+            lane_default_timeout_seconds=1.0,
             active_registry=registry,
         )
         try:
@@ -4209,7 +4438,9 @@ async def test_worker_stream_exception_closes_run_lost_from_scheduler(
             assert run.status == RunStatus.LOST
             assert attempt.status == AttemptStatus.LOST
             event = _read_event_by_type(store.transaction_runner, "RUN_LOST")
-            assert json.loads(_require_text(event.reason_json))["reason"] == ("worker_lost_before_terminal")
+            assert json.loads(_require_text(event.reason_json)) == {
+                "reason": "worker_lost_before_terminal"
+            }
             assert handle.closed is True
             assert (
                 registry.cancel(
@@ -4881,7 +5112,9 @@ async def test_scheduler_with_default_local_proxy_stream_error_closes_lost(
             assert run.status == RunStatus.LOST
             assert attempt.status == AttemptStatus.LOST
             event = _read_event_by_type(store.transaction_runner, "RUN_LOST")
-            assert json.loads(_require_text(event.reason_json))["reason"] == ("worker_lost_before_terminal")
+            assert json.loads(_require_text(event.reason_json)) == {
+                "reason": "worker_lost_before_terminal"
+            }
         finally:
             await scheduler.close()
 
@@ -4916,6 +5149,7 @@ async def test_scheduler_closes_default_local_proxy_after_terminal_before_late_e
                     filtered=False,
                     degraded=False,
                     finish_reason=FinishReason.STOP,
+                    response_identity=(_successful_response_identity_for_agent_request(request)),
                 ),
                 metadata=None,
             )
@@ -4975,10 +5209,21 @@ async def test_pre_start_governance_soft_threshold_compacts_before_attempt(
     """soft threshold 在 Attempt 创建前触发一次 proactive compact。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_user_input(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-soft-compact-history",
+            event_id="event-soft-compact-history",
+            display_text="older compactable material",
+            client_request_id="client-soft-compact-history",
+            idempotency_key="idem-soft-compact-history",
+        )
         seeded = _seed_accepted_run(
             store,
             run_id="run-soft-compact",
             display_text=_soft_threshold_prompt(),
+            session_id=session_id,
         )
         assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 0
         scheduler = await _open_scheduler(
@@ -4988,6 +5233,7 @@ async def test_pre_start_governance_soft_threshold_compacts_before_attempt(
             context_budget_policy=_soft_compact_policy(),
             context_compactor=_PreparedManifestProactiveCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_compact_no_floor_memory_policy(),
         )
         try:
             await scheduler.run_queue_promotion(seeded.session_id)
@@ -5002,22 +5248,16 @@ async def test_pre_start_governance_soft_threshold_compacts_before_attempt(
 
             assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 1
             budget_indexes = tuple(
-                index
-                for index, event_type in enumerate(event_types)
-                if event_type == CONTEXT_BUDGET_EVALUATED
+                index for index, event_type in enumerate(event_types) if event_type == CONTEXT_BUDGET_EVALUATED
             )
             assert len(budget_indexes) == 2
-            assert budget_indexes[0] < event_types.index(
-                CONTEXT_COMPACTION_REQUESTED
-            )
+            assert budget_indexes[0] < event_types.index(CONTEXT_COMPACTION_REQUESTED)
             assert event_types.index(CONTEXT_COMPACTION_REQUESTED) < event_types.index(CONTEXT_COMPACTED)
             assert event_types.index(CONTEXT_COMPACTED) < budget_indexes[1]
             assert budget_indexes[1] < event_types.index("RUN_STARTED")
             assert event_types.index("RUN_STARTED") < event_types.index("ATTEMPT_STARTED")
             budget_payloads = tuple(
-                parse_context_budget_evaluated_payload(
-                    _event_payload(event)
-                )
+                parse_context_budget_evaluated_payload(_event_payload(event))
                 for event in _events_for_run_by_type(
                     store.transaction_runner,
                     seeded.run_id,
@@ -5087,9 +5327,7 @@ async def test_budgeted_allow_stage_orders_manifest_fact_before_start(
                 manifest_digest=sha256_digest_json({"anchor": "manifest"}),
                 iteration_link_event_id="event-anchor-link",
                 usage_event_id="event-anchor-usage",
-                usage_observation_digest=sha256_digest_json(
-                    {"anchor": "usage"}
-                ),
+                usage_observation_digest=sha256_digest_json({"anchor": "usage"}),
                 iteration_completed_event_id="event-anchor-completed",
                 usage_anchor_tokens=100,
                 conservative_anchor_tokens=100,
@@ -5120,16 +5358,12 @@ async def test_budgeted_allow_stage_orders_manifest_fact_before_start(
         )
         try:
             run = _read_run(store.transaction_runner, seeded.run_id)
-            scheduler._catch_up_memory_projection_before_candidate(
-                run.session_id
-            )
+            scheduler._catch_up_memory_projection_before_candidate(run.session_id)
             outcome = store.transaction_runner.run_write(
-                lambda transaction: (
-                    scheduler._prepare_and_commit_start_in_transaction(
-                        transaction,
-                        run,
-                        stage=stage,
-                    )
+                lambda transaction: scheduler._prepare_and_commit_start_in_transaction(
+                    transaction,
+                    run,
+                    stage=stage,
                 )
             )
 
@@ -5156,17 +5390,11 @@ async def test_budgeted_allow_stage_orders_manifest_fact_before_start(
             assert fact.sizing_stage is stage
             if stage is ContextSizingStage.POST_COMPACT:
                 assert resolver_calls == []
-                assert fact.estimate_method is (
-                    ContextEstimateMethod.CONSERVATIVE_FALLBACK
-                )
-                assert fact.fallback_reason is (
-                    ContextSizingFallbackReason.ACCEPTED_COMPACT_INVALIDATED
-                )
+                assert fact.estimate_method is (ContextEstimateMethod.CONSERVATIVE_FALLBACK)
+                assert fact.fallback_reason is (ContextSizingFallbackReason.ACCEPTED_COMPACT_INVALIDATED)
             else:
                 assert resolver_calls == [stage]
-                assert fact.estimate_method is (
-                    ContextEstimateMethod.USAGE_ANCHORED
-                )
+                assert fact.estimate_method is (ContextEstimateMethod.USAGE_ANCHORED)
                 assert fact.anchor_diagnostic is not None
         finally:
             await scheduler.close()
@@ -5211,16 +5439,12 @@ async def test_budgeted_hard_stage_records_fact_before_terminal(
         )
         try:
             run = _read_run(store.transaction_runner, seeded.run_id)
-            scheduler._catch_up_memory_projection_before_candidate(
-                run.session_id
-            )
+            scheduler._catch_up_memory_projection_before_candidate(run.session_id)
             outcome = store.transaction_runner.run_write(
-                lambda transaction: (
-                    scheduler._prepare_and_commit_start_in_transaction(
-                        transaction,
-                        run,
-                        stage=stage,
-                    )
+                lambda transaction: scheduler._prepare_and_commit_start_in_transaction(
+                    transaction,
+                    run,
+                    stage=stage,
                 )
             )
 
@@ -5242,14 +5466,14 @@ async def test_budgeted_hard_stage_records_fact_before_terminal(
                 )
             )
             assert fact.sizing_stage is stage
+            assert fact.pressure_level is ContextPressureLevel.HARD_THRESHOLD_EXCEEDED
             assert (
-                fact.pressure_level
-                is ContextPressureLevel.HARD_THRESHOLD_EXCEEDED
+                _attempt_count_for_run(
+                    store.transaction_runner,
+                    seeded.run_id,
+                )
+                == 0
             )
-            assert _attempt_count_for_run(
-                store.transaction_runner,
-                seeded.run_id,
-            ) == 0
         finally:
             await scheduler.close()
 
@@ -5318,26 +5542,20 @@ async def test_budgeted_start_failure_rolls_back_candidate_fact_and_rows(
         )
         try:
             run = _read_run(store.transaction_runner, seeded.run_id)
-            scheduler._catch_up_memory_projection_before_candidate(
-                run.session_id
-            )
+            scheduler._catch_up_memory_projection_before_candidate(run.session_id)
             descriptor_count_before = _table_count(
                 store.transaction_runner,
                 TABLE_PAYLOAD_DESCRIPTORS,
             )
             expected_error = (
-                HostDurableError
-                if failure_kind == "cas_lost"
-                else host_dispatch._StartCandidateCasMissRollback
+                HostDurableError if failure_kind == "cas_lost" else host_dispatch._StartCandidateCasMissRollback
             )
             with pytest.raises(expected_error):
                 store.transaction_runner.run_write(
-                    lambda transaction: (
-                        scheduler._prepare_and_commit_start_in_transaction(
-                            transaction,
-                            run,
-                            stage=ContextSizingStage.ORDINARY,
-                        )
+                    lambda transaction: scheduler._prepare_and_commit_start_in_transaction(
+                        transaction,
+                        run,
+                        stage=ContextSizingStage.ORDINARY,
                     )
                 )
 
@@ -5349,18 +5567,27 @@ async def test_budgeted_start_failure_rolls_back_candidate_fact_and_rows(
             assert CONTEXT_BUDGET_EVALUATED not in event_types
             assert "RUN_STARTED" not in event_types
             assert "ATTEMPT_STARTED" not in event_types
-            assert _attempt_count_for_run(
-                store.transaction_runner,
-                seeded.run_id,
-            ) == 0
-            assert _table_count(
-                store.transaction_runner,
-                TABLE_HOST_ATTEMPT_DISPATCH_RECORDS,
-            ) == 0
-            assert _table_count(
-                store.transaction_runner,
-                TABLE_PAYLOAD_DESCRIPTORS,
-            ) == descriptor_count_before
+            assert (
+                _attempt_count_for_run(
+                    store.transaction_runner,
+                    seeded.run_id,
+                )
+                == 0
+            )
+            assert (
+                _table_count(
+                    store.transaction_runner,
+                    TABLE_HOST_ATTEMPT_DISPATCH_RECORDS,
+                )
+                == 0
+            )
+            assert (
+                _table_count(
+                    store.transaction_runner,
+                    TABLE_PAYLOAD_DESCRIPTORS,
+                )
+                == descriptor_count_before
+            )
         finally:
             await scheduler.close()
 
@@ -5414,10 +5641,21 @@ async def test_compact_accepted_hot_path_runs_bounded_memory_catchup(
         observed_catch_up,
     )
     with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_user_input(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-compact-catchup-history",
+            event_id="event-compact-catchup-history",
+            display_text="older compactable material",
+            client_request_id="client-compact-catchup-history",
+            idempotency_key="idem-compact-catchup-history",
+        )
         seeded = _seed_accepted_run(
             store,
             run_id="run-compact-no-memory-catchup",
             display_text=_soft_threshold_prompt(),
+            session_id=session_id,
         )
         scheduler = await _open_scheduler(
             tmp_path,
@@ -5426,6 +5664,7 @@ async def test_compact_accepted_hot_path_runs_bounded_memory_catchup(
             context_budget_policy=_soft_compact_policy(),
             context_compactor=_PreparedManifestProactiveCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_compact_no_floor_memory_policy(),
         )
         try:
             await scheduler.run_queue_promotion(seeded.session_id)
@@ -5433,10 +5672,7 @@ async def test_compact_accepted_hot_path_runs_bounded_memory_catchup(
             assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 1
             assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 1
             assert len(observed_max_event_sequences) == 2
-            assert all(
-                sequence is not None
-                for sequence in observed_max_event_sequences
-            )
+            assert all(sequence is not None for sequence in observed_max_event_sequences)
         finally:
             await scheduler.close()
 
@@ -5485,10 +5721,10 @@ async def test_governed_start_sets_dispatch_owner_immediately(
 
 
 @pytest.mark.asyncio
-async def test_proactive_compaction_uses_selected_material_not_session_start_range(
+async def test_proactive_compaction_skips_empty_citable_selection(
     tmp_path: Path,
 ) -> None:
-    """proactive request 使用 selected ordinary material，不从 Session 起点扫描。"""
+    """selection 无 citable boundary 时走 no-op start，不调用 compactor。"""
 
     compactor = _RequestCapturingCompactor()
     with open_host_durable_store(_options(tmp_path)) as store:
@@ -5509,22 +5745,16 @@ async def test_proactive_compaction_uses_selected_material_not_session_start_ran
         try:
             await scheduler.run_queue_promotion(seeded.session_id)
 
-            assert len(compactor.prepared_requests) == 1
-            request = compactor.prepared_requests[0]
-            assert request.segment_selection.input_cursor == (
-                _run_input_sequence(store.transaction_runner, seeded.run_id)
-            )
-            assert request.material_source_refs == (f"event-input-{seeded.run_id}",)
-            assert request.segment_selection.selected_block_ids == ()
-            _assert_accepted_payload_has_proposal_manifest(
-                _event_payload(
-                    _latest_event_for_run(
-                        store.transaction_runner,
-                        seeded.run_id,
-                        CONTEXT_COMPACTED,
-                    )
+            assert compactor.prepared_requests == []
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 0
+            assert (
+                _event_count(
+                    store.transaction_runner,
+                    CONTEXT_COMPACTION_REQUESTED,
                 )
+                == 0
             )
+            assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 1
         finally:
             await scheduler.close()
 
@@ -5652,6 +5882,15 @@ async def test_proactive_fallback_payload_appends_current_input_once(
             client_request_id="client-proactive-fallback-old",
             idempotency_key="idem-proactive-fallback-old",
         )
+        _append_user_input(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-proactive-fallback-recent",
+            event_id="event-proactive-fallback-recent-input",
+            display_text="recent protected delta input",
+            client_request_id="client-proactive-fallback-recent",
+            idempotency_key="idem-proactive-fallback-recent",
+        )
         seeded = _seed_accepted_run(
             store,
             run_id="run-proactive-fallback-current",
@@ -5686,14 +5925,10 @@ async def test_proactive_fallback_payload_appends_current_input_once(
             payload = _event_payload(failed)
             window = payload["fallback_input_window"]
             assert isinstance(window, Mapping)
-            selected_block_ids = _required_json_text_tuple(
-                window["selected_block_ids"]
-            )
+            selected_block_ids = _required_json_text_tuple(window["selected_block_ids"])
             current_block_id = f"current:event-input-{seeded.run_id}"
             assert selected_block_ids.count(current_block_id) == 1
-            assert "eventlog:user:event-proactive-fallback-old-input" in (
-                selected_block_ids
-            )
+            assert "eventlog:user:event-proactive-fallback-recent-input" in (selected_block_ids)
             assert window["current_input_ref"] == f"event-input-{seeded.run_id}"
             assert payload["fallback_action"] == "dispatch"
         finally:
@@ -5741,7 +5976,7 @@ async def test_second_proactive_compact_uses_previous_view_without_old_raw_repla
             await scheduler.run_queue_promotion(first.session_id)
             assert len(compactor.prepared_requests) == 1
             assert compactor.prepared_requests[0].material_pack.trace_material != ()
-            assert (await scheduler.drain_once()).dispatched == 1
+            await _wait_for_final_request_count(factory, 1)
             await _wait_for_run_status(
                 store.transaction_runner,
                 first.run_id,
@@ -5758,10 +5993,7 @@ async def test_second_proactive_compact_uses_previous_view_without_old_raw_repla
             assert len(compactor.prepared_requests) == 2
             second_request = compactor.prepared_requests[1]
             assert second_request.material_pack.previous_compacted_view != ()
-            assert all(
-                block.text != "old"
-                for block in second_request.material_pack.trace_material
-            )
+            assert all(block.text != "old" for block in second_request.material_pack.trace_material)
         finally:
             await scheduler.close()
 
@@ -5774,10 +6006,21 @@ async def test_proactive_material_pack_not_larger_than_ordinary_material_for_sam
 
     compactor = _RequestCapturingCompactor()
     with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_user_input(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-proactive-material-size-history",
+            event_id="event-proactive-material-size-history",
+            display_text="older compactable material",
+            client_request_id="client-proactive-material-size-history",
+            idempotency_key="idem-proactive-material-size-history",
+        )
         seeded = _seed_accepted_run(
             store,
             run_id="run-proactive-material-size",
             display_text=_soft_threshold_prompt(),
+            session_id=session_id,
         )
         scheduler = await _open_scheduler(
             tmp_path,
@@ -5786,6 +6029,7 @@ async def test_proactive_material_pack_not_larger_than_ordinary_material_for_sam
             context_budget_policy=_soft_compact_policy(),
             context_compactor=compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_compact_no_floor_memory_policy(),
         )
         try:
             await scheduler.run_queue_promotion(seeded.session_id)
@@ -5793,7 +6037,7 @@ async def test_proactive_material_pack_not_larger_than_ordinary_material_for_sam
             request = compactor.prepared_requests[0]
             ordinary_chars = len(_soft_threshold_prompt())
             pack_chars = len(str(request.llm_material_json()))
-            assert pack_chars <= ordinary_chars + 512
+            assert pack_chars <= ordinary_chars + 1024
             _assert_accepted_payload_has_proposal_manifest(
                 _event_payload(
                     _latest_event_for_run(
@@ -5814,10 +6058,21 @@ async def test_wake_queue_promotion_uses_tracked_async_promotion_task(
     """sync wakeup 入队后由 scheduler 管理的 promotion task 完成 compact。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_user_input(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-wake-soft-compact-history",
+            event_id="event-wake-soft-compact-history",
+            display_text="older compactable material",
+            client_request_id="client-wake-soft-compact-history",
+            idempotency_key="idem-wake-soft-compact-history",
+        )
         seeded = _seed_accepted_run(
             store,
             run_id="run-wake-soft-compact",
             display_text=_soft_threshold_prompt(),
+            session_id=session_id,
         )
         scheduler = await _open_scheduler(
             tmp_path,
@@ -5826,6 +6081,7 @@ async def test_wake_queue_promotion_uses_tracked_async_promotion_task(
             context_budget_policy=_soft_compact_policy(),
             context_compactor=_PreparedManifestProactiveCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_compact_no_floor_memory_policy(),
         )
         try:
             scheduler.wake_queue_promotion(seeded.session_id)
@@ -5862,7 +6118,7 @@ async def test_wake_queue_promotion_logs_promotion_task_exception(
     with open_host_durable_store(_options(tmp_path)) as store:
         scheduler = await _open_scheduler(tmp_path, store, _FakeWorkerFactory())
 
-        async def _raising_promotion(session_id: str) -> None:
+        async def _raising_promotion(session_id: str) -> bool:
             """模拟 promotion 内部异常。
 
             :param session_id: promotion session id。
@@ -5873,7 +6129,11 @@ async def test_wake_queue_promotion_logs_promotion_task_exception(
             del session_id
             raise RuntimeError("promotion failed")
 
-        monkeypatch.setattr(scheduler, "run_queue_promotion", _raising_promotion)
+        monkeypatch.setattr(
+            scheduler,
+            "_signal_pre_start_governance",
+            _raising_promotion,
+        )
         try:
             with caplog.at_level(logging.WARNING):
                 scheduler.wake_queue_promotion("session-promotion-error")
@@ -5898,18 +6158,23 @@ async def test_wake_queue_promotion_requeues_after_transient_exception(
     :param tmp_path: pytest 临时目录。
     :param monkeypatch: pytest monkeypatch fixture。
     :returns: ``None``。
+    :raises AssertionError: retry 次数不是精确两次时抛出。
     """
 
     with open_host_durable_store(_options(tmp_path)) as store:
         scheduler = await _open_scheduler(tmp_path, store, _FakeWorkerFactory())
+        reconciliation_task = scheduler._owned_session_reconciliation_task
+        assert reconciliation_task is not None
+        reconciliation_task.cancel()
+        await host_dispatch._suppress_task_cancel(reconciliation_task)
         attempts = 0
         recovered = asyncio.Event()
 
-        async def _flaky_promotion(session_id: str) -> None:
+        async def _flaky_promotion(session_id: str) -> bool:
             """第一次失败，第二次记录恢复。
 
             :param session_id: promotion session id。
-            :returns: ``None``。
+            :returns: 第二次及后续调用返回未 dispatch。
             :raises RuntimeError: 第一次调用时模拟 transient failure。
             """
 
@@ -5919,8 +6184,13 @@ async def test_wake_queue_promotion_requeues_after_transient_exception(
             if attempts == 1:
                 raise RuntimeError("promotion transient")
             recovered.set()
+            return False
 
-        monkeypatch.setattr(scheduler, "run_queue_promotion", _flaky_promotion)
+        monkeypatch.setattr(
+            scheduler,
+            "_signal_pre_start_governance",
+            _flaky_promotion,
+        )
         try:
             scheduler.wake_queue_promotion("session-promotion-retry")
             await asyncio.wait_for(recovered.wait(), timeout=1)
@@ -5928,6 +6198,336 @@ async def test_wake_queue_promotion_requeues_after_transient_exception(
             assert attempts == 2
         finally:
             await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_pre_start_flight_coalesces_wake_periodic_and_direct_signals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同 Session 多 signal 只形成 sole flight 与一个 fresh no-op pass。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: signal 未合并、pass 未 fresh 重读或 flight 泄漏时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            dispatch_poll_interval_seconds=60.0,
+        )
+        first_pass_entered = asyncio.Event()
+        release_first_pass = asyncio.Event()
+        pass_count = 0
+
+        async def _barrier_pass(
+            session_id: str,
+            *,
+            work_lease: SessionWorkLease,
+        ) -> bool:
+            """阻塞首个 pass，并让 coalesced pass 执行 fresh no-op。
+
+            :param session_id: 当前 Session id。
+            :param work_lease: 当前 pass 独占生命周期的 fresh lease。
+            :returns: 始终返回未创建 dispatch。
+            :raises AssertionError: Session 或 lease 类型漂移时抛出。
+            """
+
+            nonlocal pass_count
+            assert session_id == "session-flight-coalesced"
+            assert isinstance(work_lease, SessionWorkLease)
+            pass_count += 1
+            if pass_count == 1:
+                first_pass_entered.set()
+                await release_first_pass.wait()
+            return False
+
+        monkeypatch.setattr(
+            scheduler,
+            "_run_queue_promotion_with_lease",
+            _barrier_pass,
+        )
+        first_signal = asyncio.create_task(scheduler.run_queue_promotion("session-flight-coalesced"))
+        try:
+            await asyncio.wait_for(first_pass_entered.wait(), timeout=1)
+            scheduler.wake_queue_promotion("session-flight-coalesced")
+            scheduler.wake_queue_promotion("session-flight-coalesced")
+            periodic_signal = asyncio.create_task(scheduler.reconcile_owned_sessions_once(fixed_now=_NOW))
+            direct_signal = asyncio.create_task(scheduler.run_queue_promotion("session-flight-coalesced"))
+            await asyncio.sleep(0)
+
+            assert len(scheduler._pre_start_flights) == 1
+            assert scheduler._pre_start_flights["session-flight-coalesced"].rerun_requested is True
+
+            release_first_pass.set()
+            await asyncio.gather(first_signal, periodic_signal, direct_signal)
+
+            assert pass_count == 2
+            assert scheduler._pre_start_flights == {}
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_live_compactor_flight_coalesces_wake_and_periodic_without_recovery(
+    tmp_path: Path,
+) -> None:
+    """实际 compactor await 期间的多 signal 只要求 fresh no-op pass。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: live provider 被误恢复、attempt 重复或 flight 泄漏时抛出。
+    """
+
+    blocker = _BlockingAfterManifestCompactor()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_user_input(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-live-compactor-history",
+            event_id="event-live-compactor-history",
+            display_text="older compactable material",
+            client_request_id="client-live-compactor-history",
+            idempotency_key="idem-live-compactor-history",
+        )
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-live-compactor-coalesced-flight",
+            display_text=_soft_threshold_prompt(),
+            session_id=session_id,
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(accepted_handle=_CloseCountingHandle()),
+            context_budget_policy=_soft_compact_policy(
+                max_compaction_attempts_per_operation=2,
+            ),
+            context_compactor=blocker,
+            compact_artifact_root=tmp_path / "compact-artifacts",
+            dispatch_poll_interval_seconds=60.0,
+            memory_projection_policy=_compact_no_floor_memory_policy(),
+        )
+        promotion = asyncio.create_task(scheduler.run_queue_promotion(seeded.session_id))
+        try:
+            await asyncio.wait_for(blocker.provider_entered.wait(), timeout=2.0)
+            flight = scheduler._pre_start_flights[seeded.session_id]
+            projection_at_barrier = _read_proactive_projection(
+                store.transaction_runner,
+                session_id=seeded.session_id,
+                run_id=seeded.run_id,
+            )
+
+            assert len(scheduler._pre_start_flights) == 1
+            assert flight.task.done() is False
+            assert flight.rerun_requested is False
+            assert blocker.provider_calls == 1
+            assert len(blocker.prepared_requests) == 1
+            assert projection_at_barrier.state.prepared_attempt_numbers == (1,)
+            assert (
+                _event_types_for_run(
+                    store.transaction_runner,
+                    seeded.run_id,
+                ).count(CONTEXT_COMPACTION_REQUESTED)
+                == 1
+            )
+            assert (
+                _events_for_run_by_type(
+                    store.transaction_runner,
+                    seeded.run_id,
+                    CONTEXT_COMPACTED,
+                )
+                == ()
+            )
+            assert (
+                _events_for_run_by_type(
+                    store.transaction_runner,
+                    seeded.run_id,
+                    CONTEXT_COMPACTION_FAILED,
+                )
+                == ()
+            )
+
+            periodic_signal = asyncio.create_task(scheduler.reconcile_owned_sessions_once(fixed_now=_NOW))
+            await asyncio.sleep(0)
+            assert periodic_signal.done() is False
+            assert scheduler._pre_start_flights[seeded.session_id] is flight
+            assert flight.rerun_requested is True
+
+            scheduler.wake_queue_promotion(seeded.session_id)
+            scheduler.wake_queue_promotion(seeded.session_id)
+            assert len(scheduler._pre_start_flights) == 1
+            assert scheduler._pre_start_flights[seeded.session_id] is flight
+            assert blocker.provider_calls == 1
+            assert len(blocker.prepared_requests) == 1
+            assert _read_proactive_projection(
+                store.transaction_runner,
+                session_id=seeded.session_id,
+                run_id=seeded.run_id,
+            ).state.prepared_attempt_numbers == (1,)
+
+            blocker.provider_release.set()
+            await asyncio.gather(promotion, periodic_signal)
+
+            completed = _read_proactive_projection(
+                store.transaction_runner,
+                session_id=seeded.session_id,
+                run_id=seeded.run_id,
+            )
+            event_types = _event_types_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+            )
+            terminal_count = event_types.count(CONTEXT_COMPACTED) + (event_types.count(CONTEXT_COMPACTION_FAILED))
+            assert scheduler._pre_start_flights == {}
+            assert blocker.provider_calls == 1
+            assert blocker.calls == 1
+            assert len(blocker.prepared_requests) == 1
+            assert event_types.count(CONTEXT_COMPACTION_REQUESTED) == 1
+            assert terminal_count == 1
+            assert event_types.count(CONTEXT_COMPACTED) == 1
+            assert completed.state.phase is ProactiveCompactionPhase.COMPACTED
+            assert completed.state.prepared_attempt_numbers == (1,)
+            assert _run_status(store.transaction_runner, seeded.run_id) == (RunStatus.RUNNING)
+        finally:
+            blocker.provider_release.set()
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_pre_start_flight_exit_boundary_signal_starts_fresh_flight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """flight 无 await 删除后的 signal 必须启动新的 fresh flight。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: exit-boundary signal 丢失或复用旧 flight 时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            dispatch_poll_interval_seconds=60.0,
+        )
+        second_flight_entered = asyncio.Event()
+        pass_count = 0
+
+        async def _exit_boundary_pass(
+            session_id: str,
+            *,
+            work_lease: SessionWorkLease,
+        ) -> bool:
+            """首个 pass 返回前排队 signal，第二个 fresh flight 留下证据。
+
+            :param session_id: 当前 Session id。
+            :param work_lease: 当前 pass 的 fresh lease。
+            :returns: 始终返回未创建 dispatch。
+            :raises AssertionError: Session 或 lease 类型漂移时抛出。
+            """
+
+            nonlocal pass_count
+            assert session_id == "session-flight-exit-boundary"
+            assert isinstance(work_lease, SessionWorkLease)
+            pass_count += 1
+            if pass_count == 1:
+                asyncio.get_running_loop().call_soon(
+                    scheduler.wake_queue_promotion,
+                    session_id,
+                )
+            else:
+                second_flight_entered.set()
+            return False
+
+        monkeypatch.setattr(
+            scheduler,
+            "_run_queue_promotion_with_lease",
+            _exit_boundary_pass,
+        )
+        try:
+            await scheduler.run_queue_promotion("session-flight-exit-boundary")
+            await asyncio.wait_for(second_flight_entered.wait(), timeout=1)
+
+            assert pass_count == 2
+            assert scheduler._pre_start_flights == {}
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_pre_start_flight_is_parallel_per_session_and_close_owned(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """不同 Session 可并行，awaiter 取消不取消 flight，close 统一收口。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: flight 被 caller 取消、跨 Session 串行或 close 泄漏时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            dispatch_poll_interval_seconds=60.0,
+        )
+        entered = {
+            "session-flight-a": asyncio.Event(),
+            "session-flight-b": asyncio.Event(),
+        }
+        blocker = asyncio.Event()
+
+        async def _parallel_pass(
+            session_id: str,
+            *,
+            work_lease: SessionWorkLease,
+        ) -> bool:
+            """记录两个 Session 并行进入并等待 scheduler close。
+
+            :param session_id: 当前 Session id。
+            :param work_lease: 当前 pass 的 fresh lease。
+            :returns: blocker 被释放后返回未创建 dispatch。
+            :raises AssertionError: Session 或 lease 类型漂移时抛出。
+            """
+
+            assert isinstance(work_lease, SessionWorkLease)
+            entered[session_id].set()
+            await blocker.wait()
+            return False
+
+        monkeypatch.setattr(
+            scheduler,
+            "_run_queue_promotion_with_lease",
+            _parallel_pass,
+        )
+        first = asyncio.create_task(scheduler.run_queue_promotion("session-flight-a"))
+        second = asyncio.create_task(scheduler.run_queue_promotion("session-flight-b"))
+        await asyncio.wait_for(entered["session-flight-a"].wait(), timeout=1)
+        await asyncio.wait_for(entered["session-flight-b"].wait(), timeout=1)
+
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert scheduler._pre_start_flights["session-flight-a"].task.done() is False
+        assert scheduler._pre_start_flights["session-flight-b"].task.done() is False
+
+        await scheduler.close()
+
+        with pytest.raises(asyncio.CancelledError):
+            await second
+        assert scheduler._pre_start_flights == {}
 
 
 @pytest.mark.asyncio
@@ -5942,18 +6542,24 @@ async def test_scheduler_close_cancels_tracked_promotion_task(
         blocker = asyncio.Event()
         promotion_started = asyncio.Event()
 
-        async def _blocked_promotion(session_id: str) -> None:
+        async def _blocked_promotion(session_id: str) -> bool:
             """模拟长期运行的 promotion。
 
             :param session_id: promotion session id。
-            :returns: ``None``。
+            :returns: blocker 被释放后返回未 dispatch。
+            :raises asyncio.CancelledError: scheduler close 取消时透传。
             """
 
             del session_id
             promotion_started.set()
             await blocker.wait()
+            return False
 
-        monkeypatch.setattr(scheduler, "run_queue_promotion", _blocked_promotion)
+        monkeypatch.setattr(
+            scheduler,
+            "_signal_pre_start_governance",
+            _blocked_promotion,
+        )
         scheduler.wake_queue_promotion("session-promotion-close")
         await _wait_for_promotion_task_started(scheduler)
         await promotion_started.wait()
@@ -6060,10 +6666,21 @@ async def test_proactive_compaction_calls_llm_outside_write_transaction(
     """proactive compactor 外部调用不持有 Host write transaction。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_user_input(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-proactive-outside-history",
+            event_id="event-proactive-outside-history",
+            display_text="older compactable material",
+            client_request_id="client-proactive-outside-history",
+            idempotency_key="idem-proactive-outside-history",
+        )
         seeded = _seed_accepted_run(
             store,
             run_id="run-proactive-outside-transaction",
             display_text=_soft_threshold_prompt(),
+            session_id=session_id,
         )
         compactor = _TransactionReadableCompactor(store.transaction_runner)
         scheduler = await _open_scheduler(
@@ -6073,6 +6690,7 @@ async def test_proactive_compaction_calls_llm_outside_write_transaction(
             context_budget_policy=_soft_compact_policy(),
             context_compactor=compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_compact_no_floor_memory_policy(),
         )
         try:
             await scheduler.run_queue_promotion(seeded.session_id)
@@ -6104,10 +6722,21 @@ async def test_proactive_compaction_rechecks_durable_state_after_manifest(
     """
 
     with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_user_input(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-stale-manifest-history",
+            event_id="event-stale-manifest-history",
+            display_text="older compactable material",
+            client_request_id="client-stale-manifest-history",
+            idempotency_key="idem-stale-manifest-history",
+        )
         seeded = _seed_accepted_run(
             store,
             run_id="run-proactive-stale-after-manifest",
             display_text=_soft_threshold_prompt(),
+            session_id=session_id,
         )
         compactor = _PreparedManifestProactiveCompactor()
         original_record = DurableCompactorProposalManifestRecorder.record_compactor_proposal_manifest
@@ -6152,6 +6781,7 @@ async def test_proactive_compaction_rechecks_durable_state_after_manifest(
             context_budget_policy=_soft_compact_policy(),
             context_compactor=compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_compact_no_floor_memory_policy(),
         )
         try:
             await scheduler.run_queue_promotion(seeded.session_id)
@@ -6177,10 +6807,21 @@ async def test_compaction_stale_result_does_not_write_compacted_event(
     """proactive compact 返回后状态已变化时不写 ``CONTEXT_COMPACTED``。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_user_input(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-stale-result-history",
+            event_id="event-stale-result-history",
+            display_text="older compactable material",
+            client_request_id="client-stale-result-history",
+            idempotency_key="idem-stale-result-history",
+        )
         seeded = _seed_accepted_run(
             store,
             run_id="run-proactive-stale-result",
             display_text=_soft_threshold_prompt(),
+            session_id=session_id,
         )
         scheduler = await _open_scheduler(
             tmp_path,
@@ -6189,6 +6830,7 @@ async def test_compaction_stale_result_does_not_write_compacted_event(
             context_budget_policy=_soft_compact_policy(),
             context_compactor=_StaleMutatingCompactor(store.transaction_runner),
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_compact_no_floor_memory_policy(),
         )
         try:
             await scheduler.run_queue_promotion(seeded.session_id)
@@ -6218,14 +6860,383 @@ async def test_compaction_stale_result_does_not_write_compacted_event(
 
 
 @pytest.mark.asyncio
+async def test_proactive_late_accepted_result_preserves_first_failed_truth(
+    tmp_path: Path,
+) -> None:
+    """I0543 late accepted result 只保留 provider 前已提交的 manifest evidence。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: late loser 改写 first truth 或产生副作用时抛出。
+    """
+
+    artifact_root = tmp_path / "compact-artifacts"
+    factory = _FakeWorkerFactory()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run_with_compactable_history(
+            store,
+            run_id="run-proactive-first-terminal-wins",
+            display_text=_soft_threshold_prompt(),
+        )
+        descriptor_count_before = _payload_descriptor_count(store.transaction_runner)
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            context_budget_policy=_soft_compact_policy(),
+            context_compactor=_TerminalWinningProactiveCompactor(store.transaction_runner),
+            compact_artifact_root=artifact_root,
+            memory_projection_policy=_compact_no_floor_memory_policy(),
+        )
+        try:
+            await scheduler.run_queue_promotion(seeded.session_id)
+
+            failed = _latest_event_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+                CONTEXT_COMPACTION_FAILED,
+            )
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTION_FAILED) == 1
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 0
+            assert (
+                _event_count(
+                    store.transaction_runner,
+                    CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+                )
+                == 0
+            )
+            assert (
+                _event_count(
+                    store.transaction_runner,
+                    "RUNNER_CALL_INPUT_ASSEMBLED",
+                )
+                == 1
+            )
+            assert _event_payload(failed)["failure_reason"] == ("concurrent_governance_winner")
+            assert _event_count(store.transaction_runner, "RUN_STARTED") == 0
+            assert (
+                _attempt_count_for_run(
+                    store.transaction_runner,
+                    seeded.run_id,
+                )
+                == 0
+            )
+            assert factory.created == 0
+            assert _compact_artifact_files(artifact_root) == ()
+            descriptor_count_after = _payload_descriptor_count(store.transaction_runner)
+            assert descriptor_count_after == (descriptor_count_before + _COMPACTOR_PROPOSAL_DESCRIPTOR_COUNT)
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.parametrize("winner_compacted", (True, False))
+@pytest.mark.asyncio
+async def test_proactive_same_operation_terminal_contenders_preserve_first_truth(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    winner_compacted: bool,
+) -> None:
+    """两个 proactive outcome contender 的相反顺序只提交 first truth。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :param winner_compacted: 首个获准 outcome 是否为 compacted。
+    :returns: ``None``。
+    :raises AssertionError: late loser 写 artifact/event/fallback/start 时抛出。
+    """
+
+    artifact_root = tmp_path / "compact-artifacts"
+    compactor = _PreparedManifestProactiveCompactor()
+    factory = _FakeWorkerFactory()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run_with_compactable_history(
+            store,
+            run_id=("run-proactive-contender-compacted" if winner_compacted else "run-proactive-contender-failed"),
+            display_text=_soft_threshold_prompt(),
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            context_budget_policy=_soft_compact_policy(
+                max_compaction_attempts_per_operation=1,
+                context_window_size=512,
+                soft_threshold_tokens=50,
+                hard_threshold_tokens=400,
+            ),
+            context_compactor=compactor,
+            compact_artifact_root=artifact_root,
+            dispatch_poll_interval_seconds=60.0,
+            memory_projection_policy=_compact_no_floor_memory_policy(),
+        )
+        captured: list[host_dispatch._GovernanceCompactPending] = []
+        original_execute = scheduler._execute_proactive_compaction
+
+        async def _capture_pending(
+            pending: host_dispatch._GovernanceCompactPending,
+        ) -> host_dispatch._ProactiveCompactionExecutionResult:
+            """只捕获 request-owned pending，不提交 outcome。
+
+            :param pending: 已持久化 proactive request 的 pending 摘要。
+            :returns: 不含 durable 后续动作的执行结果。
+            :raises Exception: 不主动抛出异常。
+            """
+
+            captured.append(pending)
+            return host_dispatch._ProactiveCompactionExecutionResult(
+                compacted_event_sequence=None,
+                pending_dispatch=None,
+            )
+
+        monkeypatch.setattr(
+            scheduler,
+            "_execute_proactive_compaction",
+            _capture_pending,
+        )
+        try:
+            await scheduler.run_queue_promotion(seeded.session_id)
+            assert len(captured) == 1
+            pending = captured[0]
+            monkeypatch.setattr(
+                scheduler,
+                "_execute_proactive_compaction",
+                original_execute,
+            )
+            original_attempt = host_dispatch.run_compaction_attempt
+            entered_count = 0
+            both_entered = asyncio.Event()
+            releases = (asyncio.Event(), asyncio.Event())
+
+            async def _contending_attempt(
+                *,
+                request: CompactionRequest,
+                compactor: ContextCompactor,
+                attempt_number: int,
+                max_attempt_number: int,
+                cancellation_token: CancellationToken,
+                compaction_operation_id: str | None = None,
+                proposal_manifest_recorder: (DurableCompactorProposalManifestRecorder | None) = None,
+                memory_policy: MemoryProjectionPolicy,
+                repair_feedback: CompactRepairFeedbackV4 | None,
+            ) -> CompactionOperationResult:
+                """在 provider/manifest 完成后 barrier 两个相反 outcome。
+
+                :param request: 当前 frozen attempt request。
+                :param compactor: proactive compactor。
+                :param attempt_number: 当前全局 attempt number。
+                :param max_attempt_number: frozen max attempt number。
+                :param cancellation_token: durable Run cancellation token。
+                :param compaction_operation_id: request 同源 operation id。
+                :param proposal_manifest_recorder: durable manifest recorder。
+                    :param memory_policy: Context Governance 使用的 Memory policy。
+                    :param repair_feedback: 前次 semantic validation feedback。
+                :returns: 当前 contender 的 accepted 或 failed outcome。
+                :raises Exception: 真实 proposal attempt 或 barrier 失败时透传。
+                """
+
+                nonlocal entered_count
+                accepted = await original_attempt(
+                    request=request,
+                    compactor=compactor,
+                    attempt_number=attempt_number,
+                    max_attempt_number=max_attempt_number,
+                    cancellation_token=cancellation_token,
+                    compaction_operation_id=compaction_operation_id,
+                    proposal_manifest_recorder=proposal_manifest_recorder,
+                    memory_policy=memory_policy,
+                    repair_feedback=repair_feedback,
+                )
+                contender_index = entered_count
+                entered_count += 1
+                if entered_count == 2:
+                    both_entered.set()
+                await releases[contender_index].wait()
+                contender_compacted = winner_compacted if contender_index == 0 else not winner_compacted
+                if contender_compacted:
+                    return accepted
+                return CompactionOperationResult(
+                    accepted_truth=None,
+                    rejected_attempts=(),
+                    failure_reason="contending_provider_failure",
+                    budget_after_attempted_compact=None,
+                    accepted_attempt_number=None,
+                    accepted_successful_response_identity=None,
+                    accepted_proposal_manifest_reference=None,
+                )
+
+            monkeypatch.setattr(
+                host_dispatch,
+                "run_compaction_attempt",
+                _contending_attempt,
+            )
+            first = asyncio.create_task(original_execute(pending))
+            late = asyncio.create_task(original_execute(pending))
+            await asyncio.wait_for(both_entered.wait(), timeout=1)
+
+            releases[0].set()
+            winner = await first
+            first_terminal_type = CONTEXT_COMPACTED if winner_compacted else CONTEXT_COMPACTION_FAILED
+            first_terminal = _latest_event_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+                first_terminal_type,
+            )
+            cursor_after_winner = _event_log_cursor(store.transaction_runner)
+            descriptor_count_after_winner = _payload_descriptor_count(store.transaction_runner)
+            artifacts_after_winner = _compact_artifact_files(artifact_root)
+            run_started_after_winner = _event_count(
+                store.transaction_runner,
+                "RUN_STARTED",
+            )
+            attempt_count_after_winner = _attempt_count_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+            )
+            if winner_compacted:
+                assert winner.compacted_event_sequence == (first_terminal.event_sequence)
+                assert winner.pending_dispatch is None
+            else:
+                assert winner.compacted_event_sequence is None
+                assert winner.pending_dispatch is not None
+
+            releases[1].set()
+            loser = await late
+
+            assert loser.compacted_event_sequence is None
+            assert loser.pending_dispatch is None
+            assert (
+                _event_log_types_after_cursor(
+                    store.transaction_runner,
+                    cursor_after_winner,
+                )
+                == ()
+            )
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == (1 if winner_compacted else 0)
+            assert _event_count(
+                store.transaction_runner,
+                CONTEXT_COMPACTION_FAILED,
+            ) == (0 if winner_compacted else 1)
+            assert (
+                _event_count(
+                    store.transaction_runner,
+                    CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+                )
+                == 0
+            )
+            assert (
+                _latest_event_for_run(
+                    store.transaction_runner,
+                    seeded.run_id,
+                    first_terminal_type,
+                ).event_id
+                == first_terminal.event_id
+            )
+            if not winner_compacted:
+                assert _event_payload(first_terminal)["failure_reason"] == ("contending_provider_failure")
+            assert _compact_artifact_files(artifact_root) == artifacts_after_winner
+            assert len(artifacts_after_winner) == (1 if winner_compacted else 0)
+            assert _payload_descriptor_count(store.transaction_runner) == descriptor_count_after_winner
+            assert (
+                _event_count(
+                    store.transaction_runner,
+                    "RUN_STARTED",
+                )
+                == run_started_after_winner
+            )
+            assert (
+                _attempt_count_for_run(
+                    store.transaction_runner,
+                    seeded.run_id,
+                )
+                == attempt_count_after_winner
+            )
+            assert run_started_after_winner == (0 if winner_compacted else 1)
+            assert attempt_count_after_winner == (0 if winner_compacted else 1)
+            assert factory.created == 0
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_proactive_invalid_multiple_terminals_fail_closed_without_third_or_start(
+    tmp_path: Path,
+) -> None:
+    """proactive caller 对 INVALID_MULTIPLE 抛稳定错误且不改写 first truth。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: caller 追加第三 terminal、artifact 或 start 时抛出。
+    """
+
+    factory = _FakeWorkerFactory()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-proactive-invalid-multiple",
+            display_text=_soft_threshold_prompt(),
+        )
+        operation_id = "operation-proactive-invalid-multiple"
+        _append_proactive_compaction_requested(
+            store.transaction_runner,
+            seeded=seeded,
+            event_id=operation_id,
+        )
+        _append_duplicate_proactive_failed_terminals(
+            store.transaction_runner,
+            seeded=seeded,
+            operation_id=operation_id,
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            context_budget_policy=_soft_compact_policy(),
+            context_compactor=_PreparedManifestProactiveCompactor(),
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        try:
+            with pytest.raises(
+                HostDurableError,
+                match=COMPACTION_TERMINAL_INVALID_MULTIPLE_ERROR,
+            ):
+                await scheduler.run_queue_promotion(seeded.session_id)
+
+            assert (
+                _event_count(
+                    store.transaction_runner,
+                    CONTEXT_COMPACTION_FAILED,
+                )
+                == 2
+            )
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 0
+            assert _event_count(store.transaction_runner, "RUN_STARTED") == 0
+            assert (
+                _attempt_count_for_run(
+                    store.transaction_runner,
+                    seeded.run_id,
+                )
+                == 0
+            )
+            assert factory.created == 0
+            assert _compact_artifact_files(tmp_path / "compact-artifacts") == ()
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
 async def test_proactive_compaction_retries_quality_rejection_before_accept(
     tmp_path: Path,
 ) -> None:
-    """proactive compact 首次 quality rejection 后 retry 并写入 accepted fact。"""
+    """proactive compact 首次 quality rejection 后 retry 并写入 accepted fact。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: repair attempt 或 formal trace identity 不同源时抛出。
+    """
 
     compactor = _QualityRejectOnceCompactor()
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_accepted_run(
+        seeded = _seed_accepted_run_with_compactable_history(
             store,
             run_id="run-proactive-quality-retry",
             display_text=_soft_threshold_prompt(),
@@ -6239,12 +7250,23 @@ async def test_proactive_compaction_retries_quality_rejection_before_accept(
             ),
             context_compactor=compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_compact_no_floor_memory_policy(),
         )
         try:
             await scheduler.run_queue_promotion(seeded.session_id)
             event_types = _event_types_for_run(store.transaction_runner, seeded.run_id)
 
             assert compactor.calls == 2
+            assert compactor.prepared_inputs[0].repair_feedback is None
+            repair_feedback = compactor.prepared_inputs[1].repair_feedback
+            assert repair_feedback is not None
+            assert repair_feedback.previous_attempt_number == 1
+            assert repair_feedback.issues[0].json_path == "$"
+            assert (
+                repair_feedback.issues[0].code
+                is CompactValidationIssueCodeV4.EMPTY_SEMANTIC_OUTPUT
+            )
+            assert compactor.prepared_inputs[1].compact_input == compactor.prepared_inputs[0].compact_input
             assert (
                 _event_count(
                     store.transaction_runner,
@@ -6272,6 +7294,205 @@ async def test_proactive_compaction_retries_quality_rejection_before_accept(
             assert rejected_payload["failure_category"] == ("quality_check_rejected")
             _assert_rejected_payload_has_proposal_manifest(rejected_payload)
             _assert_accepted_payload_has_proposal_manifest(compacted_payload)
+            _resolve_and_assert_compactor_calls(
+                store.transaction_runner,
+                tmp_path=tmp_path,
+                run_id=seeded.run_id,
+                prepared_inputs=tuple(compactor.prepared_inputs),
+                attempt_payloads=(rejected_payload, compacted_payload),
+                accepted_attempt_number=2,
+            )
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_oversized_accepted_compact_terminal_uses_descriptor_truth(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """超限 accepted compact terminal 以同源 descriptor/blob 完成全部投影。
+
+    :param tmp_path: pytest 临时目录。
+    :param caplog: pytest 日志捕获 fixture。
+    :returns: ``None``。
+    :raises AssertionError: terminal、Memory、artifact、Tool Trace identity、
+        fail-closed 或 scheduler 收敛任一不符合 owner contract 时抛出。
+    """
+
+    payload_inline_threshold_bytes = 8192
+    caplog.set_level(logging.ERROR, logger="dayu.host.dispatch")
+    compactor = _MinimalSummaryCompactor()
+    memory_policy = _compact_no_floor_memory_policy()
+    with open_host_durable_store(
+        _options(
+            tmp_path,
+            payload_inline_threshold_bytes=payload_inline_threshold_bytes,
+        )
+    ) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        for ordinal in range(3):
+            history_run_id = f"run-oversized-accepted-history-{ordinal}"
+            _append_user_input(
+                store.transaction_runner,
+                session_id=session_id,
+                run_id=history_run_id,
+                event_id=f"event-input-{history_run_id}",
+                display_text=f"history-{ordinal}:" + ("h" * 2600),
+                client_request_id=f"client-{history_run_id}",
+                idempotency_key=f"idem-{history_run_id}",
+            )
+        seeded = _seed_accepted_run(
+            store,
+            run_id="run-oversized-accepted-terminal",
+            display_text=_soft_threshold_prompt(),
+            session_id=session_id,
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            _FakeWorkerFactory(),
+            context_budget_policy=_soft_compact_policy(
+                context_window_size=16384,
+                soft_threshold_tokens=100,
+                hard_threshold_tokens=12000,
+            ),
+            context_compactor=compactor,
+            compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=memory_policy,
+        )
+        try:
+            scheduler.wake_queue_promotion(seeded.session_id)
+            await _wait_for_event_count(
+                store.transaction_runner,
+                CONTEXT_COMPACTED,
+                expected_count=1,
+            )
+            await _wait_for_run_status(
+                store.transaction_runner,
+                seeded.run_id,
+                expected_run=RunStatus.RUNNING,
+            )
+            compacted = _latest_event_for_run(
+                store.transaction_runner,
+                seeded.run_id,
+                CONTEXT_COMPACTED,
+            )
+            compacted_payload = store.transaction_runner.run_read(
+                lambda transaction: resolve_context_compacted_payload(
+                    transaction,
+                    compacted,
+                )
+            )
+
+            assert len(canonical_json_dumps(compacted_payload).encode("utf-8")) > (
+                payload_inline_threshold_bytes
+            )
+            assert compacted.payload_json == "{}"
+            assert compacted.payload_ref is not None
+            assert compacted.payload_digest == sha256_digest_json(compacted_payload)
+            terminal_descriptor = store.transaction_runner.run_read(
+                lambda transaction: PayloadStore().read_payload_descriptor(
+                    transaction,
+                    cast(str, compacted.payload_ref),
+                )
+            )
+            assert terminal_descriptor is not None
+            assert terminal_descriptor.payload_kind is PayloadKind.ARTIFACT_REF
+
+            compact_artifact_ref = _required_json_text(
+                compacted_payload["compact_artifact_ref"]
+            )
+            compact_artifact_digest = _required_json_text(
+                compacted_payload["compact_artifact_digest"]
+            )
+            assert compact_artifact_ref != compacted.payload_ref
+            compact_descriptor = store.transaction_runner.run_read(
+                lambda transaction: PayloadStore().read_payload_descriptor(
+                    transaction,
+                    compact_artifact_ref,
+                )
+            )
+            assert compact_descriptor is not None
+            assert compact_descriptor.payload_kind is PayloadKind.ARTIFACT_REF
+            assert compact_descriptor.payload_digest == compact_artifact_digest
+            assert compact_descriptor.artifact_relative_path is not None
+            compact_artifact_bytes = read_artifact_bytes(
+                tmp_path / "compact-artifacts",
+                LocalArtifactRef(
+                    artifact_relative_path=compact_descriptor.artifact_relative_path,
+                    artifact_digest=compact_descriptor.payload_digest,
+                    artifact_size_bytes=compact_descriptor.payload_size_bytes,
+                ),
+            )
+            compact_artifact_json = cast(
+                JsonValue,
+                json.loads(compact_artifact_bytes),
+            )
+            assert isinstance(compact_artifact_json, Mapping)
+            assert compact_artifact_json["accepted_proposal"] == (
+                compacted_payload["accepted_proposal"]
+            )
+
+            memory_row = store.transaction_runner.run_read(
+                lambda transaction: read_latest_memory_snapshot(
+                    transaction,
+                    session_id=seeded.session_id,
+                    consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+                    policy_digest=digest_memory_projection_policy(memory_policy),
+                )
+            )
+            assert memory_row is not None
+            assert memory_row.snapshot.latest_compaction_event_ref == compacted.event_id
+            assert memory_row.snapshot.session_summary_memory.summary_text == "rolled"
+
+            _resolve_and_assert_compactor_calls(
+                store.transaction_runner,
+                tmp_path=tmp_path,
+                run_id=seeded.run_id,
+                prepared_inputs=tuple(compactor.prepared_inputs),
+                attempt_payloads=(compacted_payload,),
+                accepted_attempt_number=1,
+            )
+            signal_page = store.transaction_runner.run_read(
+                lambda transaction: read_runner_call_reconstruction_signals_by_run(
+                    transaction,
+                    seeded.run_id,
+                    after_event_sequence=0,
+                    limit=100,
+                )
+            )
+            compactor_signal = next(
+                signal
+                for signal in signal_page.signals
+                if signal.runner_call_kind == _COMPACTOR_RUNNER_CALL_KIND
+            )
+            store.transaction_runner.run_write(
+                lambda transaction: transaction.execute(
+                    f"UPDATE {TABLE_EVENT_LOG} SET payload_digest = ? WHERE event_id = ?",
+                    (_CALL_CONTEXT_DIGEST, compacted.event_id),
+                )
+            )
+            with pytest.raises(
+                CompactorResponseResolutionError,
+                match="canonical terminal payload is malformed",
+            ):
+                store.transaction_runner.run_read(
+                    lambda transaction: resolve_runner_call_projection_from_signal(
+                        transaction,
+                        compactor_signal,
+                    )
+                )
+
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTED) == 1
+            assert _run_status(store.transaction_runner, seeded.run_id) is RunStatus.RUNNING
+            assert scheduler._promotion_drain_task is not None
+            assert scheduler._promotion_drain_task.done() is False
+            assert scheduler._health_gate.state is HostExecutionHealthState.READY
+            assert not any(
+                "critical_task.fatal" in record.getMessage()
+                for record in caplog.records
+            )
         finally:
             await scheduler.close()
 
@@ -6310,6 +7531,7 @@ async def test_proactive_manifest_crash_resumes_deterministic_next_stage(
             session_id=session_id,
             run_id=f"run-crash-previous-{crash_attempt_number}",
             event_id=f"event-crash-previous-{crash_attempt_number}",
+            memory_policy=_fallback_cap_memory_policy(),
         )
         for ordinal in (1, 2, 3):
             _append_user_input(
@@ -6317,9 +7539,7 @@ async def test_proactive_manifest_crash_resumes_deterministic_next_stage(
                 session_id=session_id,
                 run_id=f"run-crash-delta-{crash_attempt_number}-{ordinal}",
                 event_id=f"event-crash-delta-{crash_attempt_number}-{ordinal}",
-                display_text=(
-                    f"crash resume material {crash_attempt_number}-{ordinal}"
-                ),
+                display_text=(f"crash resume material {crash_attempt_number}-{ordinal}"),
             )
         seeded = _seed_accepted_run(
             store,
@@ -6342,9 +7562,7 @@ async def test_proactive_manifest_crash_resumes_deterministic_next_stage(
             compact_artifact_root=tmp_path / "compact-artifacts",
             memory_projection_policy=_fallback_cap_memory_policy(),
         )
-        promotion = asyncio.create_task(
-            scheduler.run_queue_promotion(seeded.session_id)
-        )
+        promotion = asyncio.create_task(scheduler.run_queue_promotion(seeded.session_id))
         try:
             await asyncio.wait_for(blocker.provider_entered.wait(), timeout=2.0)
             with pytest.raises(_SimulatedProactiveCrash):
@@ -6394,12 +7612,7 @@ async def test_proactive_manifest_crash_resumes_deterministic_next_stage(
             run_id=seeded.run_id,
         )
         assert completed.state.operation_id == operation_id
-        assert (
-            _event_types_for_run(store.transaction_runner, seeded.run_id).count(
-                CONTEXT_COMPACTION_REQUESTED
-            )
-            == 1
-        )
+        assert _event_types_for_run(store.transaction_runner, seeded.run_id).count(CONTEXT_COMPACTION_REQUESTED) == 1
         if expected_resume_stage is None:
             assert resumed_compactor.calls == 0
             assert resumed_compactor.prepared_requests == []
@@ -6431,9 +7644,7 @@ async def test_proactive_manifest_crash_resumes_deterministic_next_stage(
             seeded.run_id,
             CONTEXT_COMPACTED,
         )
-        assert _event_payload(compacted)["accepted_attempt_number"] == (
-            crash_attempt_number + 1
-        )
+        assert _event_payload(compacted)["accepted_attempt_number"] == (crash_attempt_number + 1)
 
 
 @pytest.mark.asyncio
@@ -6449,7 +7660,7 @@ async def test_orphan_compactor_manifest_without_request_is_invalid(
 
     blocker = _CrashAtPreparedAttemptCompactor(1)
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_accepted_run(
+        seeded = _seed_accepted_run_with_compactable_history(
             store,
             run_id="run-orphan-proactive-manifest",
             display_text=_soft_threshold_prompt(),
@@ -6463,10 +7674,9 @@ async def test_orphan_compactor_manifest_without_request_is_invalid(
             ),
             context_compactor=blocker,
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_compact_no_floor_memory_policy(),
         )
-        promotion = asyncio.create_task(
-            scheduler.run_queue_promotion(seeded.session_id)
-        )
+        promotion = asyncio.create_task(scheduler.run_queue_promotion(seeded.session_id))
         try:
             await asyncio.wait_for(blocker.provider_entered.wait(), timeout=2.0)
             with pytest.raises(_SimulatedProactiveCrash):
@@ -6487,9 +7697,7 @@ async def test_orphan_compactor_manifest_without_request_is_invalid(
         assert projection.state.phase is ProactiveCompactionPhase.INVALID
         assert projection.state.operation_id is None
         assert projection.state.invalid_reason == "HostDurableError"
-        assert projection.decision is (
-            ProactiveCompactionDecision.FAIL_EXISTING_OPERATION
-        )
+        assert projection.decision is (ProactiveCompactionDecision.FAIL_EXISTING_OPERATION)
 
 
 def _assert_resumed_proactive_request_stage(
@@ -6519,9 +7727,11 @@ def _assert_resumed_proactive_request_stage(
         )
         return
     if stage is ProactiveCompactionAttemptStage.TIER_2_SECTION_DEGRADE:
-        assert 0 < len(
-            resumed_request.material_pack.previous_compacted_view
-        ) < len(root_request.material_pack.previous_compacted_view)
+        assert (
+            0
+            < len(resumed_request.material_pack.previous_compacted_view)
+            < len(root_request.material_pack.previous_compacted_view)
+        )
         assert resumed_request.material_pack.previous_compacted_readable_view != (
             root_request.material_pack.previous_compacted_readable_view
         )
@@ -6552,7 +7762,7 @@ async def test_proactive_projection_rejects_compacted_manifest_mismatch(
 
     compactor = _PreparedManifestProactiveCompactor()
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_accepted_run(
+        seeded = _seed_accepted_run_with_compactable_history(
             store,
             run_id=f"run-terminal-manifest-{mismatch_kind}",
             display_text=_soft_threshold_prompt(),
@@ -6566,6 +7776,7 @@ async def test_proactive_projection_rejects_compacted_manifest_mismatch(
             ),
             context_compactor=compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_compact_no_floor_memory_policy(),
         )
         try:
             await scheduler.run_queue_promotion(seeded.session_id)
@@ -6587,17 +7798,11 @@ async def test_proactive_projection_rejects_compacted_manifest_mismatch(
         if mismatch_kind == "attempt_number":
             corrupted_payload["accepted_attempt_number"] = 2
         elif mismatch_kind == "manifest_ref":
-            corrupted_payload["accepted_proposal_manifest_ref"] = (
-                "runner-call-manifest:wrong-attempt"
-            )
+            corrupted_payload["accepted_proposal_manifest_ref"] = "runner-call-manifest:wrong-attempt"
         else:
             assert mismatch_kind == "manifest_digest"
-            assert corrupted_payload["accepted_proposal_manifest_digest"] != (
-                _CALL_CONTEXT_DIGEST
-            )
-            corrupted_payload["accepted_proposal_manifest_digest"] = (
-                _CALL_CONTEXT_DIGEST
-            )
+            assert corrupted_payload["accepted_proposal_manifest_digest"] != (_CALL_CONTEXT_DIGEST)
+            corrupted_payload["accepted_proposal_manifest_digest"] = _CALL_CONTEXT_DIGEST
         _overwrite_event_payload(
             store.transaction_runner,
             event_id=compacted.event_id,
@@ -6613,9 +7818,7 @@ async def test_proactive_projection_rejects_compacted_manifest_mismatch(
         assert invalid.state.phase is ProactiveCompactionPhase.INVALID
         assert invalid.state.operation_id == valid.state.operation_id
         assert invalid.state.compacted_event_sequence == compacted.event_sequence
-        assert invalid.decision is (
-            ProactiveCompactionDecision.FAIL_EXISTING_OPERATION
-        )
+        assert invalid.decision is (ProactiveCompactionDecision.FAIL_EXISTING_OPERATION)
 
 
 @pytest.mark.asyncio
@@ -6631,7 +7834,7 @@ async def test_proactive_projection_rejects_already_rejected_accepted_attempt(
 
     compactor = _QualityRejectOnceCompactor()
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_accepted_run(
+        seeded = _seed_accepted_run_with_compactable_history(
             store,
             run_id="run-rejected-then-accepted-corrupt",
             display_text=_soft_threshold_prompt(),
@@ -6645,6 +7848,7 @@ async def test_proactive_projection_rejects_already_rejected_accepted_attempt(
             ),
             context_compactor=compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_compact_no_floor_memory_policy(),
         )
         try:
             await scheduler.run_queue_promotion(seeded.session_id)
@@ -6664,12 +7868,8 @@ async def test_proactive_projection_rejects_already_rejected_accepted_attempt(
         )
         corrupted_payload = dict(_event_payload(compacted))
         corrupted_payload["accepted_attempt_number"] = 1
-        corrupted_payload["accepted_proposal_manifest_ref"] = rejected_payload[
-            "proposal_manifest_ref"
-        ]
-        corrupted_payload["accepted_proposal_manifest_digest"] = rejected_payload[
-            "proposal_manifest_digest"
-        ]
+        corrupted_payload["accepted_proposal_manifest_ref"] = rejected_payload["proposal_manifest_ref"]
+        corrupted_payload["accepted_proposal_manifest_digest"] = rejected_payload["proposal_manifest_digest"]
         _overwrite_event_payload(
             store.transaction_runner,
             event_id=compacted.event_id,
@@ -6699,7 +7899,7 @@ async def test_proactive_projection_rejects_operation_row_after_terminal(
 
     compactor = _PreparedManifestProactiveCompactor()
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_accepted_run(
+        seeded = _seed_accepted_run_with_compactable_history(
             store,
             run_id="run-row-after-proactive-terminal",
             display_text=_soft_threshold_prompt(),
@@ -6713,6 +7913,7 @@ async def test_proactive_projection_rejects_operation_row_after_terminal(
             ),
             context_compactor=compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_compact_no_floor_memory_policy(),
         )
         try:
             await scheduler.run_queue_promotion(seeded.session_id)
@@ -6754,7 +7955,7 @@ async def test_proactive_projection_requires_exact_failed_attempt_count(
 
     compactor = _RaisingCompactor()
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_accepted_run(
+        seeded = _seed_accepted_run_with_compactable_history(
             store,
             run_id="run-failed-attempt-count",
             display_text=_soft_threshold_prompt(),
@@ -6768,6 +7969,7 @@ async def test_proactive_projection_requires_exact_failed_attempt_count(
             ),
             context_compactor=compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_compact_no_floor_memory_policy(),
         )
         try:
             await scheduler.run_queue_promotion(seeded.session_id)
@@ -6819,7 +8021,7 @@ async def test_proactive_exhausted_manifest_fails_same_operation_without_provide
 
     blocker = _BlockingAfterManifestCompactor()
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_accepted_run(
+        seeded = _seed_accepted_run_with_compactable_history(
             store,
             run_id="run-proactive-manifest-exhausted",
             display_text=_soft_threshold_prompt(),
@@ -6834,10 +8036,9 @@ async def test_proactive_exhausted_manifest_fails_same_operation_without_provide
             context_budget_policy=policy,
             context_compactor=blocker,
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_compact_no_floor_memory_policy(),
         )
-        promotion = asyncio.create_task(
-            scheduler.run_queue_promotion(seeded.session_id)
-        )
+        promotion = asyncio.create_task(scheduler.run_queue_promotion(seeded.session_id))
         try:
             await asyncio.wait_for(blocker.provider_entered.wait(), timeout=2.0)
             promotion.cancel()
@@ -6854,9 +8055,7 @@ async def test_proactive_exhausted_manifest_fails_same_operation_without_provide
         assert exhausted.state.operation_id is not None
         assert exhausted.state.prepared_attempt_numbers == (1,)
         assert exhausted.state.next_attempt_number == 2
-        assert exhausted.decision is (
-            ProactiveCompactionDecision.FAIL_EXISTING_OPERATION
-        )
+        assert exhausted.decision is (ProactiveCompactionDecision.FAIL_EXISTING_OPERATION)
         operation_id = exhausted.state.operation_id
 
         forbidden_provider = _PreparedManifestProactiveCompactor()
@@ -6876,12 +8075,7 @@ async def test_proactive_exhausted_manifest_fails_same_operation_without_provide
 
         assert forbidden_provider.calls == 0
         assert forbidden_provider.prepared_requests == []
-        assert (
-            _event_types_for_run(store.transaction_runner, seeded.run_id).count(
-                CONTEXT_COMPACTION_REQUESTED
-            )
-            == 1
-        )
+        assert _event_types_for_run(store.transaction_runner, seeded.run_id).count(CONTEXT_COMPACTION_REQUESTED) == 1
         failed = _latest_event_for_run(
             store.transaction_runner,
             seeded.run_id,
@@ -6912,6 +8106,7 @@ async def test_proactive_default_budget_executes_root_repair_and_three_tiers(
             session_id=session_id,
             run_id="run-default-schedule-previous",
             event_id="event-default-schedule-previous-compact",
+            memory_policy=_fallback_cap_memory_policy(),
         )
         for ordinal in (1, 2, 3):
             _append_user_input(
@@ -6984,19 +8179,13 @@ async def test_proactive_default_budget_executes_root_repair_and_three_tiers(
             assert len(compactor.prepared_requests) == 5
             assert len(compactor.prepared_inputs) == 5
 
-            root, root_repair, tier_1, tier_2, tier_3 = (
-                compactor.prepared_requests
-            )
+            root, root_repair, tier_1, tier_2, tier_3 = compactor.prepared_requests
             assert root_repair == root
-            assert tier_1.material_pack.previous_compacted_view == (
-                root.material_pack.previous_compacted_view
-            )
-            assert len(tier_1.segment_selection.selected_block_ids) < len(
-                root.segment_selection.selected_block_ids
-            )
+            assert tier_1.material_pack.previous_compacted_view == (root.material_pack.previous_compacted_view)
+            assert len(tier_1.segment_selection.selected_block_ids) < len(root.segment_selection.selected_block_ids)
             assert tier_2.segment_selection == tier_1.segment_selection
-            assert 0 < len(tier_2.material_pack.previous_compacted_view) < len(
-                root.material_pack.previous_compacted_view
+            assert (
+                0 < len(tier_2.material_pack.previous_compacted_view) < len(root.material_pack.previous_compacted_view)
             )
             assert tier_2.material_pack.previous_compacted_readable_view != (
                 root.material_pack.previous_compacted_readable_view
@@ -7010,19 +8199,12 @@ async def test_proactive_default_budget_executes_root_repair_and_three_tiers(
                 prepared.compact_input for prepared in compactor.prepared_inputs
             )
             assert root_repair_input == root_input
-            assert tier_1_input.previous_compacted_view == (
-                root_input.previous_compacted_view
+            assert len(tier_1_input.source_boundary) < len(root_input.source_boundary)
+            assert tier_2_input.source_boundary not in (
+                root_input.source_boundary,
+                tier_1_input.source_boundary,
             )
-            assert len(tier_1_input.trace_material) < len(
-                root_input.trace_material
-            )
-            assert tier_2_input.previous_compacted_view not in (
-                None,
-                root_input.previous_compacted_view,
-            )
-            assert tier_2_input.trace_material == tier_1_input.trace_material
-            assert tier_3_input.previous_compacted_view is None
-            assert tier_3_input.trace_material == tier_1_input.trace_material
+            assert all(not entry.source_kind.value.startswith("previous_") for entry in tier_3_input.source_boundary)
         finally:
             await scheduler.close()
 
@@ -7039,7 +8221,7 @@ async def test_proactive_compaction_recovery_stale_before_tier_attempt_discards(
             transaction_runner=store.transaction_runner,
             stale_after_call=1,
         )
-        seeded = _seed_accepted_run(
+        seeded = _seed_accepted_run_with_compactable_history(
             store,
             run_id="run-recovery-stale-before",
             display_text=_soft_threshold_prompt(),
@@ -7056,6 +8238,7 @@ async def test_proactive_compaction_recovery_stale_before_tier_attempt_discards(
             ),
             context_compactor=compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_compact_no_floor_memory_policy(),
         )
         try:
             await scheduler.run_queue_promotion(seeded.session_id)
@@ -7079,7 +8262,7 @@ async def test_proactive_compaction_recovery_stale_during_tier_proposal_discards
             transaction_runner=store.transaction_runner,
             stale_after_call=2,
         )
-        seeded = _seed_accepted_run(
+        seeded = _seed_accepted_run_with_compactable_history(
             store,
             run_id="run-recovery-stale-after",
             display_text=_soft_threshold_prompt(),
@@ -7096,6 +8279,7 @@ async def test_proactive_compaction_recovery_stale_during_tier_proposal_discards
             ),
             context_compactor=compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_compact_no_floor_memory_policy(),
         )
         try:
             await scheduler.run_queue_promotion(seeded.session_id)
@@ -7111,10 +8295,15 @@ async def test_proactive_compaction_recovery_stale_during_tier_proposal_discards
 async def test_proactive_compaction_recovery_all_tiers_fail_uses_dispatch_fallback(
     tmp_path: Path,
 ) -> None:
-    """normal 与 tier 1-3 全失败后只写一次 failed 并进入 tier 4 dispatch。"""
+    """normal 与 tier 1-3 全失败后只写一次 failed 并进入 tier 4 dispatch。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: invalid attempts、formal traces 或 fallback 不闭合时抛出。
+    """
 
     factory = _FakeWorkerFactory()
-    compactor = _RecoveryScenarioCompactor(accept_call=99)
+    compactor = _AlwaysQualityRejectingCompactor()
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
         _append_previous_compacted_event(
@@ -7144,9 +8333,24 @@ async def test_proactive_compaction_recovery_all_tiers_fail_uses_dispatch_fallba
         )
         try:
             await scheduler.run_queue_promotion(seeded.session_id)
-            assert (await scheduler.drain_once()).dispatched == 1
+            await _wait_for_event_count(
+                store.transaction_runner,
+                "ATTEMPT_RUNNING",
+                expected_count=1,
+            )
 
             assert compactor.calls == 4
+            root, root_repair, tier_1, tier_2 = compactor.prepared_requests
+            assert root_repair == root
+            assert compactor.prepared_inputs[0].repair_feedback is None
+            root_feedback = compactor.prepared_inputs[1].repair_feedback
+            assert root_feedback is not None
+            assert root_feedback.request_digest == root.digest()
+            assert root_feedback.source_boundary_digest == root.source_boundary_digest()
+            assert compactor.prepared_inputs[2].repair_feedback is None
+            assert compactor.prepared_inputs[3].repair_feedback is None
+            assert tier_1.digest() != root.digest()
+            assert tier_2.source_boundary_digest() != tier_1.source_boundary_digest()
             assert (
                 len(
                     _events_for_run_by_type(
@@ -7171,10 +8375,7 @@ async def test_proactive_compaction_recovery_all_tiers_fail_uses_dispatch_fallba
                 3,
                 4,
             )
-            assert all(
-                payload["failure_category"] == "proposal_failed"
-                for payload in rejected_payloads
-            )
+            assert all(payload["failure_category"] == "quality_check_rejected" for payload in rejected_payloads)
             for payload in rejected_payloads:
                 _assert_rejected_payload_has_proposal_manifest(payload)
             failed_payload = _event_payload(
@@ -7187,22 +8388,122 @@ async def test_proactive_compaction_recovery_all_tiers_fail_uses_dispatch_fallba
             assert failed_payload["attempt_count"] == len(rejected_events)
             assert failed_payload["retry_repair_budget_exhausted"] is True
             assert len(factory.accepted_requests) == 1
+            _resolve_and_assert_compactor_calls(
+                store.transaction_runner,
+                tmp_path=tmp_path,
+                run_id=seeded.run_id,
+                prepared_inputs=tuple(compactor.prepared_inputs),
+                attempt_payloads=rejected_payloads,
+                accepted_attempt_number=None,
+            )
         finally:
             await scheduler.close()
 
 
 @pytest.mark.asyncio
-async def test_compaction_repair_attempt_rejection_is_recorded_in_eventlog(
+async def test_defensive_feedback_mismatch_stops_schedule_with_single_terminal(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """semantic proposal failure 写 rejected facts 后通过 fallback dispatch。"""
+    """绕过 dispatcher 清理时 operation 拒绝跨 tier feedback 且只收口一次。
 
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: 仅用于让 mismatch feedback 到达 operation 的测试 seam。
+    :returns: ``None``。
+    """
+
+    monkeypatch.setattr(
+        "dayu.host.dispatch._repair_feedback_for_request",
+        _retain_feedback_without_binding_for_defensive_test,
+    )
     factory = _FakeWorkerFactory()
+    compactor = _AlwaysQualityRejectingCompactor()
     with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_previous_compacted_event(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-defensive-feedback-previous",
+            event_id="event-defensive-feedback-previous-compact",
+        )
         seeded = _seed_accepted_run(
             store,
-            run_id="run-proactive-attempt-rejected",
+            run_id="run-defensive-feedback-mismatch",
             display_text=_soft_threshold_prompt(),
+            session_id=session_id,
+        )
+        scheduler = await _open_scheduler(
+            tmp_path,
+            store,
+            factory,
+            context_budget_policy=_soft_compact_policy(
+                max_compaction_attempts_per_operation=3,
+                context_window_size=2000,
+                soft_threshold_tokens=50,
+                hard_threshold_tokens=1000,
+            ),
+            context_compactor=compactor,
+            compact_artifact_root=tmp_path / "compact-artifacts",
+        )
+        try:
+            await scheduler.run_queue_promotion(seeded.session_id)
+            await _wait_for_event_count(
+                store.transaction_runner,
+                "ATTEMPT_RUNNING",
+                expected_count=1,
+            )
+
+            assert compactor.calls == 2
+            assert len(compactor.prepared_inputs) == 2
+            assert (
+                _events_for_run_by_type(
+                    store.transaction_runner,
+                    seeded.run_id,
+                    CONTEXT_COMPACTED,
+                )
+                == ()
+            )
+            assert (
+                len(
+                    _events_for_run_by_type(
+                        store.transaction_runner,
+                        seeded.run_id,
+                        CONTEXT_COMPACTION_FAILED,
+                    )
+                )
+                == 1
+            )
+            rejected_events = _events_for_run_by_type(
+                store.transaction_runner,
+                seeded.run_id,
+                CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+            )
+            assert len(rejected_events) == 3
+            assert _event_payload(rejected_events[-1])["failure_category"] == ("proposal_failed")
+            assert len(factory.accepted_requests) == 1
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_proactive_exhausted_fallback_normalizes_current_input_for_replay(
+    tmp_path: Path,
+) -> None:
+    """连续空白输入耗尽两次 proposal 后同源 replay 并完整收口。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: rejection、fallback digest、manifest 或 cleanup 漂移时抛出。
+    """
+
+    current_input = f"{_soft_threshold_prompt()}   collapsible\n\n whitespace   input"
+    factory = _FinalAnswerWorkerFactory()
+    compactor = _AlwaysQualityRejectingCompactor()
+    with open_host_durable_store(_options(tmp_path)) as store:
+        seeded = _seed_accepted_run_with_compactable_history(
+            store,
+            run_id="run-proactive-attempt-rejected",
+            display_text=current_input,
         )
         scheduler = await _open_scheduler(
             tmp_path,
@@ -7210,21 +8511,25 @@ async def test_compaction_repair_attempt_rejection_is_recorded_in_eventlog(
             factory,
             context_budget_policy=_soft_compact_policy(
                 max_compaction_attempts_per_operation=2,
+                context_window_size=512,
+                soft_threshold_tokens=50,
+                hard_threshold_tokens=400,
             ),
-            context_compactor=_RaisingCompactor(),
+            context_compactor=compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_fallback_cap_memory_policy(),
         )
         try:
             await scheduler.run_queue_promotion(seeded.session_id)
-            assert (await scheduler.drain_once()).dispatched == 1
-
-            assert (
-                _event_count(
-                    store.transaction_runner,
-                    CONTEXT_COMPACTION_ATTEMPT_REJECTED,
-                )
-                == 2
+            await _wait_for_run_status(
+                store.transaction_runner,
+                seeded.run_id,
+                expected_run=RunStatus.SUCCEEDED,
             )
+            await _wait_for_active_tasks_to_finish(scheduler)
+
+            assert compactor.calls == 2
+            assert _event_count(store.transaction_runner, CONTEXT_COMPACTION_ATTEMPT_REJECTED) == 2
             assert _event_count(store.transaction_runner, CONTEXT_COMPACTION_FAILED) == 1
             requested = _latest_event_for_run(
                 store.transaction_runner,
@@ -7253,16 +8558,58 @@ async def test_compaction_repair_attempt_rejection_is_recorded_in_eventlog(
                 2,
             )
             for rejected_row in rejected_rows:
-                _assert_rejected_payload_has_proposal_manifest(
-                    _event_payload(rejected_row)
-                )
+                rejected_payload = _event_payload(rejected_row)
+                assert rejected_payload["failure_category"] == "quality_check_rejected"
+                _assert_rejected_payload_has_proposal_manifest(rejected_payload)
             payload = _event_payload(failed)
             assert payload["operation_id"] == requested.event_id
             assert payload["attempt_count"] == 2
             assert payload["retry_repair_budget_exhausted"] is True
             assert payload["fallback_action"] == "dispatch"
+            window = payload["fallback_input_window"]
+            assert isinstance(window, Mapping)
+            current_input_ref = f"event-input-{seeded.run_id}"
+            assert window["selected_block_ids"] == [f"current:{current_input_ref}"]
+            expected_current_block = run_input_material_block(
+                block_id=f"current:{current_input_ref}",
+                section=CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+                kind=CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+                text=current_input,
+                canonical_source_refs=(current_input_ref,),
+                event_sequence=_run_input_sequence(store.transaction_runner, seeded.run_id),
+            )
+            assert expected_current_block.text != current_input
+            assert window["selected_material_view_digest"] == selected_material_view_digest(
+                (expected_current_block,)
+            )
             assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 1
             assert len(factory.accepted_requests) == 1
+            fallback_snapshot = factory.accepted_snapshots[0]
+            fallback_source = store.transaction_runner.run_read(
+                lambda transaction: load_prepared_runner_call_source_in_transaction(
+                    transaction,
+                    EventLogStore(),
+                    run_id=seeded.run_id,
+                    attempt_id=fallback_snapshot.attempt_id,
+                    execution_id=fallback_snapshot.execution_id,
+                )
+            )
+            expected_fallback_ref = f"context_fallback:{payload['fallback_input_digest']}"
+            assert fallback_source.candidate.context_fallback_decision_ref == expected_fallback_ref
+            assert fallback_source.manifest.source_refs.context_fallback_decision_ref == expected_fallback_ref
+            assert fallback_source.manifest.sizing_snapshot.sizing_stage is ContextSizingStage.DISPATCH_FALLBACK
+            projection = _read_proactive_projection(
+                store.transaction_runner,
+                session_id=seeded.session_id,
+                run_id=seeded.run_id,
+            )
+            assert projection.state.phase is ProactiveCompactionPhase.FAILED
+            assert projection.state.prepared_attempt_numbers == (1, 2)
+            assert projection.state.rejected_attempt_numbers == (1, 2)
+            assert projection.decision is ProactiveCompactionDecision.USE_FAILED_FALLBACK
+            assert _event_count(store.transaction_runner, "RUN_SUCCEEDED") == 1
+            assert _event_count(store.transaction_runner, "RUN_LOST") == 0
+            assert scheduler._active_tasks == set()
         finally:
             await scheduler.close()
 
@@ -7273,7 +8620,7 @@ async def test_pre_start_governance_compact_failure_is_attempt_free(
 ) -> None:
     """proactive compact 缺 compactor 后 fallback 预算通过会创建 Attempt。"""
 
-    factory = _FakeWorkerFactory()
+    factory = _FakeWorkerFactory(accepted_handle=_CloseCountingHandle())
     compact_artifact_root = tmp_path / "compact-artifacts"
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
@@ -7285,6 +8632,15 @@ async def test_pre_start_governance_compact_failure_is_attempt_free(
             display_text="older fallback floor material that must render",
             client_request_id="client-run-compact-failure-old",
             idempotency_key="idem-run-compact-failure-old",
+        )
+        _append_user_input(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-compact-failure-recent",
+            event_id="event-input-run-compact-failure-recent",
+            display_text="recent protected fallback floor material",
+            client_request_id="client-run-compact-failure-recent",
+            idempotency_key="idem-run-compact-failure-recent",
         )
         seeded = _seed_accepted_run(
             store,
@@ -7302,19 +8658,23 @@ async def test_pre_start_governance_compact_failure_is_attempt_free(
             store,
             factory,
             context_budget_policy=_soft_compact_policy(
-                context_window_size=200,
+                context_window_size=512,
                 soft_threshold_tokens=70,
-                hard_threshold_tokens=200,
+                hard_threshold_tokens=400,
             ),
             memory_projection_policy=memory_policy,
             compact_artifact_root=compact_artifact_root,
         )
         try:
             await scheduler.run_queue_promotion(seeded.session_id)
-            assert (await scheduler.drain_once()).dispatched == 1
+            await _wait_for_event_count(
+                store.transaction_runner,
+                "ATTEMPT_RUNNING",
+                expected_count=1,
+            )
 
             assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 1
-            assert _run_status(store.transaction_runner, seeded.run_id) == (RunStatus.RUNNING)
+            assert _run_status(store.transaction_runner, seeded.run_id) is (RunStatus.RUNNING)
             event_types = _event_types_for_run(store.transaction_runner, seeded.run_id)
             assert event_types.index(CONTEXT_COMPACTION_FAILED) < event_types.index("RUN_STARTED")
             assert event_types.index("RUN_STARTED") < event_types.index("ATTEMPT_STARTED")
@@ -7334,28 +8694,35 @@ async def test_pre_start_governance_compact_failure_is_attempt_free(
             assert payload["operation_id"] == requested.event_id
             assert payload["fallback_action"] == "dispatch"
             assert isinstance(payload["fallback_input_window"], Mapping)
-            assert payload["fallback_input_window"]["current_input_ref"] == (
-                f"event-input-{seeded.run_id}"
-            )
+            assert payload["fallback_input_window"]["current_input_ref"] == (f"event-input-{seeded.run_id}")
             assert payload["fallback_input_window"]["selected_block_ids"] == [
-                "eventlog:user:event-input-run-compact-failure-old",
+                "eventlog:user:event-input-run-compact-failure-recent",
                 f"current:event-input-{seeded.run_id}",
             ]
-            assert "eventlog:user:event-input-run-compact-failure-old" not in (
+            assert "eventlog:user:event-input-run-compact-failure-old" in (
                 _required_json_text_tuple(payload["fallback_input_window"]["dropped_block_ids"])
             )
             assert isinstance(payload["fallback_budget_result"], Mapping)
             assert payload["fallback_budget_result"]["status"] == "within_hard_budget"
             assert _compact_artifact_files(compact_artifact_root) == ()
+            accepted_request = factory.accepted_requests[0]
             rendered = "\n".join(
                 content
-                for content in (
-                    _message_text(message)
-                    for message in factory.accepted_requests[0].messages
-                )
+                for content in (_message_text(message) for message in accepted_request.messages)
                 if content is not None
             )
-            assert "older fallback floor material that must render" in rendered
+            system_contents = tuple(
+                message.content for message in accepted_request.messages if isinstance(message, SystemMessage)
+            )
+            assert len(system_contents) == 1
+            system_content = system_contents[0]
+            assert "recent protected fallback floor material" in rendered
+            assert "older fallback floor material that must render" not in rendered
+            assert "Some earlier conversation material may be unavailable in the current request." in system_content
+            assert "Use only facts directly supported by material visible in the current request." in system_content
+            assert "state that the available material is insufficient" in system_content
+            for internal_fragment in ("compaction", "fallback", "tier 4", "tier 5", "Host"):
+                assert internal_fragment not in system_content
         finally:
             await scheduler.close()
 
@@ -7442,10 +8809,13 @@ async def test_pre_start_governance_material_source_failure_fails_closed(
             assert _attempt_count_for_run(store.transaction_runner, seeded.run_id) == 0
             assert _run_status(store.transaction_runner, seeded.run_id) == RunStatus.ACCEPTED
             assert _event_count(store.transaction_runner, CONTEXT_COMPACTION_REQUESTED) == 0
-            assert _event_count(
-                store.transaction_runner,
-                CONTEXT_COMPACTION_FAILED,
-            ) == 0
+            assert (
+                _event_count(
+                    store.transaction_runner,
+                    CONTEXT_COMPACTION_FAILED,
+                )
+                == 0
+            )
         finally:
             await scheduler.close()
 
@@ -7471,7 +8841,11 @@ async def test_pre_start_governance_invalid_incomplete_snapshot_fails_same_opera
             tmp_path,
             store,
             _FakeWorkerFactory(),
-            context_budget_policy=_soft_compact_policy(),
+            context_budget_policy=_soft_compact_policy(
+                context_window_size=512,
+                soft_threshold_tokens=50,
+                hard_threshold_tokens=400,
+            ),
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
         )
@@ -7485,9 +8859,7 @@ async def test_pre_start_governance_invalid_incomplete_snapshot_fails_same_opera
             )
             failed = _read_event_by_type(store.transaction_runner, CONTEXT_COMPACTION_FAILED)
             payload = _event_payload(failed)
-            assert payload["failure_reason"] == (
-                "proactive_operation_invalid_or_exhausted"
-            )
+            assert payload["failure_reason"] == ("proactive_operation_invalid_or_exhausted")
             assert payload["operation_id"] == "event-existing-proactive-request"
             assert payload["attempt_count"] == 0
             assert payload["retry_repair_budget_exhausted"] is True
@@ -7539,14 +8911,20 @@ async def test_pre_start_governance_without_safe_operation_id_fails_run(
                 store.transaction_runner,
                 seeded.run_id,
             )
-            assert _attempt_count_for_run(
-                store.transaction_runner,
-                seeded.run_id,
-            ) == 0
-            assert _run_status(
-                store.transaction_runner,
-                seeded.run_id,
-            ) is RunStatus.FAILED
+            assert (
+                _attempt_count_for_run(
+                    store.transaction_runner,
+                    seeded.run_id,
+                )
+                == 0
+            )
+            assert (
+                _run_status(
+                    store.transaction_runner,
+                    seeded.run_id,
+                )
+                is RunStatus.FAILED
+            )
             assert compactor.calls == 0
             assert compactor.prepared_requests == []
             for event_type in (
@@ -7554,9 +8932,7 @@ async def test_pre_start_governance_without_safe_operation_id_fails_run(
                 CONTEXT_COMPACTION_FAILED,
                 CONTEXT_COMPACTED,
             ):
-                assert event_types_after.count(event_type) == (
-                    event_types_before.count(event_type)
-                )
+                assert event_types_after.count(event_type) == (event_types_before.count(event_type))
         finally:
             await scheduler.close()
 
@@ -7565,9 +8941,15 @@ async def test_pre_start_governance_without_safe_operation_id_fails_run(
 async def test_multi_turn_proactive_compact_feeds_subsequent_run_input(
     tmp_path: Path,
 ) -> None:
-    """多轮 Run 经 proactive compact 后写入 accepted closeout。"""
+    """多轮 Run 经 proactive compact 后写入 accepted closeout。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: accepted compactor trace 或 subsequent input 不可重构时抛出。
+    """
 
     factory = _FinalAnswerWorkerFactory()
+    compactor = _PreparedManifestProactiveCompactor()
     with open_host_durable_store(_options(tmp_path)) as store:
         scheduler = await _open_scheduler(
             tmp_path,
@@ -7580,8 +8962,9 @@ async def test_multi_turn_proactive_compact_feeds_subsequent_run_input(
                 soft_threshold_tokens=60,
                 hard_threshold_tokens=260,
             ),
-            context_compactor=_PreparedManifestProactiveCompactor(),
+            context_compactor=compactor,
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_compact_floor_one_memory_policy(),
         )
         try:
             first = await _dispatch_accepted_final_run(
@@ -7625,39 +9008,113 @@ async def test_multi_turn_proactive_compact_feeds_subsequent_run_input(
                     CONTEXT_COMPACTED,
                 )
             )
-            runner_call_event = _latest_event_for_run(
+            _resolve_and_assert_compactor_calls(
                 store.transaction_runner,
-                compacted.run_id,
-                "RUNNER_CALL_INPUT_ASSEMBLED",
+                tmp_path=tmp_path,
+                run_id=compacted.run_id,
+                prepared_inputs=tuple(compactor.prepared_inputs),
+                attempt_payloads=(compacted_payload,),
+                accepted_attempt_number=1,
             )
-            hot = parse_runner_call_hot_payload(
-                _event_payload(runner_call_event)
-            )
-            manifest_json = store.transaction_runner.run_read(
-                lambda transaction: sqlite_payload_object(
+            runner_call_page = store.transaction_runner.run_read(
+                lambda transaction: read_runner_call_reconstruction_signals_by_run(
                     transaction,
-                    payload_ref=hot.manifest_payload_ref,
-                    payload_digest=hot.manifest_digest,
-                    payload_label="proactive post-compact manifest",
+                    compacted.run_id,
+                    after_event_sequence=0,
+                    limit=100,
                 )
             )
-            manifest = parse_runner_call_manifest(
-                manifest_json,
-                hot_payload=hot,
+            ordinary_signals = tuple(
+                signal for signal in runner_call_page.signals if signal.runner_call_kind != _COMPACTOR_RUNNER_CALL_KIND
+            )
+            assert len(ordinary_signals) == 1
+            ordinary_call = store.transaction_runner.run_read(
+                lambda transaction: resolve_runner_call_projection_from_signal(
+                    transaction,
+                    ordinary_signals[0],
+                )
             )
 
-            assert event_types.index(CONTEXT_COMPACTION_REQUESTED) < (
-                event_types.index(CONTEXT_COMPACTED)
-            )
+            assert event_types.index(CONTEXT_COMPACTION_REQUESTED) < (event_types.index(CONTEXT_COMPACTED))
             assert event_types.index(CONTEXT_COMPACTED) < event_types.index("RUN_STARTED")
-            assert manifest.sizing_snapshot.sizing_stage is (
-                ContextSizingStage.POST_COMPACT
-            )
+            sizing_snapshot = _required_json_mapping(ordinary_call.manifest.payload["sizing_snapshot"])
+            assert sizing_snapshot["sizing_stage"] == ContextSizingStage.POST_COMPACT.value
             assert compacted_payload["operation_id"] != ""
             assert compacted_payload["accepted_attempt_number"] == 1
             assert compacted_payload["compact_artifact_ref"] != ""
-            assert compacted_payload["accepted_candidate_digest"] != ""
+            assert compacted_payload["accepted_proposal_digest"] != ""
             _assert_accepted_payload_has_proposal_manifest(compacted_payload)
+        finally:
+            await scheduler.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_reopen_previous_pair_freezes_and_dispatches_next_ordinary_run(
+    tmp_path: Path,
+) -> None:
+    """accepted previous pair 重开后必须冻结并 dispatch 下一 ordinary Run。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: durable reopen 后候选未冻结、未 dispatch 或与 worker
+        实收 request 不同源时抛出。
+    """
+
+    run_id = "run-after-previous-pair-reopen"
+    factory = _FinalAnswerWorkerFactory()
+    seeded: _AcceptedSeededRun | None = None
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_previous_compacted_event(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-previous-pair-reopen",
+            event_id="event-previous-pair-reopen",
+            candidate=_previous_compacted_normalization_candidate(),
+        )
+        seeded = _seed_accepted_run(
+            store,
+            session_id=session_id,
+            run_id=run_id,
+            display_text="continue after durable previous pair reopen",
+        )
+
+    assert seeded is not None
+    with open_host_durable_store(_options(tmp_path)) as reopened_store:
+        scheduler = await _open_scheduler(
+            tmp_path,
+            reopened_store,
+            factory,
+            lane_default_timeout_seconds=1.0,
+        )
+        try:
+            await scheduler.run_queue_promotion(seeded.session_id)
+            await _wait_for_final_request_count(factory, 1)
+            await _wait_for_run_status(
+                reopened_store.transaction_runner,
+                seeded.run_id,
+                expected_run=RunStatus.SUCCEEDED,
+            )
+
+            accepted_snapshot = factory.accepted_snapshots[0]
+            frozen_source = reopened_store.transaction_runner.run_read(
+                lambda transaction: load_prepared_runner_call_source_in_transaction(
+                    transaction,
+                    EventLogStore(),
+                    run_id=seeded.run_id,
+                    attempt_id=accepted_snapshot.attempt_id,
+                    execution_id=accepted_snapshot.execution_id,
+                )
+            )
+            accepted_request = factory.accepted_requests[0]
+
+            assert frozen_source.candidate.run_id == seeded.run_id
+            assert frozen_source.candidate.session_id == seeded.session_id
+            assert frozen_source.candidate.messages == accepted_request.messages
+            assert frozen_source.candidate.input_snapshot_digest != ""
+            assert accepted_request.run_id == seeded.run_id
+            assert accepted_request.attempt_id == accepted_snapshot.attempt_id
+            assert accepted_request.execution_id == accepted_snapshot.execution_id
         finally:
             await scheduler.close()
 
@@ -7669,7 +9126,17 @@ async def test_reactive_overflow_recovers_and_dispatches_new_attempt(
     """worker reactive overflow 经 compact 后创建新 Attempt closeout。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_current_run(store)
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_user_input(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-reactive-history",
+            event_id="event-reactive-history",
+            display_text="older compactable material",
+            client_request_id="client-reactive-history",
+            idempotency_key="idem-reactive-history",
+        )
+        seeded = _seed_current_run(store, session_id=session_id)
         factory = _ReactiveRecoveryWorkerFactory()
         scheduler = await _open_scheduler(
             tmp_path,
@@ -7678,6 +9145,7 @@ async def test_reactive_overflow_recovers_and_dispatches_new_attempt(
             context_budget_policy=_soft_compact_policy(),
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_compact_no_floor_memory_policy(),
         )
         try:
             scheduler.wake_dispatch(_pending_dispatch(seeded))
@@ -7734,7 +9202,7 @@ async def test_reactive_compact_request_uses_latest_previous_view(
         try:
             await proactive_scheduler.run_queue_promotion(proactive.session_id)
             assert len(proactive_compactor.prepared_requests) == 1
-            assert (await proactive_scheduler.drain_once()).dispatched == 1
+            await _wait_for_final_request_count(final_factory, 1)
             await _wait_for_run_status(
                 store.transaction_runner,
                 proactive.run_id,
@@ -7851,25 +9319,13 @@ async def test_reactive_root_compact_selection_passes_protected_recent_floor(
 
         assert len(current_blocks) == 1
         assert current_blocks[0].canonical_source_refs == ("event-input-dispatch",)
-        assert all(
-            block.section is not CompactMaterialSection.CURRENT_INPUT_ANCHOR
-            for block in protected_blocks
-        )
+        assert all(block.section is not CompactMaterialSection.CURRENT_INPUT_ANCHOR for block in protected_blocks)
         assert CompactMaterialBlockKind.USER_INPUT in protected_kinds
         assert CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER in protected_kinds
         assert CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE in protected_kinds
-        assert any(
-            block.text == "recent reactive protected material"
-            for block in protected_blocks
-        )
-        assert any(
-            block.text == "recent reactive protected final answer"
-            for block in protected_blocks
-        )
-        assert any(
-            "recent reactive protected evidence" in block.text
-            for block in protected_blocks
-        )
+        assert any(block.text == "recent reactive protected material" for block in protected_blocks)
+        assert any(block.text == "recent reactive protected final answer" for block in protected_blocks)
+        assert any("recent reactive protected evidence" in block.text for block in protected_blocks)
         reactive_scheduler = await _open_scheduler(
             tmp_path,
             store,
@@ -7897,17 +9353,42 @@ async def test_reactive_root_compact_selection_passes_protected_recent_floor(
 async def test_reactive_compact_failure_fallback_dispatch_uses_failed_view(
     tmp_path: Path,
 ) -> None:
-    """reactive compact failure fallback 创建新 Attempt 且不依赖 compact artifact。"""
+    """reactive recovery 对空白输入与 protected recent view 同源 replay。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: recovery、protected recent 或 fallback digest 漂移时抛出。
+    """
 
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_current_run(store)
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_user_input(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-reactive-fallback-recent",
+            event_id="event-reactive-fallback-recent-input",
+            display_text="recent   protected\n replay material",
+            client_request_id="client-reactive-fallback-recent",
+            idempotency_key="idem-reactive-fallback-recent",
+        )
+        current_input = "dispatch   prompt\n\n with   collapsible whitespace"
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            display_text=current_input,
+        )
         factory = _ReactiveRecoveryWorkerFactory()
         scheduler = await _open_scheduler(
             tmp_path,
             store,
             factory,
-            context_budget_policy=_soft_compact_policy(),
+            context_budget_policy=_soft_compact_policy(
+                context_window_size=512,
+                soft_threshold_tokens=50,
+                hard_threshold_tokens=400,
+            ),
             lane_default_timeout_seconds=1.0,
+            memory_projection_policy=_compact_floor_one_memory_policy(),
         )
         try:
             scheduler.wake_dispatch(_pending_dispatch(seeded))
@@ -7932,21 +9413,67 @@ async def test_reactive_compact_failure_fallback_dispatch_uses_failed_view(
             )
             payload = _event_payload(failed)
             assert payload["fallback_action"] == "dispatch"
-            assert payload["fallback_policy_decision"] == (
-                "deterministic_recent_window"
+            assert payload["fallback_policy_decision"] == ("deterministic_recent_window")
+            window = payload["fallback_input_window"]
+            assert isinstance(window, Mapping)
+            selected_block_ids = _required_json_text_tuple(window["selected_block_ids"])
+            assert "eventlog:user:event-reactive-fallback-recent-input" in selected_block_ids
+            assert "current:event-input-dispatch" in selected_block_ids
+            run = _read_run(store.transaction_runner, seeded.run_id)
+            material_view = store.transaction_runner.run_read(
+                lambda transaction: build_pre_dispatch_compact_material_view(
+                    transaction,
+                    EventLogStore(),
+                    run=run,
+                    current_display_text=current_input,
+                )
             )
+            expected_current_block = run_input_material_block(
+                block_id="current:event-input-dispatch",
+                section=CompactMaterialSection.CURRENT_INPUT_ANCHOR,
+                kind=CompactMaterialBlockKind.CURRENT_INPUT_ANCHOR,
+                text=current_input,
+                canonical_source_refs=("event-input-dispatch",),
+                event_sequence=run.input_event_sequence,
+            )
+            expected_blocks = (*material_view.material_blocks, expected_current_block)
+            selected_ids = frozenset(selected_block_ids)
+            expected_selected = tuple(block for block in expected_blocks if block.block_id in selected_ids)
+            assert expected_current_block.text != current_input
+            assert window["selected_material_view_digest"] == selected_material_view_digest(expected_selected)
             second_contents = tuple(
                 content
-                for content in (
-                    _message_text(message)
-                    for message in factory.accepted_requests[1].messages
-                )
+                for content in (_message_text(message) for message in factory.accepted_requests[1].messages)
                 if content is not None
             )
-            assert "Accepted compact artifact is available for this run." not in (
-                "\n".join(second_contents)
+            assert "Accepted compact artifact is available for this run." not in ("\n".join(second_contents))
+            assert second_contents[-1] == current_input
+            assert "recent protected\nreplay material" in second_contents
+            recovery_snapshot = factory.accepted_snapshots[1]
+            recovery_source = store.transaction_runner.run_read(
+                lambda transaction: load_prepared_runner_call_source_in_transaction(
+                    transaction,
+                    EventLogStore(),
+                    run_id=seeded.run_id,
+                    attempt_id=recovery_snapshot.attempt_id,
+                    execution_id=recovery_snapshot.execution_id,
+                )
             )
-            assert second_contents[-1] == "dispatch prompt"
+            expected_fallback_ref = f"context_fallback:{payload['fallback_input_digest']}"
+            assert recovery_source.candidate.context_fallback_decision_ref == expected_fallback_ref
+            assert recovery_source.manifest.source_refs.context_fallback_decision_ref == expected_fallback_ref
+            first_attempt = store.transaction_runner.run_read(
+                lambda transaction: read_attempt_by_id(transaction, seeded.attempt_id)
+            )
+            recovery_attempt = store.transaction_runner.run_read(
+                lambda transaction: read_attempt_by_id(transaction, recovery_snapshot.attempt_id)
+            )
+            assert first_attempt is not None
+            assert recovery_attempt is not None
+            assert first_attempt.status is AttemptStatus.FAILED
+            assert recovery_attempt.status is AttemptStatus.SUCCEEDED
+            assert _run_status(store.transaction_runner, seeded.run_id) is RunStatus.SUCCEEDED
+            assert scheduler._active_tasks == set()
         finally:
             await scheduler.close()
 
@@ -8005,9 +9532,7 @@ def test_reactive_fallback_pipeline_uses_memory_policy_caps(tmp_path: Path) -> N
 
     assert decision.action_hint == "dispatch"
     assert failed_input.fallback_input_window is not None
-    assert failed_input.fallback_input_window["selected_block_ids"] == [
-        "current:event-input-dispatch"
-    ]
+    assert failed_input.fallback_input_window["selected_block_ids"] == ["current:event-input-dispatch"]
     assert "eventlog:user:event-input-run-dispatch-old" in (
         _required_json_text_tuple(failed_input.fallback_input_window["dropped_block_ids"])
     )
@@ -8021,12 +9546,20 @@ async def test_reactive_repeated_overflow_dispatch_loop_fails_closed_at_limit(
     """reactive overflow accepted closeout 不依赖后续 RunInputBuilder 消费。"""
 
     with open_host_durable_store(_options(tmp_path)) as store:
-        seeded = _seed_current_run(store)
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_user_input(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-repeated-reactive-history",
+            event_id="event-repeated-reactive-history",
+            display_text="older compactable material",
+            client_request_id="client-repeated-reactive-history",
+            idempotency_key="idem-repeated-reactive-history",
+        )
+        seeded = _seed_current_run(store, session_id=session_id)
         factory = _RepeatedReactiveOverflowWorkerFactory()
         max_reactive_compactions_per_run = 2
-        policy = _soft_compact_policy(
-            max_reactive_compactions_per_run=max_reactive_compactions_per_run
-        )
+        policy = _soft_compact_policy(max_reactive_compactions_per_run=max_reactive_compactions_per_run)
         expected_attempt_count = max_reactive_compactions_per_run + 1
         scheduler = await _open_scheduler(
             tmp_path,
@@ -8035,6 +9568,7 @@ async def test_reactive_repeated_overflow_dispatch_loop_fails_closed_at_limit(
             context_budget_policy=policy,
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_compact_no_floor_memory_policy(),
         )
         try:
             scheduler.wake_dispatch(_pending_dispatch(seeded))
@@ -8064,12 +9598,8 @@ async def test_reactive_repeated_overflow_dispatch_loop_fails_closed_at_limit(
             assert factory.created == expected_attempt_count
             assert len(factory.accepted_snapshots) == expected_attempt_count
             assert actual_attempt_count == expected_attempt_count
-            assert event_types.count(CONTEXT_COMPACTION_REQUESTED) == (
-                max_reactive_compactions_per_run
-            )
-            assert event_types.count(CONTEXT_COMPACTED) == (
-                max_reactive_compactions_per_run
-            )
+            assert event_types.count(CONTEXT_COMPACTION_REQUESTED) == (max_reactive_compactions_per_run)
+            assert event_types.count(CONTEXT_COMPACTED) == (max_reactive_compactions_per_run)
             assert event_types.count(CONTEXT_COMPACTION_FAILED) == 1
             assert payload["failure_reason"] == "reactive_compact_limit_reached"
             assert_failed_payload_no_fallback(
@@ -8091,22 +9621,28 @@ async def test_reactive_recovery_uses_fresh_duplicate_governance_attempt(
 
     first_event_gate = asyncio.Event()
     tool = _CountingTool()
-    duplicate_policy = DuplicateGovernancePolicy(
-        default_duplicate_decision=DuplicateDecisionKind.REUSE
-    )
+    duplicate_policy = DuplicateGovernancePolicy(default_duplicate_decision=DuplicateDecisionKind.REUSE)
     tool_policy = _agent_policy(True)
     tooling = _tooling_options(
         tool,
         duplicate_governance_policy=duplicate_policy,
     )
     with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_user_input(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-duplicate-reactive-history",
+            event_id="event-duplicate-reactive-history",
+            display_text="older compactable material",
+            client_request_id="client-duplicate-reactive-history",
+            idempotency_key="idem-duplicate-reactive-history",
+        )
         seeded = _seed_current_run(
             store,
+            session_id=session_id,
             agent_policy=tool_policy,
-            tool_schemas=tuple(
-                definition.to_tool_schema()
-                for definition in tooling.business_tool_bundle.definitions
-            ),
+            tool_schemas=tuple(definition.to_tool_schema() for definition in tooling.business_tool_bundle.definitions),
             tooling_options=tooling,
         )
         factory = _ReactiveRecoveryWorkerFactory(
@@ -8122,6 +9658,7 @@ async def test_reactive_recovery_uses_fresh_duplicate_governance_attempt(
             context_budget_policy=_soft_compact_policy(),
             context_compactor=FakeContextCompactor(),
             compact_artifact_root=tmp_path / "compact-artifacts",
+            memory_projection_policy=_compact_no_floor_memory_policy(),
         )
         try:
             scheduler.wake_dispatch(_pending_dispatch(seeded))
@@ -8227,9 +9764,7 @@ async def test_dispatch_consumes_exact_admission_tool_names(
             tooling_options=tooling,
         )
         try:
-            run = store.transaction_runner.run_read(
-                lambda transaction: read_run_by_id(transaction, seeded.run_id)
-            )
+            run = store.transaction_runner.run_read(lambda transaction: read_run_by_id(transaction, seeded.run_id))
             assert run is not None
             pending = _start_governed_for_test(
                 store.transaction_runner,
@@ -8245,9 +9780,7 @@ async def test_dispatch_consumes_exact_admission_tool_names(
                     execution_id=pending.execution_id,
                 )
             )
-            assert tuple(
-                schema.function.name for schema in source.candidate.tool_schemas
-            ) == expected_names
+            assert tuple(schema.function.name for schema in source.candidate.tool_schemas) == expected_names
         finally:
             await scheduler.close()
 
@@ -8266,10 +9799,13 @@ def test_replay_no_tool_facts_are_independent_of_current_tooling() -> None:
     assert facts.selector is EffectiveBusinessToolSelector.NONE
     assert facts.effective_business_tool_names == frozenset()
     assert facts.source_refs == ()
-    assert validate_effective_tool_facts_runtime(
-        facts,
-        tooling_options=None,
-    ) == frozenset()
+    assert (
+        validate_effective_tool_facts_runtime(
+            facts,
+            tooling_options=None,
+        )
+        == frozenset()
+    )
     with pytest.raises(
         HostDurableError,
         match="current business tool bundle",
@@ -8368,9 +9904,7 @@ async def test_dispatch_tool_drift_fails_before_start_without_artifacts(
             description="schema drift",
         )
     elif drift_kind == "bundle_digest":
-        tampered_facts["business_bundle_digest"] = sha256_digest_json(
-            {"corrupt": "bundle"}
-        )
+        tampered_facts["business_bundle_digest"] = sha256_digest_json({"corrupt": "bundle"})
     elif drift_kind == "schema_digest":
         corrupt_digest = sha256_digest_json({"corrupt": "schema"})
         tampered_facts["effective_schema_digest"] = corrupt_digest
@@ -8399,9 +9933,7 @@ async def test_dispatch_tool_drift_fails_before_start_without_artifacts(
             tooling_options=runtime_tooling,
         )
         try:
-            run = store.transaction_runner.run_read(
-                lambda transaction: read_run_by_id(transaction, seeded.run_id)
-            )
+            run = store.transaction_runner.run_read(lambda transaction: read_run_by_id(transaction, seeded.run_id))
             assert run is not None
             with pytest.raises(HostDurableError):
                 _start_governed_for_test(
@@ -8457,9 +9989,7 @@ async def test_no_budget_manifest_preserves_actual_dispatch_stage(
             _FakeWorkerFactory(),
         )
         try:
-            run = store.transaction_runner.run_read(
-                lambda transaction: read_run_by_id(transaction, seeded.run_id)
-            )
+            run = store.transaction_runner.run_read(lambda transaction: read_run_by_id(transaction, seeded.run_id))
             assert run is not None
             scheduler._catch_up_memory_projection_before_candidate(run.session_id)
             outcome = store.transaction_runner.run_write(
@@ -8497,16 +10027,24 @@ async def test_no_budget_manifest_preserves_actual_dispatch_stage(
             await scheduler.close()
 
 
-def _options(tmp_path: Path) -> HostDurableStoreOptions:
+def _options(
+    tmp_path: Path,
+    *,
+    payload_inline_threshold_bytes: int = 65536,
+) -> HostDurableStoreOptions:
     """构造 Host durable store options。
 
     :param tmp_path: pytest 临时目录。
+    :param payload_inline_threshold_bytes: payload inline 阈值。
     :returns: durable store options。
     """
 
     return HostDurableStoreOptions(
         db_path=tmp_path / "host.sqlite3",
-        payload_policy=PayloadStoragePolicy(artifact_root=tmp_path / "artifacts"),
+        payload_policy=PayloadStoragePolicy(
+            artifact_root=tmp_path / "artifacts",
+            payload_inline_threshold_bytes=payload_inline_threshold_bytes,
+        ),
         sqlite_policy=HostSQLiteStoragePolicy(
             busy_timeout_seconds=0.25,
             write_busy_retry_count=3,
@@ -8536,6 +10074,7 @@ async def _open_scheduler(
     host_handle_id: str = "host-test",
     host_instance_identity: HostInstanceIdentity | None = None,
     terminal_port_factory: _RecordingTerminalPortFactory | None = None,
+    dispatch_poll_interval_seconds: float = 0.01,
 ) -> HostDispatchScheduler:
     """打开测试 scheduler。
 
@@ -8557,6 +10096,7 @@ async def _open_scheduler(
     :param host_instance_identity: 可选 Host instance 身份；用于测试 handle
         与 instance id 不同的 owner 写入路径。
     :param terminal_port_factory: 可选 construction/bind recording factory。
+    :param dispatch_poll_interval_seconds: scheduler 后台 polling interval。
     :returns: scheduler。
     :raises Exception: lane controller 或 durable host instance 注册失败时透传。
     """
@@ -8569,7 +10109,7 @@ async def _open_scheduler(
         lane_claim_ttl_seconds=1.0,
         lane_heartbeat_interval_seconds=0.1,
         worker_startup_timeout_seconds=worker_startup_timeout_seconds,
-        dispatch_poll_interval_seconds=0.01,
+        dispatch_poll_interval_seconds=dispatch_poll_interval_seconds,
         runner_spec=_runner_spec(),
         runner_options=RunnerCallOptions(temperature=None, max_tokens=None, top_p=None, stream=False),
         agent_policy=agent_policy if agent_policy is not None else _agent_policy(False),
@@ -8579,9 +10119,7 @@ async def _open_scheduler(
         context_compactor=context_compactor,
         compact_artifact_root=compact_artifact_root,
         memory_projection_policy=(
-            memory_projection_policy
-            if memory_projection_policy is not None
-            else default_memory_projection_policy()
+            memory_projection_policy if memory_projection_policy is not None else default_memory_projection_policy()
         ),
     )
     if host_instance_identity is None:
@@ -8589,17 +10127,13 @@ async def _open_scheduler(
             transaction_runner=store.transaction_runner,
             transient_delta_publisher=NOOP_TRANSIENT_DELTA_PUBLISHER,
             terminal_post_commit_port_factory=(
-                terminal_port_factory
-                if terminal_port_factory is not None
-                else _RecordingTerminalPortFactory()
+                terminal_port_factory if terminal_port_factory is not None else _RecordingTerminalPortFactory()
             ),
             local_execution=local_execution,
             host_handle_id=host_handle_id,
             active_registry=active_registry,
             projection_catchup_port=projection_catchup,
-            session_new_work_access=ExplicitFakeSessionAccess(
-                allowed_session_ids=None
-            ),
+            session_new_work_access=ExplicitFakeSessionAccess(allowed_session_ids=None),
         )
     _register_host_instance(store.transaction_runner, host_instance_identity)
     lane_controller = await LaneController.open(
@@ -8630,9 +10164,7 @@ async def _open_scheduler(
         host_instance_identity=host_instance_identity,
         active_registry=active_registry,
         projection_catchup_port=projection_catchup,
-        session_new_work_access=ExplicitFakeSessionAccess(
-            allowed_session_ids=None
-        ),
+        session_new_work_access=ExplicitFakeSessionAccess(allowed_session_ids=None),
     )
 
 
@@ -8667,6 +10199,7 @@ def _runner_spec() -> RunnerSpec:
         supports_tool_calling=False,
         supports_streaming=False,
         supports_stream_usage=False,
+        structured_output_capability=StructuredOutputCapability.NONE,
         default_timeout_seconds=1.0,
         max_retries=0,
         provider_request=None,
@@ -8734,9 +10267,7 @@ def _tooling_options(
             ),
         ),
         duplicate_governance_policy=(
-            duplicate_governance_policy
-            if duplicate_governance_policy is not None
-            else DuplicateGovernancePolicy()
+            duplicate_governance_policy if duplicate_governance_policy is not None else DuplicateGovernancePolicy()
         ),
     )
 
@@ -8756,10 +10287,7 @@ def _tooling_options_for_names(
     tool = _CountingTool()
     return HostToolingOptions(
         business_tool_bundle=ToolBundle(
-            definitions=tuple(
-                _tool_definition(name, tool, description=description)
-                for name in names
-            )
+            definitions=tuple(_tool_definition(name, tool, description=description) for name in names)
         ),
         source_refs=(
             ToolBundleSourceRef(
@@ -8875,6 +10403,7 @@ def _seed_current_run(
     agent_policy: AgentPolicy | None = None,
     tool_schemas: tuple[ToolSchema, ...] = (),
     tooling_options: HostToolingOptions | None = None,
+    display_text: str = "dispatch prompt",
 ) -> _SeededRun:
     """创建 running Run、STARTING Attempt 和 pending dispatch。
 
@@ -8883,6 +10412,7 @@ def _seed_current_run(
     :param agent_policy: frozen Agent policy；缺失时使用默认no-tool policy。
     :param tool_schemas: frozen selected tool schemas。
     :param tooling_options: admission 与 dispatch 共用的 construction-time 工具真源。
+    :param display_text: 当前 Run 的用户展示文本。
     :returns: seeded run 摘要。
     """
 
@@ -8909,14 +10439,13 @@ def _seed_current_run(
         runner_options_source="test",
         agent_policy_source="test",
     )
-    effective_snapshot = effective_execution_snapshot_from_json(
-        effective_execution_config
-    )
+    effective_snapshot = effective_execution_snapshot_from_json(effective_execution_config)
     input_event_sequence = _append_user_input(
         store.transaction_runner,
         session_id=actual_session_id,
         run_id=seeded.run_id,
         event_id="event-input-dispatch",
+        display_text=display_text,
         effective_execution_config=effective_execution_config,
         effective_tool_set=effective_tool_facts_json(
             None,
@@ -8948,9 +10477,7 @@ def _seed_current_run(
 
     store.transaction_runner.run_write(_accept_operation)
     required_cursor = store.transaction_runner.run_read(
-        lambda transaction: EventLogStore()
-        .read_events_after(transaction, 0, limit=100)[-1]
-        .event_sequence
+        lambda transaction: EventLogStore().read_events_after(transaction, 0, limit=100)[-1].event_sequence
     )
     catch_up = catch_up_conversation_memory_projection(
         store.transaction_runner,
@@ -8988,9 +10515,7 @@ def _seed_current_run(
             tool_schemas=tool_schemas,
             disable_tools=not tool_schemas,
             tool_execution_mode=(
-                ToolExecutionMode.TOOL_ENABLED
-                if tool_schemas
-                else ToolExecutionMode.NO_TOOL_DISABLED
+                ToolExecutionMode.TOOL_ENABLED if tool_schemas else ToolExecutionMode.NO_TOOL_DISABLED
             ),
             memory_projection_policy=default_memory_projection_policy(),
         )
@@ -9065,9 +10590,7 @@ def _seed_accepted_run(
             top_p=None,
             stream=False,
         ),
-        agent_policy=(
-            agent_policy if agent_policy is not None else _agent_policy(False)
-        ),
+        agent_policy=(agent_policy if agent_policy is not None else _agent_policy(False)),
         runner_spec_source="test",
         runner_options_source="test",
         agent_policy_source="test",
@@ -9112,6 +10635,39 @@ def _seed_accepted_run(
     return _AcceptedSeededRun(session_id=actual_session_id, run_id=run_id)
 
 
+def _seed_accepted_run_with_compactable_history(
+    store: HostDurableStore,
+    *,
+    run_id: str,
+    display_text: str,
+) -> _AcceptedSeededRun:
+    """在同一 Session 先写入一条可 compact 历史，再创建 accepted Run。
+
+    :param store: durable store。
+    :param run_id: 当前 Run id。
+    :param display_text: 当前用户输入。
+    :returns: 带可引用 source boundary 的 accepted Run 摘要。
+    """
+
+    session_id = _ensure_session_id(store.transaction_runner)
+    history_run_id = f"{run_id}-history"
+    _append_user_input(
+        store.transaction_runner,
+        session_id=session_id,
+        run_id=history_run_id,
+        event_id=f"event-input-{history_run_id}",
+        display_text="older compactable material",
+        client_request_id=f"client-{history_run_id}",
+        idempotency_key=f"idem-{history_run_id}",
+    )
+    return _seed_accepted_run(
+        store,
+        run_id=run_id,
+        display_text=display_text,
+        session_id=session_id,
+    )
+
+
 def _soft_compact_policy(
     *,
     max_compaction_attempts_per_operation: int = 1,
@@ -9131,10 +10687,7 @@ def _soft_compact_policy(
     """
 
     actual_soft_threshold_tokens = (
-        int(
-            (context_window_size - _SOFT_RESERVED_OUTPUT_TOKENS)
-            * (1 - _SOFT_SAFETY_MARGIN_RATIO)
-        )
+        int((context_window_size - _SOFT_RESERVED_OUTPUT_TOKENS) * (1 - _SOFT_SAFETY_MARGIN_RATIO))
         if soft_threshold_tokens is None
         else soft_threshold_tokens
     )
@@ -9276,6 +10829,65 @@ def _append_proactive_compaction_requested(
                 payload_digest=None,
             ),
         )
+
+    transaction_runner.run_write(_operation)
+
+
+def _append_duplicate_proactive_failed_terminals(
+    transaction_runner: HostTransactionRunner,
+    *,
+    seeded: _AcceptedSeededRun,
+    operation_id: str,
+) -> None:
+    """为同一 proactive operation 注入两个 canonical failed terminal。
+
+    :param transaction_runner: Host transaction runner。
+    :param seeded: accepted Run 摘要。
+    :param operation_id: 已提交 proactive request id。
+    :returns: ``None``。
+    :raises Exception: EventLog append 失败时透传。
+    """
+
+    def _operation(transaction: HostTransaction) -> None:
+        """在单笔事务中追加两个损坏 terminal facts。
+
+        :param transaction: 当前 Host write transaction。
+        :returns: ``None``。
+        :raises Exception: EventLog append 失败时透传。
+        """
+
+        for ordinal in (1, 2):
+            EventLogStore().append_event(
+                transaction,
+                EventLogAppendRequest(
+                    event_id=f"event-invalid-multiple-failed-{ordinal}",
+                    event_class=EventClass.CANONICAL_FACT,
+                    session_id=seeded.session_id,
+                    run_id=seeded.run_id,
+                    attempt_id=None,
+                    execution_id=None,
+                    event_type=CONTEXT_COMPACTION_FAILED,
+                    occurred_at=_NOW,
+                    actor="tester",
+                    source="pytest",
+                    client_request_id=None,
+                    idempotency_key=None,
+                    policy_decision=None,
+                    reason=None,
+                    payload_json=build_context_compaction_failed_payload(
+                        operation_id=operation_id,
+                        failure_reason=f"invalid_multiple_{ordinal}",
+                        policy_decision="fail_closed",
+                        retryable=False,
+                        attempt_count=0,
+                        retry_repair_budget_exhausted=False,
+                        diagnostic_refs=(f"diagnostic:{ordinal}",),
+                        budget_after_attempted_compact=None,
+                    ),
+                    payload_ref=None,
+                    payload_digest=None,
+                ),
+            )
 
     transaction_runner.run_write(_operation)
 
@@ -9501,13 +11113,9 @@ def _append_accepted_tool_evidence(
         tool_call_event_id = f"{event_prefix}-tool-call"
         tool_result_event_id = f"{event_prefix}-tool-result"
         tool_call_id = f"{event_prefix}-tool-call-id"
-        arguments_json: dict[str, JsonValue] = {
-            "arguments": {"ticker": "MSFT", "topic": "risk"}
-        }
+        arguments_json: dict[str, JsonValue] = {"arguments": {"ticker": "MSFT", "topic": "risk"}}
         arguments_digest = sha256_digest_json(arguments_json)
-        semantic_query_digest = sha256_digest_json(
-            {"semantic_query_text": query_text}
-        )
+        semantic_query_digest = sha256_digest_json({"semantic_query_text": query_text})
         EventLogStore().append_event(
             transaction,
             EventLogAppendRequest(
@@ -9533,13 +11141,9 @@ def _append_accepted_tool_evidence(
                     "arguments_storage_kind": TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
                     "arguments_inline_json": arguments_json,
                     "arguments_payload_ref": None,
-                    "arguments_json_size_bytes": len(
-                        canonical_json_dumps(arguments_json).encode("utf-8")
-                    ),
+                    "arguments_json_size_bytes": len(canonical_json_dumps(arguments_json).encode("utf-8")),
                     "semantic_input_digest": semantic_query_digest,
-                    "semantic_query_storage_kind": (
-                        TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT
-                    ),
+                    "semantic_query_storage_kind": (TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT),
                     "semantic_query_text": query_text,
                     "semantic_query_payload_ref": None,
                     "semantic_query_digest": semantic_query_digest,
@@ -9572,9 +11176,7 @@ def _append_accepted_tool_evidence(
                     digest=None,
                 ),
             ),
-            locator_refs=(
-                OpaqueEvidenceRef(ref_kind="filing", ref_id="msft-10k", digest=None),
-            ),
+            locator_refs=(OpaqueEvidenceRef(ref_kind="filing", ref_id="msft-10k", digest=None),),
         )
         EventLogStore().append_event(
             transaction,
@@ -9594,9 +11196,7 @@ def _append_accepted_tool_evidence(
                 policy_decision=None,
                 reason=None,
                 payload_json={
-                    "accepted_evidence_envelope": (
-                        accepted_evidence_envelope_to_json_value(envelope)
-                    ),
+                    "accepted_evidence_envelope": (accepted_evidence_envelope_to_json_value(envelope)),
                     "raw_tool_outcome": {
                         "kind": "completed",
                         "result": {"text": raw_result_text},
@@ -9616,6 +11216,8 @@ def _append_previous_compacted_event(
     session_id: str,
     run_id: str,
     event_id: str,
+    memory_policy: MemoryProjectionPolicy | None = None,
+    candidate: CompactCandidateV4 | None = None,
 ) -> None:
     """追加测试用 latest accepted ``CONTEXT_COMPACTED`` fact。
 
@@ -9623,11 +11225,87 @@ def _append_previous_compacted_event(
     :param session_id: Session id。
     :param run_id: Run id。
     :param event_id: compacted event id。
+    :param memory_policy: 与后续 projection consumer 同源的 policy。
+    :param candidate: 可选 accepted compact candidate；缺失时使用默认全 section
+        fixture。
     :returns: ``None``。
     """
 
+    source_run_id = f"{run_id}-compact-source"
+    source_user_event_id = f"{event_id}-source-user"
+    source_answer_event_id = f"{event_id}-source-answer"
+    source_tool_prefix = f"{event_id}-source"
+    source_tool_result_event_id = f"{source_tool_prefix}-tool-result"
+    compact_current_event_id = f"{event_id}-current-input"
+    _append_user_input(
+        transaction_runner,
+        session_id=session_id,
+        run_id=source_run_id,
+        event_id=source_user_event_id,
+        display_text="previous compact source user",
+        client_request_id=f"client-{source_user_event_id}",
+        idempotency_key=f"idem-{source_user_event_id}",
+    )
+    _append_run_success(
+        transaction_runner,
+        session_id=session_id,
+        run_id=source_run_id,
+        event_id=source_answer_event_id,
+        final_answer="previous compact source answer",
+    )
+    _append_accepted_tool_evidence(
+        transaction_runner,
+        session_id=session_id,
+        run_id=source_run_id,
+        event_prefix=source_tool_prefix,
+        query_text="previous compact source query",
+        raw_result_text="previous compact source result",
+    )
+    _append_user_input(
+        transaction_runner,
+        session_id=session_id,
+        run_id=f"{run_id}-compact-current",
+        event_id=compact_current_event_id,
+        display_text="previous compact current input",
+        client_request_id=f"client-{compact_current_event_id}",
+        idempotency_key=f"idem-{compact_current_event_id}",
+    )
+
     def _operation(transaction: HostTransaction) -> None:
+        effective_policy = (
+            default_memory_projection_policy()
+            if memory_policy is None
+            else memory_policy
+        )
         operation_id = f"operation-{event_id}"
+        compactor_agent_request = AgentRunRequest(
+            run_id=f"compactor-run:{operation_id}:1",
+            session_id=f"context-compactor:{session_id}",
+            attempt_id=None,
+            execution_id=None,
+            messages=(
+                SystemMessage(
+                    role=AgentMessageRole.SYSTEM,
+                    content="system",
+                ),
+                UserMessage(
+                    role=AgentMessageRole.USER,
+                    content="previous compact fixture",
+                ),
+            ),
+            disable_tools=True,
+            runner_spec=_runner_spec(),
+            runner_options=RunnerCallOptions(
+                temperature=None,
+                max_tokens=None,
+                top_p=None,
+                stream=False,
+            ),
+            agent_policy=_agent_policy(False),
+            tool_schemas=(),
+            tool_executor=NoToolExecutor(),
+            cancellation_token=_HostCancellationToken(),
+        )
         EventLogStore().append_event(
             transaction,
             EventLogAppendRequest(
@@ -9649,9 +11327,7 @@ def _append_previous_compacted_event(
                     operation_id=operation_id,
                     max_compaction_attempts_per_operation=1,
                     trigger_source=ContextCompactionTriggerSource.PROACTIVE,
-                    budget_reason=(
-                        ContextBudgetDecision.COMPACT_SOFT_THRESHOLD.value
-                    ),
+                    budget_reason=(ContextBudgetDecision.COMPACT_SOFT_THRESHOLD.value),
                     budget_snapshot_ref=_CALL_CONTEXT_DIGEST,
                     input_snapshot_cursor=1,
                     estimator_digest=_CALL_CONTEXT_DIGEST,
@@ -9690,16 +11366,33 @@ def _append_previous_compacted_event(
                     accepted_attempt_number=1,
                     compact_artifact_ref="artifact:previous-compact",
                     compact_artifact_digest=_CALL_CONTEXT_DIGEST,
-                    accepted_candidate=_previous_compacted_candidate(),
-                    quality_check_result=CompactQualityCheckResultVNext(
-                        accepted=True,
-                        rejection_reasons=(),
+                    accepted_truth=accepted_truth_for_candidate(
+                        (
+                            _previous_compacted_candidate()
+                            if candidate is None
+                            else candidate
+                        ),
+                        current_input_ref=compact_current_event_id,
+                        source_refs_by_label={
+                            "T1": (source_user_event_id,),
+                            "E1": (f"evidence:{source_tool_result_event_id}",),
+                            "A1": (source_answer_event_id,),
+                        },
+                        memory_policy=effective_policy,
                     ),
                     budget_after_compact=16,
                     prompt_local_label_mapping_refs=("label-map:previous",),
-                    source_boundary_refs=("source-boundary:previous",),
-                    accepted_evidence_mapping_refs=("evidence:previous",),
                     projection_signal="project_memory",
+                    successful_response_identity=(
+                        _successful_response_identity_for_agent_request(compactor_agent_request)
+                    ),
+                    accepted_proposal_manifest_reference=(
+                        _proposal_manifest_reference(
+                            operation_id=operation_id,
+                            attempt_number=1,
+                            compactor_engine_run_id=(compactor_agent_request.run_id),
+                        )
+                    ),
                 ),
                 payload_ref=None,
                 payload_digest=None,
@@ -9709,52 +11402,100 @@ def _append_previous_compacted_event(
     transaction_runner.run_write(_operation)
 
 
-def _previous_compacted_candidate() -> ConversationCompactOutputVNext:
+def _previous_compacted_candidate() -> CompactCandidateV4:
     """构造含全 section 的 latest accepted compact candidate。
 
-    :returns: ConversationCompactOutputVNext。
+    :returns: CompactCandidateV4。
     """
 
-    return ConversationCompactOutputVNext(
-        schema_version=CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
-        session_summary=SessionSummaryCandidateVNext(
-            summary_text="previous session summary must drop whole",
+    return CompactCandidateV4(
+        schema=COMPACT_OUTPUT_SCHEMA_V4,
+        session_summary=CompactSessionSummaryV4(
+            text="previous session summary must drop whole",
             source_labels=("T1",),
         ),
-        evidence_backed_facts=(
-            EvidenceBackedFactCandidateVNext(
-                claim_text="previous evidence fact must stay exact",
-                evidence_labels=("E1",),
+        retained_previous_evidence_fact_labels=(),
+        evidence_facts=(
+            CompactEvidenceFactV4(
+                claim="previous evidence fact must stay exact",
+                support_labels=("E1",),
+                context_labels=(),
             ),
         ),
         answer_anchors=(
-            AnswerAnchorCandidateVNext(
-                anchor_title="previous answer anchor must drop whole",
-                anchor_items=(
-                    AnswerAnchorChildVNext(
-                        display_text="previous answer item",
-                        ordinal=1,
-                    ),
-                ),
-                answer_source_labels=("A1",),
+            CompactAnswerAnchorV4(
+                title="previous answer anchor must drop whole",
+                detail="previous answer item",
+                source_labels=("A1",),
             ),
         ),
         forward_intents=(
-            ForwardIntentCandidateVNext(
-                intent_type=ForwardIntentTypeVNext.NEXT_STEP_NOTE,
+            CompactForwardIntentV4(
+                intent_type="next_step_note",
                 text="previous forward intent must drop whole",
-                status=ForwardIntentStatusVNext.OPEN,
+                status=CompactForwardIntentStatusV4.OPEN,
                 source_labels=("T1",),
             ),
         ),
-        reference_continuity_items=(
-            ReferenceContinuityCandidateVNext(
+        reference_continuity=(
+            CompactReferenceContinuityV4(
                 text="previous reference must drop whole",
-                reason=ReferenceContinuityReasonVNext.LOCAL_REFERENCE,
+                reason="local_reference",
                 source_labels=("T1",),
             ),
         ),
-        diagnostics=(),
+    )
+
+
+def _previous_compacted_normalization_candidate() -> CompactCandidateV4:
+    """构造覆盖空白、多行、列表与表格的 previous-pair candidate。
+
+    :returns: 可复现 packed/readable 旧分叉的完整 CompactCandidateV4。
+    """
+
+    return CompactCandidateV4(
+        schema=COMPACT_OUTPUT_SCHEMA_V4,
+        session_summary=CompactSessionSummaryV4(
+            text="  summary   first  \n\n summary second ",
+            source_labels=("T1",),
+        ),
+        retained_previous_evidence_fact_labels=(),
+        evidence_facts=(
+            CompactEvidenceFactV4(
+                claim=" fact   first \n\n fact second ",
+                support_labels=("E1",),
+                context_labels=(),
+            ),
+        ),
+        answer_anchors=(
+            CompactAnswerAnchorV4(
+                title="  FY2025   conclusion  ",
+                detail=(
+                    " first   paragraph \n\n"
+                    " - bullet   one \n"
+                    " 1. numbered   item \n\n"
+                    " | year | value | \n"
+                    " | --- | ---: | \n"
+                    " | 2025 | 21.7% | "
+                ),
+                source_labels=("A1",),
+            ),
+        ),
+        forward_intents=(
+            CompactForwardIntentV4(
+                intent_type="next_step_note",
+                text=" next   step \n\n after reload ",
+                status=CompactForwardIntentStatusV4.OPEN,
+                source_labels=("T1",),
+            ),
+        ),
+        reference_continuity=(
+            CompactReferenceContinuityV4(
+                text=" this   reference \n\n stays exact ",
+                reason="local_reference",
+                source_labels=("T1",),
+            ),
+        ),
     )
 
 
@@ -10112,9 +11853,7 @@ def _table_count(
         :raises AssertionError: SQLite未返回int count时抛出。
         """
 
-        row = transaction.fetchone(
-            f"SELECT COUNT(*) AS count FROM {table_name}"
-        )
+        row = transaction.fetchone(f"SELECT COUNT(*) AS count FROM {table_name}")
         assert row is not None
         count = row.get("count")
         assert isinstance(count, int)
@@ -10171,10 +11910,7 @@ def _has_context_usage_activity(
             if row.run_id != run_id:
                 continue
             activity = _host_event_from_row(transaction, row).activity
-            if (
-                activity is not None
-                and activity.kind is HostActivityKind.CONTEXT_USAGE
-            ):
+            if activity is not None and activity.kind is HostActivityKind.CONTEXT_USAGE:
                 return True
         return False
 
@@ -10259,6 +11995,33 @@ def _compact_artifact_files(root: Path) -> tuple[Path, ...]:
     if not root.exists():
         return ()
     return tuple(sorted(path for path in root.rglob("*") if path.is_file()))
+
+
+def _payload_descriptor_count(
+    transaction_runner: HostTransactionRunner,
+) -> int:
+    """统计 durable payload descriptor rows。
+
+    :param transaction_runner: Host transaction runner。
+    :returns: descriptor row 数量。
+    :raises AssertionError: SQLite 未返回整数 count 时抛出。
+    """
+
+    def _operation(transaction: HostTransaction) -> int:
+        """在当前 read transaction 内统计 descriptor rows。
+
+        :param transaction: 当前 Host read transaction。
+        :returns: descriptor row 数量。
+        :raises AssertionError: SQLite 未返回整数 count 时抛出。
+        """
+
+        row = transaction.fetchone(f"SELECT COUNT(*) AS total FROM {TABLE_PAYLOAD_DESCRIPTORS}")
+        assert row is not None
+        total = row.get("total")
+        assert isinstance(total, int)
+        return total
+
+    return transaction_runner.run_read(_operation)
 
 
 def _event_log_types_after_cursor(
@@ -10396,11 +12159,7 @@ def _events_for_run_by_type(
             0,
             limit=_EVENT_LOG_TEST_READ_LIMIT,
         )
-        return tuple(
-            row
-            for row in rows
-            if row.run_id == run_id and row.event_type == event_type
-        )
+        return tuple(row for row in rows if row.run_id == run_id and row.event_type == event_type)
 
     return transaction_runner.run_read(_operation)
 
@@ -10528,6 +12287,8 @@ def _append_proactive_rejection_after_terminal(
                     diagnostic_refs=("diagnostic:after-terminal",),
                     next_policy_decision="fail_operation",
                     budget_after_attempted_compact=None,
+                    successful_response_identity=None,
+                    proposal_manifest_reference=None,
                 ),
                 payload_ref=None,
                 payload_digest=None,
@@ -10535,6 +12296,109 @@ def _append_proactive_rejection_after_terminal(
         )
 
     transaction_runner.run_write(_operation)
+
+
+def _resolve_and_assert_compactor_calls(
+    transaction_runner: HostTransactionRunner,
+    *,
+    tmp_path: Path,
+    run_id: str,
+    prepared_inputs: tuple[CompactorProposalRunInput, ...],
+    attempt_payloads: tuple[Mapping[str, JsonValue], ...],
+    accepted_attempt_number: int | None,
+) -> None:
+    """通过 public Tool Trace contract 重构并核对全部 compactor calls。
+
+    :param transaction_runner: 当前 Host durable transaction runner。
+    :param tmp_path: 当前 pytest 临时目录。
+    :param run_id: compaction 所属 Host Run id。
+    :param prepared_inputs: recorder 实际消费的逐 attempt prepared inputs。
+    :param attempt_payloads: 与 attempts 对齐的 rejected/accepted canonical payloads。
+    :param accepted_attempt_number: accepted attempt 序号；全部失败时为 ``None``。
+    :returns: ``None``。
+    :raises AssertionError: manifest、projection、attempt 或 response identity
+        任一无法同源重构时抛出。
+    :raises HostDurableError: Tool Trace catch-up 或 formal resolver fail closed 时透传。
+    """
+
+    assert len(prepared_inputs) == len(attempt_payloads)
+    catch_up_tool_trace_projection(
+        transaction_runner,
+        options=ToolTraceSinkOptions(cold_jsonl_path=tmp_path / "tool-trace" / "cold.jsonl"),
+    )
+    page = transaction_runner.run_read(
+        lambda transaction: read_runner_call_reconstruction_signals_by_run(
+            transaction,
+            run_id,
+            after_event_sequence=0,
+            limit=100,
+        )
+    )
+    signals = tuple(signal for signal in page.signals if signal.runner_call_kind == _COMPACTOR_RUNNER_CALL_KIND)
+    assert len(signals) == len(prepared_inputs)
+    resolved_calls = transaction_runner.run_read(
+        lambda transaction: tuple(resolve_runner_call_projection_from_signal(transaction, signal) for signal in signals)
+    )
+    source_events = {
+        row.event_id: row
+        for row in _events_for_run_by_type(
+            transaction_runner,
+            run_id,
+            "RUNNER_CALL_INPUT_ASSEMBLED",
+        )
+    }
+
+    for attempt_number, (prepared_input, attempt_payload, resolved) in enumerate(
+        zip(prepared_inputs, attempt_payloads, resolved_calls, strict=True),
+        start=1,
+    ):
+        is_accepted = attempt_number == accepted_attempt_number
+        attempt_field = _ACCEPTED_ATTEMPT_NUMBER_FIELD if is_accepted else _ATTEMPT_NUMBER_FIELD
+        manifest_ref_field = _ACCEPTED_MANIFEST_REF_FIELD if is_accepted else _REJECTED_MANIFEST_REF_FIELD
+        manifest_digest_field = _ACCEPTED_MANIFEST_DIGEST_FIELD if is_accepted else _REJECTED_MANIFEST_DIGEST_FIELD
+        signal = resolved.signal
+        source_event = source_events[signal.event_id]
+        hot_payload = _event_payload(source_event)
+        assert signal.runner_call_index == attempt_number - 1
+        assert _required_json_int(attempt_payload[attempt_field]) == attempt_number
+        assert source_event.payload_ref == signal.manifest_ref
+        assert source_event.payload_digest == signal.manifest_digest
+        assert _required_json_text(hot_payload["manifest_payload_ref"]) == signal.manifest_ref
+        assert _required_json_text(hot_payload["manifest_digest"]) == signal.manifest_digest
+        assert resolved.manifest.payload_ref == signal.manifest_ref
+        assert resolved.manifest.payload_digest == signal.manifest_digest
+        assert resolved.manifest.payload_ref == _required_json_text(attempt_payload[manifest_ref_field])
+        assert resolved.manifest.payload_digest == _required_json_text(attempt_payload[manifest_digest_field])
+
+        compactor_identity = _required_json_mapping(resolved.manifest.payload["compactor_identity"])
+        assert _required_json_int(compactor_identity["compaction_attempt_number"]) == attempt_number
+        assert (
+            _required_json_text(compactor_identity["compactor_engine_run_id"]) == prepared_input.compactor_engine_run_id
+        )
+        assert _required_json_text(compactor_identity["compaction_operation_id"]) == _required_json_text(
+            attempt_payload["operation_id"]
+        )
+        assert resolved.runner_input_projection.payload_ref == _required_json_text(
+            compactor_identity["compactor_input_projection_ref"]
+        )
+        assert _required_json_text(hot_payload["runner_call_projection_artifact_ref"]) == (
+            resolved.runner_input_projection.payload_ref
+        )
+        assert _required_json_text(hot_payload["runner_call_projection_artifact_digest"]) == (
+            resolved.runner_input_projection.payload_digest
+        )
+        assert resolved.runner_input_projection.payload_digest == (prepared_input.compactor_input_projection_digest)
+        assert resolved.runner_input_projection.payload == (prepared_input.compactor_input_projection)
+
+        response_identity = _required_json_mapping(attempt_payload["successful_response_identity"])
+        assert _required_json_text(response_identity["effective_provider"]) == (
+            prepared_input.agent_request.runner_spec.provider
+        )
+        assert _required_json_text(response_identity["effective_model"]) == (
+            prepared_input.agent_request.runner_spec.model
+        )
+        runner_request_identity = _required_json_mapping(response_identity["runner_request_identity"])
+        assert _required_json_text(runner_request_identity["run_id"]) == (prepared_input.compactor_engine_run_id)
 
 
 def _assert_accepted_payload_has_proposal_manifest(
@@ -10712,9 +12576,7 @@ async def _wait_for_compactor_request_count(
         if len(compactor.prepared_requests) >= expected_count:
             return
         await asyncio.sleep(0.01)
-    raise AssertionError(
-        f"compactor request count did not converge: {len(compactor.prepared_requests)}"
-    )
+    raise AssertionError(f"compactor request count did not converge: {len(compactor.prepared_requests)}")
 
 
 def _content_index(contents: tuple[str, ...], expected_fragment: str) -> int:
@@ -10914,6 +12776,44 @@ def _require_text(value: str | None) -> str:
     """
 
     assert value is not None
+    return value
+
+
+def _required_json_mapping(value: JsonValue) -> Mapping[str, JsonValue]:
+    """读取测试 canonical payload 中的 JSON object。
+
+    :param value: 待校验 JSON 值。
+    :returns: 严格字符串 key 的 JSON mapping。
+    :raises AssertionError: 值不是 JSON object 时抛出。
+    """
+
+    assert isinstance(value, Mapping)
+    return cast(Mapping[str, JsonValue], value)
+
+
+def _required_json_text(value: JsonValue) -> str:
+    """读取测试 canonical payload 中的非空文本。
+
+    :param value: 待校验 JSON 值。
+    :returns: 非空文本。
+    :raises AssertionError: 值不是非空文本时抛出。
+    """
+
+    assert isinstance(value, str)
+    assert value != ""
+    return value
+
+
+def _required_json_int(value: JsonValue) -> int:
+    """读取测试 canonical payload 中的严格整数。
+
+    :param value: 待校验 JSON 值。
+    :returns: 严格整数。
+    :raises AssertionError: 值不是严格整数时抛出。
+    """
+
+    assert isinstance(value, int)
+    assert not isinstance(value, bool)
     return value
 
 

@@ -23,10 +23,8 @@ CLI_BUSINESS_DOMAIN: str = "fins"
 CLI_TICKER_OBJECT_TYPE: str = "ticker"
 CLI_PROMPT_SCENARIO: str = "prompt"
 CLI_INTERACTIVE_SCENARIO: str = "interactive"
-PROMPT_SESSION_SCOPE: str = "cli.prompt"
-PROMPT_SLOT_KEY_PREFIX: str = "cli.prompt."
-INTERACTIVE_SESSION_SCOPE: str = "cli.interactive"
-INTERACTIVE_SLOT_KEY_PREFIX: str = "cli.interactive."
+CLI_AGENT_SESSION_SCOPE: str = "cli.agent"
+CLI_AGENT_SLOT_KEY_PREFIX: str = "cli.agent."
 CLI_SIGINT_REASON: str = "cli_sigint"
 _REQUEST_ID_OPERATION_SEPARATOR: str = ":"
 
@@ -82,28 +80,16 @@ def new_cli_invocation(
     )
 
 
-def prompt_slot_key(label: str) -> str:
-    """把用户 label 映射为稳定 Host slot key。
+def cli_label_slot_key(label: str) -> str:
+    """把 CLI Agent 用户 label 映射为唯一稳定 Host slot key。
 
     :param label: 用户通过 ``--label`` 传入的会话标签。
-    :returns: 形如 ``cli.prompt.<label>`` 的 Host slot key。
+    :returns: 形如 ``cli.agent.<label>`` 的 Host slot key。
     :raises ValueError: label 为空或仅包含空白时抛出。
     """
 
     stripped_label = _require_non_empty_text(label, field_name="label").strip()
-    return f"{PROMPT_SLOT_KEY_PREFIX}{stripped_label}"
-
-
-def interactive_slot_key(label: str) -> str:
-    """把 interactive 用户 label 映射为稳定 Host slot key。
-
-    :param label: 用户通过 ``--label`` 传入的会话标签。
-    :returns: 形如 ``cli.interactive.<label>`` 的 Host slot key。
-    :raises ValueError: label 为空或仅包含空白时抛出。
-    """
-
-    stripped_label = _require_non_empty_text(label, field_name="label").strip()
-    return f"{INTERACTIVE_SLOT_KEY_PREFIX}{stripped_label}"
+    return f"{CLI_AGENT_SLOT_KEY_PREFIX}{stripped_label}"
 
 
 def prompt_create_session_client_request_id(invocation: CliInvocation) -> str:
@@ -382,6 +368,8 @@ def _require_positive_turn_index(value: int) -> None:
 
 
 __all__: tuple[str, ...] = (
+    "CLI_AGENT_SESSION_SCOPE",
+    "CLI_AGENT_SLOT_KEY_PREFIX",
     "CLI_INTERACTIVE_COMMAND",
     "CLI_INTERACTIVE_SCENARIO",
     "CLI_PROMPT_COMMAND",
@@ -389,19 +377,16 @@ __all__: tuple[str, ...] = (
     "CLI_SESSION_COMMAND",
     "CLI_SIGINT_REASON",
     "CliInvocation",
-    "INTERACTIVE_SESSION_SCOPE",
-    "PROMPT_SESSION_SCOPE",
     "build_interactive_host_context",
     "build_prompt_host_context",
     "build_session_host_context",
+    "cli_label_slot_key",
     "interactive_cancel_client_request_id",
     "interactive_create_session_client_request_id",
-    "interactive_slot_key",
     "interactive_submit_client_request_id",
     "new_cli_invocation",
     "prompt_cancel_client_request_id",
     "prompt_create_session_client_request_id",
-    "prompt_slot_key",
     "prompt_submit_client_request_id",
     "session_purge_client_request_id",
 )

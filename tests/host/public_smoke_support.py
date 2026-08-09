@@ -7,6 +7,10 @@
 
 from __future__ import annotations
 
+from dayu.engine.contracts.structured_output import StructuredOutputRequest
+
+from dayu.engine.contracts.structured_output import StructuredOutputCapability
+
 import asyncio
 import os
 import pathlib
@@ -14,6 +18,7 @@ import sqlite3
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 
 import pytest
 
@@ -55,7 +60,12 @@ from dayu.engine.contracts.runner_events import (
     RunnerEventType,
     RunnerToolCallsCompletedData,
 )
-from dayu.engine.contracts.runner_identity import RunnerRequestIdentity
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    RunnerRequestIdentity,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.engine.contracts.runner_spec import (
     ClientCorrelationPolicy,
     DeepSeekThinkingExtension,
@@ -242,6 +252,30 @@ class ProviderSmokeCase:
     provider_request: ProviderRequestExtension
 
 
+class ProviderEnvironmentUnavailableKind(StrEnum):
+    """真实 provider smoke 可接受的环境不可用分类。"""
+
+    MISSING_CREDENTIAL = "missing_credential"
+    NETWORK_UNAVAILABLE = "network_unavailable"
+    SERVER_OVERLOADED_OR_TRANSIENT = "server_overloaded_or_transient"
+    EXPLICIT_UNAVAILABLE = "explicit_unavailable"
+    RESOURCE_EXHAUSTED = "resource_exhausted"
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderEnvironmentUnavailable:
+    """真实 provider smoke 的结构化环境不可用结果。
+
+    :param provider_name: provider case 名称。
+    :param kind: 精确环境分类。
+    :param reason: 可直接写入 pytest skip/evidence 的脱敏原因。
+    """
+
+    provider_name: str
+    kind: ProviderEnvironmentUnavailableKind
+    reason: str
+
+
 @dataclass(frozen=True, slots=True)
 class PublicWaitingRun:
     """public smoke 中由 public opener 生成的 WAITING Run 引用。
@@ -258,6 +292,34 @@ class PublicWaitingRun:
     wait_id: str
 
 
+def _successful_response_identity(
+    request: AgentRunRequest,
+) -> SuccessfulRunnerResponseIdentity:
+    """构造与 deterministic worker request 同源的成功响应身份。
+
+    :param request: 当前 worker 实际收到的 Engine request。
+    :returns: provider request id 明确不可用的成功响应身份。
+    :raises ValueError: request identity 字段非法时抛出。
+    """
+
+    return SuccessfulRunnerResponseIdentity(
+        effective_provider=request.runner_spec.provider,
+        effective_model=request.runner_spec.model,
+        runner_request_identity=build_runner_request_identity(
+            run_id=request.run_id,
+            attempt_id=request.attempt_id,
+            execution_id=request.execution_id,
+            iteration_id=f"{request.run_id}:final-answer",
+            iteration_index=0,
+            runner_call_index=1,
+        ),
+        provider_request_id_availability=(
+            ProviderRequestIdAvailability.UNAVAILABLE
+        ),
+        provider_request_id=None,
+    )
+
+
 class FinalAnswerHandle:
     """立即产出 final answer 的 deterministic worker handle。
 
@@ -265,10 +327,16 @@ class FinalAnswerHandle:
     :param content: final answer 文本。
     """
 
-    def __init__(self, snapshot: AttemptDispatchSnapshot, content: str) -> None:
+    def __init__(
+        self,
+        snapshot: AttemptDispatchSnapshot,
+        request: AgentRunRequest,
+        content: str,
+    ) -> None:
         """初始化 handle。
 
         :param snapshot: dispatch snapshot。
+        :param request: 当前 dispatch 的 Engine request。
         :param content: final answer 文本。
         :returns: ``None``。
         :raises ValueError: content 为空时抛出。
@@ -277,6 +345,7 @@ class FinalAnswerHandle:
         if content.strip() == "":
             raise ValueError("content must be non-empty")
         self._snapshot = snapshot
+        self._request = request
         self._content = content
 
     @property
@@ -306,6 +375,9 @@ class FinalAnswerHandle:
                 filtered=False,
                 degraded=False,
                 finish_reason=FinishReason.STOP,
+                response_identity=_successful_response_identity(
+                    self._request
+                ),
             ),
             metadata=None,
         )
@@ -361,7 +433,7 @@ class FinalAnswerWorker:
         self._factory.snapshots.append(snapshot)
         self._factory.accepted.set()
         content = f"final:{len(self._factory.requests)}:{snapshot.run_id}"
-        return FinalAnswerHandle(snapshot, content)
+        return FinalAnswerHandle(snapshot, request, content)
 
 
 class FinalAnswerWorkerFactory:
@@ -471,7 +543,11 @@ class _AwaitingThenFinalWorker:
         self._factory.accepted.set()
         if len(self._factory.requests) == 1:
             return _AgentBackedHandle(snapshot, request, _AwaitingToolRunner())
-        return FinalAnswerHandle(snapshot, f"resolved:{snapshot.run_id}")
+        return FinalAnswerHandle(
+            snapshot,
+            request,
+            f"resolved:{snapshot.run_id}",
+        )
 
 
 class _ToolCallingWorker:
@@ -599,6 +675,7 @@ class _ScriptedToolRunner:
         options: RunnerCallOptions,
         tools: Sequence[ToolSchema],
         *,
+        structured_output: StructuredOutputRequest | None,
         request_identity: RunnerRequestIdentity | None,
     ) -> AsyncIterator[RunnerEvent]:
         """返回脚本化 RunnerEvent 流。
@@ -606,6 +683,7 @@ class _ScriptedToolRunner:
         :param messages: 当前 Agent messages。
         :param options: Runner call options。
         :param tools: 当前暴露的 tool schemas。
+        :param structured_output: 本次调用的 structured-output 请求。
         :param request_identity: 本次逻辑 Runner 调用的请求身份。
         :returns: RunnerEvent 异步迭代器。
         :raises Exception: 不主动抛出异常。
@@ -659,6 +737,7 @@ class _AwaitingToolRunner:
         options: RunnerCallOptions,
         tools: Sequence[ToolSchema],
         *,
+        structured_output: StructuredOutputRequest | None,
         request_identity: RunnerRequestIdentity | None,
     ) -> AsyncIterator[RunnerEvent]:
         """返回等待型工具调用脚本。
@@ -666,6 +745,7 @@ class _AwaitingToolRunner:
         :param messages: 当前 Agent messages。
         :param options: Runner call options。
         :param tools: 当前暴露的 tool schemas。
+        :param structured_output: 本次调用的 structured-output 请求。
         :param request_identity: 本次逻辑 Runner 调用的请求身份。
         :returns: RunnerEvent 异步迭代器。
         :raises Exception: 不主动抛出异常。
@@ -835,9 +915,33 @@ def api_key_or_skip(case: ProviderSmokeCase) -> str:
     :raises pytest.skip.Exception: 环境变量缺失或为空时跳过。
     """
 
+    credential = provider_api_key_or_unavailable(case)
+    if isinstance(credential, ProviderEnvironmentUnavailable):
+        pytest.skip(credential.reason)
+    return credential
+
+
+def provider_api_key_or_unavailable(
+    case: ProviderSmokeCase,
+) -> str | ProviderEnvironmentUnavailable:
+    """读取 provider API key 或返回结构化缺失分类。
+
+    :param case: provider case。
+    :returns: 非空 API key，或精确的 credential 环境不可用结果。
+    :raises Exception: 不主动抛出异常。
+    """
+
     api_key = os.environ.get(case.env_var)
     if api_key is None or api_key.strip() == "":
-        pytest.skip(f"provider={case.name} missing_env={case.env_var}")
+        kind = ProviderEnvironmentUnavailableKind.MISSING_CREDENTIAL
+        return ProviderEnvironmentUnavailable(
+            provider_name=case.name,
+            kind=kind,
+            reason=(
+                f"provider={case.name} provider_availability={kind.value} "
+                f"missing_env={case.env_var}"
+            ),
+        )
     return api_key
 
 
@@ -863,6 +967,7 @@ def runner_spec_for_case(case: ProviderSmokeCase, api_key: str) -> RunnerSpec:
         supports_tool_calling=False,
         supports_streaming=True,
         supports_stream_usage=case.supports_stream_usage,
+        structured_output_capability=StructuredOutputCapability.NONE,
         default_timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
         max_retries=_DEFAULT_MAX_RETRIES,
         provider_request=None,
@@ -965,6 +1070,7 @@ def deterministic_runner_spec(model: str = "slice6-test-model") -> RunnerSpec:
         supports_tool_calling=True,
         supports_streaming=False,
         supports_stream_usage=False,
+        structured_output_capability=StructuredOutputCapability.NONE,
         default_timeout_seconds=1.0,
         max_retries=0,
         provider_request=None,
@@ -1201,6 +1307,37 @@ def skip_if_provider_exception(case: ProviderSmokeCase, exc: BaseException) -> N
     _skip_if_provider_failure_message(case, str(exc))
 
 
+def classify_provider_failure_message(
+    case: ProviderSmokeCase,
+    message: str,
+) -> ProviderEnvironmentUnavailable | None:
+    """按既有 marker 真源分类 provider 环境不可用消息。
+
+    :param case: provider case。
+    :param message: 已由调用边界脱敏的 provider/runner 错误摘要。
+    :returns: 匹配时返回结构化环境分类；其它失败返回 ``None``。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    lowered = message.lower()
+    if any(marker in lowered for marker in _NETWORK_FAILURE_MARKERS):
+        kind = ProviderEnvironmentUnavailableKind.NETWORK_UNAVAILABLE
+        return _provider_environment_unavailable(case, kind, message)
+    if any(
+        marker in lowered
+        for marker in _TEMPORARY_PROVIDER_UNAVAILABLE_MARKERS
+    ):
+        kind = ProviderEnvironmentUnavailableKind.SERVER_OVERLOADED_OR_TRANSIENT
+        return _provider_environment_unavailable(case, kind, message)
+    if any(marker in lowered for marker in _EXPLICIT_UNAVAILABLE_MARKERS):
+        kind = ProviderEnvironmentUnavailableKind.EXPLICIT_UNAVAILABLE
+        return _provider_environment_unavailable(case, kind, message)
+    if any(marker in lowered for marker in _TEMPORARY_PROVIDER_RATE_LIMIT_MARKERS):
+        kind = ProviderEnvironmentUnavailableKind.RESOURCE_EXHAUSTED
+        return _provider_environment_unavailable(case, kind, message)
+    return None
+
+
 def _skip_if_provider_failure_message(
     case: ProviderSmokeCase, message: str
 ) -> None:
@@ -1212,31 +1349,38 @@ def _skip_if_provider_failure_message(
     :raises pytest.skip.Exception: 匹配 provider 环境失败时跳过。
     """
 
-    lowered = message.lower()
-    if any(marker in lowered for marker in _NETWORK_FAILURE_MARKERS):
-        pytest.skip(
+    unavailable = classify_provider_failure_message(case, message)
+    if unavailable is not None:
+        pytest.skip(unavailable.reason)
+
+
+def _provider_environment_unavailable(
+    case: ProviderSmokeCase,
+    kind: ProviderEnvironmentUnavailableKind,
+    message: str,
+) -> ProviderEnvironmentUnavailable:
+    """构造 provider 调用失败的统一结构化环境分类。
+
+    :param case: provider case。
+    :param kind: 已由 marker 真源判定的精确分类。
+    :param message: 已由调用边界脱敏的错误摘要。
+    :returns: 可复用于旧 skip helper 与 fallback selector 的分类结果。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    field_name = (
+        "provider_quota_or_rate_limit"
+        if kind is ProviderEnvironmentUnavailableKind.RESOURCE_EXHAUSTED
+        else "provider_availability"
+    )
+    return ProviderEnvironmentUnavailable(
+        provider_name=case.name,
+        kind=kind,
+        reason=(
             f"provider={case.name} endpoint={case.endpoint} "
-            f"provider_availability=network_unavailable message={message}"
-        )
-    if any(
-        marker in lowered
-        for marker in _TEMPORARY_PROVIDER_UNAVAILABLE_MARKERS
-    ):
-        pytest.skip(
-            f"provider={case.name} endpoint={case.endpoint} "
-            f"provider_availability=server_overloaded_or_transient "
-            f"message={message}"
-        )
-    if any(marker in lowered for marker in _EXPLICIT_UNAVAILABLE_MARKERS):
-        pytest.skip(
-            f"provider={case.name} endpoint={case.endpoint} "
-            f"provider_availability=explicit_unavailable message={message}"
-        )
-    if any(marker in lowered for marker in _TEMPORARY_PROVIDER_RATE_LIMIT_MARKERS):
-        pytest.skip(
-            f"provider={case.name} endpoint={case.endpoint} "
-            f"provider_quota_or_rate_limit=resource_exhausted message={message}"
-        )
+            f"{field_name}={kind.value} message={message}"
+        ),
+    )
 
 
 def mock_tooling_options() -> HostToolingOptions:

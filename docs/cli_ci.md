@@ -306,6 +306,12 @@ Oracle 状态只允许：
 
 Accepted oracle 后续仍可被新证据挑战。修改时必须创建新版本并把旧版本标记为 `superseded`；不得原地改写旧 oracle，使历史 CI verdict 失去解释基础。
 
+当前判定按稳定 `predicate_id` 解析版本，而不是把 scenario 冻结的 `accepted_oracle_refs` 当作永久 current owner。每个
+`oracle_predicate_refs` 必须恰好连接到一个 `status=accepted` 且未被 supersede 的当前 oracle version；零命中是 dangling
+ref，多于一个命中是 duplicate current owner，二者都必须 fail closed。`accepted_oracle_refs` 只记录 scenario 获裁决时
+所依据的 oracle version，oracle lifecycle replacement 不得批量改写这些历史引用。旧 oracle version 标为
+`superseded` 后只用于解释历史 verdict，不再执行其 predicate contract。
+
 ### 4.4 Oracle Record
 
 每条候选或已接受 oracle 至少记录：
@@ -443,6 +449,13 @@ readiness conditions。不得把“首个 run 允许为空”误写成“第一�
 
 `docs/cli_ci_oracles.json` 中每条 oracle 至少包含第 4.4 节要求的 identity、scope、predicate、authority、状态和版本字段；只有 `accepted` 记录参与正式 verdict。`rejected` / `superseded` 可以保留在 registry 用于历史解释，但不得参与当前判定。per-run candidate/adjudication artifact 不能伪装成跨 run 已冻结 registry。
 
+当 accepted oracle 发生 replacement 时，registry 顶层状态仍由完整 readiness proof 决定，不能因新 oracle version 已
+accepted 就手工切换为 `ready`。当前 registry 中 `cli.interactive.core-execution@2` 是稳定 predicate 的 current accepted
+owner；611 条历史 scenario records 的 768 个 `oracle_predicate_refs` 继续各自按 stable predicate id 解析到唯一 current
+accepted owner，其中 interactive predicates 解析到 `core-execution@2`，跨 command predicate 仍解析到其所属的 current
+accepted oracle。冻结的 `accepted_oracle_refs` 不迁移。该 current-resolution 规则不把 replacement scenario 的 evidence
+observation 自动裁决为 accepted scenario。
+
 第一轮 campaign 只有同时满足以下 readiness conditions 才能结束：
 
 1. parser 与 interactive branch inventories 已冻结，identity/version/digest 可复核，且没有未分类 leaf、parameter、
@@ -517,9 +530,53 @@ campaign 不得结束，当前 run 也不得形成 `full-real-pass`。
 Calibration run 生成的新场景先写入 per-run candidates；用户裁决后通过正式 work unit 写入稳定 registry，不能由
 validation worktree 原地修改。
 
+Superseded scenario 只保留历史 invocation、evidence 与裁决解释，不得再作为 current formal scenario 执行。已有完整真实
+evidence、但尚待 Oracle controller 裁决的 replacement scenario 可以登记为 `unadjudicated` 并引用 immutable evidence；
+它们只作为后续裁决输入，不参与正式覆盖率、不得投影成 registry ready。F11/F12 replacement 使用
+`tool-trace-formal@2`、`rolling-correction-replacement@1` 与 `cap-constrained-memory-replacement@1`。其中
+`rolling-correction-replacement@1` 已由用户在 2026-08-08 根据 F14/F15/F16 fresh production observation 裁决为
+`accepted`。`tool-trace-formal@2` 也已由用户在 2026-08-08 根据 F18 fresh production MiMo evidence 裁决为
+`accepted`；mandatory evidence 是 public Host Tool Trace resolver/analysis response identity、canonical terminal 六字段
+6/6 exact match 与 secret scan。cold analyzer `compactor_responses=0` 与 provider-native request id unavailable 保留为
+limitation，不是 mandatory gap。F18/F19 早期未触发compaction或publication不完整的runs继续作为历史
+`needs-more-evidence`/`nonconforming`证据保留，不得重标PASS。后续fresh production cap campaign使用真实MiMo、production
+interactive与真实AAPL corpus，实际观察到同一operation五次candidate rejection后的budget-exhausted deterministic fallback、
+另一operation的invalid JSON后bounded repair accepted、真实output caps、represented/omitted精确分区、compact artifact、Memory、
+RunInput与跨进程reconnect同源。该run还观察到fallback final answer使用实际RunnerInput之外的材料生成未经支持的风险，因此先冻结为
+implementation finding；G06 root fix后的fresh production MiMo run再次触发同一fallback，实际RunnerInput明确只允许使用当前可见且
+直接支持的材料，final answer在缺少研发费用证据时明确说明无法回答并请求检索/提供材料。用户于2026-08-09据此前后复合证据裁决
+`cap-constrained-memory-replacement@1`为`accepted`。`summary-null@1`的F13既有production evidence证明已有非空摘要后接受null只清除
+session summary，保留5条EvidenceFact与1条AnswerAnchor，post-compact Run和跨进程reconnect继续消费同一状态；用户于2026-08-09
+裁决该行为正确。至此interactive replacement scenarios的真实观察和用户裁决全部闭合。
+
 Registry-level readiness proof 至少记录 inventories identity/version/digest、mandatory obligation 总数、covered
 数、gap 数、按 coverage dimension 的明细、用户裁决 identity、frozen report digests、dangling/uncovered 检查和最终
 validation result。`registry_status=ready` 只能由该 result 派生，禁止手工翻转 status 绕过校验。
+
+2026-08-09 的version 3 readiness proof以实现commit `473e66b972e7e7a3e028ca1e9f4b2798ecb2b100`为运行真源，
+重新导出root/init/prompt/interactive parser inventory，并对1056条current accepted scenarios逐条复核oracle/predicate、
+correctness surface、frozen report digest、evidence status与用户裁决identity。init为59/59、prompt为388/388、interactive为
+609/609，三者gap、unadjudicated、unresolved evidence和dangling refs均为0；`registry_status=ready`只适用于这三个命令。
+`download`、`upload_*`、`process*`、`session`与`tool_trace`仍在本proof scope之外，不得借此宣称它们已完成第一轮。
+`readiness_proof_history_20260802`只保存早期校准历史，当前第二轮入口唯一使用顶层`readiness_proof`。
+
+当前 Agent CLI capability inventory 还必须遵守这些 parser/source-of-truth 规则：`prompt` 与
+`interactive` leaf 都不包含 `--config`，root 前置 `--config` 也不能绕过 command-aware
+validation；`interactive` 不包含 `--ticker`，而 `prompt --ticker` 仍是 prompt 专属参数；有
+label 的 prompt/interactive 使用同一个 `cli.agent` Session slot，`prompt.P37-label-followup`
+只证明 prompt 同命令复用，不能标成 cross-command proof。workspace 中存在显式配置仍可作为
+precondition evidence，但不得把它登记为 command parameter claim。parser inventory 必须直接从
+`build_parser()` 导出完整 action 顺序、version 与 canonical digest；参数删除后，旧真实 argv 场景
+必须删除，不能改写成另一条 expected unknown-option oracle来保留 coverage 数量。
+
+interactive 的 parser inventory 与 dynamic branch inventory 是两份正交证据。当前实现的动态
+owner boundary 包括：TTY invocation 全程只有 composer 读取 stdin；non-TTY 读取 whole UTF-8
+stream 并至多提交一个 Run；standalone Escape 与 CSI/Alt/paste 分流；Ctrl+C cancel/exit-after-cancel；
+type-ahead 与唯一 accepted `QUEUE` handoff；fresh read-write attachment delayed orphan recovery。
+这些实现事实或 owner-level tests 不能直接变成 accepted scenario：仍须先实际执行 candidate、冻结
+目标 commit 的 observation report，再完成 evidence/ref/readiness validation。compactor 的真实成功
+response identity 同理必须由 live provider 与 durable accepted outcome 共同证明；fake/deterministic
+smoke 只能关闭 implementation finding，不能替代 provider evidence。
 
 本节的 parser leaf 指 parser inventory 中没有下级 subparser、可以执行 primary operation 或 read flow 的完整 command
 path。每个 leaf 都必须先建立 coverage obligations，而不是只规划一条 happy path。Mandatory dimensions 至少包括：
@@ -590,27 +647,295 @@ unconfigured、transport unavailable、provider rejection 与 rate limit 只要�
 证据、脱敏和 no-fallback contract 完整即可通过总体 verdict。internal product bug、
 未分类、secret leak、fallback 或证据矛盾仍使命令总体退出非零。
 
-#### 5.1.2 `dayu-cli interactive` 的 Ctrl+D Mandatory Matrix
+#### 5.1.2 `dayu-cli interactive` 第一轮 Mandatory Matrix
 
-`interactive` 拥有 composer 和跨轮 REPL 状态，因此 Ctrl+D coverage 必须按实际 UI 状态拆分，不能用一次 Run 中
-按键或 CLI 自报替代整个状态矩阵。第一轮 calibration 和以后每次适用的 `full-real` 至少真实运行：
+`interactive` 不是在 `prompt` 后增加一个输入循环。它同时拥有 invocation 级配置、TTY composer、单轮 Run 控制、
+跨轮 Session/Memory、跨进程 label reconnect、terminal cursor 和 context compaction。第一轮运行前必须先生成并冻结
+`interactive-inventory.json`、`interactive-mandatory-obligations.json` 和 `interactive-coverage-plan.json`；三者至少综合：
+
+- `dayu.cli.arg_parsing.build_parser()` 产生的当前 help/参数 leaf；
+- CLI 显式 composer bindings、运行态 key monitor actions、run view modes 和 terminal-result branches；
+- session 创建/绑定、startup reconnect、terminal cursor、单轮 submit/cancel 与 REPL continuation 的公开状态；
+- 当前 scene manifest、execution profile、tool selection、memory 与 compaction policy；
+- 已冻结的 `prompt` scenario/oracle registry 中可复用的 coverage 维度、历史高风险组合和失败反例。
+
+代码只能用于发现 branch、owner 和观测点，不能把当前分支的 outcome 写成 expected behavior。Inherited
+`prompt_toolkit` 默认 key map 不要求穷举每个组合，但必须冻结库版本/模式，并覆盖下述用户可达的代表性编辑动作和所有
+Dayu 显式 binding。运行前 coverage-plan validator 必须证明：parser leaf、显式参数、显式 key binding、运行态 key
+action、terminal branch、precondition、input class、pairwise assignment 和高风险组合均有 stable obligation；
+`unclassified_branch_count=0`、`missing_planned_scenario_count=0` 且无重复 claim。否则不得启动“全量”运行后再靠报告发现
+本可在静态盘点阶段发现的 gap。
+
+##### 5.1.2.1 从 `prompt` 复用的边界
+
+`prompt` 已冻结的矩阵用于减少遗漏，不用于替代 `interactive` 的真实运行。复用规则如下：
+
+| surface | 可以复用 | `interactive` 必须重新真实执行 |
+|---|---|---|
+| parser/help | 参数 identity、validator、互斥/依赖矩阵和已接受的通用 exit-code oracle | `interactive --help`、该 leaf 的合法/非法 invocation、无 positional prompt 与额外 positional 输入 |
+| workspace/model | workspace/package config precedence、model id/credential 分类和 init-selected default 的 accepted predicate | package fallback、workspace config、init-selected default、`--model/-m` override 各自至少一次真实 interactive Run |
+| logging | 第 5.1.3 节的 16-entry、冲突、debug-stream、log-file 和 append 矩阵定义 | interactive 长进程中的实际 ordinary/stream admission、每个入口的 primary Run、跨 turn 写入和进程 close 后落盘 |
+| provider/tool/fallback | provider identity、原生 tool request/response 配对、failed-batch 与 fallback 的已接受语义 | interactive 单轮和跨轮的真实 provider、工具、失败/取消后 REPL 行为以及后续 turn 是否受污染 |
+| signal/display | startup bootstrap、单次 Run 的取消和 Ctrl+T 维度 | composer idle、Run 各阶段、取消后恢复 REPL、第二 turn、label reconnect 和终端恢复 |
+| 财报事实 | 已固定真实 corpus、source identity 和独立 financial oracle | 同一 interactive Session 内的真实读取、追问、证据复用/刷新、跨进程恢复和 compact 前后连续性 |
+
+只有同时满足以下条件，既有 `prompt` evidence 才可作为 shared static owner 的 cross-command supporting evidence：执行在
+进入 command runner 前结束；parser action/normalizer/validator identity 与 digest 相同；不存在 command-local
+side effect；interactive 至少有一个同类 sentinel 真实执行；registry 明确引用 source scenario 和 shared owner claim。
+第一轮 interactive calibration 中，所有 command-local primary operation、REPL、Session、screen、日志、Run、Tool
+Trace、memory、SQLite 和 filesystem obligation 都必须重新执行。禁止机械复制 `prompt` scenario 后只替换 command
+字符串，也禁止因 `prompt` 已通过而省略 interactive 的动态路径。
+
+`prompt` 与 `interactive` 的公开参数中不存在 `--config`；二者只按 `--base/-b/--workspace` 解析 workspace config 或
+package fallback。`interactive` 的公开参数中也不存在 `--ticker`。第一轮若从当前实现发现这些 legacy parser leaf，只能
+记录为待删除 finding，并验证修复后 help、parser、inventory 与实现引用消失；不得为它们创建 accepted oracle/scenario，
+也不得把 legacy 动态运行扩张成产品能力。
+
+从 `prompt` 迁移矩阵时至少逐项处理：help/unknown/removed option、base/model/label、detail/thinking、
+temperature/tool timeout/max iterations/fallback/failed-batch、日志入口与冲突、invalid UTF-8、credential/provider/network/
+Host failure、startup/running/closeout cancellation、真实工具 request/response、真实财报读取和 fixed pairwise
+assignments。`prompt` positional input、一次性进程终态和 prompt-only ticker 必须显式标记不适用，不能偷偷删除；
+对应的 interactive composer 与 REPL continuation 必须建立新的 obligations。`--label` 是跨 CLI Agent 入口共享的
+conversation alias，不得为 prompt 与 interactive 建立互不相通的 label namespace。
+
+##### 5.1.2.2 Invocation、配置与运行参数
+
+第一轮至少覆盖：
+
+- 默认 `./workspace`、`--base/-b/--workspace`、空 workspace、已有 workspace、已有 `.dayu` 但缺 config、init 后
+  workspace，以及 workspace config 缺失/普通文件/损坏/缺关键文件时的 package fallback 或 fail-closed 行为；
+- 无 init 时 package default、init-selected default、显式 `--model` 和 `-m` 覆盖，以及语法有效但 catalog 不存在、
+  credential 缺失和真实 provider rejection；
+- `--label` 缺省、合法、空白、Unicode 和长文本；无 label 的每次 interactive invocation 必须证明创建 fresh Session，
+  有 label 时必须证明该 alias 绑定到可由 prompt/interactive 共同恢复的同一 conversation；
+- `--detail/--no-detail`、`--thinking/--no-thinking`、temperature、tool timeout、max iterations、fallback mode/prompt、
+  max consecutive failed tool batches 的默认值、每个合法边界、非法格式/范围、互斥和 pairwise；
+- 无 positional prompt 是合法 REPL invocation；额外 positional、unknown option、removed option、缺少 option value、
+  invalid UTF-8 argv 和日志/参数错误必须在 primary operation 前观察；
+- 全局参数位于 command 前/后、短别名和等价 spelling 的 accepted placement；重复参数按其 parser contract 全量观察，
+  不假定“最后一个生效”。
+
+高成本 provider matrix 不机械重复 init 的全部 provider choice；但 interactive 必须真实证明 package/workspace/explicit
+三种 model resolution 路径、至少一个可用 provider 的多轮调用、至少一个真实不可用/rejection 路径，以及实际触发
+compaction 时 ordinary scene 与 compactor 的 effective provider/model identity。已有 provider evidence 只能说明 adapter
+可达，不能替代 interactive 的 scene assembly 和跨轮状态。
+
+##### 5.1.2.3 Composer、输入与编辑状态
+
+TTY 与 non-TTY 是不同 input class，必须分别执行。TTY composer 至少覆盖：
+
+- 初次空 buffer、空白 buffer、普通单行、Unicode、长行、宽字符、组合字符和含前后空白输入；
+- Enter 提交；Ctrl+J 与终端能够区分时的 Shift+Enter 均插入换行后继续编辑并提交；粘贴单行/多行；光标位于
+  开头、中间、末尾时的插入。若终端把 Shift+Enter 编码为普通 Enter，必须记录 terminal capability 与 exact bytes，
+  不得伪报已支持；
+- Left/Right、Home/End、Backspace/Delete 的代表性编辑链，并记录提交前 exact buffer 和 cursor；
+- 无历史时与至少两个已完成 turn 后的 Up/Down；Ctrl+R 无匹配、有唯一匹配和多匹配；选中历史后编辑再提交；
+- Ctrl+X Ctrl+E 使用 CI-owned editor 成功修改 draft，以及 editor 缺失/非零/启动失败；记录临时文件是否残留、draft
+  是否保留、stderr 和 REPL 是否继续，但不得读取或修改 CI-owned root 之外的用户 editor 配置；
+- 非空 draft Ctrl+C、空白 draft Ctrl+C、空 draft 第一次 Ctrl+C、连续第二次 Ctrl+C，以及中间经过空输入、正常提交、
+  已完成/失败/取消 turn 后 pending-exit 状态是否重置；
+- composer 中单独 Escape、方向键产生的 CSI、Alt 组合和 bracketed paste；这些输入必须与 Run 中同 bytes 分开记录；
+- Ctrl+Z suspend/SIGCONT 后的 buffer、screen、terminal mode 与 echo 恢复；
+- 合法 UTF-8 与 raw invalid byte 的 TTY/non-TTY 输入边界；若终端/locale/文本解码层先拒绝，必须记录实际 owner，不能
+  把 stdin decoding failure 与 argv parser failure 合并；
+- non-TTY stdin 把从首 byte 到真实 EOF 的整个输入视为一个 draft：内部 LF/CRLF/CR 是 draft 内容，真实 EOF 是唯一提交
+  边界，非空 batch 只创建一个 Run；覆盖空输入、单行、多行、最后一行无换行和流中的 literal `0x04`。禁止按普通换行
+  拆成多个 turn；PTY raw key 不得归入本类。
+
+non-TTY batch 必须把 CRLF/CR 规范化为 LF，沿用 TTY 已冻结的首尾空白规则并保留内部换行；空或纯空白 batch 不创建
+Run、exit 0，非空 batch 在 EOF 后整体提交一次并在该 Run terminal 后结束进程，不恢复第二轮 REPL。真实 EOF 由 input
+stream exhaustion 表达；流中的 literal `0x04` 是普通数据，不能冒充 EOF。non-TTY 屏幕不得输出 `dayu>` 等 TTY composer
+提示符。非法 UTF-8 必须走稳定、脱敏的输入错误，不得暴露 Python codec exception 或 surrogate 文本。未来若要在一个
+pipe 中表达多轮，必须新增显式 framing contract（例如独立的结构化输入模式）；不得把普通换行重新解释为 turn delimiter。
+
+空白输入是否创建 Run、trim 后实际 user message、multi-line material、历史内容、屏幕重绘、stdout/stderr、terminal
+echo/mode 和下一次 `dayu>` 都是 observation surface。Harness 需保存 key-by-key 时间线与关键虚拟屏幕，不能只保存最终
+stdout；也不能从 EventLog 反推未被提交的 composer buffer。
+
+##### 5.1.2.4 Ctrl+D Mandatory Matrix
+
+Ctrl+D coverage 必须按实际 UI/Run 状态拆分，不能用一次 Run 中按键或 CLI 自报替代整个状态矩阵。第一轮
+calibration 和以后每次适用的 `full-real` 至少真实运行：
 
 - 初次进入 REPL、空 composer 时按 Ctrl+D；
 - composer 非空且光标位于文本中间时按 Ctrl+D，并记录按键前后的完整 buffer、光标位置、屏幕和是否提交；
 - composer 非空且光标位于文本末尾时按 Ctrl+D，并记录输入是否保留、进程是否继续；
-- Run 等待真实 provider response 时按一次及连续多次 Ctrl+D；
-- Run 执行真实 tool request/response loop 时按一次及连续多次 Ctrl+D；
-- Run final、REPL 恢复 composer 后，在空 composer 中按 Ctrl+D。
+- Run accepted 前、等待真实 provider response、真实 tool request/response loop 和 cancel/closeout 阶段分别按一次及
+  连续多次 Ctrl+D；
+- Run final、failed 或 cancelled 后 REPL 恢复 composer，在空 composer 和非空 composer 中分别按 Ctrl+D；
+- non-TTY stdin EOF、关闭 PTY master、canonical-mode EOF 与 raw-mode `0x04` 分别作为独立 input class。
 
 每个场景必须记录精确按键 bytes、发送时相对 UI/Run 状态、虚拟终端屏幕、composer buffer/光标、进程是否仍存活、
 exit code/signal、Host Run terminal 状态、后续是否自动退出，以及日志和相关 SQLite/EventLog before/after。harness
-必须把 raw-mode 下发送的 `0x04` 按键与关闭 stdin、canonical-mode EOF 分成不同 input class，不得用关闭 PTY 或
-harness cleanup 冒充 Ctrl+D。只对 Dayu 的各状态建立 mandatory observation；用户主动询问其它产品做法时可以另行
-回答，但该参考不进入场景 coverage，也不能替代任何 Dayu 状态的真实运行。
+不得用关闭 PTY、超时 kill 或 cleanup 冒充 Ctrl+D。只对 Dayu 的各状态建立 mandatory observation；用户主动询问其它
+产品做法时可以另行回答，但该参考不进入场景 coverage，也不能替代任何 Dayu 状态的真实运行。
+
+当 `cli.interactive.core-execution` oracle 适用时，conformance 还必须断言：空 composer 的 Ctrl+D 是正常 EOF、清理后
+exit 0；非空 draft 中有光标下字符时删除该字符，光标在末尾时 no-op并保留draft；active Run 中一次或连续 Ctrl+D 均
+不取消、不登记退出，只有 Run terminal 后回到空 composer 的新 Ctrl+D 才 exit 0。TTY Ctrl+D、non-TTY stream
+exhaustion、literal `0x04`、canonical-mode EOF 和 PTY master close 始终分别取证。
 
 `prompt` 是一次性命令，没有 composer 或 final 后 REPL。其 Ctrl+D obligation 只适用于命令仍在执行且终端按键监听
 有效的阶段；interactive 的空/非空 composer、光标编辑和 final 后恢复场景对 `prompt` 必须标记为不适用，禁止为追求
 矩阵对称而编造输入状态。
+
+##### 5.1.2.5 Run 控制、type-ahead 与终端恢复
+
+运行态至少区分 startup/pre-accept、accepted/provider wait、thinking/streaming、tool request、tool execution、tool
+response continuation、fallback、terminal rendering 和 final-to-composer handoff。不是每种模型都会自然暴露全部阶段；
+场景必须用真实 provider/工具和状态证据确认按键确实落在目标阶段，不能仅靠固定 sleep 命名场景。
+
+每个可达阶段按风险组合覆盖：
+
+- 单次 Escape、单次 Ctrl+C、连续 Ctrl+C，以及第一次取消后 closeout 中的后续 Ctrl+C；
+- Ctrl+T 从初始 view 切换、再次切回、在无 activity/已有多条 activity/有 thinking 时切换、terminal 后第二 turn 再切换；
+- `--detail`、`--no-detail`、默认 detail 与 thinking on/off 下 Ctrl+T 的屏幕和 Run 副作用；
+- 一次/连续 Ctrl+D；普通 printable bytes、Enter 和完整 type-ahead 文本；
+- Up/Down/Home/Delete 等 CSI sequences、Alt key 和 bracketed paste。运行态 monitor 若按字节解释输入，必须证明完整
+  sequence 是被忽略、缓存、丢弃、进入下一 composer，还是因 ESC prefix 触发控制动作，不能只测试单字节 Escape；
+- Ctrl+Z/SIGCONT、SIGWINCH/终端宽度变化、窄终端长 activity/thinking 和 Unicode 宽字符。
+
+单次 Run succeeded/failed/cancelled 后都要观察是否回到 `dayu>`、下一 turn 能否真实提交、terminal mode/echo 是否恢复、
+先前 type-ahead 是否意外提交。若进程退出，记录 exit code/signal 和是否完成 Host/attachment/display/key-monitor 清理；
+若进程继续，不能把单轮 cancel 的 terminal status 冒充 process exit 130。重复 Ctrl+C 必须同时检查用户观感、process
+生命周期和 Host canonical terminal，不能只检查其中一个。
+
+当 `cli.interactive.core-execution` oracle 适用时，running-input conformance 必须同时断言：standalone Escape 在每个
+active-turn 阶段取消当前 Run、等待 canonical cancelled 后恢复 composer且不退出；完整 CSI、Alt 与 bracketed-paste
+sequence 进入 composer 编辑/导航/draft，不得因 ESC prefix 误取消。第一次 Ctrl+C 在所有 active-turn 阶段都登记同一
+graceful cancel intent；连续第二次只登记 exit-after-cancel，必须等 Host terminal 与本地资源清理完成后 exit 130。
+
+active Run 期间未按 Enter 的 composer draft 必须跨 terminal handoff 保留；按 Enter 默认提交一个 QUEUE follow-up，
+不得丢弃或隐式 STEER，且在当前 Run terminal 后恰好执行一次。STEER 只能由明确、独立的 UI action 选择。startup 尚无
+Run/composer 时一次 SIGINT 清理后 exit 130且无 traceback；Host `lost` 显示明确错误并 exit 1，不恢复可写 composer。
+
+##### 5.1.2.6 Session、label、reconnect 与 cursor
+
+至少建立以下相互独立的 state chains：
+
+1. 无 label 的 fresh invocation：同一进程至少两个成功 turn，随后正常 EOF；新进程不应因测试 harness 假定而被当作
+   同一 Session，实际 Session identity 由证据记录并交用户裁决。
+2. label 首次绑定：第一 turn 前的 Session/slot/cursor 状态、多个 turn、正常退出；同 label 新进程 reconnect 后继续
+   提交追问。
+3. reconnect 去重：已展示 succeeded/failed/cancelled terminal 后重启，观察是否重复展示；terminal cursor 文件的
+   before/after、EventLog terminal sequence 和新 turn cursor advance 必须一致。
+4. 未完成 Run recovery：通过真实 CLI 启动有 label 的 Run，再以明确记录的进程崩溃/终端断开/受支持退出路径构造
+   precondition；第二个真实 interactive 进程观察 running/cancelling/terminal promotion。Harness termination 只能作为
+   recovery precondition，不能被报告为 Dayu 的取消或退出行为。
+5. 相同 label 的两个并发 interactive 进程：空闲/一方 running/双方提交三种时序，记录 queue/rejection、每个客户端
+   屏幕、唯一 Run identities、terminal cursor 和最终 Session 状态。
+6. 同一文本 label 在 `prompt --label` 与 `interactive --label` 之间双向续问，必须解析为同一个 durable
+   conversation/Session；分别以 prompt 创建后由 interactive 继续、interactive 创建后由 prompt 继续，并用 Session id、
+   prior-turn runner input 与 memory continuity 证明，而不是从回答猜测。另用 `session` CLI 做只读查询；该查询只证明
+   interactive 生成物可消费，不提前裁决 `session` 命令自身的 UI oracle。
+7. 同 label 新 invocation 更改 model 或其它 run override，区分 durable Session/Memory 与 invocation-local
+   scene inputs；不得从最终回答猜 effective 配置。
+8. active Run 期间由 composer Enter 提交并进入 queue 的 follow-up，在当前 interactive 退出后，用同 label 重新运行时
+   必须由 Host ordinary governance 自动 promotion/执行且恰好一次；记录 queued Run identity、退出前后状态、fresh
+   read-write attachment recovery、provider 调用与terminal。不得用 harness 重发同一文本冒充 queued Run 自动恢复。
+
+还必须覆盖空白/Unicode/长 label、cursor 文件不存在/损坏/路径冲突/不可写、Host DB 或 runtime DB 路径冲突，以及
+startup reconnect 在任何 composer 输入前产生 terminal/error 的屏幕顺序。禁止写 SQLite 私有表伪造目标状态；若只能
+通过 harness 构造异常，必须使用公开 CLI/文件系统前置动作并清楚标记 setup 与被测 observation 的边界。
+
+unfinished recovery 与 cancel non-resurrection 必须建立独立矩阵。每一行都分别覆盖没有用户 cancel facts 的正常
+opener/process close、可诊断 crash 与 SIGKILL，并通过同一 label取得fresh `READ_WRITE` attachment；另对相同状态在
+accepted cancel和terminal cancelled后重复三类终止。无label invocation是fresh Session，不能用来判定旧Run恢复。
+
+| durable precondition | 无 cancel facts 的同 Session 重连 | 已接受 cancel / terminal cancelled 后重连 |
+|---|---|---|
+| `RUNNING` | positive orphan proof 后，同一 Run 以 new Attempt/new execution id恢复并最终terminal | watchdog/closeout推进或保持`CANCELLED`，不恢复执行 |
+| `QUEUED` | 保持同一 Run，按FIFO ordinary governance promotion并恰好执行一次 | 直接或保持`CANCELLED`，不创建Attempt |
+| durable accepted steer | 保持同一 Run，按最新accepted steer candidate以new Attempt继续且恰好一次 | 按canonical commit order取消；已取消continuation不恢复 |
+
+每个恢复场景必须保存旧/new Host instance、Run/Attempt/execution identity、accepted/cancel/recovery EventLog顺序、positive
+orphan proof输入、provider/tool request、terminal、memory、cursor和重复执行检查。只有durable accepted input才可恢复；
+acceptance前键盘输入不得猜测补回。恢复不得takeover旧Attempt，不得由CLI/harness重发输入或修改private SQLite伪造。
+若recovery policy放弃、必要facts缺失或预算耗尽，必须进入明确`FAILED`/`LOST`，不能无限停留`running`。
+若fresh writer在旧heartbeat达到stale threshold前立即attach，场景必须继续越过该threshold观察同一invocation是否执行
+delayed reclassification/reconcile；产品不得要求用户在threshold后再次手工重启interactive。判定时记录真实policy threshold、
+两端heartbeat/PID/start token和每次scan/reconcile时间，不能仅用固定sleep猜positive orphan proof。
+
+accepted cancel facts是恢复分类的硬边界：`CANCELLING`先由accepted-cancel watchdog处理，不得按普通orphan创建recovery
+Attempt；terminal `CANCELLED`不可改写，重连不得调用provider、再次执行queued/steer input或重复投影旧terminal。
+正常close/crash/kill本身不是cancel；interactive双Ctrl+C因已表达显式cancel intent，必须先完成`CANCELLED`再exit 130，
+随后重连适用non-resurrection而非unfinished recovery。
+
+##### 5.1.2.7 多轮工具、Memory、财报与 Compaction
+
+低成本 smoke 不能替代以下真实 Session 场景族；核心连续性场景必须在同一 Session chain 中完成：
+
+- 普通问答后使用“继续”“刚才那个”“第二点”等指代追问；
+- 对固定真实财报先 discovery/read，再追问数值、原因、来源和前一回答中的具体风险点；
+- 已有证据足够时的复用，以及 ticker/期间/口径改变时的必要刷新；记录实际 tool call count 和 request/response；
+- 用户纠正事实或切换主体后，后续回答、memory projection 和工具参数如何变化；
+- tool not_found/error、handshake timeout、failed-batch threshold 的 raise_error/force_answer、provider failure、单轮
+  cancelled 后，若屏幕仍提供 composer 则尝试再提交一个正常 turn；若进程已经退出则记录无法继续的直接事实，不能由
+  harness 重启后伪装成同一 REPL continuation；
+- 至少一个真实 web tool 和真实 Fins read路径。真实财报主体必须来自用户prompt或同一Session已接受的业务上下文，不能
+  通过removed `interactive --ticker`注入；至少一次完整保存`list_documents`到最终read tool的request/response、accepted
+  EventLog、memory、runner input、Host SQLite与final answer grounding；
+- `dayu-cli download`与`dayu-cli preprocess/process`的UI、生成物、退出码和正确性只由各自command campaign裁决；
+  interactive campaign可以把其已有真实corpus作为前置条件，但不得用interactive工具调用或准备步骤提前关闭这些命令的
+  oracle；
+- 同 label 跨进程延续上述财报追问，区分 Host/Memory continuity 与仅存在于当前进程的 composer history。
+
+failure-continuation chain必须区分“已接受的失败工具结果”与“没有accepted response/final answer的Run失败”。not_found等已
+accepted tool response可以作为上一轮可读结果支持后续解释；handshake timeout、provider failure或cancel不得被伪装成
+成功工具事实或业务结论。每条chain都要在同一可写Session中提交下一Run，验证per-Run failed-batch预算重置、composer
+恢复、下一Run真实provider调用与terminal；无label harness重启不能冒充同一REPL/Session连续性。
+
+第一轮还必须覆盖accepted negative observation之后外部业务状态发生变化的链路，不能把“下一轮记得not_found”误当成
+完整的temporal-update验证。至少在一个起初没有MSFT文档的独立workspace和同一interactive Session中真实执行：
+
+1. 用户询问MSFT财报，保存`list_documents(MSFT)`的真实`not_found` request/response、`TOOL_RESULT_ACCEPTED`、memory和
+   下一轮runner input；
+2. 用户输入“下载微软财报”，由模型真实调用`start_fins_download`并等待accepted terminal result，同时记录Fins source
+   repository、文件生成物、EventLog、Tool Trace、memory和SQLite前后变化；本链路没有预处理环节，不得插入
+   `start_fins_preprocess`或独立`preprocess/process`命令改变前置条件；
+3. 用户再次提出需要当前MSFT财报才能回答的问题，完整记录模型是否重新调用`list_documents(MSFT)`、随后实际read tool
+   request/response、旧`not_found`与新下载证据在memory/runner input中的投影、最终回答及grounding；
+4. 若模型没有刷新、下载后仍`not_found`、读取失败或直接使用模型记忆回答，照实记录为observed behavior并交用户裁决，
+   不得由harness补发工具指令、删除旧memory、预先写入文档或把旧negative observation解释成永久事实。
+
+该场景只裁决interactive中的跨轮memory、工具选择、freshness与最终回答；`dayu-cli download`及
+`dayu-cli preprocess/process`独立命令的UI、生成物、退出码和正确性仍由各自command campaign裁决。
+
+必须在 interactive 中真正触发至少一次 context compaction。场景在同一 REPL/Session 中用真实用户输入、真实
+provider 和真实工具结果累积上下文，直到 EventLog/runner-call evidence 出现实际 compaction operation；仅出现
+context budget evaluated、低剩余 token 估计或 compaction 配置不能算触发。报告至少对比 compact 前后：
+
+- ordinary scene 与 compactor 的实际 provider/model/endpoint/credential ref、runner inputs 和 outputs；
+- 被 compact 的 event/turn 范围、artifact identity/digest、memory snapshot/projection 与 RunInputBuilder material；
+- 财务事实、单位、期间、source refs、answer anchors、open question 和用户纠正是否保留；
+- tool request/response/evidence continuity、是否重复调用、是否把内部治理状态投影给 LLM；
+- compact 后至少两个真实 follow-up turn，其中一个引用 compact 前财报事实，另一个改变口径或请求新证据。
+
+可使用 CI-owned 合法 config 选择较小但真实受支持的 context profile以控制成本；必须保存完整 config diff、证明该
+profile 经 production config loader/Service assembly 生效，且不得注入 memory、伪造 assistant/tool result、直接写
+EventLog/SQLite 或调用内部 compactor API制造触发。
+
+##### 5.1.2.8 Terminal outcome、屏幕与 evidence closure
+
+真实可达的 succeeded、failed、cancelled、lost/startup-recovery terminal 分支必须逐项观察。无法在不破坏 private
+state、伪造 Host response 或越过授权的情况下到达的 defensive branch，必须在 inventory 中给出 unreachable/out-of-
+scope 证明和 owner-level test ref；不能静默漏掉，也不能为了“覆盖”写 SQLite 或 fake terminal result。
+
+每个 stateful scenario 除第 11 节通用材料外还必须保存：
+
+- asciinema/raw PTY transcript、按键时间线，以及 composer 前/后、每次 view 切换、terminal 渲染、恢复 `dayu>` 的
+  VT-compatible screen snapshots；
+- stdout、stderr、exit code/signal、process 存活时间线、termios/echo before/after 和子进程（editor）状态；
+- workspace manifest/diff、config、log/append bytes、terminal cursor 和 compaction artifacts；
+- Session/slot/attachment、每个 Run/Attempt terminal、EventLog、Tool Trace request+response、memory store/projection、
+  runner input、runtime lane 和相关 SQLite bounded before/after；
+- 每轮 user input、effective scene/model/provider/overrides/tool schema、final answer 与真实财报 source 的关联；
+- failed/cancelled/reconnect/compaction 后下一轮行为，以及进程关闭后的 Host stopped、attachment 释放、runtime lane
+  claim 清零和不应存在的后台进程/锁。
+
+运行完成后先以 inventory 和 coverage plan 重新计算 obligation closure，再生成单一 frozen
+`observed-behavior.md`。运行中发现真正的动态新 branch 时，必须加入 inventory 并补跑；但 parser、显式 key binding、
+已知状态机或 prompt 历史反例中本可预见的漏项属于 pre-run planning failure，不能把零散补跑报告伪装成一次完整运行。
 
 #### 5.1.3 日志参数 Mandatory Matrix
 
@@ -1050,52 +1375,98 @@ cross-command identity。每个场景至少包含：
    - stdin、按键、交互输入、等待动作及相对时间线；不得记录 secret value。
 4. **Observed process result**
    - started/finished timestamps 和 duration；
-   - 真实执行时记录 `execution_outcome=success/error/timeout/cancel`；`not-run/blocked` 时该字段无值，并在
-     evidence gaps 中记录；
-   - exit code、signal、timeout/cancel 原始状态；
+   - 真实执行时只记录 `process_outcome.kind=exited/timed_out/harness_error`、exit code、signal 与 timeout 原始状态；
+     `not-run/blocked` 在 dependency/evidence facts 中单独记录；
    - stdout/stderr 分离后的 raw artifact refs 和 bounded literal summary。
 
    本段只拥有 process-level raw facts，不解释“正确/错误”、不做跨层叙述、不产生 pass/fail。exit 0 或
-   `success` 不能证明 observation completeness 或 correctness。
-5. **Terminal evidence**
+   `kind=exited` 不能证明任何 accepted Run succeeded、observation completeness 或 correctness。
+5. **Per-Run terminal 与 dependency evidence**
+   - Host EventLog/shared lifecycle terminal contract 是每个 Run terminal type 的 owner；tracked helper 必须通过物理只读
+     Host store，在 frozen `(start_event_sequence, end_event_sequence]` 中使用只含 `RUN_ACCEPTED` 与 shared Run
+     terminal types 的 filtered keyset reader读尽窗口，page size不得成为 semantic cap；
+   - `run-terminals.json` 必须逐 Run 保存 accepted ordinal、session/run/event identity、terminal event type、
+     `succeeded/failed/cancelled/lost` class、显式 required/dependent/independent role及 canonical reason；`RUN_LOST`
+     保持独立且标明非 public-outbox terminal；
+   - terminal 的 `session_id` 必须与同一 Run 的 `RUN_ACCEPTED.session_id` exact 相等；terminal class 与 public-outbox
+     eligibility 必须复用 shared lifecycle projector，不得在 harness 中另写四分支或用“不是 lost”反推；
+   - reason 的唯一源是 terminal row 的 `reason_json.reason`，禁止 fallback 到 payload、Host status、diagnostic或日志。
+     validator按现有 terminal-specific canonical shape严格校验：succeeded/failed只允许 reason；cancelled可另外携带已知且
+     合法的 `mode`；lost可另外携带非空 `orphan_proof`；unknown extra、malformed/non-object、missing/blank/wrong type均
+     `observation_invalid`；
+   - 同一 Run 两条 shared Run terminal facts（无论同型或异型）是 duplicate；Attempt terminal、`RUN_CANCELLING`与其它
+     lifecycle events不参与 duplicate判断。accepted缺 terminal、terminal无 window 内 accepted、cursor不前进或越过 frozen
+     end均 fail closed；
+   - success-required action必须显式声明直接 upstream accepted ordinal。只有 `RUN_SUCCEEDED`允许 dependent chain继续；
+     failed/cancelled/lost停止该链并记录 upstream identity/type/reason，pending只允许在deadline前，deadline后为 invalid。
+     stop/invalid 后，当前 process 的所有剩余 dependent actions必须逐项记录 `not_run`，只允许发送一次显式 cleanup/EOT，
+     并使用短 cleanup deadline 尽快退出；不得继续等待原计划 terminal count，也不得把 cleanup 后 exit 0当作 Run success。
+     independent mandatory observation、process artifact、terminal evidence、public evidence与secret scan继续执行；
+   - fresh `execution-index-f15-f16.json` 分开汇总 `process_outcomes`、`run_terminal_summary/records`、
+     `dependency_gates`、`evidence_status`、`context_compaction_observation`与public evidence；其中
+     `evidence_status`只表示Run/context/tool collection完整性，不得复制或冒充publication scan verdict。逐 Run record
+     必须携带 record path/digest；terminal summary至少区分 accepted/succeeded/failed/cancelled/lost/missing/invalid，
+     valid observation必须把四类terminal summary与逐 Run `terminal_class`分布exact对账。canonical observation缺失、重复或
+     破损时，无法由typed fact确认的计数写`null`，只确定`invalid=1`并保留diagnostics；不得从diagnostic message反推
+     missing/duplicate伪精度。required Run 的合法 non-succeeded terminal只使 evidence 为 `insufficient`；
+     dependency-stopped不得标为complete。final publication必须先落盘最终`run-completion.json`或
+     `execution-index-f15-f16.json`，其中secret scan只能引用`secret-scan.json`的record path，不复制尚未形成的
+     status/digest；随后由tracked final-tree helper扫描整个evidence tree并独占创建唯一`secret-scan.json`。
+     final metadata与此前全部evidence都必须出现在report descriptors中；唯一允许自排除的是调用时尚不存在、即将生成的
+     `secret-scan.json`本身。report target必须经lexical traversal拒绝与resolved root containment双重校验；report已存在、
+     stale、为symlink、含symlink ancestor或在scan期间出现时一律fail closed，不允许pre-scan/post-scan双真源。scan report是
+     secret与path-hygiene verdict的唯一持久化真源。exact probes只能来自实际secret环境值和有意义
+     canary；普通repo/run/corpus路径不是credential。path hygiene必须拒绝raw `*.sqlite`/`*.sqlite3`/`*.db`主库、其
+     `-wal/-shm` sidecar、文本中的同类raw database路径以及leaf/ancestor symlink候选，任一命中均fail closed；不得用
+     硬编码布尔代替扫描事实。raw DB路径分类必须由tracked typed helper唯一拥有，filesystem snapshot producer与final
+     scanner复用该真源；before/after snapshot在产生路径记录时排除raw main/WAL/SHM，diff与execution index只从已过滤
+     snapshot派生，不得在下游字符串替换或删除。独立`sqlite-before/after.json`仍通过物理只读查询发布业务/audit投影，
+     但不发布DB文件路径。public Tool Trace必须继续由production `dayu-cli tool_trace analyze`生成；distributable evidence以
+     canonical cold JSONL作为输入，避免workspace hot-store projection发布`hot_db_path/source_path`，同时保留cold
+     Run/tool-call/finding/audit facts；context compact accepted facts由独立只读EventLog projection提供。raw Host SQLite
+     不得进入public evidence；不得包含
+     `scenario_success`、综合 `success/passed`或由exit 0推导的scenario verdict，formal oracle继续为
+     `unadjudicated`。
+6. **Terminal evidence**
    - 按输入/选择顺序内嵌关键 screen 或等价 literal transcript，说明对应时间和按键；不得只列 screen 文件名；
    - 内嵌 final screen 的关键可见状态，并给出完整 cast/transcript ref，以及 ANSI 清除、prompt 恢复和增量区域的
      实际观察。
-6. **Filesystem / generated artifacts**
-   - before/after bounded manifest 和 created/modified/deleted artifact 列表；
+7. **Filesystem / generated artifacts**
+   - before/after bounded manifest 和 created/modified/deleted artifact 列表；filesystem manifest不得发布raw SQLite
+     main/WAL/SHM路径，created/modified/deleted必须从同一已过滤snapshot派生；
    - 每个用户相关关键生成文件的脱敏内容或 bounded literal excerpt、before/after diff、content/metadata digest、
      路径归属、CI-owned validation 和超预算内容的摘要方式；
    - secret 明文、secret ref、redacted 或未持久化的实际状态。
-7. **Diagnostics**
+8. **Diagnostics**
    - debug log ref、关键事件时间线和 warning/error 原始事实摘要；
    - 明确标记 debug log 为 diagnostic、非 durable truth。
-8. **Host DB / SQLite observation**
+9. **Host DB / SQLite observation**
    - `queried` / `not-queried` 及第 11.2 节 checklist 理由；
    - public read contract evidence、resolved DB path 脱敏表示和 CI-owned validation；
    - 相关 stateful 场景内嵌 SQLite schema/关键 rows 或 bounded aggregation 的 before/after 和 delta；同时给出只读
      query manifest/id、row count/digest、private-schema-dependent 标记；
    - query/redaction/row/byte/time limits，以及该证据仅为 diagnostic 的声明。
-9. **Cross-layer correlation**
+10. **Cross-layer correlation**
    - session、run、attempt、execution、tool-call identities 和映射关系；
    - CLI/Service request、Host canonical EventLog、Tool Trace、memory snapshot/source refs/diagnostics、
      runner input 和 UI/final answer refs；
    - identity 缺失或关联歧义。
-10. **Cross-command consumption**
+11. **Cross-command consumption**
     - 对生成配置、文件、Fins/Host/DB 状态，内嵌后续真实 CLI load/query/consume 的 invocation 和实际结果；
     - 明确哪些产物没有被后续命令消费，以及对应 coverage gap；创建命令的自报 summary 不能替代本节。
-11. **Observed behavior only**
+12. **Observed behavior only**
     - 引用第 4-10 项 evidence refs，按时间顺序做 bounded cross-layer narrative，只描述实际发生了什么；
     - 记录层间一致/不一致事实，不重复粘贴 raw process fields；
     - objective fact / hard-contract violation 可以标注精确 authority basis；
     - 禁止用 exit code、CLI 自报数量/summary、digest 或 raw ref 替代行为描述，禁止写期望、外部产品模仿建议、修复
       方案或未裁决产品结论。
-12. **Evidence integrity and gaps**
+13. **Evidence integrity and gaps**
     - required artifact presence、mock/fake absence proof 和 secret scan；
     - missing/corrupt/ambiguous evidence；
     - `evidence_status`，至少区分 `sufficient/missing/corrupt/ambiguous`；
     - `gap_kind`，至少区分 `none/not-run/blocked/evidence-missing/evidence-corrupt/evidence-ambiguous/
       public-observability-gap`，并记录 owner / next evidence action；
-    - 引用第 4 项 `execution_outcome`，但不得把 outcome 重写成 evidence gap 或另建 scenario verdict。
+    - 引用第 4 项 `process_outcome` 与第 5 项 per-Run/dependency facts，但不得合并重写成 scenario verdict。
 
 Scenario observation completeness 只由该 mandatory scenario 是否真实 attempted/executed 与 required evidence 是否
 sufficient 决定，不由 success/error/timeout/cancel 决定。一个 help/positive/negative 或 workspace state 的成功不能

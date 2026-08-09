@@ -8,7 +8,7 @@ from io import StringIO
 from pathlib import Path
 from types import TracebackType
 from collections.abc import Callable
-from typing import cast
+from typing import Never, cast
 
 import pytest
 
@@ -32,7 +32,6 @@ from dayu.cli.exit_codes import (
 from dayu.cli.output import render_session_list, render_session_purge_result
 from dayu.cli.session_identity import (
     CliSessionDisplayKind,
-    CliSessionLabelKind,
     display_identity_from_slot,
     slot_ref_for_cli_label,
 )
@@ -111,7 +110,7 @@ def test_host_api_error_policy_maps_label_toctou_not_found_to_failure() -> None:
     exit_code = exit_code_for_host_api_error(
         error,
         target=CliHostApiErrorTarget(
-            selector="--label alpha --kind prompt",
+            selector="--label alpha",
             session_id="session-A",
             explicit_session_id_selector=False,
             resolved_from_label=True,
@@ -424,68 +423,57 @@ class _FakeSessionHost:
         self.close_cancel_calls += 1
 
 
-def test_cli_label_kind_maps_to_host_slot_ref() -> None:
-    """CLI label kind 必须映射到对应 Host slot namespace。
+def test_cli_label_maps_once_to_shared_host_slot_ref() -> None:
+    """CLI label 必须经唯一 owner 映射到共享 Agent slot。
 
     :returns: ``None``。
-    :raises AssertionError: slot ref 映射不符合 CLI label namespace 时抛出。
+    :raises AssertionError: slot ref 映射不符合共享 namespace 时抛出。
     """
 
-    prompt_slot = slot_ref_for_cli_label(CliSessionLabelKind.PROMPT, " proj.v1 ")
-    interactive_slot = slot_ref_for_cli_label(
-        CliSessionLabelKind.INTERACTIVE,
-        "earnings",
-    )
+    shared_slot = slot_ref_for_cli_label(" 财报.项目一 ")
 
-    assert prompt_slot == SessionSlotRef(
-        scope="cli.prompt",
-        slot_key="cli.prompt.proj.v1",
+    assert shared_slot == SessionSlotRef(
+        scope="cli.agent",
+        slot_key="cli.agent.财报.项目一",
     )
-    assert interactive_slot == SessionSlotRef(
-        scope="cli.interactive",
-        slot_key="cli.interactive.earnings",
-    )
+    with pytest.raises(ValueError, match="label must not be empty"):
+        slot_ref_for_cli_label(" \t ")
 
 
-def test_display_identity_from_slot_covers_cli_and_other_slots() -> None:
-    """Session list slot 反解必须覆盖 anonymous、prompt、interactive、other。
+def test_display_identity_from_slot_covers_shared_legacy_and_other_slots() -> None:
+    """Session list 必须识别共享 alias，并把旧 namespace 视为 other。
 
     :returns: ``None``。
     :raises AssertionError: 任一 slot 展示身份反解不符合固定规则时抛出。
     """
 
     anonymous = display_identity_from_slot(None)
-    prompt = display_identity_from_slot(
-        SessionSlotRef(scope="cli.prompt", slot_key="cli.prompt.proj.v1")
-    )
-    interactive = display_identity_from_slot(
+    labeled = display_identity_from_slot(SessionSlotRef(scope="cli.agent", slot_key="cli.agent.proj.v1"))
+    legacy_prompt = display_identity_from_slot(SessionSlotRef(scope="cli.prompt", slot_key="cli.prompt.proj.v1"))
+    legacy_interactive = display_identity_from_slot(
         SessionSlotRef(
             scope="cli.interactive",
             slot_key="cli.interactive.earnings",
         )
     )
-    other_scope = display_identity_from_slot(
-        SessionSlotRef(scope="service.workflow", slot_key="workflow.alpha")
-    )
-    prompt_bad_prefix = display_identity_from_slot(
-        SessionSlotRef(scope="cli.prompt", slot_key="not-cli.prompt.alpha")
-    )
-    prompt_empty_suffix = display_identity_from_slot(
-        SessionSlotRef(scope="cli.prompt", slot_key="cli.prompt.")
-    )
+    other_scope = display_identity_from_slot(SessionSlotRef(scope="service.workflow", slot_key="workflow.alpha"))
+    labeled_bad_prefix = display_identity_from_slot(SessionSlotRef(scope="cli.agent", slot_key="not-cli.agent.alpha"))
+    labeled_empty_suffix = display_identity_from_slot(SessionSlotRef(scope="cli.agent", slot_key="cli.agent."))
 
     assert anonymous.kind is CliSessionDisplayKind.ANONYMOUS
     assert anonymous.label == "-"
-    assert prompt.kind is CliSessionDisplayKind.PROMPT
-    assert prompt.label == "proj.v1"
-    assert interactive.kind is CliSessionDisplayKind.INTERACTIVE
-    assert interactive.label == "earnings"
+    assert labeled.kind is CliSessionDisplayKind.LABELED
+    assert labeled.label == "proj.v1"
+    assert legacy_prompt.kind is CliSessionDisplayKind.OTHER
+    assert legacy_prompt.label == "cli.prompt.proj.v1"
+    assert legacy_interactive.kind is CliSessionDisplayKind.OTHER
+    assert legacy_interactive.label == "cli.interactive.earnings"
     assert other_scope.kind is CliSessionDisplayKind.OTHER
     assert other_scope.label == "workflow.alpha"
-    assert prompt_bad_prefix.kind is CliSessionDisplayKind.OTHER
-    assert prompt_bad_prefix.label == "not-cli.prompt.alpha"
-    assert prompt_empty_suffix.kind is CliSessionDisplayKind.OTHER
-    assert prompt_empty_suffix.label == "cli.prompt."
+    assert labeled_bad_prefix.kind is CliSessionDisplayKind.OTHER
+    assert labeled_bad_prefix.label == "not-cli.agent.alpha"
+    assert labeled_empty_suffix.kind is CliSessionDisplayKind.OTHER
+    assert labeled_empty_suffix.label == "cli.agent."
 
 
 def test_render_session_list_uses_public_summary_without_internal_fields() -> None:
@@ -512,8 +500,8 @@ def test_render_session_list_uses_public_summary_without_internal_fields() -> No
                 _session_list_item(
                     session_id="session-prompt",
                     slot=SessionSlotRef(
-                        scope="cli.prompt",
-                        slot_key="cli.prompt.proj.v1",
+                        scope="cli.agent",
+                        slot_key="cli.agent.proj.v1",
                     ),
                 ),
                 _session_list_item(
@@ -532,7 +520,7 @@ def test_render_session_list_uses_public_summary_without_internal_fields() -> No
 
     assert "SESSION_ID\tSTATUS\tKIND\tLABEL\tACTIVE_RUN\tQUEUED\tCREATED_AT\tCLOSED_AT" in rendered
     assert "session-anonymous\topen\tanonymous\t-\t-\t4\t2026-06-16T01:02:03Z\t-" in rendered
-    assert "session-prompt\topen\tprompt\tproj.v1\t-\t0\t2026-06-16T01:02:03Z\t-" in rendered
+    assert "session-prompt\topen\tlabeled\tproj.v1\t-\t0\t2026-06-16T01:02:03Z\t-" in rendered
     assert "session-other\topen\tother\tworkflow.alpha\t-\t0\t2026-06-16T01:02:03Z\t-" in rendered
     assert "attempt-hidden" not in rendered
     assert "execution-hidden" not in rendered
@@ -604,16 +592,16 @@ def test_session_list_calls_host_public_api_and_renders_sessions(
                 _session_list_item(
                     session_id="session-prompt",
                     slot=SessionSlotRef(
-                        scope="cli.prompt",
-                        slot_key="cli.prompt.proj.v1",
+                        scope="cli.agent",
+                        slot_key="cli.agent.proj.v1",
                     ),
                     active_run_id="run-active",
                 ),
                 _session_list_item(
                     session_id="session-closed",
                     slot=SessionSlotRef(
-                        scope="cli.interactive",
-                        slot_key="cli.interactive.ops",
+                        scope="cli.agent",
+                        slot_key="cli.agent.ops",
                     ),
                     status=SessionStatus.CLOSED,
                     closed_at=datetime(2026, 6, 16, 2, 3, 4, tzinfo=UTC),
@@ -628,10 +616,11 @@ def test_session_list_calls_host_public_api_and_renders_sessions(
 
     assert exit_code == EXIT_SUCCESS
     _assert_session_uses_admin_assembly(runtime_capture)
+    assert runtime_capture.requests[0].workspace_root == str(tmp_path)
     assert host.calls == ["list_sessions"]
     assert "session-anonymous\topen\tanonymous\t-" in captured.out
-    assert "session-prompt\topen\tprompt\tproj.v1\trun-active\t0" in captured.out
-    assert "session-closed\tclosed\tinteractive\tops\t-\t0" in captured.out
+    assert "session-prompt\topen\tlabeled\tproj.v1\trun-active\t0" in captured.out
+    assert "session-closed\tclosed\tlabeled\tops\t-\t0" in captured.out
     assert captured.err == ""
 
 
@@ -668,6 +657,56 @@ def test_real_session_list_succeeds_without_model_api_keys(
     assert captured.err == ""
 
 
+@pytest.mark.parametrize(
+    "argv",
+    (
+        ("--config=/tmp/x", "session", "list"),
+        ("session", "--config=/tmp/x", "list"),
+        ("session", "list", "--config=/tmp/x"),
+    ),
+)
+def test_session_removed_config_fails_before_service_preparation(
+    argv: tuple[str, ...],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """session 的旧配置选项必须在 admin preparation 前被拒绝。
+
+    :param argv: 覆盖 root、command 与 action scope 的旧选项调用。
+    :param capsys: pytest 标准错误捕获夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: parser 未先失败或 Service 被调用时抛出。
+    """
+
+    captured_requests: list[ServiceHostAdminRequest] = []
+
+    def unexpected_prepare(request: ServiceHostAdminRequest) -> Never:
+        """记录越过 parser boundary 的意外 admin 请求并立即失败。
+
+        :param request: 意外收到的 admin request。
+        :returns: 正常路径不会返回。
+        :raises AssertionError: 只要被调用就抛出。
+        """
+
+        captured_requests.append(request)
+        raise AssertionError("Service admin preparation must not run")
+
+    monkeypatch.setattr(
+        session_command,
+        "prepare_host_admin",
+        unexpected_prepare,
+    )
+
+    exit_code = cli_main.main(argv)
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_USAGE_ERROR
+    assert "unrecognized arguments" in captured.err
+    assert "--config" in captured.err
+    assert captured_requests == []
+
+
 def test_real_session_purge_succeeds_without_model_api_keys(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
@@ -697,7 +736,6 @@ def test_real_session_purge_succeeds_without_model_api_keys(
         ServiceHostAdminRequest(
             workspace_root=tmp_path,
             package_config_root=package_config_root(),
-            config_overlay_dir=None,
         )
     )
     admin_options = admin_assembly.options
@@ -707,24 +745,12 @@ def test_real_session_purge_succeeds_without_model_api_keys(
             db_path=admin_options.db_path,
             artifact_root=admin_options.artifact_root,
             create_parent_dirs=admin_options.create_parent_dirs,
-            sqlite_busy_timeout_seconds=(
-                admin_options.sqlite_busy_timeout_seconds
-            ),
-            sqlite_write_busy_retry_count=(
-                admin_options.sqlite_write_busy_retry_count
-            ),
-            sqlite_write_retry_initial_delay_seconds=(
-                admin_options.sqlite_write_retry_initial_delay_seconds
-            ),
-            sqlite_write_retry_backoff_multiplier=(
-                admin_options.sqlite_write_retry_backoff_multiplier
-            ),
-            sqlite_write_retry_max_delay_seconds=(
-                admin_options.sqlite_write_retry_max_delay_seconds
-            ),
-            payload_inline_threshold_bytes=(
-                admin_options.payload_inline_threshold_bytes
-            ),
+            sqlite_busy_timeout_seconds=(admin_options.sqlite_busy_timeout_seconds),
+            sqlite_write_busy_retry_count=(admin_options.sqlite_write_busy_retry_count),
+            sqlite_write_retry_initial_delay_seconds=(admin_options.sqlite_write_retry_initial_delay_seconds),
+            sqlite_write_retry_backoff_multiplier=(admin_options.sqlite_write_retry_backoff_multiplier),
+            sqlite_write_retry_max_delay_seconds=(admin_options.sqlite_write_retry_max_delay_seconds),
+            payload_inline_threshold_bytes=(admin_options.payload_inline_threshold_bytes),
             context_window_size=8192,
             reserved_output_tokens=1024,
         )
@@ -779,9 +805,7 @@ def test_session_purge_missing_yes_returns_usage_error() -> None:
     :raises AssertionError: 缺确认参数未被拒绝时抛出。
     """
 
-    assert cli_main.main(("session", "purge", "--session-id", "session-1")) == (
-        EXIT_USAGE_ERROR
-    )
+    assert cli_main.main(("session", "purge", "--session-id", "session-1")) == (EXIT_USAGE_ERROR)
 
 
 def test_session_purge_by_session_id_calls_host_purge(
@@ -857,8 +881,8 @@ def test_session_purge_by_label_resolves_slot_then_purges(
                 _session_list_item(
                     session_id="session-A",
                     slot=SessionSlotRef(
-                        scope="cli.prompt",
-                        slot_key="cli.prompt.proj.v1",
+                        scope="cli.agent",
+                        slot_key="cli.agent.proj.v1",
                     ),
                 ),
             )
@@ -878,8 +902,6 @@ def test_session_purge_by_label_resolves_slot_then_purges(
             "purge",
             "--label",
             "proj.v1",
-            "--kind",
-            "prompt",
             "--yes",
             "--base",
             str(tmp_path),
@@ -961,8 +983,8 @@ def test_session_purge_by_label_toctou_error_includes_selector_and_host_context(
                 _session_list_item(
                     session_id="session-A",
                     slot=SessionSlotRef(
-                        scope="cli.prompt",
-                        slot_key="cli.prompt.proj.v1",
+                        scope="cli.agent",
+                        slot_key="cli.agent.proj.v1",
                     ),
                 ),
             )
@@ -981,8 +1003,6 @@ def test_session_purge_by_label_toctou_error_includes_selector_and_host_context(
             "purge",
             "--label",
             "proj.v1",
-            "--kind",
-            "prompt",
             "--yes",
             "--base",
             str(tmp_path),
@@ -992,7 +1012,7 @@ def test_session_purge_by_label_toctou_error_includes_selector_and_host_context(
 
     assert exit_code == EXIT_FAILURE
     _assert_session_uses_admin_assembly(runtime_capture)
-    assert "--label proj.v1 --kind prompt" in captured.err
+    assert "--label proj.v1" in captured.err
     assert "session-A" in captured.err
     assert "conflict" in captured.err
     assert "slot changed before purge" in captured.err
@@ -1153,8 +1173,8 @@ def test_session_resume_interactive_by_label_resolves_and_reuses_session(
                 _session_list_item(
                     session_id="session-A",
                     slot=SessionSlotRef(
-                        scope="cli.interactive",
-                        slot_key="cli.interactive.proj.v1",
+                        scope="cli.agent",
+                        slot_key="cli.agent.proj.v1",
                     ),
                 ),
             )
@@ -1169,8 +1189,6 @@ def test_session_resume_interactive_by_label_resolves_and_reuses_session(
             "resume",
             "--label",
             "proj.v1",
-            "--kind",
-            "interactive",
             "--mode",
             "interactive",
             "--base",
@@ -1257,8 +1275,8 @@ def test_session_resume_interactive_passes_display_flags_to_existing_session_exe
                 _session_list_item(
                     session_id="session-A",
                     slot=SessionSlotRef(
-                        scope="cli.interactive",
-                        slot_key="cli.interactive.proj.v1",
+                        scope="cli.agent",
+                        slot_key="cli.agent.proj.v1",
                     ),
                 ),
             )
@@ -1273,8 +1291,6 @@ def test_session_resume_interactive_passes_display_flags_to_existing_session_exe
             "resume",
             "--label",
             "proj.v1",
-            "--kind",
-            "interactive",
             "--mode",
             "interactive",
             "--no-detail",
@@ -1289,6 +1305,35 @@ def test_session_resume_interactive_passes_display_flags_to_existing_session_exe
     assert captured.err == ""
     assert resume_capture.interactive_execute_sessions == ["session-A"]
     assert resume_capture.interactive_display_flags == [(False, False)]
+
+
+def test_session_resume_interactive_rejects_ticker_before_runtime_prepare(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """interactive resume 必须在 runtime prepare 前拒绝 prompt 专属 ticker。
+
+    :param capsys: pytest 标准输出捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: ticker 未返回用法错误或泄漏 traceback 时抛出。
+    """
+
+    exit_code = cli_main.main(
+        (
+            "session",
+            "resume",
+            "--session-id",
+            "session-A",
+            "--mode",
+            "interactive",
+            "--ticker",
+            "AAPL",
+        )
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_USAGE_ERROR
+    assert "does not accept --ticker" in captured.err
+    assert "Traceback" not in captured.err
 
 
 def test_session_resume_closed_session_returns_usage_error_without_submit(
@@ -1357,8 +1402,6 @@ def test_session_resume_missing_label_returns_usage_error_without_create(
             "resume",
             "--label",
             "missing",
-            "--kind",
-            "prompt",
             "--mode",
             "prompt",
             "--base",
@@ -1395,8 +1438,8 @@ def test_session_resume_by_label_toctou_error_includes_selector_and_host_context
                 _session_list_item(
                     session_id="session-A",
                     slot=SessionSlotRef(
-                        scope="cli.prompt",
-                        slot_key="cli.prompt.proj.v1",
+                        scope="cli.agent",
+                        slot_key="cli.agent.proj.v1",
                     ),
                 ),
             )
@@ -1416,8 +1459,6 @@ def test_session_resume_by_label_toctou_error_includes_selector_and_host_context
             "resume",
             "--label",
             "proj.v1",
-            "--kind",
-            "prompt",
             "--mode",
             "prompt",
             "--base",
@@ -1428,7 +1469,7 @@ def test_session_resume_by_label_toctou_error_includes_selector_and_host_context
     captured = capsys.readouterr()
 
     assert exit_code == EXIT_FAILURE
-    assert "--label proj.v1 --kind prompt" in captured.err
+    assert "--label proj.v1" in captured.err
     assert "session-A" in captured.err
     assert "invalid_state" in captured.err
     assert "session closed before submit" in captured.err
@@ -1455,8 +1496,8 @@ def test_session_resume_interactive_startup_error_includes_selector_and_session(
                 _session_list_item(
                     session_id="session-A",
                     slot=SessionSlotRef(
-                        scope="cli.interactive",
-                        slot_key="cli.interactive.proj.v1",
+                        scope="cli.agent",
+                        slot_key="cli.agent.proj.v1",
                     ),
                 ),
             )
@@ -1498,8 +1539,6 @@ def test_session_resume_interactive_startup_error_includes_selector_and_session(
             "resume",
             "--label",
             "proj.v1",
-            "--kind",
-            "interactive",
             "--mode",
             "interactive",
             "--base",
@@ -1510,7 +1549,7 @@ def test_session_resume_interactive_startup_error_includes_selector_and_session(
 
     assert exit_code == EXIT_FAILURE
     assert "interactive startup failed" in captured.err
-    assert "--label proj.v1 --kind interactive" in captured.err
+    assert "--label proj.v1" in captured.err
     assert "session-A" in captured.err
     assert "queued run did not become active" in captured.err
     assert host.calls == ["list_sessions"]
@@ -1709,7 +1748,7 @@ def _install_fake_resume_execution(
         :raises Exception: 不主动抛出异常。
         """
 
-        del context_slot_values, usage_error_factory
+        del context_slot_values
         capture.prompt_prepare_calls.append(user_prompt)
         return session_execution.PreparedPromptSessionExecution(
             runtime=cast(
@@ -1769,7 +1808,6 @@ def _install_fake_resume_execution(
         *,
         command_name: str,
         scenario: str,
-        ticker: str | None,
         context_slot_values: dict[str, JsonValue],
         usage_error_factory: Callable[[str], ValueError],
     ) -> session_execution.PreparedInteractiveSessionExecution:
@@ -1778,11 +1816,13 @@ def _install_fake_resume_execution(
         :param args: session resume 参数。
         :param command_name: 当前 CLI command 名称。
         :param scenario: interactive scene id。
+        :param context_slot_values: interactive scene context slots。
+        :param usage_error_factory: 当前命令用法错误构造器。
         :returns: fake interactive prepared execution。
         :raises Exception: 不主动抛出异常。
         """
 
-        del context_slot_values, usage_error_factory
+        del context_slot_values
         capture.interactive_prepare_calls.append(args.mode or "")
         return session_execution.PreparedInteractiveSessionExecution(
             runtime=cast(
@@ -1794,9 +1834,10 @@ def _install_fake_resume_execution(
                 command_name=command_name,
                 scenario=scenario,
                 display_user="本地 CLI 用户",
-                ticker=ticker,
+                ticker=None,
             ),
             run_overrides=ServiceRunOverrides(),
+            usage_error_factory=usage_error_factory,
         )
 
     async def fake_execute_interactive_on_session(
@@ -1804,7 +1845,6 @@ def _install_fake_resume_execution(
         host: Host,
         prepared: session_execution.PreparedInteractiveSessionExecution,
         session_id: str,
-        input_reader: Callable[[str], str] | None = None,
         sigint_monitor_factory: Callable[[], CliSigintMonitor] | None = None,
         detail: bool = True,
         thinking: bool = True,
@@ -1814,7 +1854,6 @@ def _install_fake_resume_execution(
         :param host: fake Host。
         :param prepared: fake interactive prepared execution。
         :param session_id: 目标 Session id。
-        :param input_reader: 未使用的输入读取器。
         :param sigint_monitor_factory: 未使用的 SIGINT monitor 工厂。
         :param detail: 是否显示运行态 activity stream。
         :param thinking: 是否显示运行态 thinking 增量。

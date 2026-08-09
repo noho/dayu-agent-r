@@ -52,7 +52,6 @@ COMMAND_HELP_EXPECTATIONS: dict[str, tuple[str, ...]] = {
         "--max-iterations",
     ),
     "interactive": (
-        "--ticker",
         "--label",
         "--detail",
         "--no-detail",
@@ -184,6 +183,31 @@ def _capture_help(
         parser.parse_args([*argv, "--help"])
     assert raised.value.code == EXIT_SUCCESS
     return capsys.readouterr().out
+
+
+def _collect_parser_tree(
+    parser: argparse.ArgumentParser,
+) -> tuple[argparse.ArgumentParser, ...]:
+    """递归收集 root、command 与 action parser。
+
+    :param parser: 当前 argparse parser。
+    :returns: 包含当前 parser 及全部子 parser 的稳定元组。
+    :raises AssertionError: subparser choices 不是 argparse parser 时抛出。
+    """
+
+    parsers = [parser]
+    for action in parser._actions:
+        if not isinstance(action, argparse._SubParsersAction):
+            continue
+        child_parsers = cast(
+            dict[str, argparse.ArgumentParser],
+            action.choices,
+        )
+        for child_parser in child_parsers.values():
+            if not isinstance(child_parser, argparse.ArgumentParser):
+                raise AssertionError("subparser choice must be ArgumentParser")
+            parsers.extend(_collect_parser_tree(child_parser))
+    return tuple(parsers)
 
 
 def _raise_keyboard_interrupt(_args: ParsedCliArgs) -> int:
@@ -380,19 +404,67 @@ def test_command_help_contains_debug_stream(
     assert "SSE" in help_text
 
 
-def test_interactive_help_contains_optional_ticker(
+def test_agent_help_omits_removed_parameters(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """验证 ``interactive --help`` 包含 optional ``--ticker``。
+    """验证 Agent surface help 不暴露已删除参数。
 
     :param capsys: pytest 标准输出捕获夹具。
     :returns: ``None``。
-    :raises AssertionError: help 缺少 ``--ticker`` 时抛出。
+    :raises AssertionError: help 仍暴露已删除参数时抛出。
     """
 
-    help_text = _capture_help(capsys, ("interactive",))
+    prompt_help = _capture_help(capsys, ("prompt",))
+    interactive_help = _capture_help(capsys, ("interactive",))
 
-    assert "--ticker" in help_text
+    assert "--ticker" in prompt_help
+    assert "--config" not in prompt_help
+    assert "--ticker" not in interactive_help
+    assert "--config" not in interactive_help
+
+
+def test_every_parser_scope_omits_removed_config_action() -> None:
+    """root、command 与 action parser 均不得注册已删除配置选项。
+
+    :returns: ``None``。
+    :raises AssertionError: 任一 parser action 仍暴露 ``--config`` 时抛出。
+    """
+
+    parser = build_parser()
+
+    for scoped_parser in _collect_parser_tree(parser):
+        option_strings = {
+            option
+            for action in scoped_parser._actions
+            for option in action.option_strings
+        }
+        assert "--config" not in option_strings
+
+
+@pytest.mark.parametrize(
+    "command_path",
+    (
+        (),
+        *((command_name,) for command_name in CLI_COMMAND_NAMES),
+        ("session", "list"),
+        ("session", "resume"),
+        ("session", "purge"),
+        ("tool_trace", "analyze"),
+    ),
+)
+def test_every_parser_help_omits_removed_config(
+    command_path: tuple[str, ...],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """root、command 与 action help 均不得展示已删除配置选项。
+
+    :param command_path: 待读取 help 的 parser 路径。
+    :param capsys: pytest 标准输出捕获夹具。
+    :returns: ``None``。
+    :raises AssertionError: 任一 help 仍展示 ``--config`` 时抛出。
+    """
+
+    assert "--config" not in _capture_help(capsys, command_path)
 
 
 def test_tool_trace_analyze_help_and_required_arguments(
@@ -589,7 +661,6 @@ def test_root_readme_matches_current_cli_public_contract() -> None:
         "不生成 shell",
     ):
         assert removed_batch_contract not in readme
-    assert "interactive --ticker" in readme
 
 
 def test_session_action_help_contains_fixed_parser_shape(
@@ -607,11 +678,12 @@ def test_session_action_help_contains_fixed_parser_shape(
 
     assert "--session-id" in purge_help
     assert "--label" in purge_help
-    assert "--kind" in purge_help
+    assert "--kind" not in purge_help
     assert "--yes" in purge_help
     assert "--session-id" in resume_help
     assert "--label" in resume_help
-    assert "--kind" in resume_help
+    assert "--kind" not in resume_help
+    assert "--config" not in resume_help
     assert "--mode" in resume_help
 
 
@@ -1470,78 +1542,159 @@ def test_parse_args_accepts_global_options_before_and_after_command() -> None:
 
 
 @pytest.mark.parametrize(
-    ("argv", "expected_config_dir"),
+    "argv",
     (
-        (("--config", "config-prompt-before", "prompt", "hello"), "config-prompt-before"),
-        (("prompt", "hello", "--config", "config-prompt-after"), "config-prompt-after"),
-        (("--config", "config-interactive-before", "interactive"), "config-interactive-before"),
-        (("interactive", "--config", "config-interactive-after"), "config-interactive-after"),
+        ("--config=/tmp/x", "prompt", "hello"),
+        ("init", "--config=/tmp/x"),
+        ("prompt", "--config=/tmp/x", "hello"),
+        ("interactive", "--config=/tmp/x"),
+        ("download", "--config=/tmp/x", "--ticker", "AAPL"),
+        ("session", "--config=/tmp/x", "list"),
+        ("session", "list", "--config=/tmp/x"),
         (
-            (
-                "--config",
-                "config-session-before",
-                "session",
-                "resume",
-                "--session-id",
-                "session-1",
-                "--mode",
-                "interactive",
-            ),
-            "config-session-before",
+            "session",
+            "resume",
+            "--session-id",
+            "session-1",
+            "--mode",
+            "interactive",
+            "--config=/tmp/x",
         ),
         (
-            (
-                "session",
-                "resume",
-                "--session-id",
-                "session-1",
-                "--mode",
-                "interactive",
-                "--config",
-                "config-session-after",
-            ),
-            "config-session-after",
+            "session",
+            "purge",
+            "--session-id",
+            "session-1",
+            "--yes",
+            "--config=/tmp/x",
+        ),
+        (
+            "tool_trace",
+            "analyze",
+            "trace.jsonl",
+            "--output-dir",
+            "reports",
+            "--config=/tmp/x",
         ),
     ),
 )
-def test_runtime_commands_accept_config_before_and_after_command(
+def test_removed_config_is_argparse_unknown_in_every_parser_scope(
     argv: tuple[str, ...],
-    expected_config_dir: str,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """非 init runtime 命令必须在 command 前后都接受 ``--config``。
+    """已删除配置选项在 root、command 与 action scope 均走 unknown path。
 
     :param argv: 待解析的完整 CLI 参数。
-    :param expected_config_dir: 预期的显式配置目录。
+    :param capsys: pytest 标准错误捕获夹具。
     :returns: ``None``。
-    :raises AssertionError: 参数位置改变 ``config_dir`` 映射时抛出。
+    :raises AssertionError: argparse 未以 canonical unknown option 拒绝时抛出。
     """
 
-    args = parse_cli_args(argv)
+    with pytest.raises(SystemExit) as raised:
+        parse_cli_args(argv)
+    captured = capsys.readouterr()
 
-    assert args.config_dir == expected_config_dir
+    assert raised.value.code == EXIT_USAGE_ERROR
+    assert "unrecognized arguments" in captured.err
+    assert "--config" in captured.err
 
 
 @pytest.mark.parametrize(
     "argv",
     (
-        ("--config", "forbidden-config", "init"),
-        ("init", "--config", "forbidden-config"),
+        ("--config", "/tmp/x", "prompt", "hello"),
+        ("prompt", "--config", "/tmp/x", "hello"),
+        ("interactive", "--config", "/tmp/x"),
+        ("session", "--config", "/tmp/x", "list"),
+        ("session", "list", "--config", "/tmp/x"),
     ),
 )
-def test_init_rejects_config_before_and_after_command(
+def test_removed_config_split_value_form_never_produces_namespace(
     argv: tuple[str, ...],
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """init 必须在 command 前后都由 parser owner 拒绝 ``--config``。
+    """旧 ``--config /tmp/x`` 形式在任意 parser scope 都必须失败。
 
-    :param argv: 待解析的 init 参数。
+    删除 action 后，argparse 不再把第二个 token 绑定为 option value；root 或
+    command scope 可能因此把该 token 报为非法子命令，但都必须在有效 namespace
+    返回和命令分发前以 parser usage error 结束。
+
+    :param argv: 覆盖 root、command 与 action scope 的旧 split-value 调用。
+    :param capsys: pytest 标准错误捕获夹具。
     :returns: ``None``。
-    :raises AssertionError: argparse 未返回 usage error 2 时抛出。
+    :raises AssertionError: 任一旧调用仍产生有效 namespace 时抛出。
     """
 
     with pytest.raises(SystemExit) as raised:
         parse_cli_args(argv)
+    captured = capsys.readouterr()
 
     assert raised.value.code == EXIT_USAGE_ERROR
+    assert "error:" in captured.err
+
+
+def test_parsed_namespace_omits_removed_config_field() -> None:
+    """正常解析结果不得残留已删除配置字段或默认值。
+
+    :returns: ``None``。
+    :raises AssertionError: namespace 仍含 ``config_dir`` 时抛出。
+    """
+
+    args = parse_cli_args(("prompt", "hello"))
+
+    assert "config_dir" not in vars(args)
+
+
+def test_interactive_rejects_removed_ticker_and_session_kind() -> None:
+    """interactive ticker 与 session kind 必须从 parser surface 消失。
+
+    :returns: ``None``。
+    :raises AssertionError: 任一 removed 参数未返回用法错误 2 时抛出。
+    """
+
+    with pytest.raises(SystemExit) as ticker_error:
+        parse_cli_args(("interactive", "--ticker", "AAPL"))
+    with pytest.raises(SystemExit) as kind_error:
+        parse_cli_args(
+            (
+                "session",
+                "purge",
+                "--label",
+                "earnings",
+                "--kind",
+                "prompt",
+                "--yes",
+            )
+        )
+
+    assert ticker_error.value.code == EXIT_USAGE_ERROR
+    assert kind_error.value.code == EXIT_USAGE_ERROR
+
+
+def test_prompt_and_prompt_resume_keep_ticker() -> None:
+    """prompt 与 prompt-mode resume 必须保留 ticker 参数。
+
+    :returns: ``None``。
+    :raises AssertionError: 任一 prompt surface 丢失 ticker 映射时抛出。
+    """
+
+    prompt_args = parse_cli_args(("prompt", "--ticker", "AAPL", "hello"))
+    resume_args = parse_cli_args(
+        (
+            "session",
+            "resume",
+            "--session-id",
+            "session-1",
+            "--mode",
+            "prompt",
+            "--ticker",
+            "MSFT",
+            "hello",
+        )
+    )
+
+    assert prompt_args.ticker == "AAPL"
+    assert resume_args.ticker == "MSFT"
 
 
 @pytest.mark.parametrize(

@@ -117,6 +117,7 @@ async def _collect(
 
     events: list[RunnerEvent] = []
     async for event in runner.call(
+        structured_output=None,
         messages=[UserMessage(role=AgentMessageRole.USER, content="hi")],
         options=make_options(stream=False),
         tools=[],

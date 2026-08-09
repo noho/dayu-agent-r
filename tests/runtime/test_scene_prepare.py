@@ -407,13 +407,36 @@ def test_default_non_upload_scenes_do_not_select_upload_tool() -> None:
         assert selected is not None
         assert _START_FINS_UPLOAD_TOOL_NAME not in selected
         assert _DEFAULT_FINS_READ_TOOL_NAMES.issubset(selected)
-        if scene_id in ("interactive", "wechat"):
+        if scene_id == "wechat":
             assert _DEFAULT_FINS_LONG_TRANSACTION_TOOL_NAMES.issubset(selected)
+        elif scene_id == "interactive":
+            assert _START_FINS_DOWNLOAD_TOOL_NAME in selected
+            assert _START_FINS_PREPROCESS_TOOL_NAME not in selected
         else:
             assert _START_FINS_DOWNLOAD_TOOL_NAME not in selected
             assert _START_FINS_PREPROCESS_TOOL_NAME not in selected
         if scene_id in _DEFAULT_WEB_SCENE_IDS:
             assert _DEFAULT_WEB_TOOL_NAMES.issubset(selected)
+
+
+def test_interactive_manifest_preserves_exact_non_preprocess_tool_selection() -> None:
+    """interactive manifest 只移除 preprocess tag，并保持其余选择配置与顺序。"""
+
+    manifest_value = cast(
+        JsonValue,
+        json.loads(
+            (_PACKAGE_MANIFEST_ROOT / "interactive.json").read_text(encoding="utf-8")
+        ),
+    )
+    assert isinstance(manifest_value, Mapping)
+    tool_selection = manifest_value["tool_selection"]
+    assert isinstance(tool_selection, Mapping)
+    assert tool_selection == {
+        "mode": "select",
+        "tool_names": [],
+        "tool_tags_any": ["fins-read", "fins-download", "web", "utils"],
+        "allow_empty": False,
+    }
 
 
 def test_condition_blocks_use_actual_selected_tools_and_tags(tmp_path: Path) -> None:

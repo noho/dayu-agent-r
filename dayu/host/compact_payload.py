@@ -12,123 +12,125 @@ from dataclasses import dataclass
 
 from dayu.contracts.json_value import JsonValue
 from dayu.host.compaction import (
-    CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
-    AnswerAnchorCandidateVNext,
-    AnswerAnchorChildVNext,
-    CompactCandidateDiagnosticVNext,
-    CompactQualityCheckResultVNext,
+    CompactAcceptedEvidenceFactV4,
+    CompactAcceptedReplacementV4,
+    CompactAcceptedTruthV4,
+    CompactAnswerAnchorV4,
+    CompactCandidateV4,
+    CompactForwardIntentStatusV4,
+    CompactForwardIntentV4,
+    CompactOmittedCoverageV4,
+    CompactPolicyUsageAuditV4,
+    CompactReferenceContinuityV4,
+    CompactRepresentedCoverageV4,
+    CompactRepresentedSourceV4,
+    CompactSessionSummaryV4,
+    CompactSemanticSectionV4,
+    CompactSourceBoundaryEntryV4,
+    CompactSourceKindV4,
     CompactionRequest,
-    ConversationCompactOutputVNext,
-    EvidenceBackedFactCandidateVNext,
-    ForwardIntentCandidateVNext,
-    ForwardIntentStatusVNext,
-    ForwardIntentTypeVNext,
-    ReferenceContinuityCandidateVNext,
-    ReferenceContinuityReasonVNext,
-    SessionSummaryCandidateVNext,
+    compact_proposal_boundary_binding_issues_v4,
+    validate_compact_proposal_replacement_binding_v4,
+    validate_compact_policy_usage_audit_replacement_binding_v4,
+    validate_compact_represented_coverage_replacement_binding_v4,
 )
-from dayu.host.durable.codec import is_sha256_digest
+from dayu.host.compact_structure import parse_compact_candidate_v4
+from dayu.host.durable.codec import canonical_json_dumps, is_sha256_digest
 
 COMPACT_ARTIFACT_MEDIA_TYPE_VNEXT = "application/vnd.dayu.context-compact+json"
 COMPACT_ARTIFACT_KIND_VNEXT = "context_compaction"
-COMPACT_ARTIFACT_SCHEMA_VERSION_VNEXT = 3
+COMPACT_ARTIFACT_SCHEMA_VERSION_VNEXT = 5
 COMPACT_PROJECTION_SIGNAL_MEMORY_CATCHUP = "conversation_memory_projection_catchup"
 _COMPACT_ARTIFACT_REF_PREFIX = "compact-artifact:"
 _FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS = "accepted_evidence_mapping_refs"
-_FIELD_ACCEPTED_CANDIDATE_DIGEST = "accepted_candidate_digest"
+_FIELD_ACCEPTED_PROPOSAL_DIGEST = "accepted_proposal_digest"
 _FIELD_COMPACT_ARTIFACT_REF = "compact_artifact_ref"
-_FIELD_ACCEPTED_CANDIDATE = "accepted_candidate"
+_FIELD_ACCEPTED_PROPOSAL = "accepted_proposal"
+_FIELD_ACCEPTED_REPLACEMENT = "accepted_replacement"
 _FIELD_SOURCE_BOUNDARY_REFS = "source_boundary_refs"
-_FIELD_SCHEMA_VERSION = "schema_version"
-_FIELD_SESSION_SUMMARY = "session_summary"
-_FIELD_SUMMARY_TEXT = "summary_text"
-_FIELD_SOURCE_LABELS = "source_labels"
-_FIELD_EVIDENCE_BACKED_FACTS = "evidence_backed_facts"
-_FIELD_CLAIM_TEXT = "claim_text"
-_FIELD_EVIDENCE_LABELS = "evidence_labels"
-_FIELD_ANSWER_ANCHORS = "answer_anchors"
-_FIELD_ANCHOR_TITLE = "anchor_title"
-_FIELD_ANCHOR_ITEMS = "anchor_items"
-_FIELD_DISPLAY_TEXT = "display_text"
-_FIELD_ORDINAL = "ordinal"
-_FIELD_ANSWER_SOURCE_LABELS = "answer_source_labels"
-_FIELD_FORWARD_INTENTS = "forward_intents"
-_FIELD_INTENT_TYPE = "intent_type"
-_FIELD_TEXT = "text"
-_FIELD_STATUS = "status"
-_FIELD_REFERENCE_CONTINUITY_ITEMS = "reference_continuity_items"
-_FIELD_REASON = "reason"
-_FIELD_DIAGNOSTICS = "diagnostics"
-_FIELD_CODE = "code"
+_FIELD_SOURCE_BOUNDARY = "source_boundary"
+_FIELD_REPRESENTED_COVERAGE = "represented_coverage"
+_FIELD_OMITTED_COVERAGE = "omitted_coverage"
+_FIELD_POLICY_USAGE_AUDIT = "policy_usage_audit"
 _SHA256_PREFIX = "sha256:"
-
-_CANDIDATE_FIELDS = frozenset(
-    (
-        _FIELD_SCHEMA_VERSION,
-        _FIELD_SESSION_SUMMARY,
-        _FIELD_EVIDENCE_BACKED_FACTS,
-        _FIELD_ANSWER_ANCHORS,
-        _FIELD_FORWARD_INTENTS,
-        _FIELD_REFERENCE_CONTINUITY_ITEMS,
-        _FIELD_DIAGNOSTICS,
-    )
-)
-_SUMMARY_FIELDS = frozenset((_FIELD_SUMMARY_TEXT, _FIELD_SOURCE_LABELS))
-_FACT_FIELDS = frozenset(
-    (
-        _FIELD_CLAIM_TEXT,
-        _FIELD_EVIDENCE_LABELS,
-        _FIELD_SOURCE_LABELS,
-    )
-)
-_ANCHOR_FIELDS = frozenset(
-    (_FIELD_ANCHOR_TITLE, _FIELD_ANCHOR_ITEMS, _FIELD_ANSWER_SOURCE_LABELS)
-)
-_ANCHOR_CHILD_FIELDS = frozenset((_FIELD_DISPLAY_TEXT, _FIELD_ORDINAL))
-_FORWARD_INTENT_FIELDS = frozenset(
-    (_FIELD_INTENT_TYPE, _FIELD_TEXT, _FIELD_STATUS, _FIELD_SOURCE_LABELS)
-)
-_REFERENCE_FIELDS = frozenset((_FIELD_TEXT, _FIELD_REASON, _FIELD_SOURCE_LABELS))
-_DIAGNOSTIC_FIELDS = frozenset((_FIELD_CODE, _FIELD_TEXT, _FIELD_SOURCE_LABELS))
 
 
 @dataclass(frozen=True, slots=True)
 class ContextCompactedSemanticPayload:
     """已持久化 ``CONTEXT_COMPACTED`` 的窄 typed semantic view。
 
-    :param accepted_candidate: 严格恢复的 accepted candidate。
-    :param accepted_candidate_digest: candidate canonical digest。
-    :param accepted_evidence_mapping_refs: candidate 绑定的 accepted evidence refs。
+    :param accepted_proposal: 严格恢复的模型 proposal。
+    :param accepted_proposal_digest: proposal canonical digest。
+    :param accepted_replacement: Host 验收后的自包含 replacement。
+    :param accepted_evidence_mapping_refs: replacement 逐事实 refs 的有序并集。
     :param compact_artifact_ref: compact artifact ref。
-    :param current_input_ref: 本次 compact 所属 current input boundary ref。
-    :param compacted_source_refs: 本次 accepted compact 覆盖的 canonical source refs。
+    :param current_input_ref: 本次 compact 所属 current input ref。
+    :param source_boundary: committed root typed source boundary。
+    :param represented_coverage: Host 派生的 represented coverage。
+    :param omitted_coverage: Host 派生的 omitted exact complement。
+    :param policy_usage_audit: Host 派生的 policy actual/cap audit。
     """
 
-    accepted_candidate: ConversationCompactOutputVNext
-    accepted_candidate_digest: str
+    accepted_proposal: CompactCandidateV4
+    accepted_proposal_digest: str
+    accepted_replacement: CompactAcceptedReplacementV4
     accepted_evidence_mapping_refs: tuple[str, ...]
     compact_artifact_ref: str
     current_input_ref: str
-    compacted_source_refs: tuple[str, ...]
+    source_boundary: tuple[CompactSourceBoundaryEntryV4, ...]
+    represented_coverage: CompactRepresentedCoverageV4
+    omitted_coverage: CompactOmittedCoverageV4
+    policy_usage_audit: CompactPolicyUsageAuditV4
 
     def __post_init__(self) -> None:
         """校验 typed semantic view 的内部一致性。
 
         :returns: ``None``。
-        :raises TypeError: candidate 或 refs tuple 类型非法时抛出。
-        :raises ValueError: digest、ref 或 candidate digest 不一致时抛出。
+        :raises TypeError: proposal、replacement、boundary 或 coverage 类型非法时抛出。
+        :raises ValueError: digest、ref 或 replacement binding 不一致时抛出。
         """
 
-        if not isinstance(self.accepted_candidate, ConversationCompactOutputVNext):
-            raise TypeError("accepted_candidate must be ConversationCompactOutputVNext")
-        if not is_sha256_digest(self.accepted_candidate_digest):
-            raise ValueError("accepted_candidate_digest must be sha256 digest")
-        if self.accepted_candidate_digest != self.accepted_candidate.digest():
-            raise ValueError("accepted_candidate_digest mismatch")
+        if not isinstance(self.accepted_proposal, CompactCandidateV4):
+            raise TypeError("accepted_proposal must be CompactCandidateV4")
+        if not is_sha256_digest(self.accepted_proposal_digest):
+            raise ValueError("accepted_proposal_digest must be sha256 digest")
+        if self.accepted_proposal_digest != self.accepted_proposal.digest():
+            raise ValueError("accepted_proposal_digest mismatch")
+        if not isinstance(self.accepted_replacement, CompactAcceptedReplacementV4):
+            raise TypeError(
+                "accepted_replacement must be CompactAcceptedReplacementV4"
+            )
         _require_runtime_text_tuple(
             self.accepted_evidence_mapping_refs,
             field_name=_FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS,
         )
+        if not isinstance(self.source_boundary, tuple):
+            raise TypeError("source_boundary must be tuple")
+        for entry in self.source_boundary:
+            if not isinstance(entry, CompactSourceBoundaryEntryV4):
+                raise TypeError(
+                    "source_boundary item must be CompactSourceBoundaryEntryV4"
+                )
+        proposal_issues = compact_proposal_boundary_binding_issues_v4(
+            self.source_boundary,
+            self.accepted_proposal,
+        )
+        if proposal_issues:
+            raise ValueError(
+                "accepted_proposal must satisfy source_boundary binding"
+            )
+        validate_compact_proposal_replacement_binding_v4(
+            self.source_boundary,
+            self.accepted_proposal,
+            self.accepted_replacement,
+        )
+        _validate_aggregate_boundary_unique_membership(self)
+        if self.accepted_evidence_mapping_refs != (
+            self.accepted_replacement.canonical_evidence_refs
+        ):
+            raise ValueError(
+                "accepted_evidence_mapping_refs must equal replacement refs union"
+            )
         _require_runtime_text(
             self.compact_artifact_ref,
             field_name=_FIELD_COMPACT_ARTIFACT_REF,
@@ -137,16 +139,47 @@ class ContextCompactedSemanticPayload:
             self.current_input_ref,
             field_name="current_input_ref",
         )
-        _require_runtime_text_tuple(
-            self.compacted_source_refs,
-            field_name="compacted_source_refs",
+        if not isinstance(self.represented_coverage, CompactRepresentedCoverageV4):
+            raise TypeError(
+                "represented_coverage must be CompactRepresentedCoverageV4"
+            )
+        if not isinstance(self.omitted_coverage, CompactOmittedCoverageV4):
+            raise TypeError("omitted_coverage must be CompactOmittedCoverageV4")
+        if not isinstance(self.policy_usage_audit, CompactPolicyUsageAuditV4):
+            raise TypeError("policy_usage_audit must be CompactPolicyUsageAuditV4")
+        _require_runtime_text(
+            self.policy_usage_audit.policy_ref,
+            field_name="policy_usage_audit.policy_ref",
         )
-        source_boundary_refs = (
-            self.current_input_ref,
-            *self.compacted_source_refs,
+        if not is_sha256_digest(self.policy_usage_audit.policy_digest):
+            raise ValueError("policy_usage_audit.policy_digest must be sha256 digest")
+        validate_compact_policy_usage_audit_replacement_binding_v4(
+            self.accepted_replacement,
+            self.policy_usage_audit,
         )
-        if len(frozenset(source_boundary_refs)) != len(source_boundary_refs):
-            raise ValueError("compact source boundary refs must be unique")
+        _validate_committed_coverage(self)
+
+    @property
+    def compacted_source_refs(self) -> tuple[str, ...]:
+        """从 committed typed boundary 与 coverage 派生 canonical refs。
+
+        :returns: 按 root boundary 顺序去重的 covered source refs。
+        """
+
+        covered_labels = frozenset(
+            (
+                *self.represented_coverage.source_labels,
+                *self.omitted_coverage.source_labels,
+            )
+        )
+        return tuple(
+            dict.fromkeys(
+                source_ref
+                for entry in self.source_boundary
+                if entry.source_label in covered_labels
+                for source_ref in entry.source_refs
+            )
+        )
 
 
 def parse_context_compacted_semantic_payload(
@@ -159,17 +192,20 @@ def parse_context_compacted_semantic_payload(
     :raises ValueError: shape、enum、文本、ordinal、digest 或 ref 非法时抛出。
     """
 
-    candidate_mapping = _required_mapping(payload, _FIELD_ACCEPTED_CANDIDATE)
-    candidate = _parse_persisted_candidate(candidate_mapping)
-    candidate_digest = _required_text(payload, _FIELD_ACCEPTED_CANDIDATE_DIGEST)
+    proposal_mapping = _required_mapping(payload, _FIELD_ACCEPTED_PROPOSAL)
+    proposal = _parse_persisted_proposal(proposal_mapping)
+    proposal_digest = _required_text(payload, _FIELD_ACCEPTED_PROPOSAL_DIGEST)
     source_refs = _required_unique_text_list(
         payload,
         _FIELD_SOURCE_BOUNDARY_REFS,
         path=_FIELD_SOURCE_BOUNDARY_REFS,
     )
-    return ContextCompactedSemanticPayload(
-        accepted_candidate=candidate,
-        accepted_candidate_digest=candidate_digest,
+    if len(source_refs) == 0:
+        raise ValueError("source_boundary_refs must include current_input_ref")
+    semantics = ContextCompactedSemanticPayload(
+        accepted_proposal=proposal,
+        accepted_proposal_digest=proposal_digest,
+        accepted_replacement=_parse_accepted_replacement(payload),
         accepted_evidence_mapping_refs=_required_text_list(
             payload,
             _FIELD_ACCEPTED_EVIDENCE_MAPPING_REFS,
@@ -177,313 +213,560 @@ def parse_context_compacted_semantic_payload(
         ),
         compact_artifact_ref=_required_text(payload, _FIELD_COMPACT_ARTIFACT_REF),
         current_input_ref=source_refs[0],
-        compacted_source_refs=source_refs[1:],
+        source_boundary=_parse_source_boundary(payload),
+        represented_coverage=_parse_represented_coverage(payload),
+        omitted_coverage=_parse_omitted_coverage(payload),
+        policy_usage_audit=_parse_policy_usage_audit(payload),
     )
+    if source_refs != (semantics.current_input_ref, *semantics.compacted_source_refs):
+        raise ValueError("source_boundary_refs must equal committed derived coverage")
+    return semantics
 
 
 def accepted_compact_business_texts(
-    candidate: ConversationCompactOutputVNext,
+    replacement: CompactAcceptedReplacementV4,
 ) -> tuple[str, ...]:
     """返回 accepted compact 后普通 dispatch 会消费的业务文本。
 
-    :param candidate: typed accepted compact candidate。
+    :param replacement: typed accepted compact replacement。
     :returns: 按 memory / ordinary RunInput 业务投影顺序排列的文本 tuple。
-    :raises TypeError: candidate 类型非法时抛出。
+    :raises TypeError: replacement 类型非法时抛出。
     """
 
-    if not isinstance(candidate, ConversationCompactOutputVNext):
-        raise TypeError("candidate must be ConversationCompactOutputVNext")
+    if not isinstance(replacement, CompactAcceptedReplacementV4):
+        raise TypeError("replacement must be CompactAcceptedReplacementV4")
     texts: list[str] = []
-    if candidate.session_summary is not None:
-        texts.append(candidate.session_summary.summary_text)
-    texts.extend(fact.claim_text for fact in candidate.evidence_backed_facts)
-    for anchor in candidate.answer_anchors:
-        texts.append(anchor.anchor_title)
-        texts.extend(item.display_text for item in anchor.anchor_items)
-    texts.extend(intent.text for intent in candidate.forward_intents)
-    texts.extend(item.text for item in candidate.reference_continuity_items)
+    if replacement.session_summary is not None:
+        texts.append(replacement.session_summary.text)
+    texts.extend(fact.claim for fact in replacement.evidence_facts)
+    for anchor in replacement.answer_anchors:
+        texts.append(anchor.title)
+        texts.append(anchor.detail)
+    texts.extend(intent.text for intent in replacement.forward_intents)
+    texts.extend(item.text for item in replacement.reference_continuity)
     return tuple(texts)
 
 
-def _parse_persisted_candidate(
-    candidate: Mapping[str, JsonValue],
-) -> ConversationCompactOutputVNext:
-    """从 current persisted shape 恢复 typed candidate。
+def _parse_source_boundary(
+    payload: Mapping[str, JsonValue],
+) -> tuple[CompactSourceBoundaryEntryV4, ...]:
+    """严格恢复 committed root source boundary。
 
-    :param candidate: ``accepted_candidate`` JSON object。
-    :returns: typed accepted candidate。
-    :raises ValueError: candidate 字段、shape 或 enum 非法时抛出。
+    :param payload: ``CONTEXT_COMPACTED`` payload。
+    :returns: typed boundary tuple。
+    :raises ValueError: shape、kind、label 或 refs 非法时抛出。
     """
 
-    _require_exact_fields(candidate, _CANDIDATE_FIELDS, path=_FIELD_ACCEPTED_CANDIDATE)
-    schema_version = _required_text(candidate, _FIELD_SCHEMA_VERSION)
-    if schema_version != CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT:
-        raise ValueError("accepted_candidate.schema_version is invalid")
-    return ConversationCompactOutputVNext(
-        schema_version=schema_version,
-        session_summary=_parse_session_summary(candidate),
-        evidence_backed_facts=tuple(
-            _parse_fact(item, index=index)
-            for index, item in enumerate(
-                _required_mapping_list(
-                    candidate,
-                    _FIELD_EVIDENCE_BACKED_FACTS,
-                    path=(
-                        f"{_FIELD_ACCEPTED_CANDIDATE}."
-                        f"{_FIELD_EVIDENCE_BACKED_FACTS}"
-                    ),
+    items = _required_mapping_list(
+        payload,
+        _FIELD_SOURCE_BOUNDARY,
+        path=_FIELD_SOURCE_BOUNDARY,
+    )
+    result: list[CompactSourceBoundaryEntryV4] = []
+    for index, item in enumerate(items):
+        path = f"{_FIELD_SOURCE_BOUNDARY}[{index}]"
+        _require_exact_fields(
+            item,
+            frozenset(
+                (
+                    "source_label",
+                    "source_kind",
+                    "source_refs",
+                    "canonical_evidence_refs",
+                    "readable_text",
                 )
+            ),
+            path=path,
+        )
+        result.append(
+            CompactSourceBoundaryEntryV4(
+                source_label=_required_text(item, "source_label"),
+                source_kind=CompactSourceKindV4(_required_text(item, "source_kind")),
+                source_refs=_required_unique_text_list(
+                    item,
+                    "source_refs",
+                    path=f"{path}.source_refs",
+                ),
+                canonical_evidence_refs=_required_unique_text_list(
+                    item,
+                    "canonical_evidence_refs",
+                    path=f"{path}.canonical_evidence_refs",
+                    allow_empty=True,
+                ),
+                readable_text=_required_text(item, "readable_text"),
             )
+        )
+    labels = tuple(entry.source_label for entry in result)
+    if len(set(labels)) != len(labels):
+        raise ValueError("source_boundary labels must be unique")
+    return tuple(result)
+
+
+def _parse_represented_coverage(
+    payload: Mapping[str, JsonValue],
+) -> CompactRepresentedCoverageV4:
+    """严格恢复 committed represented coverage。
+
+    :param payload: ``CONTEXT_COMPACTED`` payload。
+    :returns: typed represented coverage。
+    :raises ValueError: shape、section 或 label 非法时抛出。
+    """
+
+    coverage = _required_mapping(payload, _FIELD_REPRESENTED_COVERAGE)
+    _require_exact_fields(
+        coverage,
+        frozenset(("sources",)),
+        path=_FIELD_REPRESENTED_COVERAGE,
+    )
+    sources = _required_mapping_list(
+        coverage,
+        "sources",
+        path=f"{_FIELD_REPRESENTED_COVERAGE}.sources",
+    )
+    result: list[CompactRepresentedSourceV4] = []
+    for index, item in enumerate(sources):
+        path = f"{_FIELD_REPRESENTED_COVERAGE}.sources[{index}]"
+        _require_exact_fields(
+            item,
+            frozenset(("source_label", "sections")),
+            path=path,
+        )
+        result.append(
+            CompactRepresentedSourceV4(
+                source_label=_required_text(item, "source_label"),
+                sections=tuple(
+                    CompactSemanticSectionV4(value)
+                    for value in _required_unique_text_list(
+                        item,
+                        "sections",
+                        path=f"{path}.sections",
+                    )
+                ),
+            )
+        )
+    return CompactRepresentedCoverageV4(sources=tuple(result))
+
+
+def _parse_omitted_coverage(
+    payload: Mapping[str, JsonValue],
+) -> CompactOmittedCoverageV4:
+    """严格恢复 committed omitted coverage。
+
+    :param payload: ``CONTEXT_COMPACTED`` payload。
+    :returns: 不携带主观原因的 typed omitted coverage。
+    :raises ValueError: shape 或 label 非法时抛出。
+    """
+
+    coverage = _required_mapping(payload, _FIELD_OMITTED_COVERAGE)
+    _require_exact_fields(
+        coverage,
+        frozenset(("source_labels",)),
+        path=_FIELD_OMITTED_COVERAGE,
+    )
+    return CompactOmittedCoverageV4(
+        source_labels=_required_unique_text_list(
+            coverage,
+            "source_labels",
+            path=f"{_FIELD_OMITTED_COVERAGE}.source_labels",
+            allow_empty=True,
+        )
+    )
+
+
+def _parse_policy_usage_audit(
+    payload: Mapping[str, JsonValue],
+) -> CompactPolicyUsageAuditV4:
+    """严格恢复 Host-derived policy usage audit。
+
+    :param payload: ``CONTEXT_COMPACTED`` payload。
+    :returns: typed policy identity 与 section actual/cap audit。
+    :raises ValueError: exact fields、文本或非负整数非法时抛出。
+    """
+
+    audit = _required_mapping(payload, _FIELD_POLICY_USAGE_AUDIT)
+    fields = frozenset(
+        (
+            "policy_ref",
+            "policy_digest",
+            "session_summary_char_actual",
+            "session_summary_char_cap",
+            "evidence_fact_item_actual",
+            "evidence_fact_item_cap",
+            "evidence_fact_char_actual",
+            "evidence_fact_char_cap",
+            "answer_anchor_item_actual",
+            "answer_anchor_item_cap",
+            "answer_anchor_char_actual",
+            "answer_anchor_char_cap",
+            "forward_intent_item_actual",
+            "forward_intent_item_cap",
+            "forward_intent_char_actual",
+            "forward_intent_char_cap",
+            "reference_continuity_item_actual",
+            "reference_continuity_item_cap",
+            "reference_continuity_char_actual",
+            "reference_continuity_char_cap",
+        )
+    )
+    _require_exact_fields(audit, fields, path=_FIELD_POLICY_USAGE_AUDIT)
+    return CompactPolicyUsageAuditV4(
+        policy_ref=_required_text(audit, "policy_ref"),
+        policy_digest=_required_text(audit, "policy_digest"),
+        session_summary_char_actual=_required_non_negative_int(
+            audit, "session_summary_char_actual"
         ),
-        answer_anchors=tuple(
-            _parse_answer_anchor(item, index=index)
-            for index, item in enumerate(
-                _required_mapping_list(
-                    candidate,
-                    _FIELD_ANSWER_ANCHORS,
-                    path=f"{_FIELD_ACCEPTED_CANDIDATE}.{_FIELD_ANSWER_ANCHORS}",
-                )
-            )
+        session_summary_char_cap=_required_non_negative_int(
+            audit, "session_summary_char_cap"
         ),
-        forward_intents=tuple(
-            _parse_forward_intent(item, index=index)
-            for index, item in enumerate(
-                _required_mapping_list(
-                    candidate,
-                    _FIELD_FORWARD_INTENTS,
-                    path=f"{_FIELD_ACCEPTED_CANDIDATE}.{_FIELD_FORWARD_INTENTS}",
-                )
-            )
+        evidence_fact_item_actual=_required_non_negative_int(
+            audit, "evidence_fact_item_actual"
         ),
-        reference_continuity_items=tuple(
-            _parse_reference(item, index=index)
-            for index, item in enumerate(
-                _required_mapping_list(
-                    candidate,
-                    _FIELD_REFERENCE_CONTINUITY_ITEMS,
-                    path=(
-                        f"{_FIELD_ACCEPTED_CANDIDATE}."
-                        f"{_FIELD_REFERENCE_CONTINUITY_ITEMS}"
-                    ),
-                )
-            )
+        evidence_fact_item_cap=_required_non_negative_int(
+            audit, "evidence_fact_item_cap"
         ),
-        diagnostics=tuple(
-            _parse_diagnostic(item, index=index)
-            for index, item in enumerate(
-                _required_mapping_list(
-                    candidate,
-                    _FIELD_DIAGNOSTICS,
-                    path=f"{_FIELD_ACCEPTED_CANDIDATE}.{_FIELD_DIAGNOSTICS}",
-                )
-            )
+        evidence_fact_char_actual=_required_non_negative_int(
+            audit, "evidence_fact_char_actual"
+        ),
+        evidence_fact_char_cap=_required_non_negative_int(
+            audit, "evidence_fact_char_cap"
+        ),
+        answer_anchor_item_actual=_required_non_negative_int(
+            audit, "answer_anchor_item_actual"
+        ),
+        answer_anchor_item_cap=_required_non_negative_int(
+            audit, "answer_anchor_item_cap"
+        ),
+        answer_anchor_char_actual=_required_non_negative_int(
+            audit, "answer_anchor_char_actual"
+        ),
+        answer_anchor_char_cap=_required_non_negative_int(
+            audit, "answer_anchor_char_cap"
+        ),
+        forward_intent_item_actual=_required_non_negative_int(
+            audit, "forward_intent_item_actual"
+        ),
+        forward_intent_item_cap=_required_non_negative_int(
+            audit, "forward_intent_item_cap"
+        ),
+        forward_intent_char_actual=_required_non_negative_int(
+            audit, "forward_intent_char_actual"
+        ),
+        forward_intent_char_cap=_required_non_negative_int(
+            audit, "forward_intent_char_cap"
+        ),
+        reference_continuity_item_actual=_required_non_negative_int(
+            audit, "reference_continuity_item_actual"
+        ),
+        reference_continuity_item_cap=_required_non_negative_int(
+            audit, "reference_continuity_item_cap"
+        ),
+        reference_continuity_char_actual=_required_non_negative_int(
+            audit, "reference_continuity_char_actual"
+        ),
+        reference_continuity_char_cap=_required_non_negative_int(
+            audit, "reference_continuity_char_cap"
         ),
     )
 
 
-def _parse_session_summary(
-    candidate: Mapping[str, JsonValue],
-) -> SessionSummaryCandidateVNext | None:
-    """恢复 nullable session summary。
+def _validate_committed_coverage(
+    semantics: ContextCompactedSemanticPayload,
+) -> None:
+    """重验 committed replacement/boundary/coverage 单一真源等式。
 
-    :param candidate: accepted candidate JSON object。
-    :returns: typed summary；持久化值为 ``null`` 时返回 ``None``。
-    :raises ValueError: summary shape 或字段非法时抛出。
+    :param semantics: 待校验 committed semantic view。
+    :returns: ``None``。
+    :raises ValueError: coverage 顺序、partition 或 candidate 派生值不一致时抛出。
     """
 
-    value = _required_value(candidate, _FIELD_SESSION_SUMMARY)
+    boundary_labels = tuple(entry.source_label for entry in semantics.source_boundary)
+    represented = semantics.represented_coverage.source_labels
+    omitted = semantics.omitted_coverage.source_labels
+    if represented != tuple(label for label in boundary_labels if label in represented):
+        raise ValueError("represented coverage must follow root boundary order")
+    if omitted != tuple(label for label in boundary_labels if label in omitted):
+        raise ValueError("omitted coverage must follow root boundary order")
+    if set(represented).intersection(omitted):
+        raise ValueError("represented and omitted coverage must be disjoint")
+    if set(represented).union(omitted) != set(boundary_labels):
+        raise ValueError("coverage must exactly partition source_boundary")
+    validate_compact_represented_coverage_replacement_binding_v4(
+        semantics.accepted_replacement,
+        semantics.represented_coverage,
+    )
+    if semantics.current_input_ref in semantics.compacted_source_refs:
+        raise ValueError("current input must not enter compacted source coverage")
+
+
+def _validate_aggregate_boundary_unique_membership(
+    semantics: ContextCompactedSemanticPayload,
+) -> None:
+    """验证 accepted aggregate 唯一且每个 ref 均属于 boundary evidence。
+
+    :param semantics: strict typed semantic payload。
+    :returns: ``None``。
+    :raises ValueError: aggregate 重复或包含 boundary 外 ref 时抛出。
+    """
+
+    available = frozenset(
+        dict.fromkeys(
+            ref
+            for entry in semantics.source_boundary
+            for ref in entry.canonical_evidence_refs
+        )
+    )
+    aggregate = semantics.accepted_evidence_mapping_refs
+    if len(aggregate) != len(set(aggregate)):
+        raise ValueError(
+            "accepted_evidence_mapping_refs must contain unique refs"
+        )
+    if any(ref not in available for ref in aggregate):
+        raise ValueError(
+            "accepted_evidence_mapping_refs must be boundary evidence subset"
+        )
+
+
+def _parse_persisted_proposal(
+    proposal: Mapping[str, JsonValue],
+) -> CompactCandidateV4:
+    """从 current persisted shape 恢复 typed proposal。
+
+    :param proposal: ``accepted_proposal`` JSON object。
+    :returns: typed accepted proposal。
+    :raises ValueError: proposal 字段、shape 或 enum 非法时抛出。
+    """
+
+    return parse_compact_candidate_v4(canonical_json_dumps(proposal))
+
+
+def _parse_accepted_replacement(
+    payload: Mapping[str, JsonValue],
+) -> CompactAcceptedReplacementV4:
+    """严格恢复 durable accepted replacement。
+
+    :param payload: ``CONTEXT_COMPACTED`` payload。
+    :returns: 自包含的 typed replacement。
+    :raises ValueError: exact fields、child shape 或逐事实 refs 非法时抛出。
+    """
+
+    replacement = _required_mapping(payload, _FIELD_ACCEPTED_REPLACEMENT)
+    _require_exact_fields(
+        replacement,
+        frozenset(
+            (
+                "session_summary",
+                "evidence_facts",
+                "answer_anchors",
+                "forward_intents",
+                "reference_continuity",
+            )
+        ),
+        path=_FIELD_ACCEPTED_REPLACEMENT,
+    )
+    return CompactAcceptedReplacementV4(
+        session_summary=_parse_replacement_summary(replacement),
+        evidence_facts=_parse_replacement_facts(replacement),
+        answer_anchors=_parse_replacement_anchors(replacement),
+        forward_intents=_parse_replacement_intents(replacement),
+        reference_continuity=_parse_replacement_references(replacement),
+    )
+
+
+def _parse_replacement_summary(
+    replacement: Mapping[str, JsonValue],
+) -> CompactSessionSummaryV4 | None:
+    """严格恢复 replacement summary。
+
+    :param replacement: accepted replacement JSON object。
+    :returns: typed summary 或 ``None``。
+    :raises ValueError: summary shape 非法时抛出。
+    """
+
+    value = _required_value(replacement, "session_summary")
     if value is None:
         return None
-    summary = _mapping_value(value, path=_FIELD_SESSION_SUMMARY)
-    _require_exact_fields(summary, _SUMMARY_FIELDS, path=_FIELD_SESSION_SUMMARY)
-    return SessionSummaryCandidateVNext(
-        summary_text=_required_text(summary, _FIELD_SUMMARY_TEXT),
+    item = _mapping_value(value, path="accepted_replacement.session_summary")
+    _require_exact_fields(
+        item,
+        frozenset(("text", "source_labels")),
+        path="accepted_replacement.session_summary",
+    )
+    return CompactSessionSummaryV4(
+        text=_required_text(item, "text"),
         source_labels=_required_unique_text_list(
-            summary,
-            _FIELD_SOURCE_LABELS,
-            path=f"{_FIELD_ACCEPTED_CANDIDATE}.{_FIELD_SESSION_SUMMARY}."
-            f"{_FIELD_SOURCE_LABELS}",
+            item,
+            "source_labels",
+            path="accepted_replacement.session_summary.source_labels",
         ),
     )
 
 
-def _parse_fact(
-    fact: Mapping[str, JsonValue],
-    *,
-    index: int,
-) -> EvidenceBackedFactCandidateVNext:
-    """恢复单个 persisted evidence-backed fact。
+def _parse_replacement_facts(
+    replacement: Mapping[str, JsonValue],
+) -> tuple[CompactAcceptedEvidenceFactV4, ...]:
+    """严格恢复 replacement fact atoms。
 
-    :param fact: fact JSON object。
-    :param index: fact ordinal。
-    :returns: typed fact candidate。
-    :raises ValueError: fact shape、未知字段、文本或 labels 非法时抛出。
+    :param replacement: accepted replacement JSON object。
+    :returns: typed fact atom tuple。
+    :raises ValueError: 任一 atom shape 或 evidence refs 非法时抛出。
     """
 
-    path = f"{_FIELD_ACCEPTED_CANDIDATE}.{_FIELD_EVIDENCE_BACKED_FACTS}[{index}]"
-    _require_exact_fields(fact, _FACT_FIELDS, path=path)
-    return EvidenceBackedFactCandidateVNext(
-        claim_text=_required_text(fact, _FIELD_CLAIM_TEXT),
-        evidence_labels=_required_unique_text_list(
-            fact,
-            _FIELD_EVIDENCE_LABELS,
-            path=f"{path}.{_FIELD_EVIDENCE_LABELS}",
-        ),
-        source_labels=_required_unique_text_list(
-            fact,
-            _FIELD_SOURCE_LABELS,
-            path=f"{path}.{_FIELD_SOURCE_LABELS}",
-            allow_empty=True,
-        ),
+    items = _required_mapping_list(
+        replacement,
+        "evidence_facts",
+        path="accepted_replacement.evidence_facts",
     )
-
-
-def _parse_answer_anchor(
-    anchor: Mapping[str, JsonValue],
-    *,
-    index: int,
-) -> AnswerAnchorCandidateVNext:
-    """恢复单个 persisted answer anchor 及完整 children。
-
-    :param anchor: answer anchor JSON object。
-    :param index: anchor ordinal。
-    :returns: typed answer anchor candidate。
-    :raises ValueError: anchor 或 child shape、文本、ordinal、labels 非法时抛出。
-    """
-
-    path = f"{_FIELD_ACCEPTED_CANDIDATE}.{_FIELD_ANSWER_ANCHORS}[{index}]"
-    _require_exact_fields(anchor, _ANCHOR_FIELDS, path=path)
-    return AnswerAnchorCandidateVNext(
-        anchor_title=_required_text(anchor, _FIELD_ANCHOR_TITLE),
-        anchor_items=tuple(
-            _parse_answer_anchor_child(item, anchor_index=index, child_index=child_index)
-            for child_index, item in enumerate(
-                _required_mapping_list(
-                    anchor,
-                    _FIELD_ANCHOR_ITEMS,
-                    path=f"{path}.{_FIELD_ANCHOR_ITEMS}",
+    result: list[CompactAcceptedEvidenceFactV4] = []
+    for index, item in enumerate(items):
+        path = f"accepted_replacement.evidence_facts[{index}]"
+        _require_exact_fields(
+            item,
+            frozenset(
+                (
+                    "claim",
+                    "selection_labels",
+                    "context_labels",
+                    "canonical_evidence_refs",
                 )
+            ),
+            path=path,
+        )
+        result.append(
+            CompactAcceptedEvidenceFactV4(
+                claim=_required_text(item, "claim"),
+                selection_labels=_required_unique_text_list(
+                    item,
+                    "selection_labels",
+                    path=f"{path}.selection_labels",
+                ),
+                context_labels=_required_unique_text_list(
+                    item,
+                    "context_labels",
+                    path=f"{path}.context_labels",
+                    allow_empty=True,
+                ),
+                canonical_evidence_refs=_required_unique_text_list(
+                    item,
+                    "canonical_evidence_refs",
+                    path=f"{path}.canonical_evidence_refs",
+                ),
             )
-        ),
-        answer_source_labels=_required_unique_text_list(
-            anchor,
-            _FIELD_ANSWER_SOURCE_LABELS,
-            path=f"{path}.{_FIELD_ANSWER_SOURCE_LABELS}",
-        ),
-    )
+        )
+    return tuple(result)
 
 
-def _parse_answer_anchor_child(
-    child: Mapping[str, JsonValue],
-    *,
-    anchor_index: int,
-    child_index: int,
-) -> AnswerAnchorChildVNext:
-    """恢复单个 persisted answer anchor child。
+def _parse_replacement_anchors(
+    replacement: Mapping[str, JsonValue],
+) -> tuple[CompactAnswerAnchorV4, ...]:
+    """严格恢复 replacement answer anchors。
 
-    :param child: child JSON object。
-    :param anchor_index: parent anchor ordinal。
-    :param child_index: child ordinal。
-    :returns: typed answer anchor child。
-    :raises ValueError: child shape、文本或 ordinal 非法时抛出。
+    :param replacement: accepted replacement JSON object。
+    :returns: typed anchor tuple。
+    :raises ValueError: 任一 anchor shape 非法时抛出。
     """
 
-    path = (
-        f"{_FIELD_ACCEPTED_CANDIDATE}.{_FIELD_ANSWER_ANCHORS}[{anchor_index}]."
-        f"{_FIELD_ANCHOR_ITEMS}[{child_index}]"
+    items = _required_mapping_list(
+        replacement,
+        "answer_anchors",
+        path="accepted_replacement.answer_anchors",
     )
-    _require_exact_fields(child, _ANCHOR_CHILD_FIELDS, path=path)
-    return AnswerAnchorChildVNext(
-        display_text=_required_text(child, _FIELD_DISPLAY_TEXT),
-        ordinal=_required_optional_non_negative_int(child, _FIELD_ORDINAL),
-    )
+    result: list[CompactAnswerAnchorV4] = []
+    for index, item in enumerate(items):
+        path = f"accepted_replacement.answer_anchors[{index}]"
+        _require_exact_fields(
+            item,
+            frozenset(("title", "detail", "source_labels")),
+            path=path,
+        )
+        result.append(
+            CompactAnswerAnchorV4(
+                title=_required_text(item, "title"),
+                detail=_required_text(item, "detail"),
+                source_labels=_required_unique_text_list(
+                    item,
+                    "source_labels",
+                    path=f"{path}.source_labels",
+                ),
+            )
+        )
+    return tuple(result)
 
 
-def _parse_forward_intent(
-    intent: Mapping[str, JsonValue],
-    *,
-    index: int,
-) -> ForwardIntentCandidateVNext:
-    """恢复单个 persisted forward intent。
+def _parse_replacement_intents(
+    replacement: Mapping[str, JsonValue],
+) -> tuple[CompactForwardIntentV4, ...]:
+    """严格恢复 replacement forward intents。
 
-    :param intent: forward intent JSON object。
-    :param index: intent ordinal。
-    :returns: typed forward intent candidate。
-    :raises ValueError: shape、enum、文本或 labels 非法时抛出。
+    :param replacement: accepted replacement JSON object。
+    :returns: typed intent tuple。
+    :raises ValueError: 任一 intent shape 或 enum 非法时抛出。
     """
 
-    path = f"{_FIELD_ACCEPTED_CANDIDATE}.{_FIELD_FORWARD_INTENTS}[{index}]"
-    _require_exact_fields(intent, _FORWARD_INTENT_FIELDS, path=path)
-    return ForwardIntentCandidateVNext(
-        intent_type=ForwardIntentTypeVNext(
-            _required_text(intent, _FIELD_INTENT_TYPE)
-        ),
-        text=_required_text(intent, _FIELD_TEXT),
-        status=ForwardIntentStatusVNext(_required_text(intent, _FIELD_STATUS)),
-        source_labels=_required_unique_text_list(
-            intent,
-            _FIELD_SOURCE_LABELS,
-            path=f"{path}.{_FIELD_SOURCE_LABELS}",
-        ),
+    items = _required_mapping_list(
+        replacement,
+        "forward_intents",
+        path="accepted_replacement.forward_intents",
     )
+    result: list[CompactForwardIntentV4] = []
+    for index, item in enumerate(items):
+        path = f"accepted_replacement.forward_intents[{index}]"
+        _require_exact_fields(
+            item,
+            frozenset(("intent_type", "text", "status", "source_labels")),
+            path=path,
+        )
+        result.append(
+            CompactForwardIntentV4(
+                intent_type=_required_text(item, "intent_type"),
+                text=_required_text(item, "text"),
+                status=CompactForwardIntentStatusV4(
+                    _required_text(item, "status")
+                ),
+                source_labels=_required_unique_text_list(
+                    item,
+                    "source_labels",
+                    path=f"{path}.source_labels",
+                ),
+            )
+        )
+    return tuple(result)
 
 
-def _parse_reference(
-    reference: Mapping[str, JsonValue],
-    *,
-    index: int,
-) -> ReferenceContinuityCandidateVNext:
-    """恢复单个 persisted reference continuity item。
+def _parse_replacement_references(
+    replacement: Mapping[str, JsonValue],
+) -> tuple[CompactReferenceContinuityV4, ...]:
+    """严格恢复 replacement continuity items。
 
-    :param reference: reference item JSON object。
-    :param index: item ordinal。
-    :returns: typed reference continuity candidate。
-    :raises ValueError: shape、reason、文本或 labels 非法时抛出。
+    :param replacement: accepted replacement JSON object。
+    :returns: typed reference tuple。
+    :raises ValueError: 任一 item shape 非法时抛出。
     """
 
-    path = (
-        f"{_FIELD_ACCEPTED_CANDIDATE}."
-        f"{_FIELD_REFERENCE_CONTINUITY_ITEMS}[{index}]"
+    items = _required_mapping_list(
+        replacement,
+        "reference_continuity",
+        path="accepted_replacement.reference_continuity",
     )
-    _require_exact_fields(reference, _REFERENCE_FIELDS, path=path)
-    return ReferenceContinuityCandidateVNext(
-        text=_required_text(reference, _FIELD_TEXT),
-        reason=ReferenceContinuityReasonVNext(
-            _required_text(reference, _FIELD_REASON)
-        ),
-        source_labels=_required_unique_text_list(
-            reference,
-            _FIELD_SOURCE_LABELS,
-            path=f"{path}.{_FIELD_SOURCE_LABELS}",
-        ),
-    )
-
-
-def _parse_diagnostic(
-    diagnostic: Mapping[str, JsonValue],
-    *,
-    index: int,
-) -> CompactCandidateDiagnosticVNext:
-    """恢复单个 persisted compact diagnostic。
-
-    :param diagnostic: diagnostic JSON object。
-    :param index: diagnostic ordinal。
-    :returns: typed diagnostic candidate。
-    :raises ValueError: shape、文本或 labels 非法时抛出。
-    """
-
-    path = f"{_FIELD_ACCEPTED_CANDIDATE}.{_FIELD_DIAGNOSTICS}[{index}]"
-    _require_exact_fields(diagnostic, _DIAGNOSTIC_FIELDS, path=path)
-    return CompactCandidateDiagnosticVNext(
-        code=_required_text(diagnostic, _FIELD_CODE),
-        text=_required_text(diagnostic, _FIELD_TEXT),
-        source_labels=_required_unique_text_list(
-            diagnostic,
-            _FIELD_SOURCE_LABELS,
-            path=f"{path}.{_FIELD_SOURCE_LABELS}",
-            allow_empty=True,
-        ),
-    )
+    result: list[CompactReferenceContinuityV4] = []
+    for index, item in enumerate(items):
+        path = f"accepted_replacement.reference_continuity[{index}]"
+        _require_exact_fields(
+            item,
+            frozenset(("text", "reason", "source_labels")),
+            path=path,
+        )
+        result.append(
+            CompactReferenceContinuityV4(
+                text=_required_text(item, "text"),
+                reason=_required_text(item, "reason"),
+                source_labels=_required_unique_text_list(
+                    item,
+                    "source_labels",
+                    path=f"{path}.source_labels",
+                ),
+            )
+        )
+    return tuple(result)
 
 
 def accepted_evidence_mapping_refs(
@@ -503,57 +786,47 @@ def accepted_evidence_mapping_refs(
     )
 
 
-def accepted_candidate_fact_evidence_labels(
-    payload: Mapping[str, JsonValue],
-) -> tuple[str, ...]:
-    """读取 vNext accepted candidate 中 fact 引用的 evidence labels。
-
-    :param payload: ``CONTEXT_COMPACTED`` vNext payload。
-    :returns: 去重后的 evidence labels。
-    :raises ValueError: accepted candidate 结构非法时抛出。
-    """
-
-    candidate = parse_context_compacted_semantic_payload(payload).accepted_candidate
-    labels: list[str] = []
-    for fact in candidate.evidence_backed_facts:
-        labels.extend(fact.evidence_labels)
-    return tuple(dict.fromkeys(labels))
-
-
 def compact_artifact_json_vnext(
     *,
     request: CompactionRequest,
-    candidate: ConversationCompactOutputVNext,
-    quality: CompactQualityCheckResultVNext,
+    accepted_truth: CompactAcceptedTruthV4,
     policy_digest: str,
     budget_after_compact: int,
 ) -> JsonValue:
     """构造 vNext compact artifact canonical JSON。
 
     :param request: compaction request。
-    :param candidate: accepted vNext candidate。
-    :param quality: accepted vNext quality result。
+    :param accepted_truth: Context Governance final accepted truth。
     :param policy_digest: policy digest。
     :param budget_after_compact: Host 估算的 compact 后预算。
     :returns: artifact JSON object。
     """
 
+    proposal = accepted_truth.proposal
+    replacement = accepted_truth.replacement
     return {
         "artifact_kind": COMPACT_ARTIFACT_KIND_VNEXT,
         "schema_version": COMPACT_ARTIFACT_SCHEMA_VERSION_VNEXT,
         "compaction_request_digest": request.digest(),
-        "accepted_candidate_digest": candidate.digest(),
-        "accepted_candidate": candidate.to_json(),
-        "quality_result": quality.to_json(),
+        "accepted_proposal_digest": proposal.digest(),
+        "accepted_proposal": proposal.to_json(),
+        "accepted_replacement": replacement.to_json(),
+        "source_boundary": [
+            entry.to_internal_json() for entry in accepted_truth.source_boundary
+        ],
+        "represented_coverage": accepted_truth.represented_coverage.to_json(),
+        "omitted_coverage": accepted_truth.omitted_coverage.to_json(),
+        "policy_usage_audit": accepted_truth.policy_usage_audit.to_json(),
         "budget_before_compact": _budget_before_compact_json(request),
         "budget_after_compact": budget_after_compact,
         "input_snapshot_refs": _input_snapshot_refs_json_vnext(request),
-        "prompt_local_label_mapping_refs": list(
-            prompt_local_label_mapping_refs(request)
-        ),
-        "source_boundary_refs": list(source_boundary_refs(request)),
+        "prompt_local_label_mapping_refs": list(prompt_local_label_mapping_refs(request)),
+        "source_boundary_refs": [
+            accepted_truth.current_input_ref,
+            *accepted_truth.covered_source_refs,
+        ],
         "accepted_evidence_mapping_refs": list(
-            accepted_evidence_mapping_refs_for_candidate(request, candidate)
+            replacement.canonical_evidence_refs
         ),
         "policy_digest": policy_digest,
     }
@@ -575,14 +848,14 @@ def compact_artifact_payload_ref(artifact_digest: str) -> str:
 def compact_artifact_descriptor_metadata_vnext(
     *,
     request: CompactionRequest,
-    candidate: ConversationCompactOutputVNext,
+    accepted_truth: CompactAcceptedTruthV4,
     artifact_digest: str,
     policy_digest: str,
 ) -> Mapping[str, JsonValue]:
     """构造 vNext compact artifact descriptor metadata。
 
     :param request: compaction request。
-    :param candidate: accepted vNext candidate。
+    :param accepted_truth: Context Governance final accepted truth。
     :param artifact_digest: artifact digest。
     :param policy_digest: policy digest。
     :returns: metadata JSON object。
@@ -593,7 +866,7 @@ def compact_artifact_descriptor_metadata_vnext(
         "schema_version": COMPACT_ARTIFACT_SCHEMA_VERSION_VNEXT,
         "artifact_digest": artifact_digest,
         "compaction_request_digest": request.digest(),
-        "accepted_candidate_digest": candidate.digest(),
+        "accepted_proposal_digest": accepted_truth.proposal.digest(),
         "policy_digest": policy_digest,
     }
 
@@ -611,47 +884,6 @@ def prompt_local_label_mapping_refs(request: CompactionRequest) -> tuple[str, ..
     return tuple(refs)
 
 
-def source_boundary_refs(request: CompactionRequest) -> tuple[str, ...]:
-    """返回 compact source boundary refs。
-
-    :param request: compaction request。
-    :returns: source boundary refs。
-    """
-
-    return tuple(
-        dict.fromkeys(
-            (
-                request.current_input_ref,
-                *request.material_source_refs,
-                *request.canonical_evidence_refs,
-                *request.evidence_backed_fact_refs,
-            )
-        )
-    )
-
-
-def accepted_evidence_mapping_refs_for_candidate(
-    request: CompactionRequest,
-    candidate: ConversationCompactOutputVNext,
-) -> tuple[str, ...]:
-    """返回 accepted vNext fact candidate 绑定的 canonical evidence refs。
-
-    :param request: compaction request。
-    :param candidate: accepted vNext candidate。
-    :returns: canonical evidence refs。
-    """
-
-    evidence_labels: list[str] = []
-    for fact in candidate.evidence_backed_facts:
-        evidence_labels.extend(fact.evidence_labels)
-    refs: list[str] = []
-    for label in dict.fromkeys(evidence_labels):
-        entry = request.material_pack.provenance_map[label]
-        if entry.accepted_evidence_id is not None:
-            refs.append(entry.accepted_evidence_id)
-    return tuple(dict.fromkeys(refs))
-
-
 def _budget_before_compact_json(request: CompactionRequest) -> JsonValue:
     """构造 compact 前预算 JSON。
 
@@ -667,9 +899,7 @@ def _budget_before_compact_json(request: CompactionRequest) -> JsonValue:
         "hard_threshold_tokens": estimate.hard_threshold_tokens,
         "safety_margin_tokens": estimate.safety_margin_tokens,
         "estimator_digest": estimate.estimator_digest,
-        "overage_reason": (
-            None if estimate.overage_reason is None else estimate.overage_reason.value
-        ),
+        "overage_reason": (None if estimate.overage_reason is None else estimate.overage_reason.value),
     }
 
 
@@ -693,9 +923,7 @@ def _input_snapshot_refs_json_vnext(request: CompactionRequest) -> JsonValue:
     }
 
 
-def _required_mapping(
-    payload: Mapping[str, JsonValue], field_name: str
-) -> Mapping[str, JsonValue]:
+def _required_mapping(payload: Mapping[str, JsonValue], field_name: str) -> Mapping[str, JsonValue]:
     """读取必填 JSON object 字段。
 
     :param payload: JSON payload。
@@ -776,6 +1004,24 @@ def _required_optional_non_negative_int(
         return None
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise ValueError(f"{field_name} must be non-negative integer or null")
+    return value
+
+
+def _required_non_negative_int(
+    payload: Mapping[str, JsonValue],
+    field_name: str,
+) -> int:
+    """读取必填 non-negative integer 字段。
+
+    :param payload: JSON object。
+    :param field_name: 字段名。
+    :returns: 非负整数。
+    :raises ValueError: 字段缺失、不是 integer、为 bool 或为负数时抛出。
+    """
+
+    value = _required_value(payload, field_name)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"{field_name} must be non-negative integer")
     return value
 
 

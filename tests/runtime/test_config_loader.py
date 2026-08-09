@@ -18,6 +18,7 @@ from dayu.runtime.config_loader import (
     ConfigShapeError,
     RunnerOptionHintConfig,
     RuntimeConfig,
+    StructuredOutputCapabilityConfig,
     config_file_names,
     default_fallback_prompt,
     load_runtime_config,
@@ -89,6 +90,7 @@ def _base_model_record(*, endpoint: str) -> dict[str, JsonValue]:
         "supports_tool_calling": True,
         "supports_stream": True,
         "supports_stream_usage": False,
+        "structured_output_capability": "none",
         "default_timeout_seconds": 10.0,
         "max_retries": 1,
         "sse_idle_timeout_seconds": 20.0,
@@ -995,6 +997,47 @@ def test_single_extends_chain_resolves_to_complete_typed_record(tmp_path: Path) 
     assert final.endpoint == "https://final.example/chat"
     compact = final.runtime_hints.runner_option_hints["conversation_compaction"]
     assert compact.stream is False
+    assert (
+        final.structured_output_capability
+        is StructuredOutputCapabilityConfig.NONE
+    )
+
+
+def test_model_structured_output_capability_is_required(tmp_path: Path) -> None:
+    """模型 base record 缺失 structured-output capability 必须 fail fast。"""
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    model = _base_model_record(endpoint="https://package.example/chat")
+    del model["structured_output_capability"]
+    _write_json(
+        package_root / "models.json",
+        {"models": {"base-model": model}},
+    )
+
+    with pytest.raises(
+        ConfigFieldError,
+        match="structured_output_capability",
+    ):
+        ConfigLoader(package_config_dir=package_root).load_models()
+
+
+def test_model_structured_output_capability_rejects_unknown_enum(
+    tmp_path: Path,
+) -> None:
+    """模型 structured-output capability 必须属于封闭枚举。"""
+
+    package_root = tmp_path / "package"
+    _minimal_package_config(package_root)
+    model = _base_model_record(endpoint="https://package.example/chat")
+    model["structured_output_capability"] = "provider_magic"
+    _write_json(
+        package_root / "models.json",
+        {"models": {"base-model": model}},
+    )
+
+    with pytest.raises(ConfigFieldError, match="unsupported structured output"):
+        ConfigLoader(package_config_dir=package_root).load_models()
 
 
 def test_extends_cycle_fails_fast(tmp_path: Path) -> None:

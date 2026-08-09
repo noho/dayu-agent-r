@@ -18,6 +18,8 @@ from typing import Protocol
 
 from dayu.contracts.json_value import JsonValue
 from dayu.host._event_payload import payload_object
+from dayu.host.context_event_payload import resolve_context_compacted_payload
+from dayu.host.context_events import CONTEXT_COMPACTED
 from dayu.host.durable.codec import format_utc_timestamp
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.event_log import (
@@ -625,7 +627,7 @@ class ProjectionRunner:
             )
         row = page.rows[0]
         try:
-            event = projection_event_view_from_row(row)
+            event = projection_event_view_from_row(transaction, row)
         except HostDurableError as exc:
             raise _ProjectionEventViewFailed(row, exc) from exc
         try:
@@ -685,12 +687,18 @@ class ProjectionRunner:
         )
 
 
-def projection_event_view_from_row(row: EventLogRow) -> ProjectionEventView:
+def projection_event_view_from_row(
+    transaction: HostTransaction,
+    row: EventLogRow,
+) -> ProjectionEventView:
     """把 EventLogRow 转换为 typed ProjectionEventView。
 
+    :param transaction: 当前 Host transaction，用于严格解析 descriptor-backed
+        payload。
     :param row: EventLog durable row。
     :returns: typed projection event view。
-    :raises HostDurableError: EventLog payload JSON 非法或不是 JSON mapping 时抛出。
+    :raises HostDurableError: EventLog inline payload 非法，或 descriptor-backed
+        ``CONTEXT_COMPACTED`` ref/digest/blob 无法严格解析时抛出。
     """
 
     return ProjectionEventView(
@@ -705,7 +713,11 @@ def projection_event_view_from_row(row: EventLogRow) -> ProjectionEventView:
         occurred_at=row.occurred_at,
         payload_ref=row.payload_ref,
         payload_digest=row.payload_digest,
-        payload=payload_object(row),
+        payload=(
+            resolve_context_compacted_payload(transaction, row)
+            if row.event_type == CONTEXT_COMPACTED
+            else payload_object(row)
+        ),
     )
 
 

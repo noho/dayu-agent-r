@@ -814,9 +814,10 @@ def test_tool_trace_excludes_internal_effective_execution_value(
             )
         )
 
-        assert not consumer.event_filter.matches(
-            projection_event_view_from_row(row)
+        event = store.transaction_runner.run_read(
+            lambda transaction: projection_event_view_from_row(transaction, row)
         )
+        assert not consumer.event_filter.matches(event)
         _run_trace_once(store.transaction_runner, cold_path)
 
         hot_row = store.transaction_runner.run_read(
@@ -936,7 +937,9 @@ def test_tool_trace_direct_request_row_corruption_fails_closed(
             store.transaction_runner,
             corruption=corruption,
         )
-        event = projection_event_view_from_row(row)
+        event = store.transaction_runner.run_read(
+            lambda transaction: projection_event_view_from_row(transaction, row)
+        )
         if corruption is _RequestedRowCorruption.WRONG_EVENT_TYPE:
             event = replace(event, event_type="TOOL_CALL_REQUESTED")
         if corruption is _RequestedRowCorruption.MISSING_ROW:
@@ -996,7 +999,7 @@ def test_tool_trace_canonical_result_without_llm_material_fails_closed(
             store.transaction_runner.run_write(
                 lambda transaction: consumer.apply_event(
                     transaction,
-                    projection_event_view_from_row(result),
+                    projection_event_view_from_row(transaction, result),
                 )
             )
         hot_row = store.transaction_runner.run_read(
@@ -1900,7 +1903,7 @@ def test_tool_trace_rejects_malformed_tool_timing_signal(
             store.transaction_runner.run_write(
                 lambda transaction: consumer.apply_event(
                     transaction,
-                    projection_event_view_from_row(event),
+                    projection_event_view_from_row(transaction, event),
                 )
             )
 
@@ -1969,7 +1972,7 @@ def test_tool_trace_rejects_malformed_failure_metadata_signal(
             store.transaction_runner.run_write(
                 lambda transaction: consumer.apply_event(
                     transaction,
-                    projection_event_view_from_row(event),
+                    projection_event_view_from_row(transaction, event),
                 )
             )
 
@@ -2057,7 +2060,7 @@ def test_tool_trace_rejects_malformed_partial_tool_call_signal(
             store.transaction_runner.run_write(
                 lambda transaction: consumer.apply_event(
                     transaction,
-                    projection_event_view_from_row(event),
+                    projection_event_view_from_row(transaction, event),
                 )
             )
 
@@ -2301,7 +2304,7 @@ def test_tool_trace_rejects_non_object_summary_signal_fields(
             store.transaction_runner.run_write(
                 lambda transaction: consumer.apply_event(
                     transaction,
-                    projection_event_view_from_row(event),
+                    projection_event_view_from_row(transaction, event),
                 )
             )
 
@@ -2388,7 +2391,7 @@ def test_tool_trace_resolves_large_tool_call_arguments_without_internal_refs(
 
 
 def test_tool_trace_projects_runner_call_manifest_signal(tmp_path: Path) -> None:
-    """Tool Trace hot row 只复制 shared owner 校验后的 fixed scalars。"""
+    """Tool Trace 透传治理收口 trigger，且不从中反推精确 outcome。"""
 
     cold_path = tmp_path / "trace" / "runner-call.jsonl"
     manifest_digest = sha256_digest_json({"manifest": "runner-call"})
@@ -2405,8 +2408,8 @@ def test_tool_trace_projects_runner_call_manifest_signal(tmp_path: Path) -> None
                 "attempt_id": "attempt-1",
                 "execution_id": "execution-1",
                 "runner_call_index": 0,
-                "runner_call_kind": "initial_user_dispatch",
-                "runner_call_trigger_reason": "initial_user_input",
+                "runner_call_kind": "post_compaction_dispatch",
+                "runner_call_trigger_reason": "context_governance_resolved",
                 "iteration_id": "iteration-1",
                 "iteration_index": 0,
                 "manifest_payload_ref": "payload-runner-call-manifest",
@@ -2443,12 +2446,19 @@ def test_tool_trace_projects_runner_call_manifest_signal(tmp_path: Path) -> None
         assert row is not None
         assert row.result_digest == manifest_digest
         assert row.trace_summary["runner_call_index"] == 0
+        assert row.trace_summary["runner_call_kind"] == "post_compaction_dispatch"
+        assert row.trace_summary["runner_call_trigger_reason"] == (
+            "context_governance_resolved"
+        )
         assert row.trace_summary["manifest_ref"] == "payload-runner-call-manifest"
         assert row.trace_summary["manifest_digest"] == manifest_digest
         assert row.trace_summary["message_count"] == 2
         assert row.trace_summary["role_sequence_digest"] == role_digest
         assert row.trace_summary["input_projection_digest"] == projection_digest
         assert "projector_metadata_summary" not in row.trace_summary
+        assert "context_compaction_outcome" not in row.trace_summary
+        assert "compact_artifact_ref" not in row.trace_summary
+        assert "fallback_action" not in row.trace_summary
         assert row.trace_summary["diagnostic"] == {
             "status": "complete",
             "reason": None,
@@ -2585,7 +2595,7 @@ def test_tool_trace_rejects_non_complete_runner_call_without_diagnostic(
             store.transaction_runner.run_write(
                 lambda transaction: consumer.apply_event(
                     transaction,
-                    projection_event_view_from_row(event),
+                    projection_event_view_from_row(transaction, event),
                 )
             )
 
@@ -2808,7 +2818,7 @@ def test_tool_trace_projection_rejects_non_text_client_correlation_id(
             store.transaction_runner.run_write(
                 lambda transaction: consumer.apply_event(
                     transaction,
-                    projection_event_view_from_row(event),
+                    projection_event_view_from_row(transaction, event),
                 )
             )
 

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from dayu.engine.contracts.structured_output import StructuredOutputCapability
+
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 
 import pytest
+import dayu.host.durable.tool_trace as tool_trace_module
 
 from dayu.contracts.json_value import JsonValue
 from dayu.engine.contracts.agent_policy import AgentPolicy
@@ -20,6 +23,11 @@ from dayu.engine.contracts.runner_spec import (
     ClientCorrelationPolicy,
     RunnerCallOptions,
     RunnerSpec,
+)
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
 )
 from dayu.host._runner_call_manifest import (
     RunnerCallHotAtoms,
@@ -37,6 +45,7 @@ from dayu.host.durable.event_log import (
     EventLogAppendRequest,
     EventLogRow,
     append_event,
+    read_run_events_by_types_page,
 )
 from dayu.host.durable.payload import (
     PayloadStore,
@@ -49,9 +58,13 @@ from dayu.host.durable.options import (
     PayloadStoragePolicy,
 )
 from dayu.host.durable.tool_trace import (
+    CompactorResponseDisposition,
+    ResolvedCompactorEvidenceFact,
+    ResolvedCompactorResponseIdentity,
     RunnerCallReconstructionConsumerBoundary,
     RunnerCallReconstructionDiagnosticReason,
     RunnerCallReconstructionMissingRefKind,
+    RunnerCallReconstructionSignal,
     RunnerCallReconstructionStatus,
     find_tool_trace_by_diagnostic_ref,
     find_tool_trace_by_provider_request_id,
@@ -61,6 +74,19 @@ from dayu.host.durable.tool_trace import (
     read_tool_trace_page,
     resolve_runner_call_projection_from_signal,
     resolve_tool_trace_hot_row_payloads,
+)
+from dayu.host.context_events import (
+    CONTEXT_COMPACTED,
+    CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+    CompactorProposalManifestReference,
+    build_context_compacted_payload,
+    build_context_compaction_attempt_rejected_payload,
+)
+from dayu.host.compaction import (
+    COMPACT_OUTPUT_SCHEMA_V4,
+    CompactCandidateV4,
+    CompactEvidenceFactV4,
+    CompactSessionSummaryV4,
 )
 from dayu.host.durable.state import (
     AttemptRow,
@@ -98,6 +124,7 @@ from dayu.host.tool_call_request import (
     build_tool_call_requested_event_request,
 )
 from tests.host.fake_cancellation import ControllableCancellationToken
+from tests.host.fake_compaction import accepted_truth_for_candidate
 
 _FIXED_NOW = datetime(2026, 5, 29, 3, 4, 5, tzinfo=UTC)
 _FIELD_CONTEXT_PRESSURE = "context_pressure"
@@ -121,6 +148,43 @@ class _ManifestTamperKind(StrEnum):
     UNKNOWN_PURPOSE = "unknown_purpose"
     UNKNOWN_SCHEMA_VERSION = "unknown_schema_version"
     HOT_IDENTITY_MISMATCH = "hot_identity_mismatch"
+
+
+class _NonAdvancingTerminalPageReader:
+    """始终返回同一 full page 的损坏 keyset reader。"""
+
+    def __init__(self, row: EventLogRow) -> None:
+        """保存将被重复返回的 canonical row。
+
+        :param row: 第一次查询合法、后续查询不推进的 row。
+        :returns: ``None``。
+        :raises: 无。
+        """
+
+        self._row = row
+
+    def __call__(
+        self,
+        transaction: HostTransaction,
+        *,
+        run_id: str,
+        event_types: tuple[str, ...],
+        after_event_sequence: int,
+        limit: int,
+    ) -> tuple[EventLogRow, ...]:
+        """忽略 cursor 并重复返回同一 row。
+
+        :param transaction: 未使用的 read transaction。
+        :param run_id: 未使用的 parent Run id。
+        :param event_types: 未使用的 terminal types。
+        :param after_event_sequence: 未使用的 keyset cursor。
+        :param limit: 未使用的 page size。
+        :returns: 单 row full page。
+        :raises: 无。
+        """
+
+        del transaction, run_id, event_types, after_event_sequence, limit
+        return (self._row,)
 
 
 def _options(tmp_path: Path) -> HostDurableStoreOptions:
@@ -484,6 +548,7 @@ def _full_runner_call_manifest(
     projection_digest: str | None = None,
     projection_size_bytes: int | None = None,
     diagnostic: Mapping[str, JsonValue] | None = None,
+    compactor_identity: Mapping[str, JsonValue] | None = None,
 ) -> Mapping[str, JsonValue]:
     """构造覆盖完整字段与 metadata graph 的 runner-call manifest。
 
@@ -500,6 +565,7 @@ def _full_runner_call_manifest(
     :param projection_digest: 可选 input projection digest。
     :param projection_size_bytes: 可选 input projection size。
     :param diagnostic: 非 complete manifest diagnostic；complete 时为 ``None``。
+    :param compactor_identity: compactor proposal 的完整 typed identity JSON。
     :returns: full runner-call manifest JSON object。
     :raises AssertionError: projection descriptor 只提供一部分时抛出。
     """
@@ -508,17 +574,23 @@ def _full_runner_call_manifest(
     assert all(value is None for value in projection_values) or all(
         value is not None for value in projection_values
     )
-    purpose = (
-        "tool_continuation_input"
-        if runner_call_kind == "tool_result_continuation"
-        else "ordinary_run_input"
-    )
+    purpose = "ordinary_run_input"
+    if runner_call_kind == "tool_result_continuation":
+        purpose = "tool_continuation_input"
+    elif runner_call_kind == "compactor_proposal":
+        purpose = "compactor_proposal_input"
     projector_ids = {
         "system": "run_input_system_context",
         "user": "user_input_message",
         "assistant": "assistant_history_message",
         "tool": "tool_result_message",
     }
+    if runner_call_kind == "compactor_proposal":
+        projector_ids = {
+            **projector_ids,
+            "system": "compactor_system_prompt",
+            "user": "compactor_user_prompt",
+        }
     metadata: list[JsonValue] = []
     message_entries: list[JsonValue] = []
     for index, role in enumerate(roles):
@@ -582,7 +654,7 @@ def _full_runner_call_manifest(
         "compact_artifact_refs": [],
         "context_fallback_decision_ref": None,
         "projector_metadata": metadata,
-        "compactor_identity": None,
+        "compactor_identity": compactor_identity,
         "sizing_snapshot": {
             "status": "unavailable",
             "reason": "context_policy_unavailable",
@@ -678,6 +750,252 @@ def _hot_payload_for_manifest(
             diagnostic=diagnostic,
         ),
         manifest=manifest,
+    )
+
+
+def _record_compactor_runner_call(
+    transaction_runner: HostTransactionRunner,
+    tmp_path: Path,
+    *,
+    operation_id: str = "operation-1",
+    attempt_number: int = 1,
+    compactor_engine_run_id: str = "compactor-engine-run-1",
+) -> tuple[RunnerCallReconstructionSignal, str, str]:
+    """写入可由 production resolver 解析的 compactor runner-call signal。
+
+    :param transaction_runner: Host durable transaction runner。
+    :param tmp_path: pytest 临时目录。
+    :param operation_id: compaction operation id。
+    :param attempt_number: proposal attempt 序号。
+    :param compactor_engine_run_id: compactor Engine run id。
+    :returns: ``(signal, manifest_ref, manifest_digest)``。
+    :raises HostDurableError: production manifest/query owner 拒绝 fixture 时抛出。
+    """
+
+    projection_payload: Mapping[str, JsonValue] = {
+        "schema_version": "runner_call_input_projection.v1",
+        "messages": [],
+    }
+    projection_ref = f"payload-projection:{operation_id}:{attempt_number}"
+    projection_digest = sha256_digest_json(projection_payload)
+    manifest_ref = f"payload-manifest:{operation_id}:{attempt_number}"
+    manifest_value = dict(
+        _full_runner_call_manifest(
+            manifest_id=f"manifest:{operation_id}:{attempt_number}",
+            runner_call_index=attempt_number - 1,
+            runner_call_kind="compactor_proposal",
+            runner_call_trigger_reason="context_compaction_initial_proposal",
+            roles=(),
+            projection_ref=projection_ref,
+            projection_digest=projection_digest,
+            projection_size_bytes=len(
+                canonical_json_dumps(projection_payload).encode("utf-8")
+            ),
+            compactor_identity={
+                "parent_host_run_id": "run-1",
+                "parent_session_id": "session-1",
+                "compaction_operation_id": operation_id,
+                "compactor_engine_run_id": compactor_engine_run_id,
+                "compaction_attempt_number": attempt_number,
+                "compaction_request_digest": sha256_digest_json(
+                    {
+                        "operation_id": operation_id,
+                        "attempt_number": attempt_number,
+                    }
+                ),
+                "compactor_input_projection_ref": projection_ref,
+            },
+        )
+    )
+    manifest_value["sizing_snapshot"] = {
+        "status": "not_applicable",
+        "reason": None,
+        "sizing_stage": None,
+        "estimator_id": None,
+        "estimator_version": None,
+        "estimator_digest": None,
+        "conservative_input_tokens": None,
+        "context_window_size": None,
+        "provider": None,
+        "model": None,
+        "request_semantics_digest": None,
+        "input_snapshot_digest": None,
+        "policy_ref": None,
+        "policy_snapshot_digest": None,
+    }
+    manifest: Mapping[str, JsonValue] = manifest_value
+    manifest_digest = sha256_digest_json(manifest)
+    transaction_runner.run_write(
+        lambda transaction: (
+            _write_json_payload(
+                transaction,
+                payload_ref=projection_ref,
+                payload_id=f"sqlite-projection:{operation_id}:{attempt_number}",
+                payload=projection_payload,
+            ),
+            _write_json_payload(
+                transaction,
+                payload_ref=manifest_ref,
+                payload_id=f"sqlite-manifest:{operation_id}:{attempt_number}",
+                payload=manifest,
+            ),
+        )
+    )
+    event_id = f"event-runner-call:{operation_id}:{attempt_number}"
+    _append_event(
+        transaction_runner,
+        event_id=event_id,
+        event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+        payload=_hot_payload_for_manifest(manifest, manifest_ref=manifest_ref),
+        payload_ref=manifest_ref,
+        payload_digest=manifest_digest,
+    )
+    _catch_up(transaction_runner, tmp_path)
+    page = transaction_runner.run_read(
+        lambda transaction: read_runner_call_reconstruction_signals_by_run(
+            transaction,
+            "run-1",
+            after_event_sequence=0,
+            limit=10,
+        )
+    )
+    signal = next(item for item in page.signals if item.event_id == event_id)
+    return signal, manifest_ref, manifest_digest
+
+
+def _successful_compactor_response_identity(
+    compactor_engine_run_id: str,
+    *,
+    provider_request_id: str | None = "provider-request-actual",
+) -> SuccessfulRunnerResponseIdentity:
+    """构造 actual provider/model/request identity 测试事实。
+
+    :param compactor_engine_run_id: manifest 绑定的 compactor Engine run id。
+    :param provider_request_id: provider-native request id；``None`` 表示不可用。
+    :returns: strict successful response identity。
+    :raises ValueError: typed identity 字段非法时抛出。
+    """
+
+    return SuccessfulRunnerResponseIdentity(
+        effective_provider="provider-actual",
+        effective_model="model-actual",
+        runner_request_identity=build_runner_request_identity(
+            run_id=compactor_engine_run_id,
+            attempt_id=None,
+            execution_id=None,
+            iteration_id="iteration-final",
+            iteration_index=1,
+            runner_call_index=2,
+        ),
+        provider_request_id_availability=(
+            ProviderRequestIdAvailability.UNAVAILABLE
+            if provider_request_id is None
+            else ProviderRequestIdAvailability.PRESENT
+        ),
+        provider_request_id=provider_request_id,
+    )
+
+
+def _proposal_manifest_reference(
+    *,
+    operation_id: str,
+    attempt_number: int,
+    compactor_engine_run_id: str,
+    manifest_ref: str,
+    manifest_digest: str,
+) -> CompactorProposalManifestReference:
+    """构造与 resolver fixture exact binding 的 manifest reference。
+
+    :param operation_id: compaction operation id。
+    :param attempt_number: proposal attempt 序号。
+    :param compactor_engine_run_id: compactor Engine run id。
+    :param manifest_ref: manifest descriptor ref。
+    :param manifest_digest: manifest body digest。
+    :returns: canonical event builder 所需 typed reference。
+    :raises ValueError: typed reference 字段非法时抛出。
+    """
+
+    return CompactorProposalManifestReference(
+        manifest_event_id=f"event-runner-call:{operation_id}:{attempt_number}",
+        manifest_payload_ref=manifest_ref,
+        manifest_digest=manifest_digest,
+        compactor_input_projection_ref=(
+            f"payload-projection:{operation_id}:{attempt_number}"
+        ),
+        compactor_input_projection_digest=sha256_digest_json(
+            {"schema_version": "runner_call_input_projection.v1", "messages": []}
+        ),
+        compaction_operation_id=operation_id,
+        compaction_attempt_number=attempt_number,
+        compactor_engine_run_id=compactor_engine_run_id,
+    )
+
+
+def _accepted_compactor_payload(
+    *,
+    operation_id: str,
+    attempt_number: int,
+    compactor_engine_run_id: str,
+    manifest_ref: str,
+    manifest_digest: str,
+) -> Mapping[str, JsonValue]:
+    """通过 production owners 构造 accepted compact terminal payload。
+
+    :param operation_id: compaction operation id。
+    :param attempt_number: proposal attempt 序号。
+    :param compactor_engine_run_id: compactor Engine run id。
+    :param manifest_ref: proposal manifest ref。
+    :param manifest_digest: proposal manifest digest。
+    :returns: strict ``CONTEXT_COMPACTED`` payload。
+    :raises RuntimeError: candidate 无法通过 production governance 时抛出。
+    """
+
+    candidate = CompactCandidateV4(
+        schema=COMPACT_OUTPUT_SCHEMA_V4,
+        session_summary=CompactSessionSummaryV4(
+            text="Accepted compactor summary.",
+            source_labels=("T1",),
+        ),
+        retained_previous_evidence_fact_labels=(),
+        evidence_facts=(
+            CompactEvidenceFactV4(
+                claim="Accepted evidence-backed claim.",
+                support_labels=("E1",),
+                context_labels=(),
+            ),
+        ),
+        answer_anchors=(),
+        forward_intents=(),
+        reference_continuity=(),
+    )
+    return build_context_compacted_payload(
+        operation_id=operation_id,
+        accepted_attempt_number=attempt_number,
+        compact_artifact_ref=f"compact-artifact:{operation_id}",
+        compact_artifact_digest=sha256_digest_json(
+            {"compact_artifact": operation_id}
+        ),
+        accepted_truth=accepted_truth_for_candidate(
+            candidate,
+            current_input_ref="event-current-input",
+            source_refs_by_label={
+                "T1": ("event-trace-source",),
+                "E1": ("event-evidence-source",),
+            },
+        ),
+        budget_after_compact=128,
+        prompt_local_label_mapping_refs=("prompt-label:T1",),
+        projection_signal="conversation_memory_projection_catchup",
+        successful_response_identity=_successful_compactor_response_identity(
+            compactor_engine_run_id
+        ),
+        accepted_proposal_manifest_reference=_proposal_manifest_reference(
+            operation_id=operation_id,
+            attempt_number=attempt_number,
+            compactor_engine_run_id=compactor_engine_run_id,
+            manifest_ref=manifest_ref,
+            manifest_digest=manifest_digest,
+        ),
     )
 
 
@@ -874,6 +1192,7 @@ def _record_real_ordinary_runner_call_manifest(
             supports_tool_calling=False,
             supports_streaming=False,
             supports_stream_usage=False,
+            structured_output_capability=StructuredOutputCapability.NONE,
             default_timeout_seconds=30.0,
             max_retries=0,
             provider_request=None,
@@ -1758,6 +2077,7 @@ def test_runner_call_projection_resolver_reads_manifest_projection_and_schema(
         assert "# 当前时间" in str(messages[0]["content"])
         assert "V（Visa Inc.）" in str(messages[0]["content"])
         assert resolved.selected_tool_schema_snapshot is not None
+        assert resolved.compactor_response_identity is None
         tool_schemas = _json_object_sequence(
             resolved.selected_tool_schema_snapshot.payload["tool_schemas"]
         )
@@ -1843,6 +2163,70 @@ def test_runner_call_projection_resolver_reads_artifact_projection_payload(
         assert resolved.runner_input_projection.payload_ref == (
             "payload-artifact-projection"
         )
+
+
+def test_runner_call_query_rejects_event_row_and_hot_manifest_identity_mismatch(
+    tmp_path: Path,
+) -> None:
+    """EventLog row descriptor 与 hot manifest identity 分裂时 fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: public Tool Trace 查询未拒绝 identity mismatch 时抛出。
+    """
+
+    manifest_ref = "payload-manifest-row-hot-mismatch"
+    manifest = _full_runner_call_manifest(
+        manifest_id="runner-call-manifest:row-hot-mismatch",
+        runner_call_index=0,
+        runner_call_kind="initial_user_dispatch",
+        runner_call_trigger_reason="initial_user_input",
+        roles=("system", "user"),
+    )
+    manifest_digest = sha256_digest_json(manifest)
+    hot_payload = _hot_payload_for_manifest(
+        manifest,
+        manifest_ref=manifest_ref,
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        store.transaction_runner.run_write(
+            lambda transaction: (
+                _write_json_payload(
+                    transaction,
+                    payload_ref=manifest_ref,
+                    payload_id="sqlite-manifest-row-hot-mismatch",
+                    payload=manifest,
+                ),
+                _write_json_payload(
+                    transaction,
+                    payload_ref="payload-row-descriptor-mismatch",
+                    payload_id="sqlite-row-descriptor-mismatch",
+                    payload=manifest,
+                ),
+            )
+        )
+        _append_event(
+            store.transaction_runner,
+            event_id="event-runner-call-row-hot-mismatch",
+            event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+            payload=hot_payload,
+            payload_ref="payload-row-descriptor-mismatch",
+            payload_digest=manifest_digest,
+        )
+        _catch_up(store.transaction_runner, tmp_path)
+
+        with pytest.raises(
+            HostDurableError,
+            match="tool trace row and runner-call hot identity mismatch",
+        ):
+            store.transaction_runner.run_read(
+                lambda transaction: read_runner_call_reconstruction_signals_by_run(
+                    transaction,
+                    "run-1",
+                    after_event_sequence=0,
+                    limit=10,
+                )
+            )
 
 
 def test_runner_call_hot_owner_fails_closed_for_missing_manifest_ref() -> None:
@@ -1995,6 +2379,504 @@ def test_runner_call_projection_resolver_fails_closed_for_non_object_payload(
             store.transaction_runner.run_read(
                 lambda transaction: resolve_runner_call_projection_from_signal(
                     transaction, page.signals[0]
+                )
+            )
+
+
+def test_compactor_response_resolver_projects_accepted_actual_identity(
+    tmp_path: Path,
+) -> None:
+    """accepted terminal 公开 actual provider/model/request identity。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: resolver 未投影 exact actual identity 时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        signal, manifest_ref, manifest_digest = _record_compactor_runner_call(
+            store.transaction_runner,
+            tmp_path,
+        )
+        _append_event(
+            store.transaction_runner,
+            event_id="event-context-compacted-1",
+            event_type=CONTEXT_COMPACTED,
+            payload=_accepted_compactor_payload(
+                operation_id="operation-1",
+                attempt_number=1,
+                compactor_engine_run_id="compactor-engine-run-1",
+                manifest_ref=manifest_ref,
+                manifest_digest=manifest_digest,
+            ),
+        )
+
+        resolved = store.transaction_runner.run_read(
+            lambda transaction: resolve_runner_call_projection_from_signal(
+                transaction,
+                signal,
+            )
+        )
+
+        response = resolved.compactor_response_identity
+        assert response is not None
+        assert response.disposition is CompactorResponseDisposition.ACCEPTED
+        assert response.proposal_manifest_ref == manifest_ref
+        assert response.proposal_manifest_digest == manifest_digest
+        assert response.successful_response_identity is not None
+        assert response.successful_response_identity.effective_provider == (
+            "provider-actual"
+        )
+        assert response.successful_response_identity.effective_model == (
+            "model-actual"
+        )
+        assert response.successful_response_identity.provider_request_id == (
+            "provider-request-actual"
+        )
+        assert response.accepted_evidence_facts == (
+            ResolvedCompactorEvidenceFact(
+                claim="Accepted evidence-backed claim.",
+                canonical_evidence_refs=("evidence:E1",),
+            ),
+        )
+        with pytest.raises(ValueError, match="accepted.*requires successful"):
+            ResolvedCompactorResponseIdentity(
+                disposition=CompactorResponseDisposition.ACCEPTED,
+                terminal_event_id="event-invalid-accepted",
+                terminal_event_sequence=999,
+                compaction_operation_id="operation-invalid",
+                compaction_attempt_number=1,
+                proposal_manifest_ref="payload-invalid",
+                proposal_manifest_digest="sha256:" + "f" * 64,
+                successful_response_identity=None,
+                accepted_evidence_facts=(),
+            )
+
+
+@pytest.mark.parametrize(
+    ("failure_category", "with_success"),
+    (
+        ("quality_check_rejected", True),
+        ("cancellation_requested", False),
+    ),
+)
+def test_compactor_response_resolver_projects_rejected_nullable_identity(
+    tmp_path: Path,
+    failure_category: str,
+    with_success: bool,
+) -> None:
+    """post-success rejection 保留 actual identity，no-success 明确为 null。
+
+    :param tmp_path: pytest 临时目录。
+    :param failure_category: canonical rejection category。
+    :param with_success: 是否提供实际 Engine success identity。
+    :returns: ``None``。
+    :raises AssertionError: rejection nullable identity 不符合 terminal 事实时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        signal, manifest_ref, manifest_digest = _record_compactor_runner_call(
+            store.transaction_runner,
+            tmp_path,
+        )
+        identity = (
+            _successful_compactor_response_identity("compactor-engine-run-1")
+            if with_success
+            else None
+        )
+        payload = build_context_compaction_attempt_rejected_payload(
+            operation_id="operation-1",
+            attempt_number=1,
+            failure_category=failure_category,
+            repairable=False,
+            runner_attempt_summary_refs=("runner-attempt-1",),
+            diagnostic_refs=("diagnostic-1",),
+            next_policy_decision="stop",
+            budget_after_attempted_compact=None,
+            successful_response_identity=identity,
+            proposal_manifest_reference=_proposal_manifest_reference(
+                operation_id="operation-1",
+                attempt_number=1,
+                compactor_engine_run_id="compactor-engine-run-1",
+                manifest_ref=manifest_ref,
+                manifest_digest=manifest_digest,
+            ),
+        )
+        _append_event(
+            store.transaction_runner,
+            event_id=f"event-rejected-{failure_category}",
+            event_type=CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+            payload=payload,
+        )
+        resolved = store.transaction_runner.run_read(
+            lambda transaction: resolve_runner_call_projection_from_signal(
+                transaction,
+                signal,
+            )
+        )
+
+        response = resolved.compactor_response_identity
+        assert response is not None
+        assert response.disposition is (
+            CompactorResponseDisposition.ATTEMPT_REJECTED
+        )
+        assert (response.successful_response_identity is not None) is with_success
+        assert response.accepted_evidence_facts == ()
+
+
+@pytest.mark.parametrize(
+    "tamper_field",
+    (
+        "accepted_replacement",
+        "accepted_aggregate",
+        "source_boundary",
+    ),
+)
+def test_compactor_response_resolver_fails_closed_for_malformed_accepted_semantics(
+    tmp_path: Path,
+    tamper_field: str,
+) -> None:
+    """accepted replacement/aggregate/boundary 任一损坏都不产生公开事实。
+
+    :param tmp_path: pytest 临时目录。
+    :param tamper_field: 本次损坏的 semantic binding 字段。
+    :returns: ``None``。
+    :raises AssertionError: strict semantic parser 未 fail closed 时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        signal, manifest_ref, manifest_digest = _record_compactor_runner_call(
+            store.transaction_runner,
+            tmp_path,
+        )
+        payload = dict(
+            _accepted_compactor_payload(
+                operation_id="operation-1",
+                attempt_number=1,
+                compactor_engine_run_id="compactor-engine-run-1",
+                manifest_ref=manifest_ref,
+                manifest_digest=manifest_digest,
+            )
+        )
+        if tamper_field == "accepted_replacement":
+            replacement = dict(_json_object(payload["accepted_replacement"]))
+            facts = [
+                dict(item)
+                for item in _json_object_sequence(replacement["evidence_facts"])
+            ]
+            facts[0]["canonical_evidence_refs"] = ["evidence:replacement-poison"]
+            facts_json: list[JsonValue] = [item for item in facts]
+            replacement["evidence_facts"] = facts_json
+            payload["accepted_replacement"] = replacement
+        elif tamper_field == "accepted_aggregate":
+            payload["accepted_evidence_mapping_refs"] = ["evidence:aggregate-poison"]
+        else:
+            boundary = [
+                dict(item)
+                for item in _json_object_sequence(payload["source_boundary"])
+            ]
+            evidence_entry = next(
+                item for item in boundary if item["source_label"] == "E1"
+            )
+            evidence_entry["canonical_evidence_refs"] = []
+            boundary_json: list[JsonValue] = [item for item in boundary]
+            payload["source_boundary"] = boundary_json
+        _append_event(
+            store.transaction_runner,
+            event_id=f"event-malformed-accepted-{tamper_field}",
+            event_type=CONTEXT_COMPACTED,
+            payload=payload,
+        )
+
+        with pytest.raises(HostDurableError):
+            store.transaction_runner.run_read(
+                lambda transaction: resolve_runner_call_projection_from_signal(
+                    transaction,
+                    signal,
+                )
+            )
+
+
+def test_compactor_response_resolver_exhausts_multiple_full_pages_without_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """目标 terminal 位于多个 full page 后仍解析，不产生 scan-cap limitation。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: resolver 未 exhaust 多个 full pages 时抛出。
+    """
+
+    monkeypatch.setattr(
+        tool_trace_module,
+        "_COMPACTOR_TERMINAL_SCAN_PAGE_SIZE",
+        1,
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        signal, manifest_ref, manifest_digest = _record_compactor_runner_call(
+            store.transaction_runner,
+            tmp_path,
+        )
+        for ordinal in range(3):
+            unrelated_ref = CompactorProposalManifestReference(
+                manifest_event_id=f"event-unrelated-manifest-{ordinal}",
+                manifest_payload_ref=f"payload-unrelated-{ordinal}",
+                manifest_digest=sha256_digest_json({"unrelated": ordinal}),
+                compactor_input_projection_ref=f"projection-unrelated-{ordinal}",
+                compactor_input_projection_digest=sha256_digest_json(
+                    {"projection": ordinal}
+                ),
+                compaction_operation_id=f"unrelated-operation-{ordinal}",
+                compaction_attempt_number=ordinal + 1,
+                compactor_engine_run_id=f"unrelated-engine-run-{ordinal}",
+            )
+            _append_event(
+                store.transaction_runner,
+                event_id=f"event-unrelated-terminal-{ordinal}",
+                event_type=CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+                payload=build_context_compaction_attempt_rejected_payload(
+                    operation_id=f"unrelated-operation-{ordinal}",
+                    attempt_number=ordinal + 1,
+                    failure_category="cancellation_requested",
+                    repairable=False,
+                    runner_attempt_summary_refs=("runner-attempt",),
+                    diagnostic_refs=("diagnostic",),
+                    next_policy_decision="stop",
+                    budget_after_attempted_compact=None,
+                    successful_response_identity=None,
+                    proposal_manifest_reference=unrelated_ref,
+                ),
+            )
+        _append_event(
+            store.transaction_runner,
+            event_id="event-target-terminal",
+            event_type=CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+            payload=build_context_compaction_attempt_rejected_payload(
+                operation_id="operation-1",
+                attempt_number=1,
+                failure_category="cancellation_requested",
+                repairable=False,
+                runner_attempt_summary_refs=("runner-attempt",),
+                diagnostic_refs=("diagnostic",),
+                next_policy_decision="stop",
+                budget_after_attempted_compact=None,
+                successful_response_identity=None,
+                proposal_manifest_reference=_proposal_manifest_reference(
+                    operation_id="operation-1",
+                    attempt_number=1,
+                    compactor_engine_run_id="compactor-engine-run-1",
+                    manifest_ref=manifest_ref,
+                    manifest_digest=manifest_digest,
+                ),
+            ),
+        )
+
+        resolved = store.transaction_runner.run_read(
+            lambda transaction: resolve_runner_call_projection_from_signal(
+                transaction,
+                signal,
+            )
+        )
+
+        assert resolved.compactor_response_identity is not None
+        assert resolved.compactor_response_identity.terminal_event_id == (
+            "event-target-terminal"
+        )
+
+
+def test_compactor_response_resolver_returns_missing_only_after_exhaustion(
+    tmp_path: Path,
+) -> None:
+    """完整 empty-page exhaustion 后无 terminal 才返回 typed unavailable。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: complete exhaustion 未返回 ``None`` 时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        signal, _, _ = _record_compactor_runner_call(
+            store.transaction_runner,
+            tmp_path,
+        )
+        resolved = store.transaction_runner.run_read(
+            lambda transaction: resolve_runner_call_projection_from_signal(
+                transaction,
+                signal,
+            )
+        )
+
+        assert resolved.compactor_response_identity is None
+
+
+def test_compactor_response_resolver_rejects_non_advancing_cursor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """full page 后 reader 重复旧 row 时 resolver fail closed。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: non-advancing cursor 未被拒绝时抛出。
+    """
+
+    monkeypatch.setattr(
+        tool_trace_module,
+        "_COMPACTOR_TERMINAL_SCAN_PAGE_SIZE",
+        1,
+    )
+    with open_host_durable_store(_options(tmp_path)) as store:
+        signal, manifest_ref, manifest_digest = _record_compactor_runner_call(
+            store.transaction_runner,
+            tmp_path,
+        )
+        _append_event(
+            store.transaction_runner,
+            event_id="event-repeated-terminal",
+            event_type=CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+            payload=build_context_compaction_attempt_rejected_payload(
+                operation_id="operation-1",
+                attempt_number=1,
+                failure_category="cancellation_requested",
+                repairable=False,
+                runner_attempt_summary_refs=("runner-attempt",),
+                diagnostic_refs=("diagnostic",),
+                next_policy_decision="stop",
+                budget_after_attempted_compact=None,
+                successful_response_identity=None,
+                proposal_manifest_reference=_proposal_manifest_reference(
+                    operation_id="operation-1",
+                    attempt_number=1,
+                    compactor_engine_run_id="compactor-engine-run-1",
+                    manifest_ref=manifest_ref,
+                    manifest_digest=manifest_digest,
+                ),
+            ),
+        )
+        terminal_row = store.transaction_runner.run_read(
+            lambda transaction: read_run_events_by_types_page(
+                transaction,
+                run_id="run-1",
+                event_types=(CONTEXT_COMPACTION_ATTEMPT_REJECTED,),
+                after_event_sequence=0,
+                limit=1,
+            )[0]
+        )
+        monkeypatch.setattr(
+            tool_trace_module,
+            "read_run_events_by_types_page",
+            _NonAdvancingTerminalPageReader(terminal_row),
+        )
+
+        with pytest.raises(HostDurableError, match="cursor did not advance"):
+            store.transaction_runner.run_read(
+                lambda transaction: resolve_runner_call_projection_from_signal(
+                    transaction,
+                    signal,
+                )
+            )
+
+
+@pytest.mark.parametrize(
+    "tamper_field",
+    (
+        "manifest_ref",
+        "manifest_digest",
+        "operation_id",
+        "attempt_number",
+        "engine_run_id",
+        "duplicate_terminal",
+        "malformed_identity",
+    ),
+)
+def test_compactor_response_resolver_fails_closed_for_binding_corruption(
+    tmp_path: Path,
+    tamper_field: str,
+) -> None:
+    """ref/digest/operation/attempt/Engine identity/duplicate/malformed 全部拒绝。
+
+    :param tmp_path: pytest 临时目录。
+    :param tamper_field: 本次注入的 corruption 类别。
+    :returns: ``None``。
+    :raises AssertionError: corruption 未触发 fail-closed 时抛出。
+    """
+
+    with open_host_durable_store(_options(tmp_path)) as store:
+        signal, manifest_ref, manifest_digest = _record_compactor_runner_call(
+            store.transaction_runner,
+            tmp_path,
+        )
+        operation_id = "operation-1"
+        attempt_number = 1
+        terminal_engine_run_id = (
+            "wrong-engine-run"
+            if tamper_field == "engine_run_id"
+            else "compactor-engine-run-1"
+        )
+        reference = _proposal_manifest_reference(
+            operation_id=operation_id,
+            attempt_number=attempt_number,
+            compactor_engine_run_id=terminal_engine_run_id,
+            manifest_ref=(
+                "payload-wrong-manifest"
+                if tamper_field == "manifest_ref"
+                else manifest_ref
+            ),
+            manifest_digest=(
+                sha256_digest_json({"wrong": "digest"})
+                if tamper_field == "manifest_digest"
+                else manifest_digest
+            ),
+        )
+        identity = _successful_compactor_response_identity(
+            terminal_engine_run_id
+        )
+        payload = dict(
+            build_context_compaction_attempt_rejected_payload(
+                operation_id=operation_id,
+                attempt_number=attempt_number,
+                failure_category="quality_check_rejected",
+                repairable=False,
+                runner_attempt_summary_refs=("runner-attempt",),
+                diagnostic_refs=("diagnostic",),
+                next_policy_decision="stop",
+                budget_after_attempted_compact=None,
+                successful_response_identity=identity,
+                proposal_manifest_reference=reference,
+            )
+        )
+        if tamper_field == "operation_id":
+            payload["operation_id"] = "wrong-operation"
+        if tamper_field == "attempt_number":
+            payload["attempt_number"] = 2
+        if tamper_field == "malformed_identity":
+            response_identity = dict(
+                _json_object(payload["successful_response_identity"])
+            )
+            response_identity["authorization"] = "Bearer must-not-leak"
+            payload["successful_response_identity"] = response_identity
+        _append_event(
+            store.transaction_runner,
+            event_id="event-corrupt-terminal-1",
+            event_type=CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+            payload=payload,
+        )
+        if tamper_field == "duplicate_terminal":
+            _append_event(
+                store.transaction_runner,
+                event_id="event-corrupt-terminal-2",
+                event_type=CONTEXT_COMPACTION_ATTEMPT_REJECTED,
+                payload=payload,
+            )
+
+        with pytest.raises(HostDurableError):
+            store.transaction_runner.run_read(
+                lambda transaction: resolve_runner_call_projection_from_signal(
+                    transaction,
+                    signal,
                 )
             )
 

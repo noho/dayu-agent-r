@@ -16,6 +16,7 @@ import pytest
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
+from dayu.contracts.tool_await import ToolAwaitKind
 from dayu.contracts.tool_call import (
     BatchToolExecutionContext,
     BatchToolExecutionRequest,
@@ -24,6 +25,7 @@ from dayu.contracts.tool_call import (
 from dayu.contracts.tool_declaration import ToolBundle, ToolDefinition
 from dayu.contracts.tool_execution import AsyncDirectToolExecutionCapability
 from dayu.contracts.tool_outcome import (
+    ToolAwaitingOutcome,
     ToolCompletedOutcome,
     ToolExecutionOutcome,
     ToolFailedOutcome,
@@ -46,6 +48,7 @@ from dayu.fins.storage import (
     FsSourceDocumentRepository,
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
+from dayu.fins.tools import preprocess_provider
 from dayu.host.tool_runtime import (
     DefaultToolRuntimeFactory,
     EffectiveToolBundleBuildRequest,
@@ -70,6 +73,10 @@ from dayu.runtime.scene_prepare import (
     SceneToolSelectionMode,
     SceneToolSelectionResult,
     prepare_scene,
+)
+from dayu.runtime.tools_discovery import (
+    PythonImportPathProvider,
+    ToolsDiscoveryProviderSpec,
 )
 from dayu.service.host_assembly import (
     ServiceAssemblyOverrides,
@@ -315,6 +322,44 @@ def test_combined_discovery_returns_single_bundle_without_reserved_names(
         assert "cancellation_token" not in properties
         assert "execution_context" not in definition.schema.function.parameters.required
         assert "cancellation_token" not in definition.schema.function.parameters.required
+
+
+def test_preprocess_provider_remains_independently_discoverable_and_callable(
+    tmp_path: Path,
+) -> None:
+    """独立 preprocess provider 应继续发现并调用 awaiting 工具。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: provider 未发现 preprocess 或调用未进入 awaiting 时抛出。
+    """
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    output = preprocess_provider.discover_tools(
+        ToolsDiscoveryProviderSpec(
+            spec_id="financial-preprocess-tools",
+            location=PythonImportPathProvider(
+                import_path="dayu.fins.tools.preprocess_provider:discover_tools"
+            ),
+            enabled=True,
+            config={
+                "workspace_root": str(workspace_root),
+                "awaiting_resolution_mode": "poll",
+            },
+        )
+    )
+
+    assert tuple(definition.name for definition in output.definitions) == (
+        "start_fins_preprocess",
+    )
+    outcome = asyncio.run(
+        output.definitions[0].callable(
+            _call("start_fins_preprocess", {"ticker": "AAPL"}),
+            _context(),
+        )
+    )
+    assert isinstance(outcome, ToolAwaitingOutcome)
+    assert outcome.await_spec.await_kind is ToolAwaitKind.EXTERNAL_JOB
 
 
 def test_combined_truncate_specs_and_fetch_more_owner(tmp_path: Path) -> None:

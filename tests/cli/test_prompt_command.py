@@ -10,7 +10,7 @@ import signal
 import sys
 import threading
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from types import TracebackType
 from pathlib import Path
@@ -880,7 +880,7 @@ async def _raise_session_ensure_startup_interrupt(
 
 
 class _InterruptedInstallSigintMonitor(CliSigintMonitor):
-    """在 prompt Run cancellation hook 安装阶段模拟 Ctrl+C。"""
+    """在 prompt invocation 输入 owner 安装阶段模拟 Ctrl+C。"""
 
     def install(self) -> None:
         """在 handler 完全安装前抛出启动中断。
@@ -1039,18 +1039,18 @@ def test_prompt_startup_interrupt_before_session_commit_closes_host_context(
     assert fake_host.submit_requests == []
 
 
-def test_prompt_startup_interrupt_during_monitor_install_closes_resources(
+def test_prompt_startup_interrupt_during_monitor_install_precedes_host_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Run monitor 安装中断必须关闭 attachment/context 且不得 submit Run。
+    """invocation 输入 owner 安装中断必须发生在 runtime/Host 业务状态之前。
 
     :param tmp_path: pytest 临时 workspace root。
     :param monkeypatch: pytest argv、环境与类替换夹具。
     :param capsys: pytest 标准输出捕获夹具。
     :returns: ``None``。
-    :raises AssertionError: cleanup、Run 零创建、退出码或输出 contract 失败时抛出。
+    :raises AssertionError: 零 Host 状态、退出码或输出 contract 失败时抛出。
     """
 
     fake_host = _FakeHost(submit_terminal=None)
@@ -1076,13 +1076,177 @@ def test_prompt_startup_interrupt_during_monitor_install_closes_resources(
     captured = capsys.readouterr()
     assert "Traceback" not in captured.out
     assert "Traceback" not in captured.err
-    assert host_context.exit_count == 1
-    assert len(fake_host.create_requests) == 1
+    assert host_context.exit_count == 0
+    assert fake_host.create_requests == []
     assert fake_host.ensure_requests == []
     assert fake_host.submit_requests == []
     assert fake_host.cancel_requests == []
-    assert fake_host.attach_session_ids == ["session-1"]
+    assert fake_host.attach_session_ids == []
+    assert fake_host.attachments == []
+
+
+@pytest.mark.asyncio
+async def test_prompt_key_monitor_start_failure_restores_input_owners_before_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """按键 monitor 启动异常必须恢复按键与 SIGINT owner 且不打开 Host。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :param monkeypatch: pytest 输入 owner 与 Host opener 替换夹具。
+    :returns: ``None``。
+    :raises AssertionError: cleanup 次数、异常或零 Host 状态 contract 漂移时抛出。
+    """
+
+    sigint_monitor = _PreloadedSigintMonitor(0)
+    key_monitor = _FailingStartRunningKeyMonitor()
+    for env_name, env_value in _runtime_assembly_env().items():
+        monkeypatch.setenv(env_name, env_value)
+    monkeypatch.setattr(
+        prompt_command,
+        "CliSigintMonitor",
+        lambda: sigint_monitor,
+    )
+    monkeypatch.setattr(
+        prompt_command,
+        "new_running_key_monitor",
+        lambda: key_monitor,
+    )
+    monkeypatch.setattr(
+        prompt_command,
+        "open_host",
+        _raise_host_open_startup_interrupt,
+    )
+    args = parse_cli_args(
+        ("prompt", "--base", str(tmp_path), "请总结收入变化")
+    )
+
+    with pytest.raises(RuntimeError, match="running key monitor start failed"):
+        await prompt_command._run_prompt_command_async(args)
+
+    assert sigint_monitor.install_count == 1
+    assert sigint_monitor.close_count == 1
+    assert key_monitor.started_count == 1
+    assert key_monitor.closed_count == 1
+    assert not (tmp_path / ".dayu" / "host" / "dayu_host.sqlite3").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("early_action", "early_sigint_count"),
+    (
+        (RunningKeyAction.CANCEL_RUN, 0),
+        (None, 1),
+        (None, 2),
+    ),
+)
+async def test_prompt_very_early_cancel_intent_binds_same_accepted_run_and_waits_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    early_action: RunningKeyAction | None,
+    early_sigint_count: int,
+) -> None:
+    """runtime prepare 前 Escape/Ctrl+C 必须绑定随后接受的 Run 并等待 terminal。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :param monkeypatch: pytest 环境与输入 owner 替换夹具。
+    :param early_action: invocation 起点已解码的运行按键 action。
+    :param early_sigint_count: invocation 起点已观察到的 SIGINT 次数。
+    :returns: ``None``。
+    :raises AssertionError: Run、cancel、terminal、cleanup 或退出码 contract 漂移时抛出。
+    """
+
+    fake_host = _ControlledCancelHost()
+    host_context = _FakeOpenHostContext(fake_host)
+    sigint_monitor = _PreloadedSigintMonitor(early_sigint_count)
+    actions = () if early_action is None else (early_action,)
+    key_monitor = _FakeRunningKeyMonitor(actions)
+    for env_name, env_value in _runtime_assembly_env().items():
+        monkeypatch.setenv(env_name, env_value)
+    monkeypatch.setattr(
+        prompt_command,
+        "open_host",
+        _FixedOpenHostFactory(host_context),
+    )
+    monkeypatch.setattr(
+        prompt_command,
+        "CliSigintMonitor",
+        lambda: sigint_monitor,
+    )
+    monkeypatch.setattr(
+        prompt_command,
+        "new_running_key_monitor",
+        lambda: key_monitor,
+    )
+    args = parse_cli_args(
+        ("prompt", "--base", str(tmp_path), "请总结收入变化")
+    )
+    execution = asyncio.create_task(prompt_command._run_prompt_command_async(args))
+
+    try:
+        await asyncio.wait_for(
+            fake_host.cancel_recorded.wait(),
+            timeout=_TEST_ASYNC_TIMEOUT_SECONDS,
+        )
+        assert not execution.done()
+        assert len(fake_host.submit_requests) == 1
+        assert len(fake_host.cancel_requests) == 1
+        assert fake_host.cancel_requests[0].mode is CancelMode.GRACEFUL
+        assert fake_host.cancel_requests[0].reason == "cli_sigint"
+
+        fake_host.release_cancel_terminal.set()
+        exit_code = await asyncio.wait_for(
+            execution,
+            timeout=_TEST_ASYNC_TIMEOUT_SECONDS,
+        )
+    finally:
+        fake_host.release_cancel_terminal.set()
+        if not execution.done():
+            execution.cancel()
+            with suppress(asyncio.CancelledError):
+                await execution
+
+    assert exit_code == EXIT_KEYBOARD_INTERRUPT
+    assert host_context.exit_count == 1
+    assert sigint_monitor.install_count == 1
+    assert sigint_monitor.close_count == 1
+    assert key_monitor.started_count == 1
+    assert key_monitor.closed_count == 1
     assert [attachment.close_count for attachment in fake_host.attachments] == [1]
+
+
+class _RecordingCloseoutCancel:
+    """记录 shared closeout 发起的 Host cancel identity。"""
+
+    terminal: EntrypointRunTerminalResult
+    calls: list[tuple[str, str]]
+
+    def __init__(self, terminal: EntrypointRunTerminalResult) -> None:
+        """初始化固定 terminal 与空调用记录。
+
+        :param terminal: cancel path 返回的 Host canonical terminal。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.terminal = terminal
+        self.calls = []
+
+    async def __call__(
+        self,
+        run_id: str,
+        reason: str,
+    ) -> EntrypointRunTerminalResult:
+        """记录 exact Run/reason 并返回固定 terminal。
+
+        :param run_id: acceptance barrier 发布的 Run id。
+        :param reason: 首次冻结的 cancel reason。
+        :returns: 固定 Host canonical terminal。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.calls.append((run_id, reason))
+        return self.terminal
 
 
 class _AutoSigintMonitor(CliSigintMonitor):
@@ -1191,6 +1355,48 @@ class _ControlledSigintMonitor(CliSigintMonitor):
         self.closed_count += 1
 
 
+class _PreloadedSigintMonitor(CliSigintMonitor):
+    """在 prompt runtime prepare 前已收到指定次数中断的 invocation monitor。"""
+
+    install_count: int
+    close_count: int
+
+    def __init__(self, signal_count: int) -> None:
+        """初始化 durable SIGINT count 与幂等 lifecycle 计数。
+
+        :param signal_count: command 进入 Host 前已收到的 SIGINT 次数。
+        :returns: ``None``。
+        :raises ValueError: 次数为负数时抛出。
+        """
+
+        if signal_count < 0:
+            raise ValueError("signal_count must not be negative")
+        super().__init__()
+        self.count = signal_count
+        self.install_count = 0
+        self.close_count = 0
+
+    def install(self) -> None:
+        """记录唯一 invocation-level handler 安装。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        if self.install_count == 0:
+            self.install_count = 1
+
+    def close(self) -> None:
+        """记录唯一 invocation-level handler 恢复。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        if self.close_count == 0:
+            self.close_count = 1
+
+
 class _FakeRunningKeyMonitor:
     """测试用运行态按键 monitor。"""
 
@@ -1229,7 +1435,8 @@ class _FakeRunningKeyMonitor:
         :raises Exception: 不主动抛出异常。
         """
 
-        self.started_count += 1
+        if self.started_count == 0:
+            self.started_count = 1
 
     async def wait_next(self) -> RunningKeyAction:
         """返回下一条预设按键动作。
@@ -1254,8 +1461,86 @@ class _FakeRunningKeyMonitor:
         :raises Exception: 不主动抛出异常。
         """
 
-        self.closed_count += 1
+        if self.closed_count == 0:
+            self.closed_count = 1
         self._closed_event.set()
+
+
+class _FailingStartRunningKeyMonitor(_FakeRunningKeyMonitor):
+    """在 terminal input owner 启动阶段失败的运行按键 monitor。"""
+
+    def __init__(self) -> None:
+        """初始化无预设 action 的失败 monitor。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        super().__init__(())
+
+    def start(self) -> None:
+        """模拟 terminal mode 安装后的启动异常。
+
+        :returns: 正常路径不返回。
+        :raises RuntimeError: 每次调用均抛出固定启动错误。
+        """
+
+        super().start()
+        raise RuntimeError("running key monitor start failed")
+
+
+class _ControlledRunningKeyMonitor:
+    """允许测试精确跨 acceptance barrier 注入 typed key action。"""
+
+    _queue: asyncio.Queue[RunningKeyAction]
+    closed_count: int
+
+    def __init__(self) -> None:
+        """初始化空 typed action queue。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self._queue = asyncio.Queue()
+        self.closed_count = 0
+
+    def start(self) -> None:
+        """启动测试 monitor。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return
+
+    async def wait_next(self) -> RunningKeyAction:
+        """等待测试注入的下一 typed action。
+
+        :returns: 下一运行态 action。
+        :raises asyncio.CancelledError: prompt cleanup 取消等待时透传。
+        """
+
+        return await self._queue.get()
+
+    def emit(self, action: RunningKeyAction) -> None:
+        """同步注入一条 typed action。
+
+        :param action: 待注入的运行态 action。
+        :returns: ``None``。
+        :raises asyncio.QueueFull: queue 达到容量时抛出。
+        """
+
+        self._queue.put_nowait(action)
+
+    def close(self) -> None:
+        """记录 prompt outer cleanup 已关闭 monitor。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.closed_count += 1
 
 
 def test_prompt_command_outputs_fast_live_terminal_and_converts_requests(
@@ -1312,12 +1597,13 @@ def test_prompt_command_outputs_fast_live_terminal_and_converts_requests(
     assert captured.out.strip() == "prompt answer"
     assert "Activity:" in captured.err
     assert "工具批次完成" in captured.err
+    assert captured_requests[0].workspace_root == workspace_root
     assert captured_requests[0].scene_id == "prompt"
     assert captured_requests[0].context_slot_values["fins_default_subject"] == "# 当前分析对象\n你正在分析的是 AAPL。"
     assert "Asia/Shanghai" in str(captured_requests[0].context_slot_values["current_time"])
     assert captured_requests[0].assembly_overrides.model_id == _MODEL_ID
-    assert fake_host.ensure_requests[0].scope == "cli.prompt"
-    assert fake_host.ensure_requests[0].slot_key == "cli.prompt.earnings"
+    assert fake_host.ensure_requests[0].scope == "cli.agent"
+    assert fake_host.ensure_requests[0].slot_key == "cli.agent.earnings"
     assert fake_host.calls[:3] == ["ensure_session", "watch:session-1", "submit:session-1"]
     assert fake_host.attach_session_ids == ["session-1"]
     assert [attachment.close_count for attachment in fake_host.attachments] == [1]
@@ -2017,7 +2303,7 @@ async def test_prompt_tty_runtime_display_closes_thinking_before_activity_and_fi
         ),
     )
 
-    terminal = await session_execution._submit_prompt_turn_handling_sigint(
+    outcome = await session_execution._submit_prompt_turn_handling_sigint(
         host=cast(Host, fake_host),
         runtime=runtime,
         invocation=invocation,
@@ -2029,9 +2315,8 @@ async def test_prompt_tty_runtime_display_closes_thinking_before_activity_and_fi
         thinking_renderer=thinking_renderer,
     )
 
-    assert terminal is not None
     render_exit_code = render_prompt_terminal_result(
-        terminal,
+        outcome.terminal,
         stdout=stream,
         stderr=stream,
     )
@@ -2129,7 +2414,6 @@ async def test_prompt_sigint_after_run_id_cancels_host_run(
         EntrypointRuntimeRequest(
             workspace_root=workspace_root,
             package_config_root=package_config_root(),
-            explicit_config_dir=None,
             scene_id="prompt",
             context_slot_values={
                 "fins_default_subject": "# 当前分析对象\n你正在分析的是 AAPL。",
@@ -2161,8 +2445,7 @@ async def test_prompt_sigint_after_run_id_cancels_host_run(
         sigint_monitor=_AutoSigintMonitor(),
     )
 
-    assert result is not None
-    assert result.terminal_status is HostTerminalStatus.CANCELLED
+    assert result.terminal.terminal_status is HostTerminalStatus.CANCELLED
     assert len(fake_host.cancel_requests) == 1
     cancel_request = fake_host.cancel_requests[0]
     assert cancel_request.reason == "cli_sigint"
@@ -2174,118 +2457,60 @@ async def test_prompt_sigint_after_run_id_cancels_host_run(
 
 
 @pytest.mark.asyncio
-async def test_prompt_cancel_helper_closes_thinking_renderer() -> None:
-    """prompt 本地取消 helper 应先收尾，并由 caller 关闭 thinking renderer。"""
+async def test_active_turn_closeout_freezes_identity_and_cancels_exactly_once() -> None:
+    """shared closeout 必须冻结 reason、跨 barrier 取消一次并单调升级退出。"""
 
-    accepted_run = session_execution._PromptAcceptedRunState()
-    submit_task = asyncio.create_task(_never_finishes_prompt_terminal())
-    stderr = io.StringIO()
-    thinking_renderer = CliThinkingRenderer(
-        stderr=stderr,
-        options=CliThinkingRendererOptions(enabled=True),
-    )
-    thinking_renderer.record(
-        _entrypoint_thinking(
-            dedupe_key="thinking-before-cancel",
-            text_delta="The user is asking",
-        )
-    )
-    fake_host = _FakeHost(
-        submit_terminal=None,
-    )
-    runtime_display = RuntimeDisplayController(
-        activity_display=None,
-        thinking_display=thinking_renderer,
-    )
+    terminal = _entrypoint_terminal_result()
+    cancel_owner = _RecordingCloseoutCancel(terminal)
+    closeout = session_execution._ActiveTurnCloseout(cancel_run_and_wait=cancel_owner)
 
-    result = await session_execution._cancel_prompt_turn_after_local_request(
-        host=cast(Host, fake_host),
-        invocation=session_execution.new_cli_invocation(
-            command_name="prompt",
-            scenario="prompt",
-            display_user="本地 CLI 用户",
-            ticker="AAPL",
-        ),
-        accepted_run=accepted_run,
-        submit_task=submit_task,
-        runtime_display=runtime_display,
+    assert closeout.request_cancel(reason="first", exit_after=False) is (
+        session_execution._LocalCancelIntent.CANCEL_REQUESTED
     )
+    first_task = closeout.cancel_task
+    assert first_task is not None
+    closeout.request_cancel(reason="ignored", exit_after=False)
+    assert closeout.cancel_task is first_task
+    assert closeout.cancel_reason == "first"
+    closeout.publish_accepted("run-1")
+    closeout.publish_accepted("run-1")
 
-    assert result is None
-    assert fake_host.cancel_requests == []
-    assert stderr.getvalue() == "Thinking: The user is asking\n"
-    thinking_renderer.record(_entrypoint_thinking(dedupe_key="thinking-after-cancel"))
-    assert stderr.getvalue() == "Thinking: The user is asking\n"
-    await runtime_display.aclose()
+    assert await closeout.wait_closeout() is terminal
+    assert cancel_owner.calls == [("run-1", "first")]
+    assert closeout.request_cancel(reason="ignored", exit_after=True) is (
+        session_execution._LocalCancelIntent.EXIT_AFTER_CANCEL
+    )
+    assert closeout.cancel_task is first_task
+    with pytest.raises(ValueError, match="conflicts"):
+        closeout.publish_accepted("run-2")
+    assert {item.name for item in fields(closeout)} == {
+        "cancel_run_and_wait",
+        "barrier",
+        "intent",
+        "_cancel_reason",
+        "_cancel_task",
+        "_terminal",
+        "_terminal_observed",
+    }
 
 
 @pytest.mark.asyncio
-async def test_prompt_cancel_returns_submit_terminal_completed_during_finish() -> None:
-    """finish-thinking 窗口自然完成时应保留 live terminal 且不发 Host cancel。
+async def test_active_turn_closeout_terminal_first_skips_late_cancel() -> None:
+    """canonical terminal 先成立时必须保留真值且不发迟到 cancel。"""
 
-    :returns: ``None``。
-    :raises Exception: prompt cancel 仲裁、identity 或 cleanup 断言失败时抛出。
-    """
-
-    accepted_run = session_execution._PromptAcceptedRunState()
-    accepted_run.record("run-1")
     terminal = _entrypoint_terminal_result()
-    submit_release = asyncio.Event()
-    submit_task = asyncio.create_task(
-        _complete_prompt_terminal_after_release(submit_release, terminal)
-    )
-    thinking_display = _BlockingFinishThinkingDisplay()
-    runtime_display = RuntimeDisplayController(
-        activity_display=None,
-        thinking_display=thinking_display,
-    )
-    fake_host = _FakeHost(submit_terminal=None)
-    cancel_task = asyncio.create_task(
-        session_execution._cancel_prompt_turn_after_local_request(
-            host=cast(Host, fake_host),
-            invocation=session_execution.new_cli_invocation(
-                command_name="prompt",
-                scenario="prompt",
-                display_user="本地 CLI 用户",
-                ticker="AAPL",
-            ),
-            accepted_run=accepted_run,
-            submit_task=submit_task,
-            runtime_display=runtime_display,
-        )
-    )
+    cancel_owner = _RecordingCloseoutCancel(terminal)
+    closeout = session_execution._ActiveTurnCloseout(cancel_run_and_wait=cancel_owner)
+    closeout.request_cancel(reason="first", exit_after=False)
+    closeout.observe_terminal(terminal)
 
-    try:
-        await asyncio.wait_for(
-            _wait_for_thread_event(thinking_display.finish_started),
-            timeout=_TEST_ASYNC_TIMEOUT_SECONDS,
+    assert await closeout.wait_closeout() is terminal
+    assert cancel_owner.calls == []
+    closeout.observe_terminal(terminal)
+    with pytest.raises(ValueError, match="conflicts"):
+        closeout.observe_terminal(
+            replace(terminal, run_id="run-conflict")
         )
-        assert submit_task.done() is False
-        submit_release.set()
-        observed_terminal = await asyncio.wait_for(
-            asyncio.shield(submit_task),
-            timeout=_TEST_ASYNC_TIMEOUT_SECONDS,
-        )
-        assert observed_terminal is terminal
-        thinking_display.release_finish.set()
-        result = await asyncio.wait_for(
-            cancel_task,
-            timeout=_TEST_ASYNC_TIMEOUT_SECONDS,
-        )
-    finally:
-        thinking_display.release_finish.set()
-        if not cancel_task.done():
-            cancel_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await cancel_task
-        await runtime_display.aclose()
-
-    assert result is terminal
-    assert result is not None
-    assert result.source is EntrypointTerminalSource.LIVE_EVENT
-    assert result.terminal_event_id == "terminal-run-1-finish-race"
-    assert fake_host.cancel_requests == []
-    assert thinking_display.close_count == 1
 
 
 @pytest.mark.asyncio
@@ -2329,6 +2554,28 @@ async def test_prompt_terminal_surfaces_display_close_failure_from_caller_lifecy
     assert fake_host.watchers[0].closed_count == 1
 
 
+def test_session_execution_appends_later_cleanup_error_to_existing_cause_chain() -> None:
+    """共享 lifecycle owner 必须保留首错并把后续 cleanup 错误追加到链尾。
+
+    :returns: ``None``。
+    :raises AssertionError: 首错 identity 或既有 cause 顺序被改写时抛出。
+    """
+
+    primary_error = RuntimeError("primary cleanup failed")
+    existing_cause = ValueError("existing cleanup cause")
+    later_error = OSError("later cleanup failed")
+    primary_error.__cause__ = existing_cause
+
+    combined_error = session_execution._combine_lifecycle_cleanup_errors(
+        primary_error,
+        later_error,
+    )
+
+    assert combined_error is primary_error
+    assert primary_error.__cause__ is existing_cause
+    assert existing_cause.__cause__ is later_error
+
+
 @pytest.mark.asyncio
 async def test_prompt_ctrl_t_toggles_running_activity_without_cancel(
     tmp_path: Path,
@@ -2364,8 +2611,7 @@ async def test_prompt_ctrl_t_toggles_running_activity_without_cancel(
         key_monitor=key_monitor,
     )
 
-    assert result is not None
-    assert result.terminal_status is HostTerminalStatus.SUCCEEDED
+    assert result.terminal.terminal_status is HostTerminalStatus.SUCCEEDED
     assert renderer.visible is False
     assert fake_host.cancel_requests == []
     assert key_monitor.started_count == 1
@@ -2432,8 +2678,7 @@ async def test_prompt_esc_requests_cancel_after_run_id(
         key_monitor=key_monitor,
     )
 
-    assert result is not None
-    assert result.terminal_status is HostTerminalStatus.CANCELLED
+    assert result.terminal.terminal_status is HostTerminalStatus.CANCELLED
     assert len(fake_host.cancel_requests) == 1
     assert fake_host.cancel_requests[0].mode is CancelMode.GRACEFUL
     assert "Thinking: The user is asking\r\x1b[2KActivity: cancel requested" in (stderr.getvalue())
@@ -2577,8 +2822,7 @@ async def test_prompt_cancel_terminal_is_returned_after_coalesced_sigint(
         sigint_monitor=_AutoSigintMonitor(),
     )
 
-    assert result is not None
-    assert result.terminal_status is HostTerminalStatus.CANCELLED
+    assert result.terminal.terminal_status is HostTerminalStatus.CANCELLED
     assert len(fake_host.cancel_requests) == 1
 
 
@@ -2650,6 +2894,57 @@ def test_prompt_removed_debug_options_are_argparse_unknown(
     assert exit_code == EXIT_USAGE_ERROR
     assert "unrecognized arguments" in captured.err
     assert removed_args[0] in captured.err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    (
+        ("--config=/tmp/x", "prompt", "请总结收入变化"),
+        ("prompt", "--config=/tmp/x", "请总结收入变化"),
+    ),
+)
+def test_prompt_removed_config_fails_before_service_preparation(
+    argv: tuple[str, ...],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """prompt 的旧配置选项必须在 Service preparation 前由 parser 拒绝。
+
+    :param argv: 覆盖 root 与 command scope 的旧选项调用。
+    :param capsys: pytest 标准错误捕获夹具。
+    :param monkeypatch: pytest monkeypatch 夹具。
+    :returns: ``None``。
+    :raises AssertionError: parser 未先失败或 Service 被调用时抛出。
+    """
+
+    captured_requests: list[EntrypointRuntimeRequest] = []
+
+    async def unexpected_prepare(
+        request: EntrypointRuntimeRequest,
+    ) -> EntrypointRuntimeResult:
+        """记录越过 parser boundary 的意外 Service 请求并立即失败。
+
+        :param request: 意外收到的 runtime request。
+        :returns: 正常路径不会返回。
+        :raises AssertionError: 只要被调用就抛出。
+        """
+
+        captured_requests.append(request)
+        raise AssertionError("Service preparation must not run")
+
+    monkeypatch.setattr(
+        session_execution,
+        "prepare_entrypoint_runtime",
+        unexpected_prepare,
+    )
+
+    exit_code = cli_main.main(argv)
+    captured = capsys.readouterr()
+
+    assert exit_code == EXIT_USAGE_ERROR
+    assert "unrecognized arguments" in captured.err
+    assert "--config" in captured.err
+    assert captured_requests == []
 
 
 def test_prompt_command_rejects_all_removed_execution_flags_as_unknown(
@@ -2729,53 +3024,6 @@ def test_prompt_invalid_ticker_exits_with_usage_error_without_traceback(
     assert "Traceback" not in captured.out
 
 
-def test_prompt_explicit_config_outside_workspace_exits_with_usage_error(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """显式 config 目录逃逸 workspace 时应返回用法错误。"""
-
-    outside_config = tmp_path.parent / "outside-config"
-    outside_config.mkdir()
-
-    exit_code = cli_main.main(
-        (
-            "prompt",
-            "--base",
-            str(tmp_path),
-            "--config",
-            str(outside_config),
-            "请总结收入变化",
-        )
-    )
-    captured = capsys.readouterr()
-
-    assert exit_code == EXIT_USAGE_ERROR
-    assert "inside workspace root" in captured.err
-
-
-def test_prompt_explicit_config_missing_exits_with_usage_error(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """显式 config 目录不存在时应返回用法错误。"""
-
-    exit_code = cli_main.main(
-        (
-            "prompt",
-            "--base",
-            str(tmp_path),
-            "--config",
-            "missing-config",
-            "请总结收入变化",
-        )
-    )
-    captured = capsys.readouterr()
-
-    assert exit_code == EXIT_USAGE_ERROR
-    assert "not a directory" in captured.err
-
-
 @pytest.mark.asyncio
 async def test_prompt_sigint_after_durable_acceptance_waits_response_then_cancels(
     tmp_path: Path,
@@ -2816,10 +3064,56 @@ async def test_prompt_sigint_after_durable_acceptance_waits_response_then_cancel
     fake_host.release_response.set()
     result = await execution_task
 
-    assert result is not None
-    assert result.terminal_status is HostTerminalStatus.CANCELLED
+    assert result.terminal.terminal_status is HostTerminalStatus.CANCELLED
     assert len(fake_host.cancel_requests) == 1
     assert fake_host.cancel_requests[0].mode is CancelMode.GRACEFUL
+
+
+@pytest.mark.asyncio
+async def test_prompt_escape_before_acceptance_keeps_submit_then_cancels_exact_run(
+    tmp_path: Path,
+) -> None:
+    """pre-accept Escape 必须保留 submit，callback 后只取消 exact Run 一次。
+
+    :param tmp_path: pytest 临时 workspace root。
+    :returns: ``None``。
+    :raises Exception: acceptance、Host cancel 或 cleanup 断言失败时抛出。
+    """
+
+    runtime = await _prepare_prompt_runtime(tmp_path)
+    fake_host = _DurablyAcceptedDelayedResponseHost()
+    key_monitor = _ControlledRunningKeyMonitor()
+    execution_task = asyncio.create_task(
+        session_execution._submit_prompt_turn_handling_sigint(
+            host=cast(Host, fake_host),
+            runtime=runtime,
+            invocation=session_execution.new_cli_invocation(
+                command_name="prompt",
+                scenario="prompt",
+                display_user="本地 CLI 用户",
+                ticker="AAPL",
+            ),
+            session_id="session-1",
+            user_prompt="请总结收入变化",
+            run_overrides=ServiceRunOverrides(),
+            sigint_monitor=_NoopSigintMonitor(),
+            key_monitor=key_monitor,
+        )
+    )
+    await fake_host.committed.wait()
+
+    key_monitor.emit(RunningKeyAction.CANCEL_RUN)
+    await asyncio.sleep(0)
+    assert not execution_task.done()
+    assert fake_host.cancel_requests == []
+
+    fake_host.release_response.set()
+    outcome = await execution_task
+
+    assert outcome.terminal.terminal_status is HostTerminalStatus.CANCELLED
+    assert len(fake_host.cancel_requests) == 1
+    assert "cancel:run-1" in fake_host.calls
+    assert key_monitor.closed_count == 1
 
 
 @pytest.mark.asyncio
@@ -2837,7 +3131,7 @@ async def test_prompt_sigint_monitor_waits_for_notification() -> None:
 
 @pytest.mark.asyncio
 async def test_prompt_sigint_monitor_restores_previous_process_handler() -> None:
-    """关闭 monitor 必须恢复 asyncio runner 已有的进程级 SIGINT handler。
+    """重复 install/close 必须只管理一次 handler 并恢复 runner 原状态。
 
     :returns: ``None``。
     :raises AssertionError: monitor 关闭后 handler identity 漂移时抛出。
@@ -2850,6 +3144,9 @@ async def test_prompt_sigint_monitor_restores_previous_process_handler() -> None
     monitor.install()
     installed_handler = signal.getsignal(signal.SIGINT)
     assert installed_handler != previous_handler
+    monitor.install()
+    assert signal.getsignal(signal.SIGINT) == installed_handler
+    monitor.close()
     monitor.close()
 
     assert signal.getsignal(signal.SIGINT) == previous_handler
@@ -2910,7 +3207,6 @@ async def _prepare_prompt_runtime(workspace_root: Path) -> EntrypointRuntimeResu
         EntrypointRuntimeRequest(
             workspace_root=workspace_root,
             package_config_root=package_config_root(),
-            explicit_config_dir=None,
             scene_id="prompt",
             context_slot_values={
                 "fins_default_subject": "# 当前分析对象\n你正在分析的是 AAPL。",

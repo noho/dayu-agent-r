@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dayu.engine.contracts.structured_output import StructuredOutputCapability
+
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -12,6 +14,11 @@ import pytest
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.contracts.tool_call import BatchToolExecutionContext, ToolCallRequest
 from dayu.contracts.tool_declaration import ToolBundle, ToolDefinition
 from dayu.contracts.tool_execution import AsyncDirectToolExecutionCapability
@@ -106,6 +113,7 @@ from dayu.host.durable.session_lifecycle import ensure_session
 from dayu.host.durable.state import (
     DispatchRecordStatus,
     RunStartReason,
+    RunRow,
     StateMutationStatus,
     WorkerKind,
     mark_dispatch_waiting_for_lane_row,
@@ -116,25 +124,24 @@ from dayu.host.durable.state import (
 from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.transaction import HostRow, HostTransaction, HostTransactionRunner
 from dayu.host.compaction import (
-    CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
-    AnswerAnchorCandidateVNext,
-    AnswerAnchorChildVNext,
+    COMPACT_OUTPUT_SCHEMA_V4,
+    CompactAnswerAnchorV4,
     CompactMaterialBlockKind,
     CompactMaterialSection,
-    CompactQualityCheckResultVNext,
-    ConversationCompactOutputVNext,
-    EvidenceBackedFactCandidateVNext,
-    ForwardIntentCandidateVNext,
-    ForwardIntentStatusVNext,
-    ForwardIntentTypeVNext,
-    ReferenceContinuityCandidateVNext,
-    ReferenceContinuityReasonVNext,
-    SessionSummaryCandidateVNext,
+    CompactCandidateV4,
+    CompactEvidenceFactV4,
+    CompactForwardIntentV4,
+    CompactForwardIntentStatusV4,
+    CompactReferenceContinuityV4,
+    CompactSegmentTrigger,
+    CompactSessionSummaryV4,
 )
+from tests.host.fake_compaction import accepted_truth_for_candidate
 from dayu.host.compact_material import (
     RunInputMaterialBlock,
     build_pre_dispatch_compact_material_view,
     run_input_material_block,
+    select_compact_segment,
     selected_material_view_digest,
 )
 from dayu.host.context_fallback import (
@@ -148,7 +155,9 @@ from dayu.host.context_policy import (
     ContextCompactionTriggerSource,
     context_budget_policy_from_threshold_tokens,
 )
+from dayu.host.context_event_payload import store_context_compacted_payload
 from dayu.host.context_events import build_context_compacted_payload
+from dayu.host.compact_payload import parse_context_compacted_semantic_payload
 from dayu.host.memory_repair import catch_up_conversation_memory_projection
 from dayu.host.payload_resolution import event_payload_object
 from dayu.host.run_input import (
@@ -204,6 +213,7 @@ from dayu.host.memory import (
     digest_memory_projection_policy,
 )
 from dayu.host.projection import ProjectionRunner
+from dayu.host.context_events import CompactorProposalManifestReference
 from tests.host.memory_snapshot_factories import (
     current_input_memory_snapshot,
     recalculate_memory_snapshot_digest,
@@ -229,6 +239,62 @@ _POLICY_REF = "policy-snapshot-p5-s2"
 _CONFIGURED_SECRET_SENTINEL = "synthetic-local-trust-sentinel-6f2b9d8c"
 _DIGEST_A = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 _DIGEST_B = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+
+def _successful_response_identity(
+    *,
+    operation_id: str,
+    compactor_engine_run_id: str,
+) -> SuccessfulRunnerResponseIdentity:
+    """构造 run-input fixture 的 event-unique response identity。
+
+    :param operation_id: 当前 compaction operation id。
+    :param compactor_engine_run_id: 当前 manifest 显式绑定的 Engine run id。
+    :returns: deterministic、非敏感的成功响应身份。
+    :raises ValueError: identity 字段非法时抛出。
+    """
+
+    return SuccessfulRunnerResponseIdentity(
+        effective_provider="test-compactor",
+        effective_model="test-compactor-model",
+        runner_request_identity=build_runner_request_identity(
+            run_id=compactor_engine_run_id,
+            attempt_id=None,
+            execution_id=None,
+            iteration_id=f"{operation_id}:accepted-iteration",
+            iteration_index=0,
+            runner_call_index=1,
+        ),
+        provider_request_id_availability=ProviderRequestIdAvailability.UNAVAILABLE,
+        provider_request_id=None,
+    )
+
+
+def _proposal_manifest_reference(
+    *,
+    operation_id: str,
+    compactor_engine_run_id: str,
+) -> CompactorProposalManifestReference:
+    """构造 run-input fixture 的 typed manifest reference。
+
+    :param operation_id: 当前 compaction operation id。
+    :param compactor_engine_run_id: 当前 manifest 显式绑定的 Engine run id。
+    :returns: 与 operation/attempt/run 同源的 manifest reference。
+    :raises ValueError: manifest binding 字段非法时抛出。
+    """
+
+    return CompactorProposalManifestReference(
+        manifest_event_id=f"manifest-event:{operation_id}:1",
+        manifest_payload_ref=f"runner-call-manifest:{operation_id}:1",
+        manifest_digest=_DIGEST_A,
+        compactor_input_projection_ref=f"projection:{operation_id}:1",
+        compactor_input_projection_digest=_DIGEST_B,
+        compaction_operation_id=operation_id,
+        compaction_attempt_number=1,
+        compactor_engine_run_id=compactor_engine_run_id,
+    )
+
+
 _R03_CITATION_OBJECT: dict[str, JsonValue] = {
     "document_id": "MSFT-10K-2025",
     "source_type": "sec_filing",
@@ -253,8 +319,7 @@ _R03_OPAQUE_SENTINEL_REFS = (
 )
 _RESUME_GUIDANCE_COMPLETED_INTRO = "上一轮被等待中断的外部工具步骤已经完成。"
 _RESUME_GUIDANCE_NO_REPEAT = (
-    "这是同一次用户请求中已完成的工具结果。继续回答用户；不要为了"
-    "同一次请求再次启动相同下载、上传或处理。"
+    "这是同一次用户请求中已完成的工具结果。继续回答用户；不要为了同一次请求再次启动相同下载、上传或处理。"
 )
 _RESUME_GUIDANCE_FORBIDDEN_INTERNAL_FRAGMENTS = (
     "Resume guidance",
@@ -423,12 +488,8 @@ def _build_with_compact_memory_refs(
         )
         compact_view = CompactArtifactView(
             compaction_event_ref=compact_event_ref,
-            compact_artifact_ref=(
-                None if compact_event_ref is None else "compact-artifact:test"
-            ),
-            compact_artifact_digest=(
-                None if compact_event_ref is None else "sha256:" + "1" * 64
-            ),
+            compact_artifact_ref=(None if compact_event_ref is None else "compact-artifact:test"),
+            compact_artifact_digest=(None if compact_event_ref is None else "sha256:" + "1" * 64),
         )
         builder = create_no_tool_run_input_builder(
             transaction_runner=store.transaction_runner,
@@ -477,6 +538,87 @@ def test_current_user_message_resolves_descriptor_payload(
         assert "descriptor durable prompt" not in input_event.payload_json
         assert isinstance(request.messages[-1], UserMessage)
         assert request.messages[-1].content == "descriptor durable prompt"
+
+
+def test_durable_compact_artifact_provider_resolves_descriptor_payload_and_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """Durable compact provider 严格读取 descriptor-backed terminal 并拒绝 digest 漂移。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: descriptor owner contract 或 fail-closed 行为漂移时抛出。
+    """
+
+    inline_threshold_bytes = 2048
+    policy = _memory_policy()
+    with open_host_durable_store(
+        _options(
+            tmp_path,
+            payload_inline_threshold_bytes=inline_threshold_bytes,
+        )
+    ) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_prior_user_and_success(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-compact-source",
+            user_text="compact source user",
+            answer_text="compact source answer",
+        )
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("descriptor-backed compact artifact provider"),
+        )
+        compacted = _append_descriptor_backed_current_run_compacted_event(
+            store.transaction_runner,
+            seeded,
+            policy=policy,
+            summary_text="oversized compact summary " * 39,
+            source_refs_by_label={
+                "event-memory-raw-user": ("event-run-compact-source-input",),
+                "event-memory-episode": ("event-run-compact-source-success",),
+            },
+        )
+        recovery = _start_recovery_attempt(store.transaction_runner, seeded)
+        snapshot = _attempt_snapshot(recovery)
+        current_facts = DurableCurrentRunFactProvider(
+            store.transaction_runner
+        ).load_current_run_facts(snapshot)
+        provider = DurableCompactArtifactProvider(store.transaction_runner)
+
+        view = provider.load_compact_artifact(snapshot, current_facts)
+
+        assert compacted.payload_json == "{}"
+        payload_ref = compacted.payload_ref
+        assert payload_ref is not None
+        assert compacted.payload_digest is not None
+        descriptor = store.transaction_runner.run_read(
+            lambda transaction: PayloadStore().read_payload_descriptor(
+                transaction,
+                payload_ref,
+            )
+        )
+        assert descriptor is not None
+        assert descriptor.payload_kind is PayloadKind.ARTIFACT_REF
+        assert descriptor.payload_size_bytes > inline_threshold_bytes
+        assert view.compaction_event_ref == compacted.event_id
+        assert view.compact_artifact_ref == "compact-artifact:test"
+        assert view.compact_artifact_digest == _DIGEST_A
+        assert view.represented_evidence_refs == ()
+
+        store.transaction_runner.run_write(
+            lambda transaction: transaction.execute(
+                f"UPDATE {TABLE_EVENT_LOG} SET payload_digest = ? WHERE event_id = ?",
+                (_DIGEST_B, compacted.event_id),
+            )
+        )
+        with pytest.raises(
+            HostDurableError,
+            match="payload integrity validation failed",
+        ):
+            provider.load_compact_artifact(snapshot, current_facts)
 
 
 def test_recovery_attempt_rebuilds_current_prompt_from_same_run_eventlog_descriptor(
@@ -577,9 +719,9 @@ def test_resume_wait_messages_fail_closed_for_invalid_start_reason(
             payload=_user_input_payload("resume prompt"),
         )
         _append_resume_wait_projection_events(store.transaction_runner, seeded)
-        current_facts = DurableCurrentRunFactProvider(
-            store.transaction_runner
-        ).load_current_run_facts(_attempt_snapshot(seeded))
+        current_facts = DurableCurrentRunFactProvider(store.transaction_runner).load_current_run_facts(
+            _attempt_snapshot(seeded)
+        )
         resume_started = replace(
             _read_event_by_id(store.transaction_runner, "event-run-started-resume"),
             payload_json=canonical_json_dumps(payload_json),
@@ -613,18 +755,12 @@ def test_runner_call_manifest_classifies_resume_from_typed_start_reason(
             session_id=session_id,
             payload=_user_input_payload("resume prompt"),
         )
-        current_facts = DurableCurrentRunFactProvider(
-            store.transaction_runner
-        ).load_current_run_facts(_attempt_snapshot(seeded))
+        current_facts = DurableCurrentRunFactProvider(store.transaction_runner).load_current_run_facts(
+            _attempt_snapshot(seeded)
+        )
         resume_started = replace(
             current_facts.run_started_event,
-            payload_json=canonical_json_dumps(
-                {
-                    "start_reason": serialize_run_start_reason(
-                        RunStartReason.RESUME
-                    )
-                }
-            ),
+            payload_json=canonical_json_dumps({"start_reason": serialize_run_start_reason(RunStartReason.RESUME)}),
         )
         record_input = RunnerCallManifestRecordInput(
             attempt_snapshot=_attempt_snapshot(seeded),
@@ -641,10 +777,10 @@ def test_runner_call_manifest_classifies_resume_from_typed_start_reason(
                 compact_artifact_ref=None,
                 compact_artifact_digest=None,
             ),
-                continuity=SessionContinuityView(
-                    messages=(),
-                    source_refs=(),
-                ),
+            continuity=SessionContinuityView(
+                messages=(),
+                source_refs=(),
+            ),
             tool_snapshot=ToolSchemaSnapshot(
                 tool_schemas=(),
                 disable_tools=True,
@@ -913,6 +1049,13 @@ def test_build_is_deterministic_for_same_eventlog_and_policy(
         _append_prior_user_and_success(
             store.transaction_runner,
             session_id=session_id,
+            run_id="run-compact-source",
+            user_text="compact source user",
+            answer_text="compact source answer",
+        )
+        _append_prior_user_and_success(
+            store.transaction_runner,
+            session_id=session_id,
             run_id="run-prior",
             user_text="earlier question",
             answer_text="earlier answer",
@@ -996,9 +1139,7 @@ def test_runner_call_manifest_is_bounded_and_does_not_inline_messages(
         )
         messages = _json_object_sequence(projection.payload["messages"])
         manifest_entries = _json_object_sequence(manifest["message_entries"])
-        projector_metadata = _json_object_sequence(
-            manifest["projector_metadata"]
-        )
+        projector_metadata = _json_object_sequence(manifest["projector_metadata"])
         projection_descriptor = store.transaction_runner.run_read(
             lambda transaction: PayloadStore().read_payload_descriptor(
                 transaction,
@@ -1073,9 +1214,7 @@ def test_internal_execution_value_round_trips_without_llm_projection(
             payload=input_payload,
         )
         attempt_snapshot = _attempt_snapshot(seeded)
-        current_facts = DurableCurrentRunFactProvider(
-            store.transaction_runner
-        ).load_current_run_facts(attempt_snapshot)
+        current_facts = DurableCurrentRunFactProvider(store.transaction_runner).load_current_run_facts(attempt_snapshot)
         durable_input_payload = store.transaction_runner.run_read(
             lambda transaction: event_payload_object(
                 transaction,
@@ -1087,14 +1226,10 @@ def test_internal_execution_value_round_trips_without_llm_projection(
             durable_input_payload,
         )
 
-        assert dispatch_decision.policy_snapshot.runner_spec.headers == {
-            header_name: _CONFIGURED_SECRET_SENTINEL
-        }
+        assert dispatch_decision.policy_snapshot.runner_spec.headers == {header_name: _CONFIGURED_SECRET_SENTINEL}
         effective_attempt_snapshot = replace(
             attempt_snapshot,
-            policy_snapshot_ref=(
-                dispatch_decision.policy_snapshot.policy_snapshot_ref
-            ),
+            policy_snapshot_ref=(dispatch_decision.policy_snapshot.policy_snapshot_ref),
         )
 
         request = create_no_tool_run_input_builder(
@@ -1102,9 +1237,7 @@ def test_internal_execution_value_round_trips_without_llm_projection(
             policy_snapshot=dispatch_decision.policy_snapshot,
         ).build(effective_attempt_snapshot)
 
-        assert request.runner_spec.headers == {
-            header_name: _CONFIGURED_SECRET_SENTINEL
-        }
+        assert request.runner_spec.headers == {header_name: _CONFIGURED_SECRET_SENTINEL}
         for message in request.messages:
             assert _CONFIGURED_SECRET_SENTINEL not in _message_content(message)
 
@@ -1123,14 +1256,10 @@ def test_internal_execution_value_round_trips_without_llm_projection(
             )
         )
         assert memory_snapshot is not None
-        memory_json = canonical_json_dumps(
-            conversation_memory_snapshot_to_json_value(memory_snapshot.snapshot)
-        )
+        memory_json = canonical_json_dumps(conversation_memory_snapshot_to_json_value(memory_snapshot.snapshot))
         assert _CONFIGURED_SECRET_SENTINEL not in memory_json
 
-        run = store.transaction_runner.run_read(
-            lambda transaction: read_run_by_id(transaction, seeded.run_id)
-        )
+        run = store.transaction_runner.run_read(lambda transaction: read_run_by_id(transaction, seeded.run_id))
         assert run is not None
         compact_material = store.transaction_runner.run_read(
             lambda transaction: build_pre_dispatch_compact_material_view(
@@ -1170,9 +1299,7 @@ def test_internal_execution_value_round_trips_without_llm_projection(
         )
         assert _CONFIGURED_SECRET_SENTINEL not in canonical_json_dumps(hot_payload)
         assert _CONFIGURED_SECRET_SENTINEL not in canonical_json_dumps(manifest)
-        assert _CONFIGURED_SECRET_SENTINEL not in canonical_json_dumps(
-            runner_call_projection.payload
-        )
+        assert _CONFIGURED_SECRET_SENTINEL not in canonical_json_dumps(runner_call_projection.payload)
 
 
 def test_session_continuity_does_not_emit_unbudgeted_historical_raw_turns(
@@ -1467,9 +1594,7 @@ def test_prepared_candidate_tool_execution_mode_is_strict_and_digest_owned() -> 
         tool_execution_mode=ToolExecutionMode.NO_TOOL_REPLAY,
     )
 
-    assert disabled.candidate_input_projection_digest != (
-        replay.candidate_input_projection_digest
-    )
+    assert disabled.candidate_input_projection_digest != (replay.candidate_input_projection_digest)
     assert disabled.input_snapshot_digest != replay.input_snapshot_digest
     body = dict(
         _prepared_candidate_projection_body(
@@ -1480,8 +1605,7 @@ def test_prepared_candidate_tool_execution_mode_is_strict_and_digest_owned() -> 
     )
     assert body["tool_execution_mode"] == "no_tool_disabled"
     assert (
-        _prepared_candidate_from_json(body, policy_snapshot=policy)
-        .tool_execution_mode
+        _prepared_candidate_from_json(body, policy_snapshot=policy).tool_execution_mode
         is ToolExecutionMode.NO_TOOL_DISABLED
     )
     body["tool_execution_mode"] = "unknown_mode"
@@ -1520,7 +1644,11 @@ def test_durable_memory_provider_uses_covered_snapshot(tmp_path: Path) -> None:
     policy = _memory_policy()
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
-        _append_rich_memory_source_events(store.transaction_runner, session_id)
+        _append_rich_memory_source_events(
+            store.transaction_runner,
+            session_id,
+            policy=_memory_policy(),
+        )
         seeded = _seed_current_run(
             store,
             session_id=session_id,
@@ -1572,7 +1700,11 @@ def test_memory_provider_renders_vnext_fact_section_from_snapshot(tmp_path: Path
     policy = _memory_policy(evidence_fact_char_cap=24)
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
-        _append_rich_memory_source_events(store.transaction_runner, session_id)
+        _append_rich_memory_source_events(
+            store.transaction_runner,
+            session_id,
+            policy=_memory_policy(),
+        )
         seeded = _seed_current_run(
             store,
             session_id=session_id,
@@ -1608,7 +1740,7 @@ def test_vnext_fact_section_does_not_depend_on_old_subject_blocks(
     policy = _memory_policy(evidence_fact_char_cap=512)
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
-        _append_rich_memory_source_events(store.transaction_runner, session_id)
+        _append_rich_memory_source_events(store.transaction_runner, session_id, policy=policy)
         seeded = _seed_current_run(
             store,
             session_id=session_id,
@@ -1813,19 +1945,13 @@ def test_run_input_builder_accepted_tool_evidence_uses_raw_outcome_text(
         evidence_block = _accepted_tool_evidence_blocks(blocks)[0]
 
         assert evidence_block.accepted_tool_evidence is not None
-        assert evidence_block.accepted_tool_evidence.result_text == (
-            canonical_json_dumps(raw_outcome)
-        )
-        assert evidence_block.text == render_accepted_tool_evidence_for_llm(
-            evidence_block.accepted_tool_evidence
-        )
+        assert evidence_block.accepted_tool_evidence.result_text == (canonical_json_dumps(raw_outcome))
+        assert evidence_block.text == render_accepted_tool_evidence_for_llm(evidence_block.accepted_tool_evidence)
         assert "full raw outcome for LLM material" in evidence_block.text
         assert _DIGEST_A not in evidence_block.text
         assert seeded_evidence.tool_result_event_id not in evidence_block.text
         assert evidence_block.accepted_tool_evidence.tool_name == "fins.search"
-        assert evidence_block.accepted_tool_evidence.query_text == (
-            "Read MSFT FY2025 revenue from filing"
-        )
+        assert evidence_block.accepted_tool_evidence.query_text == ("Read MSFT FY2025 revenue from filing")
         assert evidence_block.accepted_evidence_id == (seeded_evidence.accepted_evidence_id)
         assert evidence_block.canonical_source_refs == (seeded_evidence.accepted_evidence_id,)
         assert evidence_block.payload_refs == (f"payload:{seeded_evidence.tool_result_event_id}",)
@@ -1887,9 +2013,7 @@ def test_run_input_messages_use_explicit_citation_and_hide_opaque_refs(
             material_blocks=blocks,
         )
 
-    visible_text = "\n".join(
-        _message_content(message) for message in messages
-    )
+    visible_text = "\n".join(_message_content(message) for message in messages)
     assert canonical_json_dumps(_R03_CITATION_OBJECT) in visible_text
     for ref in _R03_OPAQUE_SENTINEL_REFS:
         assert ref.ref_kind not in visible_text
@@ -2671,11 +2795,13 @@ def test_fallback_provider_renders_only_selected_window_and_current_input(
 
         request = builder.build(_attempt_snapshot(seeded))
         contents = tuple(_message_content(message) for message in request.messages)
+        system_content = _single_system_content(request.messages)
 
         assert "selected recent raw turn" in contents
         assert "current prompt" in contents
         assert "dropped older raw turn" not in contents
         assert "dropped older assistant turn" not in contents
+        _assert_fallback_grounding_guidance(system_content)
 
 
 def test_fallback_context_messages_render_all_and_only_selected_blocks() -> None:
@@ -2962,11 +3088,11 @@ def test_inline_delta_includes_vnext_memory_sections(tmp_path: Path) -> None:
 
     policy = _memory_policy(
         max_lag_events_for_inline_delta=16,
-        evidence_fact_char_cap=24,
+        evidence_fact_char_cap=2048,
     )
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
-        _append_rich_memory_source_events(store.transaction_runner, session_id)
+        _append_rich_memory_source_events(store.transaction_runner, session_id, policy=policy)
         snapshot = build_conversation_memory_snapshot_from_events(
             events=(),
             session_id=session_id,
@@ -3002,7 +3128,7 @@ def test_missing_memory_snapshot_raises_repair_without_state_mutation(
     policy = _memory_policy()
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
-        _append_rich_memory_source_events(store.transaction_runner, session_id)
+        _append_rich_memory_source_events(store.transaction_runner, session_id, policy=policy)
         seeded = _seed_current_run(
             store,
             session_id=session_id,
@@ -3024,7 +3150,7 @@ def test_damaged_memory_snapshot_raises_repair_required(tmp_path: Path) -> None:
     policy = _memory_policy()
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
-        _append_rich_memory_source_events(store.transaction_runner, session_id)
+        _append_rich_memory_source_events(store.transaction_runner, session_id, policy=policy)
         seeded = _seed_current_run(
             store,
             session_id=session_id,
@@ -3370,9 +3496,7 @@ def test_terminal_answer_text_matches_durable_projection_and_run_input(
 
         request = _build_request_with_memory(store, seeded, policy)
         run_input_answers = tuple(
-            _message_content(message)
-            for message in request.messages
-            if isinstance(message, AssistantMessage)
+            _message_content(message) for message in request.messages if isinstance(message, AssistantMessage)
         )
 
         consumer = ConversationMemoryProjectionConsumer(policy)
@@ -3418,7 +3542,7 @@ def test_over_threshold_memory_lag_raises_repair_required(
     policy = _memory_policy(max_lag_events_for_inline_delta=0)
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
-        _append_rich_memory_source_events(store.transaction_runner, session_id)
+        _append_rich_memory_source_events(store.transaction_runner, session_id, policy=policy)
         seeded = _seed_current_run(
             store,
             session_id=session_id,
@@ -3529,7 +3653,7 @@ def test_run_input_memory_messages_include_context_compacted_projection(
     policy = _memory_policy()
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
-        _append_rich_memory_source_events(store.transaction_runner, session_id)
+        _append_rich_memory_source_events(store.transaction_runner, session_id, policy=policy)
         seeded = _seed_current_run(
             store,
             session_id=session_id,
@@ -3568,7 +3692,7 @@ def test_gross_margin_followup_uses_post_compact_evidence_backed_facts(
     policy = _memory_policy()
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
-        _append_compacted_gross_margin_facts(store.transaction_runner, session_id)
+        _append_compacted_gross_margin_facts(store.transaction_runner, session_id, policy=policy)
         seeded = _seed_current_run(
             store,
             session_id=session_id,
@@ -3602,7 +3726,7 @@ def test_run_input_builder_renders_claim_text_and_evidence_refs_not_digest_only(
     policy = _memory_policy()
     with open_host_durable_store(_options(tmp_path)) as store:
         session_id = _ensure_session_id(store.transaction_runner)
-        _append_compacted_gross_margin_facts(store.transaction_runner, session_id)
+        _append_compacted_gross_margin_facts(store.transaction_runner, session_id, policy=policy)
         seeded = _seed_current_run(
             store,
             session_id=session_id,
@@ -3697,13 +3821,25 @@ def test_post_compaction_ordinary_build_preserves_protected_recent_raw_tail(
             session_id=session_id,
             payload=_user_input_payload(current_prompt),
         )
-        _append_current_run_compacted_event(store.transaction_runner, seeded)
+        _append_current_run_compacted_event(
+            store.transaction_runner,
+            seeded,
+            policy=policy,
+            source_refs_by_label={
+                "event-memory-raw-user": ("event-run-compact-source-input",),
+                "event-memory-episode": ("event-run-compact-source-success",),
+            },
+        )
         recovery = _start_recovery_attempt(store.transaction_runner, seeded)
 
         request = _build_post_compaction_request(store, recovery, policy)
         contents = tuple(_message_content(message) for message in request.messages)
         system_content = _single_system_content(request.messages)
+        hot_manifest, durable_manifest = _single_runner_call_manifest_payloads(store)
 
+        assert hot_manifest["runner_call_kind"] == "post_compaction_dispatch"
+        assert hot_manifest["runner_call_trigger_reason"] == ("context_governance_resolved")
+        assert durable_manifest["runner_call_trigger_reason"] == ("context_governance_resolved")
         assert "请列出四条关键风险" in contents
         assert answer_text in contents
         assert "3. 第三条是客户集中度升高，需要拆解前五大客户变化。" in ("\n".join(contents))
@@ -3713,6 +3849,412 @@ def test_post_compaction_ordinary_build_preserves_protected_recent_raw_tail(
         assert contents[-1] == current_prompt
         assert all("tool_call_id" not in content for content in contents)
         assert all("event-prior-tool" not in content for content in contents)
+
+
+def test_correction_ages_into_second_accepted_replacement_and_reconnects_from_memory(
+    tmp_path: Path,
+) -> None:
+    """correction 离开 recent floor 后由第二次 replacement 同源接管 reconnect。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: floor、accepted refs、Memory 或 ordinary RunInput 漂移时抛出。
+    """
+
+    policy = _memory_policy()
+    correction_user_text = "更正：本期收入应为 120，而不是旧口径 100。"
+    correction_answer_text = "已按更正口径确认本期收入为 120。"
+    correction_evidence_text = "审计后的新证据确认本期收入为 120"
+    old_fact_claim = "Old revenue was 100."
+    correction_fact_claim = "Corrected revenue was 120."
+    correction_summary = "收入更正：本期收入为 120，旧口径 100 已作废。"
+    old_evidence_event_ref = "event-aging-old-evidence"
+    old_evidence_ref = f"evidence:{old_evidence_event_ref}"
+    bridge_run_id = "run-aging-bridge"
+    bridge_user_ref = f"event-{bridge_run_id}-input"
+    bridge_answer_ref = f"event-{bridge_run_id}-success"
+    correction_run_id = "run-aging-correction"
+    correction_user_ref = f"event-{correction_run_id}-input"
+    correction_answer_ref = f"event-{correction_run_id}-success"
+    correction_evidence_event_ref = "event-aging-correction-evidence"
+    correction_evidence_ref = f"evidence:{correction_evidence_event_ref}"
+    first_compact_event_id = "event-aging-first-accepted-compact"
+    second_compact_event_id = "event-aging-second-accepted-compact"
+    seeded: _SeededRun | None = None
+    with open_host_durable_store(_options(tmp_path)) as store:
+        session_id = _ensure_session_id(store.transaction_runner)
+        _append_prior_user_and_success(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-aging-old",
+            user_text="旧问题：本期收入是多少？",
+            answer_text="旧回答：本期收入为 100。",
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: _append_canonical_tool_result_for_memory(
+                transaction,
+                session_id=session_id,
+                run_id="run-aging-old",
+                request_event_id="event-aging-old-tool-request",
+                result_event_id=old_evidence_event_ref,
+                tool_call_id="call-aging-old",
+                tool_name="filing.lookup",
+                result_summary="旧证据口径确认本期收入为 100",
+            )
+        )
+        _append_prior_user_and_success(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id=bridge_run_id,
+            user_text="过渡问题：核对收入口径",
+            answer_text="过渡回答：等待最新更正",
+        )
+        _append_prior_user_and_success(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id=correction_run_id,
+            user_text=correction_user_text,
+            answer_text=correction_answer_text,
+        )
+        store.transaction_runner.run_write(
+            lambda transaction: _append_canonical_tool_result_for_memory(
+                transaction,
+                session_id=session_id,
+                run_id=correction_run_id,
+                request_event_id="event-aging-correction-tool-request",
+                result_event_id=correction_evidence_event_ref,
+                tool_call_id="call-aging-correction",
+                tool_name="filing.lookup",
+                result_summary=correction_evidence_text,
+            )
+        )
+        first_compact_current = _append_prior_user_event(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-aging-first-compact-current",
+            event_id="event-aging-first-compact-current",
+            text="首次压缩触发输入",
+        )
+        first_terminal = store.transaction_runner.run_write(
+            lambda transaction: _append_accepted_compact_replacement(
+                transaction,
+                session_id=session_id,
+                run_id="run-aging-first-compact",
+                event_id=first_compact_event_id,
+                current_input_ref=first_compact_current.event_id,
+                source_refs_by_label={
+                    "event-memory-raw-user": ("event-run-aging-old-input",),
+                    "event-memory-episode": ("event-run-aging-old-success",),
+                    old_evidence_event_ref: (old_evidence_ref,),
+                },
+                summary_text="旧口径已压缩",
+                fact_claim=old_fact_claim,
+                evidence_source_label=old_evidence_event_ref,
+                policy=policy,
+            )
+        )
+        first_material_run = _material_view_run_for_input_event(first_compact_current)
+        first_material_view = store.transaction_runner.run_read(
+            lambda transaction: build_pre_dispatch_compact_material_view(
+                transaction,
+                EventLogStore(),
+                run=first_material_run,
+                current_display_text="首次压缩触发输入",
+            )
+        )
+        first_selection = select_compact_segment(
+            trigger_source=CompactSegmentTrigger.PROACTIVE,
+            input_cursor=first_compact_current.event_sequence,
+            memory_snapshot_cursor=None,
+            policy_digest=digest_memory_projection_policy(policy),
+            material_blocks=first_material_view.material_blocks,
+            selected_recent_window_turn_floor=policy.selected_recent_window_turn_floor,
+        )
+        assert all(
+            block.block_id in first_selection.selected_block_ids
+            for block in first_material_view.material_blocks
+            if block.turn_group_id == "run-aging-old"
+        )
+        assert all(
+            first_selection.excluded_reason_codes[block.block_id]
+            == "protected_recent_raw_floor"
+            for block in first_material_view.material_blocks
+            if block.turn_group_id in {bridge_run_id, correction_run_id}
+        )
+        catch_up_conversation_memory_projection(
+            store.transaction_runner,
+            policy=policy,
+            batch_size=32,
+            max_event_sequence=first_terminal.event_sequence,
+        )
+        first_snapshot_row = store.transaction_runner.run_read(
+            lambda transaction: read_latest_memory_snapshot(
+                transaction,
+                session_id=session_id,
+                consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+                policy_digest=digest_memory_projection_policy(policy),
+            )
+        )
+        assert first_snapshot_row is not None
+        first_semantics = parse_context_compacted_semantic_payload(
+            _payload_object(first_terminal)
+        )
+        first_facts = first_snapshot_row.snapshot.evidence_fact_memory.evidence_backed_facts
+        assert len(first_semantics.accepted_replacement.evidence_facts) == 1
+        assert first_semantics.accepted_replacement.evidence_facts[0].claim == old_fact_claim
+        assert first_semantics.accepted_replacement.evidence_facts[0].canonical_evidence_refs == (
+            old_evidence_ref,
+        )
+        assert len(first_facts) == 1
+        assert first_facts[0].claim_text == old_fact_claim
+        assert first_facts[0].evidence_refs == (old_evidence_ref,)
+        assert first_facts[0].provenance.event_id == first_compact_event_id
+        first_recent_event_ids = {
+            item.event_id
+            for item in first_snapshot_row.snapshot.trace_memory.selected_recent_window
+        }
+        assert {
+            correction_user_ref,
+            correction_answer_ref,
+            correction_evidence_event_ref,
+        }.issubset(first_recent_event_ids)
+
+        for ordinal in range(1, 5):
+            _append_prior_user_and_success(
+                store.transaction_runner,
+                session_id=session_id,
+                run_id=f"run-aging-newer-{ordinal}",
+                user_text=f"更新问题 {ordinal}",
+                answer_text=f"更新回答 {ordinal}",
+            )
+        second_compact_current = _append_prior_user_event(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-aging-second-compact-current",
+            event_id="event-aging-second-compact-current",
+            text="第二次压缩触发输入",
+        )
+        material_run = _material_view_run_for_input_event(second_compact_current)
+        material_view = store.transaction_runner.run_read(
+            lambda transaction: build_pre_dispatch_compact_material_view(
+                transaction,
+                EventLogStore(),
+                run=material_run,
+                current_display_text="第二次压缩触发输入",
+            )
+        )
+        selection = select_compact_segment(
+            trigger_source=CompactSegmentTrigger.PROACTIVE,
+            input_cursor=second_compact_current.event_sequence,
+            memory_snapshot_cursor=None,
+            policy_digest=digest_memory_projection_policy(policy),
+            material_blocks=material_view.material_blocks,
+            selected_recent_window_turn_floor=policy.selected_recent_window_turn_floor,
+        )
+        correction_blocks = tuple(
+            block
+            for block in material_view.material_blocks
+            if block.turn_group_id == correction_run_id
+        )
+        assert tuple(block.kind for block in correction_blocks) == (
+            CompactMaterialBlockKind.USER_INPUT,
+            CompactMaterialBlockKind.ASSISTANT_FINAL_ANSWER,
+            CompactMaterialBlockKind.ACCEPTED_TOOL_EVIDENCE,
+        )
+        assert all(block.block_id in selection.selected_block_ids for block in correction_blocks)
+        assert all(
+            selection.excluded_reason_codes[block.block_id]
+            == "protected_recent_raw_floor"
+            for block in material_view.material_blocks
+            if block.turn_group_id in {"run-aging-newer-3", "run-aging-newer-4"}
+        )
+
+        second_terminal = store.transaction_runner.run_write(
+            lambda transaction: _append_accepted_compact_replacement(
+                transaction,
+                session_id=session_id,
+                run_id="run-aging-second-compact",
+                event_id=second_compact_event_id,
+                current_input_ref=second_compact_current.event_id,
+                source_refs_by_label={
+                    "event-memory-raw-user": (
+                        bridge_user_ref,
+                        correction_user_ref,
+                        first_compact_current.event_id,
+                        "event-run-aging-newer-1-input",
+                        "event-run-aging-newer-2-input",
+                    ),
+                    "event-memory-episode": (
+                        bridge_answer_ref,
+                        correction_answer_ref,
+                        "event-run-aging-newer-1-success",
+                        "event-run-aging-newer-2-success",
+                    ),
+                    correction_evidence_event_ref: (correction_evidence_ref,),
+                },
+                summary_text=correction_summary,
+                fact_claim=correction_fact_claim,
+                evidence_source_label=correction_evidence_event_ref,
+                policy=policy,
+            )
+        )
+        catch_up_conversation_memory_projection(
+            store.transaction_runner,
+            policy=policy,
+            batch_size=32,
+            max_event_sequence=second_terminal.event_sequence,
+        )
+        second_snapshot_row = store.transaction_runner.run_read(
+            lambda transaction: read_latest_memory_snapshot(
+                transaction,
+                session_id=session_id,
+                consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+                policy_digest=digest_memory_projection_policy(policy),
+            )
+        )
+        assert second_snapshot_row is not None
+        second_snapshot = second_snapshot_row.snapshot
+        immutable_first_terminal = _read_event_by_id(
+            store.transaction_runner,
+            first_compact_event_id,
+        )
+        immutable_first_semantics = parse_context_compacted_semantic_payload(
+            _payload_object(immutable_first_terminal)
+        )
+        second_semantics = parse_context_compacted_semantic_payload(
+            _payload_object(second_terminal)
+        )
+        assert second_semantics.compacted_source_refs == (
+            correction_evidence_ref,
+            bridge_answer_ref,
+            correction_answer_ref,
+            "event-run-aging-newer-1-success",
+            "event-run-aging-newer-2-success",
+            bridge_user_ref,
+            correction_user_ref,
+            first_compact_current.event_id,
+            "event-run-aging-newer-1-input",
+            "event-run-aging-newer-2-input",
+        )
+        assert immutable_first_semantics == first_semantics
+        assert immutable_first_semantics.accepted_replacement.evidence_facts[
+            0
+        ].canonical_evidence_refs == (old_evidence_ref,)
+        assert second_semantics.accepted_proposal.retained_previous_evidence_fact_labels == ()
+        assert len(second_semantics.accepted_replacement.evidence_facts) == 1
+        second_replacement_fact = second_semantics.accepted_replacement.evidence_facts[0]
+        assert second_replacement_fact.claim == correction_fact_claim
+        assert second_replacement_fact.canonical_evidence_refs == (
+            correction_evidence_ref,
+        )
+        assert old_evidence_ref not in second_replacement_fact.canonical_evidence_refs
+        assert second_semantics.accepted_replacement.session_summary is not None
+        assert (
+            second_semantics.accepted_replacement.session_summary.text
+            == correction_summary
+        )
+        assert second_semantics.accepted_replacement.session_summary.source_labels == (
+            "event-memory-raw-user",
+        )
+        summary_boundary = tuple(
+            entry
+            for entry in second_semantics.source_boundary
+            if entry.source_label == "event-memory-raw-user"
+        )
+        assert len(summary_boundary) == 1
+        assert summary_boundary[0].source_refs == (
+            bridge_user_ref,
+            correction_user_ref,
+            first_compact_current.event_id,
+            "event-run-aging-newer-1-input",
+            "event-run-aging-newer-2-input",
+        )
+        assert second_snapshot.session_summary_memory.summary_text == correction_summary
+        assert second_snapshot.session_summary_memory.source_refs == (
+            "event-memory-raw-user",
+        )
+        assert second_snapshot.session_summary_memory.event_id == second_compact_event_id
+        assert second_snapshot.latest_compaction_event_ref == second_compact_event_id
+        second_facts = second_snapshot.evidence_fact_memory.evidence_backed_facts
+        assert len(second_facts) == 1
+        assert second_facts[0].claim_text == correction_fact_claim
+        assert second_facts[0].evidence_refs == (correction_evidence_ref,)
+        assert old_evidence_ref not in second_facts[0].evidence_refs
+        assert second_facts[0].provenance.event_id == second_compact_event_id
+        assert {
+            item.event_id for item in second_snapshot.trace_memory.selected_recent_window
+        }.isdisjoint(
+            {
+                correction_user_ref,
+                correction_answer_ref,
+            }
+        )
+
+        seeded = _seed_current_run(
+            store,
+            session_id=session_id,
+            payload=_user_input_payload("重连后继续分析收入更正"),
+        )
+        required_cursor = _required_memory_cursor(store.transaction_runner, seeded)
+        catch_up_conversation_memory_projection(
+            store.transaction_runner,
+            policy=policy,
+            batch_size=32,
+            max_event_sequence=required_cursor.checkpoint_event_sequence,
+        )
+        final_run = store.transaction_runner.run_read(
+            lambda transaction: read_run_by_id(transaction, seeded.run_id)
+        )
+        assert final_run is not None
+        final_material_view = store.transaction_runner.run_read(
+            lambda transaction: build_pre_dispatch_compact_material_view(
+                transaction,
+                EventLogStore(),
+                run=final_run,
+                current_display_text="重连后继续分析收入更正",
+            )
+        )
+        assert all(
+            block.turn_group_id != correction_run_id
+            for block in final_material_view.material_blocks
+        )
+        assert {
+            block.turn_group_id for block in final_material_view.material_blocks
+        }.issuperset({"run-aging-newer-3", "run-aging-newer-4"})
+
+    assert seeded is not None
+    with open_host_durable_store(_options(tmp_path)) as reopened_store:
+        reconnected_snapshot_row = reopened_store.transaction_runner.run_read(
+            lambda transaction: read_latest_memory_snapshot(
+                transaction,
+                session_id=seeded.session_id,
+                consumer_id=CONVERSATION_MEMORY_CONSUMER_ID,
+                policy_digest=digest_memory_projection_policy(policy),
+            )
+        )
+        assert reconnected_snapshot_row is not None
+        reconnected_snapshot = reconnected_snapshot_row.snapshot
+        reconnected_facts = reconnected_snapshot.evidence_fact_memory.evidence_backed_facts
+        request = _build_request_with_memory(reopened_store, seeded, policy)
+        contents = tuple(_message_content(message) for message in request.messages)
+
+        assert reconnected_snapshot.session_summary_memory.summary_text == correction_summary
+        assert reconnected_snapshot.session_summary_memory.source_refs == (
+            "event-memory-raw-user",
+        )
+        assert reconnected_snapshot.session_summary_memory.event_id == second_compact_event_id
+        assert len(reconnected_facts) == 1
+        assert reconnected_facts[0].claim_text == correction_fact_claim
+        assert reconnected_facts[0].evidence_refs == (correction_evidence_ref,)
+        assert old_evidence_ref not in reconnected_facts[0].evidence_refs
+        assert reconnected_facts[0].provenance.event_id == second_compact_event_id
+        assert _message_occurrences(contents, correction_summary) == 1
+        assert _message_occurrences(contents, correction_fact_claim) == 1
+        assert all(old_fact_claim not in content for content in contents)
+        assert all(correction_user_text not in content for content in contents)
+        assert all(correction_answer_text not in content for content in contents)
+        assert all(correction_evidence_text not in content for content in contents)
+        assert contents[-1] == "重连后继续分析收入更正"
 
 
 def test_post_compaction_raw_tail_dedupes_memory_selected_recent_window(
@@ -3754,6 +4296,13 @@ def test_post_compaction_raw_tail_dedupes_memory_selected_recent_window(
         _append_prior_user_and_success(
             store.transaction_runner,
             session_id=session_id,
+            run_id="run-compact-source",
+            user_text="compact source user",
+            answer_text="compact source answer",
+        )
+        _append_prior_user_and_success(
+            store.transaction_runner,
+            session_id=session_id,
             run_id="run-ordinal-answer",
             user_text="请列出四条关键风险",
             answer_text=answer_text,
@@ -3763,7 +4312,15 @@ def test_post_compaction_raw_tail_dedupes_memory_selected_recent_window(
             session_id=session_id,
             payload=_user_input_payload(current_prompt),
         )
-        _append_current_run_compacted_event(store.transaction_runner, seeded)
+        _append_current_run_compacted_event(
+            store.transaction_runner,
+            seeded,
+            policy=policy,
+            source_refs_by_label={
+                "event-memory-raw-user": ("event-run-compact-source-input",),
+                "event-memory-episode": ("event-run-compact-source-success",),
+            },
+        )
         recovery = _start_recovery_attempt(store.transaction_runner, seeded)
 
         builder = create_no_tool_run_input_builder(
@@ -3810,13 +4367,17 @@ def test_post_compaction_raw_tail_skips_without_compact_or_in_fallback(
             policy,
         )
 
-        assert all(
-            answer_text not in _message_content(message)
-            for message in without_compacted_event.messages
-        )
+        assert all(answer_text not in _message_content(message) for message in without_compacted_event.messages)
 
     with open_host_durable_store(_options(tmp_path / "fallback")) as store:
         session_id = _ensure_session_id(store.transaction_runner)
+        _append_prior_user_and_success(
+            store.transaction_runner,
+            session_id=session_id,
+            run_id="run-compact-source",
+            user_text="compact source user",
+            answer_text="compact source answer",
+        )
         _append_prior_user_and_success(
             store.transaction_runner,
             session_id=session_id,
@@ -3829,7 +4390,15 @@ def test_post_compaction_raw_tail_skips_without_compact_or_in_fallback(
             session_id=session_id,
             payload=_user_input_payload(current_prompt),
         )
-        _append_current_run_compacted_event(store.transaction_runner, seeded)
+        _append_current_run_compacted_event(
+            store.transaction_runner,
+            seeded,
+            policy=policy,
+            source_refs_by_label={
+                "event-memory-raw-user": ("event-run-compact-source-input",),
+                "event-memory-episode": ("event-run-compact-source-success",),
+            },
+        )
         recovery = _start_recovery_attempt(store.transaction_runner, seeded)
         fallback = _active_fallback(
             selected_blocks=(
@@ -3864,7 +4433,11 @@ def test_post_compaction_raw_tail_skips_without_compact_or_in_fallback(
 
         request = builder.build(_attempt_snapshot(recovery))
         contents = tuple(_message_content(message) for message in request.messages)
+        hot_manifest, durable_manifest = _single_runner_call_manifest_payloads(store)
 
+        assert hot_manifest["runner_call_kind"] == "post_compaction_dispatch"
+        assert hot_manifest["runner_call_trigger_reason"] == ("context_governance_resolved")
+        assert durable_manifest["runner_call_trigger_reason"] == ("context_governance_resolved")
         assert all(answer_text not in content for content in contents)
         assert _message_occurrences(contents, current_prompt) == 1
         assert contents[-1] == current_prompt
@@ -4018,6 +4591,7 @@ def test_reference_continuity_resolves_second_factor_without_full_long_input(
         compact_event = _append_reference_continuity_compact_marker(
             store.transaction_runner,
             session_id=session_id,
+            policy=policy,
         )
         seeded = _seed_current_run(
             store,
@@ -4257,6 +4831,34 @@ def _build_request_with_memory(
     return builder.build(_attempt_snapshot(seeded))
 
 
+def _single_runner_call_manifest_payloads(
+    store: HostDurableStore,
+) -> tuple[Mapping[str, JsonValue], Mapping[str, JsonValue]]:
+    """读取唯一 runner-call event 的 hot 与 durable manifest payload。
+
+    :param store: Host durable store。
+    :returns: ``(hot_payload, durable_manifest_payload)``。
+    :raises AssertionError: runner-call event 数量不是一个时抛出。
+    :raises HostDurableError: durable manifest payload 无法严格解析时抛出。
+    """
+
+    manifest_events = _events_by_type(
+        store.transaction_runner,
+        event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+    )
+    assert len(manifest_events) == 1
+    manifest_event = manifest_events[0]
+    hot_payload = _payload_object(manifest_event)
+    durable_payload = store.transaction_runner.run_read(
+        lambda transaction: event_payload_object(
+            transaction,
+            manifest_event,
+            payload_label="runner-call manifest",
+        )
+    )
+    return hot_payload, durable_payload
+
+
 def _build_post_compaction_request(
     store: HostDurableStore,
     seeded: _SeededRun,
@@ -4305,9 +4907,7 @@ def _latest_current_run_compact_event_ref(
 
     event_id = f"event-{seeded.run_id}-compacted"
     return store.transaction_runner.run_read(
-        lambda transaction: (
-            event_id if EventLogStore().read_event_by_id(transaction, event_id) is not None else None
-        )
+        lambda transaction: event_id if EventLogStore().read_event_by_id(transaction, event_id) is not None else None
     )
 
 
@@ -4327,11 +4927,19 @@ def _four_item_answer() -> str:
     )
 
 
-def _append_current_run_compacted_event(transaction_runner: HostTransactionRunner, seeded: _SeededRun) -> None:
+def _append_current_run_compacted_event(
+    transaction_runner: HostTransactionRunner,
+    seeded: _SeededRun,
+    *,
+    policy: MemoryProjectionPolicy,
+    source_refs_by_label: Mapping[str, tuple[str, ...]],
+) -> None:
     """为当前 Run 追加 accepted CONTEXT_COMPACTED fact。
 
     :param transaction_runner: Host transaction runner。
     :param seeded: 当前 Run 引用。
+    :param policy: 与 compact event audit 同源的 Memory policy。
+    :param source_refs_by_label: accepted boundary 每个 label 的真实 source refs。
     :returns: ``None``。
     """
 
@@ -4375,14 +4983,187 @@ def _append_current_run_compacted_event(transaction_runner: HostTransactionRunne
                 event_type="CONTEXT_COMPACTED",
                 payload=_compact_payload(
                     operation_id=request_event_id,
+                    current_input_ref="event-current-input",
+                    source_refs_by_label=source_refs_by_label,
                     summary_text="current run compacted semantic view",
                     pinned_patch={"candidate_id": "patch-current-run"},
+                    policy=policy,
                     fact_candidates=[],
                 ),
             ),
         )
 
     transaction_runner.run_write(operation)
+
+
+def _append_accepted_compact_replacement(
+    transaction: HostTransaction,
+    *,
+    session_id: str,
+    run_id: str,
+    event_id: str,
+    current_input_ref: str,
+    source_refs_by_label: Mapping[str, tuple[str, ...]],
+    summary_text: str,
+    fact_claim: str,
+    evidence_source_label: str,
+    policy: MemoryProjectionPolicy,
+) -> EventLogRow:
+    """追加真实 request 与同源 accepted replacement terminal。
+
+    :param transaction: Host transaction。
+    :param session_id: Session id。
+    :param run_id: compact owner Run id。
+    :param event_id: ``CONTEXT_COMPACTED`` event id。
+    :param current_input_ref: 本轮 compact current input exact ref。
+    :param source_refs_by_label: accepted boundary 的真实 canonical source refs。
+    :param summary_text: accepted replacement summary。
+    :param fact_claim: accepted EvidenceFact claim。
+    :param evidence_source_label: 绑定production evidence atom的boundary label。
+    :param policy: accepted truth audit 使用的 Memory policy。
+    :returns: accepted ``CONTEXT_COMPACTED`` EventLog row。
+    :raises HostDurableError: request、payload 或 terminal 无法持久化时抛出。
+    """
+
+    request_event_id = f"{event_id}-requested"
+    event_log = EventLogStore()
+    event_log.append_event(
+        transaction,
+        _event_request(
+            event_id=request_event_id,
+            event_class=EventClass.CANONICAL_FACT,
+            session_id=session_id,
+            run_id=run_id,
+            event_type="CONTEXT_COMPACTION_REQUESTED",
+            payload={
+                "trigger_source": ContextCompactionTriggerSource.PROACTIVE.value,
+                "budget_reason": "test_accepted_replacement_reconnect",
+                "budget_snapshot_ref": _DIGEST_A,
+                "input_snapshot_cursor": 1,
+                "estimator_digest": _DIGEST_A,
+                "policy_ref": "test-policy",
+                "provider_request_id": None,
+                "provider_error_ref": None,
+                "attempt_id": None,
+                "execution_id": None,
+            },
+        ),
+    )
+    return (
+        event_log.append_event(
+            transaction,
+            _event_request(
+                event_id=event_id,
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id=run_id,
+                event_type="CONTEXT_COMPACTED",
+                payload=_compact_payload(
+                    operation_id=request_event_id,
+                    current_input_ref=current_input_ref,
+                    source_refs_by_label=source_refs_by_label,
+                    summary_text=summary_text,
+                    pinned_patch={"candidate_id": f"patch-{event_id}"},
+                    policy=policy,
+                    fact_candidates=[{"claim_text": fact_claim}],
+                    evidence_source_label=evidence_source_label,
+                ),
+            ),
+        ).row
+    )
+
+
+def _append_descriptor_backed_current_run_compacted_event(
+    transaction_runner: HostTransactionRunner,
+    seeded: _SeededRun,
+    *,
+    policy: MemoryProjectionPolicy,
+    summary_text: str,
+    source_refs_by_label: Mapping[str, tuple[str, ...]],
+) -> EventLogRow:
+    """为当前 Run 写入真实 descriptor-backed ``CONTEXT_COMPACTED`` fact。
+
+    :param transaction_runner: Host transaction runner。
+    :param seeded: 当前 Run 引用。
+    :param policy: 与 compact event audit 同源的 Memory policy。
+    :param summary_text: 用于触发超限外置的 compact summary。
+    :param source_refs_by_label: accepted boundary 每个 label 的真实 source refs。
+    :returns: 已写入的 descriptor-backed EventLog row。
+    :raises HostDurableError: payload 外置、descriptor 或 EventLog 写入失败时抛出。
+    """
+
+    def operation(transaction: HostTransaction) -> EventLogRow:
+        """在同一 write transaction 内持久化完整 payload 与 terminal row。
+
+        :param transaction: Host transaction。
+        :returns: 已写入的 EventLog row。
+        :raises HostDurableError: durable payload 或 EventLog 写入失败时抛出。
+        """
+
+        request_event_id = f"event-{seeded.run_id}-compact-requested"
+        event_id = f"event-{seeded.run_id}-compacted"
+        event_log_store = EventLogStore()
+        event_log_store.append_event(
+            transaction,
+            _event_request(
+                event_id=request_event_id,
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=seeded.session_id,
+                run_id=seeded.run_id,
+                event_type="CONTEXT_COMPACTION_REQUESTED",
+                payload={
+                    "trigger_source": ContextCompactionTriggerSource.PROACTIVE.value,
+                    "budget_reason": "test_descriptor_backed_compact_provider",
+                    "budget_snapshot_ref": _DIGEST_A,
+                    "input_snapshot_cursor": 1,
+                    "estimator_digest": _DIGEST_A,
+                    "policy_ref": "test-policy",
+                    "provider_request_id": None,
+                    "provider_error_ref": None,
+                    "attempt_id": seeded.attempt_id,
+                    "execution_id": seeded.execution_id,
+                },
+            ),
+        )
+        payload = _compact_payload(
+            operation_id=request_event_id,
+            current_input_ref="event-current-input",
+            source_refs_by_label=source_refs_by_label,
+            summary_text=summary_text,
+            pinned_patch={"candidate_id": "patch-descriptor-backed-provider"},
+            policy=policy,
+            fact_candidates=[],
+        )
+        storage = store_context_compacted_payload(
+            transaction,
+            PayloadStore(),
+            event_id=event_id,
+            payload=payload,
+        )
+        return event_log_store.append_event(
+            transaction,
+            EventLogAppendRequest(
+                event_id=event_id,
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=seeded.session_id,
+                run_id=seeded.run_id,
+                attempt_id=None,
+                execution_id=None,
+                event_type="CONTEXT_COMPACTED",
+                occurred_at=_NOW,
+                actor="analyst",
+                source="pytest",
+                client_request_id=None,
+                idempotency_key=None,
+                policy_decision=None,
+                reason=None,
+                payload_json=storage.event_payload,
+                payload_ref=storage.payload_ref,
+                payload_digest=storage.payload_digest,
+            ),
+        ).row
+
+    return transaction_runner.run_write(operation)
 
 
 def _material_block(
@@ -4966,9 +5747,7 @@ def _append_prior_accepted_tool_evidence_tx(
         ),
     )
     result_payload: dict[str, JsonValue] = {
-        "accepted_evidence_envelope": (
-            accepted_evidence_envelope_to_json_value(envelope)
-        ),
+        "accepted_evidence_envelope": (accepted_evidence_envelope_to_json_value(envelope)),
     }
     if include_raw_outcome:
         result_payload["raw_tool_outcome"] = actual_raw_outcome
@@ -5017,14 +5796,10 @@ def _append_canonical_tool_result_for_memory(
     :raises HostDurableError: durable append 失败时由 store 抛出。
     """
 
-    arguments_json: dict[str, JsonValue] = {
-        "arguments": {"query": result_summary}
-    }
+    arguments_json: dict[str, JsonValue] = {"arguments": {"query": result_summary}}
     arguments_digest = sha256_digest_json(arguments_json)
     semantic_query = f"查询：{result_summary}"
-    semantic_query_digest = sha256_digest_json(
-        {"semantic_query_text": semantic_query}
-    )
+    semantic_query_digest = sha256_digest_json({"semantic_query_text": semantic_query})
     event_log = EventLogStore()
     event_log.append_event(
         transaction,
@@ -5042,13 +5817,9 @@ def _append_canonical_tool_result_for_memory(
                 "arguments_storage_kind": TOOL_CALL_ARGUMENTS_STORAGE_INLINE_JSON,
                 "arguments_inline_json": arguments_json,
                 "arguments_payload_ref": None,
-                "arguments_json_size_bytes": len(
-                    canonical_json_dumps(arguments_json).encode("utf-8")
-                ),
+                "arguments_json_size_bytes": len(canonical_json_dumps(arguments_json).encode("utf-8")),
                 "semantic_input_digest": semantic_query_digest,
-                "semantic_query_storage_kind": (
-                    TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT
-                ),
+                "semantic_query_storage_kind": (TOOL_CALL_SEMANTIC_QUERY_STORAGE_INLINE_TEXT),
                 "semantic_query_text": semantic_query,
                 "semantic_query_payload_ref": None,
                 "semantic_query_digest": semantic_query_digest,
@@ -5091,20 +5862,24 @@ def _append_canonical_tool_result_for_memory(
                 "tool_call_id": tool_call_id,
                 "tool_fact_kind": "completed",
                 "normalized_arguments_digest": arguments_digest,
-                "accepted_evidence_envelope": (
-                    accepted_evidence_envelope_to_json_value(envelope)
-                ),
+                "accepted_evidence_envelope": (accepted_evidence_envelope_to_json_value(envelope)),
                 "raw_tool_outcome": raw_outcome,
             },
         ),
     )
 
 
-def _append_rich_memory_source_events(transaction_runner: HostTransactionRunner, session_id: str) -> None:
+def _append_rich_memory_source_events(
+    transaction_runner: HostTransactionRunner,
+    session_id: str,
+    *,
+    policy: MemoryProjectionPolicy,
+) -> None:
     """追加 rich snapshot item 需要引用的 EventLog rows。
 
     :param transaction_runner: Host transaction runner。
     :param session_id: Session id。
+    :param policy: 与 compact event audit 同源的 Memory policy。
     :returns: ``None``。
     """
 
@@ -5161,6 +5936,17 @@ def _append_rich_memory_source_events(transaction_runner: HostTransactionRunner,
         EventLogStore().append_event(
             transaction,
             _event_request(
+                event_id="event-current-protected",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id="run-memory-compact-current",
+                event_type="USER_INPUT_ACCEPTED",
+                payload=_user_input_payload("memory compact current input"),
+            ),
+        )
+        EventLogStore().append_event(
+            transaction,
+            _event_request(
                 event_id="event-compact-requested",
                 event_class=EventClass.CANONICAL_FACT,
                 session_id=session_id,
@@ -5189,7 +5975,17 @@ def _append_rich_memory_source_events(transaction_runner: HostTransactionRunner,
                 run_id="run-memory",
                 event_type="CONTEXT_COMPACTED",
                 payload=_compact_payload(
+                    current_input_ref="event-current-protected",
+                    source_refs_by_label={
+                        "event-memory-raw-user": (
+                            "event-memory-assumption",
+                            "event-memory-raw-user",
+                        ),
+                        "event-memory-episode": ("event-memory-assistant",),
+                        "evidence:memory-tool": ("evidence:event-memory-tool",),
+                    },
                     summary_text="episode navigation only",
+                    policy=policy,
                     pinned_patch={
                         "candidate_id": "patch-memory",
                         "current_goal": {
@@ -5215,11 +6011,17 @@ def _append_rich_memory_source_events(transaction_runner: HostTransactionRunner,
     transaction_runner.run_write(operation)
 
 
-def _append_compacted_gross_margin_facts(transaction_runner: HostTransactionRunner, session_id: str) -> None:
+def _append_compacted_gross_margin_facts(
+    transaction_runner: HostTransactionRunner,
+    session_id: str,
+    *,
+    policy: MemoryProjectionPolicy,
+) -> None:
     """追加 gross-margin follow-up 需要的 compacted facts。
 
     :param transaction_runner: Host transaction runner。
     :param session_id: Session id。
+    :param policy: 与 compact event audit 同源的 Memory policy。
     :returns: ``None``。
     """
 
@@ -5239,6 +6041,39 @@ def _append_compacted_gross_margin_facts(transaction_runner: HostTransactionRunn
             tool_call_id="call-memory-gross",
             tool_name="filing.lookup",
             result_summary="收入与毛利已由工具确认",
+        )
+        EventLogStore().append_event(
+            transaction,
+            _event_request(
+                event_id="event-memory-gross-user",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id="run-memory-gross",
+                event_type="USER_INPUT_ACCEPTED",
+                payload=_user_input_payload("gross margin source user"),
+            ),
+        )
+        EventLogStore().append_event(
+            transaction,
+            _event_request(
+                event_id="event-memory-gross-answer",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id="run-memory-gross",
+                event_type="RUN_SUCCEEDED",
+                payload={"final_answer": "gross margin source answer"},
+            ),
+        )
+        EventLogStore().append_event(
+            transaction,
+            _event_request(
+                event_id="event-current-protected",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id="run-memory-gross-current",
+                event_type="USER_INPUT_ACCEPTED",
+                payload=_user_input_payload("gross margin compact current input"),
+            ),
         )
         EventLogStore().append_event(
             transaction,
@@ -5271,7 +6106,14 @@ def _append_compacted_gross_margin_facts(transaction_runner: HostTransactionRunn
                 run_id="run-memory-gross",
                 event_type="CONTEXT_COMPACTED",
                 payload=_compact_payload(
+                    current_input_ref="event-current-protected",
+                    source_refs_by_label={
+                        "event-memory-raw-user": ("event-memory-gross-user",),
+                        "event-memory-episode": ("event-memory-gross-answer",),
+                        "evidence:memory-tool": ("evidence:event-memory-gross-tool",),
+                    },
                     summary_text="gross margin episode navigation only",
+                    policy=policy,
                     pinned_patch={"candidate_id": "patch-gross-margin"},
                     fact_candidates=[
                         {
@@ -5297,12 +6139,16 @@ def _append_compacted_gross_margin_facts(transaction_runner: HostTransactionRunn
 
 
 def _append_reference_continuity_compact_marker(
-    transaction_runner: HostTransactionRunner, *, session_id: str
+    transaction_runner: HostTransactionRunner,
+    *,
+    session_id: str,
+    policy: MemoryProjectionPolicy,
 ) -> EventLogRow:
     """追加 reference continuity snapshot 的 compact producer event。
 
     :param transaction_runner: Host transaction runner。
     :param session_id: Session id。
+    :param policy: 与 compact event audit 同源的 Memory policy。
     :returns: compact producer EventLog row。
     """
 
@@ -5313,6 +6159,39 @@ def _append_reference_continuity_compact_marker(
         :returns: compact producer EventLog row。
         """
 
+        EventLogStore().append_event(
+            transaction,
+            _event_request(
+                event_id="event-long-input-answer",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id="run-long-input",
+                event_type="RUN_SUCCEEDED",
+                payload={"final_answer": "long input source answer"},
+            ),
+        )
+        EventLogStore().append_event(
+            transaction,
+            _event_request(
+                event_id="event-long-summary-source",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id="run-long-summary-source",
+                event_type="USER_INPUT_ACCEPTED",
+                payload=_user_input_payload("long input summary source"),
+            ),
+        )
+        EventLogStore().append_event(
+            transaction,
+            _event_request(
+                event_id="event-current-protected",
+                event_class=EventClass.CANONICAL_FACT,
+                session_id=session_id,
+                run_id="run-long-input-compact-current",
+                event_type="USER_INPUT_ACCEPTED",
+                payload=_user_input_payload("reference compact current input"),
+            ),
+        )
         EventLogStore().append_event(
             transaction,
             _event_request(
@@ -5346,8 +6225,15 @@ def _append_reference_continuity_compact_marker(
                     run_id="run-long-input",
                     event_type="CONTEXT_COMPACTED",
                     payload=_compact_payload(
+                        current_input_ref="event-current-protected",
+                        source_refs_by_label={
+                            "event-memory-raw-user": ("event-long-summary-source",),
+                            "event-memory-episode": ("event-long-input-answer",),
+                            "event-long-input": ("event-long-input",),
+                        },
                         summary_text="long input compacted to reference continuity",
                         pinned_patch={"candidate_id": "patch-second-factor"},
+                        policy=policy,
                         fact_candidates=[],
                         reference_continuity_items=[
                             {
@@ -5387,6 +6273,45 @@ def _read_event_by_id(transaction_runner: HostTransactionRunner, event_id: str) 
         return row
 
     return transaction_runner.run_read(operation)
+
+
+def _material_view_run_for_input_event(event: EventLogRow) -> RunRow:
+    """为真实 input EventLog row 构造只读 material owner Run boundary。
+
+    该 fixture 只用于调用 ``build_pre_dispatch_compact_material_view``；ordinary
+    RunInput 仍由 durable Run/Attempt owner 创建并读取。
+
+    :param event: 当前 ``USER_INPUT_ACCEPTED`` canonical row。
+    :returns: 指向该真实 input row 的 Run boundary。
+    :raises AssertionError: input row 缺失 Run identity 时抛出。
+    """
+
+    assert event.run_id is not None
+    return RunRow(
+        run_id=event.run_id,
+        session_id=event.session_id,
+        status=RunStatus.RUNNING,
+        client_request_id=f"request-{event.run_id}",
+        input_event_id=event.event_id,
+        input_event_sequence=event.event_sequence,
+        accepted_event_id=event.event_id,
+        accepted_event_sequence=event.event_sequence,
+        queued_event_id=None,
+        queued_event_sequence=None,
+        started_event_id=None,
+        started_event_sequence=None,
+        terminal_event_id=None,
+        terminal_event_sequence=None,
+        cancel_request_event_id=None,
+        current_attempt_id=None,
+        source_run_id=None,
+        source_run_relation=None,
+        execution_target="local-default",
+        queue_policy=RunQueuePolicy.QUEUE,
+        created_at=event.occurred_at,
+        updated_at=event.occurred_at,
+        terminal_at=None,
+    )
 
 
 def _events_by_type(transaction_runner: HostTransactionRunner, *, event_type: str) -> tuple[EventLogRow, ...]:
@@ -6035,9 +6960,7 @@ def _append_resume_wait_projection_events(
         request_arguments = accepted_arguments or {"ticker": "V"}
         request_arguments_json: dict[str, JsonValue] = {"arguments": dict(request_arguments)}
         request_arguments_digest = sha256_digest_json(request_arguments_json)
-        normalized_arguments_digest = (
-            request_normalized_arguments_digest or request_arguments_digest
-        )
+        normalized_arguments_digest = request_normalized_arguments_digest or request_arguments_digest
         request_event_id = "event-tool-call-requested-resume"
         request_row: EventLogRow | None = None
         if include_request_atom:
@@ -6223,16 +7146,10 @@ def _append_resume_wait_projection_events(
                 client_request_id=None,
                 idempotency_key="resolve-resume",
                 policy_decision=None,
-                reason={
-                    "start_reason": serialize_run_start_reason(
-                        RunStartReason.RESUME
-                    )
-                },
+                reason={"start_reason": serialize_run_start_reason(RunStartReason.RESUME)},
                 payload_json={
                     "run_id": seeded.run_id,
-                    "start_reason": serialize_run_start_reason(
-                        RunStartReason.RESUME
-                    ),
+                    "start_reason": serialize_run_start_reason(RunStartReason.RESUME),
                     "wait_id": "wait-resume-private",
                     "source_attempt_id": seeded.attempt_id,
                     "attempt_id": "attempt-resume-private",
@@ -6584,6 +7501,7 @@ def _policy_snapshot(*, allow_tool_calls: bool = False) -> PolicySnapshot:
             supports_tool_calling=False,
             supports_streaming=False,
             supports_stream_usage=False,
+            structured_output_capability=StructuredOutputCapability.NONE,
             default_timeout_seconds=30.0,
             max_retries=0,
             provider_request=None,
@@ -7036,54 +7954,62 @@ def _user_input_payload(text: str) -> dict[str, JsonValue]:
 def _compact_payload(
     *,
     operation_id: str = "event-compact-requested",
+    current_input_ref: str,
+    source_refs_by_label: Mapping[str, tuple[str, ...]],
     summary_text: str,
     pinned_patch: dict[str, JsonValue],
+    policy: MemoryProjectionPolicy,
     fact_candidates: list[JsonValue] | None = None,
     reference_continuity_items: list[JsonValue] | None = None,
+    evidence_source_label: str = "evidence:memory-tool",
 ) -> dict[str, JsonValue]:
     """构造测试用 CONTEXT_COMPACTED payload。
 
     :param operation_id: 对应 CONTEXT_COMPACTION_REQUESTED event id。
+    :param current_input_ref: accepted compact 的真实 current input event ref。
+    :param source_refs_by_label: 每个 boundary label 的真实 canonical source refs。
     :param summary_text: session summary 文本。
     :param pinned_patch: pinned patch candidate。
+    :param policy: 与 accepted truth audit 同源的 Memory policy。
     :param fact_candidates: 可选 evidence-backed fact candidates。
     :param reference_continuity_items: 可选 reference continuity candidates。
+    :param evidence_source_label: evidence fact 使用的真实boundary label。
     :returns: compacted payload。
     """
 
-    resolved_fact_candidates: list[EvidenceBackedFactCandidateVNext]
+    resolved_fact_candidates: list[CompactEvidenceFactV4]
     if fact_candidates is None:
         resolved_fact_candidates = [
-            EvidenceBackedFactCandidateVNext(
-                claim_text="Revenue increased year over year",
-                evidence_labels=("evidence:memory-tool",),
-                source_labels=("evidence:memory-tool",),
+            CompactEvidenceFactV4(
+                claim="Revenue increased year over year",
+                support_labels=(evidence_source_label,),
+                context_labels=(),
             )
         ]
     else:
         resolved_fact_candidates = [
-            EvidenceBackedFactCandidateVNext(
-                claim_text=str(candidate["claim_text"]),
-                evidence_labels=("evidence:memory-tool",),
-                source_labels=("evidence:memory-tool",),
+            CompactEvidenceFactV4(
+                claim=str(candidate["claim_text"]),
+                support_labels=(evidence_source_label,),
+                context_labels=(),
             )
             for candidate in fact_candidates
             if isinstance(candidate, dict) and "claim_text" in candidate
         ]
-    resolved_reference_continuity_items: list[ReferenceContinuityCandidateVNext]
+    resolved_reference_continuity_items: list[CompactReferenceContinuityV4]
     if reference_continuity_items is None:
         resolved_reference_continuity_items = [
-            ReferenceContinuityCandidateVNext(
+            CompactReferenceContinuityV4(
                 text="second factor: margin mix",
-                reason=ReferenceContinuityReasonVNext.RECENT_STATE,
+                reason="recent_state",
                 source_labels=("event-memory-raw-user",),
             )
         ]
     else:
         resolved_reference_continuity_items = [
-            ReferenceContinuityCandidateVNext(
+            CompactReferenceContinuityV4(
                 text=str(candidate["text"]),
-                reason=ReferenceContinuityReasonVNext.ORDINAL_REFERENCE,
+                reason="ordinal_reference",
                 source_labels=("event-long-input",),
             )
             for candidate in reference_continuity_items
@@ -7103,32 +8029,36 @@ def _compact_payload(
             values = open_questions.get("value")
             if isinstance(values, list) and values and isinstance(values[0], str):
                 forward_text = values[0]
-    candidate = ConversationCompactOutputVNext(
-        schema_version=CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
-        session_summary=SessionSummaryCandidateVNext(
-            summary_text=summary_text,
+    candidate = CompactCandidateV4(
+        schema=COMPACT_OUTPUT_SCHEMA_V4,
+        session_summary=CompactSessionSummaryV4(
+            text=summary_text,
             source_labels=("event-memory-raw-user",),
         ),
-        evidence_backed_facts=tuple(resolved_fact_candidates),
+        retained_previous_evidence_fact_labels=(),
+        evidence_facts=tuple(resolved_fact_candidates),
         answer_anchors=(
-            AnswerAnchorCandidateVNext(
-                anchor_title="Compacted answer anchor",
-                anchor_items=(
-                    AnswerAnchorChildVNext(display_text=anchor_text, ordinal=1),
-                ),
-                answer_source_labels=("event-memory-episode",),
-            ),
-        ),
-        forward_intents=(
-            ForwardIntentCandidateVNext(
-                intent_type=ForwardIntentTypeVNext.OPEN_QUESTION,
-                text=forward_text,
-                status=ForwardIntentStatusVNext.OPEN,
+            CompactAnswerAnchorV4(
+                title="Compacted answer anchor",
+                detail=anchor_text,
                 source_labels=("event-memory-episode",),
             ),
         ),
-        reference_continuity_items=tuple(resolved_reference_continuity_items),
-        diagnostics=(),
+        forward_intents=(
+            CompactForwardIntentV4(
+                intent_type="open_question",
+                text=forward_text,
+                status=CompactForwardIntentStatusV4.OPEN,
+                source_labels=("event-memory-episode",),
+            ),
+        ),
+        reference_continuity=tuple(resolved_reference_continuity_items),
+    )
+    accepted_truth = accepted_truth_for_candidate(
+        candidate,
+        current_input_ref=current_input_ref,
+        source_refs_by_label=source_refs_by_label,
+        memory_policy=policy,
     )
     return dict(
         build_context_compacted_payload(
@@ -7136,20 +8066,22 @@ def _compact_payload(
             accepted_attempt_number=1,
             compact_artifact_ref="compact-artifact:test",
             compact_artifact_digest=_DIGEST_A,
-            accepted_candidate=candidate,
-            quality_check_result=CompactQualityCheckResultVNext(
-                accepted=True,
-                rejection_reasons=(),
-            ),
+            accepted_truth=accepted_truth,
             budget_after_compact=512,
             prompt_local_label_mapping_refs=(
                 "prompt-label:event-memory-raw-user",
                 "prompt-label:event-memory-episode",
                 "prompt-label:evidence:memory-tool",
             ),
-            source_boundary_refs=("event-memory-raw-user",),
-            accepted_evidence_mapping_refs=("evidence:memory-tool",),
             projection_signal="conversation_memory_projection_catchup",
+            successful_response_identity=_successful_response_identity(
+                operation_id=operation_id,
+                compactor_engine_run_id=f"compactor-run:{operation_id}:1",
+            ),
+            accepted_proposal_manifest_reference=_proposal_manifest_reference(
+                operation_id=operation_id,
+                compactor_engine_run_id=f"compactor-run:{operation_id}:1",
+            ),
         )
     )
 
@@ -7245,6 +8177,28 @@ def _expected_system_content() -> str:
             "Tools are disabled for this runner call.",
         )
     )
+
+
+def _assert_fallback_grounding_guidance(content: str) -> None:
+    """断言 fallback guidance 自足且不泄漏内部治理术语。
+
+    :param content: ordinary RunInput 的唯一 system envelope。
+    :returns: ``None``。
+    :raises AssertionError: grounding 语义缺失、重复或泄漏内部术语时抛出。
+    """
+
+    unavailable = "Some earlier conversation material may be unavailable in the current request."
+    assert unavailable in content
+    assert "Use only facts directly supported by material visible in the current request." in content
+    assert "Do not treat references to missing earlier content" in content
+    assert "prior assistant claims" in content
+    assert "general knowledge as evidence" in content
+    assert "use an available tool only when the user's instruction permits it" in content
+    assert "state that the available material is insufficient" in content
+    assert "ask to retrieve or provide the missing evidence" in content
+    assert content.count(unavailable) == 1
+    for internal_fragment in ("compaction", "fallback", "tier 4", "tier 5", "Host"):
+        assert internal_fragment not in content
 
 
 def _single_system_content(messages: tuple[AgentMessage, ...]) -> str:

@@ -16,6 +16,11 @@ from dayu.engine.contracts.engine_events import (
     FinalAnswerData,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.engine.contracts.agent_policy import AgentPolicy
 from dayu.engine.contracts.runner_spec import RunnerCallOptions
 from dayu.host.admission import PendingDispatchRecord, effective_tool_facts_json
@@ -662,6 +667,22 @@ def _old_final_answer_candidate(old: _SeededRun) -> EngineEventCandidate:
                 filtered=False,
                 degraded=False,
                 finish_reason=FinishReason.STOP,
+                response_identity=SuccessfulRunnerResponseIdentity(
+                    effective_provider="test",
+                    effective_model="test-model",
+                    runner_request_identity=build_runner_request_identity(
+                        run_id=old.run_id,
+                        attempt_id=old.attempt_id,
+                        execution_id=old.execution_id,
+                        iteration_id=f"{old.run_id}:late-final",
+                        iteration_index=0,
+                        runner_call_index=1,
+                    ),
+                    provider_request_id_availability=(
+                        ProviderRequestIdAvailability.UNAVAILABLE
+                    ),
+                    provider_request_id=None,
+                ),
             ),
             metadata=None,
         ),

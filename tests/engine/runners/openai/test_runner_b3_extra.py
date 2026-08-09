@@ -78,7 +78,11 @@ async def test_sse_idle_aclose_does_not_leak_pending_task() -> None:
     iterator = cast(
         AsyncGenerator[RunnerEvent, None],
         runner._call_impl(  # type: ignore[attr-defined]
-            msgs, make_options(stream=True), [], request_identity=None
+            msgs,
+            make_options(stream=True),
+            [],
+            structured_output=None,
+            request_identity=None,
         ),
     )
 
@@ -134,6 +138,7 @@ async def test_sse_idle_outer_cancel_does_not_leak_pending_task() -> None:
         msgs = [UserMessage(role=AgentMessageRole.USER, content="hi")]
         events: list[RunnerEvent] = []
         async for event in runner.call(
+            structured_output=None,
             messages=msgs, options=make_options(stream=True), tools=[]
         ):
             events.append(event)
@@ -174,6 +179,7 @@ async def test_sse_idle_cancel_wins_over_timeout() -> None:
         msgs = [UserMessage(role=AgentMessageRole.USER, content="hi")]
         events: list[RunnerEvent] = []
         async for event in runner.call(
+            structured_output=None,
             messages=msgs, options=make_options(stream=True), tools=[]
         ):
             events.append(event)
@@ -214,6 +220,7 @@ async def test_terminal_error_with_empty_body_falls_back_to_status() -> None:
     msgs = [UserMessage(role=AgentMessageRole.USER, content="hi")]
     events: list[RunnerEvent] = []
     async for event in runner.call(
+        structured_output=None,
         messages=msgs, options=make_options(stream=False), tools=[]
     ):
         events.append(event)
@@ -252,6 +259,7 @@ async def test_runner_event_stream_does_not_yield_log_records() -> None:
     msgs = [UserMessage(role=AgentMessageRole.USER, content="hi")]
     events: list[RunnerEvent] = []
     async for event in runner.call(
+        structured_output=None,
         messages=msgs, options=make_options(stream=False), tools=[]
     ):
         events.append(event)
@@ -308,6 +316,7 @@ async def test_idle_timeout_only_no_heartbeat_still_works() -> None:
     msgs = [UserMessage(role=AgentMessageRole.USER, content="hi")]
     events: list[RunnerEvent] = []
     async for event in runner.call(
+        structured_output=None,
         messages=msgs, options=make_options(stream=True), tools=[]
     ):
         events.append(event)
@@ -345,6 +354,7 @@ async def test_protocol_error_emits_warning_log(
         with caplog.at_level(logging.DEBUG, logger="dayu"):
             msgs = [UserMessage(role=AgentMessageRole.USER, content="hi")]
             async for _event in runner.call(
+                structured_output=None,
                 messages=msgs,
                 options=make_options(stream=False),
                 tools=[],
@@ -388,6 +398,7 @@ async def test_http_post_and_response_debug_logs(
         with caplog.at_level(logging.DEBUG, logger="dayu"):
             msgs = [UserMessage(role=AgentMessageRole.USER, content="hi")]
             async for _event in runner.call(
+                structured_output=None,
                 messages=msgs,
                 options=make_options(stream=False),
                 tools=[],

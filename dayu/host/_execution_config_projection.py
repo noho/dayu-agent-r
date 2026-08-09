@@ -29,6 +29,7 @@ from dayu.engine.contracts.runner_spec import (
     RunnerCallOptions,
     RunnerSpec,
 )
+from dayu.engine.contracts.structured_output import StructuredOutputCapability
 from dayu.host.durable.codec import sha256_digest_json
 from dayu.host.durable.errors import HostDurableError
 
@@ -173,6 +174,9 @@ def runner_spec_json(runner_spec: RunnerSpec) -> JsonValue:
         "supports_tool_calling": runner_spec.supports_tool_calling,
         "supports_streaming": runner_spec.supports_streaming,
         "supports_stream_usage": runner_spec.supports_stream_usage,
+        "structured_output_capability": (
+            runner_spec.structured_output_capability.value
+        ),
         "default_timeout_seconds": runner_spec.default_timeout_seconds,
         "max_retries": runner_spec.max_retries,
         "provider_request": provider_request_json(runner_spec.provider_request),
@@ -207,6 +211,11 @@ def runner_spec_from_json(value: Mapping[str, JsonValue]) -> RunnerSpec:
         ),
         supports_stream_usage=required_json_bool(
             value, field_name="supports_stream_usage"
+        ),
+        structured_output_capability=StructuredOutputCapability(
+            required_json_text(
+                value, field_name="structured_output_capability"
+            )
         ),
         default_timeout_seconds=required_json_float(
             value, field_name="default_timeout_seconds"

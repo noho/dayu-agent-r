@@ -8,8 +8,9 @@ import sqlite3
 import sys
 import threading
 from contextlib import suppress
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from collections.abc import AsyncIterator
+from types import ModuleType
 from typing import cast
 
 import pytest
@@ -1040,6 +1041,186 @@ async def test_cancelled_recovery_waits_for_drain_before_fresh_attachment(
             assert fresh.access_mode is HostSessionAccessMode.READ_WRITE
         finally:
             await close_attachment_shielded(fresh)
+
+
+@pytest.mark.asyncio
+async def test_attachment_close_cancels_sleeping_delayed_recovery_without_facts(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """attachment close 取消尚在 sleep 的 task，不提交第二次 scan。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: task、EventLog 或 mutex lifecycle 漂移时抛出。
+    """
+
+    scan_calls = 0
+    schedule_deadline = True
+    sleep_started = asyncio.Event()
+    module = cast(ModuleType, sys.modules["dayu.host.open_host"])
+
+    def scheduled_scan(
+        scanner: SessionAttachmentRecoveryScanner,
+        policy: SessionAttachmentRecoveryPolicy | None = None,
+    ) -> SessionAttachmentRecoveryScanResult:
+        """让 initial scan 只返回一个 future deadline。
+
+        :param scanner: target scanner。
+        :param policy: fixed-now policy。
+        :returns: 不携带 durable action 的 scan result。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        nonlocal scan_calls
+        del scanner, policy
+        scan_calls += 1
+        return SessionAttachmentRecoveryScanResult(
+            actions=(),
+            next_reconcile_at=(
+                datetime.now(UTC) + timedelta(minutes=5)
+                if schedule_deadline
+                else None
+            ),
+        )
+
+    async def blocked_sleep(deadline: datetime) -> None:
+        """冻结 delayed task 在 actor submit 之前。
+
+        :param deadline: scanner 返回的 deadline。
+        :returns: ``None``。
+        :raises asyncio.CancelledError: attachment close 取消时抛出。
+        """
+
+        del deadline
+        sleep_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(SessionAttachmentRecoveryScanner, "scan", scheduled_scan)
+    monkeypatch.setattr(module, "_sleep_until_recovery_deadline", blocked_sleep)
+    options = _options(tmp_path, FinalAnswerWorkerFactory())
+    async with open_host(options) as host:
+        public_host = cast(_PublicHostHandle, host)
+        session = await host.ensure_session(
+            ensure_request("attachment-delayed-sleep-close")
+        )
+        attachment = await host.attach_session(session.session_id)
+        await asyncio.wait_for(sleep_started.wait(), timeout=1.0)
+        event_count_before_close = _event_count(options.db_path)
+
+        await attachment.aclose()
+
+        assert scan_calls == 1
+        assert _event_count(options.db_path) == event_count_before_close
+        assert public_host._delayed_attachment_recovery_tasks == {}
+        schedule_deadline = False
+        fresh = await host.attach_session(session.session_id)
+        try:
+            assert fresh.access_mode is HostSessionAccessMode.READ_WRITE
+        finally:
+            await fresh.aclose()
+
+
+@pytest.mark.asyncio
+async def test_attachment_close_joins_submitted_delayed_scan_before_mutex_release(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """delayed actor scan 已提交时，attachment close 必须等它收口。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: actor future、lease 或 mutex 提前释放时抛出。
+    """
+
+    scan_calls = 0
+    delayed_scan_started = threading.Event()
+    delayed_scan_release = threading.Event()
+    module = cast(ModuleType, sys.modules["dayu.host.open_host"])
+
+    def blocking_second_scan(
+        scanner: SessionAttachmentRecoveryScanner,
+        policy: SessionAttachmentRecoveryPolicy | None = None,
+    ) -> SessionAttachmentRecoveryScanResult:
+        """首次返回 deadline，第二次在 actor thread 阻塞。
+
+        :param scanner: target scanner。
+        :param policy: fixed-now policy。
+        :returns: synthetic typed scan result。
+        :raises RuntimeError: barrier 未在预算内释放时抛出。
+        """
+
+        nonlocal scan_calls
+        del scanner, policy
+        scan_calls += 1
+        if scan_calls == 1:
+            return SessionAttachmentRecoveryScanResult(
+                actions=(),
+                next_reconcile_at=datetime.now(UTC),
+            )
+        if scan_calls == 2:
+            delayed_scan_started.set()
+            if not delayed_scan_release.wait(timeout=2.0):
+                raise RuntimeError("delayed recovery barrier timed out")
+        return SessionAttachmentRecoveryScanResult(actions=())
+
+    async def immediate_sleep(deadline: datetime) -> None:
+        """立即让 delayed task 进入 actor submit。
+
+        :param deadline: scanner 返回的 deadline。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        del deadline
+
+    monkeypatch.setattr(
+        SessionAttachmentRecoveryScanner,
+        "scan",
+        blocking_second_scan,
+    )
+    monkeypatch.setattr(module, "_sleep_until_recovery_deadline", immediate_sleep)
+    options = _options(tmp_path, FinalAnswerWorkerFactory())
+    owner_manager = open_host(options)
+    observer_manager = open_host(options)
+    owner_host = await owner_manager.__aenter__()
+    observer_host = await observer_manager.__aenter__()
+    owner_attachment: HostSessionAttachment | None = None
+    observer_attachment: HostSessionAttachment | None = None
+    fresh_attachment: HostSessionAttachment | None = None
+    try:
+        session = await owner_host.ensure_session(
+            ensure_request("attachment-delayed-actor-close")
+        )
+        owner_attachment = await owner_host.attach_session(session.session_id)
+        assert await asyncio.to_thread(delayed_scan_started.wait, 1.0)
+        close_task = asyncio.create_task(owner_attachment.aclose())
+        await asyncio.sleep(0)
+        assert close_task.done() is False
+
+        observer_attachment = await observer_host.attach_session(session.session_id)
+        assert observer_attachment.access_mode is HostSessionAccessMode.READ_ONLY
+        delayed_scan_release.set()
+        await close_task
+        owner_attachment = None
+        await observer_attachment.aclose()
+        observer_attachment = None
+
+        fresh_attachment = await observer_host.attach_session(session.session_id)
+        assert fresh_attachment.access_mode is HostSessionAccessMode.READ_WRITE
+        assert scan_calls == 3
+    finally:
+        delayed_scan_release.set()
+        if fresh_attachment is not None:
+            await fresh_attachment.aclose()
+        if observer_attachment is not None:
+            await observer_attachment.aclose()
+        if owner_attachment is not None:
+            await owner_attachment.aclose()
+        await observer_manager.__aexit__(None, None, None)
+        await owner_manager.__aexit__(None, None, None)
 
 
 @pytest.mark.asyncio

@@ -3,31 +3,44 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import nullcontext
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
 import pytest
 
+import dayu.host.context_events as context_events_module
 from dayu.contracts.json_value import JsonValue
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.host.api import HostEventClass, HostEventKind, HostTerminalStatus
 from dayu.host.compaction import (
-    AnswerAnchorCandidateVNext,
-    AnswerAnchorChildVNext,
-    CompactQualityCheckResultVNext,
-    CompactQualityIssueVNext,
-    CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
-    ConversationCompactOutputVNext,
-    EvidenceBackedFactCandidateVNext,
-    ForwardIntentCandidateVNext,
-    ForwardIntentStatusVNext,
-    ForwardIntentTypeVNext,
-    ReferenceContinuityCandidateVNext,
-    ReferenceContinuityReasonVNext,
-    SessionSummaryCandidateVNext,
-    CompactCandidateDiagnosticVNext,
+    COMPACT_INPUT_SCHEMA_V4,
+    CompactAnswerAnchorV4,
+    CompactAcceptedTruthV4,
+    COMPACT_OUTPUT_SCHEMA_V4,
+    CompactAcceptedReplacementV4,
+    CompactCandidateV4,
+    CompactCurrentInputV4,
+    CompactEvidenceFactV4,
+    CompactForwardIntentV4,
+    CompactForwardIntentStatusV4,
+    CompactReferenceContinuityV4,
+    CompactRepresentedCoverageV4,
+    CompactSessionSummaryV4,
+    CompactInputV4,
+    CompactSourceBoundaryEntryV4,
+    CompactSourceKindV4,
 )
 from dayu.host.compact_payload import (
+    accepted_compact_business_texts,
+    accepted_evidence_mapping_refs,
+    compact_artifact_payload_ref,
     parse_context_compacted_semantic_payload,
 )
 from dayu.host.context_budget import ContextBudgetDecision
@@ -37,12 +50,20 @@ from dayu.host.context_events import (
     build_context_compacted_payload,
     build_context_compaction_failed_payload,
     build_context_compaction_requested_payload,
+    parse_context_compacted_terminal_binding,
+    parse_context_compaction_attempt_rejected_terminal_binding,
+    parse_successful_runner_response_identity,
     validate_context_compaction_attempt_rejected_payload,
     validate_context_compacted_payload,
     validate_context_compaction_failed_payload,
     validate_context_compaction_requested_payload,
 )
 from dayu.host.context_policy import ContextCompactionTriggerSource
+from dayu.host.context_governance import (
+    accept_compact_candidate_v4,
+    compact_output_caps_v4_from_memory_policy,
+)
+from dayu.host.context_events import CompactorProposalManifestReference
 from dayu.host.durable.codec import format_utc_timestamp, sha256_digest_json
 from dayu.host.durable.event_log import EventClass, EventLogRow
 from dayu.host.durable.connection import open_host_durable_store
@@ -52,6 +73,8 @@ from dayu.host.durable.options import (
 )
 from dayu.host.durable.transaction import HostTransaction
 from dayu.host.read_api import _host_event_from_row
+from dayu.host.memory import default_memory_projection_policy
+from tests.host.fake_compaction import accepted_truth_for_candidate
 
 _DIGEST_A = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 _DIGEST_B = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -59,6 +82,160 @@ _FIELD_FALLBACK_POLICY_DECISION = "fallback_policy_decision"
 _FIELD_FALLBACK_INPUT_WINDOW = "fallback_input_window"
 _FIELD_FALLBACK_INPUT_DIGEST = "fallback_input_digest"
 _FIELD_FALLBACK_BUDGET_RESULT = "fallback_budget_result"
+
+
+def test_context_events_owner_exports_compactor_manifest_reference() -> None:
+    """Context event owner 必须直接导出 compactor manifest 引用契约。
+
+    :returns: ``None``。
+    :raises AssertionError: manifest 引用类型未由 owner 模块导出时抛出。
+    """
+
+    assert "CompactorProposalManifestReference" in context_events_module.__all__
+    assert "parse_successful_runner_response_identity" in (
+        context_events_module.__all__
+    )
+
+
+def test_successful_response_public_parser_roundtrips_canonical_identity() -> None:
+    """公开 strict parser 与 canonical compacted payload 使用同一 identity shape。
+
+    :returns: ``None``。
+    :raises AssertionError: parser 与 terminal binding 不同源时抛出。
+    """
+
+    payload = _valid_compacted_payload()
+    identity_payload = cast(
+        Mapping[str, JsonValue],
+        payload["successful_response_identity"],
+    )
+
+    identity = parse_successful_runner_response_identity(identity_payload)
+    binding = parse_context_compacted_terminal_binding(payload)
+
+    assert binding.successful_response_identity == identity
+    assert identity.effective_provider == "test-compactor"
+    assert identity.effective_model == "test-compactor-model"
+    assert identity.provider_request_id_availability is (
+        ProviderRequestIdAvailability.UNAVAILABLE
+    )
+    assert identity.provider_request_id is None
+
+
+def test_successful_response_public_parser_rejects_secret_like_extra_field() -> None:
+    """canonical identity 白名单拒绝 header/credential/raw payload 扩展。
+
+    :returns: ``None``。
+    :raises AssertionError: secret-like extra field 未被拒绝时抛出。
+    """
+
+    payload = _valid_compacted_payload()
+    identity_payload = dict(
+        cast(
+            Mapping[str, JsonValue],
+            payload["successful_response_identity"],
+        )
+    )
+    identity_payload["authorization"] = "Bearer must-not-leak"
+
+    with pytest.raises(ValueError, match="unexpected payload fields"):
+        parse_successful_runner_response_identity(identity_payload)
+
+
+def test_attempt_rejected_terminal_parser_preserves_no_success_null() -> None:
+    """no-success canonical rejection 由 event owner 解析为 typed null identity。
+
+    :returns: ``None``。
+    :raises AssertionError: no-success identity 或 manifest binding 错误时抛出。
+    """
+
+    manifest_reference = _proposal_manifest_reference(
+        operation_id="operation-no-success",
+        attempt_number=1,
+        compactor_engine_run_id="compactor-run-no-success",
+        manifest_payload_ref="payload-manifest-no-success",
+        manifest_digest=_DIGEST_A,
+    )
+    payload = build_context_compaction_attempt_rejected_payload(
+        operation_id="operation-no-success",
+        attempt_number=1,
+        failure_category="cancellation_requested",
+        repairable=False,
+        runner_attempt_summary_refs=("runner-attempt-1",),
+        diagnostic_refs=("diagnostic-1",),
+        next_policy_decision="stop",
+        budget_after_attempted_compact=None,
+        successful_response_identity=None,
+        proposal_manifest_reference=manifest_reference,
+    )
+
+    binding = parse_context_compaction_attempt_rejected_terminal_binding(payload)
+
+    assert binding.proposal_manifest_ref == "payload-manifest-no-success"
+    assert binding.proposal_manifest_digest == _DIGEST_A
+    assert binding.successful_response_identity is None
+
+
+def _successful_response_identity(
+    *,
+    operation_id: str,
+    attempt_number: int,
+    compactor_engine_run_id: str,
+) -> SuccessfulRunnerResponseIdentity:
+    """构造与当前 durable event fixture 同源的成功响应身份。
+
+    :param operation_id: 当前 compaction operation id。
+    :param attempt_number: 当前 proposal attempt number。
+    :param compactor_engine_run_id: 当前 manifest 显式绑定的 Engine run id。
+    :returns: deterministic、非敏感且 event-unique 的 typed identity。
+    :raises ValueError: identity 字段非法时抛出。
+    """
+
+    return SuccessfulRunnerResponseIdentity(
+        effective_provider="test-compactor",
+        effective_model="test-compactor-model",
+        runner_request_identity=build_runner_request_identity(
+            run_id=compactor_engine_run_id,
+            attempt_id=None,
+            execution_id=None,
+            iteration_id=f"{operation_id}:attempt:{attempt_number}:iteration",
+            iteration_index=0,
+            runner_call_index=1,
+        ),
+        provider_request_id_availability=(ProviderRequestIdAvailability.UNAVAILABLE),
+        provider_request_id=None,
+    )
+
+
+def _proposal_manifest_reference(
+    *,
+    operation_id: str,
+    attempt_number: int,
+    compactor_engine_run_id: str,
+    manifest_payload_ref: str,
+    manifest_digest: str,
+) -> CompactorProposalManifestReference:
+    """构造与当前 durable event fixture 同源的 typed manifest reference。
+
+    :param operation_id: 当前 compaction operation id。
+    :param attempt_number: 当前 proposal attempt number。
+    :param compactor_engine_run_id: 当前 manifest 显式绑定的 Engine run id。
+    :param manifest_payload_ref: 当前 fixture 的 manifest payload ref。
+    :param manifest_digest: 当前 fixture 的 manifest digest。
+    :returns: 与 operation/attempt/run 显式绑定的 manifest reference。
+    :raises ValueError: manifest binding 字段非法时抛出。
+    """
+
+    return CompactorProposalManifestReference(
+        manifest_event_id=f"manifest-event:{operation_id}:{attempt_number}",
+        manifest_payload_ref=manifest_payload_ref,
+        manifest_digest=manifest_digest,
+        compactor_input_projection_ref=(f"projection:{operation_id}:{attempt_number}"),
+        compactor_input_projection_digest=_DIGEST_B,
+        compaction_operation_id=operation_id,
+        compaction_attempt_number=attempt_number,
+        compactor_engine_run_id=compactor_engine_run_id,
+    )
 
 
 def test_requested_payload_builder_accepts_proactive_without_attempt() -> None:
@@ -143,7 +320,7 @@ def test_compacted_payload_builder_emits_required_accepted_output() -> None:
     validate_context_compacted_payload(payload)
     assert payload["compact_artifact_ref"] == "compact-artifact:abc"
     assert payload["accepted_attempt_number"] == 2
-    assert payload["accepted_candidate_digest"] == _candidate().digest()
+    assert payload["accepted_proposal_digest"] == _candidate().digest()
     assert payload["budget_after_compact"] == 512
 
 
@@ -154,16 +331,72 @@ def test_compacted_semantic_parser_roundtrips_full_typed_candidate() -> None:
 
     semantic = parse_context_compacted_semantic_payload(payload)
 
-    assert semantic.accepted_candidate == _candidate()
-    assert semantic.accepted_candidate_digest == _candidate().digest()
-    assert semantic.accepted_evidence_mapping_refs == ("evidence:accepted-1",)
+    assert semantic.accepted_proposal == _candidate()
+    assert semantic.accepted_proposal_digest == _candidate().digest()
+    assert semantic.accepted_evidence_mapping_refs == ("evidence:E1",)
     assert semantic.compact_artifact_ref == "compact-artifact:abc"
     assert semantic.current_input_ref == "event-user-1"
     assert semantic.compacted_source_refs == ("evidence:accepted-1",)
-    assert semantic.accepted_candidate.answer_anchors[0].anchor_items == (
-        AnswerAnchorChildVNext(display_text="Revenue increased.", ordinal=1),
-        AnswerAnchorChildVNext(display_text="Margin also expanded.", ordinal=2),
+    assert semantic.accepted_proposal.answer_anchors[0].detail == ("Revenue increased.\nMargin also expanded.")
+    assert semantic.accepted_replacement.answer_anchors[0].detail == (
+        "Revenue increased.\nMargin also expanded."
     )
+    assert accepted_evidence_mapping_refs(payload) == ("evidence:E1",)
+    assert accepted_compact_business_texts(semantic.accepted_replacement) == (
+        "Q1 review focused on revenue.",
+        "Revenue increased.",
+        "Revenue answer",
+        "Revenue increased.\nMargin also expanded.",
+        "Compare quarters next.",
+        "Keep revenue comparison context.",
+    )
+
+
+def test_whitespace_only_candidate_anchor_is_rejected_at_typed_accept_boundary() -> None:
+    """candidate typed owner 必须拒绝 whitespace-only anchor，不交给 projector 补救。
+
+    :returns: ``None``。
+    :raises AssertionError: whitespace-only title 被 typed boundary 接受时抛出。
+    """
+
+    with pytest.raises(ValueError, match="CompactAnswerAnchorV4.title"):
+        CompactAnswerAnchorV4(
+            title="  \n\t ",
+            detail="valid detail",
+            source_labels=("A1",),
+        )
+
+
+def test_whitespace_only_persisted_replacement_is_rejected_at_read_boundary() -> None:
+    """strict persisted parser 必须拒绝 blank replacement，不 skip 或默认化。
+
+    :returns: ``None``。
+    :raises AssertionError: 持久化 whitespace-only title 被 read owner 接受时抛出。
+    """
+
+    payload = _valid_compacted_payload()
+    replacement = _payload_mapping(payload["accepted_replacement"])
+    anchors = _mapping_list(replacement["answer_anchors"])
+    anchors[0]["title"] = " \n\t "
+    replacement["answer_anchors"] = cast(list[JsonValue], anchors)
+    payload["accepted_replacement"] = replacement
+
+    with pytest.raises(ValueError, match="title"):
+        parse_context_compacted_semantic_payload(payload)
+
+
+def test_compact_payload_public_helpers_reject_invalid_inputs() -> None:
+    """compact payload public helper 对弱类型 replacement 与非法 digest fail closed。"""
+
+    with pytest.raises(
+        TypeError,
+        match="replacement must be CompactAcceptedReplacementV4",
+    ):
+        accepted_compact_business_texts(
+            cast(CompactAcceptedReplacementV4, "bad")
+        )
+    with pytest.raises(ValueError, match="artifact_digest must be sha256 digest"):
+        compact_artifact_payload_ref("bad")
 
 
 @pytest.mark.parametrize(
@@ -200,39 +433,44 @@ def test_compacted_semantic_parser_rejects_missing_source_boundary_refs() -> Non
         parse_context_compacted_semantic_payload(payload)
 
 
-def test_compacted_semantic_parser_accepts_current_input_only_boundary() -> None:
-    """只有 current input 的 boundary 合法且不伪造 covered refs。"""
+def test_compacted_semantic_parser_rejects_missing_covered_source_refs() -> None:
+    """source refs 必须与 committed coverage 同源，不得只留 current input。"""
 
     payload = _valid_compacted_payload()
     payload["source_boundary_refs"] = ["event-user-1"]
 
-    semantic = parse_context_compacted_semantic_payload(payload)
+    with pytest.raises(
+        ValueError,
+        match="source_boundary_refs must equal committed derived coverage",
+    ):
+        parse_context_compacted_semantic_payload(payload)
 
-    assert semantic.current_input_ref == "event-user-1"
-    assert semantic.compacted_source_refs == ()
 
-
-@pytest.mark.parametrize(
-    ("field_name", "invalid_value"),
-    (
-        ("intent_type", "unknown_intent"),
-        ("status", "unknown_status"),
-    ),
-)
-def test_compacted_semantic_parser_rejects_invalid_forward_intent_enum(
-    field_name: str,
-    invalid_value: str,
-) -> None:
-    """persisted parser 对非法 forward intent enum fail closed。
-
-    :param field_name: 被破坏的 enum 字段。
-    :param invalid_value: 非法 enum value。
-    """
+def test_compacted_semantic_parser_accepts_nonempty_intent_type() -> None:
+    """intent_type 是业务可读文本，不得被下游伪造成枚举。"""
 
     payload = _valid_compacted_payload()
-    candidate = _payload_mapping(payload["accepted_candidate"])
+    candidate = _payload_mapping(payload["accepted_proposal"])
     intents = _mapping_list(candidate["forward_intents"])
-    intents[0][field_name] = invalid_value
+    intents[0]["intent_type"] = "custom_follow_up"
+    candidate["forward_intents"] = cast(list[JsonValue], intents)
+    _replace_candidate_and_digest(payload, candidate)
+    replacement = _payload_mapping(payload["accepted_replacement"])
+    replacement["forward_intents"] = cast(list[JsonValue], intents)
+    payload["accepted_replacement"] = replacement
+
+    semantic = parse_context_compacted_semantic_payload(payload)
+
+    assert semantic.accepted_proposal.forward_intents[0].intent_type == ("custom_follow_up")
+
+
+def test_compacted_semantic_parser_rejects_invalid_forward_intent_status() -> None:
+    """persisted parser 对非法 forward intent status fail closed。"""
+
+    payload = _valid_compacted_payload()
+    candidate = _payload_mapping(payload["accepted_proposal"])
+    intents = _mapping_list(candidate["forward_intents"])
+    intents[0]["status"] = "unknown_status"
     candidate["forward_intents"] = cast(list[JsonValue], intents)
     _replace_candidate_and_digest(payload, candidate)
 
@@ -240,18 +478,22 @@ def test_compacted_semantic_parser_rejects_invalid_forward_intent_enum(
         parse_context_compacted_semantic_payload(payload)
 
 
-def test_compacted_semantic_parser_rejects_invalid_reference_reason() -> None:
-    """persisted parser 对非法 reference continuity reason fail closed。"""
+def test_compacted_semantic_parser_accepts_nonempty_reference_reason() -> None:
+    """reference reason 是业务可读文本，不得被下游伪造成枚举。"""
 
     payload = _valid_compacted_payload()
-    candidate = _payload_mapping(payload["accepted_candidate"])
-    references = _mapping_list(candidate["reference_continuity_items"])
-    references[0]["reason"] = "unknown_reason"
-    candidate["reference_continuity_items"] = cast(list[JsonValue], references)
+    candidate = _payload_mapping(payload["accepted_proposal"])
+    references = _mapping_list(candidate["reference_continuity"])
+    references[0]["reason"] = "retain_for_next_comparison"
+    candidate["reference_continuity"] = cast(list[JsonValue], references)
     _replace_candidate_and_digest(payload, candidate)
+    replacement = _payload_mapping(payload["accepted_replacement"])
+    replacement["reference_continuity"] = cast(list[JsonValue], references)
+    payload["accepted_replacement"] = replacement
 
-    with pytest.raises(ValueError):
-        validate_context_compacted_payload(payload)
+    semantic = parse_context_compacted_semantic_payload(payload)
+
+    assert semantic.accepted_proposal.reference_continuity[0].reason == ("retain_for_next_comparison")
 
 
 def test_compacted_semantic_parser_rejects_unsupported_evidence_kind_field() -> None:
@@ -262,13 +504,16 @@ def test_compacted_semantic_parser_rejects_unsupported_evidence_kind_field() -> 
     """
 
     payload = _valid_compacted_payload()
-    candidate = _payload_mapping(payload["accepted_candidate"])
-    facts = _mapping_list(candidate["evidence_backed_facts"])
+    candidate = _payload_mapping(payload["accepted_proposal"])
+    facts = _mapping_list(candidate["evidence_facts"])
     facts[0]["evidence_kind"] = "accepted_evidence_material"
-    candidate["evidence_backed_facts"] = cast(list[JsonValue], facts)
+    candidate["evidence_facts"] = cast(list[JsonValue], facts)
     _replace_candidate_and_digest(payload, candidate)
 
-    with pytest.raises(ValueError, match="evidence_kind is not supported"):
+    with pytest.raises(
+        ValueError,
+        match=r"unknown_json_key: \$\.evidence_facts\[0\]\.evidence_kind",
+    ):
         parse_context_compacted_semantic_payload(payload)
 
 
@@ -276,7 +521,7 @@ def test_compacted_semantic_parser_rejects_empty_summary_source_labels_with_path
     """persisted parser 在 owner boundary 拒绝空 summary source labels。"""
 
     payload = _valid_compacted_payload()
-    candidate = _payload_mapping(payload["accepted_candidate"])
+    candidate = _payload_mapping(payload["accepted_proposal"])
     summary = _payload_mapping(candidate["session_summary"])
     summary["source_labels"] = []
     candidate["session_summary"] = summary
@@ -284,7 +529,7 @@ def test_compacted_semantic_parser_rejects_empty_summary_source_labels_with_path
 
     with pytest.raises(
         ValueError,
-        match=r"accepted_candidate\.session_summary\.source_labels",
+        match=r"\$\.session_summary\.source_labels",
     ):
         parse_context_compacted_semantic_payload(payload)
 
@@ -293,12 +538,12 @@ def test_compacted_semantic_parser_rejects_empty_summary_source_labels_with_path
     ("label_field", "expected_path"),
     (
         (
-            "evidence_labels",
-            r"accepted_candidate\.evidence_backed_facts\[0\]\.evidence_labels\[1\]",
+            "support_labels",
+            r"\$\.evidence_facts\[0\]\.support_labels\[1\]",
         ),
         (
-            "source_labels",
-            r"accepted_candidate\.evidence_backed_facts\[0\]\.source_labels\[1\]",
+            "context_labels",
+            r"\$\.evidence_facts\[0\]\.context_labels\[1\]",
         ),
     ),
 )
@@ -313,10 +558,10 @@ def test_compacted_semantic_parser_rejects_duplicate_fact_labels_with_indexed_pa
     """
 
     payload = _valid_compacted_payload()
-    candidate = _payload_mapping(payload["accepted_candidate"])
-    facts = _mapping_list(candidate["evidence_backed_facts"])
+    candidate = _payload_mapping(payload["accepted_proposal"])
+    facts = _mapping_list(candidate["evidence_facts"])
     facts[0][label_field] = ["E1", "E1"]
-    candidate["evidence_backed_facts"] = cast(list[JsonValue], facts)
+    candidate["evidence_facts"] = cast(list[JsonValue], facts)
     _replace_candidate_and_digest(payload, candidate)
 
     with pytest.raises(ValueError, match=expected_path):
@@ -327,7 +572,7 @@ def test_compacted_semantic_parser_rejects_duplicate_intent_source_labels_with_i
     """persisted parser 拒绝重复 intent source labels 并保留 indexed JSON path。"""
 
     payload = _valid_compacted_payload()
-    candidate = _payload_mapping(payload["accepted_candidate"])
+    candidate = _payload_mapping(payload["accepted_proposal"])
     intents = _mapping_list(candidate["forward_intents"])
     intents[0]["source_labels"] = ["A1", "A1"]
     candidate["forward_intents"] = cast(list[JsonValue], intents)
@@ -336,7 +581,7 @@ def test_compacted_semantic_parser_rejects_duplicate_intent_source_labels_with_i
     with pytest.raises(
         ValueError,
         match=(
-            r"accepted_candidate\.forward_intents\[0\]\."
+            r"\$\.forward_intents\[0\]\."
             r"source_labels\[1\]"
         ),
     ):
@@ -347,27 +592,28 @@ def test_compacted_semantic_parser_rejects_wrong_nested_shape() -> None:
     """persisted parser 拒绝错误 nested list/object shape。"""
 
     payload = _valid_compacted_payload()
-    candidate = _payload_mapping(payload["accepted_candidate"])
+    candidate = _payload_mapping(payload["accepted_proposal"])
     candidate["answer_anchors"] = "not-a-list"
     _replace_candidate_and_digest(payload, candidate)
 
-    with pytest.raises(ValueError, match="answer_anchors must be list"):
+    with pytest.raises(ValueError, match=r"invalid_field_type: \$\.answer_anchors"):
         parse_context_compacted_semantic_payload(payload)
 
 
-def test_compacted_semantic_parser_rejects_negative_anchor_ordinal() -> None:
-    """persisted parser 拒绝负 anchor child ordinal。"""
+def test_compacted_semantic_parser_rejects_removed_anchor_children_field() -> None:
+    """fresh v4 anchor 不接受旧 child/ordinal 结构。"""
 
     payload = _valid_compacted_payload()
-    candidate = _payload_mapping(payload["accepted_candidate"])
+    candidate = _payload_mapping(payload["accepted_proposal"])
     anchors = _mapping_list(candidate["answer_anchors"])
-    children = _mapping_list(anchors[0]["anchor_items"])
-    children[0]["ordinal"] = -1
-    anchors[0]["anchor_items"] = cast(list[JsonValue], children)
+    anchors[0]["anchor_items"] = [{"text": "legacy", "detail": "legacy", "ordinal": -1}]
     candidate["answer_anchors"] = cast(list[JsonValue], anchors)
     _replace_candidate_and_digest(payload, candidate)
 
-    with pytest.raises(ValueError, match="ordinal must be non-negative"):
+    with pytest.raises(
+        ValueError,
+        match=r"unknown_json_key: \$\.answer_anchors\[0\]\.anchor_items",
+    ):
         parse_context_compacted_semantic_payload(payload)
 
 
@@ -375,11 +621,11 @@ def test_compacted_semantic_parser_rejects_unknown_old_candidate_field() -> None
     """persisted parser 不接受 current schema 之外的旧字段 alias。"""
 
     payload = _valid_compacted_payload()
-    candidate = _payload_mapping(payload["accepted_candidate"])
+    candidate = _payload_mapping(payload["accepted_proposal"])
     candidate["episode_summary"] = "legacy"
     _replace_candidate_and_digest(payload, candidate)
 
-    with pytest.raises(ValueError, match="episode_summary is not supported"):
+    with pytest.raises(ValueError, match=r"unknown_json_key: \$\.episode_summary"):
         parse_context_compacted_semantic_payload(payload)
 
 
@@ -387,9 +633,265 @@ def test_compacted_semantic_parser_rejects_candidate_digest_mismatch() -> None:
     """persisted parser 不接受 candidate 与 persisted digest 不一致。"""
 
     payload = _valid_compacted_payload()
-    payload["accepted_candidate_digest"] = _DIGEST_A
+    payload["accepted_proposal_digest"] = _DIGEST_A
 
-    with pytest.raises(ValueError, match="accepted_candidate_digest mismatch"):
+    with pytest.raises(ValueError, match="accepted_proposal_digest mismatch"):
+        parse_context_compacted_semantic_payload(payload)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "tampered_value", "expected_message"),
+    (
+        (
+            "claim",
+            "Tampered durable claim.",
+            "accepted_replacement must exactly bind",
+        ),
+        (
+            "selection_labels",
+            ["UNKNOWN"],
+            "accepted_replacement must exactly bind",
+        ),
+        (
+            "selection_labels",
+            [],
+            "selection_labels must be non-empty",
+        ),
+        (
+            "canonical_evidence_refs",
+            ["evidence:unrelated"],
+            "accepted_replacement must exactly bind",
+        ),
+        (
+            "canonical_evidence_refs",
+            [],
+            "canonical_evidence_refs must be non-empty",
+        ),
+    ),
+)
+def test_compacted_semantic_parser_rejects_tampered_replacement_fact_binding(
+    field_name: str,
+    tampered_value: JsonValue,
+    expected_message: str,
+) -> None:
+    """strict payload parser 重验 replacement atom 的 claim/selection/refs exact binding。
+
+    :param field_name: 被篡改的 accepted fact 字段。
+    :param tampered_value: 写入 durable payload 的非法值。
+    :param expected_message: owner fail-closed 错误片段。
+    :returns: ``None``。
+    """
+
+    payload = _valid_compacted_payload()
+    replacement = _payload_mapping(payload["accepted_replacement"])
+    facts = _mapping_list(replacement["evidence_facts"])
+    facts[0][field_name] = tampered_value
+    replacement["evidence_facts"] = cast(list[JsonValue], facts)
+    payload["accepted_replacement"] = replacement
+
+    with pytest.raises(ValueError, match=expected_message):
+        parse_context_compacted_semantic_payload(payload)
+
+
+def test_compacted_semantic_parser_accepts_reverse_cross_fact_boundary_order() -> None:
+    """fact 顺序可与 boundary 相反，aggregate 保持 replacement fact/entry 顺序。
+
+    :returns: ``None``。
+    :raises AssertionError: durable parser 错把跨 fact 顺序当作 boundary ordinal 时抛出。
+    """
+
+    accepted = _accepted_truth_for_ordered_evidence_boundary(
+        boundary_refs=(
+            ("E1", ("evidence:first",)),
+            ("E2", ("evidence:second",)),
+        ),
+        facts=(
+            CompactEvidenceFactV4(
+                claim="第二项事实先出现",
+                support_labels=("E2",),
+                context_labels=(),
+            ),
+            CompactEvidenceFactV4(
+                claim="第一项事实后出现",
+                support_labels=("E1",),
+                context_labels=(),
+            ),
+        ),
+    )
+
+    semantic = parse_context_compacted_semantic_payload(
+        _compacted_payload_for_truth(accepted)
+    )
+
+    assert semantic.accepted_evidence_mapping_refs == (
+        "evidence:second",
+        "evidence:first",
+    )
+
+
+def test_compacted_semantic_parser_accepts_three_fact_shared_ref_ordered_dedup() -> None:
+    """三 fact aggregate 按 fact/entry 顺序 unique union，并跨 fact 去重 shared ref。
+
+    :returns: ``None``。
+    """
+
+    accepted = _accepted_truth_for_ordered_evidence_boundary(
+        boundary_refs=(
+            ("E1", ("evidence:first", "evidence:shared")),
+            ("E2", ("evidence:shared", "evidence:second")),
+            ("E3", ("evidence:third",)),
+        ),
+        facts=(
+            CompactEvidenceFactV4(
+                claim="第三项事实",
+                support_labels=("E3",),
+                context_labels=(),
+            ),
+            CompactEvidenceFactV4(
+                claim="第二项事实",
+                support_labels=("E2",),
+                context_labels=(),
+            ),
+            CompactEvidenceFactV4(
+                claim="第一项事实",
+                support_labels=("E1",),
+                context_labels=(),
+            ),
+        ),
+    )
+
+    semantic = parse_context_compacted_semantic_payload(
+        _compacted_payload_for_truth(accepted)
+    )
+
+    assert semantic.accepted_evidence_mapping_refs == (
+        "evidence:third",
+        "evidence:shared",
+        "evidence:second",
+        "evidence:first",
+    )
+
+
+def test_compacted_semantic_parser_accepts_retained_then_new_aggregate() -> None:
+    """retained atom 在前、new atom 在后时 aggregate 精确反映 combined replacement。
+
+    :returns: ``None``。
+    """
+
+    policy = default_memory_projection_policy()
+    compact_input = CompactInputV4(
+        schema=COMPACT_INPUT_SCHEMA_V4,
+        current_input=CompactCurrentInputV4(
+            source_ref="event:current-retained-new",
+            readable_text="继续分析",
+        ),
+        source_boundary=(
+            CompactSourceBoundaryEntryV4(
+                source_label="P1",
+                source_kind=CompactSourceKindV4.PREVIOUS_EVIDENCE_FACT,
+                source_refs=("event:previous",),
+                canonical_evidence_refs=("evidence:previous",),
+                readable_text="旧事实",
+            ),
+            CompactSourceBoundaryEntryV4(
+                source_label="E1",
+                source_kind=CompactSourceKindV4.EVIDENCE_MATERIAL,
+                source_refs=("event:current-evidence",),
+                canonical_evidence_refs=("evidence:current",),
+                readable_text="当前证据",
+            ),
+        ),
+        output_caps=compact_output_caps_v4_from_memory_policy(policy),
+    )
+    proposal = CompactCandidateV4(
+        schema=COMPACT_OUTPUT_SCHEMA_V4,
+        session_summary=None,
+        retained_previous_evidence_fact_labels=("P1",),
+        evidence_facts=(
+            CompactEvidenceFactV4(
+                claim="新事实",
+                support_labels=("E1",),
+                context_labels=(),
+            ),
+        ),
+        answer_anchors=(),
+        forward_intents=(),
+        reference_continuity=(),
+    )
+    accepted = accept_compact_candidate_v4(compact_input, proposal, policy)
+    assert isinstance(accepted, CompactAcceptedTruthV4)
+
+    semantic = parse_context_compacted_semantic_payload(
+        _compacted_payload_for_truth(accepted)
+    )
+
+    assert semantic.accepted_evidence_mapping_refs == (
+        "evidence:previous",
+        "evidence:current",
+    )
+
+
+def test_compacted_semantic_parser_accepts_empty_evidence_aggregate() -> None:
+    """无 evidence facts 的合法 replacement 允许空 aggregate。
+
+    :returns: ``None``。
+    """
+
+    accepted = accepted_truth_for_candidate(
+        CompactCandidateV4(
+            schema=COMPACT_OUTPUT_SCHEMA_V4,
+            session_summary=CompactSessionSummaryV4(
+                text="只保留会话摘要",
+                source_labels=("T1",),
+            ),
+            retained_previous_evidence_fact_labels=(),
+            evidence_facts=(),
+            answer_anchors=(),
+            forward_intents=(),
+            reference_continuity=(),
+        ),
+        current_input_ref="event:current-empty-aggregate",
+    )
+
+    semantic = parse_context_compacted_semantic_payload(
+        _compacted_payload_for_truth(accepted)
+    )
+
+    assert semantic.accepted_evidence_mapping_refs == ()
+
+
+@pytest.mark.parametrize(
+    ("aggregate", "expected_message"),
+    (
+        (
+            ["evidence:outside"],
+            "accepted_evidence_mapping_refs must be boundary evidence subset",
+        ),
+        (
+            ["evidence:E1", "evidence:E1"],
+            "accepted_evidence_mapping_refs must contain unique refs",
+        ),
+        (
+            [],
+            "accepted_evidence_mapping_refs must equal replacement refs union",
+        ),
+    ),
+)
+def test_compacted_semantic_parser_rejects_invalid_aggregate_membership_or_binding(
+    aggregate: list[JsonValue],
+    expected_message: str,
+) -> None:
+    """aggregate 对越界、重复和 replacement mismatch 分别 fail closed。
+
+    :param aggregate: 篡改后的 durable aggregate。
+    :param expected_message: owner 错误消息。
+    :returns: ``None``。
+    """
+
+    payload = _valid_compacted_payload()
+    payload["accepted_evidence_mapping_refs"] = aggregate
+
+    with pytest.raises(ValueError, match=expected_message):
         parse_context_compacted_semantic_payload(payload)
 
 
@@ -409,7 +911,7 @@ def test_compacted_payload_rejects_summary_without_preservation_evidence() -> No
     payload = dict(_valid_compacted_payload())
     payload["episode_summary_candidate"] = {}
 
-    with pytest.raises(ValueError, match="episode_summary_candidate is not supported"):
+    with pytest.raises(ValueError, match="unexpected payload fields: episode_summary_candidate"):
         validate_context_compacted_payload(payload)
 
 
@@ -417,11 +919,9 @@ def test_compacted_payload_rejects_summary_proposed_evidence_backed_fact_refs() 
     """vNext compacted payload 拒绝旧 proposed fact summary 字段入口。"""
 
     payload = dict(_valid_compacted_payload())
-    payload["episode_summary_candidate"] = {
-        "proposed_evidence_backed_fact_refs": ["fake-fact"]
-    }
+    payload["episode_summary_candidate"] = {"proposed_evidence_backed_fact_refs": ["fake-fact"]}
 
-    with pytest.raises(ValueError, match="episode_summary_candidate is not supported"):
+    with pytest.raises(ValueError, match="unexpected payload fields: episode_summary_candidate"):
         validate_context_compacted_payload(payload)
 
 
@@ -429,11 +929,9 @@ def test_compacted_payload_rejects_old_summary_proposed_verified_fact_refs() -> 
     """vNext compacted payload 拒绝旧 proposed_verified_fact_refs key。"""
 
     payload = dict(_valid_compacted_payload())
-    payload["episode_summary_candidate"] = {
-        "proposed_verified_fact_refs": ["fake-fact"]
-    }
+    payload["episode_summary_candidate"] = {"proposed_verified_fact_refs": ["fake-fact"]}
 
-    with pytest.raises(ValueError, match="episode_summary_candidate is not supported"):
+    with pytest.raises(ValueError, match="unexpected payload fields: episode_summary_candidate"):
         validate_context_compacted_payload(payload)
 
 
@@ -443,9 +941,7 @@ def test_compacted_payload_rejects_patch_without_preservation_evidence() -> None
     payload = dict(_valid_compacted_payload())
     payload["pinned_state_patch_candidate"] = {}
 
-    with pytest.raises(
-        ValueError, match="pinned_state_patch_candidate is not supported"
-    ):
+    with pytest.raises(ValueError, match="unexpected payload fields: pinned_state_patch_candidate"):
         validate_context_compacted_payload(payload)
 
 
@@ -455,9 +951,7 @@ def test_compacted_payload_rejects_replace_patch_without_value() -> None:
     payload = dict(_valid_compacted_payload())
     payload["pinned_state_patch_candidate"] = {"current_goal": {"operation": "replace"}}
 
-    with pytest.raises(
-        ValueError, match="pinned_state_patch_candidate is not supported"
-    ):
+    with pytest.raises(ValueError, match="unexpected payload fields: pinned_state_patch_candidate"):
         validate_context_compacted_payload(payload)
 
 
@@ -467,9 +961,7 @@ def test_compacted_payload_rejects_direct_patch_field_without_tristate() -> None
     payload = dict(_valid_compacted_payload())
     payload["pinned_state_patch_candidate"] = {"current_goal": "direct goal"}
 
-    with pytest.raises(
-        ValueError, match="pinned_state_patch_candidate is not supported"
-    ):
+    with pytest.raises(ValueError, match="unexpected payload fields: pinned_state_patch_candidate"):
         validate_context_compacted_payload(payload)
 
 
@@ -477,62 +969,217 @@ def test_compacted_payload_rejects_free_form_confirmed_subject() -> None:
     """vNext compacted payload 拒绝旧 confirmed_subjects patch 字段。"""
 
     payload = dict(_valid_compacted_payload())
-    payload["pinned_state_patch_candidate"] = {
-        "confirmed_subjects": {"value": ["Apple Inc."]}
-    }
+    payload["pinned_state_patch_candidate"] = {"confirmed_subjects": {"value": ["Apple Inc."]}}
+
+    with pytest.raises(ValueError, match="unexpected payload fields: pinned_state_patch_candidate"):
+        validate_context_compacted_payload(payload)
+
+
+def test_compacted_payload_rejects_tampered_coverage() -> None:
+    """committed reader 拒绝与 candidate 派生值不一致的 coverage。"""
+
+    payload = _valid_compacted_payload()
+    payload["represented_coverage"] = {"sources": []}
+
+    with pytest.raises(ValueError, match="coverage"):
+        validate_context_compacted_payload(payload)
+
+
+def test_compacted_payload_rejects_represented_omitted_overlap() -> None:
+    """represented/omitted 不是 exact partition 时 strict reader fail closed。"""
+
+    payload = _valid_compacted_payload()
+    payload["omitted_coverage"] = {"source_labels": ["E1"]}
 
     with pytest.raises(
-        ValueError, match="pinned_state_patch_candidate is not supported"
+        ValueError,
+        match="represented and omitted coverage must be disjoint",
     ):
         validate_context_compacted_payload(payload)
 
 
-def test_compacted_payload_rejects_rejected_quality_result() -> None:
-    """CONTEXT_COMPACTED 只能承载 accepted quality check output。"""
+def test_compacted_semantic_view_rejects_invalid_source_boundary_types() -> None:
+    """typed durable view 在读取字段前拒绝非法 source boundary tuple 与 item。
 
-    with pytest.raises(ValueError, match="accepted quality result"):
-        build_context_compacted_payload(
-            operation_id="event-context-compaction-requested-rejected",
-            accepted_attempt_number=1,
-            compact_artifact_ref="compact-artifact:abc",
-            compact_artifact_digest=_DIGEST_B,
-            accepted_candidate=_candidate(),
-            quality_check_result=CompactQualityCheckResultVNext(
-                accepted=False,
-                rejection_reasons=(CompactQualityIssueVNext.UNKNOWN_SOURCE_LABEL,),
+    :returns: ``None``。
+    :raises AssertionError: 非 tuple 或非 typed boundary item 未触发 TypeError 时抛出。
+    """
+
+    semantics = parse_context_compacted_semantic_payload(_valid_compacted_payload())
+
+    with pytest.raises(TypeError, match="source_boundary must be tuple"):
+        replace(
+            semantics,
+            source_boundary=cast(tuple[CompactSourceBoundaryEntryV4, ...], []),
+        )
+    with pytest.raises(
+        TypeError,
+        match="source_boundary item must be CompactSourceBoundaryEntryV4",
+    ):
+        replace(
+            semantics,
+            source_boundary=cast(
+                tuple[CompactSourceBoundaryEntryV4, ...],
+                ("invalid",),
             ),
-            budget_after_compact=512,
-            prompt_local_label_mapping_refs=("prompt-label:E1",),
-            source_boundary_refs=("event-user-1",),
-            accepted_evidence_mapping_refs=("evidence:accepted-1",),
-            projection_signal="conversation_memory_projection_catchup",
         )
 
 
-def test_compacted_payload_records_accepted_proposal_manifest_reference() -> None:
-    """accepted outcome payload 反向引用 accepted proposal manifest。"""
+def test_compacted_semantic_view_rejects_invalid_represented_coverage_type() -> None:
+    """typed durable view 明确拒绝非法 represented coverage 类型。
 
-    payload = build_context_compacted_payload(
-        operation_id="event-context-compaction-requested-accepted",
-        accepted_attempt_number=1,
-        compact_artifact_ref="compact-artifact:abc",
-        compact_artifact_digest=_DIGEST_B,
-        accepted_candidate=_candidate(),
-        quality_check_result=_quality_result(),
-        budget_after_compact=512,
-        prompt_local_label_mapping_refs=("prompt-label:E1",),
-        source_boundary_refs=("event-user-1",),
-        accepted_evidence_mapping_refs=("evidence:accepted-1",),
-        projection_signal="conversation_memory_projection_catchup",
-        accepted_proposal_manifest_ref="runner-call-manifest:accepted",
-        accepted_proposal_manifest_digest=_DIGEST_A,
+    :returns: ``None``。
+    :raises AssertionError: 非 typed represented coverage 未触发 TypeError 时抛出。
+    """
+
+    semantics = parse_context_compacted_semantic_payload(_valid_compacted_payload())
+
+    with pytest.raises(
+        TypeError,
+        match="represented_coverage must be CompactRepresentedCoverageV4",
+    ):
+        replace(
+            semantics,
+            represented_coverage=cast(CompactRepresentedCoverageV4, "invalid"),
+        )
+
+
+@pytest.mark.parametrize(
+    "actual_field",
+    (
+        "session_summary_char_actual",
+        "evidence_fact_item_actual",
+        "evidence_fact_char_actual",
+        "answer_anchor_item_actual",
+        "answer_anchor_char_actual",
+        "forward_intent_item_actual",
+        "forward_intent_char_actual",
+        "reference_continuity_item_actual",
+        "reference_continuity_char_actual",
+    ),
+)
+def test_compacted_payload_rejects_replacement_audit_actual_mismatch(
+    actual_field: str,
+) -> None:
+    """九项 actual 被向下篡改时 strict reader fail closed。
+
+    :param actual_field: 待篡改的 durable audit 字段。
+    """
+
+    payload = _valid_compacted_payload()
+    audit = _payload_mapping(payload["policy_usage_audit"])
+    actual = audit[actual_field]
+    assert isinstance(actual, int)
+    assert actual > 0
+    audit[actual_field] = actual - 1
+    payload["policy_usage_audit"] = audit
+
+    with pytest.raises(
+        ValueError,
+        match="policy_usage_audit actuals must equal replacement-derived usage",
+    ):
+        validate_context_compacted_payload(payload)
+
+
+@pytest.mark.parametrize(
+    ("binding_field", "expected_message"),
+    [
+        (None, None),
+        ("operation_id", "operation id mismatch"),
+        ("attempt_number", "attempt number mismatch"),
+        ("engine_run_id", "Engine run id mismatch"),
+    ],
+)
+def test_compacted_payload_records_accepted_proposal_manifest_reference(
+    binding_field: str | None,
+    expected_message: str | None,
+) -> None:
+    """accepted payload 记录同源 manifest，并拒绝三类 sibling 串线。
+
+    :param binding_field: 待串线的 manifest binding 字段；正例为 ``None``。
+    :param expected_message: 负例 owner-level 拒绝消息；正例为 ``None``。
+    :returns: ``None``。
+    :raises AssertionError: 正例丢失 identity/manifest 或负例未 fail-closed 时抛出。
+    """
+
+    operation_id = "event-context-compaction-requested-accepted"
+    attempt_number = 1
+    engine_run_id = "compactor-run:accepted"
+    identity = _successful_response_identity(
+        operation_id=operation_id,
+        attempt_number=attempt_number,
+        compactor_engine_run_id=engine_run_id,
     )
+    manifest_reference = _proposal_manifest_reference(
+        operation_id=operation_id,
+        attempt_number=attempt_number,
+        compactor_engine_run_id=engine_run_id,
+        manifest_payload_ref="runner-call-manifest:accepted",
+        manifest_digest=_DIGEST_A,
+    )
+    if binding_field == "operation_id":
+        manifest_reference = replace(
+            manifest_reference,
+            compaction_operation_id="sibling-operation",
+        )
+    elif binding_field == "attempt_number":
+        manifest_reference = replace(
+            manifest_reference,
+            compaction_attempt_number=2,
+        )
+    elif binding_field == "engine_run_id":
+        manifest_reference = replace(
+            manifest_reference,
+            compactor_engine_run_id="sibling-compactor-run",
+        )
+    elif binding_field is not None:
+        raise AssertionError("unsupported binding field")
+    expected_context = nullcontext() if expected_message is None else pytest.raises(ValueError, match=expected_message)
+    payload: Mapping[str, JsonValue] | None = None
+    with expected_context:
+        payload = build_context_compacted_payload(
+            operation_id=operation_id,
+            accepted_attempt_number=1,
+            compact_artifact_ref="compact-artifact:abc",
+            compact_artifact_digest=_DIGEST_B,
+            accepted_truth=_accepted_truth(),
+            budget_after_compact=512,
+            prompt_local_label_mapping_refs=("prompt-label:E1",),
+            projection_signal="conversation_memory_projection_catchup",
+            successful_response_identity=identity,
+            accepted_proposal_manifest_reference=manifest_reference,
+        )
 
+    if expected_message is not None:
+        return
+    assert payload is not None
     validate_context_compacted_payload(payload)
-    assert payload["accepted_proposal_manifest_ref"] == (
-        "runner-call-manifest:accepted"
-    )
+    assert payload["accepted_proposal_manifest_ref"] == ("runner-call-manifest:accepted")
     assert payload["accepted_proposal_manifest_digest"] == _DIGEST_A
+    successful_response_identity = cast(
+        Mapping[str, JsonValue],
+        payload["successful_response_identity"],
+    )
+    assert set(successful_response_identity) == {
+        "effective_provider",
+        "effective_model",
+        "runner_request_identity",
+        "provider_request_id_availability",
+        "provider_request_id",
+    }
+    runner_request_identity = cast(
+        Mapping[str, JsonValue],
+        successful_response_identity["runner_request_identity"],
+    )
+    assert set(runner_request_identity) == {
+        "run_id",
+        "attempt_id",
+        "execution_id",
+        "iteration_id",
+        "iteration_index",
+        "runner_call_index",
+        "client_correlation_id",
+    }
 
 
 def test_compacted_payload_requires_proposal_manifest_ref_digest_pair() -> None:
@@ -543,6 +1190,138 @@ def test_compacted_payload_requires_proposal_manifest_ref_digest_pair() -> None:
     payload["accepted_proposal_manifest_digest"] = None
 
     with pytest.raises(ValueError, match="accepted_proposal_manifest"):
+        validate_context_compacted_payload(payload)
+
+
+def test_compacted_payload_requires_non_null_proposal_manifest_pair() -> None:
+    """accepted proposal manifest ref / digest 均不得为 null。
+
+    :returns: ``None``。
+    :raises AssertionError: accepted payload 接受无 manifest 记录时抛出。
+    """
+
+    payload = _valid_compacted_payload()
+    payload["accepted_proposal_manifest_ref"] = None
+    payload["accepted_proposal_manifest_digest"] = None
+
+    with pytest.raises(ValueError, match="accepted_proposal_manifest_ref"):
+        validate_context_compacted_payload(payload)
+
+
+@pytest.mark.parametrize(
+    ("nested", "field_name"),
+    [
+        (False, "endpoint"),
+        (False, "credential"),
+        (False, "Authorization"),
+        (False, "provider_payload"),
+        (True, "headers"),
+        (True, "cookie"),
+        (True, "secret"),
+    ],
+)
+def test_compacted_payload_identity_rejects_secret_bearing_extra_fields(
+    nested: bool,
+    field_name: str,
+) -> None:
+    """strict identity object 拒绝 endpoint/credential/header/payload 等字段。
+
+    :param nested: 是否向 runner_request_identity 注入字段。
+    :param field_name: 待注入的敏感字段名。
+    :returns: ``None``。
+    :raises AssertionError: durable identity 接受敏感扩展字段或泄露值时抛出。
+    """
+
+    secret_value = "S5-CANARY-DO-NOT-PERSIST"
+    payload = _valid_compacted_payload()
+    identity = dict(
+        cast(
+            Mapping[str, JsonValue],
+            payload["successful_response_identity"],
+        )
+    )
+    if nested:
+        runner_identity = dict(
+            cast(
+                Mapping[str, JsonValue],
+                identity["runner_request_identity"],
+            )
+        )
+        runner_identity[field_name] = secret_value
+        identity["runner_request_identity"] = runner_identity
+    else:
+        identity[field_name] = secret_value
+    payload["successful_response_identity"] = identity
+
+    with pytest.raises(ValueError) as exc_info:
+        validate_context_compacted_payload(payload)
+    assert secret_value not in str(exc_info.value)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "renamed", "extra"])
+def test_compacted_payload_identity_requires_exact_nested_fields(
+    mutation: str,
+) -> None:
+    """runner request identity nested object 拒绝缺失、改名与额外字段。
+
+    :param mutation: nested object 结构破坏方式。
+    :returns: ``None``。
+    :raises AssertionError: strict nested schema 接受结构漂移时抛出。
+    """
+
+    payload = _valid_compacted_payload()
+    identity = dict(
+        cast(
+            Mapping[str, JsonValue],
+            payload["successful_response_identity"],
+        )
+    )
+    runner_identity = dict(
+        cast(
+            Mapping[str, JsonValue],
+            identity["runner_request_identity"],
+        )
+    )
+    if mutation == "missing":
+        del runner_identity["runner_call_index"]
+    elif mutation == "renamed":
+        runner_identity["call_index"] = runner_identity.pop("runner_call_index")
+    elif mutation == "extra":
+        runner_identity["response_index"] = 1
+    else:
+        raise AssertionError("unsupported nested mutation")
+    identity["runner_request_identity"] = runner_identity
+    payload["successful_response_identity"] = identity
+
+    with pytest.raises(ValueError):
+        validate_context_compacted_payload(payload)
+
+
+def test_compacted_payload_identity_rejects_noncanonical_client_correlation() -> None:
+    """durable identity 不接受由别处复制的 client correlation id。
+
+    :returns: ``None``。
+    :raises AssertionError: validator 接受非 canonical 派生值时抛出。
+    """
+
+    payload = _valid_compacted_payload()
+    identity = dict(
+        cast(
+            Mapping[str, JsonValue],
+            payload["successful_response_identity"],
+        )
+    )
+    runner_identity = dict(
+        cast(
+            Mapping[str, JsonValue],
+            identity["runner_request_identity"],
+        )
+    )
+    runner_identity["client_correlation_id"] = "dayu-cross-wired"
+    identity["runner_request_identity"] = runner_identity
+    payload["successful_response_identity"] = identity
+
+    with pytest.raises(ValueError, match="not canonical"):
         validate_context_compacted_payload(payload)
 
 
@@ -778,9 +1557,7 @@ def test_failed_payload_rejects_missing_required_fields() -> None:
 def test_attempt_rejected_payload_builder_and_validator() -> None:
     """attempt rejected payload 输出 operation / attempt / diagnostics。"""
 
-    offending_text_digest = (
-        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-    )
+    offending_text_digest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     payload = dict(
         build_context_compaction_attempt_rejected_payload(
             operation_id="operation-1",
@@ -791,8 +1568,18 @@ def test_attempt_rejected_payload_builder_and_validator() -> None:
             diagnostic_refs=("diagnostic:1",),
             next_policy_decision="retry_semantic_repair",
             budget_after_attempted_compact=128,
-            proposal_manifest_ref="runner-call-manifest:rejected",
-            proposal_manifest_digest=_DIGEST_A,
+            successful_response_identity=_successful_response_identity(
+                operation_id="operation-1",
+                attempt_number=1,
+                compactor_engine_run_id="compactor-run:operation-1:attempt-1",
+            ),
+            proposal_manifest_reference=_proposal_manifest_reference(
+                operation_id="operation-1",
+                attempt_number=1,
+                compactor_engine_run_id="compactor-run:operation-1:attempt-1",
+                manifest_payload_ref="runner-call-manifest:rejected",
+                manifest_digest=_DIGEST_A,
+            ),
             diagnostic_artifact_ref="compaction-diagnostic:event-1",
             diagnostic_artifact_digest=_DIGEST_B,
             failure_stage="previous_compacted_view_parse",
@@ -811,9 +1598,7 @@ def test_attempt_rejected_payload_builder_and_validator() -> None:
     )
 
     validate_context_compaction_attempt_rejected_payload(payload)
-    assert CONTEXT_COMPACTION_ATTEMPT_REJECTED == (
-        "CONTEXT_COMPACTION_ATTEMPT_REJECTED"
-    )
+    assert CONTEXT_COMPACTION_ATTEMPT_REJECTED == ("CONTEXT_COMPACTION_ATTEMPT_REJECTED")
     assert payload["attempt_number"] == 1
     assert payload["proposal_manifest_ref"] == "runner-call-manifest:rejected"
     assert payload["proposal_manifest_digest"] == _DIGEST_A
@@ -839,13 +1624,67 @@ def test_attempt_rejected_payload_requires_proposal_manifest_ref_digest_pair() -
             diagnostic_refs=("diagnostic:1",),
             next_policy_decision="retry_semantic_repair",
             budget_after_attempted_compact=128,
-            proposal_manifest_ref="runner-call-manifest:rejected",
-            proposal_manifest_digest=_DIGEST_A,
+            successful_response_identity=_successful_response_identity(
+                operation_id="operation-1",
+                attempt_number=1,
+                compactor_engine_run_id="compactor-run:operation-1:attempt-1",
+            ),
+            proposal_manifest_reference=_proposal_manifest_reference(
+                operation_id="operation-1",
+                attempt_number=1,
+                compactor_engine_run_id="compactor-run:operation-1:attempt-1",
+                manifest_payload_ref="runner-call-manifest:rejected",
+                manifest_digest=_DIGEST_A,
+            ),
         )
     )
     payload["proposal_manifest_digest"] = None
 
     with pytest.raises(ValueError, match="proposal_manifest"):
+        validate_context_compaction_attempt_rejected_payload(payload)
+
+
+def test_quality_rejected_payload_requires_success_identity() -> None:
+    """quality rejection 必须保留成功 final 的 identity 与 manifest。
+
+    :returns: ``None``。
+    :raises AssertionError: quality rejection 接受 null identity 时抛出。
+    """
+
+    payload = dict(_valid_attempt_rejected_payload())
+    payload["successful_response_identity"] = None
+
+    with pytest.raises(ValueError, match="requires successful response identity"):
+        validate_context_compaction_attempt_rejected_payload(payload)
+
+
+def test_rejected_payload_success_identity_requires_manifest() -> None:
+    """任意 post-final rejection 的成功 identity 不得脱离 proposal manifest。
+
+    :returns: ``None``。
+    :raises AssertionError: validator 接受无 manifest 的成功 identity 时抛出。
+    """
+
+    payload = dict(_valid_attempt_rejected_payload())
+    payload["failure_category"] = "proposal_failed"
+    payload["proposal_manifest_ref"] = None
+    payload["proposal_manifest_digest"] = None
+
+    with pytest.raises(ValueError, match="requires proposal manifest reference"):
+        validate_context_compaction_attempt_rejected_payload(payload)
+
+
+def test_cancelled_rejected_payload_forbids_success_identity() -> None:
+    """成功 final 前 cancellation rejection 必须持久化 null identity。
+
+    :returns: ``None``。
+    :raises AssertionError: cancellation 被伪造成成功 final 时抛出。
+    """
+
+    payload = dict(_valid_attempt_rejected_payload())
+    payload["failure_category"] = "cancellation_requested"
+
+    with pytest.raises(ValueError, match="forbids successful response identity"):
         validate_context_compaction_attempt_rejected_payload(payload)
 
 
@@ -862,6 +1701,8 @@ def test_attempt_rejected_payload_requires_diagnostic_artifact_ref_digest_pair()
             diagnostic_refs=("diagnostic:1",),
             next_policy_decision="fail_compaction",
             budget_after_attempted_compact=None,
+            successful_response_identity=None,
+            proposal_manifest_reference=None,
             diagnostic_artifact_ref="compaction-diagnostic:event-1",
             diagnostic_artifact_digest=_DIGEST_A,
         )
@@ -1026,6 +1867,18 @@ def _valid_attempt_rejected_payload() -> Mapping[str, JsonValue]:
         diagnostic_refs=("diagnostic:1",),
         next_policy_decision="fail_compaction",
         budget_after_attempted_compact=None,
+        successful_response_identity=_successful_response_identity(
+            operation_id="operation-1",
+            attempt_number=1,
+            compactor_engine_run_id="compactor-run:operation-1:attempt-1",
+        ),
+        proposal_manifest_reference=_proposal_manifest_reference(
+            operation_id="operation-1",
+            attempt_number=1,
+            compactor_engine_run_id="compactor-run:operation-1:attempt-1",
+            manifest_payload_ref="runner-call-manifest:rejected",
+            manifest_digest=_DIGEST_A,
+        ),
     )
 
 
@@ -1113,79 +1966,149 @@ def _valid_compacted_payload() -> dict[str, JsonValue]:
     """
 
     return dict(
+        _compacted_payload_for_truth(_accepted_truth())
+    )
+
+
+def _compacted_payload_for_truth(
+    accepted_truth: CompactAcceptedTruthV4,
+) -> dict[str, JsonValue]:
+    """把任意 production-accepted truth 包装为 strict schema-5 payload。
+
+    :param accepted_truth: Context Governance 产生的 accepted truth。
+    :returns: 可变的 canonical compacted payload。
+    """
+
+    return dict(
         build_context_compacted_payload(
             operation_id="event-context-compaction-requested-accepted",
             accepted_attempt_number=2,
             compact_artifact_ref="compact-artifact:abc",
             compact_artifact_digest=_DIGEST_B,
-            accepted_candidate=_candidate(),
-            quality_check_result=_quality_result(),
+            accepted_truth=accepted_truth,
             budget_after_compact=512,
             prompt_local_label_mapping_refs=("prompt-label:E1", "prompt-label:A1"),
-            source_boundary_refs=("event-user-1", "evidence:accepted-1"),
-            accepted_evidence_mapping_refs=("evidence:accepted-1",),
             projection_signal="conversation_memory_projection_catchup",
+            successful_response_identity=_successful_response_identity(
+                operation_id="event-context-compaction-requested-accepted",
+                attempt_number=2,
+                compactor_engine_run_id="compactor-run:accepted:attempt-2",
+            ),
+            accepted_proposal_manifest_reference=_proposal_manifest_reference(
+                operation_id="event-context-compaction-requested-accepted",
+                attempt_number=2,
+                compactor_engine_run_id="compactor-run:accepted:attempt-2",
+                manifest_payload_ref="runner-call-manifest:accepted:attempt-2",
+                manifest_digest=_DIGEST_A,
+            ),
         )
     )
 
 
-def _candidate() -> ConversationCompactOutputVNext:
+def _accepted_truth_for_ordered_evidence_boundary(
+    *,
+    boundary_refs: tuple[tuple[str, tuple[str, ...]], ...],
+    facts: tuple[CompactEvidenceFactV4, ...],
+) -> CompactAcceptedTruthV4:
+    """用显式 boundary 顺序验收可独立排列的 evidence facts。
+
+    :param boundary_refs: 按 immutable boundary 顺序给出的 label/refs。
+    :param facts: 按 proposal 顺序给出的 new facts。
+    :returns: production Context Governance 产生的 accepted truth。
+    :raises AssertionError: fixture proposal 未满足 production contract 时抛出。
+    """
+
+    policy = default_memory_projection_policy()
+    compact_input = CompactInputV4(
+        schema=COMPACT_INPUT_SCHEMA_V4,
+        current_input=CompactCurrentInputV4(
+            source_ref="event:current-aggregate-order",
+            readable_text="继续分析 aggregate 顺序",
+        ),
+        source_boundary=tuple(
+            CompactSourceBoundaryEntryV4(
+                source_label=label,
+                source_kind=CompactSourceKindV4.EVIDENCE_MATERIAL,
+                source_refs=(f"event:{label}",),
+                canonical_evidence_refs=refs,
+                readable_text=f"{label} evidence material",
+            )
+            for label, refs in boundary_refs
+        ),
+        output_caps=compact_output_caps_v4_from_memory_policy(policy),
+    )
+    proposal = CompactCandidateV4(
+        schema=COMPACT_OUTPUT_SCHEMA_V4,
+        session_summary=None,
+        retained_previous_evidence_fact_labels=(),
+        evidence_facts=facts,
+        answer_anchors=(),
+        forward_intents=(),
+        reference_continuity=(),
+    )
+    accepted = accept_compact_candidate_v4(compact_input, proposal, policy)
+    assert isinstance(accepted, CompactAcceptedTruthV4)
+    return accepted
+
+
+def _candidate() -> CompactCandidateV4:
     """构造测试用 accepted vNext compaction candidate。
 
     :returns: vNext compaction candidate。
     """
 
-    return ConversationCompactOutputVNext(
-        schema_version=CONVERSATION_COMPACT_OUTPUT_SCHEMA_VERSION_VNEXT,
-        session_summary=SessionSummaryCandidateVNext(
-            summary_text="Q1 review focused on revenue.",
+    return CompactCandidateV4(
+        schema=COMPACT_OUTPUT_SCHEMA_V4,
+        session_summary=CompactSessionSummaryV4(
+            text="Q1 review focused on revenue.",
             source_labels=("E1", "A1"),
         ),
-        evidence_backed_facts=(
-            EvidenceBackedFactCandidateVNext(
-                claim_text="Revenue increased.",
-                evidence_labels=("E1",),
-                source_labels=("E1",),
+        retained_previous_evidence_fact_labels=(),
+        evidence_facts=(
+            CompactEvidenceFactV4(
+                claim="Revenue increased.",
+                support_labels=("E1",),
+                context_labels=(),
             ),
         ),
         answer_anchors=(
-            AnswerAnchorCandidateVNext(
-                anchor_title="Revenue answer",
-                anchor_items=(
-                    AnswerAnchorChildVNext(
-                        display_text="Revenue increased.",
-                        ordinal=1,
-                    ),
-                    AnswerAnchorChildVNext(
-                        display_text="Margin also expanded.",
-                        ordinal=2,
-                    ),
-                ),
-                answer_source_labels=("A1",),
+            CompactAnswerAnchorV4(
+                title="Revenue answer",
+                detail="Revenue increased.\nMargin also expanded.",
+                source_labels=("A1",),
             ),
         ),
         forward_intents=(
-            ForwardIntentCandidateVNext(
-                intent_type=ForwardIntentTypeVNext.NEXT_STEP_NOTE,
+            CompactForwardIntentV4(
+                intent_type="next_step_note",
                 text="Compare quarters next.",
-                status=ForwardIntentStatusVNext.OPEN,
+                status=CompactForwardIntentStatusV4.OPEN,
                 source_labels=("A1",),
             ),
         ),
-        reference_continuity_items=(
-            ReferenceContinuityCandidateVNext(
+        reference_continuity=(
+            CompactReferenceContinuityV4(
                 text="Keep revenue comparison context.",
-                reason=ReferenceContinuityReasonVNext.LOCAL_REFERENCE,
+                reason="local_reference",
                 source_labels=("A1",),
             ),
         ),
-        diagnostics=(
-            CompactCandidateDiagnosticVNext(
-                code="kept",
-                text="Host-only diagnostic text.",
-                source_labels=("E1",),
-            ),
-        ),
+    )
+
+
+def _accepted_truth() -> CompactAcceptedTruthV4:
+    """构造与 valid event fixture 同源的 accepted truth。
+
+    :returns: production governance owner 生成的 accepted truth。
+    """
+
+    return accepted_truth_for_candidate(
+        _candidate(),
+        current_input_ref="event-user-1",
+        source_refs_by_label={
+            "E1": ("evidence:accepted-1",),
+            "A1": ("evidence:accepted-1",),
+        },
     )
 
 
@@ -1224,17 +2147,5 @@ def _replace_candidate_and_digest(
     :returns: ``None``。
     """
 
-    payload["accepted_candidate"] = candidate
-    payload["accepted_candidate_digest"] = sha256_digest_json(candidate)
-
-
-def _quality_result() -> CompactQualityCheckResultVNext:
-    """构造测试用 accepted vNext quality result。
-
-    :returns: vNext quality check result。
-    """
-
-    return CompactQualityCheckResultVNext(
-        accepted=True,
-        rejection_reasons=(),
-    )
+    payload["accepted_proposal"] = candidate
+    payload["accepted_proposal_digest"] = sha256_digest_json(candidate)

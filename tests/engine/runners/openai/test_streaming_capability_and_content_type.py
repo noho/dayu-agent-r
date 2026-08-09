@@ -148,6 +148,7 @@ async def _collect(runner: AsyncOpenAIRunner) -> list[RunnerEvent]:
     messages = [UserMessage(role=AgentMessageRole.USER, content="hi")]
     events: list[RunnerEvent] = []
     async for event in runner.call(
+        structured_output=None,
         messages=messages,
         options=make_options(stream=True),
         tools=[],
@@ -491,6 +492,7 @@ async def test_non_stream_missing_content_type_keeps_json_parse_with_diagnostic(
 
     events: list[RunnerEvent] = []
     async for event in runner.call(
+        structured_output=None,
         messages=[UserMessage(role=AgentMessageRole.USER, content="hi")],
         options=make_options(stream=False),
         tools=[],

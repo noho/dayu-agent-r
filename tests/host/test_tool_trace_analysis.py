@@ -19,6 +19,7 @@ from dayu.host.tool_trace_analysis import (
 )
 from dayu.host.tool_trace_analysis_contracts import (
     ToolTraceAnalysisCapabilities,
+    ToolTraceCompactorResponseSummary,
     ToolTraceAnalysisInputSummary,
     ToolTraceAnalysisLayer,
     ToolTraceAnalysisPolicy,
@@ -37,6 +38,14 @@ from dayu.host.tool_trace_analysis_contracts import (
     ToolTraceRunSummary,
     ToolTraceSignalStatus,
     ToolTraceVendorDebuggingBlock,
+)
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    build_runner_request_identity,
+)
+from dayu.host.durable.tool_trace import (
+    CompactorResponseDisposition,
+    ResolvedCompactorEvidenceFact,
 )
 
 
@@ -101,6 +110,7 @@ def test_contract_owner_exports_complete_public_report_surface() -> None:
         "DEFAULT_TOOL_TRACE_LATENCY_OUTLIER_MULTIPLIER",
         "DEFAULT_TOOL_TRACE_PAYLOAD_RANKING_LIMIT",
         "ToolTraceAnalysisCapabilities",
+        "ToolTraceCompactorResponseSummary",
         "ToolTraceAnalysisInputSummary",
         "ToolTraceAnalysisLayer",
         "ToolTraceAnalysisPolicy",
@@ -266,6 +276,7 @@ def test_public_analyzer_builds_deterministic_final_report_shape(
     assert list(parsed) == sorted(parsed)
     assert set(parsed) == {
         "schema_version",
+        "compactor_responses",
         "input",
         "policy",
         "summary",
@@ -276,7 +287,8 @@ def test_public_analyzer_builds_deterministic_final_report_shape(
         "findings",
         "limitations",
     }
-    assert parsed["schema_version"] == 1
+    assert parsed["schema_version"] == 2
+    assert parsed["compactor_responses"] == []
     assert parsed["vendor_debugging"] == []
     assert parsed["input"]["cold_jsonl_path"] == str(source.cold_jsonl_path)
     assert parsed["input"]["cold_lock_path"] == (
@@ -286,6 +298,144 @@ def test_public_analyzer_builds_deterministic_final_report_shape(
     assert {
         item["reason_code"] for item in parsed["limitations"]
     } >= {"hot_store_unavailable", "payload_resolution_unavailable"}
+
+
+def test_compactor_response_summary_json_markdown_share_safe_typed_source(
+    tmp_path: Path,
+) -> None:
+    """JSON/Markdown 只从同一 v2 typed summary 公开实际 response identity。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 两种 renderer 不同源或泄漏非白名单字段时抛出。
+    """
+
+    report = analyze_tool_trace(_source(tmp_path), ToolTraceAnalysisPolicy())
+    request_identity = build_runner_request_identity(
+        run_id="compactor-engine-run-1",
+        attempt_id=None,
+        execution_id=None,
+        iteration_id="iteration-final",
+        iteration_index=1,
+        runner_call_index=2,
+    )
+    response = ToolTraceCompactorResponseSummary(
+        parent_host_run_id="parent-run-1",
+        disposition=CompactorResponseDisposition.ACCEPTED,
+        terminal_event_id="event-compacted-1",
+        terminal_event_sequence=11,
+        compaction_operation_id="operation-1",
+        compaction_attempt_number=1,
+        proposal_manifest_ref="payload-manifest-1",
+        proposal_manifest_digest="sha256:" + "a" * 64,
+        effective_provider="provider-actual",
+        effective_model="model-actual",
+        runner_request_identity=request_identity,
+        provider_request_id_availability=ProviderRequestIdAvailability.PRESENT,
+        provider_request_id="provider-request-actual",
+        accepted_evidence_facts=(
+            ResolvedCompactorEvidenceFact(
+                claim="Revenue increased by 21.7%.",
+                canonical_evidence_refs=(
+                    "evidence:canonical-1",
+                    "evidence:canonical-2",
+                ),
+            ),
+        ),
+    )
+    with_response = replace(report, compactor_responses=(response,))
+
+    serialized = json.loads(tool_trace_analysis_report_to_json(with_response))
+    markdown = render_tool_trace_analysis_markdown(with_response)
+    projected = serialized["compactor_responses"][0]
+
+    assert projected["effective_provider"] == "provider-actual"
+    assert projected["effective_model"] == "model-actual"
+    assert projected["provider_request_id_availability"] == "present"
+    assert projected["provider_request_id"] == "provider-request-actual"
+    assert projected["runner_request_identity"]["client_correlation_id"] == (
+        request_identity.client_correlation_id
+    )
+    assert projected["accepted_evidence_facts"] == [
+        {
+            "claim": "Revenue increased by 21.7%.",
+            "canonical_evidence_refs": [
+                "evidence:canonical-1",
+                "evidence:canonical-2",
+            ],
+        }
+    ]
+    assert set(projected["accepted_evidence_facts"][0]) == {
+        "claim",
+        "canonical_evidence_refs",
+    }
+    for expected in (
+        "provider-actual",
+        "model-actual",
+        "provider-request-actual",
+        request_identity.client_correlation_id,
+        "Revenue increased by 21.7%.",
+        "evidence:canonical-1",
+        "evidence:canonical-2",
+    ):
+        assert expected in markdown
+    rendered_text = tool_trace_analysis_report_to_json(with_response) + markdown
+    for forbidden in (
+        "Authorization",
+        "credential",
+        "api_key",
+        "raw_request",
+        "raw_response",
+        "selection-label-secret",
+        "raw-payload-secret",
+        "credential-secret",
+        "prompt-secret",
+    ):
+        assert forbidden not in rendered_text
+
+
+def test_no_success_compactor_response_requires_typed_null_identity(
+    tmp_path: Path,
+) -> None:
+    """no-success rejection 的 provider/model/request identity 必须整体为 null。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: typed null 未被 JSON renderer 保留时抛出。
+    """
+
+    report = analyze_tool_trace(_source(tmp_path), ToolTraceAnalysisPolicy())
+    response = ToolTraceCompactorResponseSummary(
+        parent_host_run_id="parent-run-1",
+        disposition=CompactorResponseDisposition.ATTEMPT_REJECTED,
+        terminal_event_id="event-rejected-1",
+        terminal_event_sequence=12,
+        compaction_operation_id="operation-1",
+        compaction_attempt_number=2,
+        proposal_manifest_ref="payload-manifest-2",
+        proposal_manifest_digest="sha256:" + "b" * 64,
+        effective_provider=None,
+        effective_model=None,
+        runner_request_identity=None,
+        provider_request_id_availability=None,
+        provider_request_id=None,
+        accepted_evidence_facts=(),
+    )
+    payload = json.loads(
+        tool_trace_analysis_report_to_json(
+            replace(report, compactor_responses=(response,))
+        )
+    )["compactor_responses"][0]
+
+    assert payload["effective_provider"] is None
+    assert payload["effective_model"] is None
+    assert payload["runner_request_identity"] is None
+    assert payload["provider_request_id_availability"] is None
+    assert payload["provider_request_id"] is None
+    with pytest.raises(ValueError, match="all be null"):
+        replace(response, effective_provider="inferred-provider")
+    with pytest.raises(ValueError, match="accepted.*requires successful identity"):
+        replace(response, disposition=CompactorResponseDisposition.ACCEPTED)
 
 
 def test_vendor_block_final_contract_serializes_without_schema_change(
@@ -533,4 +683,6 @@ def test_public_functions_reject_untyped_arguments(tmp_path: Path) -> None:
         render_tool_trace_analysis_markdown(
             cast(ToolTraceAnalysisReport, "not-report")
         )
-    assert report.schema_version == 1
+    assert report.schema_version == 2
+    with pytest.raises(ValueError, match="schema_version must be 2"):
+        replace(report, schema_version=1)

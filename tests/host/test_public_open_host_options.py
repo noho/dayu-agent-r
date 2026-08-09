@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dayu.engine.contracts.structured_output import StructuredOutputCapability
+
 import inspect
 import pathlib
 from collections.abc import AsyncIterator
@@ -170,6 +172,7 @@ def _runner_spec() -> RunnerSpec:
         supports_tool_calling=False,
         supports_streaming=False,
         supports_stream_usage=False,
+        structured_output_capability=StructuredOutputCapability.NONE,
         default_timeout_seconds=1.0,
         max_retries=0,
         provider_request=None,
@@ -381,7 +384,9 @@ def test_compactor_runner_baseline_validates_typed_fields(
         compactor_agent_policy=_agent_policy(),
         compactor_system_prompt="test compactor system prompt",
         compactor_user_prompt_template=(
-            "test compactor user prompt <<compaction_request>>"
+            "test compactor user prompt <<compaction_request>>\n"
+            "<<compact_output_rules>>\n"
+            "<<compact_output_template>>"
         ),
         compact_artifact_root=tmp_path / "compact",
     )

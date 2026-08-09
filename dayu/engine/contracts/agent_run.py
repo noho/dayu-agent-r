@@ -24,6 +24,7 @@ from dayu.engine.contracts.error_codes import (
     validate_engine_error_code,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
+from dayu.engine.contracts.runner_identity import SuccessfulRunnerResponseIdentity
 from dayu.engine.contracts.messages import (
     AgentMessage,
     AssistantMessage,
@@ -32,6 +33,10 @@ from dayu.engine.contracts.messages import (
     UserMessage,
 )
 from dayu.engine.contracts.runner_spec import RunnerCallOptions, RunnerSpec
+from dayu.engine.contracts.structured_output import (
+    StructuredOutputRequest,
+    validate_structured_output_request,
+)
 from dayu.engine.contracts.tool_records import (
     AcceptedToolExecutionRecord,
     AwaitingToolExecutionRecord,
@@ -80,6 +85,8 @@ class AgentRunRequest:
     :param runner_spec: Runner 规约。
     :param runner_options: Runner 调用参数。
     :param agent_policy: Agent 策略。
+    :param structured_output: 本次 run 的显式 structured-output 请求；
+        ``None`` 表示不请求 structured-output transport。
     :param tool_schemas: 暴露给 LLM 的工具 schema 元组。
     :param tool_executor: 工具执行器，由 Host 通过 EngineWorker capability
         提供；EngineWorker 替 Host 在选定执行环境中代持并提供该 protocol
@@ -101,6 +108,7 @@ class AgentRunRequest:
     tool_schemas: tuple[ToolSchema, ...]
     tool_executor: ToolExecutor
     cancellation_token: CancellationToken
+    structured_output: StructuredOutputRequest | None = None
     attempt_id: str | None = None
     execution_id: str | None = None
 
@@ -132,6 +140,10 @@ class AgentRunRequest:
                 "AgentRunRequest.attempt_id and execution_id must both be "
                 "None or both be non-None"
             )
+        validate_structured_output_request(
+            capability=self.runner_spec.structured_output_capability,
+            request=self.structured_output,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +156,7 @@ class EngineRunOutcomeFinalAnswer:
     :param filtered: 是否经过过滤器处理。
     :param degraded: 是否为降级回答。
     :param finish_reason: 完成原因。
+    :param response_identity: 实际终结本次 Engine run 的成功 Runner 调用身份。
     """
 
     session_id: str
@@ -152,6 +165,7 @@ class EngineRunOutcomeFinalAnswer:
     filtered: bool
     degraded: bool
     finish_reason: FinishReason
+    response_identity: SuccessfulRunnerResponseIdentity
 
 
 @dataclass(frozen=True, slots=True)

@@ -46,6 +46,8 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "GeminiToolCallState",
         "IterationCompletedData",
         "IterationStartedData",
+        "JsonObjectStructuredOutputRequest",
+        "JsonSchemaStructuredOutputRequest",
         "JsonValue",
         "MimoThinkingExtension",
         "OpenAIReasoningEffort",
@@ -54,6 +56,7 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "ProviderDiagnosticData",
         "ProviderProtocolErrorData",
         "ProviderRequestExtension",
+        "ProviderRequestIdAvailability",
         "QwenThinkingExtension",
         "ReasoningDeltaData",
         "RUNNER_INPUT_SERIALIZER_SCHEMA_VERSION",
@@ -80,6 +83,9 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "RunnerProviderDiagnosticData",
         "RunnerProtocolErrorData",
         "RunnerRequestIdentity",
+        "SuccessfulRunnerResponseIdentity",
+        "StructuredOutputCapability",
+        "StructuredOutputRequest",
         "RunnerReasoningDeltaData",
         "RunnerSpecificErrorCode",
         "RunnerSpecificErrorSource",
@@ -130,6 +136,7 @@ EXPECTED_EXPORTS: frozenset[str] = frozenset(
         "runner_protocol_error_code",
         "runner_role_sequence_digest",
         "serialize_engine_error_code",
+        "validate_structured_output_request",
     }
 )
 

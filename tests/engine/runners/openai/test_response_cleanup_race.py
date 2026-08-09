@@ -246,7 +246,7 @@ async def _collect_events(runner: AsyncOpenAIRunner) -> list[RunnerEvent]:
 
     messages = [UserMessage(role=AgentMessageRole.USER, content="hi")]
     events: list[RunnerEvent] = []
-    async for event in runner.call(messages, make_options(stream=False), []):
+    async for event in runner.call(messages, make_options(stream=False), [], structured_output=None):
         events.append(event)
     return events
 

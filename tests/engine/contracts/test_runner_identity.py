@@ -3,14 +3,29 @@
 from __future__ import annotations
 
 import pytest
+import dataclasses
 
+import dayu.engine.contracts.runner_identity as runner_identity_contract
 from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
     RunnerRequestIdentity,
+    SuccessfulRunnerResponseIdentity,
     build_runner_request_identity,
 )
 
 _CLIENT_CORRELATION_LENGTH: int = 69
 _CLIENT_CORRELATION_PREFIX: str = "dayu-"
+
+
+def test_runner_identity_owner_exports_successful_response_contracts() -> None:
+    """Runner identity owner 必须直接导出成功响应身份公共契约。
+
+    :returns: ``None``。
+    :raises AssertionError: 任一公共类型未由 owner 模块导出时抛出。
+    """
+
+    assert "ProviderRequestIdAvailability" in runner_identity_contract.__all__
+    assert "SuccessfulRunnerResponseIdentity" in runner_identity_contract.__all__
 
 
 def test_runner_request_identity_builds_stable_lowercase_digest() -> None:
@@ -75,7 +90,7 @@ def test_runner_request_identity_rejects_empty_text_fields(
     :raises AssertionError: 校验未按预期失败时由 pytest 抛出。
     """
 
-    with pytest.raises(ValueError, match=field_name):
+    with pytest.raises(ValueError) as error_info:
         if field_name == "run_id":
             _identity(run_id=invalid_value)
         elif field_name == "attempt_id":
@@ -86,6 +101,9 @@ def test_runner_request_identity_rejects_empty_text_fields(
             _identity(iteration_id=invalid_value)
         else:
             raise AssertionError(f"unexpected field name: {field_name}")
+    assert str(error_info.value) == (
+        f"RunnerRequestIdentity.{field_name} must be non-empty"
+    )
 
 
 @pytest.mark.parametrize("iteration_index", (-1, -2))
@@ -131,6 +149,103 @@ def test_runner_request_identity_rejects_non_canonical_client_id() -> None:
             runner_call_index=identity.runner_call_index + 1,
             client_correlation_id=identity.client_correlation_id,
         )
+
+
+def test_successful_response_identity_present_and_unavailable_are_strict() -> None:
+    """成功响应身份必须严格表达 provider request id 是否可用。"""
+
+    present = SuccessfulRunnerResponseIdentity(
+        effective_provider="provider-contract",
+        effective_model="model-contract",
+        runner_request_identity=_identity(),
+        provider_request_id_availability=ProviderRequestIdAvailability.PRESENT,
+        provider_request_id="provider-request-contract",
+    )
+    unavailable = SuccessfulRunnerResponseIdentity(
+        effective_provider="provider-contract",
+        effective_model="model-contract",
+        runner_request_identity=_identity(),
+        provider_request_id_availability=(
+            ProviderRequestIdAvailability.UNAVAILABLE
+        ),
+        provider_request_id=None,
+    )
+
+    assert present.provider_request_id == "provider-request-contract"
+    assert unavailable.provider_request_id is None
+    assert {field.name for field in dataclasses.fields(present)} == {
+        "effective_provider",
+        "effective_model",
+        "runner_request_identity",
+        "provider_request_id_availability",
+        "provider_request_id",
+    }
+
+
+@pytest.mark.parametrize(
+    ("availability", "provider_request_id"),
+    (
+        (ProviderRequestIdAvailability.PRESENT, None),
+        (ProviderRequestIdAvailability.UNAVAILABLE, "provider-request-contract"),
+        (ProviderRequestIdAvailability.PRESENT, " "),
+    ),
+)
+def test_successful_response_identity_rejects_invalid_request_id_pair(
+    availability: ProviderRequestIdAvailability,
+    provider_request_id: str | None,
+) -> None:
+    """availability 与 provider request id 不成对时必须拒绝。
+
+    :param availability: 待测 availability。
+    :param provider_request_id: 待测 provider request id。
+    :returns: 无返回值。
+    :raises AssertionError: 非法配对未被拒绝时由 pytest 抛出。
+    """
+
+    with pytest.raises(ValueError, match="provider_request_id"):
+        SuccessfulRunnerResponseIdentity(
+            effective_provider="provider-contract",
+            effective_model="model-contract",
+            runner_request_identity=_identity(),
+            provider_request_id_availability=availability,
+            provider_request_id=provider_request_id,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "provider", "model"),
+    (
+        ("effective_provider", "", "model-contract"),
+        ("effective_model", "provider-contract", " "),
+    ),
+)
+def test_successful_response_identity_rejects_empty_provider_or_model(
+    field_name: str,
+    provider: str,
+    model: str,
+) -> None:
+    """成功响应身份必须拒绝空 provider/model。
+
+    :param field_name: 预期由 response owner 报告的字段名。
+    :param provider: 待测 provider。
+    :param model: 待测 model。
+    :returns: 无返回值。
+    :raises AssertionError: 非法文本未被拒绝时由 pytest 抛出。
+    """
+
+    with pytest.raises(ValueError) as error_info:
+        SuccessfulRunnerResponseIdentity(
+            effective_provider=provider,
+            effective_model=model,
+            runner_request_identity=_identity(),
+            provider_request_id_availability=(
+                ProviderRequestIdAvailability.UNAVAILABLE
+            ),
+            provider_request_id=None,
+        )
+    assert str(error_info.value) == (
+        f"SuccessfulRunnerResponseIdentity.{field_name} must be non-empty"
+    )
 
 
 def _identity(

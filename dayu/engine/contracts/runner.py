@@ -15,6 +15,7 @@ from dayu.engine.contracts.messages import AgentMessage
 from dayu.engine.contracts.runner_events import RunnerEvent
 from dayu.engine.contracts.runner_identity import RunnerRequestIdentity
 from dayu.engine.contracts.runner_spec import RunnerCallOptions
+from dayu.engine.contracts.structured_output import StructuredOutputRequest
 from dayu.contracts.tool_schema import ToolSchema
 
 
@@ -28,6 +29,7 @@ class AsyncRunner(Protocol):
         options: RunnerCallOptions,
         tools: Sequence[ToolSchema],
         *,
+        structured_output: StructuredOutputRequest | None,
         request_identity: RunnerRequestIdentity | None,
     ) -> AsyncIterator[RunnerEvent]:
         """发起一次 LLM 调用并返回 :class:`RunnerEvent` 异步流。
@@ -35,6 +37,8 @@ class AsyncRunner(Protocol):
         :param messages: Agent 消息序列。
         :param options: 单次调用参数。
         :param tools: 本次调用暴露给 LLM 的工具 schema 序列。
+        :param structured_output: 本次调用的显式 structured-output 请求；
+            ``None`` 表示不请求 structured-output transport。
         :param request_identity: 本次逻辑 Runner 调用的请求身份；直接
             Runner 调用或非普通 Agent attempt 路径可显式传入 ``None``。
         :returns: :class:`RunnerEvent` 异步迭代器。

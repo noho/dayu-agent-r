@@ -23,6 +23,7 @@ from dayu.host.durable.errors import HostDurableError
 from dayu.host.durable.options import HostSQLiteStoragePolicy
 from dayu.host.durable.tool_trace import (
     TOOL_TRACE_QUERY_MAX_LIMIT,
+    CompactorResponseResolutionError,
     RunnerCallReconstructionSignal,
     RunnerCallResolvedProjection,
     ToolTraceHotRow,
@@ -55,6 +56,9 @@ _COLD_REF_PREFIX = "tool-trace-cold:"
 _INPUT_CHANGED_REASON = "input_changed_during_analysis"
 _HOT_UNAVAILABLE_REASON = "hot_store_unavailable"
 _PAYLOAD_UNAVAILABLE_REASON = "payload_resolution_unavailable"
+_COMPACTOR_RESPONSE_TERMINAL_NOT_OBSERVED_REASON = (
+    "compactor-response-terminal-not-observed"
+)
 
 _REQUIRED_COLD_FIELDS = frozenset(
     {
@@ -379,6 +383,7 @@ class _HotSnapshot:
     resolved_rows: Mapping[str, ToolTraceResolvedRowPayloads]
     runner_projections: Mapping[str, RunnerCallResolvedProjection]
     diagnostics: tuple[ToolTraceInputDiagnostic, ...]
+    limitations: tuple[ToolTraceInputLimitation, ...]
     payload_measures: tuple[ToolTraceResolvedPayloadMeasure, ...]
 
 
@@ -449,7 +454,10 @@ def load_tool_trace_analysis_input(
         )
         for record in cold_records
     )
-    limitations = list(initial_limitations + window_limitations)
+    hot_limitations = () if hot_snapshot is None else hot_snapshot.limitations
+    limitations = list(
+        initial_limitations + hot_limitations + window_limitations
+    )
     if source.artifact_root is None and hot_snapshot is None:
         limitations.append(
             ToolTraceInputLimitation(
@@ -602,6 +610,7 @@ def _read_hot_snapshot_in_transaction(
     resolved_rows: dict[str, ToolTraceResolvedRowPayloads] = {}
     runner_projections: dict[str, RunnerCallResolvedProjection] = {}
     diagnostics: list[ToolTraceInputDiagnostic] = []
+    limitations: list[ToolTraceInputLimitation] = []
     measures: list[ToolTraceResolvedPayloadMeasure] = []
     for row in rows:
         try:
@@ -637,10 +646,33 @@ def _read_hot_snapshot_in_transaction(
                 transaction,
                 signal,
             )
+        except CompactorResponseResolutionError:
+            raise
         except HostDurableError as exc:
             diagnostics.append(_runner_resolver_diagnostic(hot_db_path, row, exc))
             continue
         runner_projections[row.event_id] = projection
+        if (
+            signal.runner_call_kind == "compactor_proposal"
+            and projection.compactor_response_identity is None
+        ):
+            limitations.append(
+                ToolTraceInputLimitation(
+                    reason_code=(
+                        _COMPACTOR_RESPONSE_TERMINAL_NOT_OBSERVED_REASON
+                    ),
+                    summary=(
+                        "parent Host Run 已完整扫描，但未观察到与当前 compactor "
+                        "proposal manifest 精确匹配的 canonical terminal。"
+                    ),
+                    source_path=hot_db_path,
+                    event_id=row.event_id,
+                    event_sequence=row.event_sequence,
+                    hot_event_sequence_watermark=(
+                        rows[-1].event_sequence if rows else 0
+                    ),
+                )
+            )
         measures.extend(_runner_projection_measures(row, projection))
     watermark = rows[-1].event_sequence if rows else 0
     return _HotSnapshot(
@@ -649,6 +681,7 @@ def _read_hot_snapshot_in_transaction(
         resolved_rows=resolved_rows,
         runner_projections=runner_projections,
         diagnostics=tuple(diagnostics),
+        limitations=tuple(limitations),
         payload_measures=tuple(measures),
     )
 

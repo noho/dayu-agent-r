@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from dayu.engine.contracts.structured_output import StructuredOutputCapability
+
 import asyncio
+import json
 import pathlib
 import sqlite3
 import sys
@@ -10,7 +13,7 @@ import threading
 from collections.abc import AsyncIterator, Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import ModuleType
 from typing import TypeVar, cast
 
@@ -26,6 +29,11 @@ from dayu.engine.contracts.engine_events import (
     ReasoningDeltaData,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.engine.contracts.runner_spec import ClientCorrelationPolicy, RunnerCallOptions, RunnerSpec
 from dayu.host import (
     AttemptDispatchSnapshot,
@@ -43,6 +51,7 @@ from dayu.host import (
     HostEvent,
     HostEventKind,
     HostSessionAttachment,
+    HostSessionAccessMode,
     HostSessionEvent,
     HostSessionEventIterator,
     HostTerminalStatus,
@@ -148,17 +157,113 @@ _SCHEDULER_CLOSE_FAILURE_MESSAGE = "scheduler close failed after cleanup"
 _PROMOTION_BARRIER_EXPIRED_AT = datetime(2026, 5, 18, 3, 0, 0, tzinfo=UTC)
 
 
+class _CloseRecordingAttachment:
+    """记录底层 attachment close 调用的协议实现。"""
+
+    def __init__(self, session_id: str) -> None:
+        """初始化 close 观测。
+
+        :param session_id: 测试 attachment 对应的 Session id。
+        :returns: ``None``。
+        :raises ValueError: session id 为空时抛出。
+        """
+
+        if session_id.strip() == "":
+            raise ValueError("session_id must be non-empty")
+        self._session_id = session_id
+        self.close_calls = 0
+
+    @property
+    def session_id(self) -> str:
+        """返回测试 Session id。
+
+        :returns: Session id。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return self._session_id
+
+    @property
+    def access_mode(self) -> HostSessionAccessMode:
+        """返回固定读写模式。
+
+        :returns: ``READ_WRITE``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        return HostSessionAccessMode.READ_WRITE
+
+    async def aclose(self) -> None:
+        """记录一次底层 close。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.close_calls += 1
+
+
+async def _raise_delayed_recovery_join_failure(
+    host: _PublicHostHandle,
+    session_id: str,
+) -> None:
+    """为 cleanup 回归注入 delayed recovery join 失败。
+
+    :param host: 被 monkeypatch 的 public Host handle。
+    :param session_id: 当前 attachment Session id。
+    :returns: 永不正常返回。
+    :raises RuntimeError: 固定抛出 join 失败。
+    """
+
+    del host, session_id
+    raise RuntimeError("forced delayed recovery join failure")
+
+
+def _successful_response_identity(
+    request: AgentRunRequest,
+) -> SuccessfulRunnerResponseIdentity:
+    """构造与 open-host worker request 同源的测试响应身份。
+
+    :param request: 当前 worker 实际收到的 Engine request。
+    :returns: provider request id 明确不可用的成功响应身份。
+    :raises ValueError: request identity 字段非法时抛出。
+    """
+
+    return SuccessfulRunnerResponseIdentity(
+        effective_provider=request.runner_spec.provider,
+        effective_model=request.runner_spec.model,
+        runner_request_identity=build_runner_request_identity(
+            run_id=request.run_id,
+            attempt_id=request.attempt_id,
+            execution_id=request.execution_id,
+            iteration_id=f"{request.run_id}:open-host-final",
+            iteration_index=0,
+            runner_call_index=1,
+        ),
+        provider_request_id_availability=(
+            ProviderRequestIdAvailability.UNAVAILABLE
+        ),
+        provider_request_id=None,
+    )
+
+
 class _FinalAnswerHandle:
     """测试用立即产出 final answer 的 worker handle。"""
 
-    def __init__(self, snapshot: AttemptDispatchSnapshot) -> None:
+    def __init__(
+        self,
+        snapshot: AttemptDispatchSnapshot,
+        request: AgentRunRequest,
+    ) -> None:
         """初始化 handle。
 
         :param snapshot: 当前 dispatch snapshot。
+        :param request: 当前 dispatch 的 Engine request。
         :returns: ``None``。
         """
 
         self._snapshot = snapshot
+        self._request = request
 
     @property
     def local_worker_id(self) -> str:
@@ -185,6 +290,9 @@ class _FinalAnswerHandle:
                 filtered=False,
                 degraded=False,
                 finish_reason=FinishReason.STOP,
+                response_identity=_successful_response_identity(
+                    self._request
+                ),
             ),
             metadata=None,
         )
@@ -234,7 +342,7 @@ class _FinalAnswerWorker:
         self._factory.accepted_snapshots.append(snapshot)
         self._factory.accepted_requests.append(request)
         self._factory.accepted_event.set()
-        return _FinalAnswerHandle(snapshot)
+        return _FinalAnswerHandle(snapshot, request)
 
 
 class _FinalAnswerWorkerFactory:
@@ -267,16 +375,19 @@ class _ControlledFinalAnswerHandle:
     def __init__(
         self,
         snapshot: AttemptDispatchSnapshot,
+        request: AgentRunRequest,
         release_event: asyncio.Event,
     ) -> None:
         """初始化 handle。
 
         :param snapshot: 当前 dispatch snapshot。
+        :param request: 当前 dispatch 的 Engine request。
         :param release_event: 控制 final answer 产出的事件。
         :returns: ``None``。
         """
 
         self._snapshot = snapshot
+        self._request = request
         self._release_event = release_event
 
     @property
@@ -305,6 +416,9 @@ class _ControlledFinalAnswerHandle:
                 filtered=False,
                 degraded=False,
                 finish_reason=FinishReason.STOP,
+                response_identity=_successful_response_identity(
+                    self._request
+                ),
             ),
             metadata=None,
         )
@@ -355,6 +469,7 @@ class _ControlledFinalAnswerWorker:
         self._factory.accepted_requests.append(request)
         handle = _ControlledFinalAnswerHandle(
             snapshot,
+            request,
             self._factory.release_event,
         )
         self._factory.accepted_event.set()
@@ -393,18 +508,21 @@ class _TransientThenFinalHandle:
         self,
         *,
         snapshot: AttemptDispatchSnapshot,
+        request: AgentRunRequest,
         release_event: asyncio.Event,
         index: int,
     ) -> None:
         """初始化确定性两阶段 worker handle。
 
         :param snapshot: 当前 dispatch snapshot。
+        :param request: 当前 dispatch 的 Engine request。
         :param release_event: terminal 释放 barrier。
         :param index: factory 分配的 worker 序号。
         :returns: ``None``。
         """
 
         self._snapshot = snapshot
+        self._request = request
         self._release_event = release_event
         self._index = index
 
@@ -445,6 +563,9 @@ class _TransientThenFinalHandle:
                 filtered=False,
                 degraded=False,
                 finish_reason=FinishReason.STOP,
+                response_identity=_successful_response_identity(
+                    self._request
+                ),
             ),
             metadata=None,
         )
@@ -498,11 +619,11 @@ class _TransientThenFinalWorker:
         :returns: 两阶段 worker handle。
         """
 
-        del request
         self._factory.accepted_snapshots.append(snapshot)
         self._factory.accepted_queue.put_nowait(self._index)
         return _TransientThenFinalHandle(
             snapshot=snapshot,
+            request=request,
             release_event=self._factory.release_events[self._index],
             index=self._index,
         )
@@ -1103,6 +1224,151 @@ async def test_open_host_startup_recovery_dispatches_interrupted_run_and_watch_o
     assert recovery_factory.accepted_snapshots[0].attempt_id != (
         interrupted_factory.accepted_snapshots[0].attempt_id
     )
+
+
+@pytest.mark.asyncio
+async def test_immediate_fresh_attach_delays_once_then_recovers_with_fresh_now(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """fresh attach 在 threshold 前只调度一次，deadline 后用 fresh now 恢复。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: 提前 mutation、旧 now 复用或 recovery identity 漂移时抛出。
+    """
+
+    interrupted_factory = _ControlledFinalAnswerWorkerFactory()
+    options = _options(tmp_path, interrupted_factory)
+    async with open_host(options) as owner_host:
+        session = await owner_host.ensure_session(_ensure_request())
+        owner_attachment = await owner_host.attach_session(session.session_id)
+        try:
+            followup = await owner_host.submit_followup(
+                session.session_id,
+                _followup_request(
+                    session.session_id,
+                    "followup-immediate-delayed-recovery",
+                ),
+            )
+            await asyncio.wait_for(
+                interrupted_factory.accepted_event.wait(),
+                timeout=1,
+            )
+            run_id = followup.accepted_run_id
+            old_snapshot = interrupted_factory.accepted_snapshots[0]
+        finally:
+            await owner_attachment.aclose()
+
+    initial_now = datetime.now(UTC)
+    delayed_now = initial_now + timedelta(seconds=31)
+    _mark_current_dispatch_owner_as_recent_running(
+        options,
+        run_id,
+        heartbeat_at=initial_now - timedelta(seconds=5),
+    )
+    observed_times: list[datetime] = []
+    clock_values = [initial_now, delayed_now]
+    sleep_entered = asyncio.Event()
+    sleep_release = asyncio.Event()
+    observed_deadlines: list[datetime] = []
+    module = cast(ModuleType, sys.modules["dayu.host.open_host"])
+
+    def fake_utc_now() -> datetime:
+        """为 initial 与 delayed operation 分别返回固定时间。
+
+        :returns: 下一个 UTC-aware 测试时间。
+        :raises AssertionError: production 意外重复读取时钟时抛出。
+        """
+
+        if not clock_values:
+            raise AssertionError("delayed recovery unexpectedly reused the clock")
+        value = clock_values.pop(0)
+        observed_times.append(value)
+        return value
+
+    async def controlled_sleep(deadline: datetime) -> None:
+        """在 monotonic delay 边界冻结，证明 deadline 前零 mutation。
+
+        :param deadline: classifier 返回的 UTC deadline。
+        :returns: ``None``。
+        :raises asyncio.CancelledError: test cleanup 取消时抛出。
+        """
+
+        observed_deadlines.append(deadline)
+        sleep_entered.set()
+        await sleep_release.wait()
+
+    monkeypatch.setattr(module, "_utc_now", fake_utc_now)
+    monkeypatch.setattr(
+        module,
+        "_sleep_until_recovery_deadline",
+        controlled_sleep,
+    )
+    recovery_factory = _ControlledFinalAnswerWorkerFactory()
+    async with open_host(replace(options, worker_factory=recovery_factory)) as host:
+        public_host = cast(_PublicHostHandle, host)
+        attachment = await host.attach_session(session.session_id)
+        watcher = await host.watch_session_events(session.session_id)
+        try:
+            await asyncio.wait_for(sleep_entered.wait(), timeout=1)
+            before_deadline = await host.get_run(run_id)
+            assert before_deadline.status is RunStatus.RUNNING
+            assert _event_type_count(options.db_path, "ATTEMPT_LOST") == 0
+            assert _event_type_count(options.db_path, "RUN_RECOVERING") == 0
+            assert recovery_factory.accepted_event.is_set() is False
+            assert observed_deadlines == [initial_now + timedelta(seconds=25)]
+
+            sleep_release.set()
+            await asyncio.wait_for(
+                recovery_factory.accepted_event.wait(),
+                timeout=2,
+            )
+            terminal_task = asyncio.create_task(_next_terminal(watcher))
+            recovery_factory.release_event.set()
+            terminal = await asyncio.wait_for(terminal_task, timeout=2)
+            final_run = await _wait_for_run_status(
+                host,
+                run_id,
+                RunStatus.SUCCEEDED,
+            )
+            await asyncio.sleep(0)
+            assert public_host._health_gate.state is (
+                HostExecutionHealthState.READY
+            )
+        finally:
+            sleep_release.set()
+            await watcher.aclose()
+            await attachment.aclose()
+
+    new_snapshot = recovery_factory.accepted_snapshots[0]
+    assert observed_times == [initial_now, delayed_now]
+    assert clock_values == []
+    assert terminal.kind is HostEventKind.SUCCEEDED
+    assert final_run.status is RunStatus.SUCCEEDED
+    assert new_snapshot.run_id == old_snapshot.run_id
+    assert new_snapshot.attempt_id != old_snapshot.attempt_id
+    assert new_snapshot.execution_id != old_snapshot.execution_id
+    assert len(interrupted_factory.accepted_snapshots) == 1
+    assert len(recovery_factory.accepted_snapshots) == 1
+    assert public_host._delayed_attachment_recovery_tasks == {}
+    assert _event_type_count(options.db_path, "ATTEMPT_LOST") == 1
+    assert _event_type_count(options.db_path, "RUN_RECOVERING") == 1
+    assert _event_type_count(options.db_path, "RUN_STARTED") == 2
+    event_types, recovery_start_reason = _recovery_event_order_and_reason(
+        options.db_path,
+        run_id,
+    )
+    attempt_lost_index = event_types.index("ATTEMPT_LOST")
+    recovering_index = event_types.index("RUN_RECOVERING")
+    recovery_started_index = max(
+        index
+        for index, event_type in enumerate(event_types)
+        if event_type == "RUN_STARTED"
+    )
+    assert attempt_lost_index < recovering_index < recovery_started_index
+    assert recovery_start_reason == "recovery"
 
 
 @pytest.mark.asyncio
@@ -2209,6 +2475,233 @@ async def test_attachment_recovery_failure_does_not_fail_open_host(
 
 
 @pytest.mark.asyncio
+async def test_managed_attachment_close_releases_resource_when_recovery_join_fails(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """delayed recovery join 失败仍关闭底层资源并传播原始失败。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: 底层 close 未调用或 join 失败被吞掉时抛出。
+    """
+
+    manager = open_host(_options(tmp_path, _FinalAnswerWorkerFactory()))
+    public_host = cast(_PublicHostHandle, await manager.__aenter__())
+    attachment = _CloseRecordingAttachment("session-close-after-join-failure")
+    monkeypatch.setattr(
+        _PublicHostHandle,
+        "_cancel_and_join_delayed_attachment_recovery",
+        _raise_delayed_recovery_join_failure,
+    )
+
+    try:
+        with pytest.raises(
+            RuntimeError,
+            match="forced delayed recovery join failure",
+        ):
+            await public_host._close_managed_attachment(attachment)
+        assert attachment.close_calls == 1
+    finally:
+        await manager.__aexit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_host_close_cancels_all_sleeping_delayed_recovery_tasks_before_actor_stop(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Host close 在 actor stop 前取消/join task，且不提前释放 mutex。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :returns: ``None``。
+    :raises AssertionError: task 泄漏、第二次 scan 或 mutex 释放顺序错误时抛出。
+    """
+
+    scan_calls = 0
+    schedule_deadline = True
+    sleep_started = asyncio.Event()
+    actor_stop_entered = asyncio.Event()
+    actor_stop_release = asyncio.Event()
+    module = cast(ModuleType, sys.modules["dayu.host.open_host"])
+    original_stop_and_drain = DurableActor.stop_and_drain
+
+    def scheduled_scan(
+        scanner: SessionAttachmentRecoveryScanner,
+        policy: SessionAttachmentRecoveryPolicy | None = None,
+    ) -> SessionAttachmentRecoveryScanResult:
+        """首个 Host 返回 deadline，fresh Host 返回无 schedule。
+
+        :param scanner: target scanner。
+        :param policy: fixed-now policy。
+        :returns: synthetic typed scan result。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        nonlocal scan_calls
+        del scanner, policy
+        scan_calls += 1
+        return SessionAttachmentRecoveryScanResult(
+            actions=(),
+            next_reconcile_at=(
+                datetime.now(UTC) + timedelta(minutes=5)
+                if schedule_deadline
+                else None
+            ),
+        )
+
+    async def blocked_sleep(deadline: datetime) -> None:
+        """让 Host close 精确取消尚未提交 actor 的 task。
+
+        :param deadline: initial scan deadline。
+        :returns: ``None``。
+        :raises asyncio.CancelledError: Host close 取消时抛出。
+        """
+
+        del deadline
+        sleep_started.set()
+        await asyncio.Event().wait()
+
+    async def block_target_actor_stop(actor: DurableActor) -> None:
+        """在目标 Host actor stop 入口设置 mutex 顺序观察 barrier。
+
+        :param actor: 当前关闭的 durable actor。
+        :returns: ``None``。
+        :raises Exception: 原始 actor stop 失败时透传。
+        """
+
+        if actor is public_host._durable_actor:
+            actor_stop_entered.set()
+            await actor_stop_release.wait()
+        await original_stop_and_drain(actor)
+
+    monkeypatch.setattr(SessionAttachmentRecoveryScanner, "scan", scheduled_scan)
+    monkeypatch.setattr(module, "_sleep_until_recovery_deadline", blocked_sleep)
+    options = _options(tmp_path, _FinalAnswerWorkerFactory())
+    manager = open_host(options)
+    public_host = cast(_PublicHostHandle, await manager.__aenter__())
+    session = await public_host.ensure_session(_ensure_request())
+    attachment = await public_host.attach_session(session.session_id)
+    await asyncio.wait_for(sleep_started.wait(), timeout=1)
+    monkeypatch.setattr(
+        DurableActor,
+        "stop_and_drain",
+        block_target_actor_stop,
+    )
+
+    close_task = asyncio.create_task(public_host.close())
+    await asyncio.wait_for(actor_stop_entered.wait(), timeout=1)
+
+    assert public_host._delayed_attachment_recovery_tasks == {}
+    assert scan_calls == 1
+    assert close_task.done() is False
+
+    try:
+        async with open_host(options) as observer_host:
+            observer_attachment = await observer_host.attach_session(
+                session.session_id
+            )
+            try:
+                assert observer_attachment.access_mode.value == "read_only"
+            finally:
+                await observer_attachment.aclose()
+    finally:
+        actor_stop_release.set()
+        await close_task
+
+    assert public_host._health_gate.state is HostExecutionHealthState.CLOSED
+    await attachment.aclose()
+    await manager.__aexit__(None, None, None)
+
+    schedule_deadline = False
+    async with open_host(options) as fresh_host:
+        fresh_attachment = await fresh_host.attach_session(session.session_id)
+        try:
+            assert fresh_attachment.access_mode.value == "read_write"
+        finally:
+            await fresh_attachment.aclose()
+    assert scan_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_delayed_recovery_failure_reports_safe_fatal_and_does_not_leak_task(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """delayed scan 异常只以安全 type 报 fatal，正常 cleanup task 引用。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest monkeypatch fixture。
+    :param caplog: pytest 日志捕获 fixture。
+    :returns: ``None``。
+    :raises AssertionError: fatal detail、日志脱敏或 task cleanup 漂移时抛出。
+    """
+
+    scan_calls = 0
+    module = cast(ModuleType, sys.modules["dayu.host.open_host"])
+
+    def fail_delayed_scan(
+        scanner: SessionAttachmentRecoveryScanner,
+        policy: SessionAttachmentRecoveryPolicy | None = None,
+    ) -> SessionAttachmentRecoveryScanResult:
+        """首次返回 deadline，第二次抛出带敏感文本的异常。
+
+        :param scanner: target scanner。
+        :param policy: fixed-now policy。
+        :returns: initial typed result。
+        :raises RuntimeError: delayed scan 固定抛出。
+        """
+
+        nonlocal scan_calls
+        del scanner, policy
+        scan_calls += 1
+        if scan_calls == 1:
+            return SessionAttachmentRecoveryScanResult(
+                actions=(),
+                next_reconcile_at=datetime.now(UTC),
+            )
+        raise RuntimeError("sensitive delayed recovery detail")
+
+    async def immediate_sleep(deadline: datetime) -> None:
+        """立即进入 delayed actor scan。
+
+        :param deadline: initial scan deadline。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        del deadline
+
+    monkeypatch.setattr(SessionAttachmentRecoveryScanner, "scan", fail_delayed_scan)
+    monkeypatch.setattr(module, "_sleep_until_recovery_deadline", immediate_sleep)
+    with caplog.at_level("ERROR", logger="dayu.host.open_host"):
+        async with open_host(_options(tmp_path, _FinalAnswerWorkerFactory())) as host:
+            public_host = cast(_PublicHostHandle, host)
+            session = await host.ensure_session(_ensure_request())
+            attachment = await host.attach_session(session.session_id)
+            try:
+                for _ in range(100):
+                    if (
+                        public_host._health_gate.state
+                        is HostExecutionHealthState.UNAVAILABLE
+                    ):
+                        break
+                    await asyncio.sleep(0.01)
+                assert public_host._health_gate.state is (
+                    HostExecutionHealthState.UNAVAILABLE
+                )
+                assert public_host._delayed_attachment_recovery_tasks == {}
+            finally:
+                await attachment.aclose()
+
+    assert "error_type=RuntimeError" in caplog.text
+    assert "sensitive delayed recovery detail" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_open_host_startup_failure_closes_poller_before_scheduler(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2487,7 +2980,9 @@ def test_compactor_runner_baseline_maps_to_host_owned_compactor(
                 ),
                 compactor_system_prompt="test compactor system prompt",
                 compactor_user_prompt_template=(
-                    "test compactor user prompt <<compaction_request>>"
+                    "test compactor user prompt <<compaction_request>>\n"
+                    "rules <<compact_output_rules>>\n"
+                    "template <<compact_output_template>>"
                 ),
                 compact_artifact_root=tmp_path / "compact-artifacts",
                 compact_artifact_create_parent_dirs=False,
@@ -2643,6 +3138,65 @@ def _mark_current_dispatch_owner_as_stale_running(
         store.transaction_runner.run_write(operation)
 
 
+def _mark_current_dispatch_owner_as_recent_running(
+    options: OpenHostOptions,
+    run_id: str,
+    *,
+    heartbeat_at: datetime,
+) -> None:
+    """把已关闭 owner 改为 pid missing 但 heartbeat 仍 recent 的测试事实。
+
+    :param options: 同源 open_host options。
+    :param run_id: 目标 active Run id。
+    :param heartbeat_at: 目标 UTC-aware heartbeat 时间。
+    :returns: ``None``。
+    :raises ValueError: heartbeat 缺少 timezone 时抛出。
+    :raises Exception: durable write 失败时透传。
+    """
+
+    if heartbeat_at.tzinfo is None or heartbeat_at.utcoffset() is None:
+        raise ValueError("heartbeat_at must be timezone-aware")
+    heartbeat_text = heartbeat_at.astimezone(UTC).isoformat().replace(
+        "+00:00",
+        "Z",
+    )
+    with open_host_durable_store(_durable_options_from_open_options(options)) as store:
+
+        def operation(transaction: HostTransaction) -> None:
+            """更新 current dispatch owner liveness。
+
+            :param transaction: Host write transaction。
+            :returns: ``None``。
+            :raises Exception: SQLite 写入失败时透传。
+            """
+
+            result = transaction.execute(
+                """
+                UPDATE host_instances
+                SET
+                  pid = ?,
+                  heartbeat_at = ?,
+                  status = ?
+                WHERE host_instance_id = (
+                  SELECT dispatch.owner_host_instance_id
+                  FROM host_runs AS run
+                  JOIN host_attempt_dispatch_records AS dispatch
+                    ON dispatch.attempt_id = run.current_attempt_id
+                  WHERE run.run_id = ?
+                )
+                """,
+                (
+                    999_999,
+                    heartbeat_text,
+                    "running",
+                    run_id,
+                ),
+            )
+            assert result.rowcount == 1
+
+        store.transaction_runner.run_write(operation)
+
+
 def _durable_options_from_open_options(
     options: OpenHostOptions,
 ) -> HostDurableStoreOptions:
@@ -2689,6 +3243,43 @@ def _event_type_count(db_path: pathlib.Path, event_type: str) -> int:
         ).fetchone()
     assert row is not None
     return int(row[0])
+
+
+def _recovery_event_order_and_reason(
+    db_path: pathlib.Path,
+    run_id: str,
+) -> tuple[tuple[str, ...], str]:
+    """读取单 Run canonical event 顺序与 recovery start reason。
+
+    :param db_path: Host durable SQLite DB 路径。
+    :param run_id: 目标 Run id。
+    :returns: event type 序列与最后一条 ``RUN_STARTED`` 的 start reason。
+    :raises AssertionError: recovery start row 或 payload 不完整时抛出。
+    :raises Exception: SQLite 查询或 JSON 解析失败时透传。
+    """
+
+    with sqlite3.connect(db_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT event_type, payload_json
+            FROM event_log
+            WHERE run_id = ?
+            ORDER BY event_sequence ASC
+            """,
+            (run_id,),
+        ).fetchall()
+    event_types = tuple(str(row[0]) for row in rows)
+    started_payloads = tuple(
+        json.loads(str(row[1]))
+        for row in rows
+        if str(row[0]) == "RUN_STARTED"
+    )
+    assert len(started_payloads) == 2
+    recovery_payload = started_payloads[-1]
+    assert isinstance(recovery_payload, dict)
+    start_reason = recovery_payload.get("start_reason")
+    assert isinstance(start_reason, str)
+    return event_types, start_reason
 
 
 def _options(
@@ -2849,6 +3440,7 @@ def _runner_spec() -> RunnerSpec:
         supports_tool_calling=False,
         supports_streaming=False,
         supports_stream_usage=False,
+        structured_output_capability=StructuredOutputCapability.NONE,
         default_timeout_seconds=1.0,
         max_retries=0,
         provider_request=None,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from functools import partial
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -91,12 +92,21 @@ def test_cancel_run_cancels_waiting_run_without_resume_attempt(
         )
 
         wait_record = _read_wait(host._transaction_runner(), seeded.wait_id)
-        event_types = [event.event_type for event in _events(host._transaction_runner())]
+        events = _events(host._transaction_runner())
+        event_types = [event.event_type for event in events]
+        cancelled = next(
+            event for event in events if event.event_type == "RUN_CANCELLED"
+        )
         assert snapshot.status is RunStatus.CANCELLED
         assert snapshot.current_attempt_id == seeded.attempt_id
         assert wait_record.status is WaitRecordStatus.CANCELLED
         assert "RESUME_REQUESTED" not in event_types
         assert "ATTEMPT_STARTED" not in event_types[-2:]
+        assert cancelled.reason_json is not None
+        assert json.loads(cancelled.reason_json) == {
+            "reason": "user_cancel",
+            "mode": CancelMode.GRACEFUL.value,
+        }
     finally:
         host.close()
 

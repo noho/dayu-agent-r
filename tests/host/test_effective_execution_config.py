@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dayu.engine.contracts.structured_output import StructuredOutputCapability
+
 import asyncio
 import dataclasses
 import pathlib
@@ -22,6 +24,11 @@ from dayu.engine.contracts.engine_events import (
     FinalAnswerData,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.engine.contracts.messages import AgentMessageRole
 from dayu.engine.contracts.runner_spec import (
     AnthropicThinkingExtension,
@@ -161,15 +168,21 @@ class _ReadEventById:
 class _FinalHandle:
     """测试用成功终态 worker handle。"""
 
-    def __init__(self, snapshot: AttemptDispatchSnapshot) -> None:
+    def __init__(
+        self,
+        snapshot: AttemptDispatchSnapshot,
+        request: AgentRunRequest,
+    ) -> None:
         """初始化 handle。
 
         :param snapshot: dispatch snapshot。
+        :param request: 当前 dispatch 的 Engine request。
         :returns: ``None``。
         :raises: 无主动抛出。
         """
 
         self._snapshot = snapshot
+        self._request = request
 
     @property
     def local_worker_id(self) -> str:
@@ -198,6 +211,9 @@ class _FinalHandle:
                 filtered=False,
                 degraded=False,
                 finish_reason=FinishReason.STOP,
+                response_identity=_successful_response_identity(
+                    self._request
+                ),
             ),
             metadata=None,
         )
@@ -249,7 +265,35 @@ class _RecordingWorker:
         self._factory.snapshots.append(snapshot)
         self._factory.requests.append(request)
         self._factory.accepted.set()
-        return _FinalHandle(snapshot)
+        return _FinalHandle(snapshot, request)
+
+
+def _successful_response_identity(
+    request: AgentRunRequest,
+) -> SuccessfulRunnerResponseIdentity:
+    """构造与 effective-config worker request 同源的测试响应身份。
+
+    :param request: 当前 worker 实际收到的 Engine request。
+    :returns: provider request id 明确不可用的成功响应身份。
+    :raises ValueError: request identity 字段非法时抛出。
+    """
+
+    return SuccessfulRunnerResponseIdentity(
+        effective_provider=request.runner_spec.provider,
+        effective_model=request.runner_spec.model,
+        runner_request_identity=build_runner_request_identity(
+            run_id=request.run_id,
+            attempt_id=request.attempt_id,
+            execution_id=request.execution_id,
+            iteration_id=f"{request.run_id}:effective-config-final",
+            iteration_index=0,
+            runner_call_index=1,
+        ),
+        provider_request_id_availability=(
+            ProviderRequestIdAvailability.UNAVAILABLE
+        ),
+        provider_request_id=None,
+    )
 
 
 class _RecordingWorkerFactory:
@@ -457,6 +501,7 @@ def test_effective_execution_snapshot_rejects_unknown_provider_request_with_dura
             "supports_tool_calling": False,
             "supports_streaming": False,
             "supports_stream_usage": False,
+            "structured_output_capability": "none",
             "default_timeout_seconds": 1.0,
             "max_retries": 0,
             "provider_request": {"kind": "unknown-extension"},
@@ -568,6 +613,7 @@ def test_execution_projection_round_trips_complete_owner_contract() -> None:
     )
 
     assert list(headers_value) == ["X-Alpha", "X-Zeta"]
+    assert runner_spec_value["structured_output_capability"] == "none"
     assert runner_spec_from_json(runner_spec_value) == runner_spec
     assert runner_options_from_json(runner_options_value) == runner_options
     assert agent_policy_from_json(agent_policy_value) == agent_policy
@@ -1091,6 +1137,7 @@ def _runner_spec(model: str) -> RunnerSpec:
         supports_tool_calling=False,
         supports_streaming=False,
         supports_stream_usage=False,
+        structured_output_capability=StructuredOutputCapability.NONE,
         default_timeout_seconds=1.0,
         max_retries=0,
         provider_request=None,

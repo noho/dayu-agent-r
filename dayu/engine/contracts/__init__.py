@@ -75,7 +75,9 @@ from dayu.engine.contracts.messages import (
 from dayu.engine.contracts.partial_tool_call import PartialToolCallSummary
 from dayu.engine.contracts.runner import AsyncRunner
 from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
     RunnerRequestIdentity,
+    SuccessfulRunnerResponseIdentity,
     build_runner_request_identity,
 )
 from dayu.engine.contracts.tool_records import (
@@ -118,6 +120,13 @@ from dayu.engine.contracts.runner_spec import (
     RunnerCallOptions,
     RunnerSpec,
 )
+from dayu.engine.contracts.structured_output import (
+    JsonObjectStructuredOutputRequest,
+    JsonSchemaStructuredOutputRequest,
+    StructuredOutputCapability,
+    StructuredOutputRequest,
+    validate_structured_output_request,
+)
 
 __all__ = [
     "AcceptedToolExecutionRecord",
@@ -155,6 +164,8 @@ __all__ = [
     "GeminiThinkingExtension",
     "IterationCompletedData",
     "IterationStartedData",
+    "JsonObjectStructuredOutputRequest",
+    "JsonSchemaStructuredOutputRequest",
     "RunnerInputMessageProjection",
     "RunnerInputToolCallProjection",
     "MimoThinkingExtension",
@@ -164,6 +175,7 @@ __all__ = [
     "ProviderDiagnosticData",
     "ProviderProtocolErrorData",
     "ProviderRequestExtension",
+    "ProviderRequestIdAvailability",
     "QwenThinkingExtension",
     "ReasoningDeltaData",
     "RUN_SUSPENDED_REASON_TOOL_AWAITING",
@@ -191,6 +203,9 @@ __all__ = [
     "RunnerSpecificErrorCode",
     "RunnerSpecificErrorSource",
     "RunnerSpec",
+    "SuccessfulRunnerResponseIdentity",
+    "StructuredOutputCapability",
+    "StructuredOutputRequest",
     "RunnerToolCallDeltaData",
     "RunnerToolCallsCompletedData",
     "RunnerUsageRecordedData",
@@ -211,4 +226,5 @@ __all__ = [
     "http_provider_error_code",
     "runner_protocol_error_code",
     "serialize_engine_error_code",
+    "validate_structured_output_request",
 ]

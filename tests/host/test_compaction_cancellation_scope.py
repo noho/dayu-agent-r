@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dayu.engine.contracts.structured_output import StructuredOutputCapability
+
 import asyncio
 from collections.abc import Mapping
 from typing import cast
@@ -18,6 +20,11 @@ from dayu.engine.contracts.agent_run import (
     EngineRunOutcomeFinalAnswer,
 )
 from dayu.engine.contracts.finish_reason import FinishReason
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.engine.contracts.runner_spec import (
     ClientCorrelationPolicy,
     RunnerCallOptions,
@@ -27,7 +34,6 @@ from dayu.host.compact_material import (
     InitialEvidenceMaterial,
     InitialHistoryMaterial,
     build_initial_material_pack,
-    conversation_compact_input_vnext_from_material_pack,
     initial_segment_selection,
 )
 from dayu.host.compaction import (
@@ -36,13 +42,15 @@ from dayu.host.compaction import (
     CompactionRequest,
 )
 from dayu.host.compaction_operation import (
-    CompactorProposalManifestReference,
     CompactorProposalRunInput,
     run_compaction_operation,
 )
+from dayu.host.context_events import CompactorProposalManifestReference
 from dayu.host.context_budget import BudgetEstimate
 from dayu.host.context_policy import ContextCompactionTriggerSource
 from dayu.host.llm_compaction import LLMContextCompactor
+from dayu.host.memory import default_memory_projection_policy
+from dayu.host.context_governance import compact_output_caps_v4_from_memory_policy
 from tests.host.fake_cancellation import ControllableCancellationToken
 from tests.host.fake_compaction import fake_compaction_proposal_from_material_json
 
@@ -85,9 +93,10 @@ class _CancellingManifestRecorder:
             manifest_payload_ref=f"manifest:{compaction_operation_id}",
             manifest_digest=prepared_input.role_sequence_digest,
             compactor_input_projection_ref=f"projection:{request.run_id}",
-            compactor_input_projection_digest=(
-                prepared_input.compactor_input_projection_digest
-            ),
+            compactor_input_projection_digest=(prepared_input.compactor_input_projection_digest),
+            compaction_operation_id=compaction_operation_id,
+            compaction_attempt_number=compaction_attempt_number,
+            compactor_engine_run_id=prepared_input.compactor_engine_run_id,
         )
         self._parent.request_cancel(_PARENT_REASON)
         return self.reference
@@ -124,7 +133,10 @@ async def test_attempt_timeout_does_not_cancel_parent_or_next_attempt(
         if len(observed_tokens) == 1:
             raise TimeoutError("attempt one timeout")
         assert agent_request.cancellation_token.is_cancelled() is False
-        return _valid_final_answer(request)
+        return _valid_final_answer(
+            request=request,
+            agent_request=agent_request,
+        )
 
     monkeypatch.setattr(
         llm_compaction,
@@ -138,9 +150,10 @@ async def test_attempt_timeout_does_not_cancel_parent_or_next_attempt(
         first_attempt_number=1,
         max_attempt_number=2,
         cancellation_token=parent,
+        memory_policy=default_memory_projection_policy(),
     )
 
-    assert result.accepted_candidate is not None
+    assert result.accepted_truth is not None
     assert result.failure_reason is None
     assert len(observed_tokens) == 2
     assert observed_tokens[0] is not observed_tokens[1]
@@ -206,13 +219,14 @@ async def test_parent_cancel_after_timeout_wins_before_retry(
         first_attempt_number=1,
         max_attempt_number=2,
         cancellation_token=parent,
+        memory_policy=default_memory_projection_policy(),
     )
 
     assert provider_calls == 1
     assert first_child is not None
     assert first_child.cancel_reason() == _PARENT_REASON
     assert first_child.requested_at() == parent.requested_at()
-    assert result.accepted_candidate is None
+    assert result.accepted_truth is None
     assert result.failure_reason == "cancellation_requested"
     assert _PARENT_REASON in result.rejected_attempts[-1].diagnostic_refs[0]
 
@@ -262,6 +276,7 @@ async def test_parent_cancel_is_visible_to_running_attempt_child(
             first_attempt_number=1,
             max_attempt_number=2,
             cancellation_token=parent,
+            memory_policy=default_memory_projection_policy(),
         )
     )
     await provider_started.wait()
@@ -317,6 +332,7 @@ async def test_outer_task_cancellation_is_not_reclassified(
             first_attempt_number=1,
             max_attempt_number=1,
             cancellation_token=parent,
+            memory_policy=default_memory_projection_policy(),
         )
     )
     await provider_started.wait()
@@ -353,9 +369,12 @@ async def test_manifest_post_write_recheck_blocks_provider_and_keeps_reference(
         """
 
         nonlocal provider_calls
-        del agent_request, timeout_seconds
+        del timeout_seconds
         provider_calls += 1
-        return _valid_final_answer(_request())
+        return _valid_final_answer(
+            request=_request(),
+            agent_request=agent_request,
+        )
 
     monkeypatch.setattr(llm_compaction, "_run_agent_request", forbidden_runner)
     result = await run_compaction_operation(
@@ -366,13 +385,16 @@ async def test_manifest_post_write_recheck_blocks_provider_and_keeps_reference(
         cancellation_token=parent,
         compaction_operation_id="operation-pre-call-recheck",
         proposal_manifest_recorder=recorder,
+        memory_policy=default_memory_projection_policy(),
     )
 
     assert provider_calls == 0
     assert recorder.reference is not None
     assert result.failure_reason == "cancellation_requested"
-    assert result.rejected_attempts[0].proposal_manifest_ref == (
-        recorder.reference.manifest_payload_ref
+    assert result.rejected_attempts[0].proposal_manifest_reference is not None
+    assert (
+        result.rejected_attempts[0].proposal_manifest_reference.manifest_payload_ref
+        == recorder.reference.manifest_payload_ref
     )
 
 
@@ -393,6 +415,7 @@ def _compactor() -> LLMContextCompactor:
             supports_tool_calling=False,
             supports_streaming=False,
             supports_stream_usage=False,
+            structured_output_capability=StructuredOutputCapability.NONE,
             default_timeout_seconds=1.0,
             max_retries=0,
             provider_request=None,
@@ -412,7 +435,11 @@ def _compactor() -> LLMContextCompactor:
             continuation_prompt="test continuation",
         ),
         system_prompt="Compact the supplied material.",
-        user_prompt_template="Material: <<compaction_request>>",
+        user_prompt_template=(
+            "Material: <<compaction_request>>\n"
+            "Rules: <<compact_output_rules>>\n"
+            "Template: <<compact_output_template>>"
+        ),
     )
 
 
@@ -472,27 +499,45 @@ def _request() -> CompactionRequest:
             estimator_digest="estimate-digest",
             overage_reason=None,
         ),
+        output_caps=compact_output_caps_v4_from_memory_policy(
+            default_memory_projection_policy()
+        ),
     )
 
 
-def _valid_final_answer(request: CompactionRequest) -> EngineRunOutcomeFinalAnswer:
+def _valid_final_answer(
+    *,
+    request: CompactionRequest,
+    agent_request: AgentRunRequest,
+) -> EngineRunOutcomeFinalAnswer:
     """从 request 构造合法 deterministic compactor final answer。
 
     :param request: compaction request。
+    :param agent_request: 产出该 final 的同一次 compactor Engine request。
     :returns: Engine final answer。
     """
 
-    compact_input = conversation_compact_input_vnext_from_material_pack(
-        request.material_pack
-    )
+    compact_input = request.compact_input
     material_json = cast(Mapping[str, JsonValue], compact_input.to_json())
     return EngineRunOutcomeFinalAnswer(
-        session_id="context-compactor:test",
-        run_id="compactor-run-test",
-        content=fake_compaction_proposal_from_material_json(
-            material_json
-        ),
+        session_id=agent_request.session_id,
+        run_id=agent_request.run_id,
+        content=fake_compaction_proposal_from_material_json(material_json),
         filtered=False,
         degraded=False,
         finish_reason=FinishReason.STOP,
+        response_identity=SuccessfulRunnerResponseIdentity(
+            effective_provider=agent_request.runner_spec.provider,
+            effective_model=agent_request.runner_spec.model,
+            runner_request_identity=build_runner_request_identity(
+                run_id=agent_request.run_id,
+                attempt_id=agent_request.attempt_id,
+                execution_id=agent_request.execution_id,
+                iteration_id=f"{agent_request.run_id}:compactor-final",
+                iteration_index=0,
+                runner_call_index=1,
+            ),
+            provider_request_id_availability=(ProviderRequestIdAvailability.UNAVAILABLE),
+            provider_request_id=None,
+        ),
     )

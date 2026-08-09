@@ -59,7 +59,7 @@ async def test_non_200_status_classified_as_unknown_http_status(
 
     msgs = [UserMessage(role=AgentMessageRole.USER, content="hi")]
     events = []
-    async for ev in runner.call(msgs, make_options(stream=False), []):
+    async for ev in runner.call(msgs, make_options(stream=False), [], structured_output=None):
         events.append(ev)
 
     # 不得透到 parser 路径。

@@ -2,17 +2,36 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from dayu.contracts.json_value import JsonValue
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.host.durable.tool_trace import (
+    CompactorResponseDisposition,
+    ResolvedCompactorEvidenceFact,
+    ResolvedCompactorResponseIdentity,
+    RunnerCallReconstructionConsumerBoundary,
+    RunnerCallReconstructionDiagnostic,
+    RunnerCallReconstructionSignal,
+    RunnerCallReconstructionStatus,
+    RunnerCallResolvedProjection,
     ToolTraceHotRow,
+    ToolTraceResolvedJsonPayload,
     ToolTraceResolvedRowPayloads,
 )
-from dayu.host.tool_trace_analysis import render_tool_trace_analysis_markdown
+from dayu.host.tool_trace_analysis import (
+    render_tool_trace_analysis_markdown,
+    tool_trace_analysis_report_to_json,
+)
 from dayu.host.tool_trace_analysis_contracts import (
     ToolTraceAnalysisLayer,
     ToolTraceAnalysisPolicy,
@@ -213,11 +232,13 @@ def _joined_record(
     record: ToolTraceColdRecord,
     *,
     source_event_payload: Mapping[str, JsonValue],
+    runner_call_projection: RunnerCallResolvedProjection | None = None,
 ) -> ToolTraceJoinedRecord:
     """构造 resolver 已证明 source EventLog payload 的 joined record。
 
     :param record: strict cold record。
     :param source_event_payload: 模拟 resolver 校验通过的 source payload。
+    :param runner_call_projection: 可选 typed runner-call resolver projection。
     :returns: hot/cold/resolver joined record。
     :raises: 无。
     """
@@ -231,7 +252,96 @@ def _joined_record(
             source_event_payload=source_event_payload,
             descriptor_payload=None,
         ),
-        runner_call_projection=None,
+        runner_call_projection=runner_call_projection,
+    )
+
+
+def _compactor_projection(
+    record: ToolTraceColdRecord,
+) -> RunnerCallResolvedProjection:
+    """构造 analysis rules 只读消费的 typed compactor projection。
+
+    :param record: 对应 ``RUNNER_CALL_INPUT_ASSEMBLED`` cold record。
+    :returns: 带 actual successful response identity 的 typed projection。
+    :raises ValueError: synthetic Runner request identity 非 canonical 时抛出。
+    """
+
+    request_identity = build_runner_request_identity(
+        run_id="compactor-engine-run-1",
+        attempt_id=None,
+        execution_id=None,
+        iteration_id="compactor-iteration-1",
+        iteration_index=0,
+        runner_call_index=1,
+    )
+    signal = RunnerCallReconstructionSignal(
+        event_id=record.event_id,
+        event_sequence=record.event_sequence,
+        session_id=record.session_id,
+        run_id=record.run_id,
+        attempt_id="attempt-1",
+        execution_id="execution-1",
+        runner_call_index=0,
+        runner_call_kind="compactor_proposal",
+        runner_call_trigger_reason="context_compaction_initial_proposal",
+        iteration_id=None,
+        manifest_ref="payload-manifest-1",
+        manifest_digest=_DIGEST,
+        message_count=0,
+        role_sequence_digest=_DIGEST,
+        input_projection_digest=_DIGEST,
+        projector_metadata_summary=(),
+        diagnostic=RunnerCallReconstructionDiagnostic(
+            status=RunnerCallReconstructionStatus.COMPLETE,
+            reason=None,
+            missing_atom_kind=None,
+            missing_ref_kind=None,
+            missing_ref=None,
+            observed_count=None,
+            expected_count=None,
+            observed_digest=None,
+            expected_digest=None,
+            consumer_boundary=(
+                RunnerCallReconstructionConsumerBoundary.TOOL_TRACE_QUERY
+            ),
+        ),
+    )
+    resolved_payload = ToolTraceResolvedJsonPayload(
+        payload_ref="payload-manifest-1",
+        payload_digest=_DIGEST,
+        payload_size_bytes=128,
+        media_type="application/json",
+        payload={},
+    )
+    return RunnerCallResolvedProjection(
+        signal=signal,
+        manifest=resolved_payload,
+        runner_input_projection=resolved_payload,
+        selected_tool_schema_snapshot=None,
+        compactor_response_identity=ResolvedCompactorResponseIdentity(
+            disposition=CompactorResponseDisposition.ACCEPTED,
+            terminal_event_id="event-context-compacted-1",
+            terminal_event_sequence=record.event_sequence + 10,
+            compaction_operation_id="operation-1",
+            compaction_attempt_number=1,
+            proposal_manifest_ref="payload-manifest-1",
+            proposal_manifest_digest=_DIGEST,
+            successful_response_identity=SuccessfulRunnerResponseIdentity(
+                effective_provider="provider-actual",
+                effective_model="model-actual",
+                runner_request_identity=request_identity,
+                provider_request_id_availability=(
+                    ProviderRequestIdAvailability.PRESENT
+                ),
+                provider_request_id="provider-request-actual",
+            ),
+            accepted_evidence_facts=(
+                ResolvedCompactorEvidenceFact(
+                    claim="Accepted evidence-backed claim.",
+                    canonical_evidence_refs=("evidence:canonical-1",),
+                ),
+            ),
+        ),
     )
 
 
@@ -1405,3 +1515,193 @@ def test_finding_order_and_ids_are_deterministic(
     assert first.findings[-1].finding_id == "TT-TOOL-0001"
     assert first.findings[0].severity is ToolTraceFindingSeverity.WARNING
     assert first.findings[0].priority is ToolTraceFindingPriority.MEDIUM
+
+
+def test_compactor_response_summary_comes_only_from_typed_resolver_projection(
+    tmp_path: Path,
+) -> None:
+    """schema v2 summary 从 typed resolver 投影 actual response 白名单字段。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: summary 脱离 typed projection 或字段错误时抛出。
+    """
+
+    source = _workspace_source(tmp_path)
+    record = _record(
+        source,
+        sequence=1,
+        event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+    )
+    projection = _compactor_projection(record)
+    joined = _joined_record(
+        record,
+        source_event_payload={
+            "authorization": "credential-secret",
+            "selection_label": "selection-label-secret",
+            "raw_payload": "raw-payload-secret",
+            "prompt": "prompt-secret",
+        },
+        runner_call_projection=projection,
+    )
+
+    report = build_tool_trace_analysis_report(
+        _dataset(
+            source,
+            (record,),
+            hot_store_available=True,
+            hot_rows=(_hot_row(record),),
+            joined_records=(joined,),
+        ),
+        source,
+        ToolTraceAnalysisPolicy(),
+    )
+
+    assert report.schema_version == 2
+    assert len(report.compactor_responses) == 1
+    summary = report.compactor_responses[0]
+    assert summary.parent_host_run_id == "run-1"
+    assert summary.disposition is CompactorResponseDisposition.ACCEPTED
+    assert summary.effective_provider == "provider-actual"
+    assert summary.effective_model == "model-actual"
+    assert summary.provider_request_id_availability is (
+        ProviderRequestIdAvailability.PRESENT
+    )
+    assert summary.provider_request_id == "provider-request-actual"
+    response = projection.compactor_response_identity
+    assert response is not None
+    successful = response.successful_response_identity
+    assert successful is not None
+    assert summary.runner_request_identity == successful.runner_request_identity
+    assert summary.accepted_evidence_facts is response.accepted_evidence_facts
+    serialized = json.loads(tool_trace_analysis_report_to_json(report))
+    projected_facts = serialized["compactor_responses"][0][
+        "accepted_evidence_facts"
+    ]
+    assert projected_facts == [
+        {
+            "claim": "Accepted evidence-backed claim.",
+            "canonical_evidence_refs": ["evidence:canonical-1"],
+        }
+    ]
+    assert set(projected_facts[0]) == {"claim", "canonical_evidence_refs"}
+    rendered = tool_trace_analysis_report_to_json(report) + (
+        render_tool_trace_analysis_markdown(report)
+    )
+    for forbidden in (
+        "credential-secret",
+        "selection-label-secret",
+        "raw-payload-secret",
+        "prompt-secret",
+    ):
+        assert forbidden not in rendered
+
+
+def test_rejected_compactor_response_identity_projects_from_typed_owner_to_all_outputs(
+    tmp_path: Path,
+) -> None:
+    """post-success rejection 的实际 identity 同源进入 typed/JSON/Markdown。
+
+    邻近 event payload 刻意携带冲突的 config-like identity；analysis owner 只能
+    消费 resolver 的 ``successful_response_identity``，不得从邻近事实推断。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: disposition、identity 同源或 renderer 投影漂移时抛出。
+    """
+
+    source = _workspace_source(tmp_path)
+    record = _record(
+        source,
+        sequence=1,
+        event_type="RUNNER_CALL_INPUT_ASSEMBLED",
+    )
+    accepted_projection = _compactor_projection(record)
+    accepted_response = accepted_projection.compactor_response_identity
+    assert accepted_response is not None
+    successful = accepted_response.successful_response_identity
+    assert successful is not None
+    rejected_projection = replace(
+        accepted_projection,
+        compactor_response_identity=replace(
+            accepted_response,
+            disposition=CompactorResponseDisposition.ATTEMPT_REJECTED,
+            terminal_event_id="event-context-compaction-attempt-rejected-1",
+            accepted_evidence_facts=(),
+        ),
+    )
+    joined = _joined_record(
+        record,
+        source_event_payload={
+            "configured_provider": "provider-neighbor-poison",
+            "configured_model": "model-neighbor-poison",
+            "provider_request_id": "request-neighbor-poison",
+        },
+        runner_call_projection=rejected_projection,
+    )
+
+    report = build_tool_trace_analysis_report(
+        _dataset(
+            source,
+            (record,),
+            hot_store_available=True,
+            hot_rows=(_hot_row(record),),
+            joined_records=(joined,),
+        ),
+        source,
+        ToolTraceAnalysisPolicy(),
+    )
+
+    assert len(report.compactor_responses) == 1
+    summary = report.compactor_responses[0]
+    assert summary.disposition is CompactorResponseDisposition.ATTEMPT_REJECTED
+    assert summary.effective_provider == successful.effective_provider
+    assert summary.effective_model == successful.effective_model
+    assert summary.runner_request_identity == successful.runner_request_identity
+    assert (
+        summary.provider_request_id_availability
+        is successful.provider_request_id_availability
+    )
+    assert summary.provider_request_id == successful.provider_request_id
+    assert summary.accepted_evidence_facts == ()
+
+    serialized = json.loads(tool_trace_analysis_report_to_json(report))
+    projected = serialized["compactor_responses"][0]
+    assert projected["disposition"] == "attempt_rejected"
+    assert projected["effective_provider"] == successful.effective_provider
+    assert projected["effective_model"] == successful.effective_model
+    assert projected["runner_request_identity"] == {
+        "run_id": successful.runner_request_identity.run_id,
+        "attempt_id": successful.runner_request_identity.attempt_id,
+        "execution_id": successful.runner_request_identity.execution_id,
+        "iteration_id": successful.runner_request_identity.iteration_id,
+        "iteration_index": successful.runner_request_identity.iteration_index,
+        "runner_call_index": successful.runner_request_identity.runner_call_index,
+        "client_correlation_id": (
+            successful.runner_request_identity.client_correlation_id
+        ),
+    }
+    assert projected["provider_request_id_availability"] == (
+        successful.provider_request_id_availability.value
+    )
+    assert projected["provider_request_id"] == successful.provider_request_id
+    assert projected["accepted_evidence_facts"] == []
+
+    markdown = render_tool_trace_analysis_markdown(report)
+    for actual_value in (
+        successful.effective_provider,
+        successful.effective_model,
+        successful.runner_request_identity.run_id,
+        successful.runner_request_identity.iteration_id,
+        successful.provider_request_id_availability.value,
+        successful.provider_request_id,
+    ):
+        assert actual_value is not None
+        assert actual_value in markdown
+    rendered = tool_trace_analysis_report_to_json(report) + markdown
+    for poison in (
+        "provider-neighbor-poison",
+        "model-neighbor-poison",
+        "request-neighbor-poison",
+    ):
+        assert poison not in rendered

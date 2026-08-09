@@ -44,10 +44,45 @@ from dayu.engine.contracts.engine_events import (
     validate_engine_event_pairing,
 )
 from dayu.engine.contracts.runner_events import RunnerDiagnosticSeverity
+from dayu.engine.contracts.runner_identity import (
+    ProviderRequestIdAvailability,
+    SuccessfulRunnerResponseIdentity,
+    build_runner_request_identity,
+)
 from dayu.engine.contracts.tool_records import (
     AcceptedToolExecutionRecord,
     AwaitingToolExecutionRecord,
 )
+
+
+def _successful_response_identity(
+    *,
+    case_label: str,
+) -> SuccessfulRunnerResponseIdentity:
+    """构造当前 contract case 唯一的安全成功身份。
+
+    :param case_label: 当前无 run context contract case 的显式唯一标签。
+    :returns: deterministic typed response identity。
+    :raises ValueError: case label 为空时由 identity contract 抛出。
+    """
+
+    run_id = f"run-{case_label}"
+    return SuccessfulRunnerResponseIdentity(
+        effective_provider="provider-engine-event-contract",
+        effective_model="model-engine-event-contract",
+        runner_request_identity=build_runner_request_identity(
+            run_id=run_id,
+            attempt_id=None,
+            execution_id=None,
+            iteration_id=f"{run_id}-iteration-1",
+            iteration_index=0,
+            runner_call_index=1,
+        ),
+        provider_request_id_availability=(
+            ProviderRequestIdAvailability.UNAVAILABLE
+        ),
+        provider_request_id=None,
+    )
 
 
 def _engine_event_data_samples() -> tuple[EngineEventData, ...]:
@@ -149,6 +184,9 @@ def _engine_event_data_samples() -> tuple[EngineEventData, ...]:
             filtered=False,
             degraded=False,
             finish_reason=engine.FinishReason.STOP,
+            response_identity=_successful_response_identity(
+                case_label="sample-final-answer"
+            ),
         ),
         RunSuspendedData(
             reason=RUN_SUSPENDED_REASON_TOOL_AWAITING,
@@ -269,6 +307,9 @@ def test_engine_event_rejects_non_enum_discriminator() -> None:
                 filtered=False,
                 degraded=False,
                 finish_reason=engine.FinishReason.STOP,
+                response_identity=_successful_response_identity(
+                    case_label="invalid-discriminator-final-answer"
+                ),
             ),
             metadata=None,
         )

@@ -50,17 +50,23 @@ OLD_FETCH_MORE_PROJECTION_TOKENS: tuple[str, ...] = (
     "continuation_hint",
 )
 ENGINE_FORBIDDEN_PREFIXES: tuple[str, ...] = ("dayu.host",)
-HOST_ENGINE_CONTRACT_ALLOWED_MODULES: tuple[str, ...] = (
-    "_execution_config_projection.py",
-    "_runner_call_manifest.py",
-    "api.py",
-    "compact_pipeline.py",
-    "compaction_operation.py",
-    "dispatch.py",
-    "engine_ingest.py",
-    "llm_compaction.py",
-    "local_proxy.py",
-    "run_input.py",
+HOST_ENGINE_CONTRACT_ALLOWED_RELATIVE_FILES: frozenset[str] = frozenset(
+    {
+        "dayu/host/_execution_config_projection.py",
+        "dayu/host/_runner_call_manifest.py",
+        "dayu/host/api.py",
+        "dayu/host/compact_pipeline.py",
+        "dayu/host/compaction.py",
+        "dayu/host/compaction_operation.py",
+        "dayu/host/context_events.py",
+        "dayu/host/dispatch.py",
+        "dayu/host/durable/tool_trace.py",
+        "dayu/host/engine_ingest.py",
+        "dayu/host/llm_compaction.py",
+        "dayu/host/local_proxy.py",
+        "dayu/host/run_input.py",
+        "dayu/host/tool_trace_analysis_contracts.py",
+    }
 )
 PROJECTION_MODULES: tuple[str, ...] = (
     "projection.py",
@@ -649,18 +655,26 @@ def test_fetch_more_token_stays_inside_toolruntime_owner_modules() -> None:
 
 
 def test_host_engine_imports_stay_on_allowed_boundary_modules() -> None:
-    """Host 只有本地执行边界模块可依赖 Engine contracts / entry。"""
+    """Host 只有精确列出的 workspace-relative 文件可依赖 Engine。
+
+    :returns: ``None``。
+    :raises AssertionError: 未允许的 Host 文件依赖 Engine contracts / entry
+        时抛出。
+    """
 
     violations: list[tuple[str, str]] = []
     host_root = _host_root()
+    repo_root = _repo_root()
     for file_path in _iter_python_files(host_root):
+        relative_path = file_path.relative_to(repo_root).as_posix()
         for module in _imported_module_names(
             file_path.read_text(encoding="utf-8"),
             scanned_file=file_path,
             package_root=host_root,
         ):
             if _matches_prefix(module, ("dayu.engine",)) and (
-                file_path.name not in HOST_ENGINE_CONTRACT_ALLOWED_MODULES
+                relative_path
+                not in HOST_ENGINE_CONTRACT_ALLOWED_RELATIVE_FILES
             ):
                 violations.append((str(file_path), module))
     assert not violations, f"unexpected host engine imports: {violations}"

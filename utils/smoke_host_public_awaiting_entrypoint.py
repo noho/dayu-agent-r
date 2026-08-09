@@ -41,9 +41,12 @@ from dayu.engine import (
     EngineEventType,
     FinalAnswerData,
     FinishReason,
+    ProviderRequestIdAvailability,
     RUN_SUSPENDED_REASON_TOOL_AWAITING,
     RunSuspendedData,
+    SuccessfulRunnerResponseIdentity,
     ToolAwaitingData,
+    build_runner_request_identity,
 )
 from dayu.host import (
     AttemptDispatchSnapshot,
@@ -148,6 +151,9 @@ _LOCAL_PROVIDER_ENV = {
 }
 _NOW = datetime(2026, 7, 5, 0, 0, 0, tzinfo=UTC)
 _FINAL_ANSWER = "等待任务已完成，已收到轮询恢复结果。"
+_ANSWER_RESPONSE_ITERATION_ID = "awaiting-smoke-answer-iteration"
+_SMOKE_RESPONSE_ITERATION_INDEX = 0
+_SMOKE_RESPONSE_RUNNER_CALL_INDEX = 1
 _RESUME_TOKEN = "service-awaiting-smoke-token"
 _SOURCE_REF = ToolBundleSourceRef(
     source_kind=ToolBundleSourceKind.SERVICE_COMPOSITION,
@@ -182,6 +188,41 @@ _PACKAGED_WAIT_POLICY_SNAPSHOT = (
     5.0,
     8,
 )
+
+
+def _unavailable_smoke_response_identity(
+    *,
+    request: AgentRunRequest,
+    iteration_id: str,
+    iteration_index: int,
+    runner_call_index: int,
+) -> SuccessfulRunnerResponseIdentity:
+    """构造与当前 synthetic Runner call 同源的不可用 provider identity。
+
+    :param request: 当前 smoke worker 实际收到的 Engine request。
+    :param iteration_id: 当前 synthetic Runner iteration id。
+    :param iteration_index: 当前 synthetic Runner iteration 序号。
+    :param runner_call_index: 当前 request 内的 Runner call 序号。
+    :returns: provider request id 明确不可用的成功响应身份。
+    :raises ValueError: request 或 iteration/call identity 非法时抛出。
+    """
+
+    return SuccessfulRunnerResponseIdentity(
+        effective_provider=request.runner_spec.provider,
+        effective_model=request.runner_spec.model,
+        runner_request_identity=build_runner_request_identity(
+            run_id=request.run_id,
+            attempt_id=request.attempt_id,
+            execution_id=request.execution_id,
+            iteration_id=iteration_id,
+            iteration_index=iteration_index,
+            runner_call_index=runner_call_index,
+        ),
+        provider_request_id_availability=(
+            ProviderRequestIdAvailability.UNAVAILABLE
+        ),
+        provider_request_id=None,
+    )
 _SMOKE_PHASES = (
     "run_accepted",
     "operation_started",
@@ -764,7 +805,6 @@ async def _prepare_packaged_entrypoint_runtime(
         EntrypointRuntimeRequest(
             workspace_root=workspace_root,
             package_config_root=_PACKAGE_CONFIG_ROOT,
-            explicit_config_dir=None,
             scene_id=scene_id,
             context_slot_values={
                 "fins_default_subject": "DAYU",
@@ -2012,6 +2052,12 @@ class _AnswerHandle:
                 filtered=False,
                 degraded=False,
                 finish_reason=FinishReason.STOP,
+                response_identity=_unavailable_smoke_response_identity(
+                    request=self._request,
+                    iteration_id=_ANSWER_RESPONSE_ITERATION_ID,
+                    iteration_index=_SMOKE_RESPONSE_ITERATION_INDEX,
+                    runner_call_index=_SMOKE_RESPONSE_RUNNER_CALL_INDEX,
+                ),
             ),
             metadata=None,
         )

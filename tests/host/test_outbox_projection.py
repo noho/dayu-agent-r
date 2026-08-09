@@ -297,7 +297,7 @@ def test_provider_diagnostic_is_excluded_from_outbox_terminal_projection(
         result = store.transaction_runner.run_write(
             lambda transaction: OutboxTerminalProjectionConsumer().apply_event(
                 transaction,
-                projection_event_view_from_row(diagnostic),
+                projection_event_view_from_row(transaction, diagnostic),
             )
         )
         item = store.transaction_runner.run_read(
@@ -684,7 +684,7 @@ def test_descriptor_failure_rolls_back_and_same_descriptor_retry_is_idempotent(
         duplicate = store.transaction_runner.run_write(
             lambda transaction: OutboxTerminalProjectionConsumer().apply_event(
                 transaction,
-                projection_event_view_from_row(terminal),
+                projection_event_view_from_row(transaction, terminal),
             )
         )
         identity_counts = store.transaction_runner.run_read(

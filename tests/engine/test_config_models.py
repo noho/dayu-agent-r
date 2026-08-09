@@ -7,6 +7,7 @@ from dataclasses import fields
 from dayu.runtime.config_loader import (
     ModelConfig,
     RunnerOptionHintConfig,
+    StructuredOutputCapabilityConfig,
     load_runtime_config,
 )
 
@@ -31,6 +32,35 @@ def test_default_models_keep_provider_extension_raw() -> None:
         "type": "deepseek_thinking",
         "enabled": False,
     }
+
+
+def test_default_model_structured_output_capability_matrix() -> None:
+    """默认 catalog 只给有直接证据的 DeepSeek 标 JSON object。"""
+
+    config = load_runtime_config()
+    models = config.models.models
+
+    assert {
+        model.structured_output_capability
+        for model_id, model in models.items()
+        if model_id.startswith("deepseek-")
+    } == {StructuredOutputCapabilityConfig.JSON_OBJECT}
+    assert {
+        model.structured_output_capability
+        for model_id, model in models.items()
+        if model_id.startswith("mimo-")
+    } == {StructuredOutputCapabilityConfig.NONE}
+    assert all(
+        model.structured_output_capability
+        is not StructuredOutputCapabilityConfig.JSON_SCHEMA
+        for model in models.values()
+    )
+    assert all(
+        model.structured_output_capability
+        is StructuredOutputCapabilityConfig.NONE
+        for model_id, model in models.items()
+        if not model_id.startswith("deepseek-")
+    )
 
 
 def test_default_models_catalog_contains_migrated_legacy_records() -> None:

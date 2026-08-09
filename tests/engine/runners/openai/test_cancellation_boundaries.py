@@ -51,7 +51,7 @@ async def test_cancel_before_connect_returns_no_done() -> None:
     msgs = [UserMessage(role=AgentMessageRole.USER, content="hi")]
     start = time.monotonic()
     events: list[RunnerEvent] = []
-    async for ev in runner.call(msgs, make_options(stream=False), []):
+    async for ev in runner.call(msgs, make_options(stream=False), [], structured_output=None):
         events.append(ev)
     elapsed = time.monotonic() - start
     await runner.close()
@@ -119,7 +119,7 @@ async def test_cancel_during_sse_chunk_wait_returns_no_done() -> None:
 
     start = time.monotonic()
     events: list[RunnerEvent] = []
-    async for ev in runner.call(msgs, make_options(stream=True), []):
+    async for ev in runner.call(msgs, make_options(stream=True), [], structured_output=None):
         events.append(ev)
     elapsed = time.monotonic() - start
     await runner.close()
@@ -165,7 +165,7 @@ async def test_cancel_during_retry_sleep(
     msgs = [UserMessage(role=AgentMessageRole.USER, content="hi")]
     start = time.monotonic()
     events: list[RunnerEvent] = []
-    async for ev in runner.call(msgs, make_options(stream=False), []):
+    async for ev in runner.call(msgs, make_options(stream=False), [], structured_output=None):
         events.append(ev)
     elapsed = time.monotonic() - start
     await runner.close()

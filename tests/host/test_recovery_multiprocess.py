@@ -10,7 +10,12 @@ recovery truth。
 from __future__ import annotations
 
 import asyncio
+import json
 import pathlib
+import signal
+import sqlite3
+import sys
+import time
 from multiprocessing import Process
 
 import pytest
@@ -42,6 +47,7 @@ from tests.host.recovery_support import (
 
 _PROCESS_START_TIMEOUT_SECONDS = 5.0
 _PROCESS_JOIN_TIMEOUT_SECONDS = 5.0
+_DELAYED_RECOVERY_TIMEOUT_SECONDS = 45.0
 _LIVE_SLOT_KEY = "phase11-s5-live-owner"
 _CRASH_SLOT_KEY = "phase11-s5-crash-owner"
 _LAG_SLOT_KEY = "phase11-s5-projection-lag"
@@ -187,6 +193,111 @@ async def test_projection_lag_does_not_block_durable_recovery(
     assert attempt_count_for_run(tmp_path, accepted.run_id) == 2
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGKILL requires POSIX")
+@pytest.mark.asyncio
+async def test_sigkill_then_immediate_fresh_attach_recovers_without_second_restart(
+    tmp_path: pathlib.Path,
+) -> None:
+    """owner SIGKILL 后 immediate fresh RW attach 在 stale 时自动恢复。
+
+    :param tmp_path: pytest 临时目录。
+    :returns: ``None``。
+    :raises AssertionError: 需要第二次重启、identity 复用或执行次数越界时抛出。
+    """
+
+    accepted_marker = tmp_path / "sigkill-immediate-accepted"
+    release_marker = tmp_path / "sigkill-immediate-owner-release"
+    result_marker = tmp_path / "sigkill-immediate-owner-result"
+    owner_process = Process(
+        target=run_blocking_owner_process,
+        args=(
+            str(tmp_path),
+            str(accepted_marker),
+            str(release_marker),
+            str(result_marker),
+            "phase11-s3-sigkill-immediate",
+            "sigkill-immediate-followup",
+            "recover after immediate reconnect",
+        ),
+    )
+    owner_process.start()
+    try:
+        accepted = wait_for_accepted_marker(
+            accepted_marker,
+            _PROCESS_START_TIMEOUT_SECONDS,
+        )
+        old_execution_id = _execution_id_for_attempt(
+            tmp_path,
+            accepted.attempt_id,
+        )
+        owner_process.kill()
+        owner_process.join(_PROCESS_JOIN_TIMEOUT_SECONDS)
+        assert owner_process.is_alive() is False
+        assert owner_process.exitcode == -signal.SIGKILL
+
+        recovery_factory = AsyncControlledFinalAnswerWorkerFactory(
+            "sigkill-delayed-recovered"
+        )
+        attach_started_at = time.monotonic()
+        async with open_host(
+            recovery_open_host_options(tmp_path, recovery_factory)
+        ) as host:
+            attachment = await host.attach_session(accepted.session_id)
+            attach_elapsed = time.monotonic() - attach_started_at
+            watcher = await host.watch_session_events(accepted.session_id)
+            try:
+                immediate_snapshot = await host.get_run(accepted.run_id)
+                assert attach_elapsed < 10.0
+                assert immediate_snapshot.status is RunStatus.RUNNING
+                assert event_type_count(tmp_path, "ATTEMPT_LOST") == 0
+                assert attempt_count_for_run(tmp_path, accepted.run_id) == 1
+
+                await asyncio.wait_for(
+                    recovery_factory.accepted_event.wait(),
+                    timeout=_DELAYED_RECOVERY_TIMEOUT_SECONDS,
+                )
+                terminal_task = asyncio.create_task(
+                    next_terminal_for_run(watcher, accepted.run_id)
+                )
+                recovery_factory.release_event.set()
+                terminal = await asyncio.wait_for(
+                    terminal_task,
+                    timeout=_PROCESS_START_TIMEOUT_SECONDS,
+                )
+                final_snapshot = await host.get_run(accepted.run_id)
+            finally:
+                recovery_factory.release_event.set()
+                await close_host_event_iterator(watcher)
+                await close_attachment_shielded(attachment)
+
+        assert terminal.kind is HostEventKind.SUCCEEDED
+        assert final_snapshot.status is RunStatus.SUCCEEDED
+        assert len(recovery_factory.snapshots) == 1
+        new_snapshot = recovery_factory.snapshots[0]
+        assert new_snapshot.run_id == accepted.run_id
+        assert new_snapshot.attempt_id != accepted.attempt_id
+        assert new_snapshot.execution_id != old_execution_id
+        assert event_type_count(tmp_path, "ATTEMPT_LOST") == 1
+        assert event_type_count(tmp_path, "RUN_RECOVERING") == 1
+        assert event_type_count(tmp_path, "RUN_STARTED") == 2
+        assert attempt_count_for_run(tmp_path, accepted.run_id) == 2
+        event_types, recovery_reason = _run_event_order_and_recovery_reason(
+            tmp_path,
+            accepted.run_id,
+        )
+        attempt_lost_index = event_types.index("ATTEMPT_LOST")
+        recovering_index = event_types.index("RUN_RECOVERING")
+        recovery_started_index = max(
+            index
+            for index, event_type in enumerate(event_types)
+            if event_type == "RUN_STARTED"
+        )
+        assert attempt_lost_index < recovering_index < recovery_started_index
+        assert recovery_reason == "recovery"
+    finally:
+        terminate_process(owner_process)
+
+
 def _start_and_crash_owner(
     tmp_path: pathlib.Path,
     *,
@@ -227,3 +338,65 @@ def _start_and_crash_owner(
     force_owner_pid_missing_and_heartbeat_stale(tmp_path, accepted.run_id)
     assert attempt_count_for_run(tmp_path, accepted.run_id) == 1
     return accepted
+
+
+def _execution_id_for_attempt(
+    tmp_path: pathlib.Path,
+    attempt_id: str,
+) -> str:
+    """读取指定 Attempt 的 durable execution id。
+
+    :param tmp_path: recovery 测试根目录。
+    :param attempt_id: 目标 Attempt id。
+    :returns: 非空 execution id。
+    :raises AssertionError: Attempt 不存在或 execution id 非法时抛出。
+    :raises sqlite3.Error: durable 查询失败时抛出。
+    """
+
+    with sqlite3.connect(tmp_path / "host.sqlite3") as connection:
+        row = connection.execute(
+            "SELECT execution_id FROM host_attempts WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+    assert row is not None
+    execution_id = row[0]
+    assert isinstance(execution_id, str)
+    assert execution_id.strip() != ""
+    return execution_id
+
+
+def _run_event_order_and_recovery_reason(
+    tmp_path: pathlib.Path,
+    run_id: str,
+) -> tuple[tuple[str, ...], str]:
+    """读取指定 Run 的 canonical event 顺序与 recovery reason。
+
+    :param tmp_path: recovery 测试根目录。
+    :param run_id: 目标 Run id。
+    :returns: event type 序列与最后一条 RUN_STARTED 的 start reason。
+    :raises AssertionError: start event 数量或 payload 不合法时抛出。
+    :raises Exception: SQLite 查询或 JSON 解析失败时透传。
+    """
+
+    with sqlite3.connect(tmp_path / "host.sqlite3") as connection:
+        rows = connection.execute(
+            """
+            SELECT event_type, payload_json
+            FROM event_log
+            WHERE run_id = ?
+            ORDER BY event_sequence ASC
+            """,
+            (run_id,),
+        ).fetchall()
+    event_types = tuple(str(row[0]) for row in rows)
+    started_payloads = tuple(
+        json.loads(str(row[1]))
+        for row in rows
+        if str(row[0]) == "RUN_STARTED"
+    )
+    assert len(started_payloads) == 2
+    recovery_payload = started_payloads[-1]
+    assert isinstance(recovery_payload, dict)
+    recovery_reason = recovery_payload.get("start_reason")
+    assert isinstance(recovery_reason, str)
+    return event_types, recovery_reason

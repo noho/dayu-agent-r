@@ -23,6 +23,7 @@ def test_stream_true_supports_usage_true_writes_include_usage() -> None:
         options=make_options(stream=True),
         tools=[],
         spec=spec,
+        structured_output=None,
     )
     assert payload.get("stream_options") == {"include_usage": True}
 
@@ -36,6 +37,7 @@ def test_stream_true_supports_usage_false_no_stream_options() -> None:
         options=make_options(stream=True),
         tools=[],
         spec=spec,
+        structured_output=None,
     )
     assert "stream_options" not in payload
 
@@ -49,6 +51,7 @@ def test_stream_false_no_stream_options() -> None:
         options=make_options(stream=False),
         tools=[],
         spec=spec_true,
+        structured_output=None,
     )
     assert "stream_options" not in payload_true
 
@@ -58,5 +61,6 @@ def test_stream_false_no_stream_options() -> None:
         options=make_options(stream=False),
         tools=[],
         spec=spec_false,
+        structured_output=None,
     )
     assert "stream_options" not in payload_false

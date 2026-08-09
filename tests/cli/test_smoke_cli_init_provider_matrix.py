@@ -92,9 +92,7 @@ from utils.smoke_cli_init_provider_matrix import (
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PACKAGE_CONFIG_ROOT = PROJECT_ROOT / "dayu" / "config"
 FROZEN_MANIFEST_PATH = PROJECT_ROOT / "docs" / "cli_init_workspace_manifest_v1.json"
-FROZEN_MANIFEST_SHA256 = (
-    "a4865273f11ce059aaabaf9d91ee1154a7f5c1f26794828c343a20e0e73cea88"
-)
+FROZEN_MANIFEST_SHA256 = "064f80660b2cba0f16db392a46e8dc68ac45fdcd31252f96423c854e342cae22"
 
 
 @pytest.fixture(scope="module")

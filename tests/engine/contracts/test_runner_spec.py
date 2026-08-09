@@ -11,6 +11,13 @@
 
 from __future__ import annotations
 
+from dayu.engine.contracts.structured_output import (
+    JsonObjectStructuredOutputRequest,
+    JsonSchemaStructuredOutputRequest,
+    StructuredOutputCapability,
+    validate_structured_output_request,
+)
+
 import dataclasses
 from typing import TypeAlias
 
@@ -38,6 +45,7 @@ _BaseSpecKwargValue: TypeAlias = (
     | dict[str, str]
     | ProviderRequestExtension
     | ClientCorrelationPolicy
+    | StructuredOutputCapability
     | None
 )
 
@@ -55,6 +63,7 @@ def _base_spec_kwargs() -> dict[str, _BaseSpecKwargValue]:
         "supports_tool_calling": False,
         "supports_streaming": True,
         "supports_stream_usage": False,
+        "structured_output_capability": StructuredOutputCapability.NONE,
         "default_timeout_seconds": 30.0,
         "max_retries": 0,
         "provider_request": None,
@@ -188,12 +197,150 @@ def test_runner_spec_field_set_includes_supports_stream_usage() -> None:
         "supports_tool_calling",
         "supports_streaming",
         "supports_stream_usage",
+        "structured_output_capability",
         "default_timeout_seconds",
         "max_retries",
         "provider_request",
         "stream_idle_timeout_seconds",
         "stream_idle_heartbeat_seconds",
     }
+
+
+def test_runner_spec_structured_output_capability_is_required() -> None:
+    """RunnerSpec capability 必须是无 default 的 required 字段。"""
+
+    field = next(
+        item
+        for item in dataclasses.fields(RunnerSpec)
+        if item.name == "structured_output_capability"
+    )
+
+    assert field.default is dataclasses.MISSING
+    assert field.default_factory is dataclasses.MISSING
+
+
+def test_structured_output_capability_values_are_closed() -> None:
+    """StructuredOutputCapability 必须保持三值封闭枚举。"""
+
+    assert {member.value for member in StructuredOutputCapability} == {
+        "none",
+        "json_object",
+        "json_schema",
+    }
+
+
+@pytest.mark.parametrize(
+    ("capability", "structured_request"),
+    (
+        (StructuredOutputCapability.NONE, None),
+        (StructuredOutputCapability.JSON_OBJECT, None),
+        (
+            StructuredOutputCapability.JSON_OBJECT,
+            JsonObjectStructuredOutputRequest(),
+        ),
+        (StructuredOutputCapability.JSON_SCHEMA, None),
+        (
+            StructuredOutputCapability.JSON_SCHEMA,
+            JsonObjectStructuredOutputRequest(),
+        ),
+        (
+            StructuredOutputCapability.JSON_SCHEMA,
+            JsonSchemaStructuredOutputRequest(
+                name="owner_schema",
+                schema={"type": "object"},
+                strict=True,
+            ),
+        ),
+    ),
+)
+def test_structured_output_capability_matrix_accepts_valid_combinations(
+    capability: StructuredOutputCapability,
+    structured_request: (
+        JsonObjectStructuredOutputRequest
+        | JsonSchemaStructuredOutputRequest
+        | None
+    ),
+) -> None:
+    """Capability matrix 接受全部合法组合。
+
+    :param capability: 被测 capability。
+    :param structured_request: 被测 request。
+    """
+
+    validate_structured_output_request(
+        capability=capability,
+        request=structured_request,
+    )
+
+
+@pytest.mark.parametrize(
+    ("capability", "structured_request"),
+    (
+        (
+            StructuredOutputCapability.NONE,
+            JsonObjectStructuredOutputRequest(),
+        ),
+        (
+            StructuredOutputCapability.NONE,
+            JsonSchemaStructuredOutputRequest(
+                name="owner_schema",
+                schema={"type": "object"},
+                strict=True,
+            ),
+        ),
+        (
+            StructuredOutputCapability.JSON_OBJECT,
+            JsonSchemaStructuredOutputRequest(
+                name="owner_schema",
+                schema={"type": "object"},
+                strict=True,
+            ),
+        ),
+    ),
+)
+def test_structured_output_capability_matrix_rejects_invalid_combinations(
+    capability: StructuredOutputCapability,
+    structured_request: (
+        JsonObjectStructuredOutputRequest | JsonSchemaStructuredOutputRequest
+    ),
+) -> None:
+    """Capability matrix 在 transport 前拒绝全部非法组合。
+
+    :param capability: 被测 capability。
+    :param structured_request: 被测 request。
+    """
+
+    with pytest.raises(ValueError, match="does not support"):
+        validate_structured_output_request(
+            capability=capability,
+            request=structured_request,
+        )
+
+
+@pytest.mark.parametrize("name", ("", " schema", "schema "))
+def test_json_schema_request_rejects_invalid_name(name: str) -> None:
+    """JSON Schema request 拒绝空名称与首尾空白。
+
+    :param name: 被测 schema name。
+    """
+
+    with pytest.raises(ValueError, match="name"):
+        JsonSchemaStructuredOutputRequest(
+            name=name,
+            schema={"type": "object"},
+            strict=True,
+        )
+
+
+def test_json_schema_request_rejects_non_finite_json_number() -> None:
+    """JSON Schema request 拒绝非有限 JSON number。"""
+
+    with pytest.raises(ValueError, match="finite"):
+        JsonSchemaStructuredOutputRequest(
+            name="owner_schema",
+            schema={"multipleOf": float("nan")},
+            strict=True,
+        )
 
 
 def test_runner_spec_supports_stream_usage_true_construction() -> None:
@@ -209,6 +356,7 @@ def test_runner_spec_supports_stream_usage_true_construction() -> None:
         supports_tool_calling=True,
         supports_streaming=True,
         supports_stream_usage=True,
+        structured_output_capability=StructuredOutputCapability.NONE,
         default_timeout_seconds=30.0,
         max_retries=2,
         provider_request=OpenAIReasoningExtension(
@@ -232,6 +380,7 @@ def test_runner_spec_supports_stream_usage_false_construction() -> None:
         supports_tool_calling=False,
         supports_streaming=False,
         supports_stream_usage=False,
+        structured_output_capability=StructuredOutputCapability.NONE,
         default_timeout_seconds=30.0,
         max_retries=0,
         provider_request=None,
@@ -276,6 +425,7 @@ def test_runner_spec_allows_none_api_key_ref_for_local_provider() -> None:
         supports_tool_calling=True,
         supports_streaming=True,
         supports_stream_usage=True,
+        structured_output_capability=StructuredOutputCapability.NONE,
         default_timeout_seconds=30.0,
         max_retries=0,
         provider_request=None,

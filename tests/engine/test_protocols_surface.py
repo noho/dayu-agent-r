@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import inspect
+
 import dayu.engine.agent as agent_module
 from dayu.engine.contracts.runner import AsyncRunner
 
@@ -37,6 +39,17 @@ def test_async_runner_surface() -> None:
         "is_supports_tool_calling",
         "close",
     }
+
+
+def test_async_runner_structured_output_parameter_is_required() -> None:
+    """Protocol 的 structured_output 必须是 required keyword-only 参数。"""
+
+    parameter = inspect.signature(AsyncRunner.call).parameters[
+        "structured_output"
+    ]
+
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is inspect.Parameter.empty
 
 
 def test_async_runner_does_not_expose_old_methods() -> None:

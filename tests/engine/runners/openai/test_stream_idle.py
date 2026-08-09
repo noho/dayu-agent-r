@@ -191,6 +191,7 @@ async def test_idle_timeout_emits_retriable_timeout() -> None:
     msgs = [UserMessage(role=AgentMessageRole.USER, content="hi")]
     events: list[RunnerEvent] = []
     async for event in runner.call(
+        structured_output=None,
         messages=msgs, options=make_options(stream=True), tools=[]
     ):
         events.append(event)
@@ -226,6 +227,7 @@ async def test_idle_heartbeat_emits_debug_log_and_does_not_drop_bytes(
             msgs = [UserMessage(role=AgentMessageRole.USER, content="hi")]
             events: list[RunnerEvent] = []
             async for event in runner.call(
+                structured_output=None,
                 messages=msgs, options=make_options(stream=True), tools=[]
             ):
                 events.append(event)
@@ -268,6 +270,7 @@ async def test_idle_heartbeat_is_not_captured_at_normal_debug(
             msgs = [UserMessage(role=AgentMessageRole.USER, content="hi")]
             events: list[RunnerEvent] = []
             async for event in runner.call(
+                structured_output=None,
                 messages=msgs, options=make_options(stream=True), tools=[]
             ):
                 events.append(event)
@@ -313,6 +316,7 @@ async def test_idle_disabled_does_not_emit_heartbeat_log(
         with caplog.at_level(logging.DEBUG, logger="dayu"):
             msgs = [UserMessage(role=AgentMessageRole.USER, content="hi")]
             async for _event in runner.call(
+                structured_output=None,
                 messages=msgs, options=make_options(stream=True), tools=[]
             ):
                 pass
