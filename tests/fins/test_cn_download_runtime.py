@@ -954,7 +954,7 @@ def test_cn_hk_adapter_local_rebuild_does_not_mutate_processed_documents(
     adapter = CnDownloadAdapter(pipeline=pipeline, source=source, market=market)
     request_source = FinsDownloadSource.CNINFO if market == "CN" else FinsDownloadSource.HKEXNEWS
 
-    adapter.download(
+    summary = adapter.download(
         FinsSourceDownloadAdapterRequest(
             normalized_ticker=NormalizedTicker(canonical=ticker, market=market, exchange=exchange, raw=ticker),
             source=request_source,
@@ -969,6 +969,8 @@ def test_cn_hk_adapter_local_rebuild_does_not_mutate_processed_documents(
     processed_meta = pipeline.processed_repository.get_processed_meta(ticker, document_id)
 
     assert pipeline.recorded_rebuild_values == [True]
+    assert summary.persisted_summary is not None
+    assert summary.persisted_summary.missing_periods == ()
     assert processed_meta["reprocess_required"] is False
 
 

@@ -175,7 +175,7 @@ def test_resolve_company_szse_ticker_returns_cninfo_prefix() -> None:
             normalized_ticker="002594",
             start_date="2024-01-01",
             end_date="2025-12-31",
-            target_periods=("FY",),
+            discovery_periods=("FY",),
         )
     )
 
@@ -201,7 +201,7 @@ def test_resolve_company_sse_ticker_uses_all_market_stock_list() -> None:
             normalized_ticker="600519",
             start_date="2024-01-01",
             end_date="2025-12-31",
-            target_periods=("FY",),
+            discovery_periods=("FY",),
         )
     )
 
@@ -223,7 +223,7 @@ def test_resolve_company_unknown_ticker_raises_value_error() -> None:
                 normalized_ticker="002594",
                 start_date="2024-01-01",
                 end_date="2025-12-31",
-                target_periods=("FY",),
+                discovery_periods=("FY",),
             )
         )
 
@@ -242,7 +242,7 @@ def test_resolve_company_rejects_non_cn_market() -> None:
                 normalized_ticker="0700",
                 start_date="2024-01-01",
                 end_date="2025-12-31",
-                target_periods=("FY",),
+                discovery_periods=("FY",),
             )
         )
 
@@ -261,7 +261,7 @@ def test_resolve_company_rejects_non_a_share_prefix() -> None:
                 normalized_ticker="830001",
                 start_date="2024-01-01",
                 end_date="2025-12-31",
-                target_periods=("FY",),
+                discovery_periods=("FY",),
             )
         )
 
@@ -283,7 +283,7 @@ def test_resolve_company_caches_stock_mapping_response() -> None:
         normalized_ticker="002594",
         start_date="2024-01-01",
         end_date="2025-12-31",
-        target_periods=("FY",),
+        discovery_periods=("FY",),
     )
     client.resolve_company(query)
     client.resolve_company(query)
@@ -309,7 +309,7 @@ def test_resolve_company_does_not_depend_on_noisy_search_first_page() -> None:
             normalized_ticker="000001",
             start_date="2024-01-01",
             end_date="2025-12-31",
-            target_periods=("FY",),
+            discovery_periods=("FY",),
         )
     )
 
@@ -396,7 +396,7 @@ def test_list_report_candidates_filters_blocklisted_titles() -> None:
             normalized_ticker="002594",
             start_date="2024-01-01",
             end_date="2025-12-31",
-            target_periods=("FY",),
+            discovery_periods=("FY",),
         )
     )
     candidates = client.list_report_candidates(
@@ -405,7 +405,7 @@ def test_list_report_candidates_filters_blocklisted_titles() -> None:
             normalized_ticker="002594",
             start_date="2024-01-01",
             end_date="2025-12-31",
-            target_periods=("FY",),
+            discovery_periods=("FY",),
         ),
         profile,
     )
@@ -463,7 +463,7 @@ def test_list_report_candidates_filters_english_quarterly_report_title() -> None
         normalized_ticker="000568",
         start_date="2025-01-01",
         end_date="2025-12-31",
-        target_periods=("Q3",),
+        discovery_periods=("Q3",),
     )
     profile = client.resolve_company(query)
     candidates = client.list_report_candidates(query, profile)
@@ -514,7 +514,7 @@ def test_list_report_candidates_prefers_full_fy_over_later_report_notice() -> No
         normalized_ticker="002594",
         start_date="2025-01-01",
         end_date="2025-12-31",
-        target_periods=("FY",),
+        discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
     candidates = client.list_report_candidates(query, profile)
@@ -530,7 +530,7 @@ def test_list_report_candidates_returns_empty_for_cninfo_independent_q2_q4() -> 
         normalized_ticker="002594",
         start_date="2024-01-01",
         end_date="2025-12-31",
-        target_periods=("Q2", "Q4"),
+        discovery_periods=("Q2", "Q4"),
     )
     query_calls = 0
 
@@ -604,7 +604,7 @@ def test_list_report_candidates_prefers_a_share_fy_over_later_h_share_notice() -
         normalized_ticker="688981",
         start_date="2026-01-01",
         end_date="2026-05-02",
-        target_periods=("FY",),
+        discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
     candidates = client.list_report_candidates(query, profile)
@@ -647,7 +647,7 @@ def test_list_report_candidates_raises_on_failed_period_query() -> None:
         normalized_ticker="002594",
         start_date="2024-01-01",
         end_date="2025-12-31",
-        target_periods=("FY", "H1"),
+        discovery_periods=("FY", "H1"),
     )
     profile = client.resolve_company(query)
 
@@ -676,7 +676,7 @@ def test_list_report_candidates_raises_when_period_query_fails() -> None:
         normalized_ticker="002594",
         start_date="2024-01-01",
         end_date="2025-12-31",
-        target_periods=("FY",),
+        discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
 
@@ -736,7 +736,7 @@ def test_list_report_candidates_filters_non_pdf_and_other_sec_code() -> None:
         normalized_ticker="002594",
         start_date="2024-01-01",
         end_date="2025-12-31",
-        target_periods=("FY",),
+        discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
     candidates = client.list_report_candidates(query, profile)
@@ -781,7 +781,7 @@ def test_list_report_candidates_amended_takes_priority() -> None:
         normalized_ticker="600519",
         start_date="2024-01-01",
         end_date="2025-12-31",
-        target_periods=("FY",),
+        discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
     candidates = client.list_report_candidates(query, profile)
@@ -834,7 +834,7 @@ def test_list_report_candidates_keeps_one_per_year_for_fy() -> None:
         normalized_ticker="600519",
         start_date="2022-01-01",
         end_date="2025-12-31",
-        target_periods=("FY",),
+        discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
     candidates = client.list_report_candidates(query, profile)
@@ -886,7 +886,7 @@ def test_list_report_candidates_picks_amended_per_year_without_dropping_other_ye
         normalized_ticker="600519",
         start_date="2023-01-01",
         end_date="2025-12-31",
-        target_periods=("FY",),
+        discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
     candidates = client.list_report_candidates(query, profile)
@@ -943,7 +943,7 @@ def test_list_report_candidates_handles_pagination() -> None:
         normalized_ticker="002594",
         start_date="2023-01-01",
         end_date="2025-12-31",
-        target_periods=("FY",),
+        discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
     candidates = client.list_report_candidates(query, profile)
@@ -986,7 +986,7 @@ def test_list_report_candidates_head_failure_softly_degrades() -> None:
         normalized_ticker="002594",
         start_date="2024-01-01",
         end_date="2025-12-31",
-        target_periods=("FY",),
+        discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
     candidates = client.list_report_candidates(query, profile)
@@ -1015,7 +1015,7 @@ def test_list_report_candidates_empty_when_no_announcements() -> None:
         normalized_ticker="002594",
         start_date="2024-01-01",
         end_date="2025-12-31",
-        target_periods=("FY", "H1"),
+        discovery_periods=("FY", "H1"),
     )
     profile = client.resolve_company(query)
     candidates = client.list_report_candidates(query, profile)
@@ -1043,7 +1043,7 @@ def test_list_report_candidates_invalid_profile_provider_raises() -> None:
                 normalized_ticker="002594",
                 start_date="2024-01-01",
                 end_date="2025-12-31",
-                target_periods=("FY",),
+                discovery_periods=("FY",),
             ),
             bogus_profile,
         )
@@ -1070,7 +1070,7 @@ def test_list_report_candidates_uses_per_period_category() -> None:
         normalized_ticker="002594",
         start_date="2024-01-01",
         end_date="2025-12-31",
-        target_periods=("FY", "H1", "Q1", "Q3"),
+        discovery_periods=("FY", "H1", "Q1", "Q3"),
     )
     profile = client.resolve_company(query)
     client.list_report_candidates(query, profile)
@@ -1109,7 +1109,7 @@ def test_list_report_candidates_calls_same_checkpoint_around_each_period_post() 
         normalized_ticker="002594",
         start_date="2024-01-01",
         end_date="2025-12-31",
-        target_periods=("FY", "H1"),
+        discovery_periods=("FY", "H1"),
     )
     profile = CnCompanyProfile(
         provider="cninfo",
@@ -1173,7 +1173,7 @@ def test_list_report_candidates_calls_checkpoint_around_every_paginated_post() -
         normalized_ticker="002594",
         start_date="2024-01-01",
         end_date="2025-12-31",
-        target_periods=("FY",),
+        discovery_periods=("FY",),
     )
     profile = CnCompanyProfile(
         provider="cninfo",
@@ -1246,7 +1246,7 @@ def test_list_report_candidates_preserves_cancel_identity_and_stops_next_period(
         normalized_ticker="002594",
         start_date="2024-01-01",
         end_date="2025-12-31",
-        target_periods=("FY", "H1"),
+        discovery_periods=("FY", "H1"),
     )
     profile = CnCompanyProfile(
         provider="cninfo",
@@ -1289,7 +1289,7 @@ def test_list_report_candidates_preserves_checkpoint_failure_identity() -> None:
         normalized_ticker="002594",
         start_date="2024-01-01",
         end_date="2025-12-31",
-        target_periods=("FY",),
+        discovery_periods=("FY",),
     )
     profile = CnCompanyProfile(
         provider="cninfo",
@@ -1522,7 +1522,7 @@ def test_announcement_time_milliseconds_is_normalized() -> None:
         normalized_ticker="002594",
         start_date="2024-01-01",
         end_date="2025-12-31",
-        target_periods=("FY",),
+        discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
     candidates = client.list_report_candidates(query, profile)
@@ -1589,7 +1589,7 @@ def test_cninfo_transport_owner_closed_mapping_and_safe_log(
                 normalized_ticker="002594",
                 start_date="2025-01-01",
                 end_date="2025-12-31",
-                target_periods=("FY",),
+                discovery_periods=("FY",),
             )
         )
 
@@ -1630,7 +1630,7 @@ def test_cninfo_http_status_retry_policy(
                 normalized_ticker="002594",
                 start_date="2025-01-01",
                 end_date="2025-12-31",
-                target_periods=("FY",),
+                discovery_periods=("FY",),
             )
         )
 
@@ -1656,7 +1656,7 @@ def test_cninfo_malformed_json_is_non_retryable_protocol_failure() -> None:
                 normalized_ticker="002594",
                 start_date="2025-01-01",
                 end_date="2025-12-31",
-                target_periods=("FY",),
+                discovery_periods=("FY",),
             )
         )
 
@@ -1732,7 +1732,7 @@ def test_invalid_json_response_raises_runtime_error() -> None:
                 normalized_ticker="002594",
                 start_date="2024-01-01",
                 end_date="2025-12-31",
-                target_periods=("FY",),
+                discovery_periods=("FY",),
             )
         )
 
@@ -1757,7 +1757,7 @@ def test_serialize_query_payload_structure_assertion() -> None:
         normalized_ticker="002594",
         start_date="2024-01-01",
         end_date="2025-12-31",
-        target_periods=("FY",),
+        discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
     client.list_report_candidates(query, profile)
@@ -1789,7 +1789,7 @@ def test_stock_mapping_filters_incomplete_rows() -> None:
             normalized_ticker="002594",
             start_date="2024-01-01",
             end_date="2025-12-31",
-            target_periods=("FY",),
+            discovery_periods=("FY",),
         )
     )
 

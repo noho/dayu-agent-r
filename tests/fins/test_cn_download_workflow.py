@@ -33,11 +33,13 @@ from dayu.fins.download_contract import (
 )
 from dayu.fins.pipelines import cn_download_workflow as _cn_download_workflow
 from dayu.fins.pipelines import cn_download_filing_workflow as _cn_download_filing_workflow
+from dayu.fins.pipelines import cn_download_models as _cn_download_models
 from dayu.fins.pipelines import cn_download_rebuild as _cn_download_rebuild
 from dayu.fins.pipelines.cn_download_models import (
     CnDownloadCancelledError,
     CnCompanyProfile,
     CnFiscalPeriod,
+    CnMarketKind,
     CnReportCandidate,
     CnReportQuery,
     CnSourceProvider,
@@ -45,7 +47,11 @@ from dayu.fins.pipelines.cn_download_models import (
 )
 from dayu.fins.pipelines.cn_download_pdf_gate import CnDownloadPdfGateProtocol
 from dayu.fins.pipelines.cn_download_protocols import CnDoclingConversionRunner
-from dayu.fins.pipelines.cn_form_utils import build_cn_filing_ids, resolve_target_periods
+from dayu.fins.pipelines.cn_form_utils import (
+    CnDownloadPeriodPolicy,
+    build_cn_filing_ids,
+    resolve_download_period_policy,
+)
 from dayu.fins.pipelines.cn_pipeline import CnPipeline
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.storage import FsBatchingRepository, FsCompanyMetaRepository, FsDocumentBlobRepository
@@ -61,8 +67,8 @@ _PDF_BYTES = b"%PDF-1.7\n" + b"0" * 2048
 _DOCLING_BYTES = b'{"document": "ok"}'
 
 
-def test_cn_form_resolution_reuses_domain_alias_owner_for_defaults_and_tuple() -> None:
-    """CN/HK form resolution 应复用 domain alias，并保留各市场默认值。
+def test_download_period_policy_owns_market_defaults_and_explicit_forms() -> None:
+    """期间 policy 应唯一投影市场 bare default 与显式 forms。
 
     Args:
         无。
@@ -71,29 +77,79 @@ def test_cn_form_resolution_reuses_domain_alias_owner_for_defaults_and_tuple() -
         无。
 
     Raises:
-        AssertionError: alias 或默认财期 contract 漂移时抛出。
+        AssertionError: 三集合市场 contract 漂移时抛出。
     """
 
-    assert resolve_target_periods(None, "CN").target_periods == (
-        "FY",
-        "H1",
-        "Q1",
-        "Q2",
-        "Q3",
-        "Q4",
+    assert resolve_download_period_policy(None, "CN") == CnDownloadPeriodPolicy(
+        effective_periods=("FY", "H1", "Q1", "Q3"),
+        discovery_periods=("FY", "H1", "Q1", "Q3"),
+        missing_eligible_periods=("FY", "H1", "Q1", "Q3"),
     )
-    assert resolve_target_periods(None, "HK").target_periods == (
-        "FY",
-        "H1",
-        "Q1",
-        "Q2",
-        "Q3",
-        "Q4",
+    assert resolve_download_period_policy(None, "HK") == CnDownloadPeriodPolicy(
+        effective_periods=("FY", "H1"),
+        discovery_periods=("FY", "H1", "Q1", "Q2", "Q3", "Q4"),
+        missing_eligible_periods=("FY", "H1"),
     )
-    assert resolve_target_periods(("annual", "二季报", "FY"), "CN").target_periods == (
-        "FY",
-        "Q2",
+    assert resolve_download_period_policy(("四季报", "二季报", "Q2"), "CN") == (
+        CnDownloadPeriodPolicy(
+            effective_periods=("Q2", "Q4"),
+            discovery_periods=("Q2", "Q4"),
+            missing_eligible_periods=("Q2", "Q4"),
+        )
     )
+    assert resolve_download_period_policy(("Q4", "Q2"), "HK") == CnDownloadPeriodPolicy(
+        effective_periods=("Q2", "Q4"),
+        discovery_periods=("Q2", "Q4"),
+        missing_eligible_periods=("Q2", "Q4"),
+    )
+
+
+def test_download_period_policy_rejects_noncanonical_direct_construction() -> None:
+    """policy owner 应拒绝空、重复、乱序和集合包含关系错误。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 任一非法 policy 未被拒绝时抛出。
+    """
+
+    with pytest.raises(ValueError, match="effective_periods 不能为空"):
+        CnDownloadPeriodPolicy(
+            effective_periods=(),
+            discovery_periods=("FY",),
+            missing_eligible_periods=("FY",),
+        )
+    with pytest.raises(ValueError, match="重复"):
+        CnDownloadPeriodPolicy(
+            effective_periods=("FY", "FY"),
+            discovery_periods=("FY",),
+            missing_eligible_periods=("FY",),
+        )
+    with pytest.raises(ValueError, match="canonical"):
+        CnDownloadPeriodPolicy(
+            effective_periods=("H1", "FY"),
+            discovery_periods=("FY", "H1"),
+            missing_eligible_periods=("FY",),
+        )
+    with pytest.raises(ValueError, match="missing_eligible_periods"):
+        CnDownloadPeriodPolicy(
+            effective_periods=("FY",),
+            discovery_periods=("FY", "H1"),
+            missing_eligible_periods=("FY", "H1"),
+        )
+    with pytest.raises(ValueError, match="effective_periods"):
+        CnDownloadPeriodPolicy(
+            effective_periods=("FY", "H1"),
+            discovery_periods=("FY",),
+            missing_eligible_periods=("FY",),
+        )
+
+    with pytest.raises(ValueError, match="form 输入"):
+        resolve_download_period_policy(("not-a-period",), "CN")
 
 
 class _BatchIdentityCnBatchingRepository(FsBatchingRepository):
@@ -300,6 +356,7 @@ class _FakeDiscoveryClient:
     candidates: tuple[CnReportCandidate, ...]
     pdf_bytes: bytes = _PDF_BYTES
     download_calls: int = 0
+    queries: list[CnReportQuery] = field(default_factory=list)
     cancellation_checkpoints: list[Callable[[], None] | None] = field(default_factory=list)
     checkpoint_errors: list[RuntimeError] = field(default_factory=list)
 
@@ -316,10 +373,12 @@ class _FakeDiscoveryClient:
             无。
         """
 
+        provider: CnSourceProvider = "cninfo" if query.market == "CN" else "hkexnews"
+        company_id = "CNINFO:9900000600" if query.market == "CN" else "HKEX:7609"
         return CnCompanyProfile(
-            provider="cninfo",
-            company_id="CNINFO:9900000600",
-            company_name="贵州茅台",
+            provider=provider,
+            company_id=company_id,
+            company_name="贵州茅台" if query.market == "CN" else "腾讯控股",
             ticker=query.normalized_ticker,
         )
 
@@ -344,7 +403,8 @@ class _FakeDiscoveryClient:
             无。
         """
 
-        del query, profile
+        del profile
+        self.queries.append(query)
         self.cancellation_checkpoints.append(cancellation_checkpoint)
         if cancellation_checkpoint is not None:
             try:
@@ -697,6 +757,7 @@ def _candidate(
     fiscal_year: int = 2024,
     fiscal_period: CnFiscalPeriod = "FY",
     filing_date: str | None = None,
+    provider: CnSourceProvider = "cninfo",
 ) -> CnReportCandidate:
     """构造 CN 候选。
 
@@ -706,6 +767,7 @@ def _candidate(
         fiscal_year: 财年。
         fiscal_period: 财期。
         filing_date: 披露日期。
+        provider: 候选来源 provider。
 
     Returns:
         候选报告。
@@ -715,7 +777,7 @@ def _candidate(
     """
 
     return CnReportCandidate(
-        provider="cninfo",
+        provider=provider,
         source_id=source_id,
         source_url=f"https://static.cninfo.test/{source_id}.pdf",
         title=f"贵州茅台：{fiscal_year}年{fiscal_period}报告",
@@ -734,6 +796,7 @@ def _build_pipeline(
     *,
     tmp_path: Path,
     discovery: _FakeDiscoveryClient,
+    hk_discovery: _FakeDiscoveryClient | None = None,
     converter: CnDoclingConversionRunner,
     pdf_download_gate: CnDownloadPdfGateProtocol | None = None,
     repository_set: _FsRepositorySet | None = None,
@@ -748,6 +811,7 @@ def _build_pipeline(
     Args:
         tmp_path: 临时工作区目录。
         discovery: fake discovery client。
+        hk_discovery: 可选 HK fake discovery client；缺省时使用 production 默认装配。
         converter: fake Docling conversion runner。
         pdf_download_gate: 可选 PDF 下载 gate。
         repository_set: 可选共享 FS 仓储集合。
@@ -780,6 +844,7 @@ def _build_pipeline(
             repository_set=shared_repository_set,
         ),
         cn_discovery_client=discovery,
+        hk_discovery_client=hk_discovery,
         pdf_download_gate=pdf_download_gate,
         docling_conversion_runner=converter,
     )
@@ -789,7 +854,7 @@ def _collect_events(
     pipeline: CnPipeline,
     *,
     start_is_explicit: bool,
-    form_type: str = "FY",
+    form_type: str | None = "FY",
     overwrite: bool = False,
     cancel_checker: Callable[[], bool] | None = None,
 ) -> list[DownloadEvent]:
@@ -827,8 +892,8 @@ async def _collect_events_async(
     *,
     pipeline: CnPipeline,
     ticker: str,
-    form_type: str,
-    start_date: str,
+    form_type: str | None,
+    start_date: str | None,
     end_date: str,
     overwrite: bool,
     start_is_explicit: bool,
@@ -840,7 +905,7 @@ async def _collect_events_async(
         pipeline: 待执行 pipeline。
         ticker: 股票代码。
         form_type: form 过滤。
-        start_date: 开始日期。
+        start_date: 可选开始日期；``None`` 表示使用各财期默认业务窗口。
         end_date: 结束日期。
         overwrite: 是否覆盖。
         start_is_explicit: 起始日期是否来自调用方显式输入。
@@ -957,6 +1022,214 @@ def _final_result(events: list[DownloadEvent]) -> dict[str, JsonValue]:
     payload = events[-1].payload.get("result")
     assert isinstance(payload, dict)
     return {str(key): value for key, value in payload.items()}
+
+
+def test_cn_bare_download_consumes_policy_for_query_filters_and_missing(tmp_path: Path) -> None:
+    """CN bare download 应同源消费 FY/H1/Q1/Q3 三个 policy 投影。
+
+    Args:
+        tmp_path: 临时工作区。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: query、effective filters 或 missing 发生分叉时抛出。
+    """
+
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=())
+    pipeline = _build_pipeline(
+        tmp_path=tmp_path,
+        discovery=discovery,
+        converter=_FakeConverter(),
+    )
+
+    result = _final_result(
+        _collect_events(
+            pipeline,
+            start_is_explicit=True,
+            form_type=None,
+        )
+    )
+
+    assert discovery.queries[0].discovery_periods == ("FY", "H1", "Q1", "Q3")
+    filters = result["filters"]
+    assert isinstance(filters, dict)
+    assert filters["forms"] == ["FY", "H1", "Q1", "Q3"]
+    start_dates = filters["start_dates"]
+    assert isinstance(start_dates, dict)
+    assert set(start_dates) == {"FY", "H1", "Q1", "Q3"}
+    assert result["missing_periods"] == ["FY", "H1", "Q1", "Q3"]
+
+
+def test_cn_bare_download_projects_actual_default_period_window_start_dates(
+    tmp_path: Path,
+) -> None:
+    """未显式指定起点时应投影 FY 五年与其它财期两年的实际业务窗口。
+
+    Args:
+        tmp_path: 临时工作区。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: filters 与逐期 business window 不同源时抛出。
+    """
+
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=())
+    pipeline = _build_pipeline(
+        tmp_path=tmp_path,
+        discovery=discovery,
+        converter=_FakeConverter(),
+    )
+
+    events = asyncio.run(
+        _collect_events_async(
+            pipeline=pipeline,
+            ticker="600519",
+            form_type=None,
+            start_date=None,
+            end_date="2026",
+            overwrite=False,
+            start_is_explicit=False,
+        )
+    )
+    result = _final_result(events)
+    filters = result["filters"]
+    assert isinstance(filters, dict)
+    start_dates = filters["start_dates"]
+    assert start_dates == {
+        "FY": "2021-11-01",
+        "H1": "2024-11-01",
+        "Q1": "2024-11-01",
+        "Q3": "2024-11-01",
+    }
+
+
+def test_cn_fiscal_period_order_is_declared_in_owner_module_exports() -> None:
+    """canonical 财期顺序应由 owner 模块的显式公共清单声明。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: owner 常量遗漏于 ``__all__`` 时抛出。
+    """
+
+    assert "CN_FISCAL_PERIOD_ORDER" in _cn_download_models.__all__
+
+
+@pytest.mark.parametrize(
+    ("candidates", "expected_missing"),
+    [
+        ((), ["FY", "H1"]),
+        ((_candidate(source_id="HK-Q2", fiscal_period="Q2", provider="hkexnews"),), ["FY", "H1"]),
+        (
+            (
+                _candidate(source_id="HK-FY", fiscal_period="FY", provider="hkexnews"),
+                _candidate(source_id="HK-H1", fiscal_period="H1", provider="hkexnews"),
+            ),
+            [],
+        ),
+    ],
+)
+def test_hk_bare_download_discovers_six_periods_but_only_fy_h1_are_missing_eligible(
+    tmp_path: Path,
+    candidates: tuple[CnReportCandidate, ...],
+    expected_missing: list[str],
+) -> None:
+    """HK bare download 应发现六期，但 effective/missing 只承诺 FY/H1。
+
+    Args:
+        tmp_path: 临时工作区。
+        candidates: fake provider 返回的实际材料。
+        expected_missing: 只按 FY/H1 identity 计算的期望 missing。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: optional quarter 被当 mandatory 或 query 范围缩窄时抛出。
+    """
+
+    cn_discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=())
+    hk_discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=candidates)
+    pipeline = _build_pipeline(
+        tmp_path=tmp_path,
+        discovery=cn_discovery,
+        hk_discovery=hk_discovery,
+        converter=_FakeConverter(),
+    )
+
+    events = asyncio.run(
+        _collect_events_async(
+            pipeline=pipeline,
+            ticker="0700",
+            form_type=None,
+            start_date="2024",
+            end_date="2026",
+            overwrite=False,
+            start_is_explicit=True,
+        )
+    )
+    result = _final_result(events)
+
+    assert hk_discovery.queries[0].discovery_periods == (
+        "FY",
+        "H1",
+        "Q1",
+        "Q2",
+        "Q3",
+        "Q4",
+    )
+    filters = result["filters"]
+    assert isinstance(filters, dict)
+    assert filters["forms"] == ["FY", "H1"]
+    start_dates = filters["start_dates"]
+    assert isinstance(start_dates, dict)
+    assert set(start_dates) == {"FY", "H1", "Q1", "Q2", "Q3", "Q4"}
+    assert result["missing_periods"] == expected_missing
+
+
+def test_cn_explicit_q2_q4_remains_effective_discovery_and_missing_policy(
+    tmp_path: Path,
+) -> None:
+    """CN 显式 Q2/Q4 应保持可请求并在无候选时报告 missing。
+
+    Args:
+        tmp_path: 临时工作区。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 显式 Q2/Q4 被 bare policy 改写时抛出。
+    """
+
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=())
+    pipeline = _build_pipeline(
+        tmp_path=tmp_path,
+        discovery=discovery,
+        converter=_FakeConverter(),
+    )
+
+    result = _final_result(
+        _collect_events(
+            pipeline,
+            start_is_explicit=True,
+            form_type="Q2,Q4",
+        )
+    )
+
+    assert discovery.queries[0].discovery_periods == ("Q2", "Q4")
+    filters = result["filters"]
+    assert isinstance(filters, dict)
+    assert filters["forms"] == ["Q2", "Q4"]
+    assert result["missing_periods"] == ["Q2", "Q4"]
 
 
 def test_cn_download_workflow_commits_pdf_and_docling(tmp_path: Path) -> None:
@@ -1457,6 +1730,100 @@ def test_cn_rebuild_updates_only_source_in_one_batch(tmp_path: Path) -> None:
     assert blob_repository.read_file_bytes(source_handle, f"{document_id}_docling.json") == source_docling_before
 
 
+def test_hk_bare_rebuild_includes_local_optional_quarter_without_provider_io(
+    tmp_path: Path,
+) -> None:
+    """HK bare rebuild 应按六期 discovery 找到本地 Q2，effective 仍为 FY/H1。
+
+    Args:
+        tmp_path: 临时工作区。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: Q2 被 discovery 漏掉、访问 provider 或覆盖 source 时抛出。
+    """
+
+    cn_discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=())
+    hk_candidate = _candidate(
+        source_id="HK-Q2-LOCAL",
+        fiscal_period="Q2",
+        provider="hkexnews",
+    )
+    hk_discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(hk_candidate,))
+    converter = _FakeConverter()
+    pipeline = _build_pipeline(
+        tmp_path=tmp_path,
+        discovery=cn_discovery,
+        hk_discovery=hk_discovery,
+        converter=converter,
+    )
+    asyncio.run(
+        _collect_events_async(
+            pipeline=pipeline,
+            ticker="0700",
+            form_type="Q2",
+            start_date="2024",
+            end_date="2026",
+            overwrite=False,
+            start_is_explicit=True,
+        )
+    )
+    document_id, _ = build_cn_filing_ids(
+        ticker="0700",
+        form_type="Q2",
+        fiscal_year=2024,
+        fiscal_period="Q2",
+        amended=False,
+    )
+    source_handle = pipeline.source_repository.get_source_handle(
+        "0700",
+        document_id,
+        SourceKind.FILING,
+    )
+    source_pdf_before = pipeline.blob_repository.read_file_bytes(
+        source_handle,
+        f"{document_id}.pdf",
+    )
+    source_docling_before = pipeline.blob_repository.read_file_bytes(
+        source_handle,
+        f"{document_id}_docling.json",
+    )
+    hk_discovery.queries.clear()
+    hk_discovery.download_calls = 0
+    converter.calls = 0
+
+    result = pipeline.download(
+        ticker="0700",
+        form_type=None,
+        start_date="2024",
+        end_date="2026",
+        overwrite=False,
+        rebuild=True,
+        start_is_explicit=True,
+    )
+
+    filters = result["filters"]
+    filings = result["filings"]
+    assert isinstance(filters, dict)
+    assert isinstance(filings, list)
+    assert filters["forms"] == ["FY", "H1"]
+    assert result["missing_periods"] == []
+    assert [item["form_type"] for item in filings if isinstance(item, dict)] == ["Q2"]
+    assert hk_discovery.queries == []
+    assert hk_discovery.download_calls == 0
+    assert converter.calls == 0
+    assert pipeline.blob_repository.read_file_bytes(source_handle, f"{document_id}.pdf") == source_pdf_before
+    assert (
+        pipeline.blob_repository.read_file_bytes(
+            source_handle,
+            f"{document_id}_docling.json",
+        )
+        == source_docling_before
+    )
+
+
 def test_cn_rebuild_producer_always_emits_required_missing_periods(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1542,6 +1909,73 @@ def test_cn_rebuild_producer_always_emits_required_missing_periods(
     )
     assert cancelled_result["status"] == "cancelled"
     assert cancelled_result["missing_periods"] == []
+
+
+@pytest.mark.parametrize(
+    ("market", "ticker", "expected_forms", "expected_discovery"),
+    [
+        ("CN", "600519", ["FY", "H1", "Q1", "Q3"], {"FY", "H1", "Q1", "Q3"}),
+        (
+            "HK",
+            "0700",
+            ["FY", "H1"],
+            {"FY", "H1", "Q1", "Q2", "Q3", "Q4"},
+        ),
+    ],
+)
+def test_cn_hk_bare_rebuild_is_local_only_and_always_has_empty_missing(
+    tmp_path: Path,
+    market: CnMarketKind,
+    ticker: str,
+    expected_forms: list[str],
+    expected_discovery: set[str],
+) -> None:
+    """CN/HK bare rebuild 应消费 policy、保持 local-only 且不生成 missing。
+
+    Args:
+        tmp_path: 临时工作区。
+        market: 待验证市场。
+        ticker: 市场对应 canonical ticker。
+        expected_forms: effective forms 投影。
+        expected_discovery: 本地 source scan 的 discovery 财期。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: rebuild 访问 provider、触发转换或生成 missing 时抛出。
+    """
+
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=())
+    converter = _FakeConverter()
+    pipeline = _build_pipeline(
+        tmp_path=tmp_path,
+        discovery=discovery,
+        hk_discovery=discovery,
+        converter=converter,
+    )
+
+    result = _cn_download_rebuild.rebuild_cn_download_artifacts(
+        host=pipeline,
+        ticker=ticker,
+        market=market,
+        form_type=None,
+        start_date="2024",
+        end_date="2026",
+        overwrite=False,
+        pipeline_name="cn" if market == "CN" else "hk",
+    )
+
+    filters = result["filters"]
+    assert isinstance(filters, dict)
+    start_dates = filters["start_dates"]
+    assert isinstance(start_dates, dict)
+    assert filters["forms"] == expected_forms
+    assert set(start_dates) == expected_discovery
+    assert result["missing_periods"] == []
+    assert discovery.queries == []
+    assert discovery.download_calls == 0
+    assert converter.calls == 0
 
 
 def test_cn_active_batch_sync_cancelled_error_rolls_back_once(tmp_path: Path) -> None:

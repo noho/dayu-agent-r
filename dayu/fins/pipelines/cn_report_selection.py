@@ -98,10 +98,60 @@ _HK_ENGLISH_REPORT_TITLE_TOKENS: Final[tuple[str, ...]] = (
 _HK_PERIOD_INFERENCE_TOKENS: Final[dict[CnFiscalPeriod, tuple[str, ...]]] = {
     "FY": ("ANNUAL REPORT", "年報", "年报", "年度報告", "年度报告"),
     "H1": ("INTERIM REPORT", "HALF-YEAR", "HALF YEAR", "中期報告", "中期报告", "半年報", "半年度報告"),
-    "Q1": ("FIRST QUARTER", "FIRST QUARTERLY", "THREE MONTHS", "3 MONTHS", "第一季度", "第一季", "一季度", "一季", "三個月", "三个月"),
-    "Q2": ("SECOND QUARTER", "SECOND QUARTERLY", "SIX MONTHS", "6 MONTHS", "HALF YEAR", "Q2", "第二季度", "第二季", "二季度", "二季", "六個月", "六个月", "半年"),
-    "Q3": ("THIRD QUARTER", "THIRD QUARTERLY", "NINE MONTHS", "9 MONTHS", "第三季度", "第三季", "三季度", "三季", "九個月", "九个月"),
-    "Q4": ("FOURTH QUARTER", "FOURTH QUARTERLY", "TWELVE MONTHS", "12 MONTHS", "FULL YEAR", "Q4", "第四季度", "第四季", "四季度", "四季", "十二個月", "十二个月", "全年"),
+    "Q1": (
+        "FIRST QUARTER",
+        "FIRST QUARTERLY",
+        "THREE MONTHS",
+        "3 MONTHS",
+        "第一季度",
+        "第一季",
+        "一季度",
+        "一季",
+        "三個月",
+        "三个月",
+    ),
+    "Q2": (
+        "SECOND QUARTER",
+        "SECOND QUARTERLY",
+        "SIX MONTHS",
+        "6 MONTHS",
+        "HALF YEAR",
+        "Q2",
+        "第二季度",
+        "第二季",
+        "二季度",
+        "二季",
+        "六個月",
+        "六个月",
+        "半年",
+    ),
+    "Q3": (
+        "THIRD QUARTER",
+        "THIRD QUARTERLY",
+        "NINE MONTHS",
+        "9 MONTHS",
+        "第三季度",
+        "第三季",
+        "三季度",
+        "三季",
+        "九個月",
+        "九个月",
+    ),
+    "Q4": (
+        "FOURTH QUARTER",
+        "FOURTH QUARTERLY",
+        "TWELVE MONTHS",
+        "12 MONTHS",
+        "FULL YEAR",
+        "Q4",
+        "第四季度",
+        "第四季",
+        "四季度",
+        "四季",
+        "十二個月",
+        "十二个月",
+        "全年",
+    ),
 }
 _HK_TITLE_YEAR_PATTERN: Final[re.Pattern[str]] = re.compile(r"(20\d{2}|19\d{2})")
 _HK_TITLE_CHINESE_YEAR_PATTERN: Final[re.Pattern[str]] = re.compile(r"([零〇一二三四五六七八九]{4})年")
@@ -141,7 +191,7 @@ def select_cninfo_report_candidates(
     """
 
     per_period_year: dict[tuple[CnFiscalPeriod, int], list[CninfoRawAnnouncement]] = {}
-    for period in query.target_periods:
+    for period in query.discovery_periods:
         for item in announcements_by_period.get(period, ()):
             if _is_title_blocked(item.title):
                 continue
@@ -195,7 +245,7 @@ def select_hkexnews_report_candidates(
             title=item.title,
             category_text=item.category_text,
         )
-        if inferred_period not in query.target_periods:
+        if inferred_period not in query.discovery_periods:
             continue
         fiscal_year = _infer_hk_fiscal_year(
             title=item.title,

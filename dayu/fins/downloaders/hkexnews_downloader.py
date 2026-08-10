@@ -301,7 +301,7 @@ class HkexnewsDiscoveryClient:
 
         raw_announcements: list[HkexnewsRawAnnouncement] = []
         periods_by_category: dict[_HkCategorySpec, list[CnFiscalPeriod]] = {}
-        for period in query.target_periods:
+        for period in query.discovery_periods:
             category_spec = _PERIOD_TO_CATEGORY_SPEC.get(period)
             if category_spec is None:
                 Log.warn(f"未知 fiscal_period={period!r}，已跳过", module=_MODULE)

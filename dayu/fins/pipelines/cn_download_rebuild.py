@@ -24,7 +24,7 @@ from dayu.fins.pipelines.cn_download_protocols import CnDownloadWorkflowHost
 from dayu.fins.pipelines.cn_form_utils import (
     PeriodDownloadWindow,
     resolve_period_windows,
-    resolve_target_periods,
+    resolve_download_period_policy,
 )
 
 JsonObject: TypeAlias = dict[str, JsonValue]
@@ -66,9 +66,9 @@ def rebuild_cn_download_artifacts(
         OSError: 仓储写入失败时抛出。
     """
 
-    periods = resolve_target_periods(form_type, "HK" if market == "HK" else "CN")
+    period_policy = resolve_download_period_policy(form_type, market)
     period_windows = resolve_period_windows(
-        target_periods=periods.target_periods,
+        discovery_periods=period_policy.discovery_periods,
         start_date=start_date,
         end_date=end_date,
     )
@@ -96,9 +96,9 @@ def rebuild_cn_download_artifacts(
     warnings: list[str] = []
     if not filings:
         warnings.append("未匹配到可重建的已下载 CN/HK filings")
-    form_values: list[JsonValue] = [period for period in periods.target_periods]
+    form_values: list[JsonValue] = [period for period in period_policy.effective_periods]
     warning_values: list[JsonValue] = [warning for warning in warnings]
-    note_values: list[JsonValue] = [note for note in periods.notes]
+    note_values: list[JsonValue] = []
     if cancelled:
         note_values.append("cancelled")
     filing_values: list[JsonValue] = [filing for filing in filings]

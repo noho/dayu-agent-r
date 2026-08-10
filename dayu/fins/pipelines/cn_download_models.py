@@ -38,6 +38,16 @@ CnFiscalPeriod: TypeAlias = FiscalPeriod
 不是用相邻累计期间冒充。
 """
 
+CN_FISCAL_PERIOD_ORDER: Final[tuple[CnFiscalPeriod, ...]] = (
+    "FY",
+    "H1",
+    "Q1",
+    "Q2",
+    "Q3",
+    "Q4",
+)
+"""CN/HK 下载链路唯一的 canonical 财期顺序。"""
+
 CnSourceProvider = Literal["cninfo", "hkexnews"]
 """CN/HK 报告来源 provider 字面量。"""
 
@@ -113,14 +123,15 @@ class CnReportQuery:
         normalized_ticker: 已归一化的 canonical ticker（``NormalizedTicker.canonical``）。
         start_date: 窗口起点，``YYYY-MM-DD``。
         end_date: 窗口终点，``YYYY-MM-DD``，包含。
-        target_periods: 期望的财期集合；空集合在解析阶段已替换为默认 forms。
+        discovery_periods: provider 必须发现的 canonical 财期集合；空集合已在
+            policy 解析阶段被拒绝或替换为市场默认 discovery 范围。
     """
 
     market: CnMarketKind
     normalized_ticker: str
     start_date: str
     end_date: str
-    target_periods: tuple[CnFiscalPeriod, ...]
+    discovery_periods: tuple[CnFiscalPeriod, ...]
 
 
 @dataclass(frozen=True)
@@ -252,6 +263,7 @@ class DownloadedReportAsset:
 
 
 __all__ = [
+    "CN_FISCAL_PERIOD_ORDER",
     "CN_PIPELINE_DOWNLOAD_VERSION",
     "CnDownloadCancelledError",
     "CnCompanyProfile",

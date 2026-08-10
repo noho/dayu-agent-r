@@ -230,11 +230,11 @@ class CninfoDiscoveryClient:
         *,
         cancellation_checkpoint: Callable[[], None] | None = None,
     ) -> tuple[CnReportCandidate, ...]:
-        """列出符合 ``query.target_periods`` 与窗口约束的候选报告。
+        """列出符合 ``query.discovery_periods`` 与窗口约束的候选报告。
 
         实现细节：
 
-        - 按 ``target_periods`` 分批调用 ``hisAnnouncement/query``，每个 fiscal
+        - 按 ``discovery_periods`` 分批调用 ``hisAnnouncement/query``，每个 fiscal
           period 单独使用对应 ``category_*_szsh;``，避免巨潮把多个分类混淆。
         - 同 fiscal period 多版本仅保留最新有效全文，amended 优先。
         - HEAD 拉取 ``content-length`` / ``etag`` / ``last-modified``；HEAD
@@ -266,7 +266,7 @@ class CninfoDiscoveryClient:
         context = self._resolve_exchange_context(ticker)
 
         raw_by_period: dict[CnFiscalPeriod, tuple[CninfoRawAnnouncement, ...]] = {}
-        for period in query.target_periods:
+        for period in query.discovery_periods:
             category = _PERIOD_TO_CATEGORY.get(period)
             if category is None:
                 if period in _CNINFO_UNSUPPORTED_INDEPENDENT_PERIODS:

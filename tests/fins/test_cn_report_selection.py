@@ -50,7 +50,7 @@ def _cn_query(periods: tuple[CnFiscalPeriod, ...]) -> CnReportQuery:
         normalized_ticker="002594",
         start_date="2024-01-01",
         end_date="2026-12-31",
-        target_periods=periods,
+        discovery_periods=periods,
     )
 
 
@@ -72,7 +72,7 @@ def _hk_query(periods: tuple[CnFiscalPeriod, ...]) -> CnReportQuery:
         normalized_ticker="0700",
         start_date="2024-01-01",
         end_date="2026-12-31",
-        target_periods=periods,
+        discovery_periods=periods,
     )
 
 
@@ -166,9 +166,7 @@ def test_cninfo_selection_filters_blocklisted_titles_and_builds_candidate() -> N
         read_head_meta=_head_meta,
     )
 
-    assert [(item.source_id, item.fiscal_year, item.fiscal_period) for item in candidates] == [
-        ("FULL", 2024, "FY")
-    ]
+    assert [(item.source_id, item.fiscal_year, item.fiscal_period) for item in candidates] == [("FULL", 2024, "FY")]
     assert candidates[0].content_length == 4096
     assert candidates[0].etag == '"fixture"'
 
@@ -191,7 +189,9 @@ def test_cninfo_selection_keeps_years_and_prefers_amended_per_year() -> None:
         announcements_by_period={
             "FY": (
                 _cn_raw(announcement_id="A1", title="贵州茅台：2024年年度报告", announcement_date="2025-04-01"),
-                _cn_raw(announcement_id="A2", title="贵州茅台：2024年年度报告（更正后）", announcement_date="2025-04-15"),
+                _cn_raw(
+                    announcement_id="A2", title="贵州茅台：2024年年度报告（更正后）", announcement_date="2025-04-15"
+                ),
                 _cn_raw(announcement_id="A3", title="贵州茅台：2023年年度报告", announcement_date="2024-04-01"),
             )
         },
@@ -280,6 +280,4 @@ def test_hkexnews_selection_groups_by_year_and_prefers_amended() -> None:
         read_head_meta=_head_meta,
     )
 
-    assert [(item.source_id, item.fiscal_period, item.amended) for item in candidates] == [
-        ("H1_REVISED", "H1", True)
-    ]
+    assert [(item.source_id, item.fiscal_period, item.amended) for item in candidates] == [("H1_REVISED", "H1", True)]

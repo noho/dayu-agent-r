@@ -74,7 +74,7 @@ class CnReportDiscoveryClientProtocol(Protocol):
     """CN/HK 报告发现 / 下载 Protocol。
 
     一个 ticker 一次 download 流程会先调用 ``resolve_company`` 拿
-    :class:`CnCompanyProfile`，再按 ``target_periods`` 调
+    :class:`CnCompanyProfile`，再按 ``discovery_periods`` 调
     ``list_report_candidates`` 拿候选列表，最后按 candidate 调
     ``download_report_pdf`` 落 PDF。
 
@@ -112,7 +112,7 @@ class CnReportDiscoveryClientProtocol(Protocol):
         *,
         cancellation_checkpoint: Callable[[], None] | None = None,
     ) -> tuple[CnReportCandidate, ...]:
-        """列出符合 ``target_periods`` 与窗口约束的候选报告。
+        """列出符合 ``discovery_periods`` 与窗口约束的候选报告。
 
         实现层负责按白/黑名单与类别过滤、按 fiscal_period 去重；多版本仅保留
         最新有效全文，amended 优先。HK 季度报告查无返回空 tuple，**不**抛

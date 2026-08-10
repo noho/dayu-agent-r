@@ -21,6 +21,7 @@ from dayu.fins.pipelines.cn_download_filing_workflow import (
 from dayu.fins.pipelines.cn_download_models import (
     CnDownloadCancelledError,
     CnCompanyProfile,
+    CnFiscalPeriod,
     CnMarketKind,
     CnReportCandidate,
     CnReportQuery,
@@ -34,7 +35,7 @@ from dayu.fins.pipelines.cn_form_utils import (
     PeriodDownloadWindow,
     build_cn_filing_ids,
     resolve_period_windows,
-    resolve_target_periods,
+    resolve_download_period_policy,
     resolve_window,
 )
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
@@ -94,9 +95,9 @@ async def run_cn_download_stream_impl(
         raise ValueError(f"CN/HK download 不支持 ticker={ticker!r}")
     market = _coerce_market(normalized.market)
     normalized_ticker = normalized.canonical
-    periods = resolve_target_periods(form_type, market)
+    period_policy = resolve_download_period_policy(form_type, market)
     period_windows = resolve_period_windows(
-        target_periods=periods.target_periods,
+        discovery_periods=period_policy.discovery_periods,
         start_date=start_date,
         end_date=end_date,
     )
@@ -176,7 +177,7 @@ async def run_cn_download_stream_impl(
         normalized_ticker=normalized_ticker,
         start_date=window.start_date,
         end_date=window.end_date,
-        target_periods=periods.target_periods,
+        discovery_periods=period_policy.discovery_periods,
     )
     cancellation_checkpoint: Callable[[], None] | None = None
     if cancel_checker is not None:
@@ -189,7 +190,7 @@ async def run_cn_download_stream_impl(
         )
     filings: list[JsonObject] = []
     warnings: list[str] = []
-    notes = list(periods.notes)
+    notes: list[str] = []
     company_info: JsonObject = {}
     missing_periods: tuple[str, ...] = ()
     try:
@@ -234,7 +235,10 @@ async def run_cn_download_stream_impl(
                     key=lambda item: (_candidate_document_id(normalized_ticker, item) != repair_document_id,),
                 )
             )
-        missing_periods = _resolve_missing_periods(periods.target_periods, selected)
+        missing_periods = _resolve_missing_periods(
+            period_policy.missing_eligible_periods,
+            selected,
+        )
         cancelled = False
         repair_gate_completed = False
         if repair_document_id is None:
@@ -360,8 +364,8 @@ async def run_cn_download_stream_impl(
         ticker=normalized_ticker,
         company_info=company_info,
         filters={
-            "forms": list(periods.target_periods),
-            "start_dates": {period: window.start_date for period in periods.target_periods},
+            "forms": list(period_policy.effective_periods),
+            "start_dates": {item.fiscal_period: item.start_date for item in period_windows},
             "end_date": window.end_date,
             "overwrite": overwrite,
         },
@@ -562,13 +566,24 @@ def _year_from_iso_date(value: str) -> int:
 
 
 def _resolve_missing_periods(
-    requested: tuple[str, ...],
+    missing_eligible_periods: tuple[CnFiscalPeriod, ...],
     selected: tuple[CnReportCandidate, ...],
-) -> tuple[str, ...]:
-    """计算无候选的请求 period。"""
+) -> tuple[CnFiscalPeriod, ...]:
+    """只按 missing eligibility 与候选 identity period 计算缺失财期。
+
+    Args:
+        missing_eligible_periods: policy owner 允许报告 missing 的 canonical 财期。
+        selected: workflow 已选择的候选；仅消费其 identity fiscal period。
+
+    Returns:
+        保持 policy canonical 顺序的缺失财期 tuple。
+
+    Raises:
+        无。
+    """
 
     found = {item.fiscal_period for item in selected}
-    return tuple(period for period in requested if period not in found)
+    return tuple(period for period in missing_eligible_periods if period not in found)
 
 
 def _build_candidate_failed_result(

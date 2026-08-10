@@ -349,7 +349,7 @@ def _query(
         normalized_ticker=ticker,
         start_date="2024-01-01",
         end_date="2026-12-31",
-        target_periods=periods,
+        discovery_periods=periods,
     )
 
 
@@ -418,7 +418,7 @@ def test_resolve_company_rejects_non_hk_market() -> None:
                 normalized_ticker="0700",
                 start_date="2024-01-01",
                 end_date="2026-12-31",
-                target_periods=("FY",),
+                discovery_periods=("FY",),
             )
         )
 
@@ -1065,7 +1065,7 @@ def test_captured_official_title_search_shape_replays_through_strict_owner() -> 
         normalized_ticker="0700",
         start_date="2026-07-15",
         end_date="2026-07-15",
-        target_periods=("FY",),
+        discovery_periods=("FY",),
     )
 
     assert _build_client(handler).list_report_candidates(query, _profile()) == ()

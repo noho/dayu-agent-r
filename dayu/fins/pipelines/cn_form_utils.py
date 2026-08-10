@@ -5,14 +5,14 @@
 - :func:`split_cn_form_input`：把 CLI / service 透传过来的 form 输入
   （``None`` / CSV 字符串 / 已切分 tuple）规范化为 ``tuple[str, ...]``，
   同时支持英文逗号 ``,``、中文全角逗号 ``，`` 与空白分隔。
-- :func:`resolve_target_periods`：把 form 输入解析成
-  :data:`CnFiscalPeriod` 字面量集合，``Q1``/``Q2``/``Q3``/``Q4`` 均保留为
-  独立季度期间。
+- :func:`resolve_download_period_policy`：按市场把 form 输入解析成 effective、
+  discovery 与 missing eligibility 三个 typed 财期集合。
 - :func:`resolve_window`：解析 ``start_date`` / ``end_date``，生成远端查询用的
   最大窗口。
 - :func:`resolve_period_windows`：生成按财期区分的业务窗口；年报默认 5 年，
   半年报/季报默认 2 年。
-- 默认 forms 常量：CN/HK 默认均为 ``(FY, H1, Q1, Q2, Q3, Q4)``。
+- CN bare default 为 ``(FY, H1, Q1, Q3)``；HK bare effective/missing baseline
+  为 ``(FY, H1)``，discovery 覆盖全部六期。
 
 设计要点：
 
@@ -31,13 +31,20 @@ from dataclasses import dataclass
 from typing import Final
 
 from dayu.fins.domain.filing_semantics import parse_fiscal_period_filter_value
-from dayu.fins.pipelines.cn_download_models import CnFiscalPeriod, CnMarketKind
+from dayu.fins.pipelines.cn_download_models import (
+    CN_FISCAL_PERIOD_ORDER,
+    CnFiscalPeriod,
+    CnMarketKind,
+)
 
-DEFAULT_FORMS_CN: Final[tuple[CnFiscalPeriod, ...]] = ("FY", "H1", "Q1", "Q2", "Q3", "Q4")
-"""A 股默认下载 form 集合。"""
+CN_BARE_DEFAULT_PERIODS: Final[tuple[CnFiscalPeriod, ...]] = ("FY", "H1", "Q1", "Q3")
+"""A 股 bare 请求的 effective、discovery 与 missing eligibility 集合。"""
 
-DEFAULT_FORMS_HK: Final[tuple[CnFiscalPeriod, ...]] = ("FY", "H1", "Q1", "Q2", "Q3", "Q4")
-"""港股默认下载 form 集合；主源缺失财期通过独立 ``missing_periods`` 报告。"""
+HK_BARE_EFFECTIVE_PERIODS: Final[tuple[CnFiscalPeriod, ...]] = ("FY", "H1")
+"""港股 bare 请求向用户承诺并允许报告 missing 的基线财期。"""
+
+HK_BARE_DISCOVERY_PERIODS: Final[tuple[CnFiscalPeriod, ...]] = CN_FISCAL_PERIOD_ORDER
+"""港股 bare 请求为发现 optional 季度材料而覆盖的全部六期。"""
 
 # 窗口默认值与 SEC 链路的业务意图对齐：年报 5 年，季报/半年报 2 年。
 _ANNUAL_LOOKBACK_YEARS: Final[int] = 5
@@ -52,17 +59,41 @@ _DATE_YEAR_MONTH_PATTERN: Final[re.Pattern[str]] = re.compile(r"^\d{4}-\d{1,2}$"
 _DATE_YEAR_PATTERN: Final[re.Pattern[str]] = re.compile(r"^\d{4}$")
 
 
-@dataclass(frozen=True)
-class TargetPeriodResolution:
-    """``resolve_target_periods`` 的强类型返回。
+@dataclass(frozen=True, slots=True)
+class CnDownloadPeriodPolicy:
+    """CN/HK 下载期间策略的唯一强类型 owner。
 
     Attributes:
-        target_periods: 已去重并按 ``CnFiscalPeriod`` 字面量归一的 form tuple。
-        notes: 解析过程产生的 summary 标记字符串集合。
+        effective_periods: 向用户承诺并投影到 effective filters 的财期。
+        discovery_periods: provider 与本地 rebuild 必须搜索的财期。
+        missing_eligible_periods: 无候选时允许报告 missing 的财期。
     """
 
-    target_periods: tuple[CnFiscalPeriod, ...]
-    notes: tuple[str, ...]
+    effective_periods: tuple[CnFiscalPeriod, ...]
+    discovery_periods: tuple[CnFiscalPeriod, ...]
+    missing_eligible_periods: tuple[CnFiscalPeriod, ...]
+
+    def __post_init__(self) -> None:
+        """校验三个期间集合的 canonical 与包含关系。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: 任一集合为空、重复、顺序非 canonical，或不满足
+                ``missing ⊆ effective ⊆ discovery`` 时抛出。
+        """
+
+        _validate_policy_periods("effective_periods", self.effective_periods)
+        _validate_policy_periods("discovery_periods", self.discovery_periods)
+        _validate_policy_periods("missing_eligible_periods", self.missing_eligible_periods)
+        if not set(self.missing_eligible_periods).issubset(self.effective_periods):
+            raise ValueError("missing_eligible_periods 必须是 effective_periods 的子集")
+        if not set(self.effective_periods).issubset(self.discovery_periods):
+            raise ValueError("effective_periods 必须是 discovery_periods 的子集")
 
 
 @dataclass(frozen=True)
@@ -109,7 +140,7 @@ def split_cn_form_input(form_type: str | tuple[str, ...] | None) -> tuple[str, .
             CSV 串与 CLI 直接拼接的 ``"FY,H1"`` / ``"FY H1"`` 都能解析。
 
     Returns:
-        归一化后的 token tuple；调用方再交给 :func:`resolve_target_periods`
+        归一化后的 token tuple；调用方再交给 :func:`resolve_download_period_policy`
         做语义校验。
     """
 
@@ -163,16 +194,16 @@ def build_cn_filing_ids(
     return document_id, internal_document_id
 
 
-def resolve_target_periods(
+def resolve_download_period_policy(
     raw_forms: str | tuple[str, ...] | None,
     market: CnMarketKind,
-) -> TargetPeriodResolution:
-    """把 form 输入解析成 :class:`CnFiscalPeriod` 集合。
+) -> CnDownloadPeriodPolicy:
+    """把 form 输入解析成市场专属的三集合期间策略。
 
     解析规则：
 
-    - 输入为空 / ``None`` / 全空白 -> 返回 :data:`DEFAULT_FORMS_CN` 或
-      :data:`DEFAULT_FORMS_HK`。
+    - CN bare 输入令三集合均为 ``FY,H1,Q1,Q3``。
+    - HK bare 输入令 effective/missing 为 ``FY,H1``，discovery 为全部六期。
     - 字符串输入按 :func:`split_cn_form_input` 规则切分；tuple 输入直接消费。
     - 输入 token 经 domain 财期 parser 归一，``Q2``/``Q4`` 保留为独立季度期间，
       不折叠到 ``H1``/``FY``。
@@ -184,7 +215,7 @@ def resolve_target_periods(
         market: 市场标识，决定空输入时使用哪个默认集合。
 
     Returns:
-        :class:`TargetPeriodResolution`。
+        :class:`CnDownloadPeriodPolicy`。
 
     Raises:
         ValueError: 出现无法识别的 token、或全部 token 解析后为空时抛出，
@@ -193,20 +224,31 @@ def resolve_target_periods(
 
     tokens = split_cn_form_input(raw_forms)
     if not tokens:
-        defaults = DEFAULT_FORMS_CN if market == "CN" else DEFAULT_FORMS_HK
-        return TargetPeriodResolution(target_periods=defaults, notes=())
+        if market == "CN":
+            return CnDownloadPeriodPolicy(
+                effective_periods=CN_BARE_DEFAULT_PERIODS,
+                discovery_periods=CN_BARE_DEFAULT_PERIODS,
+                missing_eligible_periods=CN_BARE_DEFAULT_PERIODS,
+            )
+        return CnDownloadPeriodPolicy(
+            effective_periods=HK_BARE_EFFECTIVE_PERIODS,
+            discovery_periods=HK_BARE_DISCOVERY_PERIODS,
+            missing_eligible_periods=HK_BARE_EFFECTIVE_PERIODS,
+        )
 
     seen: set[CnFiscalPeriod] = set()
-    notes: list[str] = []
     for raw in tokens:
         period = parse_fiscal_period_filter_value(raw, field_name="form 输入")
         seen.add(period)
     if not seen:
         raise ValueError("form 输入解析后为空")
 
-    canonical_order: tuple[CnFiscalPeriod, ...] = ("FY", "H1", "Q1", "Q2", "Q3", "Q4")
-    target_periods: tuple[CnFiscalPeriod, ...] = tuple(period for period in canonical_order if period in seen)
-    return TargetPeriodResolution(target_periods=target_periods, notes=tuple(notes))
+    explicit_periods: tuple[CnFiscalPeriod, ...] = tuple(period for period in CN_FISCAL_PERIOD_ORDER if period in seen)
+    return CnDownloadPeriodPolicy(
+        effective_periods=explicit_periods,
+        discovery_periods=explicit_periods,
+        missing_eligible_periods=explicit_periods,
+    )
 
 
 def resolve_window(
@@ -250,7 +292,7 @@ def resolve_window(
 
 def resolve_period_windows(
     *,
-    target_periods: tuple[CnFiscalPeriod, ...],
+    discovery_periods: tuple[CnFiscalPeriod, ...],
     start_date: str | None,
     end_date: str | None,
     today: dt.date | None = None,
@@ -258,13 +300,13 @@ def resolve_period_windows(
     """解析各财期的业务下载窗口。
 
     Args:
-        target_periods: 已归一化目标财期。
+        discovery_periods: 已归一化的 provider / rebuild discovery 财期。
         start_date: 用户显式起点；提供时所有财期共用该起点。
         end_date: 用户显式终点；缺省时使用 ``today``。
         today: 测试注入日期；生产传 ``None``。
 
     Returns:
-        按 ``target_periods`` 顺序返回的窗口 tuple。默认窗口为年报 5 年、
+        按 ``discovery_periods`` 顺序返回的窗口 tuple。默认窗口为年报 5 年、
         半年报/季报 2 年，均加 60 天披露宽限。
 
     Raises:
@@ -275,7 +317,7 @@ def resolve_period_windows(
     end = _parse_date(end_date, is_end=True) if end_date else anchor_today
     explicit_start = _parse_date(start_date, is_end=False) if start_date else None
     windows: list[PeriodDownloadWindow] = []
-    for period in target_periods:
+    for period in discovery_periods:
         lookback_years = _ANNUAL_LOOKBACK_YEARS if period == "FY" else _INTERIM_LOOKBACK_YEARS
         start = explicit_start or (_subtract_years(end, lookback_years) - dt.timedelta(days=_LOOKBACK_GRACE_DAYS))
         if start > end:
@@ -291,6 +333,32 @@ def resolve_period_windows(
 
 
 # ---------- 模块级私有辅助 ----------
+
+
+def _validate_policy_periods(
+    field_name: str,
+    periods: tuple[CnFiscalPeriod, ...],
+) -> None:
+    """校验单个 policy 财期 tuple 非空、无重复且顺序 canonical。
+
+    Args:
+        field_name: 用于错误消息的字段名。
+        periods: 待校验财期 tuple。
+
+    Returns:
+        无。
+
+    Raises:
+        ValueError: tuple 为空、包含重复/未知值或顺序非 canonical 时抛出。
+    """
+
+    if not periods:
+        raise ValueError(f"{field_name} 不能为空")
+    if len(periods) != len(set(periods)):
+        raise ValueError(f"{field_name} 不能包含重复财期")
+    canonical = tuple(period for period in CN_FISCAL_PERIOD_ORDER if period in periods)
+    if periods != canonical:
+        raise ValueError(f"{field_name} 必须使用 canonical 财期顺序")
 
 
 def _parse_date(value: str, *, is_end: bool) -> dt.date:
@@ -327,14 +395,15 @@ def _subtract_years(anchor_date: dt.date, years: int) -> dt.date:
 
 
 __all__ = [
-    "DEFAULT_FORMS_CN",
-    "DEFAULT_FORMS_HK",
+    "CN_BARE_DEFAULT_PERIODS",
+    "CnDownloadPeriodPolicy",
     "DownloadWindow",
+    "HK_BARE_DISCOVERY_PERIODS",
+    "HK_BARE_EFFECTIVE_PERIODS",
     "PeriodDownloadWindow",
-    "TargetPeriodResolution",
     "build_cn_filing_ids",
+    "resolve_download_period_policy",
     "resolve_period_windows",
-    "resolve_target_periods",
     "resolve_window",
     "split_cn_form_input",
 ]
