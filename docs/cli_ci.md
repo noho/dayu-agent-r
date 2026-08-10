@@ -1018,10 +1018,14 @@ Service、Fins runtime、市场 adapter、source-specific workflow 和 storage o
 - **forms 与日期**：无 forms、每个 form family、别名/大小写/中文拼写、多 forms、CSV、重复、空项、非法项、超长和数量
   边界；无日期、year/year-month/full-date、单边窗口、精确窗口、无结果窗口、非法日期、超长和 start-after-end。默认 form/
   lookback、SC13 补拉/回溯、CN/HK missing-period 等代码分支必须分别获得真实观察或显式 gap；不得只相信 pure helper 或
-  pipeline summary。
+  pipeline summary。默认 form 与 missing-period 必须按市场适用规则生成：A股默认集合是 `FY,H1,Q1,Q3`，制度上不存在的
+  独立 Q2/Q4 不得进入 effective forms 或 missing；港股主板以年度和中期材料为基础集合，季度材料按发行人实际披露发现，
+  不得把 Q1～Q4 当作所有发行人的必有材料。选定发行人实际公开了可选季度材料时，CI 必须对照发行人/交易所公开来源验证
+  discovery 与分类，不能因为该材料不是强制披露就允许漏选；腾讯 `0700` 必须覆盖其实际发布的 Q2 与合并年度/Q4业绩材料。
 - **workspace 状态**：fresh、init 后、已有完整 source、部分/损坏 source、目标路径冲突、只读 workspace；每种状态都记录
   command 开始前是否已产生目录，以及失败后是否存在半发布、旧文档丢失、临时 staging、锁或 recovery residue。
-- **重复、overwrite 与 rebuild**：首次下载、无 overwrite 重复、overwrite、rebuild、overwrite+rebuild 分开运行。必须用
+- **重复、overwrite 与 rebuild**：首次下载、无 overwrite 重复、overwrite、rebuild 分开运行；`--overwrite --rebuild` 与
+  `--rebuild --overwrite` 必须作为互斥 usage error 在业务 operation、网络访问和 workspace 写入前 exit 2。合法场景必须用
   原始文件/meta/manifest/processed 的 before/after bytes 和 digest 证明实际行为；`--rebuild` 的名称、自报或 help 不能代替
   downstream processed 状态及后续 `process` 真正消费验证。还要观察 overwrite 在现有目标损坏时能否安全修复，以及失败/
   空结果/取消是否保留旧文档和非目标文档。
