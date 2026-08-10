@@ -24,6 +24,7 @@ from dayu.documents.processors.source import Source
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.fins import ticker_normalization
 import dayu.fins.download_contract as download_contract
+from dayu.fins.downloaders.sec_downloader import SEC_USER_AGENT_ENV
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins import ingestion_runtime
 from dayu.fins.direct_events import (
@@ -117,6 +118,7 @@ from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_
 from dayu.fins.storage.repository_protocols import SourceSnapshotProtocol
 from dayu.fins.ticker_normalization import NormalizedTicker
 from dayu.fins.tools.read_runtime import FinsReadRuntime
+import dayu.runtime.log as runtime_log
 
 
 def _typed_download_summary(
@@ -2737,6 +2739,41 @@ def test_default_runtime_registers_production_download_adapters(tmp_path: Path) 
     assert auto_cn_adapter is cn_adapter
     assert isinstance(hk_adapter, CnDownloadAdapter)
     assert auto_hk_adapter is hk_adapter
+
+
+@pytest.mark.asyncio
+async def test_default_runtime_logs_missing_sec_user_agent_only_at_download_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """单次 production download 应在首次请求前记录一次缺配置诊断。
+
+    Args:
+        tmp_path: pytest 临时目录夹具。
+        monkeypatch: pytest 环境变量隔离夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 装配期报警、单次请求重复报警或失败分类漂移时抛出。
+    """
+
+    monkeypatch.delenv(SEC_USER_AGENT_ENV, raising=False)
+    log_stream = io.StringIO()
+    runtime_log.configure(level=runtime_log.LogLevel.WARNING, stream=log_stream)
+    ingestion = DefaultFinsRuntime.create(workspace_root=tmp_path / "fins-workspace").get_ingestion_runtime()
+
+    assert "SEC User-Agent 未配置:" not in log_stream.getvalue()
+
+    events = await _collect_direct_events(ingestion.download(build_fins_download_request(ticker="AAPL")))
+    result = events[-1].result
+
+    assert log_stream.getvalue().count("SEC User-Agent 未配置:") == 1
+    assert result is not None
+    assert result.status is FinsResultStatus.FAILURE
+    assert result.failure is not None
+    assert result.failure.transport_category is FinsDownloadTransportCategory.UNCONFIGURED
 
 
 def test_start_download_repeated_request_skips_existing_source_document(tmp_path: Path) -> None:

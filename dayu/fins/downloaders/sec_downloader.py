@@ -2313,10 +2313,6 @@ class SecDownloader:
         value = (configured_user_agent or os.environ.get(SEC_USER_AGENT_ENV) or "").strip()
         if value:
             return SecUserAgentState.CONFIGURED, value
-        Log.warning(
-            f"SEC User-Agent 未配置: configured=false; 请通过环境变量 {SEC_USER_AGENT_ENV} 或部署配置提供合规身份。",
-            module=self.MODULE,
-        )
         return SecUserAgentState.UNCONFIGURED, None
 
     def _build_headers(self) -> dict[str, str]:
@@ -2333,6 +2329,10 @@ class SecDownloader:
         """
 
         if self._user_agent_state is SecUserAgentState.UNCONFIGURED:
+            Log.warning(
+                f"SEC User-Agent 未配置: configured=false; 请通过环境变量 {SEC_USER_AGENT_ENV} 或部署配置提供合规身份。",
+                module=self.MODULE,
+            )
             raise SecUserAgentConfigurationError()
         assert self._user_agent is not None
 

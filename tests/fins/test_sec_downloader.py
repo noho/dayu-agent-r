@@ -2009,12 +2009,14 @@ def test_missing_sec_user_agent_warning_names_config_fact(
     downloader._client = client  # type: ignore[assignment]
     downloader.configure(user_agent=None, sleep_seconds=0.0, max_retries=1)
 
+    assert "SEC User-Agent 未配置:" not in log_stream.getvalue()
+    with pytest.raises(SecUserAgentConfigurationError):
+        _run(downloader._http_get_json("https://contact-canary.invalid/payload"))
+
     warning_text = log_stream.getvalue()
     assert warning_text.count(SEC_USER_AGENT_ENV) == 1
     # 保持拼接形式，避免 Fins 源码扫描把否定断言误判为 CLI 命令名残留。
     assert "dayu" + "-cli" not in warning_text
-    with pytest.raises(SecUserAgentConfigurationError):
-        _run(downloader._http_get_json("https://contact-canary.invalid/payload"))
     assert client.calls == 0
     assert "contact-canary" not in log_stream.getvalue()
 
