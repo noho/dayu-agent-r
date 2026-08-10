@@ -50,7 +50,11 @@ from dayu.fins.pipelines.cn_pipeline import CnPipeline
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.storage import FsBatchingRepository, FsCompanyMetaRepository, FsDocumentBlobRepository
 from dayu.fins.storage import FsFilingMaintenanceRepository, FsProcessedDocumentRepository
-from dayu.fins.storage import FsSourceDocumentRepository
+from dayu.fins.storage import (
+    FsSourceDocumentRepository,
+    SourceIntegrityPreflightError,
+    SourceIntegrityPreflightReason,
+)
 from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
 
 _PDF_BYTES = b"%PDF-1.7\n" + b"0" * 2048
@@ -1000,7 +1004,9 @@ def test_cn_download_workflow_commits_pdf_and_docling(tmp_path: Path) -> None:
         amended=False,
     )
     source_meta = pipeline.source_repository.get_source_meta("600519", document_id, SourceKind.FILING)
-    assert source_meta["company_id"] == "600519_SSE"
+    company_event = next(event for event in events if event.event_type is DownloadEventType.COMPANY_RESOLVED)
+    company_meta = pipeline._company_repository.get_company_meta("600519")
+    assert company_event.payload["company_id"] == source_meta["company_id"] == company_meta.company_id == "600519_SSE"
     assert source_meta["provider_company_id"] == "CNINFO:9900000600"
     assert source_meta["document_version"] == "v1"
 
@@ -1217,8 +1223,8 @@ def test_cn_replacement_separates_company_and_document_transactions(
     assert batching_repository.rollback_calls == rollback_calls
 
 
-def test_cn_pdf_sha_skip_final_meta_uses_one_caller_batch(tmp_path: Path) -> None:
-    """PDF-SHA skip 的 final meta helper 也必须只暂存到 caller 唯一 batch。"""
+def test_cn_complete_phase_a_skips_transport_without_source_mutation(tmp_path: Path) -> None:
+    """Phase A COMPLETE+overwrite=False 必须零 PDF 传输且不打开 source batch。"""
 
     repository_set = build_fs_repository_set(workspace_root=tmp_path)
     batching_repository = _BatchIdentityCnBatchingRepository(tmp_path, repository_set)
@@ -1242,6 +1248,8 @@ def test_cn_pdf_sha_skip_final_meta_uses_one_caller_batch(tmp_path: Path) -> Non
     batching_repository.phases.clear()
     begin_calls = batching_repository.begin_calls
     commit_calls = batching_repository.commit_calls
+    rollback_calls = batching_repository.rollback_calls
+    download_calls = discovery.download_calls
     discovery.candidates = (_candidate(source_id="A2", etag='"v2"'),)
 
     result = _final_result(_collect_events(pipeline, start_is_explicit=True))
@@ -1251,11 +1259,12 @@ def test_cn_pdf_sha_skip_final_meta_uses_one_caller_batch(tmp_path: Path) -> Non
     summary = result["summary"]
     assert isinstance(summary, dict)
     assert summary["skipped"] == 1
-    assert phases == ["begin", "commit", "begin", "final_meta", "commit"]
-    assert len(batch_ids) == 2
-    assert batching_repository.begin_calls == begin_calls + 2
-    assert batching_repository.commit_calls == commit_calls + 2
-    assert batching_repository.rollback_calls == 0
+    assert phases == ["begin", "commit"]
+    assert len(batch_ids) == 1
+    assert batching_repository.begin_calls == begin_calls + 1
+    assert batching_repository.commit_calls == commit_calls + 1
+    assert batching_repository.rollback_calls == rollback_calls
+    assert discovery.download_calls == download_calls
 
 
 def test_cn_replacement_final_failure_restores_old_source_and_blobs(tmp_path: Path) -> None:
@@ -1343,7 +1352,7 @@ def test_cn_replacement_success_exposes_source_blobs_and_processed_marker_togeth
     discovery.pdf_bytes = replacement_pdf
     discovery.candidates = (_candidate(source_id="A2", etag='"v2"'),)
 
-    result = _final_result(_collect_events(pipeline, start_is_explicit=True))
+    result = _final_result(_collect_events(pipeline, start_is_explicit=True, overwrite=True))
 
     source_meta = pipeline.source_repository.get_source_meta(
         "600519",
@@ -1586,6 +1595,12 @@ def test_cn_active_batch_sync_cancelled_error_rolls_back_once(tmp_path: Path) ->
             source_fingerprint="source",
             previous_completed_meta=None,
             source_meta_exists=False,
+            phase_a_integrity=source_repository.classify_source_integrity(
+                "600519",
+                "fil_cancelled",
+                SourceKind.FILING,
+            ),
+            overwrite=False,
             cancel_checker=cancel_during_batch,
             module="TEST",
         )
@@ -1631,6 +1646,149 @@ def test_cn_commit_failure_does_not_trigger_caller_rollback_or_success(tmp_path:
     assert DownloadEventType.FILING_COMPLETED not in {event.event_type for event in events}
     with pytest.raises(FileNotFoundError):
         source_repository.get_source_meta("600519", "fil2024", SourceKind.FILING)
+
+
+@pytest.mark.parametrize("corruption", ["size", "digest", "missing"])
+def test_cn_top_level_repairs_selected_corruption_with_overwrite_false(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    """真实 CN top-level 必须在 company mutation 前修复唯一 selected source。"""
+
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(_candidate(),))
+    converter = _FakeConverter()
+    pipeline = _build_pipeline(
+        tmp_path=tmp_path,
+        discovery=discovery,
+        converter=converter,
+    )
+    _collect_events(pipeline, start_is_explicit=True)
+    candidate = _candidate()
+    document_id, _internal_document_id = build_cn_filing_ids(
+        ticker="600519",
+        form_type=candidate.fiscal_period,
+        fiscal_year=candidate.fiscal_year,
+        fiscal_period=candidate.fiscal_period,
+        amended=candidate.amended,
+    )
+    locator = pipeline.source_repository.get_source_document_locator(
+        "600519",
+        document_id,
+        SourceKind.FILING,
+    )
+    pdf_path = tmp_path / locator / f"{document_id}.pdf"
+    old_pdf = pdf_path.read_bytes()
+    if corruption == "size":
+        pdf_path.write_bytes(old_pdf + b"-corrupt")
+    elif corruption == "digest":
+        pdf_path.write_bytes(b"X" * len(old_pdf))
+    else:
+        pdf_path.unlink()
+
+    result = _final_result(_collect_events(pipeline, start_is_explicit=True))
+
+    summary = result["summary"]
+    assert isinstance(summary, dict)
+    assert summary["downloaded"] == 1
+    assert converter.calls == 1
+    with pipeline.source_repository.read_source_snapshot(
+        "600519",
+        document_id,
+        SourceKind.FILING,
+        materialize_files=True,
+    ) as snapshot:
+        with snapshot.get_primary_source().open() as stream:
+            assert stream.read() == _DOCLING_BYTES
+
+
+def test_cn_selected_repair_transport_failure_preserves_old_company_and_source(
+    tmp_path: Path,
+) -> None:
+    """selected repair 的 PDF 失败由 filing owner 收口，且 company/source 全保持 old。"""
+
+    initial_discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(_candidate(),))
+    initial_pipeline = _build_pipeline(
+        tmp_path=tmp_path,
+        discovery=initial_discovery,
+        converter=_FakeConverter(),
+    )
+    _collect_events(initial_pipeline, start_is_explicit=True)
+    old_company = initial_pipeline._company_repository.get_company_meta("600519")
+    candidate = _candidate()
+    document_id, _internal_document_id = build_cn_filing_ids(
+        ticker="600519",
+        form_type=candidate.fiscal_period,
+        fiscal_year=candidate.fiscal_year,
+        fiscal_period=candidate.fiscal_period,
+        amended=candidate.amended,
+    )
+    locator = initial_pipeline.source_repository.get_source_document_locator(
+        "600519",
+        document_id,
+        SourceKind.FILING,
+    )
+    source_dir = tmp_path / locator
+    meta_path = source_dir / "meta.json"
+    old_meta = meta_path.read_bytes()
+    pdf_path = source_dir / f"{document_id}.pdf"
+    pdf_path.unlink()
+    failing_pipeline = _build_pipeline(
+        tmp_path=tmp_path,
+        discovery=_FailingDownloadDiscoveryClient(
+            temp_dir=tmp_path,
+            candidates=(candidate,),
+        ),
+        converter=_FakeConverter(),
+    )
+
+    result = _final_result(_collect_events(failing_pipeline, start_is_explicit=True))
+
+    summary = result["summary"]
+    assert isinstance(summary, dict)
+    assert summary["failed"] == 1
+    assert failing_pipeline._company_repository.get_company_meta("600519") == old_company
+    assert meta_path.read_bytes() == old_meta
+    assert pdf_path.exists() is False
+
+
+def test_cn_no_filing_with_corruption_fails_before_company_batch(tmp_path: Path) -> None:
+    """no-filing 若仍有 corruption，必须在首个新 batch 前 typed fail closed。"""
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching_repository = _BatchIdentityCnBatchingRepository(tmp_path, repository_set)
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(_candidate(),))
+    pipeline = _build_pipeline(
+        tmp_path=tmp_path,
+        discovery=discovery,
+        converter=_FakeConverter(),
+        repository_set=repository_set,
+        batching_repository=batching_repository,
+    )
+    _collect_events(pipeline, start_is_explicit=True)
+    old_company = pipeline._company_repository.get_company_meta("600519")
+    candidate = _candidate()
+    document_id, _internal_document_id = build_cn_filing_ids(
+        ticker="600519",
+        form_type=candidate.fiscal_period,
+        fiscal_year=candidate.fiscal_year,
+        fiscal_period=candidate.fiscal_period,
+        amended=candidate.amended,
+    )
+    locator = pipeline.source_repository.get_source_document_locator(
+        "600519",
+        document_id,
+        SourceKind.FILING,
+    )
+    (tmp_path / locator / f"{document_id}.pdf").unlink()
+    begin_calls = batching_repository.begin_calls
+    discovery.candidates = ()
+
+    with pytest.raises(SourceIntegrityPreflightError) as exc_info:
+        _collect_events(pipeline, start_is_explicit=True)
+
+    assert exc_info.value.reason is SourceIntegrityPreflightReason.UNSELECTED_REPAIR_REQUIRED
+    assert batching_repository.begin_calls == begin_calls
+    assert pipeline._company_repository.get_company_meta("600519") == old_company
 
 
 def test_cn_download_pdf_gate_does_not_cover_docling_convert(tmp_path: Path) -> None:
@@ -1986,14 +2144,16 @@ def test_cn_parent_leak_catch_reuses_filing_owner_pair_and_continues(
     assert isinstance(filings, list)
     filing_rows = [filing for filing in filings if isinstance(filing, dict)]
     assert len(filing_rows) == len(filings)
-    assert [filing["status"] for filing in filing_rows] == ["failed", "downloaded"]
+    # MISSING target 不再执行冗余 published meta probe；首个真实 meta read 发生在
+    # 第一份 filing 的 staging/fiscal owner 后，故 injected failure 对应第二行。
+    assert [filing["status"] for filing in filing_rows] == ["downloaded", "failed"]
     assert len(projection_spy.calls) == 1
     assert projection_spy.calls[0] is failure
     assert (
-        filing_rows[0]["reason_code"],
-        filing_rows[0]["reason_message"],
+        filing_rows[1]["reason_code"],
+        filing_rows[1]["reason_message"],
     ) == _cn_download_filing_workflow.project_cn_filing_failure(failure)
-    serialized = str(filing_rows[0])
+    serialized = str(filing_rows[1])
     for forbidden in (
         "secret.invalid",
         "/Users/private",

@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from dayu.contracts.json_value import JsonValue
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import Callable
 from functools import partial
 from io import BytesIO
 from typing import BinaryIO, Final, Optional, Protocol
 
 from dayu.fins.domain.document_models import (
     BatchToken,
+    DownloadRejectionRegistry,
     FileObjectMeta,
     RejectedFilingArtifactUpsertRequest,
     SourceFileEntry,
@@ -20,8 +21,10 @@ from dayu.fins.domain.document_models import (
 from dayu.fins.downloaders.sec_downloader import (
     DownloaderEvent,
     RemoteFileDescriptor,
+    SecDownloader,
     SecDownloadCancelledError,
     StoreDownloadedFile,
+    _PrefetchEvent,
 )
 from dayu.fins.pipelines.sec_download_event_mapping import DownloadFileResult
 from dayu.fins.storage import (
@@ -70,41 +73,6 @@ class RejectedArtifactFilingRecord(Protocol):
 
 
 _DOWNLOADER_EVENT_FILE_DOWNLOAD_STARTED: Final[str] = "file_download_started"
-
-
-class DownloadFilesStream(Protocol):
-    """rejected artifact flow 消费的精确流式下载边界。"""
-
-    def __call__(
-        self,
-        remote_files: list[RemoteFileDescriptor],
-        overwrite: bool,
-        store_file: StoreDownloadedFile,
-        *,
-        batch: BatchToken,
-        existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
-        primary_document: Optional[str] = None,
-        cancellation_checker: Optional[Callable[[], bool]] = None,
-    ) -> AsyncIterator[DownloaderEvent]:
-        """逐文件下载并在每次存储回调 invocation 显式传入 batch。
-
-        Args:
-            remote_files: 远端文件描述。
-            overwrite: 是否覆盖已存在文件。
-            store_file: required-batch 文件写入回调。
-            batch: caller-owned batch capability。
-            existing_files: 既有文件映射。
-            primary_document: 主文档名。
-            cancellation_checker: 可选取消检查器。
-
-        Yields:
-            文件下载事件。
-
-        Raises:
-            OSError: 下载或存储失败时抛出。
-        """
-
-        ...
 
 
 def build_file_entries(
@@ -219,7 +187,8 @@ async def persist_rejected_filing_artifact(
     classification_version: str,
     batching_repository: BatchingRepositoryProtocol,
     filing_maintenance_repository: FilingMaintenanceRepositoryProtocol,
-    download_files_stream: DownloadFilesStream,
+    downloader: SecDownloader,
+    registry_after: DownloadRejectionRegistry,
     build_file_result_from_downloader_event: Callable[[DownloaderEvent], DownloadFileResult],
     summarize_failed_download_file_reasons: Callable[[list[DownloadFileResult]], str],
     cancellation_checker: Callable[[], bool] | None = None,
@@ -239,7 +208,8 @@ async def persist_rejected_filing_artifact(
         classification_version: 当前下载链路版本号。
         batching_repository: batch lifecycle 唯一仓储。
         filing_maintenance_repository: rejected artifact 仓储。
-        download_files_stream: required-batch 流式下载函数。
+        downloader: SEC transport 与唯一 prefetch materializer owner。
+        registry_after: 与 rejected artifact 同批发布的完整 registry 真值。
         build_file_result_from_downloader_event: 下载器事件转文件结果 helper。
         summarize_failed_download_file_reasons: 文件失败原因汇总 helper。
         cancellation_checker: 可选协作式取消检查器。
@@ -252,6 +222,18 @@ async def persist_rejected_filing_artifact(
         其他内部错误会转换为失败原因返回。
     """
 
+    prefetched_events: list[_PrefetchEvent] = []
+    async for event in downloader.prefetch_files_stream(
+        remote_files,
+        allow_not_modified=not overwrite,
+        existing_files={},
+        primary_document=filing.primary_document,
+        cancellation_checker=cancellation_checker,
+    ):
+        prefetched_events.append(event)
+    # 复杂逻辑说明：这是 prefetch 已完成、任何 ticker batch 尚未开始的取消检查点。
+    _raise_if_cancelled(cancellation_checker)
+
     batch = batching_repository.begin_batch(ticker)
     try:
         document_id = f"fil_{filing.accession_number}"
@@ -261,27 +243,19 @@ async def persist_rejected_filing_artifact(
             document_id=document_id,
         )
         file_results: list[DownloadFileResult] = []
-        _raise_if_cancelled(cancellation_checker)
-        async for event in download_files_stream(
-            remote_files=remote_files,
-            overwrite=overwrite,
-            store_file=store_file,
-            batch=batch,
-            existing_files={},
-            primary_document=filing.primary_document,
-            cancellation_checker=cancellation_checker,
-        ):
+        for prefetched_event in prefetched_events:
+            event = downloader.materialize_prefetched_event(
+                prefetched_event,
+                store_file,
+                batch=batch,
+            )
             if event.event_type == _DOWNLOADER_EVENT_FILE_DOWNLOAD_STARTED:
                 continue
             file_results.append(build_file_result_from_downloader_event(event))
         _raise_if_cancelled(cancellation_checker)
 
         failed_files = [item for item in file_results if item.get("status") == "failed"]
-        failure_reason = (
-            summarize_failed_download_file_reasons(failed_files)
-            if failed_files
-            else None
-        )
+        failure_reason = summarize_failed_download_file_reasons(failed_files) if failed_files else None
         if failure_reason is None:
             file_entries = build_file_entries(file_results=file_results, previous_files={})
             fiscal_year, fiscal_period = _infer_download_fiscal_fields(
@@ -290,26 +264,31 @@ async def persist_rejected_filing_artifact(
             )
             filing_maintenance_repository.upsert_rejected_filing_artifact(
                 RejectedFilingArtifactUpsertRequest(
-                ticker=ticker,
-                document_id=document_id,
-                internal_document_id=filing.accession_number,
-                accession_number=filing.accession_number,
-                company_id=cik,
-                form_type=filing.form_type,
-                filing_date=filing.filing_date,
-                report_date=filing.report_date,
-                primary_document=filing.primary_document,
-                selected_primary_document=selected_primary_document or filing.primary_document,
-                rejection_reason=rejection_reason,
-                rejection_category=rejection_category,
-                classification_version=classification_version,
-                source_fingerprint=source_fingerprint,
-                files=_build_typed_source_file_entries(file_entries),
-                fiscal_year=fiscal_year,
-                fiscal_period=fiscal_period,
-                amended=filing.form_type.endswith("/A"),
-                has_xbrl=_remote_files_have_xbrl_instance(remote_files),
+                    ticker=ticker,
+                    document_id=document_id,
+                    internal_document_id=filing.accession_number,
+                    accession_number=filing.accession_number,
+                    company_id=cik,
+                    form_type=filing.form_type,
+                    filing_date=filing.filing_date,
+                    report_date=filing.report_date,
+                    primary_document=filing.primary_document,
+                    selected_primary_document=selected_primary_document or filing.primary_document,
+                    rejection_reason=rejection_reason,
+                    rejection_category=rejection_category,
+                    classification_version=classification_version,
+                    source_fingerprint=source_fingerprint,
+                    files=_build_typed_source_file_entries(file_entries),
+                    fiscal_year=fiscal_year,
+                    fiscal_period=fiscal_period,
+                    amended=filing.form_type.endswith("/A"),
+                    has_xbrl=_remote_files_have_xbrl_instance(remote_files),
                 ),
+                batch=batch,
+            )
+            filing_maintenance_repository.save_download_rejection_registry(
+                ticker,
+                registry_after,
                 batch=batch,
             )
     except BaseException:

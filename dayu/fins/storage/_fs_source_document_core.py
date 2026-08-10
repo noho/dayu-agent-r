@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import uuid
-from pathlib import PurePosixPath
-from typing import Optional
+from collections.abc import Mapping
+from pathlib import Path, PurePosixPath
+from typing import Optional, cast
 
+from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.source import Source
 from dayu.fins.domain.document_models import (
     BatchToken,
@@ -38,10 +40,15 @@ from ._fs_storage_infra import (
     _SOURCE_REVISION_META_FIELD,
     _ActiveBatchState,
     _FsStorageInfra,
+    _hash_regular_file_sha256,
+    _require_canonical_sha256,
+    _source_identity_namespace,
     _source_meta_without_revision,
+    _source_revision_from_meta,
 )
 from ._fs_identity import (
     _FILING_IDENTITY_NAMESPACE,
+    _IDENTITY_DESCRIPTOR_FILENAME,
     _MATERIAL_IDENTITY_NAMESPACE,
     _PROCESSED_IDENTITY_NAMESPACE,
     _identity_directory_for_read,
@@ -56,6 +63,7 @@ from ._fs_storage_utils import (
     _infer_filename_from_uri,
     _local_path_from_uri,
     _normalize_file_entries,
+    _normalize_filename,
     _normalize_source_kind,
     _project_filesystem_error,
     _raise_path_free_error,
@@ -65,6 +73,11 @@ from ._fs_storage_utils import (
     _write_json,
 )
 from .repository_protocols import SourceSnapshotProtocol
+from .source_integrity import (
+    SourceIntegrityClassification,
+    SourceIntegrityReason,
+    SourceIntegrityStatus,
+)
 
 
 class _FsSourceDocumentMixin(_FsStorageInfra):
@@ -410,6 +423,333 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             )
         finally:
             self._release_lock_token(guard_token)
+
+    def classify_source_integrity(
+        self,
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+    ) -> SourceIntegrityClassification:
+        """在短 publication guard 内分类 published source 完整性。
+
+        Args:
+            ticker: exact external ticker。
+            document_id: exact external document ID。
+            source_kind: filing 或 material。
+
+        Returns:
+            不泄漏路径、raw meta 或 bytes 的 typed classification。
+
+        Raises:
+            ValueError: identity、meta、文件声明或摘要结构非法时抛出。
+            RuntimeError: publication guard 获取或释放失败时抛出。
+            OSError: published 文件系统读取失败时抛出。
+        """
+
+        external_ticker = _require_external_identity(ticker, field_name="ticker")
+        external_document_id = _require_external_identity(
+            document_id,
+            field_name="document_id",
+        )
+        normalized_source_kind = _normalize_source_kind(source_kind)
+        guard_token = self._acquire_publication_guard(external_ticker)
+        try:
+            meta_path = self._source_meta_path_for_read(
+                external_ticker,
+                external_document_id,
+                normalized_source_kind,
+            )
+            return self._classify_source_integrity_unguarded(
+                external_ticker,
+                external_document_id,
+                normalized_source_kind,
+                meta_path=meta_path,
+            )
+        finally:
+            self._release_lock_token(guard_token)
+
+    def classify_staged_source_integrity(
+        self,
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+        *,
+        batch: BatchToken,
+    ) -> SourceIntegrityClassification:
+        """分类真实 open batch staging 内的 source 完整性。
+
+        Args:
+            ticker: exact external ticker。
+            document_id: exact external document ID。
+            source_kind: filing 或 material。
+            batch: 同一 core、ticker 且仍 open 的真实 batch capability。
+
+        Returns:
+            staging source 的 typed classification。
+
+        Raises:
+            ValueError: capability、identity、meta、文件声明或摘要结构非法时抛出。
+            OSError: staging 文件系统读取失败时抛出。
+        """
+
+        external_ticker = _require_external_identity(ticker, field_name="ticker")
+        external_document_id = _require_external_identity(
+            document_id,
+            field_name="document_id",
+        )
+        normalized_source_kind = _normalize_source_kind(source_kind)
+        state = self._resolve_active_batch(batch, external_ticker)
+        document_dir = _identity_directory_for_read(
+            self._source_root(external_ticker, normalized_source_kind, state),
+            _source_identity_namespace(normalized_source_kind),
+            external_document_id,
+        )
+        return self._classify_source_integrity_unguarded(
+            external_ticker,
+            external_document_id,
+            normalized_source_kind,
+            meta_path=document_dir / "meta.json",
+        )
+
+    def list_source_integrity(
+        self,
+        ticker: str,
+    ) -> tuple[SourceIntegrityClassification, ...]:
+        """在单一短 publication guard 内返回完整 ticker source inventory。
+
+        Args:
+            ticker: exact external ticker。
+
+        Returns:
+            按 source kind 与 document ID 排序的 filing+material classification。
+
+        Raises:
+            ValueError: identity、manifest、meta 或文件声明结构非法时抛出。
+            RuntimeError: publication guard 获取或释放失败时抛出。
+            OSError: published 文件系统读取失败时抛出。
+        """
+
+        external_ticker = _require_external_identity(ticker, field_name="ticker")
+        guard_token = self._acquire_publication_guard(external_ticker)
+        try:
+            inventory: list[SourceIntegrityClassification] = []
+            for source_kind in (SourceKind.FILING, SourceKind.MATERIAL):
+                document_ids = self._list_document_ids_unguarded(
+                    external_ticker,
+                    source_kind,
+                )
+                self._validate_published_source_manifest_unguarded(
+                    external_ticker,
+                    source_kind,
+                    document_ids,
+                )
+                for document_id in document_ids:
+                    inventory.append(
+                        self._classify_source_integrity_unguarded(
+                            external_ticker,
+                            document_id,
+                            source_kind,
+                            meta_path=self._source_meta_path_for_read(
+                                external_ticker,
+                                document_id,
+                                source_kind,
+                            ),
+                        )
+                    )
+            return tuple(
+                sorted(
+                    inventory,
+                    key=lambda item: (item.source_kind.value, item.document_id),
+                )
+            )
+        finally:
+            self._release_lock_token(guard_token)
+
+    def _classify_source_integrity_unguarded(
+        self,
+        external_ticker: str,
+        external_document_id: str,
+        source_kind: SourceKind,
+        *,
+        meta_path: Path,
+    ) -> SourceIntegrityClassification:
+        """在稳定 published view 或真实 staging 上分类单个 source。
+
+        Args:
+            external_ticker: 已校验的 exact external ticker。
+            external_document_id: 已校验的 exact external document ID。
+            source_kind: 已规范化 source kind。
+            meta_path: storage owner 已解析的 meta locator。
+
+        Returns:
+            typed integrity classification。
+
+        Raises:
+            ValueError: source 结构或 meta 非法时抛出。
+            OSError: 文件系统读取失败时抛出。
+        """
+
+        document_dir = meta_path.parent
+        if not document_dir.exists() and not document_dir.is_symlink():
+            return SourceIntegrityClassification(
+                ticker=external_ticker,
+                source_kind=source_kind,
+                document_id=external_document_id,
+                revision=None,
+                status=SourceIntegrityStatus.MISSING,
+                reasons=(),
+            )
+        if not meta_path.exists():
+            raise ValueError("existing source directory 缺少 meta.json")
+        if meta_path.is_symlink() or not meta_path.is_file():
+            raise ValueError("source meta 必须为 non-symlink regular file")
+        meta = _read_json_object(meta_path)
+        if (
+            meta.get("ticker") != external_ticker
+            or meta.get("document_id") != external_document_id
+            or meta.get("source_kind") != source_kind.value
+        ):
+            raise ValueError("source meta 与 identity descriptor/source kind 不一致")
+        provenance = SourceDocumentProvenance.from_meta(meta, source_kind)
+        if not provenance.ingest_complete:
+            raise ValueError("published source ingest_complete 必须为 true")
+        revision = _source_revision_from_meta(meta)
+        raw_files = meta.get("files")
+        if not isinstance(raw_files, list) or not raw_files:
+            raise ValueError("complete source files 必须为非空数组")
+
+        reasons: set[SourceIntegrityReason] = set()
+        declared_names: set[str] = set()
+        for raw_file in raw_files:
+            if not isinstance(raw_file, Mapping):
+                raise ValueError("source files 条目必须为 object")
+            raw_name = raw_file.get("name")
+            if not isinstance(raw_name, str):
+                raise ValueError("source file.name 必须为字符串")
+            name = _normalize_filename(raw_name)
+            if name != raw_name or name == "meta.json" or name in declared_names:
+                raise ValueError("source file.name 非法或重复")
+            declared_names.add(name)
+            raw_size = raw_file.get("size")
+            if raw_size is not None and (isinstance(raw_size, bool) or not isinstance(raw_size, int) or raw_size < 0):
+                raise ValueError("source file.size 必须为非负整数")
+            raw_sha256 = raw_file.get("sha256")
+            expected_sha256 = (
+                None
+                if raw_sha256 is None
+                else _require_canonical_sha256(
+                    raw_sha256,
+                    label=f"{external_document_id}/{name}",
+                )
+            )
+            physical_path = document_dir / name
+            if not physical_path.exists():
+                reasons.add(SourceIntegrityReason.PHYSICAL_FILE_MISSING)
+                continue
+            if physical_path.is_symlink() or not physical_path.is_file():
+                raise ValueError("source business file 必须为 non-symlink regular file")
+            self._require_contained_path(
+                physical_path,
+                document_dir,
+                label="source integrity file",
+            )
+            if raw_size is not None and physical_path.stat().st_size != raw_size:
+                reasons.add(SourceIntegrityReason.SIZE_MISMATCH)
+            if expected_sha256 is not None and _hash_regular_file_sha256(physical_path) != expected_sha256:
+                reasons.add(SourceIntegrityReason.DIGEST_MISMATCH)
+
+        physical_names = {
+            child.name
+            for child in document_dir.iterdir()
+            if child.name not in {"meta.json", _IDENTITY_DESCRIPTOR_FILENAME}
+        }
+        if physical_names != declared_names:
+            missing_names = declared_names - physical_names
+            if physical_names - declared_names:
+                raise ValueError("source directory 存在未声明业务文件")
+            if missing_names:
+                reasons.add(SourceIntegrityReason.PHYSICAL_FILE_MISSING)
+
+        ordered_reasons = tuple(reason for reason in SourceIntegrityReason if reason in reasons)
+        return SourceIntegrityClassification(
+            ticker=external_ticker,
+            source_kind=source_kind,
+            document_id=external_document_id,
+            revision=revision,
+            status=(SourceIntegrityStatus.REPAIR_REQUIRED if ordered_reasons else SourceIntegrityStatus.COMPLETE),
+            reasons=ordered_reasons,
+        )
+
+    def _validate_published_source_manifest_unguarded(
+        self,
+        external_ticker: str,
+        source_kind: SourceKind,
+        document_ids: list[str],
+    ) -> None:
+        """校验 published source manifest 与 identity directories 双向一致。
+
+        Args:
+            external_ticker: 已校验的 exact external ticker。
+            source_kind: filing 或 material。
+            document_ids: descriptor 枚举得到的有序 ID。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: manifest 结构、身份或投影不一致时抛出。
+            OSError: manifest/meta 读取失败时抛出。
+        """
+
+        manifest_name = "filing_manifest.json" if source_kind is SourceKind.FILING else "material_manifest.json"
+        manifest_path = (
+            self._source_root_for_read(
+                external_ticker,
+                source_kind,
+            )
+            / manifest_name
+        )
+        if not manifest_path.exists():
+            if document_ids:
+                raise ValueError("source directories 存在但 manifest 缺失")
+            return
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            raise ValueError("source manifest 必须为 non-symlink regular file")
+        manifest = _read_json_object(manifest_path)
+        if manifest.get("ticker") != external_ticker:
+            raise ValueError("source manifest ticker 不一致")
+        raw_documents = manifest.get("documents")
+        if not isinstance(raw_documents, list):
+            raise ValueError("source manifest documents 必须为数组")
+        manifest_items: dict[str, dict[str, JsonValue]] = {}
+        for raw_item in raw_documents:
+            if not isinstance(raw_item, Mapping):
+                raise ValueError("source manifest document 必须为 object")
+            raw_document_id = raw_item.get("document_id")
+            if not isinstance(raw_document_id, str):
+                raise ValueError("source manifest document_id 必须为字符串")
+            document_id = _require_external_identity(
+                raw_document_id,
+                field_name="source manifest document_id",
+            )
+            if document_id in manifest_items:
+                raise ValueError("source manifest document_id 重复")
+            manifest_items[document_id] = cast(dict[str, JsonValue], dict(raw_item))
+        if set(manifest_items) != set(document_ids):
+            raise ValueError("source manifest 与 identity directories 不双向一致")
+        for document_id in document_ids:
+            meta = self._get_persisted_source_meta_unguarded(
+                external_ticker,
+                document_id,
+                source_kind,
+            )
+            expected = (
+                FilingManifestItem.from_source_meta(meta).to_dict()
+                if source_kind is SourceKind.FILING
+                else MaterialManifestItem.from_source_meta(meta).to_dict()
+            )
+            if dict(manifest_items[document_id]) != expected:
+                raise ValueError("source manifest 与 source meta 投影不一致")
 
     def get_source_document_locator(
         self,

@@ -61,6 +61,7 @@ from dayu.documents.processors.base import (
     build_search_hit,
     build_section_summary,
 )
+from dayu.runtime.filelock import RuntimeFileLockToken
 from dayu.documents.processors.source import Source
 from dayu.fins.domain.document_models import (
     BatchToken,
@@ -351,6 +352,7 @@ class _SearchCancellingProcessor:
                 preview="Annual recurring revenue",
             )
         ]
+
     def list_tables(self) -> list[TableSummary]:
         """返回测试表格列表。
 
@@ -977,12 +979,15 @@ def test_published_revision_is_persisted_and_changes_only_with_source_publicatio
 
     first_revision = _read_snapshot_revision(repository, "AAPL", "revision-doc", SourceKind.FILING)
     reopened_repository = FsSourceDocumentRepository(workspace_root)
-    assert _read_snapshot_revision(
-        reopened_repository,
-        "AAPL",
-        "revision-doc",
-        SourceKind.FILING,
-    ) == first_revision
+    assert (
+        _read_snapshot_revision(
+            reopened_repository,
+            "AAPL",
+            "revision-doc",
+            SourceKind.FILING,
+        )
+        == first_revision
+    )
 
     unchanged_business_meta = repository.get_source_meta(
         "AAPL",
@@ -1001,12 +1006,15 @@ def test_published_revision_is_persisted_and_changes_only_with_source_publicatio
 
     second_revision = _read_snapshot_revision(repository, "AAPL", "revision-doc", SourceKind.FILING)
     assert second_revision != first_revision
-    assert _read_snapshot_revision(
-        FsSourceDocumentRepository(workspace_root),
-        "AAPL",
-        "revision-doc",
-        SourceKind.FILING,
-    ) == second_revision
+    assert (
+        _read_snapshot_revision(
+            FsSourceDocumentRepository(workspace_root),
+            "AAPL",
+            "revision-doc",
+            SourceKind.FILING,
+        )
+        == second_revision
+    )
 
 
 def test_source_document_revision_accepts_nonempty_opaque_token_and_rejects_empty() -> None:
@@ -1070,12 +1078,15 @@ def test_rollback_and_non_source_batch_preserve_published_revision(tmp_path: Pat
         batch=rollback_batch,
     )
     batching.rollback_batch(rollback_batch)
-    assert _read_snapshot_revision(
-        repository,
-        "AAPL",
-        "revision-doc",
-        SourceKind.FILING,
-    ) == published_revision
+    assert (
+        _read_snapshot_revision(
+            repository,
+            "AAPL",
+            "revision-doc",
+            SourceKind.FILING,
+        )
+        == published_revision
+    )
 
     company_batch = batching.begin_batch("AAPL")
     company_repository.upsert_company_meta(
@@ -1090,12 +1101,15 @@ def test_rollback_and_non_source_batch_preserve_published_revision(tmp_path: Pat
         batch=company_batch,
     )
     batching.commit_batch(company_batch)
-    assert _read_snapshot_revision(
-        repository,
-        "AAPL",
-        "revision-doc",
-        SourceKind.FILING,
-    ) == published_revision
+    assert (
+        _read_snapshot_revision(
+            repository,
+            "AAPL",
+            "revision-doc",
+            SourceKind.FILING,
+        )
+        == published_revision
+    )
 
 
 def test_snapshot_descriptor_meta_provenance_primary_and_files_share_one_revision(
@@ -1361,10 +1375,7 @@ def test_source_repository_projects_source_document_provenance(tmp_path: Path) -
     batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
     source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
     blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
-    batches = {
-        ticker: batching_repository.begin_batch(ticker)
-        for ticker in ("AAPL", "600519", "0700")
-    }
+    batches = {ticker: batching_repository.begin_batch(ticker) for ticker in ("AAPL", "600519", "0700")}
 
     _create_source_document_for_provenance(
         source_repository=source_repository,
@@ -1409,26 +1420,38 @@ def test_source_repository_projects_source_document_provenance(tmp_path: Path) -
     for batch in batches.values():
         batching_repository.commit_batch(batch)
 
-    assert source_repository.get_source_document_provenance(
-        "AAPL",
-        "fil_sec",
-        SourceKind.FILING,
-    ).source_provider is FinsSourceProvider.SEC_EDGAR
-    assert source_repository.get_source_document_provenance(
-        "600519",
-        "fil_cninfo",
-        SourceKind.FILING,
-    ).source_provider is FinsSourceProvider.CNINFO
-    assert source_repository.get_source_document_provenance(
-        "0700",
-        "fil_hkexnews",
-        SourceKind.FILING,
-    ).source_provider is FinsSourceProvider.HKEXNEWS
-    assert source_repository.get_source_document_provenance(
-        "AAPL",
-        "upload_10k",
-        SourceKind.FILING,
-    ).source_provider is FinsSourceProvider.USER_UPLOAD
+    assert (
+        source_repository.get_source_document_provenance(
+            "AAPL",
+            "fil_sec",
+            SourceKind.FILING,
+        ).source_provider
+        is FinsSourceProvider.SEC_EDGAR
+    )
+    assert (
+        source_repository.get_source_document_provenance(
+            "600519",
+            "fil_cninfo",
+            SourceKind.FILING,
+        ).source_provider
+        is FinsSourceProvider.CNINFO
+    )
+    assert (
+        source_repository.get_source_document_provenance(
+            "0700",
+            "fil_hkexnews",
+            SourceKind.FILING,
+        ).source_provider
+        is FinsSourceProvider.HKEXNEWS
+    )
+    assert (
+        source_repository.get_source_document_provenance(
+            "AAPL",
+            "upload_10k",
+            SourceKind.FILING,
+        ).source_provider
+        is FinsSourceProvider.USER_UPLOAD
+    )
 
 
 def test_source_repository_requires_typed_provenance_and_owns_completion(tmp_path: Path) -> None:
@@ -1556,11 +1579,7 @@ def test_blob_first_staging_remains_unpublished_until_complete_source_commit(tmp
         SourceKind.FILING,
         meta=completed_meta,
     )
-    manifest = json.loads(
-        repository_set.core._filing_manifest_path_for_read("AAPL").read_text(
-            encoding="utf-8"
-        )
-    )
+    manifest = json.loads(repository_set.core._filing_manifest_path_for_read("AAPL").read_text(encoding="utf-8"))
     assert completed_meta["primary_document"] == "filing.htm"
     assert completed_meta["files"][0]["uri"] == file_meta.uri
     assert provenance.ingest_complete is True
@@ -1757,15 +1776,9 @@ def test_complete_filing_and_material_commit_share_one_source_truth(tmp_path: Pa
         assert provenance.source_provider is FinsSourceProvider.USER_UPLOAD
         assert provenance.ingest_complete is True
 
-    filing_manifest = json.loads(
-        repository_set.core._filing_manifest_path_for_read("AAPL").read_text(
-            encoding="utf-8"
-        )
-    )
+    filing_manifest = json.loads(repository_set.core._filing_manifest_path_for_read("AAPL").read_text(encoding="utf-8"))
     material_manifest = json.loads(
-        repository_set.core._material_manifest_path_for_read("AAPL").read_text(
-            encoding="utf-8"
-        )
+        repository_set.core._material_manifest_path_for_read("AAPL").read_text(encoding="utf-8")
     )
     assert filing_manifest["documents"][0]["source_provider"] == "user_upload"
     assert filing_manifest["documents"][0]["ingest_method"] == "upload"
@@ -2122,15 +2135,16 @@ def test_canonical_ticker_and_opaque_document_identity_round_trip_all_storage_na
     assert blob_repository.read_file_bytes(handle, "filing.htm") == b"opaque payload"
     assert processed_repository.get_processed_meta(ticker, document_id)["document_id"] == document_id
     assert filing_repository.list_rejected_filing_artifacts(ticker)[0].document_id == document_id
-    assert filing_repository.read_rejected_filing_file_bytes(
-        ticker,
-        document_id,
-        "rejected.htm",
-    ) == b"rejected payload"
-    assert rejected_meta.uri.startswith("local://")
-    assert repository_set.core._target_ticker_dir(ticker) == (
-        workspace_root / "portfolio" / ticker
+    assert (
+        filing_repository.read_rejected_filing_file_bytes(
+            ticker,
+            document_id,
+            "rejected.htm",
+        )
+        == b"rejected payload"
     )
+    assert rejected_meta.uri.startswith("local://")
+    assert repository_set.core._target_ticker_dir(ticker) == (workspace_root / "portfolio" / ticker)
     assert document_id not in rejected_meta.uri
 
 
@@ -2170,9 +2184,7 @@ def test_opaque_document_identity_round_trips_path_shaped_values(
 
     for document_id in document_ids:
         assert processed.get_processed_meta(ticker, document_id)["document_id"] == document_id
-    published_ticker_names = {
-        entry.name for entry in repository_set.core.portfolio_root.iterdir()
-    }
+    published_ticker_names = {entry.name for entry in repository_set.core.portfolio_root.iterdir()}
     processed_names = {
         entry.name
         for entry in (repository_set.core._target_ticker_dir(ticker) / "processed").iterdir()
@@ -2296,9 +2308,7 @@ def test_company_inventory_projects_canonical_ticker_and_hides_invalid_candidate
     company = FsCompanyMetaRepository(workspace_root, repository_set=repository_set)
     batch = batching.begin_batch("AAPL")
     batching.commit_batch(batch)
-    assert repository_set.core._target_ticker_dir("AAPL") == (
-        workspace_root / "portfolio" / "AAPL"
-    )
+    assert repository_set.core._target_ticker_dir("AAPL") == (workspace_root / "portfolio" / "AAPL")
     corrupt_key = "corrupt-private-candidate"
     (repository_set.core.portfolio_root / corrupt_key).mkdir()
 
@@ -2307,10 +2317,7 @@ def test_company_inventory_projects_canonical_ticker_and_hides_invalid_candidate
     assert any(entry.ticker == "AAPL" and entry.status == "missing_meta" for entry in inventory)
     assert any(entry.ticker is None and entry.status == "invalid_meta" for entry in inventory)
     serialized = json.dumps(
-        [
-            {"ticker": entry.ticker, "status": entry.status, "detail": entry.detail}
-            for entry in inventory
-        ],
+        [{"ticker": entry.ticker, "status": entry.status, "detail": entry.detail} for entry in inventory],
         ensure_ascii=False,
     )
     assert "AAPL" in serialized
@@ -2388,7 +2395,6 @@ def test_public_storage_errors_never_expose_internal_locator_or_workspace_path(
         batch=batch,
     )
     batching.commit_batch(batch)
-    target_dir = repository_set.core._target_ticker_dir(ticker)
     document_dir = repository_set.core._processed_dir_for_read(ticker, document_id)
     private_locators = (document_dir.name,)
 
@@ -2692,9 +2698,7 @@ def test_public_storage_os_errors_are_path_free_across_read_and_inventory_bounda
         filing_root.chmod(original_mode)
 
     descriptor_path = next(
-        path
-        for path in target_dir.iterdir()
-        if path.name.startswith(".") and path.suffix == ".json"
+        path for path in target_dir.iterdir() if path.name.startswith(".") and path.suffix == ".json"
     )
     descriptor_mode = descriptor_path.stat().st_mode & 0o777
     descriptor_path.chmod(0)
@@ -2821,9 +2825,7 @@ def test_blob_read_projects_real_socket_io_error_without_private_locator(
             exc_info.value,
             expected_errno=expected_errno,
             workspace_root=workspace_root,
-            private_locators=(
-                physical_file.parent.name,
-            ),
+            private_locators=(physical_file.parent.name,),
         )
     finally:
         os.chdir(original_cwd)
@@ -3072,8 +3074,7 @@ def test_fins_read_tool_schemas_do_not_expose_execution_context(tmp_path: Path) 
     ticker_schema: Mapping[str, JsonValue] = {
         "type": "string",
         "description": (
-            "股票代码。直接使用自然的股票代码写法，例如 AAPL、600519 或 0700；"
-            "不要传公司名称，也不要手工穷举代码变体。"
+            "股票代码。直接使用自然的股票代码写法，例如 AAPL、600519 或 0700；不要传公司名称，也不要手工穷举代码变体。"
         ),
     }
     document_id_schema: Mapping[str, JsonValue] = {
@@ -3320,8 +3321,7 @@ def test_fins_read_process_target_persistent_close_failure_logs_path_free_diagno
     workspace_root = _build_fins_workspace(tmp_path)
     failure_target = _build_process_target(workspace_root, "list_documents", {})
     secret_message = (
-        "/private/dayu-source-snapshot-secret key=private-key "
-        "revision=private-revision cause=private-cause"
+        "/private/dayu-source-snapshot-secret key=private-key revision=private-revision cause=private-cause"
     )
     close_call_count = 0
 
@@ -3352,13 +3352,9 @@ def test_fins_read_process_target_persistent_close_failure_logs_path_free_diagno
     assert failure_envelope.get("error_type") == "invalid_argument"
     assert close_call_count == 2
     diagnostics = [
-        record.getMessage()
-        for record in caplog.records
-        if "action=runtime.close.follow_up" in record.getMessage()
+        record.getMessage() for record in caplog.records if "action=runtime.close.follow_up" in record.getMessage()
     ]
-    assert diagnostics == [
-        f"action=runtime.close.follow_up type=OSError errno={errno.EBUSY}"
-    ]
+    assert diagnostics == [f"action=runtime.close.follow_up type=OSError errno={errno.EBUSY}"]
     diagnostic = diagnostics[0]
     for forbidden_fragment in (
         secret_message,
@@ -3472,9 +3468,7 @@ def test_read_outputs_never_expose_revision_internal_key_local_uri_or_temp_path(
     ).parent.name
     runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
     read_runtime = runtime.get_read_runtime()
-    definitions = _definitions_by_name(
-        _definitions_for_read_runtime(read_runtime, workspace_root)
-    )
+    definitions = _definitions_by_name(_definitions_for_read_runtime(read_runtime, workspace_root))
     completed_outcomes: dict[str, ToolExecutionOutcome] = {}
     try:
         sections_outcome = asyncio.run(
@@ -3688,9 +3682,7 @@ def test_fins_read_financial_statement_projects_statement_not_found(
     workspace_root = _build_fins_aapl_xbrl_workspace(
         tmp_path,
         excluded_fixture_names=frozenset({"aapl-20240928_pre.xml"}),
-        primary_payload_override=(
-            b"<html><body><p>Business overview without tabular data.</p></body></html>"
-        ),
+        primary_payload_override=(b"<html><body><p>Business overview without tabular data.</p></body></html>"),
     )
     target = _build_process_target(
         workspace_root,
@@ -3784,9 +3776,7 @@ def test_fins_read_aapl_xbrl_query_separates_pre_host_value_from_host_truncation
             "query_xbrl_facts_max_items": _FORCED_XBRL_MAX_ITEMS,
         }
     }
-    provider_output = discover_tools(
-        _spec(workspace_root, extra_config=extra_config)
-    )
+    provider_output = discover_tools(_spec(workspace_root, extra_config=extra_config))
     definitions = _definitions_by_name(provider_output.definitions)
     query_arguments: Mapping[str, JsonValue] = {
         "ticker": "AAPL",
@@ -3826,15 +3816,11 @@ def test_fins_read_aapl_xbrl_query_separates_pre_host_value_from_host_truncation
         extra_config=extra_config,
         enable_truncation_manager=True,
     )
-    assert FrameworkToolName.FETCH_MORE in (
-        runtime.effective_bundle.injected_framework_tool_names
-    )
+    assert FrameworkToolName.FETCH_MORE in (runtime.effective_bundle.injected_framework_tool_names)
     host_response = asyncio.run(
         runtime.tool_executor.execute(
             BatchToolExecutionRequest(
-                calls=(
-                    _call("query_xbrl_facts", query_arguments),
-                ),
+                calls=(_call("query_xbrl_facts", query_arguments),),
                 context=_context(),
             )
         )
@@ -3996,9 +3982,7 @@ def test_xbrl_number_parameters_reject_bool_and_accept_json_number(
     """
 
     workspace_root = _build_fins_aapl_xbrl_workspace(tmp_path)
-    definition = _definitions_by_name(_discover_definitions(workspace_root))[
-        "query_xbrl_facts"
-    ]
+    definition = _definitions_by_name(_discover_definitions(workspace_root))["query_xbrl_facts"]
     base_arguments: dict[str, JsonValue] = {
         "ticker": "AAPL",
         "document_id": _AAPL_XBRL_DOCUMENT_ID,
@@ -4617,8 +4601,11 @@ def test_read_provider_only_exposes_read_tools(tmp_path: Path) -> None:
     assert "start_fins_preprocess" not in names
 
 
-def test_same_ticker_batch_fails_fast_across_independent_repository_cores(tmp_path: Path) -> None:
-    """同 workspace 独立仓储 core 的同 ticker 活动 batch 应保持 fail-fast 语义。"""
+def test_same_ticker_batch_blocks_across_independent_repository_cores(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同 workspace 独立 core 的后 writer 必须阻塞并在前 writer 释放后成功。"""
 
     workspace_root = tmp_path / "fins-workspace"
     first_repository_set = build_fs_repository_set(workspace_root=workspace_root)
@@ -4627,11 +4614,23 @@ def test_same_ticker_batch_fails_fast_across_independent_repository_cores(tmp_pa
 
     second_repository_set = build_fs_repository_set(workspace_root=workspace_root)
     second_repository = FsBatchingRepository(workspace_root, repository_set=second_repository_set)
-    with pytest.raises(RuntimeError, match="ticker=AAPL 已存在跨进程活动 batch"):
-        second_repository.begin_batch("AAPL")
+    acquire_entered = Event()
+    second_core = second_repository_set.core
+    original_acquire = second_core._acquire_ticker_lock
 
-    first_repository.rollback_batch(first_token)
-    second_token = second_repository.begin_batch("AAPL")
+    def record_blocking_acquire(ticker: str) -> RuntimeFileLockToken:
+        """记录第二个 core 已进入真实 blocking file-lock acquire。"""
+
+        acquire_entered.set()
+        return original_acquire(ticker)
+
+    monkeypatch.setattr(second_core, "_acquire_ticker_lock", record_blocking_acquire)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        waiting = executor.submit(second_repository.begin_batch, "AAPL")
+        assert acquire_entered.wait(timeout=5)
+        assert waiting.done() is False
+        first_repository.rollback_batch(first_token)
+        second_token = waiting.result(timeout=5)
     second_repository.rollback_batch(second_token)
 
 
@@ -4668,9 +4667,7 @@ def test_explicit_batch_allows_child_task_mutation_on_shared_core(tmp_path: Path
         raise
     batching_repository.commit_batch(token)
 
-    assert source_repository.list_source_document_ids("AAPL", SourceKind.FILING) == [
-        "aapl-child-task"
-    ]
+    assert source_repository.list_source_document_ids("AAPL", SourceKind.FILING) == ["aapl-child-task"]
 
 
 async def _create_source_in_child_task(
@@ -4692,9 +4689,7 @@ async def _create_source_in_child_task(
         OSError: source 写入失败时抛出。
     """
 
-    task = asyncio.create_task(
-        _create_child_task_source(source_repository, blob_repository, batch)
-    )
+    task = asyncio.create_task(_create_child_task_source(source_repository, blob_repository, batch))
     await task
 
 
@@ -4801,9 +4796,7 @@ def test_explicit_batch_allows_worker_thread_mutation_on_shared_core(tmp_path: P
         raise
     batching_repository.commit_batch(token)
 
-    assert source_repository.list_source_document_ids("AAPL", SourceKind.FILING) == [
-        "aapl-worker-thread"
-    ]
+    assert source_repository.list_source_document_ids("AAPL", SourceKind.FILING) == ["aapl-worker-thread"]
 
 
 def test_fins_workspace_root_must_be_explicit_absolute_path() -> None:
@@ -5096,11 +5089,9 @@ def _create_source_document_for_provenance(
         handle,
         filename,
         io.BytesIO(
-            (
-                f"# {document_id}\n\nProvider provenance fixture.\n"
-                if processor_compatible
-                else document_id
-            ).encode("utf-8")
+            (f"# {document_id}\n\nProvider provenance fixture.\n" if processor_compatible else document_id).encode(
+                "utf-8"
+            )
         ),
         batch=batch,
         content_type="text/markdown" if processor_compatible else "text/plain",
@@ -5162,9 +5153,7 @@ def _corrupt_staged_complete_source(
     assert isinstance(raw_documents, list) and len(raw_documents) == 2
     file_item = raw_files[0]
     manifest_item = next(
-        item
-        for item in raw_documents
-        if isinstance(item, dict) and item.get("document_id") == "new_source"
+        item for item in raw_documents if isinstance(item, dict) and item.get("document_id") == "new_source"
     )
 
     if failure_case == "missing_meta":
@@ -5247,10 +5236,7 @@ def _build_read_runtime_with_provenance_documents(tmp_path: Path) -> FinsReadRun
     source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
     blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
     processed_repository = FsProcessedDocumentRepository(workspace_root, repository_set=repository_set)
-    batches = {
-        ticker: batching_repository.begin_batch(ticker)
-        for ticker in ("AAPL", "600519", "0700")
-    }
+    batches = {ticker: batching_repository.begin_batch(ticker) for ticker in ("AAPL", "600519", "0700")}
     for ticker, company_id, market in (
         ("AAPL", "0000320193", "US"),
         ("600519", "600519_CNINFO", "CN"),
@@ -5464,8 +5450,7 @@ def _build_fins_aapl_xbrl_workspace(
                 continue
             payload = (
                 primary_payload_override
-                if file_path.name == primary_document
-                and primary_payload_override is not None
+                if file_path.name == primary_document and primary_payload_override is not None
                 else file_path.read_bytes()
             )
             file_metas.append(
@@ -6201,9 +6186,7 @@ def _tool_runtime(
     framework_tool_policy = default_framework_tool_policy_view()
     if enable_truncation_manager:
         framework_tool_policy = FrameworkToolPolicyView(
-            reserved_framework_tool_names=frozenset(
-                {FrameworkToolName.FETCH_MORE}
-            ),
+            reserved_framework_tool_names=frozenset({FrameworkToolName.FETCH_MORE}),
             enabled_framework_tools=frozenset({FrameworkToolName.FETCH_MORE}),
         )
     runtime = DefaultToolRuntimeFactory(EffectiveToolBundleBuilder()).create_tool_runtime(

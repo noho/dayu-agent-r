@@ -7,8 +7,9 @@ from dayu.contracts.json_value import JsonValue
 import datetime as dt
 import inspect
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Awaitable, Callable, Optional, Protocol, Sequence, TypeVar
+from typing import Awaitable, Callable, Literal, Optional, Protocol, Sequence, TypeAlias, TypeVar
 
 from dayu.fins.downloaders.sec_downloader import (
     BrowseEdgarFiling,
@@ -28,13 +29,62 @@ from .sec_download_state import (
     _dicts_to_browse_edgar_filings,
     _is_rejected as _is_rejected_impl,
     _read_sec_cache_async,
-    _record_rejection as _record_rejection_impl,
     _write_sec_cache_async,
 )
 
 SC13_FORMS = frozenset({"SC 13D", "SC 13D/A", "SC 13G", "SC 13G/A"})
 SC13_RETRY_MAX = 2
 SC13_RETRY_EXPAND_YEARS = 1
+
+
+@dataclass(frozen=True, slots=True)
+class Sc13DirectionAccepted:
+    """SC13 direction policy 接受的 filing。"""
+
+    filing: Sc13FilingRecordProtocol
+    kind: Literal["accepted"] = "accepted"
+
+
+@dataclass(frozen=True, slots=True)
+class Sc13DirectionRejectedWithArtifact:
+    """SC13 direction 拒绝且远端 artifact descriptors 已准备完成。"""
+
+    filing: Sc13FilingRecordProtocol
+    archive_cik: str
+    remote_files: tuple[RemoteFileDescriptor, ...]
+    source_fingerprint: str
+    kind: Literal["rejected_with_artifact"] = "rejected_with_artifact"
+
+
+@dataclass(frozen=True, slots=True)
+class Sc13DirectionRejectedRegistryOnly:
+    """artifact listing 失败、只能延后发布 registry 的 SC13 拒绝。"""
+
+    filing: Sc13FilingRecordProtocol
+    diagnostic: str
+    kind: Literal["rejected_registry_only"] = "rejected_registry_only"
+
+
+@dataclass(frozen=True, slots=True)
+class Sc13DirectionRejectedAlreadyRegistered:
+    """overwrite=False 命中同版本 registry 的纯 skip。"""
+
+    filing: Sc13FilingRecordProtocol
+    kind: Literal["rejected_already_registered"] = "rejected_already_registered"
+
+
+Sc13RejectedDirectionDecision: TypeAlias = (
+    Sc13DirectionRejectedWithArtifact | Sc13DirectionRejectedRegistryOnly | Sc13DirectionRejectedAlreadyRegistered
+)
+Sc13DirectionDecision: TypeAlias = Sc13DirectionAccepted | Sc13RejectedDirectionDecision
+
+
+@dataclass(frozen=True, slots=True)
+class Sc13DirectionFilterResult:
+    """SC13 pure selection 的 accepted filings 与 deferred rejection intents。"""
+
+    filings: tuple[Sc13FilingRecordProtocol, ...]
+    rejections: tuple[Sc13RejectedDirectionDecision, ...]
 
 
 def _browse_cache_rows(value: JsonValue | None) -> list[dict[str, str]]:
@@ -58,6 +108,7 @@ def _browse_cache_rows(value: JsonValue | None) -> list[dict[str, str]]:
             continue
         rows.append({key: str(raw_value) for key, raw_value in item.items()})
     return rows
+
 
 _AwaitableResult = TypeVar("_AwaitableResult")
 
@@ -183,7 +234,7 @@ class SecSc13WorkflowHost(Protocol):
         form_windows: dict[str, dt.date],
         end_date: dt.date,
         target_cik: str,
-        sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
+        sc13_direction_cache: Optional[dict[str, Sc13DirectionDecision]] = None,
         rejection_registry: Optional[DownloadRejectionRegistry] = None,
         overwrite: bool = False,
         cancel_checker: Optional[Callable[[], bool]] = None,
@@ -200,7 +251,7 @@ class SecSc13WorkflowHost(Protocol):
         form_windows: dict[str, dt.date],
         end_date: dt.date,
         target_cik: str,
-        sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
+        sc13_direction_cache: Optional[dict[str, Sc13DirectionDecision]] = None,
         rejection_registry: Optional[DownloadRejectionRegistry] = None,
         overwrite: bool = False,
         cancel_checker: Optional[Callable[[], bool]] = None,
@@ -215,29 +266,12 @@ class SecSc13WorkflowHost(Protocol):
         filing: Sc13FilingRecordProtocol,
         archive_cik: str,
         target_cik: str,
-        sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
+        sc13_direction_cache: Optional[dict[str, Sc13DirectionDecision]] = None,
         rejection_registry: Optional[DownloadRejectionRegistry] = None,
         overwrite: bool = False,
         cancel_checker: Optional[Callable[[], bool]] = None,
-    ) -> Awaitable[bool]:
-        """判断单条 SC13 是否应保留。"""
-
-        ...
-
-    def _persist_rejected_filing_artifact(
-        self,
-        ticker: str,
-        cik: str,
-        filing: Sc13FilingRecordProtocol,
-        remote_files: list[RemoteFileDescriptor],
-        overwrite: bool,
-        rejection_reason: str,
-        rejection_category: str,
-        selected_primary_document: str,
-        source_fingerprint: Optional[str],
-        cancel_checker: Optional[Callable[[], bool]] = None,
-    ) -> Awaitable[tuple[bool, Optional[str]]] | tuple[bool, Optional[str]]:
-        """持久化 rejected artifact。"""
+    ) -> Awaitable[Sc13DirectionDecision]:
+        """返回单条 SC13 的 pure typed direction decision。"""
 
         ...
 
@@ -318,20 +352,13 @@ def evaluate_sc13_direction(
     target_cik_normalized = normalize_cik_for_compare(target_cik)
     if roles is None:
         Log.debug(
-            (
-                "SC13 方向不可判定，按策略跳过: "
-                f"accession={filing.accession_number} form={filing.form_type}"
-            ),
+            (f"SC13 方向不可判定，按策略跳过: accession={filing.accession_number} form={filing.form_type}"),
             module=module,
         )
         return False
     filed_by_cik_normalized = normalize_cik_for_compare(roles.filed_by_cik)
     subject_cik_normalized = normalize_cik_for_compare(roles.subject_cik)
-    if (
-        target_cik_normalized is None
-        or filed_by_cik_normalized is None
-        or subject_cik_normalized is None
-    ):
+    if target_cik_normalized is None or filed_by_cik_normalized is None or subject_cik_normalized is None:
         Log.warn(
             (
                 "SC13 CIK 字段非法，按策略跳过: "
@@ -364,6 +391,33 @@ def evaluate_sc13_direction(
     return True
 
 
+def _deduplicate_rejection_decisions(
+    decisions: Sequence[Sc13RejectedDirectionDecision],
+) -> tuple[Sc13RejectedDirectionDecision, ...]:
+    """按首次发现顺序对 exact accession rejection intent 去重。
+
+    Args:
+        decisions: pure SC13 rejection decisions。
+
+    Returns:
+        每个 exact accession 至多一条的有序 tuple。
+
+    Raises:
+        ValueError: 同一 accession 出现互相矛盾的 typed decision 时抛出。
+    """
+
+    by_accession: dict[str, Sc13RejectedDirectionDecision] = {}
+    for decision in decisions:
+        accession = decision.filing.accession_number
+        existing = by_accession.get(accession)
+        if existing is None:
+            by_accession[accession] = decision
+            continue
+        if existing != decision:
+            raise ValueError("同一 SC13 accession 出现互相矛盾的 direction decision")
+    return tuple(by_accession.values())
+
+
 async def filter_sc13_by_direction(
     host: SecSc13WorkflowHost,
     *,
@@ -371,21 +425,22 @@ async def filter_sc13_by_direction(
     filings: Sequence[Sc13FilingRecordProtocol],
     target_cik: str,
     archive_cik: str,
-    sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
+    sc13_direction_cache: Optional[dict[str, Sc13DirectionDecision]] = None,
     rejection_registry: Optional[DownloadRejectionRegistry] = None,
     overwrite: bool = False,
     cancel_checker: Optional[Callable[[], bool]] = None,
-) -> list[Sc13FilingRecordProtocol]:
-    """按 SC13 方向规则过滤 filings。"""
+) -> Sc13DirectionFilterResult:
+    """按 SC13 方向规则返回 accepted filings 与 deferred rejection intents。"""
 
     if not filings:
-        return []
+        return Sc13DirectionFilterResult(filings=(), rejections=())
     filtered: list[Sc13FilingRecordProtocol] = []
+    rejections: list[Sc13RejectedDirectionDecision] = []
     for filing in filings:
         if filing.form_type not in SC13_FORMS:
             filtered.append(filing)
             continue
-        keep = await host._should_keep_sc13_direction(
+        decision = await host._should_keep_sc13_direction(
             ticker=ticker,
             filing=filing,
             archive_cik=archive_cik,
@@ -395,9 +450,14 @@ async def filter_sc13_by_direction(
             overwrite=overwrite,
             cancel_checker=cancel_checker,
         )
-        if keep:
+        if isinstance(decision, Sc13DirectionAccepted):
             filtered.append(filing)
-    return filtered
+        else:
+            rejections.append(decision)
+    return Sc13DirectionFilterResult(
+        filings=tuple(filtered),
+        rejections=_deduplicate_rejection_decisions(rejections),
+    )
 
 
 async def should_keep_sc13_direction(
@@ -408,15 +468,15 @@ async def should_keep_sc13_direction(
     archive_cik: str,
     target_cik: str,
     download_version: str,
-    sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
+    sc13_direction_cache: Optional[dict[str, Sc13DirectionDecision]] = None,
     rejection_registry: Optional[DownloadRejectionRegistry] = None,
     overwrite: bool = False,
     cancel_checker: Optional[Callable[[], bool]] = None,
-) -> bool:
-    """判断单条 SC13 是否应保留。"""
+) -> Sc13DirectionDecision:
+    """在无 durable side effect 的边界内裁决单条 SC13 direction。"""
 
     if filing.form_type not in SC13_FORMS:
-        return True
+        return Sc13DirectionAccepted(filing=filing)
     document_id = f"fil_{filing.accession_number}"
     effective_registry = rejection_registry if rejection_registry is not None else {}
     if _is_rejected_impl(
@@ -429,13 +489,16 @@ async def should_keep_sc13_direction(
             f"SC13 拒绝注册表跳过: accession={filing.accession_number}",
             module=host.MODULE,
         )
+        decision = Sc13DirectionRejectedAlreadyRegistered(filing=filing)
         if sc13_direction_cache is not None:
-            sc13_direction_cache[filing.accession_number] = False
-        return False
+            sc13_direction_cache[filing.accession_number] = decision
+        return decision
     cache_key = filing.accession_number
     if sc13_direction_cache is not None and cache_key in sc13_direction_cache:
         cached_result = sc13_direction_cache[cache_key]
-        return bool(cached_result)
+        if cached_result.filing.accession_number != filing.accession_number:
+            raise ValueError("SC13 decision cache accession identity 不一致")
+        return cached_result
     roles = await _maybe_await(
         host._downloader.fetch_sc13_party_roles(
             archive_cik=archive_cik,
@@ -449,9 +512,9 @@ async def should_keep_sc13_direction(
         roles=roles,
         target_cik=target_cik,
     )
-    if sc13_direction_cache is not None:
-        sc13_direction_cache[cache_key] = keep
-    if not keep and rejection_registry is not None:
+    if keep:
+        decision: Sc13DirectionDecision = Sc13DirectionAccepted(filing=filing)
+    else:
         accession_no_dash = accession_to_no_dash(filing.accession_number)
         try:
             remote_files = await _maybe_await(
@@ -476,40 +539,21 @@ async def should_keep_sc13_direction(
                 ),
                 module=host.MODULE,
             )
+            decision = Sc13DirectionRejectedRegistryOnly(
+                filing=filing,
+                diagnostic=exc.__class__.__name__,
+            )
         else:
             source_fingerprint = build_source_fingerprint(remote_files)
-            artifact_saved, artifact_error = await _maybe_await(
-                host._persist_rejected_filing_artifact(
-                    ticker=ticker,
-                    cik=archive_cik,
-                    filing=filing,
-                    remote_files=remote_files,
-                    overwrite=overwrite,
-                    rejection_reason="sc13_direction_rejected",
-                    rejection_category="direction_mismatch",
-                    selected_primary_document=filing.primary_document,
-                    source_fingerprint=source_fingerprint,
-                    cancel_checker=cancel_checker,
-                )
+            decision = Sc13DirectionRejectedWithArtifact(
+                filing=filing,
+                archive_cik=archive_cik,
+                remote_files=tuple(remote_files),
+                source_fingerprint=source_fingerprint,
             )
-            if not artifact_saved:
-                Log.warn(
-                    (
-                        "SC13 reject artifact 落盘失败，仅写 registry: "
-                        f"ticker={ticker} accession={filing.accession_number} error={artifact_error}"
-                    ),
-                    module=host.MODULE,
-                )
-        _record_rejection_impl(
-            registry=rejection_registry,
-            document_id=document_id,
-            reason="sc13_direction_rejected",
-            category="direction_mismatch",
-            form_type=filing.form_type,
-            filing_date=filing.filing_date,
-            download_version=download_version,
-        )
-    return keep
+    if sc13_direction_cache is not None:
+        sc13_direction_cache[cache_key] = decision
+    return decision
 
 
 async def extend_with_browse_edgar_sc13(
@@ -523,7 +567,7 @@ async def extend_with_browse_edgar_sc13(
     target_cik: str,
     parse_date: Callable[[str, bool], dt.date],
     create_filing_record: Callable[[str, str, Optional[str], str, str, Optional[str]], Sc13FilingRecordProtocol],
-    sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
+    sc13_direction_cache: Optional[dict[str, Sc13DirectionDecision]] = None,
     rejection_registry: Optional[DownloadRejectionRegistry] = None,
     overwrite: bool = False,
     cancel_checker: Optional[Callable[[], bool]] = None,
@@ -577,27 +621,6 @@ async def extend_with_browse_edgar_sc13(
                 continue
             if entry.accession_number in records:
                 continue
-            if normalized_form in SC13_FORMS:
-                pending_record = create_filing_record(
-                    normalized_form,
-                    filing_date_value.isoformat(),
-                    None,
-                    entry.accession_number,
-                    "",
-                    filenum,
-                )
-                keep_direction = await host._should_keep_sc13_direction(
-                    ticker=ticker,
-                    filing=pending_record,
-                    archive_cik=entry.cik,
-                    target_cik=target_cik,
-                    sc13_direction_cache=sc13_direction_cache,
-                    rejection_registry=rejection_registry,
-                    overwrite=overwrite,
-                    cancel_checker=cancel_checker,
-                )
-                if not keep_direction:
-                    continue
             accession_no_dash = accession_to_no_dash(entry.accession_number)
             try:
                 primary_document = await _maybe_await(
@@ -619,7 +642,7 @@ async def extend_with_browse_edgar_sc13(
                     module=host.MODULE,
                 )
                 continue
-            records[entry.accession_number] = create_filing_record(
+            candidate_record = create_filing_record(
                 normalized_form,
                 filing_date_value.isoformat(),
                 None,
@@ -627,6 +650,20 @@ async def extend_with_browse_edgar_sc13(
                 primary_document,
                 filenum,
             )
+            if normalized_form in SC13_FORMS:
+                decision = await host._should_keep_sc13_direction(
+                    ticker=ticker,
+                    filing=candidate_record,
+                    archive_cik=entry.cik,
+                    target_cik=target_cik,
+                    sc13_direction_cache=sc13_direction_cache,
+                    rejection_registry=rejection_registry,
+                    overwrite=overwrite,
+                    cancel_checker=cancel_checker,
+                )
+                if not isinstance(decision, Sc13DirectionAccepted):
+                    continue
+            records[entry.accession_number] = candidate_record
     merged = sorted(
         records.values(),
         key=lambda item: (item.filing_date, item.form_type, item.accession_number),
@@ -645,7 +682,7 @@ async def retry_sc13_if_empty(
     end_date: dt.date,
     target_cik: str,
     start_is_explicit: bool,
-    sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
+    sc13_direction_cache: Optional[dict[str, Sc13DirectionDecision]] = None,
     rejection_registry: Optional[DownloadRejectionRegistry] = None,
     overwrite: bool = False,
     cancel_checker: Optional[Callable[[], bool]] = None,

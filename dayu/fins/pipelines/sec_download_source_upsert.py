@@ -73,6 +73,7 @@ def upsert_downloaded_filing_source_document(
     primary_document: str,
     file_entries: list[dict[str, JsonValue]],
     previous_meta: Optional[dict[str, JsonValue]],
+    create_source: bool,
     source_fingerprint: str,
     download_version: str,
     has_xbrl: bool,
@@ -95,6 +96,7 @@ def upsert_downloaded_filing_source_document(
         primary_document: 当前写入的主文件名。
         file_entries: 已规范化的文件条目列表。
         previous_meta: 历史 filing source meta。
+        create_source: 当前 staging target 已不存在、必须走 create 时为真。
         source_fingerprint: 当前远端文件指纹。
         download_version: 当前下载链路版本号。
         has_xbrl: 当前 filing 是否已落盘 XBRL instance。
@@ -139,7 +141,7 @@ def upsert_downloaded_filing_source_document(
         meta_payload=meta_payload,
         previous_meta=previous_meta,
     )
-    if previous_meta is None:
+    if create_source:
         source_repository.create_source_document(
             upsert_request,
             source_kind=SourceKind.FILING,
@@ -212,9 +214,7 @@ def _build_downloaded_filing_meta_payload(
         else now_iso8601()
     )
     created_at = (
-        str(previous_meta.get("created_at"))
-        if previous_meta and previous_meta.get("created_at")
-        else now_iso8601()
+        str(previous_meta.get("created_at")) if previous_meta and previous_meta.get("created_at") else now_iso8601()
     )
     return {
         "document_id": document_id,

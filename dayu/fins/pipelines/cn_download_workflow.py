@@ -20,6 +20,7 @@ from dayu.fins.pipelines.cn_download_filing_workflow import (
 )
 from dayu.fins.pipelines.cn_download_models import (
     CnDownloadCancelledError,
+    CnCompanyProfile,
     CnMarketKind,
     CnReportCandidate,
     CnReportQuery,
@@ -37,8 +38,13 @@ from dayu.fins.pipelines.cn_form_utils import (
     resolve_window,
 )
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
+from dayu.fins.storage import (
+    SelectedSourceRepairRequired,
+    SourceIntegrityRevisionConflictError,
+    classify_source_integrity_preflight,
+)
 from dayu.fins._log import Log
-from dayu.fins.ticker_normalization import try_normalize_ticker
+from dayu.fins.ticker_normalization import ticker_to_company_id, try_normalize_ticker
 
 JsonObject: TypeAlias = dict[str, JsonValue]
 
@@ -190,21 +196,8 @@ async def run_cn_download_stream_impl(
         _raise_if_cancelled(module=module, ticker=normalized_ticker, document_id="", cancel_checker=cancel_checker)
         profile = discovery.resolve_company(query)
         _raise_if_cancelled(module=module, ticker=normalized_ticker, document_id="", cancel_checker=cancel_checker)
-        company_batch = host.batching_repository.begin_batch(normalized_ticker)
-        try:
-            company_meta = upsert_company_meta_for_cn_download(
-                repository=host.company_meta_repository,
-                profile=profile,
-                normalized_ticker=normalized_ticker,
-                ticker_aliases=ticker_aliases,
-                batch=company_batch,
-            )
-        except BaseException:
-            host.batching_repository.rollback_batch(company_batch)
-            raise
-        host.batching_repository.commit_batch(company_batch)
         company_info = {
-            "company_id": company_meta.company_id,
+            "company_id": ticker_to_company_id(normalized),
             "provider_company_id": profile.company_id,
             "company_name": profile.company_name,
             "market": market,
@@ -226,8 +219,32 @@ async def run_cn_download_stream_impl(
             period_windows=period_windows,
             use_default_business_limits=not start_is_explicit,
         )
+        accepted_filing_ids = frozenset(_candidate_document_id(normalized_ticker, candidate) for candidate in selected)
+        preflight = classify_source_integrity_preflight(
+            host.source_repository.list_source_integrity(normalized_ticker),
+            accepted_filing_ids=accepted_filing_ids,
+            rejected_filing_ids=frozenset(),
+        )
+        repair_document_id: str | None = None
+        if isinstance(preflight, SelectedSourceRepairRequired):
+            repair_document_id = preflight.target.document_id
+            selected = tuple(
+                sorted(
+                    selected,
+                    key=lambda item: (_candidate_document_id(normalized_ticker, item) != repair_document_id,),
+                )
+            )
         missing_periods = _resolve_missing_periods(periods.target_periods, selected)
         cancelled = False
+        repair_gate_completed = False
+        if repair_document_id is None:
+            _publish_cn_company_after_repair(
+                host=host,
+                profile=profile,
+                normalized_ticker=normalized_ticker,
+                ticker_aliases=ticker_aliases,
+            )
+            repair_gate_completed = True
         for candidate in selected:
             if cancel_checker is not None and cancel_checker():
                 notes.append("cancelled")
@@ -246,6 +263,7 @@ async def run_cn_download_stream_impl(
                     "source_id": candidate.source_id,
                 },
             )
+            filing_terminal_status: str | None = None
             try:
                 async for event in run_cn_download_single_filing_stream(
                     batching_repository=host.batching_repository,
@@ -268,6 +286,7 @@ async def run_cn_download_stream_impl(
                         DownloadEventType.FILING_FAILED,
                     }:
                         filing_result: JsonObject = dict(item)
+                        filing_terminal_status = str(filing_result.get("status", "failed"))
                         filings.append(filing_result)
                         _log_filing_download_result(
                             module=module,
@@ -287,6 +306,7 @@ async def run_cn_download_stream_impl(
                     reason_code=reason_code,
                     reason_message=reason_message,
                 )
+                filing_terminal_status = "failed"
                 filings.append(failed_item)
                 _log_filing_download_result(
                     module=module,
@@ -299,6 +319,30 @@ async def run_cn_download_stream_impl(
                     document_id=str(failed_item["document_id"]),
                     payload=_filing_event_payload(failed_item),
                 )
+            if document_id == repair_document_id and not repair_gate_completed:
+                if filing_terminal_status == "failed":
+                    # 单 filing owner 已投影失败；repair gate 直接终止，company 保持旧值。
+                    break
+                post_repair = classify_source_integrity_preflight(
+                    host.source_repository.list_source_integrity(normalized_ticker),
+                    accepted_filing_ids=accepted_filing_ids,
+                    rejected_filing_ids=frozenset(),
+                )
+                if isinstance(post_repair, SelectedSourceRepairRequired):
+                    raise SourceIntegrityRevisionConflictError
+                _raise_if_cancelled(
+                    module=module,
+                    ticker=normalized_ticker,
+                    document_id=document_id,
+                    cancel_checker=cancel_checker,
+                )
+                _publish_cn_company_after_repair(
+                    host=host,
+                    profile=profile,
+                    normalized_ticker=normalized_ticker,
+                    ticker_aliases=ticker_aliases,
+                )
+                repair_gate_completed = True
     except CnDownloadCancelledError:
         notes.append("cancelled")
         cancelled = True
@@ -351,6 +395,44 @@ def _select_discovery_client(
     """按市场选择 discovery client。"""
 
     return host.cn_discovery_client if market == "CN" else host.hk_discovery_client
+
+
+def _publish_cn_company_after_repair(
+    *,
+    host: CnDownloadWorkflowHost,
+    profile: CnCompanyProfile,
+    normalized_ticker: str,
+    ticker_aliases: list[str] | None,
+) -> None:
+    """在 whole-tree clean gate 后以独立 atomic batch 发布 company meta。
+
+    Args:
+        host: CN/HK workflow host。
+        profile: provider 已解析的公司 profile。
+        normalized_ticker: canonical ticker。
+        ticker_aliases: request 传入的可选 aliases。
+
+    Returns:
+        无。
+
+    Raises:
+        OSError: company storage batch 失败时抛出。
+        ValueError: company facts 或 batch capability 非法时抛出。
+    """
+
+    company_batch = host.batching_repository.begin_batch(normalized_ticker)
+    try:
+        upsert_company_meta_for_cn_download(
+            repository=host.company_meta_repository,
+            profile=profile,
+            normalized_ticker=normalized_ticker,
+            ticker_aliases=ticker_aliases,
+            batch=company_batch,
+        )
+    except BaseException:
+        host.batching_repository.rollback_batch(company_batch)
+        raise
+    host.batching_repository.commit_batch(company_batch)
 
 
 def _is_cancel_requested(cancel_checker: Callable[[], bool] | None) -> bool:

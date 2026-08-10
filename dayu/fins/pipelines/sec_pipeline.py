@@ -122,6 +122,7 @@ from dayu.fins.pipelines.sec_safe_meta_access import (
     safe_get_processed_meta as _safe_get_processed_meta_impl,
 )
 from dayu.fins.pipelines.sec_sc13_filtering import (
+    Sc13DirectionDecision,
     SecSc13WorkflowHost as _SecSc13WorkflowHost,
     extend_with_browse_edgar_sc13 as _extend_with_browse_edgar_sc13_impl,
     filter_sc13_by_direction as _filter_sc13_by_direction_impl,
@@ -713,6 +714,8 @@ class SecPipeline:
             merge_ticker_aliases=merge_ticker_aliases,
             load_rejection_registry=_load_rejection_registry_impl,
             save_rejection_registry=_save_rejection_registry_impl,
+            is_rejected=_is_rejected,
+            record_rejection=_record_rejection,
             should_warn_missing_sc13=should_warn_missing_sc13,
             warn_insufficient_filings=warn_insufficient_filings,
             warn_xbrl_missing_filings=warn_xbrl_missing_filings,
@@ -1150,7 +1153,7 @@ class SecPipeline:
         form_windows: dict[str, dt.date],
         end_date: dt.date,
         target_cik: str,
-        sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
+        sc13_direction_cache: Optional[dict[str, Sc13DirectionDecision]] = None,
         rejection_registry: Optional[DownloadRejectionRegistry] = None,
         overwrite: bool = False,
         cancel_checker: Optional[Callable[[], bool]] = None,
@@ -1215,20 +1218,18 @@ class SecPipeline:
             records.values(),
             key=lambda item: (item.filing_date, item.form_type, item.accession_number),
         )
-        direction_filtered_records = cast(
-            list[FilingRecord],
-            await _filter_sc13_by_direction_impl(
-                cast(_SecSc13WorkflowHost, self),
-                ticker=ticker,
-                filings=sorted_records,
-                target_cik=target_cik,
-                archive_cik=target_cik,
-                sc13_direction_cache=sc13_direction_cache,
-                rejection_registry=rejection_registry,
-                overwrite=overwrite,
-                cancel_checker=cancel_checker,
-            ),
+        direction_result = await _filter_sc13_by_direction_impl(
+            cast(_SecSc13WorkflowHost, self),
+            ticker=ticker,
+            filings=sorted_records,
+            target_cik=target_cik,
+            archive_cik=target_cik,
+            sc13_direction_cache=sc13_direction_cache,
+            rejection_registry=rejection_registry,
+            overwrite=overwrite,
+            cancel_checker=cancel_checker,
         )
+        direction_filtered_records = cast(list[FilingRecord], list(direction_result.filings))
         deduplicated_records = cast(
             list[FilingRecord],
             _keep_latest_sc13_per_filer_impl(tuple(direction_filtered_records)),
@@ -1251,7 +1252,7 @@ class SecPipeline:
         form_windows: dict[str, dt.date],
         end_date: dt.date,
         target_cik: str,
-        sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
+        sc13_direction_cache: Optional[dict[str, Sc13DirectionDecision]] = None,
         rejection_registry: Optional[DownloadRejectionRegistry] = None,
         overwrite: bool = False,
         cancel_checker: Optional[Callable[[], bool]] = None,
@@ -1315,7 +1316,7 @@ class SecPipeline:
         end_date: dt.date,
         target_cik: str,
         start_is_explicit: bool,
-        sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
+        sc13_direction_cache: Optional[dict[str, Sc13DirectionDecision]] = None,
         rejection_registry: Optional[DownloadRejectionRegistry] = None,
         overwrite: bool = False,
         cancel_checker: Optional[Callable[[], bool]] = None,
@@ -1368,11 +1369,11 @@ class SecPipeline:
         filing: FilingRecord,
         archive_cik: str,
         target_cik: str,
-        sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
+        sc13_direction_cache: Optional[dict[str, Sc13DirectionDecision]] = None,
         rejection_registry: Optional[DownloadRejectionRegistry] = None,
         overwrite: bool = False,
         cancel_checker: Optional[Callable[[], bool]] = None,
-    ) -> bool:
+    ) -> Sc13DirectionDecision:
         """判断单条 SC13 是否满足别人持股当前 ticker 的方向。
 
         Args:
@@ -1386,7 +1387,7 @@ class SecPipeline:
             cancel_checker: 可选协作式取消检查器。
 
         Returns:
-            应保留时返回 ``True``。
+            exact accession 对应的 pure typed direction decision。
 
         Raises:
             RuntimeError: 角色解析失败时由底层抛出。
@@ -1622,6 +1623,7 @@ class SecPipeline:
         rejection_category: str,
         selected_primary_document: str,
         source_fingerprint: str,
+        registry_after: DownloadRejectionRegistry,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> tuple[bool, Optional[str]]:
         """下载并保存 rejected filing artifact。
@@ -1636,6 +1638,7 @@ class SecPipeline:
             rejection_category: 拒绝分类。
             selected_primary_document: 当前规则选中的主文件。
             source_fingerprint: 来源指纹。
+            registry_after: 与 artifact 同 batch 发布的完整 registry 真值。
             cancel_checker: 可选协作式取消检查器。
 
         Returns:
@@ -1658,7 +1661,8 @@ class SecPipeline:
             classification_version=SEC_PIPELINE_DOWNLOAD_VERSION,
             batching_repository=self._batching_repository,
             filing_maintenance_repository=self._filing_maintenance_repository,
-            download_files_stream=self._downloader.download_files_stream,
+            downloader=self._downloader,
+            registry_after=registry_after,
             build_file_result_from_downloader_event=build_file_result_from_downloader_event,
             summarize_failed_download_file_reasons=summarize_failed_download_file_reasons,
             cancellation_checker=cancel_checker,

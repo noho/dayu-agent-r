@@ -50,6 +50,11 @@ from dayu.fins.storage import (
     FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
     LocalFileStore,
+    SourceIntegrityPreflightError,
+    SourceIntegrityPreflightReason,
+    SourceIntegrityReason,
+    SourceIntegrityStatus,
+    classify_source_integrity_preflight,
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
 from dayu.fins.storage._fs_storage_core import FsStorageCore
@@ -407,10 +412,7 @@ def test_begin_batch_preserves_initialization_primary_when_lock_release_fails(
         assert "identity descriptor" in str(exc_info.value)
     else:
         assert exc_info.value is primary_error
-    assert any(
-        "writer mutex release failed during batch initialization" in note
-        for note in exc_info.value.__notes__
-    )
+    assert any("writer mutex release failed during batch initialization" in note for note in exc_info.value.__notes__)
     assert core._active_batches == {}
     assert core._active_transaction_by_ticker == {}
     assert list(core.batch_root.iterdir()) == []
@@ -504,10 +506,7 @@ def test_begin_batch_preserves_primary_with_staging_cleanup_and_release_failures
         notes = exc_info.value.__notes__
         assert exc_info.value is primary_error
         assert any("batch staging cleanup failed" in note for note in notes)
-        assert any(
-            "writer mutex release failed during batch initialization" in note
-            for note in notes
-        )
+        assert any("writer mutex release failed during batch initialization" in note for note in notes)
         assert all(str(core.workspace_root) not in note for note in notes)
         assert all(root.name not in " ".join(notes) for root in staging_roots)
         assert core._active_batches == {}
@@ -863,10 +862,7 @@ def test_company_owner_reads_only_published_meta_inventory_and_aliases(tmp_path:
     repository_set = build_fs_repository_set(workspace_root=workspace_root)
     batching = FsBatchingRepository(workspace_root, repository_set=repository_set)
     company = FsCompanyMetaRepository(workspace_root, repository_set=repository_set)
-    batches = {
-        ticker: batching.begin_batch(ticker)
-        for ticker in ("AAPL", "MSFT", "DUP-A", "DUP-B")
-    }
+    batches = {ticker: batching.begin_batch(ticker) for ticker in ("AAPL", "MSFT", "DUP-A", "DUP-B")}
     for ticker, aliases in (
         ("AAPL", ["APPLE"]),
         ("MSFT", ["MICROSOFT"]),
@@ -909,16 +905,13 @@ def test_company_owner_reads_only_published_meta_inventory_and_aliases(tmp_path:
     (invalid_dir / "meta.json").write_text("{}", encoding="utf-8")
 
     status_by_name = {
-        item.ticker: item.status
-        for item in company.scan_company_meta_inventory()
-        if item.ticker is not None
+        item.ticker: item.status for item in company.scan_company_meta_inventory() if item.ticker is not None
     }
     assert status_by_name["AAPL"] == "available"
     assert status_by_name["MISSING"] == "missing_meta"
     assert status_by_name["INVALID"] == "invalid_meta"
     assert any(
-        item.ticker is None and item.status == "hidden_directory"
-        for item in company.scan_company_meta_inventory()
+        item.ticker is None and item.status == "hidden_directory" for item in company.scan_company_meta_inventory()
     )
 
 
@@ -960,12 +953,9 @@ def test_processed_owner_public_crud_mark_list_delete_and_clear(tmp_path: Path) 
         ticker="AAPL",
         document_id="processed-one",
     )
-    assert processed.get_processed_meta("AAPL", "processed-one")["document_id"] == (
-        "processed-one"
-    )
+    assert processed.get_processed_meta("AAPL", "processed-one")["document_id"] == ("processed-one")
     assert [
-        item.document_id
-        for item in processed.list_processed_documents("AAPL", DocumentQuery(form_type="10-K"))
+        item.document_id for item in processed.list_processed_documents("AAPL", DocumentQuery(form_type="10-K"))
     ] == ["processed-one", "processed-two"]
 
     unchanged_meta = processed.get_processed_meta("AAPL", "processed-one")
@@ -1053,9 +1043,7 @@ def test_processed_owner_public_crud_mark_list_delete_and_clear(tmp_path: Path) 
         json.dumps({"document_id": "legacy-meta-must-not-be-read"}),
         encoding="utf-8",
     )
-    assert processed.get_processed_meta("AAPL", "processed-two")["document_id"] == (
-        "processed-two"
-    )
+    assert processed.get_processed_meta("AAPL", "processed-two")["document_id"] == ("processed-two")
     tool_meta_path.unlink()
     with pytest.raises(FileNotFoundError, match="processed 元数据不存在"):
         processed.get_processed_meta("AAPL", "processed-two")
@@ -1132,18 +1120,16 @@ def test_maintenance_owner_artifact_reads_cleanup_and_clear_are_guarded(tmp_path
     assert second_artifact.created_at == first_artifact.created_at
     batching.commit_batch(batch)
 
-    assert maintenance.get_rejected_filing_artifact("AAPL", "fil_rejected").document_id == (
-        "fil_rejected"
+    assert maintenance.get_rejected_filing_artifact("AAPL", "fil_rejected").document_id == ("fil_rejected")
+    assert [artifact.document_id for artifact in maintenance.list_rejected_filing_artifacts("AAPL")] == ["fil_rejected"]
+    assert (
+        maintenance.read_rejected_filing_file_bytes(
+            "AAPL",
+            "fil_rejected",
+            "rejected.htm",
+        )
+        == b"rejected payload"
     )
-    assert [
-        artifact.document_id
-        for artifact in maintenance.list_rejected_filing_artifacts("AAPL")
-    ] == ["fil_rejected"]
-    assert maintenance.read_rejected_filing_file_bytes(
-        "AAPL",
-        "fil_rejected",
-        "rejected.htm",
-    ) == b"rejected payload"
     with pytest.raises(FileNotFoundError, match="rejected filing 文件不存在"):
         maintenance.read_rejected_filing_file_bytes(
             "AAPL",
@@ -1164,10 +1150,7 @@ def test_maintenance_owner_artifact_reads_cleanup_and_clear_are_guarded(tmp_path
         )
     directory_path.rmdir()
 
-    corrupt_dir = (
-        repository_set.core._rejected_filings_root_for_read("AAPL")
-        / "corrupt-private-locator"
-    )
+    corrupt_dir = repository_set.core._rejected_filings_root_for_read("AAPL") / "corrupt-private-locator"
     corrupt_dir.mkdir()
     with pytest.raises(ValueError, match="identity descriptor"):
         maintenance.list_rejected_filing_artifacts("AAPL")
@@ -1189,12 +1172,15 @@ def test_maintenance_owner_artifact_reads_cleanup_and_clear_are_guarded(tmp_path
     rejected_meta_path.write_text(json.dumps(rejected_meta), encoding="utf-8")
 
     cleanup_batch = batching.begin_batch("AAPL")
-    assert maintenance.cleanup_stale_filing_documents(
-        "AAPL",
-        batch=cleanup_batch,
-        active_form_types={"10-K"},
-        valid_document_ids={"fil_keep"},
-    ) == 1
+    assert (
+        maintenance.cleanup_stale_filing_documents(
+            "AAPL",
+            batch=cleanup_batch,
+            active_form_types={"10-K"},
+            valid_document_ids={"fil_keep"},
+        )
+        == 1
+    )
     batching.commit_batch(cleanup_batch)
     assert source.list_source_document_ids("AAPL", SourceKind.FILING) == ["fil_keep"]
 
@@ -1534,11 +1520,14 @@ def test_maintenance_public_file_read_delegates_to_unguarded_helper(
         _read_rejected_filing_file_bytes_unguarded,
     )
 
-    assert maintenance.read_rejected_filing_file_bytes(
-        "AAPL",
-        " fil_rejected ",
-        "rejected.htm",
-    ) == b"delegated"
+    assert (
+        maintenance.read_rejected_filing_file_bytes(
+            "AAPL",
+            " fil_rejected ",
+            "rejected.htm",
+        )
+        == b"delegated"
+    )
     assert calls == [("AAPL", " fil_rejected ", "rejected.htm")]
 
 
@@ -1587,9 +1576,7 @@ def test_source_owner_material_update_delete_restore_replace_and_reset(tmp_path:
     )
     assert created_handle.primary_file_uri == file_meta.uri
     batching.commit_batch(create_batch)
-    assert repository_set.core.get_document_meta("AAPL", "material-owner")[
-        "material_name"
-    ] == "Investor presentation"
+    assert repository_set.core.get_document_meta("AAPL", "material-owner")["material_name"] == "Investor presentation"
 
     update_batch = batching.begin_batch("AAPL")
     source.update_source_document(
@@ -1635,9 +1622,10 @@ def test_source_owner_material_update_delete_restore_replace_and_reset(tmp_path:
         batch=update_batch,
     )
     batching.commit_batch(update_batch)
-    assert source.get_source_meta("AAPL", "material-owner", SourceKind.MATERIAL)[
-        "material_name"
-    ] == "Replaced presentation"
+    assert (
+        source.get_source_meta("AAPL", "material-owner", SourceKind.MATERIAL)["material_name"]
+        == "Replaced presentation"
+    )
 
     reset_batch = batching.begin_batch("AAPL")
     source.reset_source_document(
@@ -2324,15 +2312,10 @@ def test_commit_primary_failure_survives_writer_release_failure(
 
         assert exc_info.value is commit_error
         notes = exc_info.value.__notes__
-        assert (
-            "publication guard release failed: error_type=PermissionError "
-            f"errno={errno.EACCES}"
-            in notes
-        )
+        assert f"publication guard release failed: error_type=PermissionError errno={errno.EACCES}" in notes
         assert (
             "writer mutex release failed during terminal cleanup: "
-            f"error_type=PermissionError errno={errno.EACCES}"
-            in notes
+            f"error_type=PermissionError errno={errno.EACCES}" in notes
         )
         _assert_exception_graph_path_free(
             exc_info.value,
@@ -2372,9 +2355,7 @@ def test_commit_batch_publication_release_failure_preserves_committed_truth(
     core, batch, paths = _begin_mutated_batch(tmp_path, old_target_exists=True)
     state = _only_active_batch_state(core)
     original_release = core._release_lock_token
-    publication_release_error = RuntimeFileLockError(
-        "injected publication guard release failure"
-    )
+    publication_release_error = RuntimeFileLockError("injected publication guard release failure")
     cleanup_error = PermissionError(
         errno.EACCES,
         "post-commit cleanup private message",
@@ -2457,13 +2438,11 @@ def test_commit_batch_publication_release_failure_preserves_committed_truth(
         notes = exc_info.value.__notes__
         assert (
             "post-commit cleanup failed after publication guard release failure: "
-            f"error_type=PermissionError errno={errno.EACCES}"
-            in notes
+            f"error_type=PermissionError errno={errno.EACCES}" in notes
         )
         assert (
             "writer mutex release failed during terminal cleanup: "
-            f"error_type=PermissionError errno={errno.EACCES}"
-            in notes
+            f"error_type=PermissionError errno={errno.EACCES}" in notes
         )
         _assert_exception_graph_path_free(
             exc_info.value,
@@ -2651,9 +2630,7 @@ def test_recovery_rejects_nonminimal_journal_fields_without_touching_evidence(
 
     actions = core.recover_orphan_batches()
 
-    assert actions == (
-        f"skip batch transaction={paths.staging_root_dir.name} reason=invalid_journal_fields",
-    )
+    assert actions == (f"skip batch transaction={paths.staging_root_dir.name} reason=invalid_journal_fields",)
     assert paths.staging_root_dir.exists()
     assert (paths.target_ticker_dir / "state.txt").read_text(encoding="utf-8") == "old"
 
@@ -2690,14 +2667,9 @@ def test_unparseable_journal_preserves_evidence_and_later_orphan_recovers(
 
     actions = core.recover_orphan_batches()
 
-    assert (
-        f"skip batch transaction={invalid_transaction_dir.name} reason=unparseable_journal"
-        in actions
-    )
+    assert f"skip batch transaction={invalid_transaction_dir.name} reason=unparseable_journal" in actions
     assert any(
-        action.startswith(
-            f"restore backup ticker=AAPL transaction={valid_paths.staging_root_dir.name}"
-        )
+        action.startswith(f"restore backup ticker=AAPL transaction={valid_paths.staging_root_dir.name}")
         for action in actions
     )
     assert invalid_transaction_dir.is_dir()
@@ -2744,15 +2716,9 @@ def test_invalid_journal_ticker_cannot_escape_canonical_recovery_locator(
     actions = core.recover_orphan_batches()
 
     assert invalid_transaction_dir.exists()
-    assert (
-        f"skip batch transaction={invalid_transaction_dir.name} "
-        "reason=invalid_journal_ticker"
-        in actions
-    )
+    assert f"skip batch transaction={invalid_transaction_dir.name} reason=invalid_journal_ticker" in actions
     assert any(
-        action.startswith(
-            f"restore backup ticker=AAPL transaction={valid_paths.staging_root_dir.name}"
-        )
+        action.startswith(f"restore backup ticker=AAPL transaction={valid_paths.staging_root_dir.name}")
         for action in actions
     )
     assert (protected_target / "state.txt").read_text(encoding="utf-8") == "published"
@@ -2790,10 +2756,7 @@ def test_orphan_backup_requires_descriptor_and_recovers_canonical_ticker(
 
     actions = core.recover_orphan_batches()
 
-    assert (
-        "preserve backup transaction=000-invalid-backup reason=invalid_identity_descriptor"
-        in actions
-    )
+    assert "preserve backup transaction=000-invalid-backup reason=invalid_identity_descriptor" in actions
     assert f"restore backup ticker={ticker} transaction=999-valid-backup" in actions
     assert invalid_backup.exists()
     assert (invalid_backup / "state.txt").read_text(encoding="utf-8") == "invalid"
@@ -3278,10 +3241,7 @@ def test_complete_source_rollback_and_precommit_recovery_keep_source_absent(
     fresh_source = FsSourceDocumentRepository(workspace_root)
     fresh_blob = FsDocumentBlobRepository(workspace_root)
 
-    assert any(
-        "cleanup batch ticker=AAPL" in action and "phase=started" in action
-        for action in actions
-    )
+    assert any("cleanup batch ticker=AAPL" in action and "phase=started" in action for action in actions)
     with pytest.raises(FileNotFoundError):
         fresh_source.get_source_meta("AAPL", "orphan_source", SourceKind.FILING)
     with pytest.raises(FileNotFoundError):
@@ -3349,9 +3309,7 @@ def test_concurrent_reader_blocks_at_each_publication_rename_barrier(
             OSError: 真实 rename 失败时抛出。
         """
 
-        selected = (
-            barrier == "target_to_backup" and source_path == paths.target_ticker_dir
-        ) or (
+        selected = (barrier == "target_to_backup" and source_path == paths.target_ticker_dir) or (
             barrier == "staging_to_target" and source_path == paths.staging_ticker_dir
         )
         if selected:
@@ -3590,7 +3548,10 @@ def test_local_file_store_put_orders_file_sync_replace_and_directory_sync(
         events.append("file_fsync")
         original_fsync(file_descriptor)
 
-    def _record_replace(source: str | bytes | os.PathLike[str] | os.PathLike[bytes], target: str | bytes | os.PathLike[str] | os.PathLike[bytes]) -> None:
+    def _record_replace(
+        source: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        target: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+    ) -> None:
         """记录atomic replace并执行真实系统调用。
 
         Args:
@@ -3674,9 +3635,17 @@ def test_local_file_store_put_failure_preserves_old_object_and_cleans_temp(
     injected_error = OSError(f"injected {failure_point} failure")
 
     if failure_point == "fsync":
-        monkeypatch.setattr(local_file_store_module.os, "fsync", lambda file_descriptor: _raise_os_error(file_descriptor, injected_error))
+        monkeypatch.setattr(
+            local_file_store_module.os,
+            "fsync",
+            lambda file_descriptor: _raise_os_error(file_descriptor, injected_error),
+        )
     else:
-        monkeypatch.setattr(local_file_store_module.os, "replace", lambda source, target: _raise_replace_error(source, target, injected_error))
+        monkeypatch.setattr(
+            local_file_store_module.os,
+            "replace",
+            lambda source, target: _raise_replace_error(source, target, injected_error),
+        )
 
     with pytest.raises(OSError) as exc_info:
         store.put_object("AAPL/report.md", io.BytesIO(b"new"))
@@ -3834,9 +3803,7 @@ def test_complete_validator_rejects_identity_descriptor_symlink_and_mismatch(
         batching.commit_batch(batch)
     assert not repository_set.core._target_ticker_dir(ticker).exists()
     if outside_descriptor is not None:
-        assert json.loads(outside_descriptor.read_text(encoding="utf-8"))[
-            "external_identity"
-        ] == document_id
+        assert json.loads(outside_descriptor.read_text(encoding="utf-8"))["external_identity"] == document_id
 
 
 def test_filename_absolute_and_local_uri_attacks_remain_rejected_for_opaque_documents(
@@ -4320,11 +4287,14 @@ def test_snapshot_fd_copy_silent_mutation_is_corruption_without_revision_change(
         "snapshot-doc",
         SourceKind.FILING,
     )
-    business_file = repository_set.core._source_meta_path_for_read(
-        "AAPL",
-        "snapshot-doc",
-        SourceKind.FILING,
-    ).parent / "a-primary.txt"
+    business_file = (
+        repository_set.core._source_meta_path_for_read(
+            "AAPL",
+            "snapshot-doc",
+            SourceKind.FILING,
+        ).parent
+        / "a-primary.txt"
+    )
     copy_entered = Event()
     allow_copy = Event()
     observed_roots: set[Path] = set()
@@ -4378,12 +4348,15 @@ def test_snapshot_fd_copy_silent_mutation_is_corruption_without_revision_change(
         with pytest.raises(ValueError) as exc_info:
             future.result(timeout=10)
     assert not isinstance(exc_info.value, SourceSnapshotConsistencyError)
-    assert _read_snapshot_revision(
-        source_repository,
-        "AAPL",
-        "snapshot-doc",
-        SourceKind.FILING,
-    ) == revision
+    assert (
+        _read_snapshot_revision(
+            source_repository,
+            "AAPL",
+            "snapshot-doc",
+            SourceKind.FILING,
+        )
+        == revision
+    )
     assert observed_roots
     assert all(not root.exists() for root in observed_roots)
 
@@ -4456,8 +4429,7 @@ def test_snapshot_acquire_primary_survives_guard_release_secondary_without_locat
     assert exc_info.value is primary_error
     assert release_paths
     assert (
-        "source snapshot publication guard release failed: "
-        "error_type=RuntimeFileLockError"
+        "source snapshot publication guard release failed: error_type=RuntimeFileLockError"
     ) in exc_info.value.__notes__
     assert exc_info.value.__cause__ is None
     assert exc_info.value.__context__ is None
@@ -4500,11 +4472,14 @@ def test_snapshot_guard_release_primary_survives_fd_close_secondary_without_loca
         version="A",
         replace_existing=False,
     )
-    published_path = repository_set.core._source_meta_path_for_read(
-        "AAPL",
-        "snapshot-doc",
-        SourceKind.FILING,
-    ).parent / "a-primary.txt"
+    published_path = (
+        repository_set.core._source_meta_path_for_read(
+            "AAPL",
+            "snapshot-doc",
+            SourceKind.FILING,
+        ).parent
+        / "a-primary.txt"
+    )
     original_release = RuntimeFileLockToken.release
     original_close = source_snapshot_module._close_open_snapshot_files
     release_paths: list[Path] = []
@@ -4556,8 +4531,7 @@ def test_snapshot_guard_release_primary_survives_fd_close_secondary_without_loca
     assert release_paths
     assert closed_descriptor_counts == [2]
     assert (
-        "source snapshot published descriptor cleanup failed: "
-        f"error_type=PermissionError errno={errno.EIO}"
+        f"source snapshot published descriptor cleanup failed: error_type=PermissionError errno={errno.EIO}"
     ) in exc_info.value.__notes__
     assert isinstance(exc_info.value.__cause__, PermissionError)
     assert exc_info.value.__cause__.errno == errno.EACCES
@@ -4682,8 +4656,7 @@ def test_snapshot_marker_read_primary_survives_guard_release_secondary_without_l
     assert release_calls == 2
     assert release_paths
     assert (
-        "source snapshot marker publication guard release failed: "
-        "error_type=RuntimeFileLockError"
+        "source snapshot marker publication guard release failed: error_type=RuntimeFileLockError"
     ) in exc_info.value.__notes__
     assert exc_info.value.__cause__ is None
     assert exc_info.value.__context__ is None
@@ -4867,8 +4840,7 @@ def test_snapshot_context_preserves_active_primary_when_close_fails(
     assert exc_info.value is primary_error
     assert _exception_graph_nodes(exc_info.value) == (primary_error,)
     assert exc_info.value.__notes__ == [
-        "source snapshot lifecycle close failed: "
-        f"error_type=PermissionError errno={errno.EACCES}"
+        f"source snapshot lifecycle close failed: error_type=PermissionError errno={errno.EACCES}"
     ]
     assert temp_root.exists()
     _assert_exception_graph_path_free(
@@ -5009,11 +4981,14 @@ def test_snapshot_initial_fstat_primary_survives_stream_close_secondary(
         version="A",
         replace_existing=False,
     )
-    published_path = repository_set.core._source_meta_path_for_read(
-        "AAPL",
-        "snapshot-doc",
-        SourceKind.FILING,
-    ).parent / "a-primary.txt"
+    published_path = (
+        repository_set.core._source_meta_path_for_read(
+            "AAPL",
+            "snapshot-doc",
+            SourceKind.FILING,
+        ).parent
+        / "a-primary.txt"
+    )
     raw_fstat_error = OSError(
         errno.EIO,
         "snapshot initial fstat private message",
@@ -5059,8 +5034,7 @@ def test_snapshot_initial_fstat_primary_survives_stream_close_secondary(
     assert exc_info.value.errno == errno.EIO
     assert failing_stream.close_calls == 1
     assert (
-        "source snapshot initial descriptor cleanup failed: "
-        f"error_type=PermissionError errno={errno.EACCES}"
+        f"source snapshot initial descriptor cleanup failed: error_type=PermissionError errno={errno.EACCES}"
     ) in exc_info.value.__notes__
     assert exc_info.value.__context__ is None
     _assert_exception_graph_path_free(
@@ -5104,11 +5078,14 @@ def test_snapshot_marker_primary_survives_fd_and_temp_cleanup_failures(
         version="A",
         replace_existing=False,
     )
-    published_path = repository_set.core._source_meta_path_for_read(
-        "AAPL",
-        "snapshot-doc",
-        SourceKind.FILING,
-    ).parent / "a-primary.txt"
+    published_path = (
+        repository_set.core._source_meta_path_for_read(
+            "AAPL",
+            "snapshot-doc",
+            SourceKind.FILING,
+        ).parent
+        / "a-primary.txt"
+    )
     primary_error = ValueError("snapshot marker authoritative failure")
     original_create = source_snapshot_module._create_snapshot_temp_root
     original_close = source_snapshot_module._close_open_snapshot_files
@@ -5179,12 +5156,10 @@ def test_snapshot_marker_primary_survives_fd_and_temp_cleanup_failures(
     assert remove_calls == 1
     assert observed_roots and all(not root.exists() for root in observed_roots)
     assert (
-        "source snapshot published descriptor cleanup failed: "
-        f"error_type=PermissionError errno={errno.EIO}"
+        f"source snapshot published descriptor cleanup failed: error_type=PermissionError errno={errno.EIO}"
     ) in exc_info.value.__notes__
     assert (
-        "source snapshot temporary tree cleanup failed: "
-        f"error_type=OSError errno={errno.ENOSPC}"
+        f"source snapshot temporary tree cleanup failed: error_type=OSError errno={errno.ENOSPC}"
     ) in exc_info.value.__notes__
     assert exc_info.value.__cause__ is None
     assert exc_info.value.__context__ is None
@@ -5229,11 +5204,14 @@ def test_snapshot_transient_discard_cleanup_preserves_first_failure_and_attempts
         version="A",
         replace_existing=False,
     )
-    published_path = repository_set.core._source_meta_path_for_read(
-        "AAPL",
-        "snapshot-doc",
-        SourceKind.FILING,
-    ).parent / "a-primary.txt"
+    published_path = (
+        repository_set.core._source_meta_path_for_read(
+            "AAPL",
+            "snapshot-doc",
+            SourceKind.FILING,
+        ).parent
+        / "a-primary.txt"
+    )
     original_create = source_snapshot_module._create_snapshot_temp_root
     original_close = source_snapshot_module._close_open_snapshot_files
     original_remove = source_snapshot_module._remove_snapshot_temp_root
@@ -5304,8 +5282,7 @@ def test_snapshot_transient_discard_cleanup_preserves_first_failure_and_attempts
     assert remove_calls == 1
     assert observed_roots and all(not root.exists() for root in observed_roots)
     assert (
-        "source snapshot temporary tree cleanup failed: "
-        f"error_type=OSError errno={errno.ENOSPC}"
+        f"source snapshot temporary tree cleanup failed: error_type=OSError errno={errno.ENOSPC}"
     ) in exc_info.value.__notes__
     assert isinstance(exc_info.value.__cause__, PermissionError)
     assert exc_info.value.__cause__.errno == errno.EIO
@@ -5362,11 +5339,7 @@ def _identity_descriptor_file(identity_directory: Path) -> Path:
         AssertionError: descriptor 候选不唯一时抛出。
     """
 
-    candidates = [
-        path
-        for path in identity_directory.iterdir()
-        if path.name.startswith(".") and path.suffix == ".json"
-    ]
+    candidates = [path for path in identity_directory.iterdir() if path.name.startswith(".") and path.suffix == ".json"]
     assert len(candidates) == 1
     return candidates[0]
 
@@ -5489,6 +5462,145 @@ def _create_complete_source(
         batch=batch,
     )
     return handle
+
+
+def test_source_integrity_classifies_published_staged_and_whole_tree(
+    tmp_path: Path,
+) -> None:
+    """typed integrity 必须区分 missing/complete/三类物理 corruption 并单 guard 枚举。"""
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    missing = source.classify_source_integrity(
+        "AAPL",
+        "missing",
+        SourceKind.FILING,
+    )
+    assert missing.status is SourceIntegrityStatus.MISSING
+    assert missing.revision is None
+
+    batch = batching.begin_batch("AAPL")
+    _create_complete_source(source, blob, batch=batch, document_id="filing-a")
+    _create_complete_source(
+        source,
+        blob,
+        batch=batch,
+        document_id="material-a",
+        source_kind=SourceKind.MATERIAL,
+    )
+    staged = source.classify_staged_source_integrity(
+        "AAPL",
+        "filing-a",
+        SourceKind.FILING,
+        batch=batch,
+    )
+    assert staged.status is SourceIntegrityStatus.COMPLETE
+    batching.commit_batch(batch)
+
+    inventory = source.list_source_integrity("AAPL")
+    assert [(item.source_kind, item.document_id) for item in inventory] == [
+        (SourceKind.FILING, "filing-a"),
+        (SourceKind.MATERIAL, "material-a"),
+    ]
+    locator = source.get_source_document_locator(
+        "AAPL",
+        "filing-a",
+        SourceKind.FILING,
+    )
+    source_dir = tmp_path / locator
+    payload_path = source_dir / "filing-a.txt"
+    original_payload = payload_path.read_bytes()
+
+    payload_path.write_bytes(original_payload + b"-size")
+    size_corrupt = source.classify_source_integrity(
+        "AAPL",
+        "filing-a",
+        SourceKind.FILING,
+    )
+    assert size_corrupt.status is SourceIntegrityStatus.REPAIR_REQUIRED
+    assert SourceIntegrityReason.SIZE_MISMATCH in size_corrupt.reasons
+    assert SourceIntegrityReason.DIGEST_MISMATCH in size_corrupt.reasons
+
+    payload_path.write_bytes(b"X" * len(original_payload))
+    digest_corrupt = source.classify_source_integrity(
+        "AAPL",
+        "filing-a",
+        SourceKind.FILING,
+    )
+    assert digest_corrupt.reasons == (SourceIntegrityReason.DIGEST_MISMATCH,)
+
+    payload_path.unlink()
+    missing_file = source.classify_source_integrity(
+        "AAPL",
+        "filing-a",
+        SourceKind.FILING,
+    )
+    assert missing_file.reasons == (SourceIntegrityReason.PHYSICAL_FILE_MISSING,)
+    payload_path.write_bytes(original_payload)
+
+    meta_path = source_dir / "meta.json"
+    original_meta = meta_path.read_text(encoding="utf-8")
+    meta = json.loads(original_meta)
+    meta["files"][0]["sha256"] = "malformed"
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    with pytest.raises(ValueError, match="64位小写十六进制"):
+        source.classify_source_integrity(
+            "AAPL",
+            "filing-a",
+            SourceKind.FILING,
+        )
+    with pytest.raises(ValueError, match="64位小写十六进制"):
+        source.list_source_integrity("AAPL")
+    meta_path.write_text(original_meta, encoding="utf-8")
+
+
+def test_source_integrity_preflight_fails_closed_for_multiple_and_unselected(
+    tmp_path: Path,
+) -> None:
+    """完整 inventory 的 multiple/material/unselected corruption 必须 typed fail closed。"""
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    batch = batching.begin_batch("AAPL")
+    _create_complete_source(source, blob, batch=batch, document_id="selected")
+    _create_complete_source(source, blob, batch=batch, document_id="unselected")
+    batching.commit_batch(batch)
+    for document_id in ("selected", "unselected"):
+        locator = source.get_source_document_locator(
+            "AAPL",
+            document_id,
+            SourceKind.FILING,
+        )
+        (tmp_path / locator / f"{document_id}.txt").unlink()
+    with pytest.raises(SourceIntegrityPreflightError) as multiple_error:
+        classify_source_integrity_preflight(
+            source.list_source_integrity("AAPL"),
+            accepted_filing_ids=frozenset({"selected"}),
+            rejected_filing_ids=frozenset(),
+        )
+    assert multiple_error.value.reason is SourceIntegrityPreflightReason.MULTIPLE_REPAIR_REQUIRED
+
+    unselected_path = (
+        tmp_path
+        / source.get_source_document_locator(
+            "AAPL",
+            "unselected",
+            SourceKind.FILING,
+        )
+        / "unselected.txt"
+    )
+    unselected_path.write_bytes(b"unselected")
+    with pytest.raises(SourceIntegrityPreflightError) as unselected_error:
+        classify_source_integrity_preflight(
+            source.list_source_integrity("AAPL"),
+            accepted_filing_ids=frozenset(),
+            rejected_filing_ids=frozenset(),
+        )
+    assert unselected_error.value.reason is SourceIntegrityPreflightReason.UNSELECTED_REPAIR_REQUIRED
 
 
 def _publish_snapshot_version(
@@ -5636,6 +5748,120 @@ def _stage_snapshot_version(
         SourceKind.FILING,
         batch=batch,
     )
+
+
+def _blocking_batch_writer_in_process(
+    workspace_root: str,
+    connection: Connection,
+) -> None:
+    """在子进程记录 blocking acquire 前后并按父进程指令释放 batch。
+
+    Args:
+        workspace_root: 共享 workspace 字符串路径。
+        connection: 与父进程同步的 duplex pipe。
+
+    Returns:
+        无。
+
+    Raises:
+        Exception: storage 或 pipe 失败时让子进程非零退出。
+    """
+
+    repository = FsBatchingRepository(Path(workspace_root))
+    connection.send_bytes(b"acquire_entered")
+    token = repository.begin_batch("AAPL")
+    connection.send_bytes(b"acquired")
+    if connection.recv_bytes() != b"release":
+        raise RuntimeError("父进程未发送预期 release 指令")
+    repository.rollback_batch(token)
+    connection.close()
+
+
+def test_cross_process_writer_blocks_then_acquires_after_release(tmp_path: Path) -> None:
+    """跨进程同 ticker 后 writer 必须真实等待并在统一 release 后成功。"""
+
+    workspace_root = tmp_path / "workspace"
+    repository = FsBatchingRepository(workspace_root)
+    first_token = repository.begin_batch("AAPL")
+    context = multiprocessing.get_context("spawn")
+    parent_connection, child_connection = context.Pipe(duplex=True)
+    process = context.Process(
+        target=_blocking_batch_writer_in_process,
+        args=(str(workspace_root), child_connection),
+    )
+    process.start()
+    child_connection.close()
+    try:
+        assert parent_connection.poll(5)
+        assert parent_connection.recv_bytes() == b"acquire_entered"
+        assert parent_connection.poll(0) is False
+        repository.rollback_batch(first_token)
+        assert parent_connection.poll(5)
+        assert parent_connection.recv_bytes() == b"acquired"
+        parent_connection.send_bytes(b"release")
+        process.join(timeout=5)
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+        parent_connection.close()
+    assert process.exitcode == 0
+
+
+def test_same_core_local_reservation_waits_then_notifies_on_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同 core 同 ticker 后 writer 必须先等 local reservation，再被统一 notify。"""
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    repository = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    core = repository_set.core
+    first_token = repository.begin_batch("AAPL")
+    second_started = Event()
+    file_lock_acquire_entered = Event()
+    original_acquire = core._acquire_ticker_lock
+
+    def observe_file_lock_acquire(ticker: str) -> RuntimeFileLockToken:
+        """记录 local reservation 释放后的 file-lock acquire。"""
+
+        file_lock_acquire_entered.set()
+        return original_acquire(ticker)
+
+    def begin_second() -> BatchToken:
+        """报告线程已启动后尝试同 ticker batch。"""
+
+        second_started.set()
+        return repository.begin_batch("AAPL")
+
+    monkeypatch.setattr(core, "_acquire_ticker_lock", observe_file_lock_acquire)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        waiting = executor.submit(begin_second)
+        assert second_started.wait(timeout=5)
+        assert waiting.done() is False
+        assert file_lock_acquire_entered.is_set() is False
+        repository.rollback_batch(first_token)
+        second_token = waiting.result(timeout=5)
+    assert file_lock_acquire_entered.is_set() is True
+    repository.rollback_batch(second_token)
+
+
+def test_recovery_try_lock_stays_nonblocking_while_writer_is_active(tmp_path: Path) -> None:
+    """独立 core recovery 遇到活动 writer 时必须立即跳过且不改变 staging。"""
+
+    first_set = build_fs_repository_set(workspace_root=tmp_path)
+    first_repository = FsBatchingRepository(tmp_path, repository_set=first_set)
+    active_token = first_repository.begin_batch("AAPL")
+    staging_dir = first_set.core._active_batches[active_token.transaction_id].staging_ticker_dir
+    second_set = build_fs_repository_set(workspace_root=tmp_path)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        recovery = executor.submit(second_set.core.ensure_batch_recovery)
+        recovery.result(timeout=5)
+
+    assert staging_dir.is_dir()
+    assert active_token.transaction_id in first_set.core._active_batches
+    first_repository.rollback_batch(active_token)
 
 
 def _read_source_ids_in_process(workspace_root: str, connection: Connection) -> None:

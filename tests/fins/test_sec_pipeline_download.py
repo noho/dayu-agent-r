@@ -9,10 +9,12 @@ import json
 import logging
 import datetime as dt
 from collections.abc import AsyncIterator, Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path, PurePosixPath
-from typing import Optional, cast
+from threading import Event
+from typing import Literal, Optional, cast
 
 import pytest
 
@@ -23,6 +25,12 @@ from dayu.fins.downloaders.sec_downloader import (
     Sc13PartyRoles,
     SecDownloader,
     StoreDownloadedFile,
+    SecDownloadCancelledError,
+    _PrefetchEvent,
+    _PrefetchFailed,
+    _PrefetchedFile,
+    _PrefetchSkipped,
+    _PrefetchStarted,
     build_source_fingerprint,
 )
 from dayu.fins.domain.document_models import (
@@ -75,6 +83,8 @@ from dayu.fins.storage import (
     FsDocumentBlobRepository,
     FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
+    SourceIntegrityPreflightError,
+    SourceIntegrityPreflightReason,
 )
 from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
 from dayu.fins.storage.repository_protocols import (
@@ -897,6 +907,102 @@ class StubDownloader:
                 results.append(item)
         return results
 
+    async def prefetch_files_stream(
+        self,
+        remote_files: list[RemoteFileDescriptor],
+        *,
+        allow_not_modified: bool,
+        existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
+        primary_document: Optional[str] = None,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> AsyncIterator[_PrefetchEvent]:
+        """按固定测试结果产生 storage-neutral typed prefetch variants。
+
+        Args:
+            remote_files: 远端 descriptors。
+            allow_not_modified: 是否允许 304；测试按固定结果投影。
+            existing_files: 既有文件映射。
+            primary_document: 主文档名。
+            cancellation_checker: 可选取消检查器。
+
+        Yields:
+            started 与固定终态 prefetch variants。
+
+        Raises:
+            无。
+        """
+
+        del allow_not_modified, existing_files, primary_document, cancellation_checker
+        self.download_files_called = True
+        descriptors = {item.name: item for item in remote_files}
+        for item in self._download_results:
+            name = str(item.get("name", ""))
+            descriptor = descriptors.get(name)
+            if descriptor is None:
+                base = remote_files[0]
+                descriptor = RemoteFileDescriptor(
+                    name=name,
+                    source_url=str(item.get("source_url") or base.source_url),
+                    http_etag=base.http_etag,
+                    http_last_modified=base.http_last_modified,
+                    remote_size=base.remote_size,
+                    http_status=base.http_status,
+                )
+            yield _PrefetchStarted(descriptor=descriptor)
+            status = item.get("status")
+            if status == "downloaded":
+                payload = self._content_by_name.get(name, f"dummy:{name}".encode())
+                yield _PrefetchedFile(
+                    descriptor=descriptor,
+                    http_status=descriptor.http_status or 200,
+                    content=payload,
+                )
+            elif status == "skipped":
+                yield _PrefetchSkipped(
+                    descriptor=descriptor,
+                    http_status=304,
+                    reason_code="not_modified",
+                    reason_message="远端文件未修改，跳过重新下载",
+                )
+            else:
+                reason = str(item.get("reason_message") or "")
+                yield _PrefetchFailed(
+                    descriptor=descriptor,
+                    http_status=descriptor.http_status,
+                    reason_code=str(item.get("reason_code") or "download_failed"),
+                    reason_message=reason,
+                    error=reason,
+                )
+
+    def materialize_prefetched_event(
+        self,
+        event: _PrefetchEvent,
+        store_file: StoreDownloadedFile,
+        *,
+        batch: BatchToken,
+    ) -> DownloaderEvent:
+        """复用 production 唯一 materializer 处理测试 prefetch variant。
+
+        Args:
+            event: typed prefetch variant。
+            store_file: 真实 test storage callback。
+            batch: 真实 open batch capability。
+
+        Returns:
+            production mapping 产生的 downloader event。
+
+        Raises:
+            OSError: test storage callback 失败时抛出。
+            ValueError: batch 非法时抛出。
+        """
+
+        return SecDownloader.materialize_prefetched_event(
+            cast(SecDownloader, self),
+            event,
+            store_file,
+            batch=batch,
+        )
+
     async def download_files_stream(
         self,
         remote_files: list[RemoteFileDescriptor],
@@ -1147,6 +1253,85 @@ class StreamStubDownloader(StubDownloader):
             )
 
 
+class BarrierPrefetchDownloader(StubDownloader):
+    """用 Event 精确控制 Phase A prefetch 与 writer publication 顺序的测试下载器。"""
+
+    def __init__(
+        self,
+        *,
+        role: Literal["first", "second"],
+        submissions: dict[str, JsonValue],
+        remote_files: list[RemoteFileDescriptor],
+        download_results: list[DownloadFileResult],
+        first_prefetch_payload: bytes,
+        retry_payload: bytes,
+        second_prefetch_complete: Event,
+        first_source_committed: Event,
+    ) -> None:
+        """初始化 deterministic prefetch barrier。
+
+        Args:
+            role: first writer 或 second writer。
+            submissions: 固定 submissions。
+            remote_files: 固定 descriptors。
+            download_results: 固定文件结果。
+            first_prefetch_payload: 第一轮 payload。
+            retry_payload: identity churn 后重试 payload。
+            second_prefetch_complete: second 第一轮预取完成事件。
+            first_source_committed: first source commit 完成事件。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        super().__init__(
+            submissions=submissions,
+            remote_files=remote_files,
+            download_results=download_results,
+        )
+        self.role = role
+        self.first_prefetch_payload = first_prefetch_payload
+        self.retry_payload = retry_payload
+        self.second_prefetch_complete = second_prefetch_complete
+        self.first_source_committed = first_source_committed
+        self.prefetch_rounds = 0
+
+    async def prefetch_files_stream(
+        self,
+        remote_files: list[RemoteFileDescriptor],
+        *,
+        allow_not_modified: bool,
+        existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
+        primary_document: Optional[str] = None,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> AsyncIterator[_PrefetchEvent]:
+        """在第二 writer 旧预取完成与第一 writer commit 两处放置 Event barrier。"""
+
+        self.prefetch_rounds += 1
+        if self.role == "first":
+            ready = await asyncio.to_thread(self.second_prefetch_complete.wait, 5)
+            if not ready:
+                raise TimeoutError("second writer prefetch barrier 未到达")
+        payload = self.retry_payload if self.prefetch_rounds > 1 else self.first_prefetch_payload
+        self._content_by_name = {remote_files[0].name: payload}
+        async for event in super().prefetch_files_stream(
+            remote_files,
+            allow_not_modified=allow_not_modified,
+            existing_files=existing_files,
+            primary_document=primary_document,
+            cancellation_checker=cancellation_checker,
+        ):
+            yield event
+        if self.role == "second" and self.prefetch_rounds == 1:
+            self.second_prefetch_complete.set()
+            committed = await asyncio.to_thread(self.first_source_committed.wait, 5)
+            if not committed:
+                raise TimeoutError("first writer source commit barrier 未释放")
+
+
 class RebuildOnlyDownloader:
     """仅用于重建模式测试的下载器桩。"""
 
@@ -1293,6 +1478,39 @@ def _build_submissions() -> dict[str, JsonValue]:
                 "reportDate": ["2024-12-31"],
                 "accessionNumber": ["0000000000-25-000001"],
                 "primaryDocument": ["sample-10k.htm"],
+            },
+            "files": [],
+        },
+    }
+
+
+def _build_single_filing_submissions(
+    *,
+    accession_number: str,
+    primary_document: str,
+) -> dict[str, JsonValue]:
+    """构造一个指定 accession identity 的 SEC submissions。
+
+    Args:
+        accession_number: 精确 accession number。
+        primary_document: 精确主文档名。
+
+    Returns:
+        只包含指定 filing 的 submissions JSON。
+
+    Raises:
+        无。
+    """
+
+    return {
+        "tickers": ["AAPL", "APC"],
+        "filings": {
+            "recent": {
+                "form": ["10-K"],
+                "filingDate": ["2025-02-01"],
+                "reportDate": ["2024-12-31"],
+                "accessionNumber": [accession_number],
+                "primaryDocument": [primary_document],
             },
             "files": [],
         },
@@ -2943,9 +3161,9 @@ def test_sec_pipeline_skip_with_etag_gzip_variant_without_re_download(tmp_path: 
 @pytest.mark.parametrize(
     ("existing_download_version", "expected_status", "expected_skip_reason"),
     [
-        (SEC_PIPELINE_DOWNLOAD_VERSION, "skipped", "not_modified"),
-        ("legacy-download-version", "downloaded", None),
-        (None, "downloaded", None),
+        (SEC_PIPELINE_DOWNLOAD_VERSION, "skipped", "integrity_complete"),
+        ("legacy-download-version", "skipped", "integrity_complete"),
+        (None, "skipped", "integrity_complete"),
     ],
 )
 def test_sec_pipeline_all_files_not_modified_respects_download_version(
@@ -2998,15 +3216,15 @@ def test_sec_pipeline_all_files_not_modified_respects_download_version(
     result = pipeline.download(ticker="AAPL", overwrite=False, start_is_explicit=False)
     after_text = meta_path.read_text(encoding="utf-8")
 
-    assert downloader.download_files_called is True
+    assert downloader.download_files_called is False
     assert result["filings"][0]["status"] == expected_status
     assert result["filings"][0].get("skip_reason") == expected_skip_reason
-    if expected_skip_reason == "not_modified":
+    if expected_skip_reason == "integrity_complete":
         assert result["summary"]["skipped"] == 1
         assert result["summary"]["downloaded"] == 0
         assert before_text == after_text
-        assert result["filings"][0]["reason_code"] == "not_modified"
-        assert "未修改" in str(result["filings"][0]["reason_message"])
+        assert result["filings"][0]["reason_code"] == "integrity_complete"
+        assert "完整" in str(result["filings"][0]["reason_message"])
         return
 
     assert result["summary"]["skipped"] == 0
@@ -4328,6 +4546,77 @@ def test_sec_pipeline_sc13_direction_filters_gs_like_records(tmp_path: Path) -> 
     ).exists()
 
 
+def test_sec_pipeline_sc13_transport_failure_publishes_registry_only(
+    tmp_path: Path,
+) -> None:
+    """SC13 rejected artifact transport failure 必须保留 registry-only durable 语义。
+
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: transport typed failure 未回退到 registry-only 或伪造 artifact 时抛出。
+    """
+
+    accession_number = "0000000000-25-000703"
+    document_id = f"fil_{accession_number}"
+    submissions: dict[str, JsonValue] = {
+        "filings": {
+            "recent": {
+                "form": ["SC 13G"],
+                "filingDate": ["2025-08-12"],
+                "reportDate": [""],
+                "accessionNumber": [accession_number],
+                "primaryDocument": ["sc13g-failed.htm"],
+                "fileNumber": ["005-10003"],
+            },
+            "files": [],
+        }
+    }
+    descriptor = RemoteFileDescriptor(
+        name="sc13g-failed.htm",
+        source_url="https://example.com/sc13g-failed.htm",
+        http_etag=None,
+        http_last_modified=None,
+        remote_size=None,
+        http_status=503,
+    )
+    downloader = StubDownloader(
+        submissions=submissions,
+        remote_files=[descriptor],
+        download_results=[
+            {
+                "name": descriptor.name,
+                "status": "failed",
+                "source_url": descriptor.source_url,
+                "reason_code": "provider_unavailable",
+                "reason_message": "来源暂不可用",
+            }
+        ],
+        sc13_roles_by_accession={accession_number: ("320193", "999999")},
+    )
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=downloader,
+        processor_registry=build_fins_processor_registry(),
+    )
+
+    result = pipeline.download(
+        ticker="GS",
+        form_type="SC13D/G",
+        overwrite=False,
+        start_is_explicit=False,
+    )
+
+    registry_payload = json.loads(_download_rejections_path(tmp_path, "GS").read_text(encoding="utf-8"))
+    assert result["summary"]["total"] == 0
+    assert registry_payload[document_id]["reason"] == "sc13_direction_rejected"
+    assert not _rejected_meta_path(tmp_path, "GS", document_id).exists()
+
+
 def test_sec_pipeline_sc13_direction_keeps_aapl_like_records(tmp_path: Path) -> None:
     """验证 AAPL-like 场景仅保留“别人持股 ticker”的 SC13。"""
 
@@ -4797,3 +5086,432 @@ def test_sc13_retry_warns_after_max_retries(tmp_path: Path) -> None:
     # 最大重试后仍无 SC 13 → 应有缺失警告
     warnings = result.get("warnings") or []
     assert any("SC 13D/G" in w for w in warnings)
+
+
+@pytest.mark.parametrize("corruption", ["size", "digest", "missing"])
+def test_sec_top_level_repairs_selected_corruption_before_company_mutation(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    """真实 SEC top-level overwrite=False 必须修复唯一 selected corruption。"""
+
+    meta_path = _seed_complete_sec_source(workspace_root=tmp_path)
+    payload_path = meta_path.parent / "sample-10k.htm"
+    old_payload = payload_path.read_bytes()
+    if corruption == "size":
+        payload_path.write_bytes(old_payload + b"-corrupt")
+    elif corruption == "digest":
+        payload_path.write_bytes(b"X" * len(old_payload))
+    else:
+        payload_path.unlink()
+    replacement = b"<html>repaired</html>"
+    downloader = StubDownloader(
+        submissions=_build_submissions(),
+        remote_files=[_make_descriptor("etag-repair")],
+        download_results=[
+            {
+                "name": "sample-10k.htm",
+                "status": "downloaded",
+                "source_url": "https://example.com/sample-10k.htm",
+                "http_etag": "etag-repair",
+            }
+        ],
+        content_by_name={"sample-10k.htm": replacement},
+    )
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=downloader,
+        processor_registry=build_fins_processor_registry(),
+    )
+
+    result = pipeline.download(
+        ticker="AAPL",
+        overwrite=False,
+        start_is_explicit=False,
+    )
+
+    assert result["summary"]["downloaded"] == 1
+    with pipeline._source_repository.read_source_snapshot(
+        "AAPL",
+        "fil_0000000000-25-000001",
+        SourceKind.FILING,
+        materialize_files=True,
+    ) as snapshot:
+        with snapshot.get_primary_source().open() as stream:
+            assert stream.read() == replacement
+
+
+def test_sec_top_level_unselected_corruption_fails_before_company_batch(
+    tmp_path: Path,
+) -> None:
+    """未选中 corruption 必须在任何 company/source/rejection mutation 前 typed fail closed。"""
+
+    meta_path = _seed_complete_sec_source(
+        workspace_root=tmp_path,
+        document_id="fil_unselected",
+    )
+    (meta_path.parent / "sample-10k.htm").unlink()
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=StubDownloader(
+            submissions=_build_submissions(),
+            remote_files=[_make_descriptor("etag")],
+            download_results=[],
+        ),
+        processor_registry=build_fins_processor_registry(),
+    )
+
+    with pytest.raises(SourceIntegrityPreflightError) as exc_info:
+        pipeline.download(
+            ticker="AAPL",
+            overwrite=False,
+            start_is_explicit=False,
+        )
+
+    assert exc_info.value.reason is SourceIntegrityPreflightReason.UNSELECTED_REPAIR_REQUIRED
+    with pytest.raises(FileNotFoundError):
+        pipeline._company_repository.get_company_meta("AAPL")
+
+
+def test_sec_same_target_overwrite_discards_stale_prefetch_and_last_writer_wins(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同 target 双 overwrite 都成功，后 writer 必须丢弃旧 payload 并重新预取。"""
+
+    second_prefetch_complete = Event()
+    first_source_committed = Event()
+    remote_files = [_make_descriptor("etag-race")]
+    download_results: list[DownloadFileResult] = [
+        {
+            "name": "sample-10k.htm",
+            "status": "downloaded",
+            "source_url": "https://example.com/sample-10k.htm",
+        }
+    ]
+    first_downloader = BarrierPrefetchDownloader(
+        role="first",
+        submissions=_build_submissions(),
+        remote_files=remote_files,
+        download_results=download_results,
+        first_prefetch_payload=b"writer-a",
+        retry_payload=b"unused-a",
+        second_prefetch_complete=second_prefetch_complete,
+        first_source_committed=first_source_committed,
+    )
+    second_downloader = BarrierPrefetchDownloader(
+        role="second",
+        submissions=_build_submissions(),
+        remote_files=remote_files,
+        download_results=download_results,
+        first_prefetch_payload=b"writer-b-stale",
+        retry_payload=b"writer-b-final",
+        second_prefetch_complete=second_prefetch_complete,
+        first_source_committed=first_source_committed,
+    )
+    first_pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=first_downloader,
+        processor_registry=build_fins_processor_registry(),
+    )
+    second_pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=second_downloader,
+        processor_registry=build_fins_processor_registry(),
+    )
+    original_first_commit = first_pipeline._batching_repository.commit_batch
+
+    def observe_first_source_commit(batch: BatchToken) -> None:
+        """在真实 commit 后仅当 target 已完整时释放 second writer。"""
+
+        original_first_commit(batch)
+        classification = first_pipeline._source_repository.classify_source_integrity(
+            "AAPL",
+            "fil_0000000000-25-000001",
+            SourceKind.FILING,
+        )
+        if classification.status.value == "complete":
+            first_source_committed.set()
+
+    monkeypatch.setattr(
+        first_pipeline._batching_repository,
+        "commit_batch",
+        observe_first_source_commit,
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(
+            first_pipeline.download,
+            "AAPL",
+            overwrite=True,
+            start_is_explicit=False,
+        )
+        second_future = executor.submit(
+            second_pipeline.download,
+            "AAPL",
+            overwrite=True,
+            start_is_explicit=False,
+        )
+        first_result = first_future.result(timeout=10)
+        second_result = second_future.result(timeout=10)
+
+    assert first_result["summary"]["downloaded"] == 1
+    assert second_result["summary"]["downloaded"] == 1
+    assert first_downloader.prefetch_rounds == 1
+    assert second_downloader.prefetch_rounds == 2
+    with second_pipeline._source_repository.read_source_snapshot(
+        "AAPL",
+        "fil_0000000000-25-000001",
+        SourceKind.FILING,
+        materialize_files=True,
+    ) as snapshot:
+        with snapshot.get_primary_source().open() as stream:
+            assert stream.read() == b"writer-b-final"
+
+
+def test_sec_different_target_overwrite_writers_publish_union(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同 ticker 不同 target writer 必须从 latest tree 发布最终 union。"""
+
+    second_prefetch_complete = Event()
+    first_source_committed = Event()
+    first_descriptor = RemoteFileDescriptor(
+        name="sample-10k-a.htm",
+        source_url="https://example.com/sample-10k-a.htm",
+        http_etag="etag-a",
+        http_last_modified=None,
+        remote_size=None,
+        http_status=200,
+    )
+    second_descriptor = RemoteFileDescriptor(
+        name="sample-10k-b.htm",
+        source_url="https://example.com/sample-10k-b.htm",
+        http_etag="etag-b",
+        http_last_modified=None,
+        remote_size=None,
+        http_status=200,
+    )
+    first_downloader = BarrierPrefetchDownloader(
+        role="first",
+        submissions=_build_single_filing_submissions(
+            accession_number="0000000000-25-000001",
+            primary_document=first_descriptor.name,
+        ),
+        remote_files=[first_descriptor],
+        download_results=[
+            {
+                "name": first_descriptor.name,
+                "status": "downloaded",
+                "source_url": first_descriptor.source_url,
+            }
+        ],
+        first_prefetch_payload=b"target-a",
+        retry_payload=b"unused-a",
+        second_prefetch_complete=second_prefetch_complete,
+        first_source_committed=first_source_committed,
+    )
+    second_downloader = BarrierPrefetchDownloader(
+        role="second",
+        submissions=_build_single_filing_submissions(
+            accession_number="0000000000-25-000002",
+            primary_document=second_descriptor.name,
+        ),
+        remote_files=[second_descriptor],
+        download_results=[
+            {
+                "name": second_descriptor.name,
+                "status": "downloaded",
+                "source_url": second_descriptor.source_url,
+            }
+        ],
+        first_prefetch_payload=b"target-b",
+        retry_payload=b"unused-b",
+        second_prefetch_complete=second_prefetch_complete,
+        first_source_committed=first_source_committed,
+    )
+    first_pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=first_downloader,
+        processor_registry=build_fins_processor_registry(),
+    )
+    second_pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=second_downloader,
+        processor_registry=build_fins_processor_registry(),
+    )
+    original_first_commit = first_pipeline._batching_repository.commit_batch
+
+    def release_second_after_first_source(batch: BatchToken) -> None:
+        """在 target A 真实 publication 后释放 target B。"""
+
+        original_first_commit(batch)
+        try:
+            first_pipeline._source_repository.get_source_meta(
+                "AAPL",
+                "fil_0000000000-25-000001",
+                SourceKind.FILING,
+            )
+        except FileNotFoundError:
+            return
+        first_source_committed.set()
+
+    monkeypatch.setattr(
+        first_pipeline._batching_repository,
+        "commit_batch",
+        release_second_after_first_source,
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(
+            first_pipeline.download,
+            "AAPL",
+            overwrite=True,
+            start_is_explicit=False,
+        )
+        second_future = executor.submit(
+            second_pipeline.download,
+            "AAPL",
+            overwrite=True,
+            start_is_explicit=False,
+        )
+        first_result = first_future.result(timeout=10)
+        second_result = second_future.result(timeout=10)
+
+    assert first_result["summary"]["downloaded"] == 1
+    assert second_result["summary"]["downloaded"] == 1
+    assert first_downloader.prefetch_rounds == 1
+    assert second_downloader.prefetch_rounds == 1
+    for document_id, expected in (
+        ("fil_0000000000-25-000001", b"target-a"),
+        ("fil_0000000000-25-000002", b"target-b"),
+    ):
+        with second_pipeline._source_repository.read_source_snapshot(
+            "AAPL",
+            document_id,
+            SourceKind.FILING,
+            materialize_files=True,
+        ) as snapshot:
+            with snapshot.get_primary_source().open() as stream:
+                assert stream.read() == expected
+
+
+def test_rejected_prefetch_cancelled_before_begin_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """rejected prefetch 返回后取消必须发生在 begin_batch 前。"""
+
+    descriptor = RemoteFileDescriptor(
+        name="sample-6k.htm",
+        source_url="https://example.com/sample-6k.htm",
+        http_etag="etag-rejected",
+        http_last_modified=None,
+        remote_size=None,
+        http_status=200,
+    )
+    downloader = StubDownloader(
+        submissions=_build_foreign_submissions(),
+        remote_files=[descriptor],
+        download_results=[
+            {
+                "name": descriptor.name,
+                "status": "downloaded",
+                "source_url": descriptor.source_url,
+            }
+        ],
+    )
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=downloader,
+        processor_registry=build_fins_processor_registry(),
+    )
+    begin_called = False
+
+    def observe_begin(ticker: str) -> BatchToken:
+        """记录任何越过取消 gate 的 batch 开启。"""
+
+        del ticker
+        nonlocal begin_called
+        begin_called = True
+        raise AssertionError("取消后不得 begin_batch")
+
+    monkeypatch.setattr(pipeline._batching_repository, "begin_batch", observe_begin)
+    filing = _sec_filing_collection.FilingRecord(
+        form_type="6-K",
+        filing_date="2025-08-01",
+        report_date="2024-12-31",
+        accession_number="0000000000-25-000101",
+        primary_document=descriptor.name,
+    )
+
+    with pytest.raises(SecDownloadCancelledError):
+        asyncio.run(
+            pipeline._persist_rejected_filing_artifact(
+                ticker="TCOM",
+                cik="320193",
+                filing=filing,
+                remote_files=[descriptor],
+                overwrite=True,
+                rejection_reason="6k_filtered",
+                rejection_category="EXCLUDE_NON_QUARTERLY",
+                selected_primary_document=descriptor.name,
+                source_fingerprint="fingerprint",
+                registry_after={},
+                cancel_checker=lambda: True,
+            )
+        )
+
+    assert downloader.download_files_called is True
+    assert begin_called is False
+
+
+def test_sec_selected_repair_that_6k_policy_rejects_fails_before_mutation(
+    tmp_path: Path,
+) -> None:
+    """selected repair 在 6-K Phase A 被拒时必须保留全部 old facts。"""
+
+    document_id = "fil_0000000000-25-000101"
+    meta_path = _seed_complete_sec_source(
+        workspace_root=tmp_path,
+        ticker="TCOM",
+        document_id=document_id,
+    )
+    payload_path = meta_path.parent / "sample-10k.htm"
+    payload_path.write_bytes(payload_path.read_bytes() + b"-corrupt")
+    old_meta = meta_path.read_bytes()
+    old_payload = payload_path.read_bytes()
+    descriptor = RemoteFileDescriptor(
+        name="sample-6k.htm",
+        source_url="https://example.com/sample-6k.htm",
+        http_etag="etag-6k-reject",
+        http_last_modified=None,
+        remote_size=None,
+        http_status=200,
+    )
+    downloader = StubDownloader(
+        submissions=_build_foreign_submissions(),
+        remote_files=[descriptor],
+        download_results=[
+            {
+                "name": descriptor.name,
+                "status": "downloaded",
+                "source_url": descriptor.source_url,
+            }
+        ],
+        content_by_name={descriptor.name: b"Annual general meeting voting results."},
+    )
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=downloader,
+        processor_registry=build_fins_processor_registry(),
+    )
+
+    with pytest.raises(SourceIntegrityPreflightError) as exc_info:
+        pipeline.download(ticker="TCOM", overwrite=False, start_is_explicit=False)
+
+    assert exc_info.value.reason is SourceIntegrityPreflightReason.SELECTED_REJECTED_REPAIR_REQUIRED
+    assert meta_path.read_bytes() == old_meta
+    assert payload_path.read_bytes() == old_payload
+    assert not _company_meta_path(tmp_path, "TCOM").exists()
+    assert not _download_rejections_path(tmp_path, "TCOM").exists()
+    assert not _rejected_meta_path(tmp_path, "TCOM", document_id).exists()

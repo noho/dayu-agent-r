@@ -26,6 +26,10 @@ from dayu.fins.downloaders.sec_downloader import (
     SecDownloadCancelledError,
     SecDownloader,
     StoreDownloadedFile,
+    _PrefetchEvent,
+    _PrefetchFailed,
+    _PrefetchedFile,
+    _PrefetchStarted,
 )
 from dayu.fins.ingestion_runtime import FinsDownloadProgressEvent
 from dayu.fins.download_contract import (
@@ -74,6 +78,50 @@ class StreamStubDownloader(SecDownloader):
         """初始化下载器桩。"""
 
         self.configure_called = False
+
+    async def prefetch_files_stream(
+        self,
+        remote_files: list[RemoteFileDescriptor],
+        *,
+        allow_not_modified: bool,
+        existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
+        primary_document: Optional[str] = None,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> AsyncIterator[_PrefetchEvent]:
+        """为 pipeline 测试产生无 storage callback 的固定 prefetch variants。
+
+        Args:
+            remote_files: 远端 descriptors。
+            allow_not_modified: 是否允许 conditional transport。
+            existing_files: 既有文件映射。
+            primary_document: 主文档名。
+            cancellation_checker: 可选取消检查器。
+
+        Yields:
+            started 与 downloaded/failed typed variants。
+
+        Raises:
+            无。
+        """
+
+        del allow_not_modified, existing_files, primary_document, cancellation_checker
+        for descriptor in remote_files:
+            yield _PrefetchStarted(descriptor=descriptor)
+            if isinstance(self, FailingStreamStubDownloader):
+                yield _PrefetchFailed(
+                    descriptor=descriptor,
+                    http_status=descriptor.http_status,
+                    reason_code="download_failed",
+                    reason_message="测试下载失败",
+                    error="测试下载失败",
+                )
+                continue
+            payload = b"<xbrl></xbrl>" if descriptor.name.endswith(".xml") else b"<html>payload</html>"
+            yield _PrefetchedFile(
+                descriptor=descriptor,
+                http_status=descriptor.http_status or 200,
+                content=payload,
+            )
 
     def configure(self, user_agent: Optional[str], sleep_seconds: float, max_retries: int) -> None:
         """记录配置调用。"""
@@ -748,10 +796,10 @@ def test_failed_sec_download_rolls_back_and_retry_publishes_complete_source(tmp_
     assert completed_meta["files"][0]["name"] == "sample-10k.htm"
 
 
-def test_download_stream_final_status_does_not_recheck_cancel_token(
+def test_download_stream_repair_gate_rechecks_cancel_before_company_batch(
     tmp_path: Path,
 ) -> None:
-    """最终状态只使用已记录取消路径，不在收尾阶段重读取消 token。"""
+    """whole-tree repair gate 后、company batch 前必须主动重读取消 token。"""
 
     pipeline = SecPipeline(
         workspace_root=tmp_path,
@@ -789,8 +837,8 @@ def test_download_stream_final_status_does_not_recheck_cancel_token(
     )
     final_result = _event_pipeline_result(events[-1])
 
-    assert final_result["status"] == "ok"
-    assert call_count == 1
+    assert final_result["status"] == "cancelled"
+    assert call_count == 2
 
 
 def test_download_stream_cancel_stops_during_collection_before_filing_requests(

@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import threading
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -143,9 +144,7 @@ def _source_meta_without_revision(
     """
 
     return {
-        field_name: field_value
-        for field_name, field_value in meta.items()
-        if field_name != _SOURCE_REVISION_META_FIELD
+        field_name: field_value for field_name, field_value in meta.items() if field_name != _SOURCE_REVISION_META_FIELD
     }
 
 
@@ -190,9 +189,7 @@ def _project_runtime_lock_error(
             action=f"{action}底层文件系统",
         )
     elif raw_cause is not None:
-        projected_error.__cause__ = RuntimeError(
-            f"{action}底层失败: error_type={raw_cause.__class__.__name__}"
-        )
+        projected_error.__cause__ = RuntimeError(f"{action}底层失败: error_type={raw_cause.__class__.__name__}")
     projected_error.__suppress_context__ = True
     return projected_error
 
@@ -232,9 +229,7 @@ def _acquire_storage_lock_token(
             _raise_path_free_error(busy_error)
         _raise_path_free_error(projected_error)
     except RuntimeFileLockError as exc:
-        _raise_path_free_error(
-            _project_runtime_lock_error(exc, action="获取 storage lock")
-        )
+        _raise_path_free_error(_project_runtime_lock_error(exc, action="获取 storage lock"))
 
 
 def _release_storage_lock_token(token: RuntimeFileLockToken) -> None:
@@ -254,13 +249,9 @@ def _release_storage_lock_token(token: RuntimeFileLockToken) -> None:
     try:
         token.release()
     except RuntimeFileLockError as exc:
-        _raise_path_free_error(
-            _project_runtime_lock_error(exc, action="释放 storage lock")
-        )
+        _raise_path_free_error(_project_runtime_lock_error(exc, action="释放 storage lock"))
     except OSError as exc:
-        _raise_path_free_error(
-            _project_filesystem_error(exc, action="释放 storage lock")
-        )
+        _raise_path_free_error(_project_filesystem_error(exc, action="释放 storage lock"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,10 +300,31 @@ def _hash_regular_file_sha256(path: Path) -> str:
             while chunk := stream.read(64 * 1024):
                 digest.update(chunk)
     except OSError as exc:
-        _raise_path_free_error(
-            _project_filesystem_error(exc, action="读取 complete source 文件")
-        )
+        _raise_path_free_error(_project_filesystem_error(exc, action="读取 complete source 文件"))
     return digest.hexdigest()
+
+
+def _require_canonical_sha256(value: JsonValue, *, label: str) -> str:
+    """校验并返回 canonical SHA-256 摘要。
+
+    Args:
+        value: source meta 中的摘要值。
+        label: path-free 业务定位标签。
+
+    Returns:
+        64 位小写十六进制摘要。
+
+    Raises:
+        ValueError: 摘要不是 canonical SHA-256 字符串时抛出。
+    """
+
+    if not isinstance(value, str) or len(value) != 64 or value != value.lower():
+        raise ValueError(f"source file.sha256 必须为64位小写十六进制字符串: {label}")
+    try:
+        int(value, 16)
+    except ValueError as exc:
+        raise ValueError(f"source file.sha256 必须为64位小写十六进制字符串: {label}") from exc
+    return value
 
 
 def _parse_backup_directory_name(name: str) -> tuple[str, str] | None:
@@ -375,9 +387,7 @@ def _is_contained_recovery_path(path: Path, root: Path) -> bool:
     except ValueError:
         return False
     except OSError as exc:
-        _raise_path_free_error(
-            _project_filesystem_error(exc, action="校验 recovery locator")
-        )
+        _raise_path_free_error(_project_filesystem_error(exc, action="校验 recovery locator"))
     try:
         current = path
         while current != root:
@@ -389,9 +399,7 @@ def _is_contained_recovery_path(path: Path, root: Path) -> bool:
             current = parent
         return not root.is_symlink()
     except OSError as exc:
-        _raise_path_free_error(
-            _project_filesystem_error(exc, action="校验 recovery symlink 链")
-        )
+        _raise_path_free_error(_project_filesystem_error(exc, action="校验 recovery symlink 链"))
 
 
 class _FsStorageInfra:
@@ -427,9 +435,7 @@ class _FsStorageInfra:
         try:
             self.workspace_root = workspace_root.resolve()
         except OSError as exc:
-            _raise_path_free_error(
-                _project_filesystem_error(exc, action="解析 storage workspace")
-            )
+            _raise_path_free_error(_project_filesystem_error(exc, action="解析 storage workspace"))
         self.portfolio_root = self.workspace_root / "portfolio"
         self.dayu_root = self.workspace_root / _DAYU_DIRNAME
         self.batch_root = self.dayu_root / _BATCH_ROOT_DIRNAME
@@ -440,15 +446,15 @@ class _FsStorageInfra:
         self._batch_recovery_completed = False
         self._active_batches: dict[str, _ActiveBatchState] = {}
         self._active_transaction_by_ticker: dict[str, str] = {}
+        self._batch_condition = threading.Condition()
+        self._reserved_batch_tickers: set[str] = set()
         self._file_store = file_store
         if create_directories:
             try:
                 self.portfolio_root.mkdir(parents=True, exist_ok=True)
                 self._ensure_batch_storage_dirs()
             except OSError as exc:
-                _raise_path_free_error(
-                    _project_filesystem_error(exc, action="初始化 storage workspace")
-                )
+                _raise_path_free_error(_project_filesystem_error(exc, action="初始化 storage workspace"))
 
     def ensure_batch_recovery(self) -> tuple[str, ...]:
         """确保当前工作区的 batch 孤儿状态已完成一次恢复。
@@ -482,18 +488,15 @@ class _FsStorageInfra:
 
         Raises:
             ValueError: ticker 非法时抛出。
-            RuntimeError: 同一 ticker 已存在活动事务时抛出。
+            RuntimeError: 本地 reservation 或跨进程 writer lock 失败时抛出。
             RuntimeFileLockError: writer lock 获取或初始化失败后的释放失败时抛出。
             OSError: 暂存目录准备失败时抛出。
         """
 
         external_ticker = _require_external_identity(ticker, field_name="ticker")
-        if external_ticker in self._active_transaction_by_ticker:
-            raise RuntimeError(f"ticker={external_ticker} 已存在活动 batch")
-
-        self._ensure_batch_storage_dirs()
-        self.ensure_batch_recovery()
-        lock_token = self._acquire_ticker_lock(external_ticker)
+        self._reserve_batch_ticker(external_ticker)
+        lock_token: RuntimeFileLockToken | None = None
+        registered = False
         transaction_id = uuid.uuid4().hex
         ticker_key = _derive_storage_key(_TICKER_IDENTITY_NAMESPACE, external_ticker)
         target_ticker_dir = self._target_ticker_dir(external_ticker)
@@ -505,18 +508,22 @@ class _FsStorageInfra:
             transaction_id=transaction_id,
             ticker=external_ticker,
         )
-        state = _ActiveBatchState(
-            token=token,
-            lifecycle=_BATCH_LIFECYCLE_OPEN,
-            writer_lock_token=lock_token,
-            target_ticker_dir=target_ticker_dir,
-            staging_root_dir=staging_root_dir,
-            staging_ticker_dir=staging_ticker_dir,
-            backup_dir=backup_dir,
-            journal_path=journal_path,
-            phase=_PHASE_STARTED,
-        )
         try:
+            self._ensure_batch_storage_dirs()
+            self.ensure_batch_recovery()
+            # 复杂逻辑说明：跨进程 writer 必须阻塞等待；本地 Condition 只串行化同实例。
+            lock_token = self._acquire_ticker_lock(external_ticker)
+            state = _ActiveBatchState(
+                token=token,
+                lifecycle=_BATCH_LIFECYCLE_OPEN,
+                writer_lock_token=lock_token,
+                target_ticker_dir=target_ticker_dir,
+                staging_root_dir=staging_root_dir,
+                staging_ticker_dir=staging_ticker_dir,
+                backup_dir=backup_dir,
+                journal_path=journal_path,
+                phase=_PHASE_STARTED,
+            )
             self._write_batch_journal(state, _PHASE_STARTED)
             if target_ticker_dir.exists() or target_ticker_dir.is_symlink():
                 _read_identity_descriptor(
@@ -549,21 +556,28 @@ class _FsStorageInfra:
                     cleanup_error,
                     action="batch staging cleanup failed",
                 )
-            try:
-                self._release_lock_token(lock_token)
-            except Exception as release_error:
-                _append_secondary_error_note(
-                    primary_error,
-                    release_error,
-                    action="writer mutex release failed during batch initialization",
-                )
+            if lock_token is not None:
+                try:
+                    self._release_lock_token(lock_token)
+                except Exception as release_error:
+                    _append_secondary_error_note(
+                        primary_error,
+                        release_error,
+                        action="writer mutex release failed during batch initialization",
+                    )
             if primary_error is raw_primary_error:
                 raise
             _raise_path_free_error(primary_error)
-
-        self._active_batches[transaction_id] = state
-        self._active_transaction_by_ticker[external_ticker] = transaction_id
-        return token
+        else:
+            with self._batch_condition:
+                self._active_batches[transaction_id] = state
+                self._active_transaction_by_ticker[external_ticker] = transaction_id
+                self._reserved_batch_tickers.discard(external_ticker)
+                registered = True
+            return token
+        finally:
+            if not registered:
+                self._release_batch_ticker_reservation(external_ticker)
 
     def commit_batch(self, batch: BatchToken) -> None:
         """提交批处理事务，并在任一 terminal 路径消费 capability。
@@ -637,9 +651,7 @@ class _FsStorageInfra:
         if commit_error is not None:
             self._close_active_batch(state, primary_error=commit_error)
             if rollback_error is not None:
-                commit_error.add_note(
-                    "commit_batch rollback failed; journal/backup/staging recovery evidence retained"
-                )
+                commit_error.add_note("commit_batch rollback failed; journal/backup/staging recovery evidence retained")
                 Log.warn(
                     f"commit_batch 与 rollback 均失败，已保留恢复证据: ticker={state.token.ticker}",
                     module=self.MODULE,
@@ -663,9 +675,7 @@ class _FsStorageInfra:
                 _append_secondary_error_note(
                     terminal_error,
                     cleanup_error,
-                    action=(
-                        "post-commit cleanup failed after publication guard release failure"
-                    ),
+                    action=("post-commit cleanup failed after publication guard release failure"),
                 )
                 Log.warn(
                     "publication guard 释放主异常后 post-commit cleanup 失败，"
@@ -738,11 +748,7 @@ class _FsStorageInfra:
             state.staging_ticker_dir,
             label=f"{source_kind.value} source root",
         )
-        manifest_name = (
-            "filing_manifest.json"
-            if source_kind is SourceKind.FILING
-            else "material_manifest.json"
-        )
+        manifest_name = "filing_manifest.json" if source_kind is SourceKind.FILING else "material_manifest.json"
         manifest_path = source_root / manifest_name
         source_directories: dict[str, Path] = {}
         for child in _list_directory(source_root, action="枚举 complete source root"):
@@ -750,22 +756,14 @@ class _FsStorageInfra:
                 raise ValueError("source root 禁止 symlink 条目")
             if child.name == manifest_name:
                 continue
-            if (
-                source_kind is SourceKind.FILING
-                and child.name == _DOWNLOAD_REJECTIONS_FILENAME
-            ):
+            if source_kind is SourceKind.FILING and child.name == _DOWNLOAD_REJECTIONS_FILENAME:
                 continue
-            if (
-                source_kind is SourceKind.FILING
-                and child.name == _REJECTED_FILINGS_DIRNAME
-            ):
+            if source_kind is SourceKind.FILING and child.name == _REJECTED_FILINGS_DIRNAME:
                 continue
             if not child.is_dir():
                 raise ValueError("source root 存在非法非目录条目")
             identity_namespace = (
-                _FILING_IDENTITY_NAMESPACE
-                if source_kind is SourceKind.FILING
-                else _MATERIAL_IDENTITY_NAMESPACE
+                _FILING_IDENTITY_NAMESPACE if source_kind is SourceKind.FILING else _MATERIAL_IDENTITY_NAMESPACE
             )
             document_id = _read_identity_descriptor(child, identity_namespace)
             if document_id in source_directories:
@@ -780,14 +778,10 @@ class _FsStorageInfra:
         manifest_ids = set(manifest_items)
         missing_manifest_ids = sorted(source_ids - manifest_ids)
         if missing_manifest_ids:
-            raise ValueError(
-                f"source 缺少 manifest 项目: {','.join(missing_manifest_ids)}"
-            )
+            raise ValueError(f"source 缺少 manifest 项目: {','.join(missing_manifest_ids)}")
         dangling_manifest_ids = sorted(manifest_ids - source_ids)
         if dangling_manifest_ids:
-            raise ValueError(
-                f"manifest 存在 dangling source: {','.join(dangling_manifest_ids)}"
-            )
+            raise ValueError(f"manifest 存在 dangling source: {','.join(dangling_manifest_ids)}")
 
         validated_meta: dict[str, dict[str, JsonValue]] = {}
         for document_id, source_dir in source_directories.items():
@@ -963,8 +957,7 @@ class _FsStorageInfra:
                 label=f"source file {document_id}/{name}",
             )
             expected_uri = (
-                f"local://{state.staging_ticker_dir.name}/{_source_dir_name(source_kind)}/"
-                f"{source_dir.name}/{name}"
+                f"local://{state.staging_ticker_dir.name}/{_source_dir_name(source_kind)}/{source_dir.name}/{name}"
             )
             if raw_file.get("uri") != expected_uri:
                 raise ValueError(f"source file.uri 与 staged physical file 不一致: {document_id}/{name}")
@@ -985,9 +978,11 @@ class _FsStorageInfra:
                     raise ValueError(f"source file.size 与 physical file 不一致: {document_id}/{name}")
             raw_sha256 = raw_file.get("sha256")
             if raw_sha256 is not None:
-                if not isinstance(raw_sha256, str) or not raw_sha256:
-                    raise ValueError(f"source file.sha256 必须为非空字符串: {document_id}/{name}")
-                if _hash_regular_file_sha256(physical_path) != raw_sha256:
+                expected_sha256 = _require_canonical_sha256(
+                    raw_sha256,
+                    label=f"{document_id}/{name}",
+                )
+                if _hash_regular_file_sha256(physical_path) != expected_sha256:
                     raise ValueError(f"source file.sha256 与 physical file 不一致: {document_id}/{name}")
 
         physical_file_names: set[str] = set()
@@ -1062,9 +1057,7 @@ class _FsStorageInfra:
         except ValueError:
             _raise_path_free_error(ValueError(f"{label} 越出 staging root"))
         except OSError as exc:
-            _raise_path_free_error(
-                _project_filesystem_error(exc, action="校验 storage containment")
-            )
+            _raise_path_free_error(_project_filesystem_error(exc, action="校验 storage containment"))
 
     def _replace_directory(self, source: Path, target: Path) -> None:
         """原子移动目录并刷新受影响的父目录。
@@ -1096,9 +1089,7 @@ class _FsStorageInfra:
         try:
             os.replace(source, target)
         except OSError as exc:
-            _raise_path_free_error(
-                _project_filesystem_error(exc, action="原子替换 storage directory")
-            )
+            _raise_path_free_error(_project_filesystem_error(exc, action="原子替换 storage directory"))
         _fsync_directory(source_parent)
         if target_parent != source_parent:
             _fsync_directory(target_parent)
@@ -1120,9 +1111,7 @@ class _FsStorageInfra:
         try:
             shutil.rmtree(path)
         except OSError as exc:
-            _raise_path_free_error(
-                _project_filesystem_error(exc, action="删除 storage directory")
-            )
+            _raise_path_free_error(_project_filesystem_error(exc, action="删除 storage directory"))
         _fsync_directory(parent)
 
     def _rollback_precommit_batch(self, state: _ActiveBatchState) -> None:
@@ -1201,8 +1190,7 @@ class _FsStorageInfra:
         except Exception as exc:
             rollback_error = exc
             Log.warn(
-                "rollback_batch 写入 journal 失败，但仍继续清理 staging 与释放锁: "
-                f"ticker={state.token.ticker}",
+                f"rollback_batch 写入 journal 失败，但仍继续清理 staging 与释放锁: ticker={state.token.ticker}",
                 module=self.MODULE,
             )
         finally:
@@ -1236,7 +1224,8 @@ class _FsStorageInfra:
         transaction_id = batch.transaction_id.strip()
         if not transaction_id:
             raise ValueError("无效的 batch token：transaction_id 不能为空")
-        state = self._active_batches.get(transaction_id)
+        with self._batch_condition:
+            state = self._active_batches.get(transaction_id)
         if state is None:
             raise ValueError("无效的 batch token：transaction 未在当前 storage core 登记")
         canonical_token = BatchToken(
@@ -1254,6 +1243,41 @@ class _FsStorageInfra:
         if state.lifecycle != _BATCH_LIFECYCLE_OPEN:
             raise ValueError("无效的 batch token：transaction 已进入终态")
         return state
+
+    def _reserve_batch_ticker(self, ticker: str) -> None:
+        """阻塞取得当前 repository instance 的 ticker writer reservation。
+
+        Args:
+            ticker: 已校验的 exact external ticker。
+
+        Returns:
+            无；返回时当前线程独占本地 reservation。
+
+        Raises:
+            无。
+        """
+
+        with self._batch_condition:
+            while ticker in self._reserved_batch_tickers or ticker in self._active_transaction_by_ticker:
+                self._batch_condition.wait()
+            self._reserved_batch_tickers.add(ticker)
+
+    def _release_batch_ticker_reservation(self, ticker: str) -> None:
+        """释放未登记为 active batch 的本地 reservation 并通知等待者。
+
+        Args:
+            ticker: 已校验的 exact external ticker。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        with self._batch_condition:
+            self._reserved_batch_tickers.discard(ticker)
+            self._batch_condition.notify_all()
 
     def _close_active_batch(
         self,
@@ -1276,25 +1300,35 @@ class _FsStorageInfra:
         """
 
         state.lifecycle = _BATCH_LIFECYCLE_CLOSED
-        self._active_batches.pop(state.token.transaction_id, None)
-        indexed_transaction_id = self._active_transaction_by_ticker.get(state.token.ticker)
-        if indexed_transaction_id == state.token.transaction_id:
-            self._active_transaction_by_ticker.pop(state.token.ticker, None)
+        release_error: Exception | None = None
         try:
             self._release_lock_token(state.writer_lock_token)
-        except Exception as release_error:
+        except Exception as exc:
+            release_error = exc
             if primary_error is None:
-                raise
-            _append_secondary_error_note(
-                primary_error,
-                release_error,
-                action="writer mutex release failed during terminal cleanup",
-            )
-            Log.warn(
-                "transaction 主异常后 writer mutex 释放失败，已消费 capability 并保留主异常: "
-                f"ticker={state.token.ticker} error_type={release_error.__class__.__name__}",
-                module=self.MODULE,
-            )
+                pass
+            else:
+                _append_secondary_error_note(
+                    primary_error,
+                    release_error,
+                    action="writer mutex release failed during terminal cleanup",
+                )
+                Log.warn(
+                    "transaction 主异常后 writer mutex 释放失败，已消费 capability并保留主异常: "
+                    f"ticker={state.token.ticker} error_type={release_error.__class__.__name__}",
+                    module=self.MODULE,
+                )
+        finally:
+            # 复杂逻辑说明：先释放跨进程锁，再清除本地 active 标记并统一唤醒等待者。
+            with self._batch_condition:
+                self._active_batches.pop(state.token.transaction_id, None)
+                indexed_transaction_id = self._active_transaction_by_ticker.get(state.token.ticker)
+                if indexed_transaction_id == state.token.transaction_id:
+                    self._active_transaction_by_ticker.pop(state.token.ticker, None)
+                self._reserved_batch_tickers.discard(state.token.ticker)
+                self._batch_condition.notify_all()
+        if release_error is not None and primary_error is None:
+            raise release_error
 
     def recover_orphan_batches(self, *, dry_run: bool = False) -> tuple[str, ...]:
         """恢复异常退出后遗留的孤儿 batch/backup。
@@ -1333,7 +1367,9 @@ class _FsStorageInfra:
             无。
         """
 
-        return self._create_directories or self.dayu_root.exists() or self.batch_root.exists() or self.backup_root.exists()
+        return (
+            self._create_directories or self.dayu_root.exists() or self.batch_root.exists() or self.backup_root.exists()
+        )
 
     def _ensure_batch_storage_dirs(self) -> None:
         """确保 `.dayu` 下的 batch 基础目录存在。
@@ -1354,9 +1390,7 @@ class _FsStorageInfra:
             self.backup_root.mkdir(parents=True, exist_ok=True)
             self._batch_lock_root.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            _raise_path_free_error(
-                _project_filesystem_error(exc, action="准备 batch storage directory")
-            )
+            _raise_path_free_error(_project_filesystem_error(exc, action="准备 batch storage directory"))
 
     def _ticker_lock_path(self, ticker: str) -> Path:
         """返回指定 ticker 的事务锁路径。
@@ -1424,10 +1458,7 @@ class _FsStorageInfra:
             ValueError: private key 不是单一路径组件时抛出。
         """
 
-        return (
-            self._batch_lock_root
-            / f"{_normalize_entry_name(ticker_key)}{_PUBLICATION_LOCK_SUFFIX}"
-        )
+        return self._batch_lock_root / f"{_normalize_entry_name(ticker_key)}{_PUBLICATION_LOCK_SUFFIX}"
 
     def _acquire_lock_token(self, lock_path: Path, *, blocking: bool) -> RuntimeFileLockToken:
         """获取并持有 runtime 文件锁 token。
@@ -1472,20 +1503,14 @@ class _FsStorageInfra:
 
         Raises:
             ValueError: ticker identity 非法时抛出。
-            RuntimeError: 锁已被其他进程持有时抛出。
             RuntimeFileLockError: 锁文件访问失败时抛出。
         """
 
         external_ticker = _require_external_identity(ticker, field_name="ticker")
-        try:
-            return self._acquire_lock_token(
-                self._ticker_lock_path(external_ticker),
-                blocking=False,
-            )
-        except RuntimeError as exc:
-            raise RuntimeError(
-                f"ticker={external_ticker} 已存在跨进程活动 batch"
-            ) from exc
+        return self._acquire_lock_token(
+            self._ticker_lock_path(external_ticker),
+            blocking=True,
+        )
 
     def _acquire_publication_guard(self, ticker: str) -> RuntimeFileLockToken:
         """获取 ticker 级跨进程 publication guard。
@@ -1629,9 +1654,7 @@ class _FsStorageInfra:
         try:
             journal = _read_json_object(journal_path)
         except ValueError:
-            actions.append(
-                f"skip batch transaction={token_dir.name} reason=unparseable_journal"
-            )
+            actions.append(f"skip batch transaction={token_dir.name} reason=unparseable_journal")
             return actions
         if frozenset(journal) != _JOURNAL_FIELDS:
             actions.append(f"skip batch transaction={token_dir.name} reason=invalid_journal_fields")
@@ -1639,10 +1662,7 @@ class _FsStorageInfra:
         transaction_id_value = journal["transaction_id"]
         ticker_value = journal["ticker"]
         phase_value = journal["phase"]
-        if not all(
-            isinstance(value, str)
-            for value in (transaction_id_value, ticker_value, phase_value)
-        ):
+        if not all(isinstance(value, str) for value in (transaction_id_value, ticker_value, phase_value)):
             actions.append(f"skip batch transaction={token_dir.name} reason=invalid_journal_values")
             return actions
         transaction_id = transaction_id_value.strip()
@@ -1658,9 +1678,7 @@ class _FsStorageInfra:
                 external_ticker,
             )
         except ValueError:
-            actions.append(
-                f"skip batch transaction={token_dir.name} reason=invalid_journal_ticker"
-            )
+            actions.append(f"skip batch transaction={token_dir.name} reason=invalid_journal_ticker")
             return actions
         if phase not in _RECOVERY_PHASES:
             actions.append(f"skip batch transaction={token_dir.name} reason=invalid_journal_values")
@@ -1680,9 +1698,7 @@ class _FsStorageInfra:
                     _is_contained_recovery_path(journal_path, token_dir),
                 )
             ):
-                actions.append(
-                    f"skip batch transaction={transaction_id} reason=invalid_recovery_locator"
-                )
+                actions.append(f"skip batch transaction={transaction_id} reason=invalid_recovery_locator")
                 return actions
             try:
                 for identity_directory, expected_storage_key in (
@@ -1690,9 +1706,7 @@ class _FsStorageInfra:
                     (backup_dir, ticker_key),
                     (staging_dir, None),
                 ):
-                    if not (
-                        identity_directory.exists() or identity_directory.is_symlink()
-                    ):
+                    if not (identity_directory.exists() or identity_directory.is_symlink()):
                         continue
                     _read_identity_descriptor(
                         identity_directory,
@@ -1701,10 +1715,7 @@ class _FsStorageInfra:
                         expected_storage_key=expected_storage_key,
                     )
             except (FileNotFoundError, ValueError, OSError):
-                actions.append(
-                    f"skip batch transaction={transaction_id} "
-                    "reason=invalid_identity_descriptor"
-                )
+                actions.append(f"skip batch transaction={transaction_id} reason=invalid_identity_descriptor")
                 return actions
             publication_token = self._acquire_publication_guard(external_ticker)
             try:
@@ -1717,8 +1728,7 @@ class _FsStorageInfra:
                         return actions
                     if backup_dir.exists():
                         actions.append(
-                            f"delete backup ticker={external_ticker} "
-                            f"transaction={transaction_id} phase={phase}"
+                            f"delete backup ticker={external_ticker} transaction={transaction_id} phase={phase}"
                         )
                         if not dry_run:
                             self._remove_directory(backup_dir)
@@ -1735,8 +1745,7 @@ class _FsStorageInfra:
                                 self._replace_directory(target_dir, staging_dir)
                     if backup_dir.exists():
                         actions.append(
-                            f"restore backup ticker={external_ticker} "
-                            f"transaction={transaction_id} phase={phase}"
+                            f"restore backup ticker={external_ticker} transaction={transaction_id} phase={phase}"
                         )
                         if not dry_run:
                             self._replace_directory(backup_dir, target_dir)
@@ -1756,8 +1765,7 @@ class _FsStorageInfra:
             finally:
                 self._release_lock_token(publication_token)
             actions.append(
-                f"cleanup batch ticker={external_ticker} transaction={transaction_id} "
-                f"phase={phase or 'unknown'}"
+                f"cleanup batch ticker={external_ticker} transaction={transaction_id} phase={phase or 'unknown'}"
             )
             if not dry_run:
                 self._remove_directory(token_dir)
@@ -1807,9 +1815,7 @@ class _FsStorageInfra:
                 if ticker_key != expected_ticker_key:
                     raise ValueError("backup locator 与 identity descriptor 不一致")
             except (FileNotFoundError, ValueError, OSError):
-                actions.append(
-                    f"preserve backup transaction={token_id} reason=invalid_identity_descriptor"
-                )
+                actions.append(f"preserve backup transaction={token_id} reason=invalid_identity_descriptor")
                 continue
             ticker_token = self._try_acquire_recovery_ticker_lock(external_ticker)
             if ticker_token is None:
@@ -1841,15 +1847,11 @@ class _FsStorageInfra:
                 publication_token = self._acquire_publication_guard(external_ticker)
                 try:
                     if target_dir.exists():
-                        actions.append(
-                            f"delete backup ticker={external_ticker} transaction={token_id}"
-                        )
+                        actions.append(f"delete backup ticker={external_ticker} transaction={token_id}")
                         if not dry_run:
                             self._remove_directory(backup_dir)
                         continue
-                    actions.append(
-                        f"restore backup ticker={external_ticker} transaction={token_id}"
-                    )
+                    actions.append(f"restore backup ticker={external_ticker} transaction={token_id}")
                     if not dry_run:
                         self._replace_directory(backup_dir, target_dir)
                 finally:
@@ -1928,9 +1930,7 @@ class _FsStorageInfra:
         except ValueError:
             _raise_path_free_error(ValueError("条目名称越界，禁止访问文档目录外路径"))
         except OSError as exc:
-            _raise_path_free_error(
-                _project_filesystem_error(exc, action="解析 published document 条目")
-            )
+            _raise_path_free_error(_project_filesystem_error(exc, action="解析 published document 条目"))
         return candidate
 
     def _handle_dir_path_for_state(
@@ -1998,9 +1998,7 @@ class _FsStorageInfra:
         except ValueError:
             _raise_path_free_error(ValueError("条目名称越界，禁止访问文档目录外路径"))
         except OSError as exc:
-            _raise_path_free_error(
-                _project_filesystem_error(exc, action="解析 staging document 条目")
-            )
+            _raise_path_free_error(_project_filesystem_error(exc, action="解析 staging document 条目"))
         return candidate
 
     def _get_handle_meta(self, handle: SourceHandle | ProcessedHandle) -> dict[str, Any]:
@@ -2028,10 +2026,7 @@ class _FsStorageInfra:
                 source_kind,
             )
         if not meta_path.exists():
-            raise FileNotFoundError(
-                "meta.json 不存在: "
-                f"ticker={handle.ticker} document_id={handle.document_id}"
-            )
+            raise FileNotFoundError(f"meta.json 不存在: ticker={handle.ticker} document_id={handle.document_id}")
         return _read_json_object(meta_path)
 
     def _get_handle_meta_for_state(
@@ -2057,10 +2052,7 @@ class _FsStorageInfra:
         filename = _PROCESSED_META_FILENAME if isinstance(handle, ProcessedHandle) else _SOURCE_META_FILENAME
         meta_path = directory / filename
         if not meta_path.exists():
-            raise FileNotFoundError(
-                "staging meta 不存在: "
-                f"ticker={handle.ticker} document_id={handle.document_id}"
-            )
+            raise FileNotFoundError(f"staging meta 不存在: ticker={handle.ticker} document_id={handle.document_id}")
         return _read_json_object(meta_path)
 
     def _list_handle_files_unguarded(
@@ -2263,10 +2255,7 @@ class _FsStorageInfra:
             _source_identity_namespace(source_kind),
             external_document_id,
         )
-        return (
-            f"{ticker_key}/{_source_dir_name(source_kind)}/"
-            f"{document_key}/{normalized_filename}"
-        )
+        return f"{ticker_key}/{_source_dir_name(source_kind)}/{document_key}/{normalized_filename}"
 
     def _select_primary_document(
         self,
@@ -2426,9 +2415,7 @@ class _FsStorageInfra:
             field_name="document_id",
         )
         manifest = self._read_manifest(path, ticker)
-        manifest["documents"] = [
-            doc for doc in manifest["documents"] if doc.get("document_id") != external_document_id
-        ]
+        manifest["documents"] = [doc for doc in manifest["documents"] if doc.get("document_id") != external_document_id]
         manifest["updated_at"] = now_iso8601()
         _write_json(path, manifest)
 
@@ -2448,10 +2435,7 @@ class _FsStorageInfra:
             OSError: 写入失败时抛出。
         """
 
-        stale_set = {
-            _require_external_identity(document_id, field_name="document_id")
-            for document_id in document_ids
-        }
+        stale_set = {_require_external_identity(document_id, field_name="document_id") for document_id in document_ids}
         manifest = self._read_manifest(path, ticker)
         manifest["documents"] = [doc for doc in manifest["documents"] if doc.get("document_id") not in stale_set]
         manifest["updated_at"] = now_iso8601()
@@ -2980,11 +2964,7 @@ class _FsStorageInfra:
             OSError: 路径构建失败时抛出。
         """
 
-        return (
-            self._ticker_dir_for_write(ticker, state)
-            / "filings"
-            / _DOWNLOAD_REJECTIONS_FILENAME
-        )
+        return self._ticker_dir_for_write(ticker, state) / "filings" / _DOWNLOAD_REJECTIONS_FILENAME
 
     def _download_rejections_path_for_read(self, ticker: str) -> Path:
         """返回下载拒绝注册表路径（用于读取）。
@@ -2999,10 +2979,7 @@ class _FsStorageInfra:
             无。
         """
 
-        return (
-            self._source_root_for_read(ticker, SourceKind.FILING)
-            / _DOWNLOAD_REJECTIONS_FILENAME
-        )
+        return self._source_root_for_read(ticker, SourceKind.FILING) / _DOWNLOAD_REJECTIONS_FILENAME
 
     def _rejected_filings_root(self, ticker: str, state: _ActiveBatchState) -> Path:
         """返回 rejected filings 根目录。
@@ -3018,11 +2995,7 @@ class _FsStorageInfra:
             OSError: 路径构建失败时抛出。
         """
 
-        return (
-            self._ticker_dir_for_write(ticker, state)
-            / "filings"
-            / _REJECTED_FILINGS_DIRNAME
-        )
+        return self._ticker_dir_for_write(ticker, state) / "filings" / _REJECTED_FILINGS_DIRNAME
 
     def _rejected_filings_root_for_read(self, ticker: str) -> Path:
         """返回 rejected filings 根目录（用于读取）。
@@ -3037,10 +3010,7 @@ class _FsStorageInfra:
             无。
         """
 
-        return (
-            self._source_root_for_read(ticker, SourceKind.FILING)
-            / _REJECTED_FILINGS_DIRNAME
-        )
+        return self._source_root_for_read(ticker, SourceKind.FILING) / _REJECTED_FILINGS_DIRNAME
 
     def _rejected_filing_dir(
         self,
@@ -3159,7 +3129,5 @@ class _FsStorageInfra:
         except ValueError:
             _raise_path_free_error(ValueError("条目名称越界，禁止访问文档目录外路径"))
         except OSError as exc:
-            _raise_path_free_error(
-                _project_filesystem_error(exc, action="解析 rejected filing 条目")
-            )
+            _raise_path_free_error(_project_filesystem_error(exc, action="解析 rejected filing 条目"))
         return candidate

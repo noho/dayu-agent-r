@@ -6,11 +6,11 @@ from dayu.contracts.json_value import JsonValue
 
 import asyncio
 import hashlib
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from io import StringIO
 from itertools import repeat
 from pathlib import Path
-from typing import AsyncIterator, BinaryIO, Optional, TypeVar
+from typing import AsyncIterator, BinaryIO, Optional, TypeVar, cast
 
 import httpx
 import pytest
@@ -38,6 +38,11 @@ from dayu.fins.downloaders.sec_downloader import (
     _SEC_THROTTLE_MAX_RETRIES,
     _SEC_THROTTLE_RECOVERY_SECONDS,
     _SecThrottleReservation,
+    _PrefetchEvent,
+    _PrefetchFailed,
+    _PrefetchedFile,
+    _PrefetchSkipped,
+    _PrefetchStarted,
     _await_if_needed,
     _parse_browse_edgar_atom,
     _parse_browse_edgar_href,
@@ -922,6 +927,71 @@ def test_download_files_stream_cancel_stops_without_failed_event(tmp_path: Path)
         ):
             events.append(event)
         return events
+
+    events = _run(_collect())
+
+    assert [event.event_type for event in events] == ["file_download_started"]
+    assert store_stub.calls == []
+
+
+def test_download_files_stream_conditional_cancel_after_transport_stops_without_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """conditional transport 返回后取消必须停止 stream，且不得伪造失败事件。
+
+    Args:
+        tmp_path: 临时目录。
+        monkeypatch: pytest monkeypatch fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 取消被投影为失败、payload 被落盘或异常外泄时抛出。
+    """
+
+    downloader = _create_downloader(tmp_path)
+    descriptor = RemoteFileDescriptor(
+        name="a.htm",
+        source_url="https://example.com/a.htm",
+        http_etag='"etag-a"',
+        http_last_modified=None,
+        remote_size=7,
+        http_status=200,
+    )
+    cancelled = False
+
+    async def _conditional_then_cancel(
+        url: str,
+        etag: Optional[str],
+        last_modified: Optional[str],
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> tuple[int, Optional[bytes]]:
+        """返回 payload 前主动触发下一 checkpoint 的取消。"""
+
+        del url, etag, last_modified, cancellation_checker
+        nonlocal cancelled
+        cancelled = True
+        return 200, b"payload"
+
+    monkeypatch.setattr(downloader, "_http_download_if_modified", _conditional_then_cancel)
+    store_stub = StoreStub()
+
+    async def _collect() -> list[DownloaderEvent]:
+        """完整消费组合 stream。"""
+
+        return [
+            event
+            async for event in downloader.download_files_stream(
+                remote_files=[descriptor],
+                overwrite=False,
+                store_file=store_stub,
+                batch=_TEST_BATCH,
+                existing_files={"a.htm": {"http_etag": '"etag-a"'}},
+                cancellation_checker=lambda: cancelled,
+            )
+        ]
 
     events = _run(_collect())
 
@@ -2191,3 +2261,162 @@ def test_rate_limit_uses_shared_state_across_instances(
     state = _load_sec_throttle_state(downloader_a._throttle_state_path)
     assert state.next_request_at == pytest.approx(1000.24)
     assert state.cooldown_until == pytest.approx(0.0)
+
+
+def test_download_files_stream_materializes_only_shared_prefetch_core(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """组合 API 必须只消费 typed prefetch core 并由唯一 materializer 调 callback。"""
+
+    downloader = _create_downloader(tmp_path)
+    downloaded = RemoteFileDescriptor(
+        name="downloaded.htm",
+        source_url="https://example.com/downloaded.htm",
+        http_etag="etag",
+        http_last_modified=None,
+        remote_size=7,
+        http_status=200,
+    )
+    skipped = RemoteFileDescriptor(
+        name="skipped.xml",
+        source_url="https://example.com/skipped.xml",
+        http_etag="etag-old",
+        http_last_modified=None,
+        remote_size=3,
+        http_status=200,
+    )
+    failed = RemoteFileDescriptor(
+        name="failed.xsd",
+        source_url="https://example.com/failed.xsd",
+        http_etag=None,
+        http_last_modified=None,
+        remote_size=None,
+        http_status=503,
+    )
+    observed_allow_not_modified: list[bool] = []
+
+    async def fake_prefetch(
+        remote_files: list[RemoteFileDescriptor],
+        *,
+        allow_not_modified: bool,
+        existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
+        primary_document: Optional[str] = None,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> AsyncIterator[_PrefetchEvent]:
+        """返回完整 control/payload variant matrix。"""
+
+        del remote_files, existing_files, primary_document, cancellation_checker
+        observed_allow_not_modified.append(allow_not_modified)
+        yield _PrefetchStarted(descriptor=downloaded)
+        yield _PrefetchedFile(
+            descriptor=downloaded,
+            http_status=200,
+            content=b"payload",
+        )
+        yield _PrefetchStarted(descriptor=skipped)
+        yield _PrefetchSkipped(
+            descriptor=skipped,
+            http_status=304,
+            reason_code="not_modified",
+            reason_message="未修改",
+        )
+        yield _PrefetchStarted(descriptor=failed)
+        yield _PrefetchFailed(
+            descriptor=failed,
+            http_status=503,
+            reason_code="provider_unavailable",
+            reason_message="来源暂不可用",
+            error="来源暂不可用",
+        )
+
+    monkeypatch.setattr(downloader, "prefetch_files_stream", fake_prefetch)
+    store = StoreStub()
+
+    async def collect() -> list[DownloaderEvent]:
+        """收集真实组合 API 输出。"""
+
+        return [
+            event
+            async for event in downloader.download_files_stream(
+                [downloaded, skipped, failed],
+                overwrite=False,
+                store_file=store,
+                batch=_TEST_BATCH,
+            )
+        ]
+
+    events = _run(collect())
+
+    assert observed_allow_not_modified == [True]
+    assert store.calls == [("downloaded.htm", b"payload")]
+    assert [event.event_type for event in events] == [
+        "file_download_started",
+        "file_downloaded",
+        "file_download_started",
+        "file_skipped",
+        "file_download_started",
+        "file_failed",
+    ]
+
+
+def test_download_files_stream_aclose_finalizes_shared_prefetch_generator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """组合 stream 提前关闭时必须同步 finalize 内层 prefetch generator。"""
+
+    downloader = _create_downloader(tmp_path)
+    descriptor = RemoteFileDescriptor(
+        name="primary.htm",
+        source_url="https://example.com/primary.htm",
+        http_etag=None,
+        http_last_modified=None,
+        remote_size=None,
+        http_status=200,
+    )
+    finalized: list[bool] = []
+
+    async def fake_prefetch(
+        remote_files: list[RemoteFileDescriptor],
+        *,
+        allow_not_modified: bool,
+        existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
+        primary_document: Optional[str] = None,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> AsyncIterator[_PrefetchEvent]:
+        """产生首个事件，并在 generator finalization 时记录事实。"""
+
+        del allow_not_modified, existing_files, primary_document, cancellation_checker
+        try:
+            yield _PrefetchStarted(descriptor=remote_files[0])
+            yield _PrefetchedFile(
+                descriptor=remote_files[0],
+                http_status=200,
+                content=b"payload",
+            )
+        finally:
+            finalized.append(True)
+
+    monkeypatch.setattr(downloader, "prefetch_files_stream", fake_prefetch)
+
+    async def consume_one_then_close() -> DownloaderEvent:
+        """读取一个事件后显式关闭真实组合 generator。"""
+
+        stream = cast(
+            AsyncGenerator[DownloaderEvent, None],
+            downloader.download_files_stream(
+                [descriptor],
+                overwrite=True,
+                store_file=StoreStub(),
+                batch=_TEST_BATCH,
+            ),
+        )
+        first = await anext(stream)
+        await stream.aclose()
+        return first
+
+    first = _run(consume_one_then_close())
+
+    assert first.event_type == "file_download_started"
+    assert finalized == [True]

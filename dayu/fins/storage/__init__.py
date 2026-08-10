@@ -16,6 +16,19 @@ from .repository_protocols import (
     ProcessedDocumentRepositoryProtocol,
     SourceDocumentRepositoryProtocol,
 )
+from .source_integrity import (
+    NoSourceRepairRequired,
+    SelectedSourceRepairRequired,
+    SourceIntegrityClassification,
+    SourceIntegrityPreflightDisposition,
+    SourceIntegrityPreflightError,
+    SourceIntegrityPreflightReason,
+    SourceIntegrityReason,
+    SourceIntegrityRevisionConflictError,
+    SourceIntegrityStatus,
+    classify_source_integrity_preflight,
+    has_same_source_publication_identity,
+)
 
 __all__ = [
     "BatchingRepositoryProtocol",
@@ -32,4 +45,15 @@ __all__ = [
     "FsFilingMaintenanceRepository",
     "FileStore",
     "LocalFileStore",
+    "NoSourceRepairRequired",
+    "SelectedSourceRepairRequired",
+    "SourceIntegrityClassification",
+    "SourceIntegrityPreflightDisposition",
+    "SourceIntegrityPreflightError",
+    "SourceIntegrityPreflightReason",
+    "SourceIntegrityReason",
+    "SourceIntegrityRevisionConflictError",
+    "SourceIntegrityStatus",
+    "classify_source_integrity_preflight",
+    "has_same_source_publication_identity",
 ]

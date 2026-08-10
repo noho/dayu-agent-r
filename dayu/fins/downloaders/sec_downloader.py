@@ -202,6 +202,69 @@ class DownloaderEvent:
     error: Optional[str] = None
 
 
+@dataclass(frozen=True, slots=True)
+class _PrefetchStarted:
+    """SEC transport 已开始处理一个 descriptor。"""
+
+    descriptor: RemoteFileDescriptor
+    kind: Literal["started"] = "started"
+
+
+@dataclass(frozen=True, slots=True)
+class _PrefetchedFile:
+    """尚未触达 storage 的非空 immutable SEC payload。"""
+
+    descriptor: RemoteFileDescriptor
+    http_status: int
+    content: bytes
+    kind: Literal["prefetched"] = "prefetched"
+
+    def __post_init__(self) -> None:
+        """校验 payload 非空且为 immutable bytes。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: content 为空时抛出。
+            TypeError: content 不是 bytes 时抛出。
+        """
+
+        if not isinstance(self.content, bytes):
+            raise TypeError("prefetched SEC content 必须为 immutable bytes")
+        if not self.content:
+            raise ValueError("prefetched SEC content 不得为空")
+
+
+@dataclass(frozen=True, slots=True)
+class _PrefetchSkipped:
+    """conditional SEC transport 返回 304。"""
+
+    descriptor: RemoteFileDescriptor
+    http_status: Literal[304]
+    reason_code: Literal["not_modified"]
+    reason_message: str
+    kind: Literal["skipped"] = "skipped"
+
+
+@dataclass(frozen=True, slots=True)
+class _PrefetchFailed:
+    """不携带 payload 的 path/contact-free SEC transport failure。"""
+
+    descriptor: RemoteFileDescriptor
+    http_status: Optional[int]
+    reason_code: str
+    reason_message: str
+    error: str
+    kind: Literal["failed"] = "failed"
+
+
+_PrefetchEvent: TypeAlias = _PrefetchStarted | _PrefetchedFile | _PrefetchSkipped | _PrefetchFailed
+
+
 class SecDownloadCancelledError(Exception):
     """SEC 下载在协作式检查点观察到取消请求。"""
 
@@ -230,33 +293,30 @@ class _SecThrottleReservation:
     cooldown_hit: bool
 
 
-def _build_empty_content_failure_event(
+def _build_empty_content_prefetch_failure(
     descriptor: RemoteFileDescriptor,
     http_status: Optional[int],
-) -> DownloaderEvent:
-    """构造 0 字节下载失败事件。
+) -> _PrefetchFailed:
+    """构造不含 storage 语义的 0 字节 transport failure。
 
     Args:
         descriptor: 当前远端文件描述。
-        http_status: 本次下载对应的 HTTP 状态码。
+        http_status: 本次 transport HTTP 状态码。
 
     Returns:
-        `empty_content` 类型的失败事件。
+        typed empty-content prefetch failure。
 
     Raises:
         无。
     """
 
-    return DownloaderEvent(
-        event_type="file_failed",
-        name=descriptor.name,
-        source_url=descriptor.source_url,
-        http_etag=descriptor.http_etag,
-        http_last_modified=descriptor.http_last_modified,
+    message = "下载内容为 0 字节，视为下载失败"
+    return _PrefetchFailed(
+        descriptor=descriptor,
         http_status=http_status,
         reason_code="empty_content",
-        reason_message="下载内容为 0 字节，视为下载失败",
-        error="下载内容为 0 字节，视为下载失败",
+        reason_message=message,
+        error=message,
     )
 
 
@@ -1485,53 +1545,52 @@ class SecDownloader:
             )
         return descriptors
 
-    async def download_files_stream(
+    async def prefetch_files_stream(
         self,
         remote_files: list[RemoteFileDescriptor],
-        overwrite: bool,
-        store_file: StoreDownloadedFile,
         *,
-        batch: BatchToken,
+        allow_not_modified: bool,
         existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
         primary_document: Optional[str] = None,
         cancellation_checker: Optional[Callable[[], bool]] = None,
-    ) -> AsyncIterator[DownloaderEvent]:
-        """下载远端文件列表并流式返回文件级事件。
+    ) -> AsyncIterator[_PrefetchEvent]:
+        """执行 storage-neutral SEC transport 并返回 typed intermediate。
 
         Args:
             remote_files: 远端文件描述列表。
-            overwrite: 是否覆盖下载。
-            store_file: 文件存储回调（入参：文件名、二进制流）。
-            batch: 每次回调 invocation 显式传入的 batch capability。
+            allow_not_modified: 是否允许 conditional request 与 304。
             existing_files: 既有文件元数据映射（按文件名）。
-            primary_document: 主文档文件名（如 *.htm）；若指定且该文件下载为 0 字节，
-                立即停止生成器，后续文件不再下载，确保整个 filing 不落盘。
+            primary_document: 主文档文件名；其 0 字节会终止后续 transport。
             cancellation_checker: 可选协作式取消检查器。
 
         Yields:
-            文件级下载事件。
+            started、prefetched、skipped 或 failed 私有 typed variant。
 
         Raises:
-            OSError: 本地落盘失败时抛出。
+            RuntimeError: cancellation checker 或 transport helper 抛出未被本方法
+                归类的运行时错误时原样传播。
+
+        取消语义:
+            任一协作式取消检查点命中后，本 stream 正常停止枚举，不为取消伪造
+            ``failed`` variant；首个 descriptor 前取消会产生空 stream，中途取消
+            可能保留已经 yield 的事件前缀。完整消费本 stream 的调用方必须在循环
+            结束后立即再次执行同一个 ``cancellation_checker`` checkpoint；迭代结束
+            本身只表示不再有 transport event，不表示操作成功。
         """
 
         previous_map = existing_files or {}
         for descriptor in remote_files:
-            _raise_if_download_cancelled(cancellation_checker)
-            yield DownloaderEvent(
-                event_type="file_download_started",
-                name=descriptor.name,
-                source_url=descriptor.source_url,
-                http_etag=descriptor.http_etag,
-                http_last_modified=descriptor.http_last_modified,
-                http_status=descriptor.http_status,
-            )
+            try:
+                _raise_if_download_cancelled(cancellation_checker)
+            except SecDownloadCancelledError:
+                return
+            yield _PrefetchStarted(descriptor=descriptor)
             previous = previous_map.get(descriptor.name, {})
             previous_etag = str(previous.get("http_etag") or previous.get("etag") or "").strip() or None
             previous_last_modified = (
                 str(previous.get("http_last_modified") or previous.get("last_modified") or "").strip() or None
             )
-            if not overwrite:
+            if allow_not_modified:
                 try:
                     status_code, payload = await _await_if_needed(
                         self._http_download_if_modified(
@@ -1545,12 +1604,8 @@ class SecDownloader:
                     return
                 except RuntimeError as exc:
                     reason_code, safe_message = _sec_file_failure_facts(exc)
-                    yield DownloaderEvent(
-                        event_type="file_failed",
-                        name=descriptor.name,
-                        source_url=descriptor.source_url,
-                        http_etag=descriptor.http_etag,
-                        http_last_modified=descriptor.http_last_modified,
+                    yield _PrefetchFailed(
+                        descriptor=descriptor,
                         http_status=None,
                         reason_code=reason_code,
                         reason_message=safe_message,
@@ -1558,51 +1613,39 @@ class SecDownloader:
                     )
                     continue
                 if status_code == 304:
-                    yield DownloaderEvent(
-                        event_type="file_skipped",
-                        name=descriptor.name,
-                        source_url=descriptor.source_url,
-                        http_etag=descriptor.http_etag,
-                        http_last_modified=descriptor.http_last_modified,
+                    yield _PrefetchSkipped(
+                        descriptor=descriptor,
                         http_status=304,
                         reason_code="not_modified",
                         reason_message="远端文件未修改，跳过重新下载",
                     )
                     continue
                 if payload is None:
-                    yield DownloaderEvent(
-                        event_type="file_failed",
-                        name=descriptor.name,
-                        source_url=descriptor.source_url,
-                        http_etag=descriptor.http_etag,
-                        http_last_modified=descriptor.http_last_modified,
+                    message = "下载失败，未返回内容"
+                    yield _PrefetchFailed(
+                        descriptor=descriptor,
                         http_status=status_code,
                         reason_code="empty_response",
-                        reason_message="下载失败，未返回内容",
-                        error="下载失败，未返回内容",
+                        reason_message=message,
+                        error=message,
                     )
                     continue
-                _raise_if_download_cancelled(cancellation_checker)
+                try:
+                    _raise_if_download_cancelled(cancellation_checker)
+                except SecDownloadCancelledError:
+                    return
                 if len(payload) == 0:
-                    yield _build_empty_content_failure_event(descriptor, status_code)
+                    yield _build_empty_content_prefetch_failure(
+                        descriptor,
+                        status_code,
+                    )
                     if _should_abort_after_empty_primary(descriptor.name, primary_document):
-                        # 主文档 0 字节：整个 filing 无效，中止下载，确保后续文件不落盘。
                         return
                     continue
-                file_meta = store_file(
-                    descriptor.name,
-                    _to_binary_stream(payload),
-                    batch=batch,
-                )
-                _raise_if_download_cancelled(cancellation_checker)
-                yield DownloaderEvent(
-                    event_type="file_downloaded",
-                    name=descriptor.name,
-                    source_url=descriptor.source_url,
-                    http_etag=descriptor.http_etag,
-                    http_last_modified=descriptor.http_last_modified,
+                yield _PrefetchedFile(
+                    descriptor=descriptor,
                     http_status=status_code,
-                    file_meta=file_meta,
+                    content=bytes(payload),
                 )
                 continue
             try:
@@ -1614,41 +1657,142 @@ class SecDownloader:
                 )
                 _raise_if_download_cancelled(cancellation_checker)
                 if len(payload) == 0:
-                    yield _build_empty_content_failure_event(descriptor, descriptor.http_status)
+                    yield _build_empty_content_prefetch_failure(
+                        descriptor,
+                        descriptor.http_status,
+                    )
                     if _should_abort_after_empty_primary(descriptor.name, primary_document):
-                        # 主文档 0 字节：整个 filing 无效，中止下载，确保后续文件不落盘。
                         return
                     continue
-                file_meta = store_file(
-                    descriptor.name,
-                    _to_binary_stream(payload),
-                    batch=batch,
-                )
-                _raise_if_download_cancelled(cancellation_checker)
-                yield DownloaderEvent(
-                    event_type="file_downloaded",
-                    name=descriptor.name,
-                    source_url=descriptor.source_url,
-                    http_etag=descriptor.http_etag,
-                    http_last_modified=descriptor.http_last_modified,
-                    http_status=descriptor.http_status,
-                    file_meta=file_meta,
+                yield _PrefetchedFile(
+                    descriptor=descriptor,
+                    http_status=(descriptor.http_status if descriptor.http_status is not None else 200),
+                    content=bytes(payload),
                 )
             except SecDownloadCancelledError:
                 return
             except RuntimeError as exc:
                 reason_code, safe_message = _sec_file_failure_facts(exc)
-                yield DownloaderEvent(
-                    event_type="file_failed",
-                    name=descriptor.name,
-                    source_url=descriptor.source_url,
-                    http_etag=descriptor.http_etag,
-                    http_last_modified=descriptor.http_last_modified,
+                yield _PrefetchFailed(
+                    descriptor=descriptor,
                     http_status=descriptor.http_status,
                     reason_code=reason_code,
                     reason_message=safe_message,
                     error=safe_message,
                 )
+
+    def materialize_prefetched_event(
+        self,
+        event: _PrefetchEvent,
+        store_file: StoreDownloadedFile,
+        *,
+        batch: BatchToken,
+    ) -> DownloaderEvent:
+        """唯一地把 typed prefetch intermediate 投影为 downloader event。
+
+        Args:
+            event: storage-neutral private prefetch variant。
+            store_file: persistence owner 提供的真实文件写入 callback。
+            batch: callback 必须消费的真实 open batch capability。
+
+        Returns:
+            保持既有 observable fields 的 downloader event。
+
+        Raises:
+            OSError: payload 落盘失败时抛出。
+            ValueError: batch capability 或 storage mutation 非法时抛出。
+        """
+
+        descriptor = event.descriptor
+        if isinstance(event, _PrefetchStarted):
+            return DownloaderEvent(
+                event_type="file_download_started",
+                name=descriptor.name,
+                source_url=descriptor.source_url,
+                http_etag=descriptor.http_etag,
+                http_last_modified=descriptor.http_last_modified,
+                http_status=descriptor.http_status,
+            )
+        if isinstance(event, _PrefetchSkipped):
+            return DownloaderEvent(
+                event_type="file_skipped",
+                name=descriptor.name,
+                source_url=descriptor.source_url,
+                http_etag=descriptor.http_etag,
+                http_last_modified=descriptor.http_last_modified,
+                http_status=event.http_status,
+                reason_code=event.reason_code,
+                reason_message=event.reason_message,
+            )
+        if isinstance(event, _PrefetchFailed):
+            return DownloaderEvent(
+                event_type="file_failed",
+                name=descriptor.name,
+                source_url=descriptor.source_url,
+                http_etag=descriptor.http_etag,
+                http_last_modified=descriptor.http_last_modified,
+                http_status=event.http_status,
+                reason_code=event.reason_code,
+                reason_message=event.reason_message,
+                error=event.error,
+            )
+        file_meta = store_file(
+            descriptor.name,
+            _to_binary_stream(event.content),
+            batch=batch,
+        )
+        return DownloaderEvent(
+            event_type="file_downloaded",
+            name=descriptor.name,
+            source_url=descriptor.source_url,
+            http_etag=descriptor.http_etag,
+            http_last_modified=descriptor.http_last_modified,
+            http_status=event.http_status,
+            file_meta=file_meta,
+        )
+
+    async def download_files_stream(
+        self,
+        remote_files: list[RemoteFileDescriptor],
+        overwrite: bool,
+        store_file: StoreDownloadedFile,
+        *,
+        batch: BatchToken,
+        existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
+        primary_document: Optional[str] = None,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> AsyncIterator[DownloaderEvent]:
+        """通过唯一 prefetch core 下载并以真实 batch materialize 文件。
+
+        Args:
+            remote_files: 远端文件描述列表。
+            overwrite: 是否禁用 conditional reuse。
+            store_file: persistence owner 的真实文件写入 callback。
+            batch: 每次 callback invocation 显式传入的真实 capability。
+            existing_files: 既有文件元数据映射。
+            primary_document: 主文档文件名。
+            cancellation_checker: 可选协作式取消检查器。
+
+        Yields:
+            唯一 materializer 产生的文件级 downloader event。
+
+        Raises:
+            OSError: 本地落盘失败时抛出。
+            ValueError: batch capability 非法时抛出。
+        """
+
+        async for event in self.prefetch_files_stream(
+            remote_files,
+            allow_not_modified=not overwrite,
+            existing_files=existing_files,
+            primary_document=primary_document,
+            cancellation_checker=cancellation_checker,
+        ):
+            yield self.materialize_prefetched_event(
+                event,
+                store_file,
+                batch=batch,
+            )
 
     async def download_files(
         self,
