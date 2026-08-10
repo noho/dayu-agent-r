@@ -885,11 +885,15 @@ def _register_download_command(
     parser.add_argument("--forms", nargs="+", help="需要下载的报表类型。")
     parser.add_argument("--start", help="最早 filing 日期。")
     parser.add_argument("--end", help="最晚 filing 日期。")
-    parser.add_argument("--overwrite", action="store_true", help="覆盖已有原始文档。")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="覆盖已有原始文档；不可与 --rebuild 同时使用。",
+    )
     parser.add_argument(
         "--rebuild",
         action="store_true",
-        help="仅基于本地源文件重建下载元数据，不访问远端来源。",
+        help="仅基于本地源文件重建下载元数据，不访问远端来源；不可与 --overwrite 同时使用。",
     )
 
 

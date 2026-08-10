@@ -501,6 +501,30 @@ def fake_service(monkeypatch: pytest.MonkeyPatch) -> _FakeFinsDirectService:
     return service
 
 
+def _recording_direct_service_factory(
+    workspace_root: Path,
+    *,
+    service: _FakeFinsDirectService,
+    factory_calls: list[Path],
+) -> fins_command.FinsDirectCommandService:
+    """记录不应发生的 factory 调用并返回指定测试 Service。
+
+    Args:
+        workspace_root: CLI 传入的 workspace root。
+        service: 发生调用时应返回的测试 Service。
+        factory_calls: 记录调用路径的列表。
+
+    Returns:
+        转换为 production 接口类型的测试 Service。
+
+    Raises:
+        无。
+    """
+
+    factory_calls.append(workspace_root)
+    return cast(fins_command.FinsDirectCommandService, service)
+
+
 @pytest.mark.parametrize(
     "command_name",
     (
@@ -755,10 +779,59 @@ def test_output_keeps_absolute_paths_visible_and_bounded() -> None:
     assert len(rendered) == 120
 
 
-def test_download_command_maps_args_to_service(
-    fake_service: _FakeFinsDirectService,
+def test_download_help_explains_mutually_exclusive_mutation_modes(
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """download CLI 参数必须转换为 Service direct stream 方法参数。"""
+    """download help 应分别说明 overwrite 与 rebuild 不可组合。
+
+    Args:
+        capsys: pytest 标准输出捕获夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 任一 option、互斥说明或退出码不符合契约时抛出。
+    """
+
+    exit_code = cli_main.main(("download", "--help"))
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_SUCCESS
+    assert "--overwrite" in captured.out
+    assert "覆盖已有原始文档；不可与 --rebuild 同时使用。" in captured.out
+    assert "--rebuild" in captured.out
+    assert "不访问远端来源；不可与 --overwrite 同时使用。" in captured.out
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize(
+    ("mutation_flag", "expected_overwrite", "expected_rebuild"),
+    (
+        ("--overwrite", True, False),
+        ("--rebuild", False, True),
+    ),
+)
+def test_download_command_maps_single_mutation_mode_to_service(
+    fake_service: _FakeFinsDirectService,
+    mutation_flag: str,
+    expected_overwrite: bool,
+    expected_rebuild: bool,
+) -> None:
+    """download CLI 应分别把合法单一变更模式映射到 Service。
+
+    Args:
+        fake_service: direct service 测试替身。
+        mutation_flag: 当前用例传入的变更模式 flag。
+        expected_overwrite: request 中预期的 overwrite 值。
+        expected_rebuild: request 中预期的 rebuild 值。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: CLI 参数映射或退出码不符合契约时抛出。
+    """
 
     exit_code = cli_main.main(
         (
@@ -772,8 +845,7 @@ def test_download_command_maps_args_to_service(
             "2024-01-01",
             "--end",
             "2024-12-31",
-            "--overwrite",
-            "--rebuild",
+            mutation_flag,
         )
     )
 
@@ -784,8 +856,8 @@ def test_download_command_maps_args_to_service(
             form_types=("10-K", "10-Q"),
             start="2024-01-01",
             end="2024-12-31",
-            overwrite_existing=True,
-            rebuild_local_artifacts=True,
+            overwrite_existing=expected_overwrite,
+            rebuild_local_artifacts=expected_rebuild,
         )
     ]
 
@@ -855,6 +927,65 @@ def test_download_static_usage_error_precedes_workspace_and_service_factory(
     if download_args == ():
         assert captured.err == ("dayu-cli download: --ticker 不能为空，请提供一个公司代码\n")
     assert factory_calls == []
+    assert not workspace_root.exists()
+
+
+@pytest.mark.parametrize(
+    "mutation_flags",
+    (
+        ("--overwrite", "--rebuild"),
+        ("--rebuild", "--overwrite"),
+    ),
+)
+def test_download_mutation_mode_conflict_precedes_all_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    mutation_flags: tuple[str, str],
+) -> None:
+    """两种冲突 argv 顺序都应在 workspace、factory 与 operation 前 exit 2。
+
+    Args:
+        tmp_path: pytest 临时目录夹具。
+        monkeypatch: factory 替换夹具。
+        capsys: 标准流捕获夹具。
+        mutation_flags: 当前用例的冲突 flag 顺序。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 冲突未前置拒绝或产生任一副作用时抛出。
+    """
+
+    workspace_root = tmp_path / "must-not-exist"
+    service = _FakeFinsDirectService()
+    factory_calls: list[Path] = []
+    recording_factory = partial(
+        _recording_direct_service_factory,
+        service=service,
+        factory_calls=factory_calls,
+    )
+
+    monkeypatch.setattr(fins_command, "FINS_DIRECT_SERVICE_FACTORY", recording_factory)
+
+    exit_code = cli_main.main(
+        (
+            "download",
+            "--base",
+            str(workspace_root),
+            "--ticker",
+            "AAPL",
+            *mutation_flags,
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_USAGE_ERROR
+    assert captured.err == ("dayu-cli download: --overwrite 与 --rebuild 不能同时使用；请只选择一种下载变更模式\n")
+    assert factory_calls == []
+    assert service.download_requests == []
+    assert service.stream_calls == []
     assert not workspace_root.exists()
 
 

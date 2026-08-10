@@ -49,6 +49,37 @@ class FinsDownloadUsageError(ValueError):
     """下载调用可在静态输入阶段确定的用法错误。"""
 
 
+_DOWNLOAD_MUTATION_MODE_CONFLICT_MESSAGE: Final[str] = "--overwrite 与 --rebuild 不能同时使用；请只选择一种下载变更模式"
+"""下载变更模式冲突的唯一用户可读诊断。"""
+
+
+def _validate_download_mutation_mode(
+    *,
+    overwrite_existing: bool,
+    rebuild_local_artifacts: bool,
+) -> None:
+    """校验下载请求只能选择一种变更模式。
+
+    Args:
+        overwrite_existing: 是否允许远端下载覆盖完整本地 source。
+        rebuild_local_artifacts: 是否只基于本地 source 重建下载元数据。
+
+    Returns:
+        无。
+
+    Raises:
+        TypeError: 任一模式字段不是布尔值时抛出。
+        FinsDownloadUsageError: overwrite 与 rebuild 同时启用时抛出。
+    """
+
+    if not isinstance(overwrite_existing, bool):
+        raise TypeError("overwrite_existing must be bool")
+    if not isinstance(rebuild_local_artifacts, bool):
+        raise TypeError("rebuild_local_artifacts must be bool")
+    if overwrite_existing and rebuild_local_artifacts:
+        raise FinsDownloadUsageError(_DOWNLOAD_MUTATION_MODE_CONFLICT_MESSAGE)
+
+
 class FinsDownloadSource(StrEnum):
     """由 canonical ticker 市场唯一确定的下载来源。"""
 
@@ -188,12 +219,13 @@ class FinsDownloadEffectiveFilters:
         Raises:
             TypeError: form 或布尔字段类型非法时抛出。
             ValueError: form/date 为空、重复或日期范围非法时抛出。
+            FinsDownloadUsageError: overwrite 与 rebuild 同时启用时抛出。
         """
 
-        if not isinstance(self.overwrite_existing, bool):
-            raise TypeError("overwrite_existing must be bool")
-        if not isinstance(self.rebuild_local_artifacts, bool):
-            raise TypeError("rebuild_local_artifacts must be bool")
+        _validate_download_mutation_mode(
+            overwrite_existing=self.overwrite_existing,
+            rebuild_local_artifacts=self.rebuild_local_artifacts,
+        )
         if len(set(self.form_types)) != len(self.form_types):
             raise ValueError("form_types must not contain duplicates")
         for form_type in self.form_types:
@@ -592,6 +624,25 @@ class FinsDownloadRequest:
     overwrite_existing: bool = False
     rebuild_local_artifacts: bool = False
 
+    def __post_init__(self) -> None:
+        """校验下载请求的变更模式不变量。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            TypeError: overwrite 或 rebuild 字段不是布尔值时抛出。
+            FinsDownloadUsageError: overwrite 与 rebuild 同时启用时抛出。
+        """
+
+        _validate_download_mutation_mode(
+            overwrite_existing=self.overwrite_existing,
+            rebuild_local_artifacts=self.rebuild_local_artifacts,
+        )
+
 
 def build_fins_download_request(
     *,
@@ -616,6 +667,7 @@ def build_fins_download_request(
         完成 canonicalization 的下载请求。
 
     Raises:
+        TypeError: overwrite 或 rebuild 参数不是布尔值时抛出。
         FinsDownloadUsageError: ticker、form、日期或日期范围非法时抛出。
     """
 

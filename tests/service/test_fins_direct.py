@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator
 from datetime import date, datetime, timezone
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -30,6 +31,7 @@ from dayu.fins.download_contract import (
     FINS_DOWNLOAD_MAX_FORM_ITEMS,
     FINS_DOWNLOAD_MAX_TICKER_CHARS,
     FinsDownloadDateRange,
+    FinsDownloadEffectiveFilters,
     FinsDownloadSource,
     FinsDownloadUsageError,
     FinsDownloadRequest,
@@ -290,7 +292,17 @@ async def _consume_until_cancelled(events: AsyncIterator[FinsEvent]) -> None:
 
 @pytest.mark.asyncio
 async def test_download_stream_accepts_typed_request_and_yields_progress_result() -> None:
-    """download 必须透传 owner 构造的 typed request 并产出 progress -> result。"""
+    """download 必须透传 owner 构造的 typed request 并产出 progress -> result。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: Service 透传、事件顺序或终态退出码不符合契约时抛出。
+    """
 
     token = ControllableCancellationToken()
     runtime = _FakeIngestionRuntime((_progress_event(), _result_event()))
@@ -301,7 +313,7 @@ async def test_download_stream_accepts_typed_request_and_yields_progress_result(
         start="2024-01-01",
         end="2024-12-31",
         overwrite_existing=True,
-        rebuild_local_artifacts=True,
+        rebuild_local_artifacts=False,
     )
 
     events = await _collect_events(
@@ -319,6 +331,125 @@ async def test_download_stream_accepts_typed_request_and_yields_progress_result(
     ]
     assert events[-1].result is not None
     assert events[-1].result.exit_code == FINS_DIRECT_EXIT_SUCCESS
+
+
+@pytest.mark.parametrize(
+    ("overwrite_existing", "rebuild_local_artifacts"),
+    (
+        (False, False),
+        (True, False),
+        (False, True),
+    ),
+)
+def test_download_mutation_mode_contract_accepts_legal_matrix(
+    overwrite_existing: bool,
+    rebuild_local_artifacts: bool,
+) -> None:
+    """request 与 effective filters 应接受相同的三个合法模式组合。
+
+    Args:
+        overwrite_existing: 当前用例是否启用 overwrite。
+        rebuild_local_artifacts: 当前用例是否启用 rebuild。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 任一 typed contract 拒绝合法组合或投影错误时抛出。
+    """
+
+    request = build_fins_download_request(
+        ticker="AAPL",
+        overwrite_existing=overwrite_existing,
+        rebuild_local_artifacts=rebuild_local_artifacts,
+    )
+    filters = FinsDownloadEffectiveFilters(
+        form_types=("10-K",),
+        start_date=None,
+        end_date=None,
+        overwrite_existing=overwrite_existing,
+        rebuild_local_artifacts=rebuild_local_artifacts,
+    )
+
+    assert request.overwrite_existing is overwrite_existing
+    assert request.rebuild_local_artifacts is rebuild_local_artifacts
+    assert filters.overwrite_existing is overwrite_existing
+    assert filters.rebuild_local_artifacts is rebuild_local_artifacts
+
+
+def test_download_mutation_mode_contract_rejects_conflict_with_one_diagnostic() -> None:
+    """request 与 effective filters 应以同一精确诊断拒绝双 true。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 任一 typed contract 接受冲突模式或诊断漂移时抛出。
+    """
+
+    expected_message = "--overwrite 与 --rebuild 不能同时使用；请只选择一种下载变更模式"
+
+    with pytest.raises(FinsDownloadUsageError) as request_error:
+        build_fins_download_request(
+            ticker="AAPL",
+            overwrite_existing=True,
+            rebuild_local_artifacts=True,
+        )
+    with pytest.raises(FinsDownloadUsageError) as filters_error:
+        FinsDownloadEffectiveFilters(
+            form_types=("10-K",),
+            start_date=None,
+            end_date=None,
+            overwrite_existing=True,
+            rebuild_local_artifacts=True,
+        )
+
+    assert str(request_error.value) == expected_message
+    assert str(filters_error.value) == expected_message
+
+
+def test_download_mutation_mode_contract_rejects_non_boolean_fields() -> None:
+    """唯一 mode helper 应为 request 与 filters 拒绝非布尔字段。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 任一 typed contract 接受非布尔模式字段时抛出。
+    """
+
+    with pytest.raises(TypeError, match="overwrite_existing must be bool"):
+        build_fins_download_request(
+            ticker="AAPL",
+            overwrite_existing=cast(bool, 1),
+        )
+    with pytest.raises(TypeError, match="rebuild_local_artifacts must be bool"):
+        build_fins_download_request(
+            ticker="AAPL",
+            rebuild_local_artifacts=cast(bool, 1),
+        )
+    with pytest.raises(TypeError, match="overwrite_existing must be bool"):
+        FinsDownloadEffectiveFilters(
+            form_types=("10-K",),
+            start_date=None,
+            end_date=None,
+            overwrite_existing=cast(bool, 1),
+            rebuild_local_artifacts=False,
+        )
+    with pytest.raises(TypeError, match="rebuild_local_artifacts must be bool"):
+        FinsDownloadEffectiveFilters(
+            form_types=("10-K",),
+            start_date=None,
+            end_date=None,
+            overwrite_existing=False,
+            rebuild_local_artifacts=cast(bool, 1),
+        )
 
 
 def test_download_request_builder_owns_canonical_ticker_forms_source_and_dates() -> None:
