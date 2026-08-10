@@ -56,7 +56,6 @@ _LOST_FALLBACK_MESSAGE: str = "Host run lost without error message."
 _USER_CANCELLED_MESSAGE: str = "Cancelled."
 _MISSING_FINAL_ANSWER_MESSAGE: str = "Host run succeeded without final answer."
 _FINS_CANCEL_REQUESTED_MESSAGE: str = "Fins operation cancel requested."
-_FINS_LOCAL_EXIT_AFTER_CANCEL_MESSAGE: str = "Fins operation already cancelling; local process exiting."
 _FINS_FAILED_FALLBACK_MESSAGE: str = "Fins operation failed."
 _FINS_EVENT_PROGRESS_PREFIX: Final[str] = "Fins progress"
 _FINS_EVENT_SUMMARY_PREFIX: Final[str] = "Fins summary"
@@ -272,23 +271,6 @@ def render_fins_direct_cancel_requested(
 
     print(
         _FINS_CANCEL_REQUESTED_MESSAGE,
-        file=sys.stderr if stderr is None else stderr,
-    )
-
-
-def render_fins_direct_local_exit_after_cancel(
-    *,
-    stderr: TextIO | None = None,
-) -> None:
-    """输出本地取消后退出的提示。
-
-    :param stderr: 标准错误流；``None`` 表示使用当前 ``sys.stderr``。
-    :returns: ``None``。
-    :raises OSError: 输出流写入失败时由底层 ``print`` 透传。
-    """
-
-    print(
-        _FINS_LOCAL_EXIT_AFTER_CANCEL_MESSAGE,
         file=sys.stderr if stderr is None else stderr,
     )
 
@@ -586,7 +568,6 @@ __all__: tuple[str, ...] = (
     "render_cli_error",
     "render_fins_direct_cancel_requested",
     "render_fins_direct_event",
-    "render_fins_direct_local_exit_after_cancel",
     "render_prompt_terminal_result",
     "render_session_list",
     "render_session_purge_result",

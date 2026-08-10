@@ -1595,6 +1595,8 @@ async def test_sigint_requests_token_and_waits_without_job_id(
     assert service.closed_streams == 1
     captured = capsys.readouterr()
     assert "Fins operation cancel requested" in captured.err
+    assert "Fins cancelled" in captured.err
+    assert "local process exiting" not in captured.err
     assert "job_id" not in captured.err
 
 
