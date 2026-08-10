@@ -16,6 +16,7 @@ from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.document_models import FinsIngestMethod, FilingUpdateRequest, now_iso8601
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.pipelines.cn_download_models import (
+    CN_FISCAL_PERIOD_ORDER,
     CN_PIPELINE_DOWNLOAD_VERSION,
     CnFiscalPeriod,
     CnMarketKind,
@@ -82,7 +83,8 @@ def rebuild_cn_download_artifacts(
             break
         previous_meta = host.source_repository.get_source_meta(ticker, document_id, SourceKind.FILING)
         meta = dict(previous_meta)
-        if not _should_rebuild_meta(meta=meta, period_windows=period_windows):
+        period_projection = _resolve_rebuild_period_projection(meta=meta, period_windows=period_windows)
+        if period_projection is None:
             continue
         filings.append(
             _rebuild_single_cn_download_document(
@@ -90,6 +92,7 @@ def rebuild_cn_download_artifacts(
                 ticker=ticker,
                 document_id=document_id,
                 previous_meta=meta,
+                covered_fiscal_periods=period_projection[1],
             )
         )
     elapsed_ms = int((time.perf_counter() - started_at) * 1000)
@@ -124,27 +127,42 @@ def rebuild_cn_download_artifacts(
     return result
 
 
-def _should_rebuild_meta(
+def _resolve_rebuild_period_projection(
     *,
     meta: JsonObject,
     period_windows: tuple[PeriodDownloadWindow, ...],
-) -> bool:
-    """判断 source meta 是否属于本次 CN/HK rebuild 范围。"""
+) -> tuple[CnFiscalPeriod, tuple[CnFiscalPeriod, ...]] | None:
+    """严格解析 source 财期投影，并判断是否属于本次 rebuild 范围。
+
+    Args:
+        meta: source meta。
+        period_windows: 本次 discovery 财期窗口。
+
+    Returns:
+        命中范围时返回身份与覆盖财期；不属于 CN/HK download 范围时返回
+        ``None``。
+
+    Raises:
+        ValueError: 命中 CN/HK download source 的 coverage schema 非法时抛出。
+    """
 
     if FinsIngestMethod.from_storage_value(str(meta["ingest_method"])) is not FinsIngestMethod.DOWNLOAD:
-        return False
+        return None
     if bool(meta.get("is_deleted", False)):
-        return False
+        return None
     period = _optional_period(meta.get("fiscal_period"))
     if period is None:
-        return False
+        return None
+    covered_fiscal_periods = _required_covered_fiscal_periods(meta, identity_period=period)
     matched_window = next((item for item in period_windows if item.fiscal_period == period), None)
     if matched_window is None:
-        return False
+        return None
     filing_date = _optional_text(meta.get("filing_date"))
     if filing_date is None:
-        return False
-    return matched_window.start_date <= filing_date <= matched_window.end_date
+        return None
+    if not matched_window.start_date <= filing_date <= matched_window.end_date:
+        return None
+    return period, covered_fiscal_periods
 
 
 def _rebuild_single_cn_download_document(
@@ -153,8 +171,23 @@ def _rebuild_single_cn_download_document(
     ticker: str,
     document_id: str,
     previous_meta: JsonObject,
+    covered_fiscal_periods: tuple[CnFiscalPeriod, ...],
 ) -> JsonObject:
-    """重建单个 CN/HK 本地下载文档。"""
+    """重建单个 CN/HK 本地下载文档。
+
+    Args:
+        host: CN/HK workflow 宿主。
+        ticker: canonical ticker。
+        document_id: source 文档 ID。
+        previous_meta: 已验证属于本次范围的 source meta。
+        covered_fiscal_periods: 已严格解析的覆盖财期。
+
+    Returns:
+        单文档 rebuild 结果。
+
+    Raises:
+        OSError: 仓储操作失败时抛出。
+    """
 
     internal_document_id = _required_text(previous_meta, "internal_document_id", document_id)
     form_type = _required_text(previous_meta, "form_type", "")
@@ -167,6 +200,7 @@ def _rebuild_single_cn_download_document(
             internal_document_id=internal_document_id,
             reason_code="missing_form_type",
             reason_message="重建失败：meta.json 缺少 form_type",
+            covered_fiscal_periods=covered_fiscal_periods,
         )
     if not _has_docling_file(file_entries):
         return _failed_rebuild_result(
@@ -177,6 +211,7 @@ def _rebuild_single_cn_download_document(
             report_date=report_date,
             reason_code="missing_docling_json",
             reason_message="重建失败：CN/HK 下载完成态缺少 Docling JSON",
+            covered_fiscal_periods=covered_fiscal_periods,
         )
     if not _has_pdf_file(file_entries):
         return _failed_rebuild_result(
@@ -187,6 +222,7 @@ def _rebuild_single_cn_download_document(
             report_date=report_date,
             reason_code="missing_pdf",
             reason_message="重建失败：CN/HK 下载完成态缺少 PDF",
+            covered_fiscal_periods=covered_fiscal_periods,
         )
     primary_document = _resolve_primary_document(previous_meta=previous_meta, file_entries=file_entries)
     if not primary_document:
@@ -198,6 +234,7 @@ def _rebuild_single_cn_download_document(
             report_date=report_date,
             reason_code="missing_primary_document",
             reason_message="重建失败：CN/HK 下载完成态缺少 primary_document",
+            covered_fiscal_periods=covered_fiscal_periods,
         )
     source_fingerprint = _resolve_source_fingerprint(previous_meta=previous_meta, file_entries=file_entries)
     meta_payload = dict(previous_meta)
@@ -242,6 +279,7 @@ def _rebuild_single_cn_download_document(
         "form_type": form_type,
         "filing_date": filing_date,
         "report_date": report_date,
+        "covered_fiscal_periods": list(covered_fiscal_periods),
         "downloaded_files": 0,
         "skipped_files": len(file_entries),
         "failed_files": [],
@@ -333,11 +371,29 @@ def _failed_rebuild_result(
     internal_document_id: str,
     reason_code: str,
     reason_message: str,
+    covered_fiscal_periods: tuple[CnFiscalPeriod, ...],
     form_type: str | None = None,
     filing_date: str | None = None,
     report_date: str | None = None,
 ) -> JsonObject:
-    """构建单文档 rebuild 失败结果。"""
+    """构建单文档 rebuild 失败结果。
+
+    Args:
+        document_id: source 文档 ID。
+        internal_document_id: 内部文档 ID。
+        reason_code: 稳定失败原因码。
+        reason_message: 失败说明。
+        covered_fiscal_periods: 已验证的覆盖财期。
+        form_type: 可选 form type。
+        filing_date: 可选披露日期。
+        report_date: 可选报告日期。
+
+    Returns:
+        单文档失败结果。
+
+    Raises:
+        无。
+    """
 
     return {
         "document_id": document_id,
@@ -346,6 +402,7 @@ def _failed_rebuild_result(
         "form_type": form_type,
         "filing_date": filing_date,
         "report_date": report_date,
+        "covered_fiscal_periods": list(covered_fiscal_periods),
         "downloaded_files": 0,
         "skipped_files": 0,
         "failed_files": [],
@@ -389,6 +446,46 @@ def _optional_period(value: JsonValue | None) -> CnFiscalPeriod | None:
     if normalized == "Q4":
         return "Q4"
     return None
+
+
+def _required_covered_fiscal_periods(
+    meta: JsonObject,
+    *,
+    identity_period: CnFiscalPeriod,
+) -> tuple[CnFiscalPeriod, ...]:
+    """严格读取 fresh source schema 的覆盖财期。
+
+    Args:
+        meta: source meta。
+        identity_period: source 身份财期。
+
+    Returns:
+        canonical ordered 覆盖财期。
+
+    Raises:
+        ValueError: 字段缺失、类型非法、重复、顺序非法或不含 identity 时抛出。
+    """
+
+    if "covered_fiscal_periods" not in meta or not isinstance(meta["covered_fiscal_periods"], list):
+        raise ValueError("CN/HK rebuild source meta 的 covered_fiscal_periods 必须是列表")
+    raw_periods = meta["covered_fiscal_periods"]
+    assert isinstance(raw_periods, list)
+    periods: list[CnFiscalPeriod] = []
+    for index, value in enumerate(raw_periods):
+        period = _optional_period(value)
+        if period is None:
+            raise ValueError(f"CN/HK rebuild covered_fiscal_periods[{index}] 非法")
+        periods.append(period)
+    if not periods:
+        raise ValueError("CN/HK rebuild covered_fiscal_periods 不能为空")
+    if len(set(periods)) != len(periods):
+        raise ValueError("CN/HK rebuild covered_fiscal_periods 不能重复")
+    canonical = tuple(period for period in CN_FISCAL_PERIOD_ORDER if period in periods)
+    if tuple(periods) != canonical:
+        raise ValueError("CN/HK rebuild covered_fiscal_periods 顺序非法")
+    if identity_period not in periods:
+        raise ValueError("CN/HK rebuild covered_fiscal_periods 必须包含 identity period")
+    return tuple(periods)
 
 
 def _optional_text(value: JsonValue | None) -> str | None:

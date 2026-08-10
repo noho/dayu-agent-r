@@ -41,6 +41,7 @@ from dayu.fins.pipelines.cn_download_models import (
     CnFiscalPeriod,
     CnLanguage,
     CnReportCandidate,
+    CnReportPeriodProjection,
     CnReportQuery,
 )
 
@@ -481,7 +482,7 @@ def test_list_report_candidates_gets_title_search_and_builds_absolute_url() -> N
     assert candidate.source_url == _PDF_URL
     assert candidate.language == "zh"
     assert candidate.fiscal_year == 2024
-    assert candidate.fiscal_period == "FY"
+    assert candidate.period_projection.identity_period == "FY"
     assert candidate.content_length == 4096
     assert candidate.etag == '"hk-v1"'
     assert candidate.last_modified == "Tue, 01 Apr 2025 00:00:00 GMT"
@@ -1184,7 +1185,7 @@ def test_list_report_candidates_maps_hk_period_codes_and_allows_empty_quarters()
     assert category_params == [
         ("40000", "-2", "40100"),
         ("40000", "-2", "40200"),
-        ("10000", "3", "13600"),
+        ("10000", "3", "-2"),
     ]
 
 
@@ -1265,10 +1266,11 @@ def test_list_report_candidates_maps_direct_q2_to_quarterly_category() -> None:
         _profile(),
     )
 
-    assert seen_t2codes == ["13600"]
+    assert seen_t2codes == ["-2"]
     assert len(candidates) == 1
     assert candidates[0].source_id == "Q2_2025"
-    assert candidates[0].fiscal_period == "Q2"
+    assert candidates[0].period_projection.identity_period == "Q2"
+    assert candidates[0].period_projection.covered_periods == ("H1", "Q2")
 
 
 def test_list_report_candidates_keeps_q4_distinct_from_fy() -> None:
@@ -1321,7 +1323,7 @@ def test_list_report_candidates_keeps_q4_distinct_from_fy() -> None:
         _profile(),
     )
 
-    assert [(candidate.source_id, candidate.fiscal_period) for candidate in candidates] == [
+    assert [(candidate.source_id, candidate.period_projection.identity_period) for candidate in candidates] == [
         ("FY_2025", "FY"),
         ("Q4_2025", "Q4"),
     ]
@@ -1361,7 +1363,7 @@ def test_list_report_candidates_treats_traditional_half_year_as_h1() -> None:
         _profile(),
     )
 
-    assert [(candidate.source_id, candidate.fiscal_period) for candidate in candidates] == [
+    assert [(candidate.source_id, candidate.period_projection.identity_period) for candidate in candidates] == [
         ("H1_2025", "H1"),
     ]
 
@@ -1377,7 +1379,7 @@ def test_list_report_candidates_filters_q1_q3_by_title_period() -> None:
             form = _query_from_request(request)
             assert form["t1code"] == ("10000",)
             assert form["t2Gcode"] == ("3",)
-            assert form["t2code"] == ("13600",)
+            assert form["t2code"] == ("-2",)
             if form["lang"] == ("E",):
                 return httpx.Response(200, json=_title_search_payload([]))
             return httpx.Response(
@@ -1411,14 +1413,14 @@ def test_list_report_candidates_filters_q1_q3_by_title_period() -> None:
         _profile(),
     )
 
-    assert [(candidate.source_id, candidate.fiscal_period) for candidate in candidates] == [
+    assert [(candidate.source_id, candidate.period_projection.identity_period) for candidate in candidates] == [
         ("Q1_2024", "Q1"),
         ("Q3_2024", "Q3"),
     ]
 
 
 def test_list_report_candidates_reads_hk_quarterly_results_announcements() -> None:
-    """真实腾讯式 ``公告及通告 - [季度業績]`` 应归入 Q1/Q2/Q3/Q4。"""
+    """通用 ``公告及通告 - [季度業績]`` raw fixture 应归入 Q1/Q2/Q3/Q4。"""
 
     q1_url = f"{HKEXNEWS_BASE_URL}/listedco/listconews/sehk/2025/0514/q1.pdf"
     q2_url = f"{HKEXNEWS_BASE_URL}/listedco/listconews/sehk/2025/0813/q2.pdf"
@@ -1430,7 +1432,7 @@ def test_list_report_candidates_reads_hk_quarterly_results_announcements() -> No
             form = _query_from_request(request)
             assert form["t1code"] == ("10000",)
             assert form["t2Gcode"] == ("3",)
-            assert form["t2code"] == ("13600",)
+            assert form["t2code"] == ("-2",)
             if form["lang"] == ("E",):
                 return httpx.Response(200, json=_title_search_payload([]))
             return httpx.Response(
@@ -1478,7 +1480,7 @@ def test_list_report_candidates_reads_hk_quarterly_results_announcements() -> No
         _profile(),
     )
 
-    assert [(candidate.source_id, candidate.fiscal_period) for candidate in candidates] == [
+    assert [(candidate.source_id, candidate.period_projection.identity_period) for candidate in candidates] == [
         ("Q1_2025", "Q1"),
         ("Q2_2025", "Q2"),
         ("Q3_2025", "Q3"),
@@ -1557,7 +1559,7 @@ def test_download_report_pdf_returns_asset_for_valid_pdf() -> None:
         language="en",
         filing_date="2025-04-01",
         fiscal_year=2024,
-        fiscal_period="FY",
+        period_projection=CnReportPeriodProjection(identity_period="FY", covered_periods=("FY",)),
         amended=False,
         content_length=len(pdf_payload),
         etag=None,
@@ -1590,7 +1592,7 @@ def test_download_report_pdf_does_not_sleep_before_first_request() -> None:
         language="en",
         filing_date="2025-04-01",
         fiscal_year=2024,
-        fiscal_period="FY",
+        period_projection=CnReportPeriodProjection(identity_period="FY", covered_periods=("FY",)),
         amended=False,
         content_length=len(pdf_payload),
         etag=None,
@@ -1626,7 +1628,7 @@ def test_download_report_pdf_throttles_between_successful_requests() -> None:
         language="en",
         filing_date="2025-04-01",
         fiscal_year=2024,
-        fiscal_period="FY",
+        period_projection=CnReportPeriodProjection(identity_period="FY", covered_periods=("FY",)),
         amended=False,
         content_length=len(pdf_payload),
         etag=None,
@@ -1663,7 +1665,7 @@ def test_download_report_pdf_repeated_calls_return_complete_bytes() -> None:
         language="en",
         filing_date="2025-04-01",
         fiscal_year=2024,
-        fiscal_period="FY",
+        period_projection=CnReportPeriodProjection(identity_period="FY", covered_periods=("FY",)),
         amended=False,
         content_length=len(pdf_payload),
         etag=None,
@@ -1699,7 +1701,7 @@ def test_download_report_pdf_rejects_short_or_non_pdf_payload() -> None:
             language="en",
             filing_date="2025-04-01",
             fiscal_year=2024,
-            fiscal_period="FY",
+            period_projection=CnReportPeriodProjection(identity_period="FY", covered_periods=("FY",)),
             amended=False,
             content_length=len(payload),
             etag=None,
@@ -1842,7 +1844,7 @@ def test_hkexnews_preloop_provider_misuse_makes_zero_http_requests() -> None:
         language="en",
         filing_date="2025-04-01",
         fiscal_year=2024,
-        fiscal_period="FY",
+        period_projection=CnReportPeriodProjection(identity_period="FY", covered_periods=("FY",)),
         amended=False,
         content_length=None,
         etag=None,

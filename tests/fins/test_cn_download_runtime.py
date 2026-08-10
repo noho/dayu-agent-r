@@ -31,6 +31,7 @@ from dayu.fins.pipelines.cn_download_models import (
     CnMarketKind,
     CnCompanyProfile,
     CnReportCandidate,
+    CnReportPeriodProjection,
     CnReportQuery,
     DownloadedReportAsset,
 )
@@ -210,7 +211,7 @@ class _RuntimeFakeDiscoveryClient:
                 language="zh",
                 filing_date=filing_date,
                 fiscal_year=fiscal_year,
-                fiscal_period="FY",
+                period_projection=CnReportPeriodProjection(identity_period="FY", covered_periods=("FY",)),
                 amended=False,
                 content_length=len(_PDF_BYTES),
                 etag=f'"{self.source_id}-v1"',
@@ -822,6 +823,7 @@ def test_cn_adapter_rejects_invalid_binding_and_request_identity(tmp_path: Path)
                         "form_type": "FY",
                         "filing_date": "2024-08-01",
                         "report_date": "2023-12-31",
+                        "covered_fiscal_periods": ["FY"],
                     }
                 ]
             ),
@@ -879,6 +881,7 @@ def test_cn_adapter_summary_counts_are_derived_from_typed_rows(tmp_path: Path) -
                     "form_type": "FY",
                     "filing_date": "2024-08-01",
                     "report_date": "2023-12-31",
+                    "covered_fiscal_periods": ["FY"],
                 }
             ]
         ),
@@ -891,6 +894,54 @@ def test_cn_adapter_summary_counts_are_derived_from_typed_rows(tmp_path: Path) -
     assert summary.downloaded_count == 0
     assert summary.failed_count == 0
     assert summary.written_document_ids == ()
+    assert summary.document_rows[0].covered_fiscal_periods == ("FY",)
+
+
+@pytest.mark.parametrize(
+    "coverage_value",
+    (
+        None,
+        "FY",
+        [],
+        ["FY", "FY"],
+        ["Q4", "FY"],
+        ["FY"],
+    ),
+)
+def test_cn_adapter_rejects_invalid_required_coverage(
+    tmp_path: Path,
+    coverage_value: JsonValue | None,
+) -> None:
+    """CN adapter 对缺失、非数组、空、重复、乱序或不含 identity 的 coverage fail closed。
+
+    Args:
+        tmp_path: source repository 临时根目录。
+        coverage_value: 缺失或非法 coverage。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法 workflow coverage 被接纳时抛出。
+    """
+
+    row: dict[str, JsonValue] = {
+        "document_id": "fil-invalid-coverage",
+        "status": "skipped",
+        "reason_code": "already_downloaded_complete",
+        "form_type": "Q4",
+        "filing_date": "2025-01-01",
+        "report_date": None,
+    }
+    if coverage_value is not None:
+        row["covered_fiscal_periods"] = coverage_value
+
+    with pytest.raises(ValueError, match="covered_fiscal_periods"):
+        cn_pipeline_module._summary_from_pipeline_result(
+            _cn_projection_result([row]),
+            request=_cn_projection_request(),
+            source_repository=FsSourceDocumentRepository(tmp_path),
+        )
 
 
 def test_cn_pipeline_upload_status_preserves_non_uploaded_state() -> None:
@@ -934,6 +985,7 @@ def test_cn_hk_adapter_local_rebuild_does_not_mutate_processed_documents(
         "form_type": "FY",
         "filing_date": "2024-08-01",
         "report_date": "2023-12-31",
+        "covered_fiscal_periods": ["FY"],
     }
     pipeline.result_filings = [filing_payload]
     setup_batch = pipeline.batching_repository.begin_batch(ticker)

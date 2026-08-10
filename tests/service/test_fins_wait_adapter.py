@@ -298,6 +298,7 @@ def test_fins_wait_adapter_projects_same_typed_download_object() -> None:
                 form_or_period="10-K",
                 filing_date="2024-08-01",
                 report_date="2024-06-30",
+                covered_fiscal_periods=(),
                 disposition=FinsDownloadDocumentDisposition.DOWNLOADED,
                 reason_category=None,
                 reason_message=None,
@@ -337,6 +338,16 @@ def test_fins_wait_adapter_projects_same_typed_download_object() -> None:
     value = poll.outcome.result.value
     assert isinstance(value, Mapping)
     assert value["download"] == download.to_json_value()
+    download_value = value["download"]
+    assert isinstance(download_value, Mapping)
+    documents_value = download_value["documents"]
+    assert isinstance(documents_value, list)
+    assert len(documents_value) == 1
+    document_value = documents_value[0]
+    assert isinstance(document_value, Mapping)
+    coverage_value = document_value["covered_fiscal_periods"]
+    assert isinstance(coverage_value, list)
+    assert coverage_value == []
     assert "details" not in value
     serialized = str(value)
     assert "must-not-project" not in serialized

@@ -154,9 +154,9 @@ async def run_cn_download_single_filing_stream(
     _raise_if_cancelled(module=module, ticker=ticker, document_id="", cancel_checker=cancel_checker)
     document_id, internal_document_id = build_cn_filing_ids(
         ticker=ticker,
-        form_type=candidate.fiscal_period,
+        form_type=candidate.period_projection.identity_period,
         fiscal_year=candidate.fiscal_year,
-        fiscal_period=candidate.fiscal_period,
+        fiscal_period=candidate.period_projection.identity_period,
         amended=candidate.amended,
     )
     pdf_filename = f"{document_id}.pdf"
@@ -295,7 +295,7 @@ async def run_cn_download_single_filing_stream(
         try:
             Log.info(
                 f"开始 Docling 转换: ticker={ticker} document_id={document_id} "
-                f"form={candidate.fiscal_period} filing_date={candidate.filing_date} "
+                f"form={candidate.period_projection.identity_period} filing_date={candidate.filing_date} "
                 f"source_file={pdf_filename}",
                 module=module,
             )
@@ -361,7 +361,6 @@ async def run_cn_download_single_filing_stream(
         ticker=ticker,
         document_id=document_id,
         internal_document_id=internal_document_id,
-        form_type=candidate.fiscal_period,
         pdf_filename=pdf_filename,
         docling_filename=docling_filename,
         pdf_bytes=pdf_bytes,
@@ -507,7 +506,6 @@ def _commit_cn_filing_assets_batch(
     ticker: str,
     document_id: str,
     internal_document_id: str,
-    form_type: str,
     pdf_filename: str,
     docling_filename: str,
     pdf_bytes: bytes,
@@ -534,7 +532,6 @@ def _commit_cn_filing_assets_batch(
         ticker: 已归一化 ticker。
         document_id: 文档 ID。
         internal_document_id: 内部文档 ID。
-        form_type: 财期 form type。
         pdf_filename: PDF 对象名。
         docling_filename: Docling JSON 对象名。
         pdf_bytes: 已在 batch 外完成下载或复用读取的 PDF 字节。
@@ -656,7 +653,6 @@ def _commit_cn_filing_assets_batch(
             ticker=ticker,
             document_id=document_id,
             internal_document_id=internal_document_id,
-            form_type=form_type,
             primary_document=docling_filename,
             file_entries=file_entries,
             candidate=candidate,
@@ -807,11 +803,12 @@ def _build_filing_result(
     payload: JsonObject = {
         "document_id": document_id,
         "status": status,
-        "form_type": candidate.fiscal_period,
+        "form_type": candidate.period_projection.identity_period,
         "filing_date": candidate.filing_date,
         "report_date": None,
         "fiscal_year": candidate.fiscal_year,
-        "fiscal_period": candidate.fiscal_period,
+        "fiscal_period": candidate.period_projection.identity_period,
+        "covered_fiscal_periods": list(candidate.period_projection.covered_periods),
         "downloaded_files": downloaded_files,
         "skipped_files": skipped_files,
         "failed_files": [],

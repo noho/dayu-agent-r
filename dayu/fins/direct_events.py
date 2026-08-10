@@ -24,6 +24,7 @@ from dayu.fins.download_contract import (
     FinsDownloadTerminalDisposition,
     FinsDownloadTransportCategory,
 )
+from dayu.fins.domain.filing_semantics import FISCAL_PERIODS
 
 FINS_RESULT_EXIT_SUCCESS: Final[int] = 0
 FINS_RESULT_EXIT_FAILURE: Final[int] = 1
@@ -254,12 +255,25 @@ class FinsPublicFailure:
 
 @dataclass(frozen=True, slots=True)
 class FinsDownloadPublicDocument:
-    """public terminal 中的单个有界下载文档行。"""
+    """public terminal 中的单个有界下载文档行。
+
+    Attributes:
+        document_id: provider candidate 的业务文档 ID。
+        form_or_period: canonical form 或身份财期。
+        filing_date: 可选披露日期。
+        report_date: 可选报告期日期。
+        covered_fiscal_periods: 上游 typed contract 原样投影的覆盖财期。
+        disposition: 互斥结果分类。
+        reason_category: 可选稳定原因分类。
+        reason_message: 可选脱敏原因说明。
+        artifact_locator: 可选 workspace-relative source locator。
+    """
 
     document_id: str
     form_or_period: str | None
     filing_date: str | None
     report_date: str | None
+    covered_fiscal_periods: tuple[str, ...]
     disposition: FinsDownloadDocumentDisposition
     reason_category: str | None
     reason_message: str | None
@@ -288,6 +302,12 @@ class FinsDownloadPublicDocument:
         _validate_optional_safe_text(self.form_or_period, "download.row.form_or_period")
         _validate_optional_safe_text(self.filing_date, "download.row.filing_date")
         _validate_optional_safe_text(self.report_date, "download.row.report_date")
+        if not isinstance(self.covered_fiscal_periods, tuple):
+            raise TypeError("covered_fiscal_periods must be tuple")
+        if any(not isinstance(period, str) or period not in FISCAL_PERIODS for period in self.covered_fiscal_periods):
+            raise ValueError("covered_fiscal_periods must contain canonical fiscal periods")
+        if len(set(self.covered_fiscal_periods)) != len(self.covered_fiscal_periods):
+            raise ValueError("covered_fiscal_periods must not contain duplicates")
         if not isinstance(self.disposition, FinsDownloadDocumentDisposition):
             raise TypeError("disposition must be FinsDownloadDocumentDisposition")
         _validate_optional_safe_text(self.reason_category, "download.row.reason_category")
@@ -334,6 +354,7 @@ class FinsDownloadPublicDocument:
             "form_or_period": self.form_or_period,
             "filing_date": self.filing_date,
             "report_date": self.report_date,
+            "covered_fiscal_periods": list(self.covered_fiscal_periods),
             "disposition": self.disposition.value,
             "reason_category": self.reason_category,
             "reason_message": self.reason_message,

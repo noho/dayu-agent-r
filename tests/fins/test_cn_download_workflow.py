@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from collections.abc import AsyncGenerator, Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
@@ -41,6 +42,7 @@ from dayu.fins.pipelines.cn_download_models import (
     CnFiscalPeriod,
     CnMarketKind,
     CnReportCandidate,
+    CnReportPeriodProjection,
     CnReportQuery,
     CnSourceProvider,
     DownloadedReportAsset,
@@ -758,6 +760,7 @@ def _candidate(
     fiscal_period: CnFiscalPeriod = "FY",
     filing_date: str | None = None,
     provider: CnSourceProvider = "cninfo",
+    covered_periods: tuple[CnFiscalPeriod, ...] | None = None,
 ) -> CnReportCandidate:
     """构造 CN 候选。
 
@@ -768,6 +771,7 @@ def _candidate(
         fiscal_period: 财期。
         filing_date: 披露日期。
         provider: 候选来源 provider。
+        covered_periods: 显式覆盖财期；省略时构造 identity singleton。
 
     Returns:
         候选报告。
@@ -784,7 +788,10 @@ def _candidate(
         language="zh",
         filing_date=filing_date or f"{fiscal_year + 1}-04-01",
         fiscal_year=fiscal_year,
-        fiscal_period=fiscal_period,
+        period_projection=CnReportPeriodProjection(
+            identity_period=fiscal_period,
+            covered_periods=(fiscal_period,) if covered_periods is None else covered_periods,
+        ),
         amended=False,
         content_length=len(_PDF_BYTES),
         etag=etag,
@@ -1127,7 +1134,23 @@ def test_cn_fiscal_period_order_is_declared_in_owner_module_exports() -> None:
     ("candidates", "expected_missing"),
     [
         ((), ["FY", "H1"]),
-        ((_candidate(source_id="HK-Q2", fiscal_period="Q2", provider="hkexnews"),), ["FY", "H1"]),
+        (
+            (
+                _candidate(
+                    source_id="HK-Q2",
+                    fiscal_period="Q2",
+                    provider="hkexnews",
+                    covered_periods=("H1", "Q2"),
+                ),
+                _candidate(
+                    source_id="HK-Q4",
+                    fiscal_period="Q4",
+                    provider="hkexnews",
+                    covered_periods=("FY", "Q4"),
+                ),
+            ),
+            ["FY", "H1"],
+        ),
         (
             (
                 _candidate(source_id="HK-FY", fiscal_period="FY", provider="hkexnews"),
@@ -1309,6 +1332,89 @@ def test_cn_company_publication_failure_rolls_back_once(tmp_path: Path) -> None:
     assert batching_repository.rollback_calls == 1
 
 
+def test_hk_result_coverage_projects_without_creating_extra_documents(tmp_path: Path) -> None:
+    """Q4 result 与 FY report 各有一个 identity，coverage 不增加 source/manifest 数量。
+
+    Args:
+        tmp_path: 临时工作区。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: identity、source meta、workflow row 或 manifest 投影漂移时抛出。
+    """
+
+    q4_candidate = _candidate(
+        source_id="GENERIC-Q4-RESULT",
+        fiscal_period="Q4",
+        provider="hkexnews",
+        covered_periods=("FY", "Q4"),
+    )
+    fy_candidate = _candidate(
+        source_id="GENERIC-FY-REPORT",
+        fiscal_period="FY",
+        provider="hkexnews",
+    )
+    pipeline = _build_pipeline(
+        tmp_path=tmp_path,
+        discovery=_FakeDiscoveryClient(temp_dir=tmp_path, candidates=()),
+        hk_discovery=_FakeDiscoveryClient(temp_dir=tmp_path, candidates=(fy_candidate, q4_candidate)),
+        converter=_FakeConverter(),
+    )
+
+    result = _final_result(
+        asyncio.run(
+            _collect_events_async(
+                pipeline=pipeline,
+                ticker="0005",
+                form_type=None,
+                start_date="2024",
+                end_date="2026",
+                overwrite=False,
+                start_is_explicit=True,
+            )
+        )
+    )
+    document_ids = pipeline.source_repository.list_source_document_ids("0005", SourceKind.FILING)
+
+    assert len(document_ids) == 2
+    rows = result["filings"]
+    assert isinstance(rows, list)
+    coverage_values: set[tuple[str, ...]] = set()
+    for row in rows:
+        assert isinstance(row, dict)
+        raw_coverage = row["covered_fiscal_periods"]
+        assert isinstance(raw_coverage, list)
+        assert all(isinstance(value, str) for value in raw_coverage)
+        coverage_values.add(tuple(cast(list[str], raw_coverage)))
+    assert coverage_values == {
+        ("FY",),
+        ("FY", "Q4"),
+    }
+    q4_document_id = next(
+        document_id
+        for document_id in document_ids
+        if pipeline.source_repository.get_source_meta("0005", document_id, SourceKind.FILING)["fiscal_period"] == "Q4"
+    )
+    q4_meta = pipeline.source_repository.get_source_meta("0005", q4_document_id, SourceKind.FILING)
+    assert q4_meta["form_type"] == q4_meta["fiscal_period"] == q4_meta["report_kind"] == "Q4"
+    assert q4_meta["covered_fiscal_periods"] == ["FY", "Q4"]
+    assert q4_meta["source_id"] == "GENERIC-Q4-RESULT"
+    assert q4_meta["source_provider"] == "hkexnews"
+    assert q4_meta["source_url"] == q4_candidate.source_url
+
+    locator = pipeline.source_repository.get_source_document_locator("0005", q4_document_id, SourceKind.FILING)
+    manifest = json.loads((tmp_path / locator.parent / "filing_manifest.json").read_text(encoding="utf-8"))
+    assert isinstance(manifest, dict)
+    manifest_rows = manifest["documents"]
+    assert isinstance(manifest_rows, list)
+    assert len(manifest_rows) == 2
+    q4_manifest_rows = [row for row in manifest_rows if isinstance(row, dict) and row["document_id"] == q4_document_id]
+    assert len(q4_manifest_rows) == 1
+    assert q4_manifest_rows[0]["fiscal_period"] == "Q4"
+
+
 @pytest.mark.parametrize(
     ("previous_meta", "expected_reason"),
     [
@@ -1356,6 +1462,7 @@ def test_cn_rebuild_rejects_missing_complete_download_facts(
         ticker="600519",
         document_id="fil_invalid",
         previous_meta=previous_meta,
+        covered_fiscal_periods=("FY",),
     )
 
     assert result["status"] == "failed"
@@ -1365,20 +1472,51 @@ def test_cn_rebuild_rejects_missing_complete_download_facts(
 @pytest.mark.parametrize(
     ("meta", "expected"),
     [
-        ({"ingest_method": "upload", "fiscal_period": "FY", "filing_date": "2025-01-01"}, False),
+        (
+            {
+                "ingest_method": "upload",
+                "fiscal_period": "FY",
+                "filing_date": "2025-01-01",
+            },
+            False,
+        ),
         (
             {
                 "ingest_method": "download",
                 "is_deleted": True,
                 "fiscal_period": "FY",
                 "filing_date": "2025-01-01",
+                "covered_fiscal_periods": ["FY"],
             },
             False,
         ),
         ({"ingest_method": "download", "fiscal_period": "invalid", "filing_date": "2025-01-01"}, False),
-        ({"ingest_method": "download", "fiscal_period": "Q1", "filing_date": "2025-01-01"}, False),
-        ({"ingest_method": "download", "fiscal_period": "FY"}, False),
-        ({"ingest_method": "download", "fiscal_period": "FY", "filing_date": "2025-01-01"}, True),
+        (
+            {
+                "ingest_method": "download",
+                "fiscal_period": "Q1",
+                "filing_date": "2025-01-01",
+                "covered_fiscal_periods": ["Q1"],
+            },
+            False,
+        ),
+        (
+            {
+                "ingest_method": "download",
+                "fiscal_period": "FY",
+                "covered_fiscal_periods": ["FY"],
+            },
+            False,
+        ),
+        (
+            {
+                "ingest_method": "download",
+                "fiscal_period": "FY",
+                "filing_date": "2025-01-01",
+                "covered_fiscal_periods": ["FY"],
+            },
+            True,
+        ),
     ],
 )
 def test_cn_rebuild_scope_filter_contract(meta: dict[str, JsonValue], expected: bool) -> None:
@@ -1390,7 +1528,58 @@ def test_cn_rebuild_scope_filter_contract(meta: dict[str, JsonValue], expected: 
         end_date="2026-12-31",
     )
 
-    assert _cn_download_rebuild._should_rebuild_meta(meta=meta, period_windows=(window,)) is expected
+    projection = _cn_download_rebuild._resolve_rebuild_period_projection(
+        meta=meta,
+        period_windows=(window,),
+    )
+    assert (projection is not None) is expected
+
+
+@pytest.mark.parametrize(
+    "coverage_value",
+    (
+        None,
+        "FY",
+        [],
+        ["FY", "FY"],
+        ["Q4", "FY"],
+        ["FY"],
+        ["INVALID", "Q4"],
+    ),
+)
+def test_cn_rebuild_fails_closed_on_invalid_fresh_schema_coverage(
+    coverage_value: JsonValue | None,
+) -> None:
+    """fresh source schema 的 coverage 缟失或畸形时 rebuild 必须 fail closed。
+
+    Args:
+        coverage_value: 缺失或非法 coverage 值。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: rebuild 未拒绝非法 coverage 时抛出。
+    """
+
+    meta: dict[str, JsonValue] = {
+        "ingest_method": "download",
+        "fiscal_period": "Q4",
+        "filing_date": "2025-01-01",
+    }
+    if coverage_value is not None:
+        meta["covered_fiscal_periods"] = coverage_value
+    window = _cn_download_rebuild.PeriodDownloadWindow(
+        fiscal_period="Q4",
+        start_date="2024-01-01",
+        end_date="2026-12-31",
+    )
+
+    with pytest.raises(ValueError, match="covered_fiscal_periods"):
+        _cn_download_rebuild._resolve_rebuild_period_projection(
+            meta=meta,
+            period_windows=(window,),
+        )
 
 
 def test_cn_rebuild_cancel_checker_contract() -> None:
@@ -2012,7 +2201,6 @@ def test_cn_active_batch_sync_cancelled_error_rolls_back_once(tmp_path: Path) ->
             ticker="600519",
             document_id="fil_cancelled",
             internal_document_id="fil_cancelled",
-            form_type="FY",
             pdf_filename="fil_cancelled.pdf",
             docling_filename="fil_cancelled_docling.json",
             pdf_bytes=_PDF_BYTES,
@@ -2100,9 +2288,9 @@ def test_cn_top_level_repairs_selected_corruption_with_overwrite_false(
     candidate = _candidate()
     document_id, _internal_document_id = build_cn_filing_ids(
         ticker="600519",
-        form_type=candidate.fiscal_period,
+        form_type=candidate.period_projection.identity_period,
         fiscal_year=candidate.fiscal_year,
-        fiscal_period=candidate.fiscal_period,
+        fiscal_period=candidate.period_projection.identity_period,
         amended=candidate.amended,
     )
     locator = pipeline.source_repository.get_source_document_locator(
@@ -2151,9 +2339,9 @@ def test_cn_selected_repair_transport_failure_preserves_old_company_and_source(
     candidate = _candidate()
     document_id, _internal_document_id = build_cn_filing_ids(
         ticker="600519",
-        form_type=candidate.fiscal_period,
+        form_type=candidate.period_projection.identity_period,
         fiscal_year=candidate.fiscal_year,
-        fiscal_period=candidate.fiscal_period,
+        fiscal_period=candidate.period_projection.identity_period,
         amended=candidate.amended,
     )
     locator = initial_pipeline.source_repository.get_source_document_locator(
@@ -2203,9 +2391,9 @@ def test_cn_no_filing_with_corruption_fails_before_company_batch(tmp_path: Path)
     candidate = _candidate()
     document_id, _internal_document_id = build_cn_filing_ids(
         ticker="600519",
-        form_type=candidate.fiscal_period,
+        form_type=candidate.period_projection.identity_period,
         fiscal_year=candidate.fiscal_year,
-        fiscal_period=candidate.fiscal_period,
+        fiscal_period=candidate.period_projection.identity_period,
         amended=candidate.amended,
     )
     locator = pipeline.source_repository.get_source_document_locator(

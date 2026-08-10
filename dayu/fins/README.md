@@ -491,7 +491,15 @@ batching repository 是 begin / commit / rollback 的唯一 lifecycle owner。pr
 
 ### Downloaders 与 CN/HK report selection
 
-CNInfo / HKEXNews downloader 只负责 HTTP 请求响应、provider JSON 解析、provider raw 字段归一、股票代码匹配、PDF URL 归一、HEAD / GET 与 PDF 字节校验。产品级财报候选语义由 `dayu.fins.pipelines.cn_report_selection` 持有：title blocklist、语言过滤、report kind / fiscal period / fiscal year 推断、同 period/year 去重、amended 优先和 `CnReportCandidate` 构造都在 pipeline helper 内完成。
+CNInfo / HKEXNews downloader 只负责 HTTP 请求响应、provider JSON 解析、provider raw 字段归一、股票代码匹配、PDF URL 归一、HEAD / GET 与 PDF 字节校验。产品级财报候选语义由 `dayu.fins.pipelines.cn_report_selection` 持有：title blocklist、语言过滤、report kind / fiscal period / fiscal year 推断、同 period/year 去重、amended 优先和 `CnReportCandidate` 构造都在 pipeline helper 内完成。HKEXNews 的 Q1～Q4 共用一次全 results group discovery；selection 先只由 provider category 判定 report/results family，再在该 family 内共同解释 category 与 title 的期间事实。category family 或期间事实不唯一、同一 source ID 的核心事实冲突时失败关闭。
+
+CN/HK candidate 使用 `CnReportPeriodProjection` 区分唯一 `identity_period` 与只读
+`covered_periods`。identity 是 document ID、窗口、form、fiscal period、report kind 与
+missing satisfaction 的唯一输入；coverage 只描述同一 source 内容覆盖的期间，不生成额外
+source/manifest 项目，也不能满足独立 report baseline。CNInfo、HK 年报和中期报告使用
+singleton coverage；HK 中期业绩使用 `Q2 -> (H1,Q2)`，末期业绩使用
+`Q4 -> (FY,Q4)`。source meta、workflow result、typed download result、public JSON、Service
+wait projection与 CLI 文档行沿同一字段原样投影，不从标题、form 或字符串重新计算。
 
 HKEXNews title search 由 downloader 内的 provider-private strict contract 持有官方 cumulative `rowRange` 完整性：每个语言/分类从 100 条开始，在不改变其余查询和排序条件的前提下扩大累计 range。每轮响应必须提供 exact-typed `hasNextRow` / `rowRange` / `loadedRecord` / `recordCnt` / 字符串化 `result`；只有最终响应同时满足 `hasNextRow=false` 且 `loadedRecord == recordCnt == len(rows)` 时才宣布完整。续取期间每轮 snapshot 替换上一轮，候选解析和 HEAD 只消费最后完整 snapshot；字段矛盾或加载无进展以 typed provider protocol failure 失败关闭。
 
@@ -539,7 +547,7 @@ production download overwrite 只替换本轮实际写入的目标文档。SEC �
 
 `rebuild_local_artifacts=true` 是 download 自身的 local-only 模式：SEC、CNInfo 与 HKEXNews workflow 只枚举已下载的 source document，并从本地 source meta、文件描述符和内容重建下载 meta/manifest；该分支不配置或调用 provider，也不新增、删除或替换 source 内容。它与 preprocess 的 `rebuild_processed` 是两个独立 owner，不通过 persisted summary 互相映射。
 
-Download terminal 由同一个 typed `FinsResultSummary` 收口：成功、失败与取消具有固定 status/exit code，downloaded、skipped、rejected 与 failed 对同一候选集合互斥且守恒，并携带有界文档明细和缺失期间。CLI、Service、awaiting observation 与 legacy job projection 只消费该 terminal truth，不从日志、文件树或 provider payload 重建结果。SEC transport 在首个 HTTP 请求前要求显式 User-Agent 或 `SEC_USER_AGENT`；缺失身份、provider failure、取消与完整性失败均按封闭类型进入 download terminal，不用隐式 provider fallback 伪造成功。
+Download terminal 由同一个 typed `FinsResultSummary` 收口：成功、失败与取消具有固定 status/exit code，downloaded、skipped、rejected 与 failed 对同一候选集合互斥且守恒，并携带有界文档明细和缺失期间。每个 `FinsDownloadDocumentResult` 与 public document row 都必填 `covered_fiscal_periods`；CN/HK 原样投影 workflow coverage，SEC 与不适用来源显式投影空 tuple/JSON array。CLI、Service、awaiting observation 与 legacy job projection 只消费该 terminal truth，不从日志、文件树或 provider payload 重建结果。SEC transport 在首个 HTTP 请求前要求显式 User-Agent 或 `SEC_USER_AGENT`；缺失身份、provider failure、取消与完整性失败均按封闭类型进入 download terminal，不用隐式 provider fallback 伪造成功。
 
 当前 `DefaultFinsRuntime` 内置 production upload runner：US filing/material 上传走 SEC upload workflow，CN/HK filing/material 上传走 CN/HK upload facade，通用文件校验、Docling 转换、source document create/update/delete/skip/overwrite 与 blob 写入由 `DoclingUploadService` 通过仓储协议完成。production upload runner 把 pipeline JSON result 收敛为 Fins-local typed upload result，`status` 必须由 pipeline 显式提供，runtime 不用缺省值伪造上传状态。直接调用 `FinsIngestionRuntime.create(...)` 且不装配 `FinsUploadRunner` 时，upload job 仍会进入明确的 failed 终态，不执行真实上传、文件读取或仓储写入。
 

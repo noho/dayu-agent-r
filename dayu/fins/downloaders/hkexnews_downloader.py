@@ -72,7 +72,7 @@ _HKEXNEWS_T2_GROUP_ALL: Final[str] = "-2"
 _HKEXNEWS_T2_GROUP_RESULTS: Final[str] = "3"
 _HKEXNEWS_T2_ANNUAL_REPORT: Final[str] = "40100"
 _HKEXNEWS_T2_INTERIM_REPORT: Final[str] = "40200"
-_HKEXNEWS_T2_QUARTERLY_RESULTS: Final[str] = "13600"
+_HKEXNEWS_T2_ALL_RESULTS: Final[str] = "-2"
 _HKEXNEWS_INITIAL_CUMULATIVE_ROW_RANGE: Final[int] = 100
 _HKEXNEWS_MB_DATE_RANGE: Final[str] = "0"
 _HKEXNEWS_SORT_BY_DATETIME: Final[str] = "DateTime"
@@ -156,22 +156,22 @@ _PERIOD_TO_CATEGORY_SPEC: Final[dict[CnFiscalPeriod, _HkCategorySpec]] = {
     "Q2": _HkCategorySpec(
         t1code=_HKEXNEWS_T1_ANNOUNCEMENTS,
         t2_group_code=_HKEXNEWS_T2_GROUP_RESULTS,
-        t2code=_HKEXNEWS_T2_QUARTERLY_RESULTS,
+        t2code=_HKEXNEWS_T2_ALL_RESULTS,
     ),
     "Q1": _HkCategorySpec(
         t1code=_HKEXNEWS_T1_ANNOUNCEMENTS,
         t2_group_code=_HKEXNEWS_T2_GROUP_RESULTS,
-        t2code=_HKEXNEWS_T2_QUARTERLY_RESULTS,
+        t2code=_HKEXNEWS_T2_ALL_RESULTS,
     ),
     "Q3": _HkCategorySpec(
         t1code=_HKEXNEWS_T1_ANNOUNCEMENTS,
         t2_group_code=_HKEXNEWS_T2_GROUP_RESULTS,
-        t2code=_HKEXNEWS_T2_QUARTERLY_RESULTS,
+        t2code=_HKEXNEWS_T2_ALL_RESULTS,
     ),
     "Q4": _HkCategorySpec(
         t1code=_HKEXNEWS_T1_ANNOUNCEMENTS,
         t2_group_code=_HKEXNEWS_T2_GROUP_RESULTS,
-        t2code=_HKEXNEWS_T2_QUARTERLY_RESULTS,
+        t2code=_HKEXNEWS_T2_ALL_RESULTS,
     ),
 }
 

@@ -459,6 +459,7 @@ def _download_document_line(row: FinsDownloadPublicDocument) -> str:
         f"form_or_period={_bounded_json_text(row.form_or_period or _EMPTY_CELL)}",
         f"filing_date={_bounded_json_text(row.filing_date or _EMPTY_CELL)}",
         f"report_date={_bounded_json_text(row.report_date or _EMPTY_CELL)}",
+        f"covered_fiscal_periods={json.dumps(list(row.covered_fiscal_periods), ensure_ascii=False, separators=(',', ':'))}",
         f"disposition={_bounded_json_text(row.disposition.value)}",
     ]
     if row.reason_category is not None:

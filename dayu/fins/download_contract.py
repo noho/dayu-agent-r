@@ -17,6 +17,7 @@ from typing import Final
 
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.filing_semantics import (
+    FISCAL_PERIODS,
     parse_fiscal_period_filter_value,
     parse_sec_form_filter_value,
 )
@@ -245,6 +246,7 @@ class FinsDownloadDocumentResult:
         form_or_period: canonical form 或财期；来源无法提供时为 ``None``。
         filing_date: 可选披露日期。
         report_date: 可选报告期日期。
+        covered_fiscal_periods: 来源明确声明的覆盖财期；不适用时为空 tuple。
         disposition: 互斥结果分类。
         reason_category: 可选稳定原因分类。
         reason_message: 可选脱敏、可行动原因说明。
@@ -255,6 +257,7 @@ class FinsDownloadDocumentResult:
     form_or_period: str | None
     filing_date: str | None
     report_date: str | None
+    covered_fiscal_periods: tuple[str, ...]
     disposition: FinsDownloadDocumentDisposition
     reason_category: str | None
     reason_message: str | None
@@ -278,6 +281,12 @@ class FinsDownloadDocumentResult:
         _validate_public_text(self.form_or_period, field_name="form_or_period", allow_none=True)
         _parse_optional_iso_date(self.filing_date, field_name="filing_date")
         _parse_optional_iso_date(self.report_date, field_name="report_date")
+        if not isinstance(self.covered_fiscal_periods, tuple):
+            raise TypeError("covered_fiscal_periods must be tuple")
+        if any(not isinstance(period, str) or period not in FISCAL_PERIODS for period in self.covered_fiscal_periods):
+            raise ValueError("covered_fiscal_periods must contain canonical fiscal periods")
+        if len(set(self.covered_fiscal_periods)) != len(self.covered_fiscal_periods):
+            raise ValueError("covered_fiscal_periods must not contain duplicates")
         if not isinstance(self.disposition, FinsDownloadDocumentDisposition):
             raise TypeError("disposition must be FinsDownloadDocumentDisposition")
         _validate_public_text(self.reason_category, field_name="reason_category", allow_none=True)

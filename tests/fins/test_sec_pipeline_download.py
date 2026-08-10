@@ -3766,6 +3766,7 @@ def test_sec_download_adapter_summary_classifies_skipped_and_rejected_exclusivel
     assert summary.skipped_count == 1
     assert summary.rejected_count == 1
     assert summary.failed_count == 1
+    assert all(row.covered_fiscal_periods == () for row in summary.document_rows)
     assert summary.discovered_count == (
         summary.downloaded_count + summary.skipped_count + summary.rejected_count + summary.failed_count
     )

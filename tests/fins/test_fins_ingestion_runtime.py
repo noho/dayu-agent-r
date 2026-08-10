@@ -153,6 +153,7 @@ def _typed_download_summary(
             form_or_period="10-K",
             filing_date="2024-08-01",
             report_date="2024-06-30",
+            covered_fiscal_periods=(),
             disposition=FinsDownloadDocumentDisposition.DOWNLOADED,
             reason_category=None,
             reason_message=None,
@@ -166,6 +167,7 @@ def _typed_download_summary(
             form_or_period="10-K",
             filing_date="2024-08-01",
             report_date="2024-06-30",
+            covered_fiscal_periods=(),
             disposition=disposition,
             reason_category=reason_category,
             reason_message=reason_message,
@@ -190,6 +192,56 @@ def _typed_download_summary(
         ),
         document_rows=rows,
     )
+
+
+def test_public_download_json_preserves_cn_coverage_and_sec_empty_array() -> None:
+    """runtime public projection 与 JSON serializer 原样保留 coverage array。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: CN coverage 被重算或 SEC 空数组缺失时抛出。
+    """
+
+    cn_row = FinsDownloadDocumentResult(
+        document_id="fil-cn-q4",
+        form_or_period="Q4",
+        filing_date="2025-03-31",
+        report_date=None,
+        covered_fiscal_periods=("FY", "Q4"),
+        disposition=FinsDownloadDocumentDisposition.SKIPPED,
+        reason_category="already_present",
+        reason_message="本地已有完整文档",
+        artifact_locator=None,
+    )
+    cn_summary = FinsDownloadResultSummary.from_document_rows(
+        source=FinsDownloadSource.HKEXNEWS,
+        canonical_ticker="0005",
+        effective_filters=FinsDownloadEffectiveFilters(
+            form_types=("FY", "H1"),
+            start_date=None,
+            end_date=None,
+            overwrite_existing=False,
+            rebuild_local_artifacts=False,
+        ),
+        document_rows=(cn_row,),
+        missing_periods=("FY", "H1"),
+    )
+    sec_summary = _typed_download_summary(canonical_ticker="AAPL", skipped_ids=("fil-sec",))
+
+    cn_json = ingestion_runtime._public_download_summary(cn_summary).to_json_value()
+    sec_json = ingestion_runtime._public_download_summary(sec_summary).to_json_value()
+    cn_round_trip = json.loads(json.dumps(cn_json, ensure_ascii=False))
+    sec_round_trip = json.loads(json.dumps(sec_json, ensure_ascii=False))
+
+    assert cn_round_trip["documents"][0]["form_or_period"] == "Q4"
+    assert cn_round_trip["documents"][0]["covered_fiscal_periods"] == ["FY", "Q4"]
+    assert sec_round_trip["documents"][0]["form_or_period"] == "10-K"
+    assert sec_round_trip["documents"][0]["covered_fiscal_periods"] == []
 
 
 class _CommitFailingDownloadBatchingRepository(FsBatchingRepository):

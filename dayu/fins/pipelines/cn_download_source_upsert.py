@@ -128,7 +128,6 @@ def commit_cn_filing_source_document(
     ticker: str,
     document_id: str,
     internal_document_id: str,
-    form_type: str,
     primary_document: str,
     file_entries: list[JsonObject],
     candidate: CnReportCandidate,
@@ -153,7 +152,6 @@ def commit_cn_filing_source_document(
         ticker: ticker。
         document_id: 文档 ID。
         internal_document_id: 内部文档 ID。
-        form_type: form type。
         primary_document: 必须指向 Docling JSON 文件。
         file_entries: PDF 与 Docling JSON 文件条目。
         candidate: 远端候选报告。
@@ -182,7 +180,6 @@ def commit_cn_filing_source_document(
         ticker=ticker,
         document_id=document_id,
         internal_document_id=internal_document_id,
-        form_type=form_type,
         candidate=candidate,
         profile=profile,
         previous_completed_meta=previous_completed_meta,
@@ -196,7 +193,7 @@ def commit_cn_filing_source_document(
         ticker=ticker,
         document_id=document_id,
         internal_document_id=internal_document_id,
-        form_type=form_type,
+        form_type=candidate.period_projection.identity_period,
         primary_document=primary_document,
         file_entries=file_entries,
         meta=meta,
@@ -234,7 +231,6 @@ def _build_base_meta(
     ticker: str,
     document_id: str,
     internal_document_id: str,
-    form_type: str,
     candidate: CnReportCandidate,
     profile: CnCompanyProfile,
     previous_completed_meta: JsonObject | None = None,
@@ -251,12 +247,13 @@ def _build_base_meta(
         "company_id": company_id,
         "provider_company_id": profile.company_id,
         "company_name": profile.company_name,
-        "form_type": form_type,
+        "form_type": candidate.period_projection.identity_period,
         "fiscal_year": candidate.fiscal_year,
-        "fiscal_period": candidate.fiscal_period,
+        "fiscal_period": candidate.period_projection.identity_period,
+        "covered_fiscal_periods": list(candidate.period_projection.covered_periods),
         "fiscal_year_source": _FISCAL_YEAR_SOURCE,
         "report_date_source": _REPORT_DATE_SOURCE,
-        "report_kind": candidate.fiscal_period,
+        "report_kind": candidate.period_projection.identity_period,
         "report_date": None,
         "filing_date": candidate.filing_date,
         "first_ingested_at": _preserve_text_meta(previous_completed_meta, "first_ingested_at", now),

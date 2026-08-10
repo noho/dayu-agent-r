@@ -40,6 +40,7 @@ from dayu.fins.pipelines.cn_download_models import (
     CnCompanyProfile,
     CnDownloadCancelledError,
     CnReportCandidate,
+    CnReportPeriodProjection,
     CnReportQuery,
 )
 
@@ -413,7 +414,8 @@ def test_list_report_candidates_filters_blocklisted_titles() -> None:
     assert len(candidates) == 1
     only = candidates[0]
     assert only.source_id == "A1"
-    assert only.fiscal_period == "FY"
+    assert only.period_projection.identity_period == "FY"
+    assert only.period_projection.covered_periods == ("FY",)
     assert only.fiscal_year == 2024
     assert only.source_url == CNINFO_STATIC_BASE_URL + "finalpage/2025-04-03/full.PDF"
     assert only.content_length == 12345
@@ -1322,7 +1324,7 @@ def _make_candidate(*, source_url: str = "https://example.com/test.pdf") -> CnRe
         language="zh",
         filing_date="2025-04-01",
         fiscal_year=2024,
-        fiscal_period="FY",
+        period_projection=CnReportPeriodProjection(identity_period="FY", covered_periods=("FY",)),
         amended=False,
         content_length=4096,
         etag='"abc"',
@@ -1472,7 +1474,7 @@ def test_download_report_pdf_rejects_non_cninfo_provider() -> None:
         language="zh",
         filing_date="2025-01-01",
         fiscal_year=2024,
-        fiscal_period="FY",
+        period_projection=CnReportPeriodProjection(identity_period="FY", covered_periods=("FY",)),
         amended=False,
         content_length=None,
         etag=None,
@@ -1685,7 +1687,7 @@ def test_cninfo_preloop_provider_misuse_makes_zero_http_requests() -> None:
         language=candidate.language,
         filing_date=candidate.filing_date,
         fiscal_year=candidate.fiscal_year,
-        fiscal_period=candidate.fiscal_period,
+        period_projection=candidate.period_projection,
         amended=candidate.amended,
         content_length=candidate.content_length,
         etag=candidate.etag,

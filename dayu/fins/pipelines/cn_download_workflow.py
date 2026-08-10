@@ -260,10 +260,11 @@ async def run_cn_download_stream_impl(
                 ticker=normalized_ticker,
                 document_id=document_id,
                 payload={
-                    "form_type": candidate.fiscal_period,
+                    "form_type": candidate.period_projection.identity_period,
                     "filing_date": candidate.filing_date,
                     "fiscal_year": candidate.fiscal_year,
-                    "fiscal_period": candidate.fiscal_period,
+                    "fiscal_period": candidate.period_projection.identity_period,
+                    "covered_fiscal_periods": list(candidate.period_projection.covered_periods),
                     "source_id": candidate.source_id,
                 },
             )
@@ -524,7 +525,7 @@ def _select_candidates_for_a4(
     windows = {item.fiscal_period: item for item in period_windows}
     preselected: list[CnReportCandidate] = []
     for candidate in candidates:
-        window = windows.get(candidate.fiscal_period)
+        window = windows.get(candidate.period_projection.identity_period)
         if window is None:
             continue
         if window.start_date <= candidate.filing_date <= window.end_date:
@@ -545,10 +546,10 @@ def _apply_default_business_limits(
     fy_count = 0
     selected: list[CnReportCandidate] = []
     for candidate in candidates:
-        end_year = end_years.get(candidate.fiscal_period)
+        end_year = end_years.get(candidate.period_projection.identity_period)
         if end_year is None:
             continue
-        if candidate.fiscal_period == "FY":
+        if candidate.period_projection.identity_period == "FY":
             if fy_count >= 5:
                 continue
             fy_count += 1
@@ -582,7 +583,7 @@ def _resolve_missing_periods(
         无。
     """
 
-    found = {item.fiscal_period for item in selected}
+    found = {item.period_projection.identity_period for item in selected}
     return tuple(period for period in missing_eligible_periods if period not in found)
 
 
@@ -611,11 +612,12 @@ def _build_candidate_failed_result(
     return {
         "document_id": _candidate_document_id(ticker, candidate),
         "status": "failed",
-        "form_type": candidate.fiscal_period,
+        "form_type": candidate.period_projection.identity_period,
         "filing_date": candidate.filing_date,
         "report_date": None,
         "fiscal_year": candidate.fiscal_year,
-        "fiscal_period": candidate.fiscal_period,
+        "fiscal_period": candidate.period_projection.identity_period,
+        "covered_fiscal_periods": list(candidate.period_projection.covered_periods),
         "downloaded_files": 0,
         "skipped_files": 0,
         "failed_files": [],
@@ -834,9 +836,9 @@ def _candidate_document_id(ticker: str, candidate: CnReportCandidate) -> str:
 
     document_id, _ = build_cn_filing_ids(
         ticker=ticker,
-        form_type=candidate.fiscal_period,
+        form_type=candidate.period_projection.identity_period,
         fiscal_year=candidate.fiscal_year,
-        fiscal_period=candidate.fiscal_period,
+        fiscal_period=candidate.period_projection.identity_period,
         amended=candidate.amended,
     )
     return document_id

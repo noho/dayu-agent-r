@@ -42,7 +42,7 @@ from dayu.fins.ingestion_runtime import (
 )
 from dayu.fins.domain.document_models import FinsIngestMethod
 from dayu.fins.domain.enums import SourceKind
-from dayu.fins.pipelines.cn_download_models import CnMarketKind
+from dayu.fins.pipelines.cn_download_models import CN_FISCAL_PERIOD_ORDER, CnMarketKind
 from dayu.fins.pipelines.cn_download_pdf_gate import (
     CnDownloadPdfGateProtocol,
     NoopCnDownloadPdfGate,
@@ -1480,6 +1480,10 @@ def _project_cn_document_row(
         "report_date",
         allow_missing=allow_missing_business_fields,
     )
+    covered_fiscal_periods = _required_cn_covered_fiscal_periods(
+        item,
+        identity_period=form_or_period,
+    )
     if status == _CN_STATUS_DOWNLOADED:
         locator = source_repository.get_source_document_locator(
             ticker,
@@ -1491,6 +1495,7 @@ def _project_cn_document_row(
             form_or_period=form_or_period,
             filing_date=filing_date,
             report_date=report_date,
+            covered_fiscal_periods=covered_fiscal_periods,
             disposition=FinsDownloadDocumentDisposition.DOWNLOADED,
             reason_category=None,
             reason_message=None,
@@ -1503,6 +1508,7 @@ def _project_cn_document_row(
             form_or_period=form_or_period,
             filing_date=filing_date,
             report_date=report_date,
+            covered_fiscal_periods=covered_fiscal_periods,
             disposition=FinsDownloadDocumentDisposition.SKIPPED,
             reason_category=category,
             reason_message="该文档按下载策略跳过",
@@ -1514,6 +1520,7 @@ def _project_cn_document_row(
             form_or_period=form_or_period,
             filing_date=filing_date,
             report_date=report_date,
+            covered_fiscal_periods=covered_fiscal_periods,
             disposition=FinsDownloadDocumentDisposition.FAILED,
             reason_category=reason_code or "cn_document_failed",
             reason_message="财报来源未能完成该文档",
@@ -1712,6 +1719,39 @@ def _required_cn_text_list(
             raise ValueError(f"CN/HK 下载结果 {key}[{index}] 必须是非空文本")
         items.append(item.strip())
     return tuple(items)
+
+
+def _required_cn_covered_fiscal_periods(
+    value: Mapping[str, JsonValue],
+    *,
+    identity_period: str | None,
+) -> tuple[str, ...]:
+    """严格读取 workflow 的必填覆盖财期投影。
+
+    Args:
+        value: 单文档 workflow 结果。
+        identity_period: 同行身份财期；closed failure 可为 ``None``。
+
+    Returns:
+        canonical ordered 覆盖财期 tuple。
+
+    Raises:
+        ValueError: 字段缺失、为空、重复、顺序非法或不含 identity 时抛出。
+    """
+
+    periods = _required_cn_text_list(value, "covered_fiscal_periods")
+    if not periods:
+        raise ValueError("CN/HK 下载结果 covered_fiscal_periods 不能为空")
+    if any(period not in CN_FISCAL_PERIOD_ORDER for period in periods):
+        raise ValueError("CN/HK 下载结果 covered_fiscal_periods 含非法财期")
+    if len(set(periods)) != len(periods):
+        raise ValueError("CN/HK 下载结果 covered_fiscal_periods 不能重复")
+    canonical = tuple(period for period in CN_FISCAL_PERIOD_ORDER if period in periods)
+    if periods != canonical:
+        raise ValueError("CN/HK 下载结果 covered_fiscal_periods 顺序非法")
+    if identity_period is not None and identity_period not in periods:
+        raise ValueError("CN/HK 下载结果 covered_fiscal_periods 必须包含 identity period")
+    return periods
 
 
 def _required_cn_bool(value: Mapping[str, JsonValue], key: str) -> bool:
