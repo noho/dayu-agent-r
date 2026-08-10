@@ -881,7 +881,7 @@ def _register_download_command(
         command_name=COMMAND_DOWNLOAD,
         help_text="下载指定主体的财报文档。",
     )
-    _add_required_ticker_argument(parser)
+    parser.add_argument("--ticker", help="公司代码或财报主体（必填）。")
     parser.add_argument("--forms", nargs="+", help="需要下载的报表类型。")
     parser.add_argument("--start", help="最早 filing 日期。")
     parser.add_argument("--end", help="最晚 filing 日期。")

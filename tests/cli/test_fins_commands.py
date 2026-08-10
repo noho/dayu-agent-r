@@ -793,6 +793,7 @@ def test_download_command_maps_args_to_service(
 @pytest.mark.parametrize(
     ("download_args", "expected_message"),
     (
+        ((), "--ticker 不能为空，请提供一个公司代码"),
         (("--ticker", "AAPL,MSFT"), "只接受一个公司代码"),
         (("--ticker", "AAPL", "--forms", "UNKNOWN"), "--forms 不支持"),
         (("--ticker", "AAPL", "--start", "2024/01/01"), "--start 格式错误"),
@@ -851,6 +852,8 @@ def test_download_static_usage_error_precedes_workspace_and_service_factory(
     captured = capsys.readouterr()
     assert exit_code == EXIT_USAGE_ERROR
     assert expected_message in captured.err
+    if download_args == ():
+        assert captured.err == ("dayu-cli download: --ticker 不能为空，请提供一个公司代码\n")
     assert factory_calls == []
     assert not workspace_root.exists()
 

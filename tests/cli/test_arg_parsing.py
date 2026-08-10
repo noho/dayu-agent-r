@@ -58,7 +58,14 @@ COMMAND_HELP_EXPECTATIONS: dict[str, tuple[str, ...]] = {
         "--model",
         "--temperature",
     ),
-    "download": ("--ticker", "--forms", "--start", "--end", "--overwrite"),
+    "download": (
+        "--ticker",
+        "公司代码或财报主体（必填）。",
+        "--forms",
+        "--start",
+        "--end",
+        "--overwrite",
+    ),
     "upload_filing": (
         "--ticker",
         "--action",
