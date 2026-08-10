@@ -13,6 +13,7 @@ from dayu.contracts.json_value import JsonValue
 from dayu.fins.downloaders.hkexnews_downloader import HkexnewsDiscoveryClient
 from dayu.fins.domain.document_models import CompanyMeta, now_iso8601
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.ingestion_runtime import FinsDownloadProgressEvent
 from dayu.fins.pipelines.cn_download_models import (
     CnCompanyProfile,
     CnReportCandidate,
@@ -20,7 +21,7 @@ from dayu.fins.pipelines.cn_download_models import (
     DownloadedReportAsset,
 )
 from dayu.fins.pipelines.cn_download_protocols import CnDoclingConversionRunner
-from dayu.fins.pipelines.cn_pipeline import CnPipeline
+from dayu.fins.pipelines.cn_pipeline import CnPipeline, collect_cn_download_result_from_events
 from dayu.fins.pipelines.download_events import DownloadEventType
 from dayu.fins.pipelines.upload_company_meta import RESOLVER_VERSION
 from dayu.fins.pipelines.upload_filing_events import UploadFilingEventType
@@ -493,6 +494,51 @@ async def test_download_stream_runs_cn_workflow_with_injected_discovery_client(
     assert summary["downloaded"] == 1
     assert discovery.download_calls == 1
     assert runner.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_hk_adapter_progress_sink_projects_conversion_lifecycle(tmp_path: Path) -> None:
+    """HK adapter 应按真实 workflow 顺序投影完整文档转换生命周期。
+
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 转换完成事件缺失、乱序或业务字段漂移时抛出。
+    """
+
+    pipeline = CnPipeline(
+        workspace_root=tmp_path,
+        hk_discovery_client=_PipelineDownloadFakeHkDiscoveryClient(temp_dir=tmp_path),
+        docling_conversion_runner=_PipelineDownloadFakeConversionRunner(),
+    )
+    progress_events: list[FinsDownloadProgressEvent] = []
+
+    result = await collect_cn_download_result_from_events(
+        pipeline.download_stream(
+            ticker="0700",
+            form_type="FY",
+            start_date="2024-01-01",
+            end_date="2025-12-31",
+            overwrite=False,
+            start_is_explicit=True,
+        ),
+        progress_sink=progress_events.append,
+    )
+    conversion_progress = [event for event in progress_events if event.stage.startswith("download.conversion_")]
+
+    assert result["status"] == "ok"
+    assert [(event.stage, event.message) for event in conversion_progress] == [
+        ("download.conversion_started", "开始转换文档"),
+        ("download.conversion_completed", "完成转换文档"),
+    ]
+    assert conversion_progress[0].document_id is not None
+    assert conversion_progress[0].document_id == conversion_progress[1].document_id
+    assert conversion_progress[0].file_name is not None
+    assert conversion_progress[0].file_name == conversion_progress[1].file_name
 
 
 def test_download_non_explicit_nonempty_start_keeps_default_business_limit(tmp_path: Path) -> None:

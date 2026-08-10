@@ -763,7 +763,15 @@ class _ProgressReportingDownloadAdapter(FinsSourceDownloadAdapter):
             request.progress_sink(
                 FinsDownloadProgressEvent(
                     stage="download.conversion_started",
-                    message="开始 convert",
+                    message="开始转换文档",
+                    document_id="fil-test",
+                    file_name="sample-10k_docling.json",
+                )
+            )
+            request.progress_sink(
+                FinsDownloadProgressEvent(
+                    stage="download.conversion_completed",
+                    message="完成转换文档",
                     document_id="fil-test",
                     file_name="sample-10k_docling.json",
                 )
@@ -2114,7 +2122,7 @@ async def test_direct_download_projects_adapter_file_progress_events(
     conversion_progress = [
         event
         for event in progress_events
-        if event.progress is not None and event.progress.stage == "download.conversion_started"
+        if event.progress is not None and event.progress.stage.startswith("download.conversion_")
     ]
 
     file_progress_details: list[tuple[str, str | None, str]] = []
@@ -2125,8 +2133,13 @@ async def test_direct_download_projects_adapter_file_progress_events(
         ("download.file_started", "sample-10k.htm", "开始下载"),
         ("download.file_completed", "sample-10k.htm", "完成下载"),
     ]
-    assert [(event.document_label, event.message) for event in conversion_progress] == [
-        ("sample-10k_docling.json", "开始 convert"),
+    conversion_progress_details: list[tuple[str, str | None, str]] = []
+    for event in conversion_progress:
+        assert event.progress is not None
+        conversion_progress_details.append((event.progress.stage, event.document_label, event.message))
+    assert conversion_progress_details == [
+        ("download.conversion_started", "sample-10k_docling.json", "开始转换文档"),
+        ("download.conversion_completed", "sample-10k_docling.json", "完成转换文档"),
     ]
 
 

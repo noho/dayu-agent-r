@@ -104,6 +104,7 @@ _ADAPTER_PROGRESS_FILE_COMPLETED: Final[str] = "download.file_completed"
 _ADAPTER_PROGRESS_FILE_SKIPPED: Final[str] = "download.file_skipped"
 _ADAPTER_PROGRESS_FILE_FAILED: Final[str] = "download.file_failed"
 _ADAPTER_PROGRESS_CONVERSION_STARTED: Final[str] = "download.conversion_started"
+_ADAPTER_PROGRESS_CONVERSION_COMPLETED: Final[str] = "download.conversion_completed"
 
 
 CnPipelineDownloadResult: TypeAlias = dict[str, JsonValue]
@@ -218,7 +219,17 @@ def _emit_adapter_download_progress(
         progress_sink(
             FinsDownloadProgressEvent(
                 stage=_ADAPTER_PROGRESS_CONVERSION_STARTED,
-                message="开始 convert",
+                message="开始转换文档",
+                document_id=event.document_id,
+                file_name=_payload_text(event.payload, "name"),
+            )
+        )
+        return
+    if event.event_type == DownloadEventType.CONVERSION_COMPLETED:
+        progress_sink(
+            FinsDownloadProgressEvent(
+                stage=_ADAPTER_PROGRESS_CONVERSION_COMPLETED,
+                message="完成转换文档",
                 document_id=event.document_id,
                 file_name=_payload_text(event.payload, "name"),
             )
