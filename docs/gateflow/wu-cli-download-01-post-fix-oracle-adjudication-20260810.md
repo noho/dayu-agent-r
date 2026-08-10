@@ -58,7 +58,7 @@ O05 观察到的 `--overwrite --rebuild` 组合成功行为不正确。
 
 O12 当前行为不正确。腾讯实际发布的 Q2 与合并年度/Q4 结果材料不能被报为 missing；Q2 不能由 H1 报告替代，合并年度/Q4 业绩公告也不能由后来发布的年度报告替代。
 
-该裁决是腾讯发行人特定的 discovery/classification 事实，不代表所有港股发行人都必须披露 Q1～Q4。港股主板强制年度与中期报告，季度财务结果属于推荐最佳实践；GEM 另有季度披露义务。
+用户进一步冻结港股通用材料身份：中期报告为 H1、年度报告为 FY、中期业绩公告为 Q2、年度业绩公告为 Q4；这是港股普遍采用的材料/期间映射，不要求公告标题或正文额外出现“第二季度/第四季度”字样。腾讯特定事实只在于其四类材料均已由真实来源和实际产物证明存在且彼此独立。该映射仍不表示 Q1～Q4 都是所有港股发行人的 mandatory missing 集合；Q1/Q3 等其它季度材料继续按发行人实际披露发现。
 
 ### 修复边界
 
@@ -96,7 +96,7 @@ A股规则只要求年度、半年度、前3个月和前9个月报告，即 `FY,
 ### 冻结 CI/Oracle 规则
 
 - A股默认集合是 `FY,H1,Q1,Q3`。独立 Q2/Q4 在该市场制度下不适用，不得进入 effective forms，也不得显示为 missing。
-- 港股主板以年度和中期材料为基础集合。Q1/Q3及其它季度结果属于发行人可选披露，不能冻结为所有港股发行人的必有文档。
+- 港股主板 effective/missing 基础集合仍为 FY/H1；材料身份按 `年度报告=FY`、`中期报告=H1`、`中期业绩公告=Q2`、`年度业绩公告=Q4` 冻结。Q1/Q3 等其它季度结果按发行人实际披露发现，不能冻结为所有港股发行人的必有文档。
 - “可选披露”不等于“允许系统漏选”：当选定发行人实际发布了季度材料时，CI 必须用发行人/交易所公开来源核对 discovery、分类、下载与持久化。
 - 腾讯 `0700` 已确认实际发布2025年 Q2，以及合并年度/Q4业绩材料；DL-F13 必须继续修复，不能因为港股季度披露 optional 而关闭。
 
@@ -109,5 +109,23 @@ A股规则只要求年度、半年度、前3个月和前9个月报告，即 `FY,
 ### 修复后必跑
 
 - fresh A股 bare-default：effective forms 只含 `FY,H1,Q1,Q3`，不存在错误 Q2/Q4 missing；实际产物和本次已接受的9份选择结果对账。
-- fresh 港股主板 baseline issuer：年度和中期基础集合正确，不因不存在 optional quarter 而误报产品失败。
+- fresh 港股主板 baseline issuer：effective/missing 仍只承诺 FY/H1；实际材料可观察为 FY 年度报告、H1 中期报告、Q2 中期业绩公告和 Q4 年度业绩公告。没有 Q1/Q3 等其它 optional quarter 时不得误报产品失败。
 - fresh 腾讯 `0700`：实际 Q2、H1、合并年度/Q4业绩材料和年度报告分别正确发现、分类、下载、转换和持久化；不存在把 H1/FY当作 Q2/Q4替代的情况。
+
+## 7. DL-F12～F14 修复后补跑裁决与 DL-F15
+
+修复后产品 HEAD 为 `54dd750a2e300e943eb25d9e49c09d31145ef1fb`；真实观察报告为
+`/Users/leo/workspace/.dayu-cli-ci/wu-cli-download-02-postfix-20260810-A9vLZQ/evidence/observed-behavior.md`，
+SHA-256 为 `7ca07d76a6d0d5ed37a5c4b54917f08262bd8a5203bf2d31cc7781da4fa2e666`。
+
+用户接受以下 post-fix 行为：
+
+- DL-F12：`--overwrite` 与 `--rebuild` 两种 argv 顺序均在业务执行前 exit 2，单独使用时语义不变。
+- DL-F14/CN：裸 `600519` effective forms 为 `FY,H1,Q1,Q3`，9/9 下载转换并由 production process 9/9 消费，且不报告 Q2/Q4 missing。
+- DL-F13/HK：港股通用分类 `中期报告=H1`、`年度报告=FY`、`中期业绩公告=Q2`、`年度业绩公告=Q4` 正确；腾讯四份目标材料的 source、URL、document、PDF、Docling、meta、manifest 与正文期间证据均独立且充分。
+
+补跑同时发现 DL-F15：Docling attempt chain 在第一次转换失败后复用同一个 `DocumentStream`。第一次 converter 已关闭底层
+`BytesIO`，第二次 backend 因而稳定出现 `I/O operation on closed file`，使声明的 backend/device fallback 失效。正确 owner
+是 `dayu/documents/docling_runtime.py::convert_pdf_bytes_with_docling` 与其 attempt 输入装配边界；每个 attempt 必须从 immutable
+raw PDF bytes 新建独立 stream。修复后须用真实首次失败触发后续 attempt，并证明成功转换、无 closed-stream 错误、实际产物完整且
+后续 process 可消费。
