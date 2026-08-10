@@ -36,7 +36,6 @@ from __future__ import annotations
 import os
 import logging
 import sys
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, TypeVar, cast
 
@@ -55,9 +54,7 @@ _CPU_DEVICE_NAME = "cpu"
 _CUDA_DEVICE_NAME = "cuda"
 _MPS_DEVICE_NAME = "mps"
 _XPU_DEVICE_NAME = "xpu"
-_ACCELERATOR_DEVICE_NAMES = frozenset(
-    {_CUDA_DEVICE_NAME, _MPS_DEVICE_NAME, _XPU_DEVICE_NAME}
-)
+_ACCELERATOR_DEVICE_NAMES = frozenset({_CUDA_DEVICE_NAME, _MPS_DEVICE_NAME, _XPU_DEVICE_NAME})
 _DOCLING_PARSE_BACKEND_NAME = "docling-parse"
 _PYPDFIUM2_BACKEND_NAME = "pypdfium2"
 _SUPPORTED_DOCLING_BACKENDS = frozenset({_DOCLING_PARSE_BACKEND_NAME, _PYPDFIUM2_BACKEND_NAME})
@@ -130,8 +127,7 @@ def _normalize_docling_device_name(device_name: str) -> str:
     if normalized_device_name not in _SUPPORTED_DOCLING_DEVICES:
         supported = ", ".join(sorted(_SUPPORTED_DOCLING_DEVICES))
         raise DoclingRuntimeInitializationError(
-            f"{DOCLING_DEVICE_ENV} 不支持 {normalized_device_name!r}；"
-            f"允许值: {supported}"
+            f"{DOCLING_DEVICE_ENV} 不支持 {normalized_device_name!r}；允许值: {supported}"
         )
     return normalized_device_name
 
@@ -153,8 +149,7 @@ def _normalize_docling_backend_name(backend_name: str) -> str:
     if normalized_backend_name not in _SUPPORTED_DOCLING_BACKENDS:
         supported = ", ".join(sorted(_SUPPORTED_DOCLING_BACKENDS))
         raise DoclingRuntimeInitializationError(
-            f"不支持的 Docling backend {normalized_backend_name!r}；"
-            f"允许值: {supported}"
+            f"不支持的 Docling backend {normalized_backend_name!r}；允许值: {supported}"
         )
     return normalized_backend_name
 
@@ -434,17 +429,13 @@ def build_docling_pdf_pipeline_options(
         raise DoclingRuntimeInitializationError("Docling 未安装，无法构造 PDF pipeline 选项") from exc
 
     normalized_device_name = (
-        resolve_docling_device_name()
-        if device_name is None
-        else _normalize_docling_device_name(device_name)
+        resolve_docling_device_name() if device_name is None else _normalize_docling_device_name(device_name)
     )
 
     pipeline_options = cast(_DoclingPdfPipelineOptionsProtocol, PdfPipelineOptions())
     pipeline_options.do_ocr = do_ocr
     pipeline_options.do_table_structure = do_table_structure
-    pipeline_options.accelerator_options = AcceleratorOptions(
-        device=AcceleratorDevice(normalized_device_name)
-    )
+    pipeline_options.accelerator_options = AcceleratorOptions(device=AcceleratorDevice(normalized_device_name))
 
     if do_table_structure:
         table_structure_options = cast(
@@ -452,9 +443,7 @@ def build_docling_pdf_pipeline_options(
             pipeline_options.table_structure_options,
         )
         table_structure_options.mode = (
-            TableFormerMode.ACCURATE
-            if normalized_table_mode == _TABLE_MODE_ACCURATE
-            else TableFormerMode.FAST
+            TableFormerMode.ACCURATE if normalized_table_mode == _TABLE_MODE_ACCURATE else TableFormerMode.FAST
         )
         table_structure_options.do_cell_matching = do_cell_matching
 
@@ -640,6 +629,8 @@ def convert_pdf_bytes_with_docling(
     Docling 在 Windows 上把 ``Path`` 输入按 mbcs（cp936）编码后传给
     docling-parse C++ 后端，导致合法文档被判 ``not valid``。本函数把字节流
     封装成 ``DocumentStream`` 直接喂给 Docling，绕开文件系统路径编码层。
+    每次回退尝试都从同一份不可变原始字节构造独立流，避免前一档转换器
+    关闭输入后破坏后续尝试。
 
     Args:
         raw_bytes: PDF 原始字节内容。
@@ -657,9 +648,8 @@ def convert_pdf_bytes_with_docling(
         ValueError: ``table_mode`` 非法时抛出。
     """
 
-    stream = _build_docling_document_stream(raw_bytes, stream_name=stream_name)
     return run_docling_pdf_conversion(
-        lambda converter: converter.convert(stream),
+        lambda converter: converter.convert(_build_docling_document_stream(raw_bytes, stream_name=stream_name)),
         do_ocr=do_ocr,
         do_table_structure=do_table_structure,
         table_mode=table_mode,
