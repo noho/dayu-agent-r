@@ -518,11 +518,7 @@ def test_download_request_builder_reuses_domain_period_alias_owner(
 async def test_process_methods_build_preprocess_requests() -> None:
     """process/process_filing/process_material 必须映射到 preprocess request。"""
 
-    runtime = _FakeIngestionRuntime(
-        (
-            _result_event(operation_kind=FinsOperationKind.PREPROCESS),
-        )
-    )
+    runtime = _FakeIngestionRuntime((_result_event(operation_kind=FinsOperationKind.PREPROCESS),))
     service = FinsDirectCommandService(runtime)
 
     await _collect_events(
@@ -582,11 +578,7 @@ async def test_upload_methods_build_union_requests(tmp_path: Path) -> None:
 
     filing_file = tmp_path / "filing.pdf"
     material_file = tmp_path / "material.pdf"
-    runtime = _FakeIngestionRuntime(
-        (
-            _result_event(operation_kind=FinsOperationKind.UPLOAD_FILING),
-        )
-    )
+    runtime = _FakeIngestionRuntime((_result_event(operation_kind=FinsOperationKind.UPLOAD_FILING),))
     service = FinsDirectCommandService(runtime)
 
     await _collect_events(
@@ -665,9 +657,7 @@ async def test_failure_result_is_passed_through() -> None:
     runtime = _FakeIngestionRuntime((_result_event(status=FinsResultStatus.FAILURE),))
     service = FinsDirectCommandService(runtime)
 
-    events = await _collect_events(
-        service.download(build_fins_download_request(ticker="AAPL"))
-    )
+    events = await _collect_events(service.download(build_fins_download_request(ticker="AAPL")))
 
     assert len(events) == 1
     assert events[0].result is not None
@@ -686,9 +676,7 @@ async def test_stream_exception_is_propagated_without_synthetic_result() -> None
     service = FinsDirectCommandService(runtime)
 
     with pytest.raises(RuntimeError, match="provider failed"):
-        await _collect_events(
-            service.download(build_fins_download_request(ticker="AAPL"))
-        )
+        await _collect_events(service.download(build_fins_download_request(ticker="AAPL")))
 
 
 @pytest.mark.asyncio
@@ -799,11 +787,7 @@ async def test_task_cancellation_closes_runtime_stream() -> None:
     )
     service = FinsDirectCommandService(runtime)
 
-    task = asyncio.create_task(
-        _consume_until_cancelled(
-            service.download(build_fins_download_request(ticker="AAPL"))
-        )
-    )
+    task = asyncio.create_task(_consume_until_cancelled(service.download(build_fins_download_request(ticker="AAPL"))))
     await runtime.first_event_yielded.wait()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):

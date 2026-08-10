@@ -29,9 +29,7 @@ from .sec_fiscal_fields import (
     _resolve_download_fiscal_fields,
 )
 
-_ROLLBACK_FAILURE_NOTE_PREFIX: Final[str] = (
-    "rollback_batch failed; recovery evidence retained"
-)
+_ROLLBACK_FAILURE_NOTE_PREFIX: Final[str] = "rollback_batch failed; recovery evidence retained"
 
 
 class SecRebuildWorkflowHost(Protocol):
@@ -196,13 +194,16 @@ def rebuild_download_artifacts(
         action="download",
         ticker=ticker,
         market_profile={"market": "US"},
-        filters=cast(JsonValue, {
-            "forms": sorted(target_forms) if target_forms is not None else None,
-            "start_date": start_date,
-            "end_date": end_date,
-            "overwrite": overwrite,
-            "rebuild": True,
-        }),
+        filters=cast(
+            JsonValue,
+            {
+                "forms": sorted(target_forms) if target_forms is not None else None,
+                "start_date": start_date,
+                "end_date": end_date,
+                "overwrite": overwrite,
+                "rebuild": True,
+            },
+        ),
         warnings=cast(JsonValue, warnings),
         filings=cast(JsonValue, filing_results),
         summary=cast(JsonValue, summary),
@@ -427,9 +428,7 @@ def rebuild_single_local_filing(
         try:
             batching_repository.rollback_batch(batch)
         except BaseException as rollback_error:
-            operation_error.add_note(
-                f"{_ROLLBACK_FAILURE_NOTE_PREFIX}: {rollback_error}"
-            )
+            operation_error.add_note(f"{_ROLLBACK_FAILURE_NOTE_PREFIX}: {rollback_error}")
             raise operation_error from rollback_error
         if not isinstance(operation_error, Exception):
             raise

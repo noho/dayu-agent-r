@@ -205,9 +205,7 @@ def resolve_target_periods(
         raise ValueError("form 输入解析后为空")
 
     canonical_order: tuple[CnFiscalPeriod, ...] = ("FY", "H1", "Q1", "Q2", "Q3", "Q4")
-    target_periods: tuple[CnFiscalPeriod, ...] = tuple(
-        period for period in canonical_order if period in seen
-    )
+    target_periods: tuple[CnFiscalPeriod, ...] = tuple(period for period in canonical_order if period in seen)
     return TargetPeriodResolution(target_periods=target_periods, notes=tuple(notes))
 
 
@@ -244,9 +242,7 @@ def resolve_window(
     if start_date:
         start = _parse_date(start_date, is_end=False)
     else:
-        start = _subtract_years(end, _ANNUAL_LOOKBACK_YEARS) - dt.timedelta(
-            days=_LOOKBACK_GRACE_DAYS
-        )
+        start = _subtract_years(end, _ANNUAL_LOOKBACK_YEARS) - dt.timedelta(days=_LOOKBACK_GRACE_DAYS)
     if start > end:
         raise ValueError(f"start_date 不能晚于 end_date: {start.isoformat()} > {end.isoformat()}")
     return DownloadWindow(start_date=start.isoformat(), end_date=end.isoformat())
@@ -281,9 +277,7 @@ def resolve_period_windows(
     windows: list[PeriodDownloadWindow] = []
     for period in target_periods:
         lookback_years = _ANNUAL_LOOKBACK_YEARS if period == "FY" else _INTERIM_LOOKBACK_YEARS
-        start = explicit_start or (
-            _subtract_years(end, lookback_years) - dt.timedelta(days=_LOOKBACK_GRACE_DAYS)
-        )
+        start = explicit_start or (_subtract_years(end, lookback_years) - dt.timedelta(days=_LOOKBACK_GRACE_DAYS))
         if start > end:
             raise ValueError(f"start_date 不能晚于 end_date: {start.isoformat()} > {end.isoformat()}")
         windows.append(
@@ -312,9 +306,7 @@ def _parse_date(value: str, *, is_end: bool) -> dt.date:
             year = int(year_str)
             month = int(month_str)
             if is_end:
-                next_month = (
-                    dt.date(year + 1, 1, 1) if month == 12 else dt.date(year, month + 1, 1)
-                )
+                next_month = dt.date(year + 1, 1, 1) if month == 12 else dt.date(year, month + 1, 1)
                 return next_month - dt.timedelta(days=1)
             return dt.date(year, month, 1)
         if _DATE_FULL_PATTERN.fullmatch(raw):
