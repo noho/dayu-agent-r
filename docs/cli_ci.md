@@ -1037,8 +1037,9 @@ Service、Fins runtime、市场 adapter、source-specific workflow 和 storage o
   下载、转换和 publication 各适用阶段的 Ctrl+C；至少一个真实 process crash/kill 后以同一 workspace 重跑。记录屏幕、
   signal/exit、operation 是否达到 canonical terminal、后台工作是否继续、锁/staging/half-document、旧文档保持和 retry
   结果。Docling 声明 backend/device fallback 时，每个 attempt 必须从 immutable PDF bytes 新建独立输入 stream；不得复用已被
-  前一 converter 关闭的 stream。至少真实触发一次首 attempt 失败并验证后续 attempt 实际成功。harness deadline 导致的 kill
-  必须与产品取消分开标记。
+  前一 converter 关闭的 stream。真实运行自然触发首 attempt 失败时，必须继续验证后续 attempt 实际成功；若首 attempt 直接成功，
+  记录 `conditional/not-triggered`，由 owner contract test 锁定 attempt-local stream，不得为制造失败增加生产 hook、mock、断网副作用
+  或 observation infrastructure，也不得把该条件路径作为 readiness blocker。harness deadline 导致的 kill 必须与产品取消分开标记。
 - **外部配置与诊断**：有/无 SEC User-Agent、真实 provider transport failure、日志等级、`--log-file`、quiet 和
   `--debug-stream`。报告必须扫描 stdout/stderr/log/evidence 中的 exact credential/contact canary，只报告名称类别与计数，
   不回显值；同一 warning 的重复、只写 log 未写屏幕、以及过度泛化的失败文案都交用户裁决。

@@ -6,9 +6,9 @@
 - 产品 HEAD：`3811f95c82fbf0daf15740a5d217eed4d8b49df5`
 - 观察报告：`/Users/leo/workspace/.dayu-cli-ci/download-postfix-20260810T041254Z/observed-behavior.md`
 - 观察报告 SHA-256：`be0c3c4cbc6a7b27877bd156cd7528ef33bd87f9e8fe097f8fdc09299886f6a6`
-- 当前状态：`adjudicated-pending-fix-and-rerun`
+- 当前状态：`adjudicated-ready-for-oracle-scenario-publication`
 
-本文件只记录用户对 post-fix 真实运行的裁决以及由裁决产生的修复项和覆盖 gap。修复、补跑并再次裁决前，不得把 download Oracle、scenario registry 或 readiness 标记为 ready。
+本文件记录用户对 post-fix 真实运行的裁决、由裁决产生的修复项及最终正式发布。DL-F12～DL-F15 修复、补跑和用户裁决完成前不得标记 ready；其完成后的正式 registry/readiness 结果见第9节。
 
 ## 2. 已接受观察
 
@@ -129,3 +129,38 @@ SHA-256 为 `7ca07d76a6d0d5ed37a5c4b54917f08262bd8a5203bf2d31cc7781da4fa2e666`�
 是 `dayu/documents/docling_runtime.py::convert_pdf_bytes_with_docling` 与其 attempt 输入装配边界；每个 attempt 必须从 immutable
 raw PDF bytes 新建独立 stream。修复后须用真实首次失败触发后续 attempt，并证明成功转换、无 closed-stream 错误、实际产物完整且
 后续 process 可消费。
+
+## 8. DL-F15 修复后补跑最终裁决
+
+- 修复 HEAD：`5e1a0d109685a03b6477e2e129e148c8e0127554`。
+- 真实观察报告：`/Users/leo/workspace/.dayu-cli-ci/wu-cli-download-03-dl-f15-postfix-20260810-yCJM88/evidence/observed-behavior.md`。
+- 报告 SHA-256：`c4387f279cdca7466aec36cbe1166e2c3529e29c8ed5203c491eb897be0278a1`。
+
+用户接受以下行为：
+
+- 每个 Docling attempt 从同一 immutable PDF bytes 新建独立 `DocumentStream/BytesIO`；首 attempt 关闭输入后失败，不得破坏后续 attempt。
+- 真实腾讯 `0700` Q3 精确窗口下载 exit 0，`discovered/downloaded/failed=1/1/0`；PDF、Docling、meta、manifest 完整，后续 production process `selected/processed/failed=1/1/0`，生成100个 sections 与46个 tables。
+- 本次真实 run 的首 attempt 直接成功，因此 `real fallback` 未自然触发；该条件路径不是 readiness blocker。以后真实 CI 自然触发首 attempt 失败时，由 Agent 检查后续 attempt、日志、产物与 process 可消费性。
+- 禁止为了强行触发该条件路径增加生产 hook、mock/fake、断网副作用或 observation infrastructure；deterministic owner test 负责锁定 attempt-local stream contract，但不得伪报为真实 fallback observation。
+
+至此 DL-F01～DL-F15 及第一轮实际观察均已完成用户裁决；下一步只允许把已裁决行为机械投影到正式 download Oracle、scenario registry 与 readiness proof，不再重开产品语义。
+
+## 9. 正式 Oracle、scenarios 与 readiness 发布
+
+已把上述用户裁决机械投影到两个正式 registry：
+
+- accepted Oracle：`cli.download.document-acquisition@1`，包含17个业务 predicates；
+- accepted scenarios：101条逐 case 记录，全部带 exact argv/chain、前置状态、evidence obligations、冻结报告 digest 与用户裁决 identity；
+- readiness proof：version 4，`init/prompt/interactive/download` 四个 command scope 均为 `ready`，download 的 accepted/covered/mandatory scenario 数均为101，unadjudicated 与 gap 均为0；
+- 三个不能安全强制触发的路径继续以已裁决边界进入正式集合：candidate 级 partial provider failure 与 publication 微窗口为 `defensive-unreachable`，Docling 首次失败 fallback 为 `conditional-live`。它们要求每轮复核公开可达性或自然触发，不允许 fake、生产后门或观察基础设施，也不阻塞 readiness；
+- 共享日志 selector/冲突/debug-stream/append 的全矩阵继续由公共 parser/runtime owner 下已 accepted 的 prompt/interactive scenarios 唯一承担；download 以 quiet、debug-stream、debug+log-file 三个真实 wiring smoke 证明接线，不复制数百条等价外部网络 operation。
+
+独立闭环校验结果：
+
+- Oracle registry 文件 SHA-256：`2e69d33668416cca0dd9131c1fab628c508df68c214c4e4d41b0522cbb9e0d73`；
+- Scenario registry 文件 SHA-256：`224acc289512c417d7a6924b948b48d950e6235f8c9ad5c4fad25427f851c583`；
+- Oracle records canonical basis：`dc2c5ac1411bb82ef29053468fc0ac052929732605c14f0c9a1beb4e5f7059d6`；
+- Scenario records canonical basis：`01c34bce9d706d306533b30368b65dcfbdfd0a009b575f1de0f52b5ca0a16806`；
+- Oracle→scenario 双向集合、17个 predicate 覆盖、exact refs、evidence status、用户裁决 identity、五份冻结观察报告实物 SHA 与 registry basis 均重新计算通过；生成器连续运行两次得到相同文件 digest。
+
+结论：`download` 第一轮已闭环，下一轮可直接按正式 registry 运行 `full-real`，由 Agent-in-the-loop 对照 accepted Oracle 检查实际生成物、Fins public state、日志、屏幕和条件路径，而不是只检查 CLI summary。

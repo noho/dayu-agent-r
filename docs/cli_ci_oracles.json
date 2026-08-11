@@ -2076,25 +2076,421 @@
       },
       "supersedes": "cli.interactive.core-execution@1",
       "superseded_by": null
+    },
+    {
+      "oracle_id": "cli.download.document-acquisition",
+      "version": 1,
+      "status": "accepted",
+      "category": "behavioral",
+      "scope": {
+        "command": "download",
+        "scenes": [],
+        "surfaces": [
+          "argv-and-workspace",
+          "real-source-and-artifacts",
+          "fins-public-state",
+          "stdout-stderr-screen-and-log",
+          "concurrency-cancel-crash-recovery",
+          "cross-command-consumption"
+        ]
+      },
+      "predicates": [
+        {
+          "predicate_id": "download.public-surface-and-workspace",
+          "expected": [
+            "公开命令只有 help 中列出的 download 参数；不存在 --source。",
+            "--ticker 必填；workspace 由默认 ./workspace 或 --base/-b/--workspace 解析。",
+            "路径错误在明确 owner 边界失败；所有静态 usage error 在业务 operation、网络和 workspace 业务写入前 exit 2。"
+          ],
+          "forbidden": [
+            "Agent 或实现把内部 source=auto 暴露为 --source。",
+            "静态输入错误先创建 Fins 业务目录、锁或 job 再失败。"
+          ]
+        },
+        {
+          "predicate_id": "download.input-validation",
+          "expected": [
+            "ticker、forms、date、数量/长度边界、未知参数、缺失值、额外 positional 与互斥冲突给出有界可行动诊断。",
+            "重复 --ticker/--forms 采用最后一次 occurrence；CSV ticker 明确拒绝。",
+            "usage error exit 2；workspace/storage/provider 等动态失败 exit 1；正常零结果 exit 0；一次性取消 exit 130。"
+          ],
+          "forbidden": [
+            "用通用失败文案掩盖可识别的输入原因。",
+            "把应用失败或取消误报为 parser usage error。"
+          ]
+        },
+        {
+          "predicate_id": "download.ticker-canonicalization",
+          "expected": [
+            "US AAPL/US.AAPL/AAPL.US 归一为 AAPL，BRK.B 归一为 BRK-B。",
+            "CN 600519.SH/SH600519/600519 与 000333.SZ 归一到相应六位 canonical ticker。",
+            "HK 0700.HK/HK.700/0700 归一为 0700；source 由 canonical market 唯一选择。"
+          ],
+          "forbidden": [
+            "不同 alias 产生不同公司或重复 document identity。",
+            "用目录名或 provider 返回文本反推 canonical ticker。"
+          ]
+        },
+        {
+          "predicate_id": "download.forms-and-date-bounds",
+          "expected": [
+            "支持市场适用 form alias、大小写/中文拼写、多 forms 与 year/year-month/full-date。",
+            "显式 start/end 是 inclusive hard bounds；SC13 扩展不能越过用户显式边界。",
+            "start-after-end、非法或超限 form/date 在 operation 前 exit 2。"
+          ],
+          "forbidden": [
+            "下载显式窗口外 filing。",
+            "把 missing period 占位计作真实 candidate。"
+          ]
+        },
+        {
+          "predicate_id": "download.market-material-selection",
+          "expected": [
+            "A股裸默认集合是 FY,H1,Q1,Q3；制度上不存在的独立 Q2/Q4 不进入 effective defaults/missing，但显式 Q2/Q4 输入仍按合法请求处理。",
+            "港股基础集合是年度报告 FY 与中期报告 H1；实际发布的季度材料按披露发现。",
+            "腾讯 0700 必须把中期业绩公告 Q2、年度业绩公告 Q4 与中期报告 H1、年度报告 FY 识别为四个独立 source/document identity；Q1/Q3 按实际发布发现。"
+          ],
+          "forbidden": [
+            "以 H1 替代 Q2 或以 FY 年报替代 Q4 业绩公告。",
+            "把 Q1～Q4 当作所有港股发行人的必有 missing 集合。"
+          ]
+        },
+        {
+          "predicate_id": "download.real-source-publication",
+          "expected": [
+            "US/CN/HK 真实请求分别使用 SEC EDGAR、CNInfo、HKEX，保存来源 URL、document identity、实际 form/date 与完整业务文件。",
+            "US 保存主 HTML/XBRL 等来源文件；CN/HK 保存原 PDF 与可解析 Docling JSON，meta/manifest size/digest 与实物一致。",
+            "publication 成功后 public repository 可重新读取。"
+          ],
+          "forbidden": [
+            "只凭 CLI summary 宣称下载成功。",
+            "把 fake provider、fixture 或仅 owner test 计为 real source observation。"
+          ]
+        },
+        {
+          "predicate_id": "download.repeat-overwrite-and-nondeletion",
+          "expected": [
+            "已有完整 source 的普通重复计 skipped 并保持业务 bytes；--overwrite 重新获取并原子替换本次选中 source。",
+            "普通 download 与 overwrite 都不得删除未选择的历史 filing、用户文档或非目标 source。",
+            "已有 rejection 的普通重复与 overwrite 重新分类分别如实计账。"
+          ],
+          "forbidden": [
+            "无 --overwrite 静默重写完整 source。",
+            "以 active forms 或本轮 candidate 集合清理未选择历史 filing。"
+          ]
+        },
+        {
+          "predicate_id": "download.local-rebuild-and-mutual-exclusion",
+          "expected": [
+            "--rebuild 只基于本地完整 source 重建 download-owned meta/manifest；不联网、不覆盖 source bytes、不运行 process、不修改 processed/reprocess 状态。",
+            "--overwrite 与 --rebuild 互斥；两种 argv 顺序都在 operation/网络/workspace 写入前 exit 2。"
+          ],
+          "forbidden": [
+            "把 rebuild 当作远端重下或 process/reprocess。",
+            "保留 overwrite+rebuild 的兼容成功路径。"
+          ]
+        },
+        {
+          "predicate_id": "download.outcome-accounting",
+          "expected": [
+            "downloaded/skipped/rejected/failed/zero-match 与真实 candidate、rejection artifact 和 source publication 守恒。",
+            "CN/HK missing periods 独立显示，不伪造 discovered/skipped。",
+            "rejected-only 与 downloaded+rejected 正常完成 exit 0；provider/configuration failure 明确分类并 exit 1。"
+          ],
+          "forbidden": [
+            "用 summary 自报替代 repository 对账。",
+            "把 filtered rejection、missing period 与 provider failure 混成同一结果。"
+          ]
+        },
+        {
+          "predicate_id": "download.provider-identity-and-throttle",
+          "expected": [
+            "SEC_USER_AGENT 未配置时首次真实 HTTP 前 fail-closed，warning 恰好一次且不泄漏 contact value。",
+            "真实 transport failure 保留 provider_transport/transport 分类、可行动提示和无半文档。",
+            "只有 SEC 使用跨进程 shared throttle；CN/HK 不施加 SEC-style 限速。"
+          ],
+          "forbidden": [
+            "用 fallback User-Agent 继续请求。",
+            "把 provider 不可达泛化为输入错误，或给 CN/HK 添加无业务依据的全局串行锁。"
+          ]
+        },
+        {
+          "predicate_id": "download.concurrency",
+          "expected": [
+            "同 workspace 同 ticker 与不同 ticker 的并发 download 均可运行；每个 operation 有唯一 terminal。",
+            "同目标最终 publication 完整且 last-writer 安全，不同目标形成完整并集。"
+          ],
+          "forbidden": [
+            "以 workspace/ticker busy 为由禁止普通并发。",
+            "并发后留下半文档、破坏 meta/manifest 或混淆计数。"
+          ]
+        },
+        {
+          "predicate_id": "download.cancellation-crash-and-recovery",
+          "expected": [
+            "very-early、provider/file wait、Docling conversion 阶段一次 Ctrl+C 都请求协作取消，等待 canonical cancelled，清理后 exit 130。",
+            "取消后无后台继续输出、worker 泄漏或半 publication；相同 argv/workspace 可原样重跑成功。",
+            "真实 SIGKILL 作为 crash 前置单独记录；重启依靠 production recovery，不伪装为产品取消。"
+          ],
+          "forbidden": [
+            "第一次 Ctrl+C 强杀进程或在 canonical terminal 前返回。",
+            "harness deadline/kill 冒充产品 timeout/cancel。"
+          ]
+        },
+        {
+          "predicate_id": "download.integrity-and-atomicity",
+          "expected": [
+            "选中 source 的 physical/meta size 或 digest 不一致时，无论是否 --overwrite 都自动重取并恢复同源完整状态。",
+            "失败、取消、crash 与并发 publication 保持 old-or-new 完整真相；无 staging、backup、lock 或 journal 阻断后续重跑。",
+            "无稳定公开 commit-phase marker 的极短 publication interrupt 记 defensive/unreachable，不增加后门。"
+          ],
+          "forbidden": [
+            "因完整性不一致永久拒绝可安全重取的目标。",
+            "展示成功但 physical/meta/manifest 不一致。"
+          ]
+        },
+        {
+          "predicate_id": "download.ui-logging-and-secret-boundary",
+          "expected": [
+            "屏幕展示 source/ticker/effective forms/window、逐项 bounded outcomes、missing/conversion lifecycle、summary 与相对 artifact locator。",
+            "quiet 关闭普通诊断但保留业务 UI；debug-stream 对无模型 stream 的 download 不伪造输出；--log-file 独立记录诊断并 append。",
+            "stdout/stderr/log/evidence 不投影 credential/contact 明文；只记录 configured/unconfigured 与分类。"
+          ],
+          "forbidden": [
+            "仅显示泛化‘处理失败’而隐藏已知 typed reason。",
+            "日志、报告或 Tool Trace 回显 secret/contact value。"
+          ]
+        },
+        {
+          "predicate_id": "download.durable-boundary",
+          "expected": [
+            "download 是 Fins direct command：不依赖 init/model provider，不创建 Host Run/Attempt/EventLog/Memory/Tool Trace 或 Host/runtime SQLite。",
+            "每次场景仍必须实际查询这些层并记录 absent/not-applicable proof；workspace config 不被 download 修改。"
+          ],
+          "forbidden": [
+            "把未检查写成不适用。",
+            "为 direct download 创建 legacy durable ingestion job 或 Host Run。"
+          ]
+        },
+        {
+          "predicate_id": "download.cross-command-consumability",
+          "expected": [
+            "至少一个 US 和一个 CN/HK source 可由 production read/process 通过 dayu.fins.storage 重新加载并生成 downstream 产物。",
+            "跨命令步骤只证明 download 产物可消费，不提前裁决 process/read 命令自身 UI/oracle。"
+          ],
+          "forbidden": [
+            "绕过 repository 私有读取文件来伪造可消费性。",
+            "把 process 的成功计作 download 本身 summary 正确的唯一证据。"
+          ]
+        },
+        {
+          "predicate_id": "download.docling-attempt-isolation",
+          "expected": [
+            "每个 Docling attempt 都从 immutable PDF bytes 新建独立 DocumentStream；前一 converter 关闭 stream 不影响下一 attempt。",
+            "若真实环境自然触发首 attempt 失败，后续 attempt 必须可成功；若首 attempt 成功则如实记录 conditional/not-triggered。",
+            "owner contract test 锁定 attempt-local stream，条件路径不阻塞 readiness。"
+          ],
+          "forbidden": [
+            "跨 attempt 复用可能已关闭的 stream。",
+            "为制造 fallback 增加 production hook、mock、断网副作用或观察基础设施。"
+          ]
+        }
+      ],
+      "allowed_variants": [
+        "真实外部来源的候选数量、网络耗时与最新材料会随运行日期变化，但 identity、分类、边界、生成物和计账规则不变。",
+        "同内容远端文件与 publication 时间类 meta 可以变化；必须保留来源 identity、实物/meta digest 同源和非目标不删除。",
+        "Docling 首 attempt 是否自然失败属于环境条件；attempt-local stream contract 与最终结果不能变化。",
+        "不影响业务语义、退出码、artifact locator 和可行动性的终端文案微调。"
+      ],
+      "authority_basis": [
+        {
+          "kind": "user-decision",
+          "date": "2026-08-09",
+          "summary": "用户逐项裁决 download 第一轮 O01～O22；未指出项接受 Agent 建议。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-08-10",
+          "summary": "用户冻结 F12 互斥、A股默认 FY/H1/Q1/Q3、港股 FY/H1 基础集合及腾讯 FY/H1/Q2/Q4 独立材料。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-08-10",
+          "summary": "用户接受 F15 post-fix 真实成功链；真实 fallback 未自然触发是非阻塞条件路径。"
+        },
+        {
+          "kind": "design-and-owner-evidence",
+          "summary": "download source/storage 语义由 Fins owners 产生；CLI 只解析、调用与投影，不从文件名或 summary 反推。"
+        }
+      ],
+      "observed_behavior": {
+        "run_ids": [
+          "download-20260809Tjbv3bg",
+          "download-postfix-20260810T041254Z",
+          "download-cn-bare-calibration-0uNsYI",
+          "wu-cli-download-02-postfix-20260810-A9vLZQ",
+          "wu-cli-download-03-dl-f15-postfix-20260810-yCJM88"
+        ],
+        "report_ids": [
+          "workspace/tmp/download-observed-behavior.md",
+          "/Users/leo/workspace/.dayu-cli-ci/download-postfix-20260810T041254Z/observed-behavior.md",
+          "/Users/leo/workspace/.dayu-cli-ci/download-cn-bare-calibration-0uNsYI/observed-behavior.md",
+          "/Users/leo/workspace/.dayu-cli-ci/wu-cli-download-02-postfix-20260810-A9vLZQ/evidence/observed-behavior.md",
+          "/Users/leo/workspace/.dayu-cli-ci/wu-cli-download-03-dl-f15-postfix-20260810-yCJM88/evidence/observed-behavior.md"
+        ],
+        "report_digest_sha256": [
+          "994827953d9694b191611038d29c038b63738f23c670df417bd2e07d81f8d25e",
+          "be0c3c4cbc6a7b27877bd156cd7528ef33bd87f9e8fe097f8fdc09299886f6a6",
+          "d25446fd9d5c3d9e5e2e317c5f6743067978d5239f800de6524d4a1128dc6069",
+          "7ca07d76a6d0d5ed37a5c4b54917f08262bd8a5203bf2d31cc7781da4fa2e666",
+          "c4387f279cdca7466aec36cbe1166e2c3529e29c8ed5203c491eb897be0278a1"
+        ],
+        "report_frozen": true,
+        "scenario_refs": [
+          "download.DL-001-help",
+          "download.DL-002-source-option-absent",
+          "download.DL-003-missing-ticker",
+          "download.DL-004-empty-ticker",
+          "download.DL-005-path-like-ticker",
+          "download.DL-006-unrecognized-ticker",
+          "download.DL-007-overlong-ticker",
+          "download.DL-008-csv-ticker",
+          "download.DL-009-repeated-ticker-last-wins",
+          "download.DL-010-empty-form-item",
+          "download.DL-011-invalid-form",
+          "download.DL-012-overlong-form",
+          "download.DL-013-forms-count-limit",
+          "download.DL-014-forms-count-over-limit",
+          "download.DL-015-invalid-date",
+          "download.DL-016-overlong-date",
+          "download.DL-017-start-after-end",
+          "download.DL-018-empty-base",
+          "download.DL-019-forms-missing-value",
+          "download.DL-020-start-missing-value",
+          "download.DL-021-extra-positional",
+          "download.DL-022-workspace-root-file",
+          "download.DL-023-dayu-root-file",
+          "download.DL-024-portfolio-root-file",
+          "download.DL-025-read-only-workspace",
+          "download.DL-026-default-workspace",
+          "download.DL-027-root-base-position",
+          "download.DL-028-workspace-alias",
+          "download.DL-029-short-base-alias",
+          "download.DL-030-space-unicode-base",
+          "download.DL-031-relative-base",
+          "download.DL-032-symlink-base",
+          "download.DL-033-piped-stdin",
+          "download.DL-C01-us-bare-aapl",
+          "download.DL-C02-us-prefix-aapl",
+          "download.DL-C03-us-suffix-aapl",
+          "download.DL-C04-us-class-share",
+          "download.DL-C05-cn-suffix-sh",
+          "download.DL-C06-cn-prefix-sh",
+          "download.DL-C07-cn-bare-sh",
+          "download.DL-C08-cn-suffix-sz",
+          "download.DL-C09-hk-suffix",
+          "download.DL-C10-hk-prefix",
+          "download.DL-C11-hk-bare",
+          "download.DL-M01-sec-aapl-10k-exact",
+          "download.DL-M02-sec-start-only",
+          "download.DL-M03-sec-end-only",
+          "download.DL-M04-sec-multi-form-month",
+          "download.DL-M05-sec-repeated-forms-last-wins",
+          "download.DL-M06-sec-zero-match",
+          "download.DL-M07-sec-us-domestic-real",
+          "download.DL-M08-sec-foreign-issuer-20f",
+          "download.DL-M09-sec-bare-default",
+          "download.DL-M10-sec-6k-rejected-only",
+          "download.DL-M11-sec-6k-downloaded-plus-rejected",
+          "download.DL-M12-cn-fy-real",
+          "download.DL-M13-cn-chinese-form-alias",
+          "download.DL-M14-hk-fy-real",
+          "download.DL-M15-hk-q1-real",
+          "download.DL-M16-hk-missing-all",
+          "download.DL-M17-hk-missing-partial",
+          "download.DL-M18-cn-explicit-q2-q4",
+          "download.DL-M19-cn-bare-default",
+          "download.DL-M20-hk-bare-default",
+          "download.DL-M21-hk-tencent-four-materials",
+          "download.DL-M22-hk-q3-docling",
+          "download.DL-S01-sec-repeat-skip",
+          "download.DL-S02-sec-overwrite",
+          "download.DL-S03-cn-overwrite",
+          "download.DL-S04-sec-rebuild-local",
+          "download.DL-S05-hk-rebuild-local",
+          "download.DL-S06-overwrite-rebuild-conflict",
+          "download.DL-S07-rebuild-overwrite-conflict",
+          "download.DL-S08-sec-nontarget-preserve-plain",
+          "download.DL-S09-sec-nontarget-preserve-overwrite",
+          "download.DL-S10-sec-size-mismatch-auto-repair",
+          "download.DL-S11-sec-digest-mismatch-auto-repair-overwrite",
+          "download.DL-S12-hk-size-mismatch-auto-repair",
+          "download.DL-S13-hk-digest-mismatch-auto-repair-overwrite",
+          "download.DL-L01-sec-same-ticker",
+          "download.DL-L02-hk-same-ticker",
+          "download.DL-L03-sec-different-ticker",
+          "download.DL-L04-very-early-cancel",
+          "download.DL-L05-sec-provider-wait-cancel",
+          "download.DL-L06-hk-docling-cancel",
+          "download.DL-L07-retry-after-cancel",
+          "download.DL-L08-sigkill-during-docling",
+          "download.DL-L09-retry-after-sigkill",
+          "download.DL-D01-sec-user-agent-missing",
+          "download.DL-D02-provider-transport-failure",
+          "download.DL-D03-quiet-business-output",
+          "download.DL-D04-debug-stream-no-model-stream",
+          "download.DL-D05-debug-log-file",
+          "download.DL-D06-fresh-without-init",
+          "download.DL-D07-after-init",
+          "download.DL-D08-us-process-consume",
+          "download.DL-D09-cn-process-consume",
+          "download.DL-D10-hk-process-consume",
+          "download.DL-X01-partial-provider-failure-if-natural",
+          "download.DL-X02-publication-window-interrupt-if-reachable",
+          "download.DL-X03-docling-fallback-if-natural"
+        ],
+        "conditional_paths": [
+          "download.DL-X01-partial-provider-failure-if-natural",
+          "download.DL-X02-publication-window-interrupt-if-reachable",
+          "download.DL-X03-docling-fallback-if-natural"
+        ]
+      },
+      "user_adjudication": {
+        "identity": "cli.download.document-acquisition@1:user-adjudication:2026-08-10",
+        "date": "2026-08-10",
+        "result": "accepted",
+        "notes": [
+          "全部 DL-F01～DL-F15 已裁决；F12～F15 post-fix 结果接受。",
+          "defensive/unreachable 与 conditional/not-triggered 按已裁决边界保留，不伪称真实命中。"
+        ]
+      },
+      "applicable_from": {
+        "date": "2026-08-10",
+        "target": "5e1a0d109685a03b6477e2e129e148c8e0127554"
+      },
+      "supersedes": null,
+      "superseded_by": null
     }
   ],
   "readiness_proof": {
-    "proof_version": 3,
-    "generated_at": "2026-08-09T05:14:27Z",
-    "target_commit": "473e66b972e7e7a3e028ca1e9f4b2798ecb2b100",
+    "proof_version": 4,
+    "generated_at": "2026-08-10T16:00:00Z",
+    "target_commit": "5e1a0d109685a03b6477e2e129e148c8e0127554",
     "registry_scope": [
       "init",
       "prompt",
-      "interactive"
+      "interactive",
+      "download"
     ],
     "validation_result": "ready",
-    "accepted_oracle_count": 3,
+    "accepted_oracle_count": 4,
     "superseded_oracle_count": 1,
-    "accepted_predicate_count": 66,
+    "accepted_predicate_count": 83,
     "current_accepted_oracle_refs": [
       "cli.init.workspace-initialization@1",
       "cli.prompt.core-execution@1",
-      "cli.interactive.core-execution@2"
+      "cli.interactive.core-execution@2",
+      "cli.download.document-acquisition@1"
     ],
     "reference_validation": {
       "missing_exact_oracle_refs": 0,
@@ -2102,15 +2498,18 @@
       "unresolved_predicates": 0,
       "unresolved_evidence_gaps": 0,
       "unresolved_user_adjudications": 0,
-      "uncovered_correctness_surfaces": 0
+      "uncovered_correctness_surfaces": 0,
+      "dangling_local_report_refs": 0,
+      "local_report_digest_mismatches": 0
     },
     "latest_user_adjudication_identities": [
       "cli.init.workspace-initialization@1:user-adjudication:2026-07-30",
       "cli.prompt.core-execution@1:user-adjudication:2026-08-02",
       "cli.interactive.core-execution@2:user-adjudication:2026-08-09",
-      "interactive.interactive.g06.summary-null@1:user-adjudication:2026-08-09"
+      "interactive.interactive.g06.summary-null@1:user-adjudication:2026-08-09",
+      "cli.download.document-acquisition@1:user-adjudication:2026-08-10"
     ],
-    "scenario_registry_digest_basis": "202f4c81037b72b642cfc15ee0d1fb19a6d346f82e8c217cbff4d0df02c3e123",
-    "registry_digest_basis": "316d7ba4b06cc642df54d989bb0078d389eb04f6f809e4bc96124f770e6654cd"
+    "scenario_registry_digest_basis": "01c34bce9d706d306533b30368b65dcfbdfd0a009b575f1de0f52b5ca0a16806",
+    "registry_digest_basis": "dc2c5ac1411bb82ef29053468fc0ac052929732605c14f0c9a1beb4e5f7059d6"
   }
 }
