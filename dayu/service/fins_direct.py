@@ -23,9 +23,12 @@ from dayu.fins.direct_events import (
     FinsOperationKind,
 )
 from dayu.fins.direct_events import ValidatedFinsEventStream
+from dayu.fins.download_contract import (
+    FinsDownloadRequest,
+    build_fins_download_request,
+)
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.ingestion_runtime import (
-    FinsDownloadRequest,
     FinsPreprocessRequest,
     FinsUploadFilingRequest,
     FinsUploadMaterialRequest,
@@ -38,10 +41,6 @@ FINS_DIRECT_EXIT_FAILURE: Final[int] = FINS_RESULT_EXIT_FAILURE
 FINS_DIRECT_EXIT_KEYBOARD_INTERRUPT: Final[int] = FINS_RESULT_EXIT_CANCELLED
 
 _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
-
-
-class FinsDirectUsageError(ValueError):
-    """Fins direct Service 参数错误。"""
 
 
 class FinsDirectIngestionRuntime(Protocol):
@@ -162,41 +161,23 @@ class FinsDirectCommandService:
 
     def download(
         self,
+        request: FinsDownloadRequest,
         *,
-        ticker: str,
-        form_types: tuple[str, ...] = (),
-        filed_after: str | None = None,
-        filed_before: str | None = None,
-        overwrite_existing: bool = False,
-        rebuild_processed: bool = False,
         cancellation_token: CancellationToken | None = None,
     ) -> ValidatedFinsEventStream:
         """执行 Fins 下载 direct stream。
 
-        :param ticker: canonical ticker 文本。
-        :param form_types: 表单过滤条件。
-        :param filed_after: 可选最早 filing 日期。
-        :param filed_before: 可选最晚 filing 日期。
-        :param overwrite_existing: 是否覆盖已有 source document。
-        :param rebuild_processed: 是否请求重建 processed 产物。
+        :param request: 已完成静态校验的下载请求。
         :param cancellation_token: 可选 operation-scoped 取消 token。
         :returns: runtime 返回的同一个 Fins owner 已验证事件流。
-        :raises Exception: request 构造或 runtime 执行失败时由底层抛出。
+        :raises Exception: runtime 执行失败时由底层抛出。
         """
 
         runtime_log.log_verbose(
             _LOGGER,
             "Fins direct command stream opened; command=%s ticker=%s",
             FinsOperationKind.DOWNLOAD.value,
-            ticker,
-        )
-        request = FinsDownloadRequest(
-            ticker=ticker,
-            form_types=form_types,
-            filed_after=filed_after,
-            filed_before=filed_before,
-            overwrite_existing=overwrite_existing,
-            rebuild_processed=rebuild_processed,
+            request.normalized_ticker.canonical,
         )
         return self._runtime.download(
             request,
@@ -456,6 +437,42 @@ class FinsDirectCommandService:
         )
 
 
+def build_direct_download_request(
+    *,
+    ticker: str,
+    form_types: tuple[str, ...] = (),
+    start: str | None = None,
+    end: str | None = None,
+    overwrite_existing: bool = False,
+    rebuild_local_artifacts: bool = False,
+) -> FinsDownloadRequest:
+    """在 runtime 装配前构造 Fins direct 下载请求。
+
+    Args:
+        ticker: 单个公司 ticker。
+        form_types: 用户显式提供的 form 项。
+        start: 可选 inclusive 起始日期输入。
+        end: 可选 inclusive 结束日期输入。
+        overwrite_existing: 是否覆盖已有 source document。
+        rebuild_local_artifacts: 是否只重建本地下载产物。
+
+    Returns:
+        已完成静态校验与 canonicalization 的下载请求。
+
+    Raises:
+        FinsDownloadUsageError: 下载输入不符合公开调用契约时由 owner 抛出。
+    """
+
+    return build_fins_download_request(
+        ticker=ticker,
+        form_types=form_types,
+        start=start,
+        end=end,
+        overwrite_existing=overwrite_existing,
+        rebuild_local_artifacts=rebuild_local_artifacts,
+    )
+
+
 __all__: tuple[str, ...] = (
     "FINS_DIRECT_EXIT_FAILURE",
     "FINS_DIRECT_EXIT_KEYBOARD_INTERRUPT",
@@ -463,5 +480,5 @@ __all__: tuple[str, ...] = (
     "FinsDirectCommandService",
     "FinsDirectIngestionRuntime",
     "FinsDirectRuntimeRequest",
-    "FinsDirectUsageError",
+    "build_direct_download_request",
 )

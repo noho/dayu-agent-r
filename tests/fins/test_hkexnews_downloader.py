@@ -18,6 +18,11 @@ from urllib.parse import parse_qs
 import httpx
 import pytest
 
+from dayu.fins.download_contract import (
+    FinsDownloadProviderError,
+    FinsDownloadSource,
+    FinsDownloadTransportCategory,
+)
 from dayu.fins.downloaders import hkexnews_downloader as _hkexnews_downloader
 from dayu.fins.downloaders.hkexnews_downloader import (
     DEFAULT_MAX_RETRIES,
@@ -36,6 +41,7 @@ from dayu.fins.pipelines.cn_download_models import (
     CnFiscalPeriod,
     CnLanguage,
     CnReportCandidate,
+    CnReportPeriodProjection,
     CnReportQuery,
 )
 
@@ -222,9 +228,7 @@ def _announcement_rows(
         _announcement(
             document_id=f"{prefix}_{index}",
             title=f"腾讯控股有限公司：{title_year}年年度报告 {prefix} {index}",
-            file_link=(
-                f"/listedco/listconews/sehk/2025/0401/{prefix.lower()}_{index}.pdf"
-            ),
+            file_link=(f"/listedco/listconews/sehk/2025/0401/{prefix.lower()}_{index}.pdf"),
         )
         for index in range(count)
     ]
@@ -272,9 +276,7 @@ def _title_search_payload(
     """
 
     effective_loaded_record = len(rows) if loaded_record is None else loaded_record
-    effective_record_count = (
-        effective_loaded_record if record_count is None else record_count
-    )
+    effective_record_count = effective_loaded_record if record_count is None else record_count
     return {
         "hasNextRow": has_next_row,
         "rowRange": row_range,
@@ -348,7 +350,7 @@ def _query(
         normalized_ticker=ticker,
         start_date="2024-01-01",
         end_date="2026-12-31",
-        target_periods=periods,
+        discovery_periods=periods,
     )
 
 
@@ -417,7 +419,7 @@ def test_resolve_company_rejects_non_hk_market() -> None:
                 normalized_ticker="0700",
                 start_date="2024-01-01",
                 end_date="2026-12-31",
-                target_periods=("FY",),
+                discovery_periods=("FY",),
             )
         )
 
@@ -480,7 +482,7 @@ def test_list_report_candidates_gets_title_search_and_builds_absolute_url() -> N
     assert candidate.source_url == _PDF_URL
     assert candidate.language == "zh"
     assert candidate.fiscal_year == 2024
-    assert candidate.fiscal_period == "FY"
+    assert candidate.period_projection.identity_period == "FY"
     assert candidate.content_length == 4096
     assert candidate.etag == '"hk-v1"'
     assert candidate.last_modified == "Tue, 01 Apr 2025 00:00:00 GMT"
@@ -560,10 +562,7 @@ def test_list_report_candidates_fetches_two_round_cumulative_snapshot_with_invar
 
     assert events[:6] == ["CP1", "GET(100)", "CP2", "CP3", "GET(200)", "CP4"]
     assert [params["rowRange"] for params in requested] == [("100",), ("200",)]
-    without_range = [
-        {key: value for key, value in params.items() if key != "rowRange"}
-        for params in requested
-    ]
+    without_range = [{key: value for key, value in params.items() if key != "rowRange"} for params in requested]
     assert without_range[0] == without_range[1]
     assert len(candidates) == 1
     assert candidates[0].source_id.startswith("FINAL_")
@@ -707,9 +706,11 @@ def test_list_report_candidates_rejects_continuation_without_loaded_progress() -
             )
         raise AssertionError("no HEAD or additional request is allowed")
 
-    with pytest.raises(HkexnewsProviderProtocolError, match="无进展"):
+    with pytest.raises(HkexnewsProviderProtocolError) as exc_info:
         _build_client(handler).list_report_candidates(_query(), _profile())
 
+    assert exc_info.value.transport_category is FinsDownloadTransportCategory.PROTOCOL
+    assert exc_info.value.retryable is False
     assert request_count == 2
 
 
@@ -726,7 +727,7 @@ def test_list_report_candidates_requires_all_official_fields(missing_field: str)
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=payload)
 
-    with pytest.raises(HkexnewsProviderProtocolError, match=missing_field):
+    with pytest.raises(HkexnewsProviderProtocolError):
         _build_client(handler).list_report_candidates(_query(), _profile())
 
 
@@ -740,7 +741,7 @@ def test_list_report_candidates_requires_exact_has_next_bool(invalid_value: Json
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=payload)
 
-    with pytest.raises(HkexnewsProviderProtocolError, match="hasNextRow"):
+    with pytest.raises(HkexnewsProviderProtocolError):
         _build_client(handler).list_report_candidates(_query(), _profile())
 
 
@@ -758,7 +759,7 @@ def test_list_report_candidates_requires_exact_count_ints(
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=payload)
 
-    with pytest.raises(HkexnewsProviderProtocolError, match=field_name):
+    with pytest.raises(HkexnewsProviderProtocolError):
         _build_client(handler).list_report_candidates(_query(), _profile())
 
 
@@ -772,7 +773,7 @@ def test_list_report_candidates_rejects_negative_count_fields(field_name: str) -
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=payload)
 
-    with pytest.raises(HkexnewsProviderProtocolError, match=field_name):
+    with pytest.raises(HkexnewsProviderProtocolError):
         _build_client(handler).list_report_candidates(_query(), _profile())
 
 
@@ -788,7 +789,7 @@ def test_list_report_candidates_requires_stringified_object_list(
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=payload)
 
-    with pytest.raises(HkexnewsProviderProtocolError, match="result"):
+    with pytest.raises(HkexnewsProviderProtocolError):
         _build_client(handler).list_report_candidates(_query(), _profile())
 
 
@@ -871,14 +872,17 @@ def test_list_report_candidates_preserves_cancel_identity_and_suppresses_publica
     assert head_count == 0
 
 
-def test_list_report_candidates_preserves_non_cancel_failure_full_cause_chain() -> None:
-    """workflow checkpoint 非取消失败经 HKEX context wrapper 后应保留两层 cause。"""
+def test_list_report_candidates_preserves_non_cancel_failure_identity() -> None:
+    """workflow checkpoint 非取消失败应原样传播且零 HTTP。"""
 
     original = ValueError("checker exploded")
     request_count = 0
 
+    expected = RuntimeError("取消检查失败")
+    expected.__cause__ = original
+
     def checkpoint() -> None:
-        raise RuntimeError("取消检查失败") from original
+        raise expected
 
     def handler(_request: httpx.Request) -> httpx.Response:
         nonlocal request_count
@@ -893,8 +897,8 @@ def test_list_report_candidates_preserves_non_cancel_failure_full_cause_chain() 
         )
 
     assert type(exc_info.value) is RuntimeError
-    assert type(exc_info.value.__cause__) is RuntimeError
-    assert exc_info.value.__cause__.__cause__ is original
+    assert exc_info.value is expected
+    assert exc_info.value.__cause__ is original
     assert request_count == 0
 
 
@@ -919,7 +923,7 @@ def test_list_report_candidates_preserves_provider_protocol_object_identity(
     """预构造 provider protocol error 经 public generic wrapper 边界应保持 identity/cause。"""
 
     original = ValueError("provider parser cause")
-    expected = HkexnewsProviderProtocolError("expected provider protocol failure")
+    expected = HkexnewsProviderProtocolError()
     expected.__cause__ = original
 
     def raise_expected(
@@ -975,9 +979,12 @@ def test_list_report_candidates_discards_partial_rows_when_later_http_fails() ->
             return httpx.Response(200, headers={})
         raise AssertionError(f"unexpected request {request.method} {request.url}")
 
-    with pytest.raises(RuntimeError, match="披露易公告分类查询失败"):
+    with pytest.raises(FinsDownloadProviderError) as exc_info:
         _build_client(handler).list_report_candidates(_query(), _profile())
 
+    assert exc_info.value.source is FinsDownloadSource.HKEXNEWS
+    assert exc_info.value.transport_category is FinsDownloadTransportCategory.HTTP_STATUS
+    assert exc_info.value.retryable is True
     assert title_gets == 3
     assert head_count == 0
 
@@ -1028,12 +1035,7 @@ def test_list_report_candidates_keeps_cumulative_state_isolated_per_language() -
 def test_captured_official_title_search_shape_replays_through_strict_owner() -> None:
     """官方小响应 fixture 的 body hash、请求参数与 exact types 应可审计重放。"""
 
-    fixture_path = (
-        Path(__file__).parent
-        / "fixtures"
-        / "hkexnews"
-        / "title_search_protocol_shape.json"
-    )
+    fixture_path = Path(__file__).parent / "fixtures" / "hkexnews" / "title_search_protocol_shape.json"
     fixture = cast(JsonValue, json.loads(fixture_path.read_text(encoding="utf-8")))
     assert isinstance(fixture, dict)
     raw_body = fixture.get("raw_response_body")
@@ -1064,7 +1066,7 @@ def test_captured_official_title_search_shape_replays_through_strict_owner() -> 
         normalized_ticker="0700",
         start_date="2026-07-15",
         end_date="2026-07-15",
-        target_periods=("FY",),
+        discovery_periods=("FY",),
     )
 
     assert _build_client(handler).list_report_candidates(query, _profile()) == ()
@@ -1183,7 +1185,7 @@ def test_list_report_candidates_maps_hk_period_codes_and_allows_empty_quarters()
     assert category_params == [
         ("40000", "-2", "40100"),
         ("40000", "-2", "40200"),
-        ("10000", "3", "13600"),
+        ("10000", "3", "-2"),
     ]
 
 
@@ -1218,11 +1220,14 @@ def test_list_report_candidates_raises_on_failed_hk_period_query() -> None:
         raise AssertionError(f"unexpected request {request.method} {request.url}")
 
     client = _build_client(handler)
-    with pytest.raises(RuntimeError, match="periods=FY"):
+    with pytest.raises(FinsDownloadProviderError) as exc_info:
         client.list_report_candidates(
             _query(periods=("FY", "H1")),
             _profile(),
         )
+
+    assert exc_info.value.transport_category is FinsDownloadTransportCategory.HTTP_STATUS
+    assert exc_info.value.retryable is True
 
 
 def test_list_report_candidates_maps_direct_q2_to_quarterly_category() -> None:
@@ -1261,10 +1266,11 @@ def test_list_report_candidates_maps_direct_q2_to_quarterly_category() -> None:
         _profile(),
     )
 
-    assert seen_t2codes == ["13600"]
+    assert seen_t2codes == ["-2"]
     assert len(candidates) == 1
     assert candidates[0].source_id == "Q2_2025"
-    assert candidates[0].fiscal_period == "Q2"
+    assert candidates[0].period_projection.identity_period == "Q2"
+    assert candidates[0].period_projection.covered_periods == ("H1", "Q2")
 
 
 def test_list_report_candidates_keeps_q4_distinct_from_fy() -> None:
@@ -1317,7 +1323,7 @@ def test_list_report_candidates_keeps_q4_distinct_from_fy() -> None:
         _profile(),
     )
 
-    assert [(candidate.source_id, candidate.fiscal_period) for candidate in candidates] == [
+    assert [(candidate.source_id, candidate.period_projection.identity_period) for candidate in candidates] == [
         ("FY_2025", "FY"),
         ("Q4_2025", "Q4"),
     ]
@@ -1357,7 +1363,7 @@ def test_list_report_candidates_treats_traditional_half_year_as_h1() -> None:
         _profile(),
     )
 
-    assert [(candidate.source_id, candidate.fiscal_period) for candidate in candidates] == [
+    assert [(candidate.source_id, candidate.period_projection.identity_period) for candidate in candidates] == [
         ("H1_2025", "H1"),
     ]
 
@@ -1373,7 +1379,7 @@ def test_list_report_candidates_filters_q1_q3_by_title_period() -> None:
             form = _query_from_request(request)
             assert form["t1code"] == ("10000",)
             assert form["t2Gcode"] == ("3",)
-            assert form["t2code"] == ("13600",)
+            assert form["t2code"] == ("-2",)
             if form["lang"] == ("E",):
                 return httpx.Response(200, json=_title_search_payload([]))
             return httpx.Response(
@@ -1407,14 +1413,14 @@ def test_list_report_candidates_filters_q1_q3_by_title_period() -> None:
         _profile(),
     )
 
-    assert [(candidate.source_id, candidate.fiscal_period) for candidate in candidates] == [
+    assert [(candidate.source_id, candidate.period_projection.identity_period) for candidate in candidates] == [
         ("Q1_2024", "Q1"),
         ("Q3_2024", "Q3"),
     ]
 
 
 def test_list_report_candidates_reads_hk_quarterly_results_announcements() -> None:
-    """真实腾讯式 ``公告及通告 - [季度業績]`` 应归入 Q1/Q2/Q3/Q4。"""
+    """通用 ``公告及通告 - [季度業績]`` raw fixture 应归入 Q1/Q2/Q3/Q4。"""
 
     q1_url = f"{HKEXNEWS_BASE_URL}/listedco/listconews/sehk/2025/0514/q1.pdf"
     q2_url = f"{HKEXNEWS_BASE_URL}/listedco/listconews/sehk/2025/0813/q2.pdf"
@@ -1426,7 +1432,7 @@ def test_list_report_candidates_reads_hk_quarterly_results_announcements() -> No
             form = _query_from_request(request)
             assert form["t1code"] == ("10000",)
             assert form["t2Gcode"] == ("3",)
-            assert form["t2code"] == ("13600",)
+            assert form["t2code"] == ("-2",)
             if form["lang"] == ("E",):
                 return httpx.Response(200, json=_title_search_payload([]))
             return httpx.Response(
@@ -1474,7 +1480,7 @@ def test_list_report_candidates_reads_hk_quarterly_results_announcements() -> No
         _profile(),
     )
 
-    assert [(candidate.source_id, candidate.fiscal_period) for candidate in candidates] == [
+    assert [(candidate.source_id, candidate.period_projection.identity_period) for candidate in candidates] == [
         ("Q1_2025", "Q1"),
         ("Q2_2025", "Q2"),
         ("Q3_2025", "Q3"),
@@ -1553,7 +1559,7 @@ def test_download_report_pdf_returns_asset_for_valid_pdf() -> None:
         language="en",
         filing_date="2025-04-01",
         fiscal_year=2024,
-        fiscal_period="FY",
+        period_projection=CnReportPeriodProjection(identity_period="FY", covered_periods=("FY",)),
         amended=False,
         content_length=len(pdf_payload),
         etag=None,
@@ -1586,7 +1592,7 @@ def test_download_report_pdf_does_not_sleep_before_first_request() -> None:
         language="en",
         filing_date="2025-04-01",
         fiscal_year=2024,
-        fiscal_period="FY",
+        period_projection=CnReportPeriodProjection(identity_period="FY", covered_periods=("FY",)),
         amended=False,
         content_length=len(pdf_payload),
         etag=None,
@@ -1622,7 +1628,7 @@ def test_download_report_pdf_throttles_between_successful_requests() -> None:
         language="en",
         filing_date="2025-04-01",
         fiscal_year=2024,
-        fiscal_period="FY",
+        period_projection=CnReportPeriodProjection(identity_period="FY", covered_periods=("FY",)),
         amended=False,
         content_length=len(pdf_payload),
         etag=None,
@@ -1659,7 +1665,7 @@ def test_download_report_pdf_repeated_calls_return_complete_bytes() -> None:
         language="en",
         filing_date="2025-04-01",
         fiscal_year=2024,
-        fiscal_period="FY",
+        period_projection=CnReportPeriodProjection(identity_period="FY", covered_periods=("FY",)),
         amended=False,
         content_length=len(pdf_payload),
         etag=None,
@@ -1682,6 +1688,7 @@ def test_download_report_pdf_rejects_short_or_non_pdf_payload() -> None:
     payloads = [b"%PDF-", b"not-a-pdf" + b"0" * 2048]
 
     for payload in payloads:
+
         def handler(request: httpx.Request, payload: bytes = payload) -> httpx.Response:
             assert str(request.url) == _PDF_URL
             return httpx.Response(200, content=payload)
@@ -1694,7 +1701,7 @@ def test_download_report_pdf_rejects_short_or_non_pdf_payload() -> None:
             language="en",
             filing_date="2025-04-01",
             fiscal_year=2024,
-            fiscal_period="FY",
+            period_projection=CnReportPeriodProjection(identity_period="FY", covered_periods=("FY",)),
             amended=False,
             content_length=len(payload),
             etag=None,
@@ -1702,5 +1709,148 @@ def test_download_report_pdf_rejects_short_or_non_pdf_payload() -> None:
         )
 
         client = _build_client(handler)
-        with pytest.raises(RuntimeError):
+        with pytest.raises(FinsDownloadProviderError) as exc_info:
             client.download_report_pdf(candidate)
+        assert exc_info.value.transport_category is FinsDownloadTransportCategory.PROTOCOL
+        assert exc_info.value.retryable is False
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_category", "expected_retryable", "expected_calls"),
+    [
+        ("timeout", FinsDownloadTransportCategory.TIMEOUT, True, 2),
+        ("network", FinsDownloadTransportCategory.CONNECTION, True, 2),
+        ("protocol", FinsDownloadTransportCategory.PROTOCOL, False, 1),
+        ("unknown", FinsDownloadTransportCategory.UNKNOWN, True, 2),
+    ],
+)
+def test_hkexnews_transport_owner_closed_mapping_and_safe_log(
+    failure_kind: str,
+    expected_category: FinsDownloadTransportCategory,
+    expected_retryable: bool,
+    expected_calls: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """真实 httpx hierarchy 应在披露易 owner 处闭合且日志不含 raw/URL。"""
+
+    calls = 0
+    errors: list[httpx.HTTPError] = []
+    logs: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if failure_kind == "timeout":
+            error: httpx.HTTPError = httpx.ReadTimeout(
+                "raw-timeout-contact@example.invalid",
+                request=request,
+            )
+        elif failure_kind == "network":
+            error = httpx.ConnectError(
+                "raw-network https://secret.invalid/path",
+                request=request,
+            )
+        elif failure_kind == "protocol":
+            error = httpx.RemoteProtocolError(
+                "raw-protocol https://secret.invalid/path",
+                request=request,
+            )
+        else:
+            error = httpx.HTTPError("raw-unknown https://secret.invalid/path")
+        errors.append(error)
+        raise error
+
+    monkeypatch.setattr(
+        _hkexnews_downloader.Log,
+        "debug",
+        lambda message, *, module: logs.append(f"{module}:{message}"),
+    )
+
+    with pytest.raises(FinsDownloadProviderError) as exc_info:
+        _build_client(handler).resolve_company(_query())
+
+    failure = exc_info.value
+    assert failure.source is FinsDownloadSource.HKEXNEWS
+    assert failure.transport_category is expected_category
+    assert failure.retryable is expected_retryable
+    assert failure.__cause__ is errors[-1]
+    assert calls == expected_calls
+    public_text = f"{failure}\n{' '.join(logs)}"
+    assert "secret.invalid" not in public_text
+    assert "contact@example.invalid" not in public_text
+    assert "raw-" not in public_text
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected_retryable", "expected_calls"),
+    [(404, False, 1), (503, True, 2)],
+)
+def test_hkexnews_http_status_retry_policy(
+    status_code: int,
+    expected_retryable: bool,
+    expected_calls: int,
+) -> None:
+    """披露易 4xx 立即终止，5xx 才消耗 bounded retries。"""
+
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(status_code, json={"raw": "secret"})
+
+    with pytest.raises(FinsDownloadProviderError) as exc_info:
+        _build_client(handler).resolve_company(_query())
+
+    assert exc_info.value.transport_category is FinsDownloadTransportCategory.HTTP_STATUS
+    assert exc_info.value.retryable is expected_retryable
+    assert calls == expected_calls
+
+
+def test_hkexnews_malformed_json_is_non_retryable_protocol_failure() -> None:
+    """成功 HTTP 后的 JSON parse failure 不得进入 transport retry。"""
+
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, content=b"{raw-secret-url:https://secret.invalid")
+
+    with pytest.raises(HkexnewsProviderProtocolError) as exc_info:
+        _build_client(handler).resolve_company(_query())
+
+    assert exc_info.value.transport_category is FinsDownloadTransportCategory.PROTOCOL
+    assert exc_info.value.retryable is False
+    assert calls == 1
+    assert "secret.invalid" not in str(exc_info.value)
+
+
+def test_hkexnews_preloop_provider_misuse_makes_zero_http_requests() -> None:
+    """错误 candidate provider 是 API misuse，必须 ValueError 且零 HTTP。"""
+
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, content=_build_pdf_payload())
+
+    invalid = CnReportCandidate(
+        provider="cninfo",
+        source_id="invalid",
+        source_url=_PDF_URL,
+        title="invalid",
+        language="en",
+        filing_date="2025-04-01",
+        fiscal_year=2024,
+        period_projection=CnReportPeriodProjection(identity_period="FY", covered_periods=("FY",)),
+        amended=False,
+        content_length=None,
+        etag=None,
+        last_modified=None,
+    )
+
+    with pytest.raises(ValueError):
+        _build_client(handler).download_report_pdf(invalid)
+    assert calls == 0

@@ -10,14 +10,24 @@ import time
 from typing import AsyncIterator, Awaitable, Callable, Final, Optional, Protocol, TypeVar, cast
 
 from dayu.fins.domain.document_models import BatchToken, DownloadRejectionRegistry
-from dayu.fins.downloaders.sec_downloader import SecDownloadCancelledError
+from dayu.fins.downloaders.sec_downloader import RemoteFileDescriptor, SecDownloadCancelledError
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.pipelines.sec_filing_collection import FilingRecord
+from dayu.fins.pipelines.sec_sc13_filtering import (
+    Sc13DirectionDecision,
+    Sc13DirectionRejectedAlreadyRegistered,
+    Sc13DirectionRejectedRegistryOnly,
+    Sc13DirectionRejectedWithArtifact,
+    Sc13RejectedDirectionDecision,
+)
 from dayu.fins.ticker_normalization import normalize_ticker
 from dayu.fins.storage import (
     BatchingRepositoryProtocol,
     FilingMaintenanceRepositoryProtocol,
     SourceDocumentRepositoryProtocol,
+    SourceIntegrityRevisionConflictError,
+    SelectedSourceRepairRequired,
+    classify_source_integrity_preflight,
 )
 from dayu.fins._log import Log
 
@@ -88,37 +98,6 @@ class _SaveRejectionRegistry(Protocol):
 
         ...
 
-
-class _CleanupStaleFilingDirs(Protocol):
-    """SEC stale filing 清理回调边界。"""
-
-    def __call__(
-        self,
-        repository: FilingMaintenanceRepositoryProtocol,
-        ticker: str,
-        form_windows: dict[str, dt.date],
-        filing_results: list[dict[str, JsonValue]],
-        *,
-        batch: BatchToken,
-    ) -> int:
-        """清理不再有效的 filing。
-
-        Args:
-            repository: filing 维护仓储。
-            ticker: 股票代码。
-            form_windows: 当前 form 窗口。
-            filing_results: 本次 filing 结果。
-            batch: invocation-time 显式 batch capability。
-
-        Returns:
-            清理数量。
-
-        Raises:
-            OSError: 仓储写入失败时抛出。
-            ValueError: batch capability 非法时抛出。
-        """
-
-        ...
 
 class SecDownloadWorkflowHost(Protocol):
     """Sec download 工作流所需的最小宿主边界。"""
@@ -239,7 +218,7 @@ class SecDownloadWorkflowHost(Protocol):
         form_windows: dict[str, dt.date],
         end_date: dt.date,
         target_cik: str,
-        sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
+        sc13_direction_cache: Optional[dict[str, Sc13DirectionDecision]] = None,
         rejection_registry: Optional[DownloadRejectionRegistry] = None,
         overwrite: bool = False,
         cancel_checker: Optional[Callable[[], bool]] = None,
@@ -257,7 +236,7 @@ class SecDownloadWorkflowHost(Protocol):
         form_windows: dict[str, dt.date],
         end_date: dt.date,
         target_cik: str,
-        sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
+        sc13_direction_cache: Optional[dict[str, Sc13DirectionDecision]] = None,
         rejection_registry: Optional[DownloadRejectionRegistry] = None,
         overwrite: bool = False,
         cancel_checker: Optional[Callable[[], bool]] = None,
@@ -276,12 +255,32 @@ class SecDownloadWorkflowHost(Protocol):
         form_windows: dict[str, dt.date],
         end_date: dt.date,
         target_cik: str,
-        sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
+        start_is_explicit: bool,
+        sc13_direction_cache: Optional[dict[str, Sc13DirectionDecision]] = None,
         rejection_registry: Optional[DownloadRejectionRegistry] = None,
         overwrite: bool = False,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> Awaitable[list[FilingRecord]]:
-        """在 SC13 为空时执行渐进式回溯。"""
+        """仅在未显式给出起点且 SC13 为空时执行渐进式回溯。"""
+
+        ...
+
+    def _persist_rejected_filing_artifact(
+        self,
+        *,
+        ticker: str,
+        cik: str,
+        filing: FilingRecord,
+        remote_files: list[RemoteFileDescriptor],
+        overwrite: bool,
+        rejection_reason: str,
+        rejection_category: str,
+        selected_primary_document: str,
+        source_fingerprint: str,
+        registry_after: DownloadRejectionRegistry,
+        cancel_checker: Optional[Callable[[], bool]] = None,
+    ) -> Awaitable[tuple[bool, Optional[str]]]:
+        """在 repair gate 后原子发布 rejected artifact 与 registry。"""
 
         ...
 
@@ -307,6 +306,7 @@ async def run_download_stream_impl(
     overwrite: bool = False,
     rebuild: bool = False,
     ticker_aliases: Optional[list[str]] = None,
+    start_is_explicit: bool,
     cancel_checker: Optional[Callable[[], bool]] = None,
     parse_date: Callable[[str, bool], dt.date],
     extract_sec_ticker_aliases: Callable[..., list[str]],
@@ -316,13 +316,17 @@ async def run_download_stream_impl(
         DownloadRejectionRegistry,
     ],
     save_rejection_registry: _SaveRejectionRegistry,
+    is_rejected: Callable[[DownloadRejectionRegistry, str, bool], bool],
+    record_rejection: Callable[
+        [DownloadRejectionRegistry, str, str, str, str, str],
+        None,
+    ],
     should_warn_missing_sc13: Callable[[dict[str, dt.date], list[FilingRecord]], bool],
     warn_insufficient_filings: Callable[
         [dict[str, dt.date], list[dict[str, JsonValue]], DownloadRejectionRegistry],
         list[str],
     ],
     warn_xbrl_missing_filings: Callable[[list[dict[str, JsonValue]]], list[str]],
-    cleanup_stale_filing_dirs: _CleanupStaleFilingDirs,
     build_download_filing_event_payload: Callable[[dict[str, JsonValue]], dict[str, JsonValue]],
 ) -> AsyncIterator[DownloadEvent]:
     """执行 SecPipeline 下载主工作流。
@@ -336,16 +340,18 @@ async def run_download_stream_impl(
         overwrite: 是否强制覆盖。
         rebuild: 是否仅基于本地已下载数据重建 `meta/manifest`。
         ticker_aliases: CLI 侧传入的 alias 列表。
+        start_is_explicit: 起始日期是否来自调用方显式输入。
         cancel_checker: 可选协作式取消检查函数。
         parse_date: 日期解析 helper。
         extract_sec_ticker_aliases: SEC alias 提取 helper。
         merge_ticker_aliases: alias 合并 helper。
         load_rejection_registry: 加载拒绝注册表 helper。
         save_rejection_registry: 保存拒绝注册表 helper。
+        is_rejected: 既有同版本 rejection 命中 helper。
+        record_rejection: 在 registry 副本构造 typed rejection entry 的 helper。
         should_warn_missing_sc13: SC13 缺失 warning helper。
         warn_insufficient_filings: form 数量检查 helper。
         warn_xbrl_missing_filings: XBRL 缺失检查 helper。
-        cleanup_stale_filing_dirs: 清理过期 filing 目录 helper。
         build_download_filing_event_payload: 构建 filing 事件 payload helper。
 
     Yields:
@@ -385,17 +391,13 @@ async def run_download_stream_impl(
             if not isinstance(filing_result, dict):
                 continue
             status = str(filing_result.get("status", "failed"))
-            event_type = (
-                DownloadEventType.FILING_FAILED
-                if status == "failed"
-                else DownloadEventType.FILING_COMPLETED
-            )
+            event_type = DownloadEventType.FILING_FAILED if status == "failed" else DownloadEventType.FILING_COMPLETED
             document_id = str(filing_result.get("document_id", ""))
             yield DownloadEvent(
                 event_type=event_type,
                 ticker=normalized_ticker,
                 document_id=document_id,
-            payload=build_download_filing_event_payload(cast(dict[str, JsonValue], filing_result)),
+                payload=build_download_filing_event_payload(cast(dict[str, JsonValue], filing_result)),
             )
         yield DownloadEvent(
             event_type=DownloadEventType.PIPELINE_COMPLETED,
@@ -484,20 +486,7 @@ async def run_download_stream_impl(
         ),
         module=host.MODULE,
     )
-    company_batch = host._batching_repository.begin_batch(normalized_ticker)
-    try:
-        host._upsert_company_meta(
-            ticker=normalized_ticker,
-            company_id=cik,
-            company_name=company_name,
-            ticker_aliases=merged_ticker_aliases,
-            batch=company_batch,
-        )
-    except BaseException:
-        host._batching_repository.rollback_batch(company_batch)
-        raise
-    host._batching_repository.commit_batch(company_batch)
-    sc13_direction_cache: dict[str, Optional[bool]] = {}
+    sc13_direction_cache: dict[str, Sc13DirectionDecision] = {}
     rejection_registry = load_rejection_registry(host._filing_maintenance_repository, normalized_ticker)
     try:
         filings, filenums = await host._filter_filings(
@@ -523,6 +512,12 @@ async def run_download_stream_impl(
             overwrite=overwrite,
             cancel_checker=cancel_checker,
         )
+        filings = _filter_filings_to_windows(
+            filings=filings,
+            form_windows=form_windows,
+            end_date=download_end_date,
+            parse_date=parse_date,
+        )
         filings = await host._retry_sc13_if_empty(
             ticker=normalized_ticker,
             filings=filings,
@@ -531,10 +526,17 @@ async def run_download_stream_impl(
             form_windows=form_windows,
             end_date=download_end_date,
             target_cik=cik,
+            start_is_explicit=start_is_explicit,
             sc13_direction_cache=sc13_direction_cache,
             rejection_registry=rejection_registry,
             overwrite=overwrite,
             cancel_checker=cancel_checker,
+        )
+        filings = _filter_filings_to_windows(
+            filings=filings,
+            form_windows=form_windows,
+            end_date=download_end_date,
+            parse_date=parse_date,
         )
     except SecDownloadCancelledError:
         Log.info(
@@ -554,6 +556,44 @@ async def run_download_stream_impl(
             elapsed_ms=int((time.perf_counter() - started_at) * 1000),
         )
         return
+
+    rejection_decisions = tuple(
+        decision
+        for decision in sc13_direction_cache.values()
+        if isinstance(
+            decision,
+            (
+                Sc13DirectionRejectedWithArtifact,
+                Sc13DirectionRejectedRegistryOnly,
+                Sc13DirectionRejectedAlreadyRegistered,
+            ),
+        )
+    )
+    rejected_filing_ids = {f"fil_{decision.filing.accession_number}" for decision in rejection_decisions}
+    accepted_filings: list[FilingRecord] = []
+    for filing in filings:
+        document_id = f"fil_{filing.accession_number}"
+        if is_rejected(rejection_registry, document_id, overwrite):
+            rejected_filing_ids.add(document_id)
+            continue
+        accepted_filings.append(filing)
+    filings = accepted_filings
+    accepted_filing_ids = frozenset(f"fil_{filing.accession_number}" for filing in filings)
+    rejected_filing_id_set = frozenset(rejected_filing_ids)
+    preflight = classify_source_integrity_preflight(
+        host._source_repository.list_source_integrity(normalized_ticker),
+        accepted_filing_ids=accepted_filing_ids,
+        rejected_filing_ids=rejected_filing_id_set,
+    )
+    repair_document_id: str | None = None
+    if isinstance(preflight, SelectedSourceRepairRequired):
+        repair_document_id = preflight.target.document_id
+        # stable partition：唯一 repair target 必须在所有其它 accepted filing 前执行。
+        filings = sorted(
+            filings,
+            key=lambda item: (f"fil_{item.accession_number}" != repair_document_id,),
+        )
+
     warnings: list[str] = []
     if should_warn_missing_sc13(form_windows, filings):
         warning = (
@@ -565,7 +605,28 @@ async def run_download_stream_impl(
 
     filing_results: list[dict[str, JsonValue]] = []
     cancelled = False
+    repair_gate_completed = False
+    if repair_document_id is None:
+        if cancel_checker is not None and cancel_checker():
+            cancelled = True
+        else:
+            await _publish_sec_post_repair_mutations(
+                host=host,
+                ticker=normalized_ticker,
+                cik=cik,
+                company_name=company_name,
+                ticker_aliases=merged_ticker_aliases,
+                rejection_decisions=rejection_decisions,
+                rejection_registry=rejection_registry,
+                overwrite=overwrite,
+                record_rejection=record_rejection,
+                save_rejection_registry=save_rejection_registry,
+                cancel_checker=cancel_checker,
+            )
+            repair_gate_completed = True
     for filing in filings:
+        if cancelled:
+            break
         if cancel_checker is not None and cancel_checker():
             cancelled = True
             Log.info(
@@ -587,6 +648,7 @@ async def run_download_stream_impl(
             },
         )
         filing_terminal_seen = False
+        filing_terminal_status: str | None = None
         async for event in host._download_single_filing_stream(
             ticker=normalized_ticker,
             cik=cik,
@@ -601,6 +663,7 @@ async def run_download_stream_impl(
                 DownloadEventType.FILING_FAILED,
             } and isinstance(event_result, dict):
                 filing_terminal_seen = True
+                filing_terminal_status = str(event_result.get("status", "failed"))
                 filing_results.append(cast(dict[str, JsonValue], event_result))
                 host._log_filing_download_result(
                     ticker=normalized_ticker,
@@ -615,25 +678,35 @@ async def run_download_stream_impl(
             )
             break
 
-    maintenance_batch = host._batching_repository.begin_batch(normalized_ticker)
-    try:
-        save_rejection_registry(
-            host._filing_maintenance_repository,
-            normalized_ticker,
-            rejection_registry,
-            batch=maintenance_batch,
-        )
-        cleaned = cleanup_stale_filing_dirs(
-            repository=host._filing_maintenance_repository,
-            ticker=normalized_ticker,
-            form_windows=form_windows,
-            filing_results=filing_results,
-            batch=maintenance_batch,
-        )
-    except BaseException:
-        host._batching_repository.rollback_batch(maintenance_batch)
-        raise
-    host._batching_repository.commit_batch(maintenance_batch)
+        if document_id == repair_document_id and not repair_gate_completed:
+            if filing_terminal_status == "failed":
+                # repair filing 已由其 owner 投影真实失败；禁止再制造第二个顶层错误原因。
+                break
+            post_repair = classify_source_integrity_preflight(
+                host._source_repository.list_source_integrity(normalized_ticker),
+                accepted_filing_ids=accepted_filing_ids,
+                rejected_filing_ids=rejected_filing_id_set,
+            )
+            if isinstance(post_repair, SelectedSourceRepairRequired):
+                raise SourceIntegrityRevisionConflictError
+            if cancel_checker is not None and cancel_checker():
+                cancelled = True
+                break
+            await _publish_sec_post_repair_mutations(
+                host=host,
+                ticker=normalized_ticker,
+                cik=cik,
+                company_name=company_name,
+                ticker_aliases=merged_ticker_aliases,
+                rejection_decisions=rejection_decisions,
+                rejection_registry=rejection_registry,
+                overwrite=overwrite,
+                record_rejection=record_rejection,
+                save_rejection_registry=save_rejection_registry,
+                cancel_checker=cancel_checker,
+            )
+            repair_gate_completed = True
+
     for warning in warn_insufficient_filings(
         form_windows,
         filing_results,
@@ -644,11 +717,6 @@ async def run_download_stream_impl(
     for warning in warn_xbrl_missing_filings(filing_results):
         warnings.append(warning)
         Log.warn(warning, module=host.MODULE)
-    if cleaned:
-        Log.info(
-            f"清理过期 filing 目录: ticker={normalized_ticker} cleaned={cleaned}",
-            module=host.MODULE,
-        )
     elapsed_ms = int((time.perf_counter() - started_at) * 1000)
     rejected_count = sum(1 for item in filing_results if _is_rejected_filing_result(item))
     skipped_count = sum(
@@ -681,12 +749,15 @@ async def run_download_stream_impl(
         market_profile={
             "market": normalized.market,
         },
-        filters=cast(JsonValue, {
-            "forms": sorted(form_windows.keys()),
-            "start_dates": {key: value.isoformat() for key, value in sorted(form_windows.items())},
-            "end_date": download_end_date.isoformat(),
-            "overwrite": overwrite,
-        }),
+        filters=cast(
+            JsonValue,
+            {
+                "forms": sorted(form_windows.keys()),
+                "start_dates": {key: value.isoformat() for key, value in sorted(form_windows.items())},
+                "end_date": download_end_date.isoformat(),
+                "overwrite": overwrite,
+            },
+        ),
         warnings=cast(JsonValue, warnings),
         filings=cast(JsonValue, filing_results),
         summary=cast(JsonValue, summary),
@@ -697,6 +768,113 @@ async def run_download_stream_impl(
         ticker=normalized_ticker,
         payload={"result": final_result},
     )
+
+
+async def _publish_sec_post_repair_mutations(
+    *,
+    host: SecDownloadWorkflowHost,
+    ticker: str,
+    cik: str,
+    company_name: str,
+    ticker_aliases: list[str],
+    rejection_decisions: tuple[Sc13RejectedDirectionDecision, ...],
+    rejection_registry: DownloadRejectionRegistry,
+    overwrite: bool,
+    record_rejection: Callable[
+        [DownloadRejectionRegistry, str, str, str, str, str],
+        None,
+    ],
+    save_rejection_registry: _SaveRejectionRegistry,
+    cancel_checker: Optional[Callable[[], bool]],
+) -> None:
+    """在 whole-tree repair gate 后依次发布 company 与 deferred SC13 facts。
+
+    Args:
+        host: SEC workflow host。
+        ticker: canonical ticker。
+        cik: 公司 CIK。
+        company_name: 公司名称。
+        ticker_aliases: 已合并的 ticker aliases。
+        rejection_decisions: 首次发现顺序的 pure SC13 rejection intents。
+        rejection_registry: 当前 published registry 的内存真值。
+        overwrite: 原始 request-level overwrite policy。
+        record_rejection: registry entry owner helper。
+        save_rejection_registry: registry persistence owner helper。
+        cancel_checker: 可选协作式取消检查器。
+
+    Returns:
+        无。
+
+    Raises:
+        SecDownloadCancelledError: durable unit 前观察到取消时抛出。
+        OSError: company、artifact 或 registry batch 失败时抛出。
+        ValueError: storage capability 或 rejection facts 非法时抛出。
+    """
+
+    company_batch = host._batching_repository.begin_batch(ticker)
+    try:
+        host._upsert_company_meta(
+            ticker=ticker,
+            company_id=cik,
+            company_name=company_name,
+            ticker_aliases=ticker_aliases,
+            batch=company_batch,
+        )
+    except BaseException:
+        host._batching_repository.rollback_batch(company_batch)
+        raise
+    host._batching_repository.commit_batch(company_batch)
+
+    for decision in rejection_decisions:
+        if isinstance(decision, Sc13DirectionRejectedAlreadyRegistered):
+            continue
+        if cancel_checker is not None and cancel_checker():
+            raise SecDownloadCancelledError("SEC deferred rejection persistence cancelled")
+        document_id = f"fil_{decision.filing.accession_number}"
+        registry_after = dict(rejection_registry)
+        record_rejection(
+            registry_after,
+            document_id,
+            "sc13_direction_rejected",
+            "direction_mismatch",
+            decision.filing.form_type,
+            decision.filing.filing_date,
+        )
+        artifact_saved = False
+        if isinstance(decision, Sc13DirectionRejectedWithArtifact):
+            artifact_saved, _artifact_error = await host._persist_rejected_filing_artifact(
+                ticker=ticker,
+                cik=decision.archive_cik,
+                filing=cast(FilingRecord, decision.filing),
+                remote_files=list(decision.remote_files),
+                overwrite=overwrite,
+                rejection_reason="sc13_direction_rejected",
+                rejection_category="direction_mismatch",
+                selected_primary_document=decision.filing.primary_document,
+                source_fingerprint=decision.source_fingerprint,
+                registry_after=registry_after,
+                cancel_checker=cancel_checker,
+            )
+        if artifact_saved:
+            rejection_registry.clear()
+            rejection_registry.update(registry_after)
+            continue
+
+        # SC13 artifact listing/transport failure 保留既有 registry-only durable 语义。
+        registry_batch = host._batching_repository.begin_batch(ticker)
+        try:
+            save_rejection_registry(
+                host._filing_maintenance_repository,
+                ticker,
+                registry_after,
+                batch=registry_batch,
+            )
+        except BaseException:
+            host._batching_repository.rollback_batch(registry_batch)
+            raise
+        host._batching_repository.commit_batch(registry_batch)
+        rejection_registry.clear()
+        rejection_registry.update(registry_after)
 
 
 def _cancelled_pipeline_completed_event(
@@ -752,12 +930,15 @@ def _cancelled_pipeline_completed_event(
         action="download",
         ticker=normalized_ticker,
         market_profile={"market": normalized_market},
-        filters=cast(JsonValue, {
-            "forms": sorted(form_windows.keys()),
-            "start_dates": {key: value.isoformat() for key, value in sorted(form_windows.items())},
-            "end_date": end_date.isoformat(),
-            "overwrite": overwrite,
-        }),
+        filters=cast(
+            JsonValue,
+            {
+                "forms": sorted(form_windows.keys()),
+                "start_dates": {key: value.isoformat() for key, value in sorted(form_windows.items())},
+                "end_date": end_date.isoformat(),
+                "overwrite": overwrite,
+            },
+        ),
         warnings=cast(JsonValue, list(warnings)),
         filings=cast(JsonValue, list(filing_results)),
         summary=cast(JsonValue, summary),
@@ -788,3 +969,36 @@ def _is_rejected_filing_result(item: dict[str, JsonValue]) -> bool:
     skip_reason = str(item.get("skip_reason", "")).strip()
     reason_code = str(item.get("reason_code", "")).strip()
     return skip_reason == _FILING_REASON_6K_FILTERED or reason_code == _FILING_REASON_6K_FILTERED
+
+
+def _filter_filings_to_windows(
+    *,
+    filings: list[FilingRecord],
+    form_windows: dict[str, dt.date],
+    end_date: dt.date,
+    parse_date: Callable[[str, bool], dt.date],
+) -> list[FilingRecord]:
+    """在产生 filing outcome 前执行统一 inclusive 窗口终检。
+
+    Args:
+        filings: submissions、browse 与 SC13 retry 合并后的候选。
+        form_windows: 每个 canonical form 的 inclusive 起始日期。
+        end_date: 所有 form 共享的 inclusive 结束日期。
+        parse_date: SEC 日期解析 owner。
+
+    Returns:
+        仍处于各自 form inclusive 窗口内的候选。
+
+    Raises:
+        ValueError: 候选 filing date 非法时由日期 owner 抛出。
+    """
+
+    selected: list[FilingRecord] = []
+    for filing in filings:
+        lower_bound = form_windows.get(filing.form_type)
+        if lower_bound is None:
+            continue
+        filing_date = parse_date(filing.filing_date, False)
+        if lower_bound <= filing_date <= end_date:
+            selected.append(filing)
+    return selected

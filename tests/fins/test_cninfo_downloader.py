@@ -21,6 +21,12 @@ from urllib.parse import parse_qs
 import httpx
 import pytest
 
+from dayu.fins.downloaders import cninfo_downloader as _cninfo_downloader
+from dayu.fins.download_contract import (
+    FinsDownloadProviderError,
+    FinsDownloadSource,
+    FinsDownloadTransportCategory,
+)
 from dayu.fins.downloaders.cninfo_downloader import (
     CNINFO_QUERY_URL,
     CNINFO_STOCK_JSON_URL,
@@ -34,6 +40,7 @@ from dayu.fins.pipelines.cn_download_models import (
     CnCompanyProfile,
     CnDownloadCancelledError,
     CnReportCandidate,
+    CnReportPeriodProjection,
     CnReportQuery,
 )
 
@@ -169,7 +176,7 @@ def test_resolve_company_szse_ticker_returns_cninfo_prefix() -> None:
             normalized_ticker="002594",
             start_date="2024-01-01",
             end_date="2025-12-31",
-            target_periods=("FY",),
+            discovery_periods=("FY",),
         )
     )
 
@@ -195,7 +202,7 @@ def test_resolve_company_sse_ticker_uses_all_market_stock_list() -> None:
             normalized_ticker="600519",
             start_date="2024-01-01",
             end_date="2025-12-31",
-            target_periods=("FY",),
+            discovery_periods=("FY",),
         )
     )
 
@@ -217,7 +224,7 @@ def test_resolve_company_unknown_ticker_raises_value_error() -> None:
                 normalized_ticker="002594",
                 start_date="2024-01-01",
                 end_date="2025-12-31",
-                target_periods=("FY",),
+                discovery_periods=("FY",),
             )
         )
 
@@ -236,7 +243,7 @@ def test_resolve_company_rejects_non_cn_market() -> None:
                 normalized_ticker="0700",
                 start_date="2024-01-01",
                 end_date="2025-12-31",
-                target_periods=("FY",),
+                discovery_periods=("FY",),
             )
         )
 
@@ -255,7 +262,7 @@ def test_resolve_company_rejects_non_a_share_prefix() -> None:
                 normalized_ticker="830001",
                 start_date="2024-01-01",
                 end_date="2025-12-31",
-                target_periods=("FY",),
+                discovery_periods=("FY",),
             )
         )
 
@@ -277,7 +284,7 @@ def test_resolve_company_caches_stock_mapping_response() -> None:
         normalized_ticker="002594",
         start_date="2024-01-01",
         end_date="2025-12-31",
-        target_periods=("FY",),
+        discovery_periods=("FY",),
     )
     client.resolve_company(query)
     client.resolve_company(query)
@@ -303,7 +310,7 @@ def test_resolve_company_does_not_depend_on_noisy_search_first_page() -> None:
             normalized_ticker="000001",
             start_date="2024-01-01",
             end_date="2025-12-31",
-            target_periods=("FY",),
+            discovery_periods=("FY",),
         )
     )
 
@@ -390,7 +397,7 @@ def test_list_report_candidates_filters_blocklisted_titles() -> None:
             normalized_ticker="002594",
             start_date="2024-01-01",
             end_date="2025-12-31",
-            target_periods=("FY",),
+            discovery_periods=("FY",),
         )
     )
     candidates = client.list_report_candidates(
@@ -399,7 +406,7 @@ def test_list_report_candidates_filters_blocklisted_titles() -> None:
             normalized_ticker="002594",
             start_date="2024-01-01",
             end_date="2025-12-31",
-            target_periods=("FY",),
+            discovery_periods=("FY",),
         ),
         profile,
     )
@@ -407,7 +414,8 @@ def test_list_report_candidates_filters_blocklisted_titles() -> None:
     assert len(candidates) == 1
     only = candidates[0]
     assert only.source_id == "A1"
-    assert only.fiscal_period == "FY"
+    assert only.period_projection.identity_period == "FY"
+    assert only.period_projection.covered_periods == ("FY",)
     assert only.fiscal_year == 2024
     assert only.source_url == CNINFO_STATIC_BASE_URL + "finalpage/2025-04-03/full.PDF"
     assert only.content_length == 12345
@@ -457,7 +465,7 @@ def test_list_report_candidates_filters_english_quarterly_report_title() -> None
         normalized_ticker="000568",
         start_date="2025-01-01",
         end_date="2025-12-31",
-        target_periods=("Q3",),
+        discovery_periods=("Q3",),
     )
     profile = client.resolve_company(query)
     candidates = client.list_report_candidates(query, profile)
@@ -508,7 +516,7 @@ def test_list_report_candidates_prefers_full_fy_over_later_report_notice() -> No
         normalized_ticker="002594",
         start_date="2025-01-01",
         end_date="2025-12-31",
-        target_periods=("FY",),
+        discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
     candidates = client.list_report_candidates(query, profile)
@@ -524,7 +532,7 @@ def test_list_report_candidates_returns_empty_for_cninfo_independent_q2_q4() -> 
         normalized_ticker="002594",
         start_date="2024-01-01",
         end_date="2025-12-31",
-        target_periods=("Q2", "Q4"),
+        discovery_periods=("Q2", "Q4"),
     )
     query_calls = 0
 
@@ -598,7 +606,7 @@ def test_list_report_candidates_prefers_a_share_fy_over_later_h_share_notice() -
         normalized_ticker="688981",
         start_date="2026-01-01",
         end_date="2026-05-02",
-        target_periods=("FY",),
+        discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
     candidates = client.list_report_candidates(query, profile)
@@ -641,12 +649,16 @@ def test_list_report_candidates_raises_on_failed_period_query() -> None:
         normalized_ticker="002594",
         start_date="2024-01-01",
         end_date="2025-12-31",
-        target_periods=("FY", "H1"),
+        discovery_periods=("FY", "H1"),
     )
     profile = client.resolve_company(query)
 
-    with pytest.raises(RuntimeError, match="period=FY"):
+    with pytest.raises(FinsDownloadProviderError) as exc_info:
         client.list_report_candidates(query, profile)
+
+    assert exc_info.value.source is FinsDownloadSource.CNINFO
+    assert exc_info.value.transport_category is FinsDownloadTransportCategory.HTTP_STATUS
+    assert exc_info.value.retryable is True
 
 
 def test_list_report_candidates_raises_when_period_query_fails() -> None:
@@ -666,12 +678,15 @@ def test_list_report_candidates_raises_when_period_query_fails() -> None:
         normalized_ticker="002594",
         start_date="2024-01-01",
         end_date="2025-12-31",
-        target_periods=("FY",),
+        discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
 
-    with pytest.raises(RuntimeError, match="period=FY"):
+    with pytest.raises(FinsDownloadProviderError) as exc_info:
         client.list_report_candidates(query, profile)
+
+    assert exc_info.value.transport_category is FinsDownloadTransportCategory.HTTP_STATUS
+    assert exc_info.value.retryable is True
 
 
 def test_list_report_candidates_filters_non_pdf_and_other_sec_code() -> None:
@@ -723,7 +738,7 @@ def test_list_report_candidates_filters_non_pdf_and_other_sec_code() -> None:
         normalized_ticker="002594",
         start_date="2024-01-01",
         end_date="2025-12-31",
-        target_periods=("FY",),
+        discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
     candidates = client.list_report_candidates(query, profile)
@@ -768,7 +783,7 @@ def test_list_report_candidates_amended_takes_priority() -> None:
         normalized_ticker="600519",
         start_date="2024-01-01",
         end_date="2025-12-31",
-        target_periods=("FY",),
+        discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
     candidates = client.list_report_candidates(query, profile)
@@ -821,7 +836,7 @@ def test_list_report_candidates_keeps_one_per_year_for_fy() -> None:
         normalized_ticker="600519",
         start_date="2022-01-01",
         end_date="2025-12-31",
-        target_periods=("FY",),
+        discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
     candidates = client.list_report_candidates(query, profile)
@@ -873,7 +888,7 @@ def test_list_report_candidates_picks_amended_per_year_without_dropping_other_ye
         normalized_ticker="600519",
         start_date="2023-01-01",
         end_date="2025-12-31",
-        target_periods=("FY",),
+        discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
     candidates = client.list_report_candidates(query, profile)
@@ -930,7 +945,7 @@ def test_list_report_candidates_handles_pagination() -> None:
         normalized_ticker="002594",
         start_date="2023-01-01",
         end_date="2025-12-31",
-        target_periods=("FY",),
+        discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
     candidates = client.list_report_candidates(query, profile)
@@ -973,7 +988,7 @@ def test_list_report_candidates_head_failure_softly_degrades() -> None:
         normalized_ticker="002594",
         start_date="2024-01-01",
         end_date="2025-12-31",
-        target_periods=("FY",),
+        discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
     candidates = client.list_report_candidates(query, profile)
@@ -1002,7 +1017,7 @@ def test_list_report_candidates_empty_when_no_announcements() -> None:
         normalized_ticker="002594",
         start_date="2024-01-01",
         end_date="2025-12-31",
-        target_periods=("FY", "H1"),
+        discovery_periods=("FY", "H1"),
     )
     profile = client.resolve_company(query)
     candidates = client.list_report_candidates(query, profile)
@@ -1030,7 +1045,7 @@ def test_list_report_candidates_invalid_profile_provider_raises() -> None:
                 normalized_ticker="002594",
                 start_date="2024-01-01",
                 end_date="2025-12-31",
-                target_periods=("FY",),
+                discovery_periods=("FY",),
             ),
             bogus_profile,
         )
@@ -1057,7 +1072,7 @@ def test_list_report_candidates_uses_per_period_category() -> None:
         normalized_ticker="002594",
         start_date="2024-01-01",
         end_date="2025-12-31",
-        target_periods=("FY", "H1", "Q1", "Q3"),
+        discovery_periods=("FY", "H1", "Q1", "Q3"),
     )
     profile = client.resolve_company(query)
     client.list_report_candidates(query, profile)
@@ -1096,7 +1111,7 @@ def test_list_report_candidates_calls_same_checkpoint_around_each_period_post() 
         normalized_ticker="002594",
         start_date="2024-01-01",
         end_date="2025-12-31",
-        target_periods=("FY", "H1"),
+        discovery_periods=("FY", "H1"),
     )
     profile = CnCompanyProfile(
         provider="cninfo",
@@ -1160,7 +1175,7 @@ def test_list_report_candidates_calls_checkpoint_around_every_paginated_post() -
         normalized_ticker="002594",
         start_date="2024-01-01",
         end_date="2025-12-31",
-        target_periods=("FY",),
+        discovery_periods=("FY",),
     )
     profile = CnCompanyProfile(
         provider="cninfo",
@@ -1233,7 +1248,7 @@ def test_list_report_candidates_preserves_cancel_identity_and_stops_next_period(
         normalized_ticker="002594",
         start_date="2024-01-01",
         end_date="2025-12-31",
-        target_periods=("FY", "H1"),
+        discovery_periods=("FY", "H1"),
     )
     profile = CnCompanyProfile(
         provider="cninfo",
@@ -1254,14 +1269,17 @@ def test_list_report_candidates_preserves_cancel_identity_and_stops_next_period(
     assert head_count == 0
 
 
-def test_list_report_candidates_preserves_checkpoint_failure_full_cause_chain() -> None:
-    """CNInfo generic context wrapper 应保留 workflow checkpoint 与 raw failure 两层 cause。"""
+def test_list_report_candidates_preserves_checkpoint_failure_identity() -> None:
+    """非取消 checkpoint failure 应原样越过 downloader，且零 HTTP。"""
 
     original = ValueError("checker exploded")
     post_count = 0
 
+    expected = RuntimeError("取消检查失败")
+    expected.__cause__ = original
+
     def checkpoint() -> None:
-        raise RuntimeError("取消检查失败") from original
+        raise expected
 
     def handler(_request: httpx.Request) -> httpx.Response:
         nonlocal post_count
@@ -1273,7 +1291,7 @@ def test_list_report_candidates_preserves_checkpoint_failure_full_cause_chain() 
         normalized_ticker="002594",
         start_date="2024-01-01",
         end_date="2025-12-31",
-        target_periods=("FY",),
+        discovery_periods=("FY",),
     )
     profile = CnCompanyProfile(
         provider="cninfo",
@@ -1282,15 +1300,15 @@ def test_list_report_candidates_preserves_checkpoint_failure_full_cause_chain() 
         ticker="002594",
     )
 
-    with pytest.raises(RuntimeError, match="巨潮公告分类查询失败") as exc_info:
+    with pytest.raises(RuntimeError) as exc_info:
         _build_client(handler).list_report_candidates(
             query,
             profile,
             cancellation_checkpoint=checkpoint,
         )
 
-    assert type(exc_info.value.__cause__) is RuntimeError
-    assert exc_info.value.__cause__.__cause__ is original
+    assert exc_info.value is expected
+    assert exc_info.value.__cause__ is original
     assert post_count == 0
 
 
@@ -1306,7 +1324,7 @@ def _make_candidate(*, source_url: str = "https://example.com/test.pdf") -> CnRe
         language="zh",
         filing_date="2025-04-01",
         fiscal_year=2024,
-        fiscal_period="FY",
+        period_projection=CnReportPeriodProjection(identity_period="FY", covered_periods=("FY",)),
         amended=False,
         content_length=4096,
         etag='"abc"',
@@ -1405,8 +1423,10 @@ def test_download_report_pdf_rejects_short_content() -> None:
         return httpx.Response(200, content=b"%PDF-tiny")
 
     client = _build_client(handler)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(FinsDownloadProviderError) as exc_info:
         client.download_report_pdf(_make_candidate())
+    assert exc_info.value.transport_category is FinsDownloadTransportCategory.PROTOCOL
+    assert exc_info.value.retryable is False
 
 
 def test_download_report_pdf_rejects_non_pdf_magic() -> None:
@@ -1416,8 +1436,10 @@ def test_download_report_pdf_rejects_non_pdf_magic() -> None:
         return httpx.Response(200, content=b"<html>" + b"\x00" * 4096)
 
     client = _build_client(handler)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(FinsDownloadProviderError) as exc_info:
         client.download_report_pdf(_make_candidate())
+    assert exc_info.value.transport_category is FinsDownloadTransportCategory.PROTOCOL
+    assert exc_info.value.retryable is False
 
 
 def test_download_report_pdf_retries_then_raises() -> None:
@@ -1452,13 +1474,13 @@ def test_download_report_pdf_rejects_non_cninfo_provider() -> None:
         language="zh",
         filing_date="2025-01-01",
         fiscal_year=2024,
-        fiscal_period="FY",
+        period_projection=CnReportPeriodProjection(identity_period="FY", covered_periods=("FY",)),
         amended=False,
         content_length=None,
         etag=None,
         last_modified=None,
     )
-    with pytest.raises(RuntimeError):
+    with pytest.raises(ValueError):
         client.download_report_pdf(bogus)
 
 
@@ -1502,12 +1524,179 @@ def test_announcement_time_milliseconds_is_normalized() -> None:
         normalized_ticker="002594",
         start_date="2024-01-01",
         end_date="2025-12-31",
-        target_periods=("FY",),
+        discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
     candidates = client.list_report_candidates(query, profile)
 
     assert candidates[0].filing_date == "2025-04-03"
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_category", "expected_retryable", "expected_calls"),
+    [
+        ("timeout", FinsDownloadTransportCategory.TIMEOUT, True, 2),
+        ("network", FinsDownloadTransportCategory.CONNECTION, True, 2),
+        ("protocol", FinsDownloadTransportCategory.PROTOCOL, False, 1),
+        ("unknown", FinsDownloadTransportCategory.UNKNOWN, True, 2),
+    ],
+)
+def test_cninfo_transport_owner_closed_mapping_and_safe_log(
+    failure_kind: str,
+    expected_category: FinsDownloadTransportCategory,
+    expected_retryable: bool,
+    expected_calls: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """真实 httpx hierarchy 应在巨潮 owner 处闭合且日志不含 raw/URL。"""
+
+    calls = 0
+    errors: list[httpx.HTTPError] = []
+    logs: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if failure_kind == "timeout":
+            error: httpx.HTTPError = httpx.ReadTimeout(
+                "raw-timeout-contact@example.invalid",
+                request=request,
+            )
+        elif failure_kind == "network":
+            error = httpx.ConnectError(
+                "raw-network https://secret.invalid/path",
+                request=request,
+            )
+        elif failure_kind == "protocol":
+            error = httpx.RemoteProtocolError(
+                "raw-protocol https://secret.invalid/path",
+                request=request,
+            )
+        else:
+            error = httpx.HTTPError("raw-unknown https://secret.invalid/path")
+        errors.append(error)
+        raise error
+
+    monkeypatch.setattr(
+        _cninfo_downloader.Log,
+        "debug",
+        lambda message, *, module: logs.append(f"{module}:{message}"),
+    )
+    client = _build_client(handler)
+
+    with pytest.raises(FinsDownloadProviderError) as exc_info:
+        client.resolve_company(
+            CnReportQuery(
+                market="CN",
+                normalized_ticker="002594",
+                start_date="2025-01-01",
+                end_date="2025-12-31",
+                discovery_periods=("FY",),
+            )
+        )
+
+    failure = exc_info.value
+    assert failure.source is FinsDownloadSource.CNINFO
+    assert failure.transport_category is expected_category
+    assert failure.retryable is expected_retryable
+    assert failure.__cause__ is errors[-1]
+    assert calls == expected_calls
+    public_text = f"{failure}\n{' '.join(logs)}"
+    assert "secret.invalid" not in public_text
+    assert "contact@example.invalid" not in public_text
+    assert "raw-" not in public_text
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected_retryable", "expected_calls"),
+    [(404, False, 1), (503, True, 2)],
+)
+def test_cninfo_http_status_retry_policy(
+    status_code: int,
+    expected_retryable: bool,
+    expected_calls: int,
+) -> None:
+    """巨潮 4xx 立即终止，5xx 才消耗 bounded retries。"""
+
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(status_code, json={"raw": "secret"})
+
+    with pytest.raises(FinsDownloadProviderError) as exc_info:
+        _build_client(handler).resolve_company(
+            CnReportQuery(
+                market="CN",
+                normalized_ticker="002594",
+                start_date="2025-01-01",
+                end_date="2025-12-31",
+                discovery_periods=("FY",),
+            )
+        )
+
+    assert exc_info.value.transport_category is FinsDownloadTransportCategory.HTTP_STATUS
+    assert exc_info.value.retryable is expected_retryable
+    assert calls == expected_calls
+
+
+def test_cninfo_malformed_json_is_non_retryable_protocol_failure() -> None:
+    """成功 HTTP 后的 JSON parse failure 不得进入 transport retry。"""
+
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, content=b"{raw-secret-url:https://secret.invalid")
+
+    with pytest.raises(FinsDownloadProviderError) as exc_info:
+        _build_client(handler).resolve_company(
+            CnReportQuery(
+                market="CN",
+                normalized_ticker="002594",
+                start_date="2025-01-01",
+                end_date="2025-12-31",
+                discovery_periods=("FY",),
+            )
+        )
+
+    assert exc_info.value.transport_category is FinsDownloadTransportCategory.PROTOCOL
+    assert exc_info.value.retryable is False
+    assert calls == 1
+    assert "secret.invalid" not in str(exc_info.value)
+
+
+def test_cninfo_preloop_provider_misuse_makes_zero_http_requests() -> None:
+    """错误 candidate provider 是 API misuse，必须 ValueError 且零 HTTP。"""
+
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, content=_build_pdf_payload())
+
+    candidate = _make_candidate()
+    invalid = CnReportCandidate(
+        provider="hkexnews",
+        source_id=candidate.source_id,
+        source_url=candidate.source_url,
+        title=candidate.title,
+        language=candidate.language,
+        filing_date=candidate.filing_date,
+        fiscal_year=candidate.fiscal_year,
+        period_projection=candidate.period_projection,
+        amended=candidate.amended,
+        content_length=candidate.content_length,
+        etag=candidate.etag,
+        last_modified=candidate.last_modified,
+    )
+
+    with pytest.raises(ValueError):
+        _build_client(handler).download_report_pdf(invalid)
+    assert calls == 0
 
 
 def test_close_releases_owned_http_client() -> None:
@@ -1545,7 +1734,7 @@ def test_invalid_json_response_raises_runtime_error() -> None:
                 normalized_ticker="002594",
                 start_date="2024-01-01",
                 end_date="2025-12-31",
-                target_periods=("FY",),
+                discovery_periods=("FY",),
             )
         )
 
@@ -1570,7 +1759,7 @@ def test_serialize_query_payload_structure_assertion() -> None:
         normalized_ticker="002594",
         start_date="2024-01-01",
         end_date="2025-12-31",
-        target_periods=("FY",),
+        discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
     client.list_report_candidates(query, profile)
@@ -1602,7 +1791,7 @@ def test_stock_mapping_filters_incomplete_rows() -> None:
             normalized_ticker="002594",
             start_date="2024-01-01",
             end_date="2025-12-31",
-            target_periods=("FY",),
+            discovery_periods=("FY",),
         )
     )
 

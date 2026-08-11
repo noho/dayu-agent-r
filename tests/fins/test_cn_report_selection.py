@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import pytest
+
 from dayu.fins.pipelines.cn_download_models import (
     CnFiscalPeriod,
     CnLanguage,
     CnReportHeadMeta,
+    CnReportPeriodProjection,
     CnReportQuery,
     CninfoRawAnnouncement,
     HkexnewsRawAnnouncement,
@@ -14,6 +17,7 @@ from dayu.fins.pipelines.cn_report_selection import (
     select_cninfo_report_candidates,
     select_hkexnews_report_candidates,
 )
+from dayu.fins.pipelines.docling_upload_service import build_cn_filing_ids
 
 
 def _head_meta(_source_url: str) -> CnReportHeadMeta:
@@ -50,7 +54,7 @@ def _cn_query(periods: tuple[CnFiscalPeriod, ...]) -> CnReportQuery:
         normalized_ticker="002594",
         start_date="2024-01-01",
         end_date="2026-12-31",
-        target_periods=periods,
+        discovery_periods=periods,
     )
 
 
@@ -69,10 +73,10 @@ def _hk_query(periods: tuple[CnFiscalPeriod, ...]) -> CnReportQuery:
 
     return CnReportQuery(
         market="HK",
-        normalized_ticker="0700",
+        normalized_ticker="0005",
         start_date="2024-01-01",
         end_date="2026-12-31",
-        target_periods=periods,
+        discovery_periods=periods,
     )
 
 
@@ -134,7 +138,7 @@ def _hk_raw(
         document_id=document_id,
         title=title,
         source_url=f"https://www1.hkexnews.hk/listedco/{document_id}.pdf",
-        stock_code_payload="00700",
+        stock_code_payload="00005",
         category_text=category_text,
         filing_date=filing_date,
         language=language,
@@ -166,9 +170,10 @@ def test_cninfo_selection_filters_blocklisted_titles_and_builds_candidate() -> N
         read_head_meta=_head_meta,
     )
 
-    assert [(item.source_id, item.fiscal_year, item.fiscal_period) for item in candidates] == [
+    assert [(item.source_id, item.fiscal_year, item.period_projection.identity_period) for item in candidates] == [
         ("FULL", 2024, "FY")
     ]
+    assert candidates[0].period_projection.covered_periods == ("FY",)
     assert candidates[0].content_length == 4096
     assert candidates[0].etag == '"fixture"'
 
@@ -191,7 +196,9 @@ def test_cninfo_selection_keeps_years_and_prefers_amended_per_year() -> None:
         announcements_by_period={
             "FY": (
                 _cn_raw(announcement_id="A1", title="贵州茅台：2024年年度报告", announcement_date="2025-04-01"),
-                _cn_raw(announcement_id="A2", title="贵州茅台：2024年年度报告（更正后）", announcement_date="2025-04-15"),
+                _cn_raw(
+                    announcement_id="A2", title="贵州茅台：2024年年度报告（更正后）", announcement_date="2025-04-15"
+                ),
                 _cn_raw(announcement_id="A3", title="贵州茅台：2023年年度报告", announcement_date="2024-04-01"),
             )
         },
@@ -242,10 +249,11 @@ def test_hkexnews_selection_filters_english_and_infers_periods() -> None:
         read_head_meta=_head_meta,
     )
 
-    assert [(item.source_id, item.fiscal_year, item.fiscal_period) for item in candidates] == [
+    assert [(item.source_id, item.fiscal_year, item.period_projection.identity_period) for item in candidates] == [
         ("Q2_ZH", 2025, "Q2"),
         ("FY_ZH", 2024, "FY"),
     ]
+    assert candidates[0].period_projection.covered_periods == ("H1", "Q2")
 
 
 def test_hkexnews_selection_groups_by_year_and_prefers_amended() -> None:
@@ -280,6 +288,203 @@ def test_hkexnews_selection_groups_by_year_and_prefers_amended() -> None:
         read_head_meta=_head_meta,
     )
 
-    assert [(item.source_id, item.fiscal_period, item.amended) for item in candidates] == [
+    assert [(item.source_id, item.period_projection.identity_period, item.amended) for item in candidates] == [
         ("H1_REVISED", "H1", True)
     ]
+
+
+@pytest.mark.parametrize(
+    ("category_text", "title", "expected_identity", "expected_coverage"),
+    (
+        ("INTERIM RESULTS", "截至期末六個月", "Q2", ("H1", "Q2")),
+        ("中期業績", "截至期末六个月", "Q2", ("H1", "Q2")),
+        ("FINAL RESULTS", "全年業績", "Q4", ("FY", "Q4")),
+        ("末期业绩", "ANNUAL RESULTS", "Q4", ("FY", "Q4")),
+        ("INTERIM RESULTS", "業績公告", "Q2", ("H1", "Q2")),
+        ("FINAL RESULTS", "業績公告", "Q4", ("FY", "Q4")),
+    ),
+)
+def test_hkexnews_selection_uses_category_first_then_category_and_title_period_facts(
+    category_text: str,
+    title: str,
+    expected_identity: CnFiscalPeriod,
+    expected_coverage: tuple[CnFiscalPeriod, ...],
+) -> None:
+    """family 只由 category 判定，期间事实随后读取 category 与 title。
+
+    Args:
+        category_text: provider 分类文本。
+        title: 通用公告标题片段。
+        expected_identity: 预期身份财期。
+        expected_coverage: 预期覆盖财期。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 分类投影不符合 contract 时抛出。
+    """
+
+    candidates = select_hkexnews_report_candidates(
+        query=_hk_query((expected_identity,)),
+        announcements=(
+            _hk_raw(
+                document_id="GENERIC_PERIOD_FACT",
+                title=f"2025 {title}",
+                category_text=category_text,
+            ),
+        ),
+        read_head_meta=_head_meta,
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].period_projection.identity_period == expected_identity
+    assert candidates[0].period_projection.covered_periods == expected_coverage
+
+
+@pytest.mark.parametrize(
+    ("category_text", "title"),
+    (
+        ("", "2025 INTERIM RESULTS"),
+        ("INTERIM RESULTS / INTERIM REPORT", "2025 SIX MONTHS"),
+        ("INTERIM REPORT", "2025 THIRD QUARTER"),
+        ("RESULTS", "2025 RESULTS"),
+        ("FINAL RESULTS", "2025 SIX MONTHS"),
+    ),
+)
+def test_hkexnews_selection_rejects_ambiguous_family_or_period_facts(
+    category_text: str,
+    title: str,
+) -> None:
+    """family 或 family 内期间事实不唯一时必须 fail closed。
+
+    Args:
+        category_text: provider 分类文本。
+        title: 通用公告标题片段。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 歧义公告被错误接纳时抛出。
+    """
+
+    candidates = select_hkexnews_report_candidates(
+        query=_hk_query(("FY", "H1", "Q1", "Q2", "Q3", "Q4")),
+        announcements=(_hk_raw(document_id="GENERIC_AMBIGUOUS", title=title, category_text=category_text),),
+        read_head_meta=_head_meta,
+    )
+
+    assert candidates == ()
+
+
+@pytest.mark.parametrize(
+    ("identity_period", "covered_periods"),
+    (
+        ("FY", ()),
+        ("Q4", ("FY", "Q4", "Q4")),
+        ("Q4", ("Q4", "FY")),
+        ("Q4", ("FY",)),
+    ),
+)
+def test_cn_report_period_projection_rejects_invalid_coverage(
+    identity_period: CnFiscalPeriod,
+    covered_periods: tuple[CnFiscalPeriod, ...],
+) -> None:
+    """candidate contract 拒绝空、重复、乱序或不含 identity 的 coverage。
+
+    Args:
+        identity_period: 身份财期。
+        covered_periods: 非法覆盖财期。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法 coverage 未被拒绝时抛出。
+    """
+
+    with pytest.raises(ValueError):
+        CnReportPeriodProjection(
+            identity_period=identity_period,
+            covered_periods=covered_periods,
+        )
+
+
+def test_hkexnews_selection_projects_four_generic_materials_to_distinct_identities() -> None:
+    """同批通用 raw material 保持 report/result 身份、coverage 与 ID 各自唯一。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: material 被折叠或 coverage/ID 漂移时抛出。
+    """
+
+    candidates = select_hkexnews_report_candidates(
+        query=_hk_query(("FY", "H1", "Q2", "Q4")),
+        announcements=(
+            _hk_raw(document_id="RESULT_H1", title="2025 六個月業績", category_text="中期業績"),
+            _hk_raw(document_id="REPORT_H1", title="2025 半年度報告", category_text="中期報告"),
+            _hk_raw(document_id="RESULT_FY", title="2025 全年業績", category_text="末期業績"),
+            _hk_raw(document_id="REPORT_FY", title="2025 年度報告", category_text="年報"),
+        ),
+        read_head_meta=_head_meta,
+    )
+
+    assert [candidate.source_id for candidate in candidates] == [
+        "REPORT_FY",
+        "REPORT_H1",
+        "RESULT_H1",
+        "RESULT_FY",
+    ]
+    assert [
+        (
+            candidate.period_projection.identity_period,
+            candidate.period_projection.covered_periods,
+        )
+        for candidate in candidates
+    ] == [
+        ("FY", ("FY",)),
+        ("H1", ("H1",)),
+        ("Q2", ("H1", "Q2")),
+        ("Q4", ("FY", "Q4")),
+    ]
+    document_ids = {
+        build_cn_filing_ids(
+            ticker="0005",
+            form_type=candidate.period_projection.identity_period,
+            fiscal_year=candidate.fiscal_year,
+            fiscal_period=candidate.period_projection.identity_period,
+            amended=candidate.amended,
+        )[0]
+        for candidate in candidates
+    }
+    assert len(document_ids) == 4
+
+
+def test_hkexnews_selection_fails_closed_on_same_source_id_fact_conflict() -> None:
+    """同一 source ID 的 raw 核心事实冲突必须 fail closed。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 冲突 raw 未抛错时抛出。
+    """
+
+    with pytest.raises(ValueError, match="核心事实冲突"):
+        select_hkexnews_report_candidates(
+            query=_hk_query(("Q2",)),
+            announcements=(
+                _hk_raw(document_id="CONFLICT", title="2025 六個月業績", category_text="中期業績"),
+                _hk_raw(document_id="CONFLICT", title="2025 全年業績", category_text="末期業績"),
+            ),
+            read_head_meta=_head_meta,
+        )

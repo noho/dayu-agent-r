@@ -32,14 +32,20 @@ from dayu.fins.downloaders.sec_downloader import (
     SecDownloader,
     StoreDownloadedFile,
 )
+from dayu.fins.download_contract import (
+    FinsDownloadDocumentDisposition,
+    FinsDownloadDocumentResult,
+    FinsDownloadEffectiveFilters,
+    FinsDownloadResultSummary,
+    FinsDownloadSource,
+    FinsDownloadProviderError,
+)
 from dayu.fins.ingestion_runtime import (
     FinsDownloadProgressEvent,
     FinsDownloadProgressSink,
-    FinsDownloadResultSummary,
     FinsSourceDownloadAdapter,
     FinsSourceDownloadAdapterRequest,
     FinsSourceDownloadAdapterResult,
-    mark_downloaded_processed_rebuild_required,
 )
 from dayu.fins.pipelines.docling_upload_service import DoclingUploadService, UploadCancellationChecker
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
@@ -116,6 +122,7 @@ from dayu.fins.pipelines.sec_safe_meta_access import (
     safe_get_processed_meta as _safe_get_processed_meta_impl,
 )
 from dayu.fins.pipelines.sec_sc13_filtering import (
+    Sc13DirectionDecision,
     SecSc13WorkflowHost as _SecSc13WorkflowHost,
     extend_with_browse_edgar_sc13 as _extend_with_browse_edgar_sc13_impl,
     filter_sc13_by_direction as _filter_sc13_by_direction_impl,
@@ -508,7 +515,10 @@ class SecPipeline:
         if processor_registry is None:
             raise ValueError("processor_registry 必须由调用方显式传入")
         self._workspace_root = (workspace_root or Path.cwd()).resolve()
-        self._downloader = downloader or SecDownloader(workspace_root=self._workspace_root)
+        self._downloader = downloader or SecDownloader(
+            workspace_root=self._workspace_root,
+            user_agent=user_agent,
+        )
         repository_set = build_fs_repository_set(workspace_root=self._workspace_root)
         self._batching_repository = batching_repository or FsBatchingRepository(
             self._workspace_root,
@@ -543,6 +553,22 @@ class SecPipeline:
             blob_repository=self._blob_repository,
         )
 
+    @property
+    def source_repository(self) -> SourceDocumentRepositoryProtocol:
+        """返回 SEC pipeline 使用的源文档仓储。
+
+        Args:
+            无。
+
+        Returns:
+            relative locator 查询所属的源文档仓储。
+
+        Raises:
+            无。
+        """
+
+        return self._source_repository
+
     def download(
         self,
         ticker: str,
@@ -553,6 +579,7 @@ class SecPipeline:
         rebuild: bool = False,
         ticker_aliases: Optional[list[str]] = None,
         *,
+        start_is_explicit: bool,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> SecPipelineDownloadResult:
         """执行 SEC 下载并同步返回聚合结果。
@@ -565,6 +592,7 @@ class SecPipeline:
             overwrite: 是否强制覆盖。
             rebuild: 是否仅基于本地已下载数据重建 meta。
             ticker_aliases: 可选 ticker alias。
+            start_is_explicit: 起始日期是否来自调用方显式输入。
             cancel_checker: 可选协作式取消检查器。
 
         Returns:
@@ -585,6 +613,7 @@ class SecPipeline:
                     overwrite=overwrite,
                     rebuild=rebuild,
                     ticker_aliases=ticker_aliases,
+                    start_is_explicit=start_is_explicit,
                     cancel_checker=cancel_checker,
                 )
             )
@@ -600,6 +629,7 @@ class SecPipeline:
         rebuild: bool = False,
         ticker_aliases: Optional[list[str]] = None,
         *,
+        start_is_explicit: bool,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> AsyncIterator[DownloadEvent]:
         """执行 SEC 下载并流式产出事件。
@@ -612,6 +642,7 @@ class SecPipeline:
             overwrite: 是否强制覆盖。
             rebuild: 是否仅基于本地已下载数据重建 meta。
             ticker_aliases: 可选 ticker alias。
+            start_is_explicit: 起始日期是否来自调用方显式输入。
             cancel_checker: 可选协作式取消检查器。
 
         Yields:
@@ -629,6 +660,7 @@ class SecPipeline:
             overwrite=overwrite,
             rebuild=rebuild,
             ticker_aliases=ticker_aliases,
+            start_is_explicit=start_is_explicit,
             cancel_checker=cancel_checker,
         ):
             yield event
@@ -643,6 +675,7 @@ class SecPipeline:
         rebuild: bool = False,
         ticker_aliases: Optional[list[str]] = None,
         *,
+        start_is_explicit: bool,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> AsyncIterator[DownloadEvent]:
         """执行 OLD SEC 下载主工作流。
@@ -655,6 +688,7 @@ class SecPipeline:
             overwrite: 是否强制覆盖。
             rebuild: 是否仅基于本地已下载数据重建 meta。
             ticker_aliases: 可选 ticker alias。
+            start_is_explicit: 起始日期是否来自调用方显式输入。
             cancel_checker: 可选协作式取消检查器。
 
         Yields:
@@ -673,16 +707,18 @@ class SecPipeline:
             overwrite=overwrite,
             rebuild=rebuild,
             ticker_aliases=ticker_aliases,
+            start_is_explicit=start_is_explicit,
             cancel_checker=cancel_checker,
             parse_date=parse_date,
             extract_sec_ticker_aliases=extract_sec_ticker_aliases,
             merge_ticker_aliases=merge_ticker_aliases,
             load_rejection_registry=_load_rejection_registry_impl,
             save_rejection_registry=_save_rejection_registry_impl,
+            is_rejected=_is_rejected,
+            record_rejection=_record_rejection,
             should_warn_missing_sc13=should_warn_missing_sc13,
             warn_insufficient_filings=warn_insufficient_filings,
             warn_xbrl_missing_filings=warn_xbrl_missing_filings,
-            cleanup_stale_filing_dirs=_cleanup_stale_filing_dirs,
             build_download_filing_event_payload=build_download_filing_event_payload,
         ):
             yield event
@@ -1117,7 +1153,7 @@ class SecPipeline:
         form_windows: dict[str, dt.date],
         end_date: dt.date,
         target_cik: str,
-        sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
+        sc13_direction_cache: Optional[dict[str, Sc13DirectionDecision]] = None,
         rejection_registry: Optional[DownloadRejectionRegistry] = None,
         overwrite: bool = False,
         cancel_checker: Optional[Callable[[], bool]] = None,
@@ -1166,14 +1202,10 @@ class SecPipeline:
                 history_json = cached_data
             else:
                 history_url = f"https://data.sec.gov/submissions/{filename}"
-                try:
-                    history_json = await self._downloader.fetch_json(
-                        history_url,
-                        cancellation_checker=cancel_checker,
-                    )
-                except RuntimeError as exc:
-                    Log.warn(f"历史 filings 文件抓取失败: {history_url} error={exc}", module=self.MODULE)
-                    continue
+                history_json = await self._downloader.fetch_json(
+                    history_url,
+                    cancellation_checker=cancel_checker,
+                )
                 await _write_sec_cache_async(self._workspace_root, "submissions", cache_key, history_json)
             collect_filings_from_table(
                 records=records,
@@ -1186,20 +1218,18 @@ class SecPipeline:
             records.values(),
             key=lambda item: (item.filing_date, item.form_type, item.accession_number),
         )
-        direction_filtered_records = cast(
-            list[FilingRecord],
-            await _filter_sc13_by_direction_impl(
-                cast(_SecSc13WorkflowHost, self),
-                ticker=ticker,
-                filings=sorted_records,
-                target_cik=target_cik,
-                archive_cik=target_cik,
-                sc13_direction_cache=sc13_direction_cache,
-                rejection_registry=rejection_registry,
-                overwrite=overwrite,
-                cancel_checker=cancel_checker,
-            ),
+        direction_result = await _filter_sc13_by_direction_impl(
+            cast(_SecSc13WorkflowHost, self),
+            ticker=ticker,
+            filings=sorted_records,
+            target_cik=target_cik,
+            archive_cik=target_cik,
+            sc13_direction_cache=sc13_direction_cache,
+            rejection_registry=rejection_registry,
+            overwrite=overwrite,
+            cancel_checker=cancel_checker,
         )
+        direction_filtered_records = cast(list[FilingRecord], list(direction_result.filings))
         deduplicated_records = cast(
             list[FilingRecord],
             _keep_latest_sc13_per_filer_impl(tuple(direction_filtered_records)),
@@ -1222,7 +1252,7 @@ class SecPipeline:
         form_windows: dict[str, dt.date],
         end_date: dt.date,
         target_cik: str,
-        sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
+        sc13_direction_cache: Optional[dict[str, Sc13DirectionDecision]] = None,
         rejection_registry: Optional[DownloadRejectionRegistry] = None,
         overwrite: bool = False,
         cancel_checker: Optional[Callable[[], bool]] = None,
@@ -1259,13 +1289,15 @@ class SecPipeline:
                 end_date=end_date,
                 target_cik=target_cik,
                 parse_date=parse_date,
-                create_filing_record=lambda form_type, filing_date, report_date, accession_number, primary_document, filer_key: FilingRecord(
-                    form_type=form_type,
-                    filing_date=filing_date,
-                    report_date=report_date,
-                    accession_number=accession_number,
-                    primary_document=primary_document,
-                    filer_key=filer_key,
+                create_filing_record=lambda form_type, filing_date, report_date, accession_number, primary_document, filer_key: (
+                    FilingRecord(
+                        form_type=form_type,
+                        filing_date=filing_date,
+                        report_date=report_date,
+                        accession_number=accession_number,
+                        primary_document=primary_document,
+                        filer_key=filer_key,
+                    )
                 ),
                 sc13_direction_cache=sc13_direction_cache,
                 rejection_registry=rejection_registry,
@@ -1283,7 +1315,8 @@ class SecPipeline:
         form_windows: dict[str, dt.date],
         end_date: dt.date,
         target_cik: str,
-        sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
+        start_is_explicit: bool,
+        sc13_direction_cache: Optional[dict[str, Sc13DirectionDecision]] = None,
         rejection_registry: Optional[DownloadRejectionRegistry] = None,
         overwrite: bool = False,
         cancel_checker: Optional[Callable[[], bool]] = None,
@@ -1298,6 +1331,7 @@ class SecPipeline:
             form_windows: form 到起始日期映射。
             end_date: 下载结束日期。
             target_cik: 目标 CIK。
+            start_is_explicit: 起始日期是否由调用方显式提供。
             sc13_direction_cache: SC13 方向缓存。
             rejection_registry: 拒绝注册表。
             overwrite: 是否覆盖。
@@ -1321,6 +1355,7 @@ class SecPipeline:
                 form_windows=form_windows,
                 end_date=end_date,
                 target_cik=target_cik,
+                start_is_explicit=start_is_explicit,
                 sc13_direction_cache=sc13_direction_cache,
                 rejection_registry=rejection_registry,
                 overwrite=overwrite,
@@ -1334,11 +1369,11 @@ class SecPipeline:
         filing: FilingRecord,
         archive_cik: str,
         target_cik: str,
-        sc13_direction_cache: Optional[dict[str, Optional[bool]]] = None,
+        sc13_direction_cache: Optional[dict[str, Sc13DirectionDecision]] = None,
         rejection_registry: Optional[DownloadRejectionRegistry] = None,
         overwrite: bool = False,
         cancel_checker: Optional[Callable[[], bool]] = None,
-    ) -> bool:
+    ) -> Sc13DirectionDecision:
         """判断单条 SC13 是否满足别人持股当前 ticker 的方向。
 
         Args:
@@ -1352,7 +1387,7 @@ class SecPipeline:
             cancel_checker: 可选协作式取消检查器。
 
         Returns:
-            应保留时返回 ``True``。
+            exact accession 对应的 pure typed direction decision。
 
         Raises:
             RuntimeError: 角色解析失败时由底层抛出。
@@ -1588,6 +1623,7 @@ class SecPipeline:
         rejection_category: str,
         selected_primary_document: str,
         source_fingerprint: str,
+        registry_after: DownloadRejectionRegistry,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> tuple[bool, Optional[str]]:
         """下载并保存 rejected filing artifact。
@@ -1602,6 +1638,7 @@ class SecPipeline:
             rejection_category: 拒绝分类。
             selected_primary_document: 当前规则选中的主文件。
             source_fingerprint: 来源指纹。
+            registry_after: 与 artifact 同 batch 发布的完整 registry 真值。
             cancel_checker: 可选协作式取消检查器。
 
         Returns:
@@ -1624,7 +1661,8 @@ class SecPipeline:
             classification_version=SEC_PIPELINE_DOWNLOAD_VERSION,
             batching_repository=self._batching_repository,
             filing_maintenance_repository=self._filing_maintenance_repository,
-            download_files_stream=self._downloader.download_files_stream,
+            downloader=self._downloader,
+            registry_after=registry_after,
             build_file_result_from_downloader_event=build_file_result_from_downloader_event,
             summarize_failed_download_file_reasons=summarize_failed_download_file_reasons,
             cancellation_checker=cancel_checker,
@@ -1687,9 +1725,9 @@ class SecPipeline:
                 max_lines=120,
                 cancellation_checker=cancel_checker,
             )
-        except RuntimeError as exc:
+        except FinsDownloadProviderError as exc:
             Log.warn(
-                f"6-K 预下载失败: ticker={ticker} document_id={document_id} error={exc}",
+                f"6-K 预下载来源请求失败: transport_category={exc.transport_category.value}",
                 module=self.MODULE,
             )
             return False, "DOWNLOAD_FAILED", selected_name
@@ -1789,11 +1827,8 @@ class SecDownloadAdapter(FinsSourceDownloadAdapter):
     def download(self, request: FinsSourceDownloadAdapterRequest) -> FinsSourceDownloadAdapterResult:
         """执行 SEC 下载并返回已持久化摘要。
 
-        SEC adapter 是 persisted-summary adapter：迁移的 SEC workflow 已经通过
-        NEW storage repositories 完成 source/rejected 相关副作用。`request.rebuild_processed`
-        只代表 NEW processed 重处理治理语义；adapter 在下载摘要确认后按
-        `written_document_ids` 标记既有 processed 需要重处理，不映射为 OLD
-        `SecPipeline.download(rebuild=...)`。
+        SEC adapter 是 persisted-summary adapter：SEC workflow 通过同一个
+        ``SecPipeline`` host 完成 source/rejected 与 local-only rebuild 副作用。
 
         Args:
             request: runtime 传入的已归一化下载请求。
@@ -1808,36 +1843,28 @@ class SecDownloadAdapter(FinsSourceDownloadAdapter):
 
         if request.normalized_ticker.market != "US":
             raise ValueError(f"SEC 下载仅支持 US market，当前 market={request.normalized_ticker.market}")
+        if request.source is not FinsDownloadSource.SEC:
+            raise ValueError(f"SEC 下载来源不匹配: source={request.source.value}")
         result = _run_async_download_sync(
             collect_download_result_from_events(
                 self._pipeline.download_stream(
                     ticker=request.normalized_ticker.canonical,
                     form_type=_form_type_from_adapter_request(request.form_types),
-                    start_date=request.filed_after,
-                    end_date=request.filed_before,
+                    start_date=request.date_range.start_text,
+                    end_date=request.date_range.end_text,
                     overwrite=request.overwrite_existing,
-                    rebuild=False,
+                    rebuild=request.rebuild_local_artifacts,
+                    start_is_explicit=request.date_range.start_is_explicit,
                     cancel_checker=request.cancellation_checker,
                 ),
                 progress_sink=request.progress_sink,
             )
         )
-        persisted_summary = _summary_from_pipeline_result(result)
-        if request.rebuild_processed:
-            batch = self._pipeline._batching_repository.begin_batch(
-                request.normalized_ticker.canonical
-            )
-            try:
-                mark_downloaded_processed_rebuild_required(
-                    self._pipeline._processed_repository,
-                    ticker=request.normalized_ticker.canonical,
-                    summary=persisted_summary,
-                    batch=batch,
-                )
-            except BaseException:
-                self._pipeline._batching_repository.rollback_batch(batch)
-                raise
-            self._pipeline._batching_repository.commit_batch(batch)
+        persisted_summary = _summary_from_pipeline_result(
+            cast(dict[str, JsonValue], result),
+            request=request,
+            source_repository=self._pipeline.source_repository,
+        )
         return FinsSourceDownloadAdapterResult(
             discovered_count=persisted_summary.discovered_count,
             persisted_summary=persisted_summary,
@@ -1862,79 +1889,459 @@ def _form_type_from_adapter_request(form_types: tuple[str, ...]) -> Optional[str
     return _SEC_FORMS_ADAPTER_JOINER.join(form_types)
 
 
-def _summary_from_pipeline_result(result: SecPipelineDownloadResult) -> FinsDownloadResultSummary:
-    """把 OLD SEC pipeline 结果转换为 runtime 下载摘要。
+def _summary_from_pipeline_result(
+    result: Mapping[str, JsonValue],
+    *,
+    request: FinsSourceDownloadAdapterRequest,
+    source_repository: SourceDocumentRepositoryProtocol,
+) -> FinsDownloadResultSummary:
+    """把 SEC workflow 私有结果严格投影为 typed 下载摘要。
 
     Args:
-        result: OLD pipeline 下载结果。
+        result: SEC workflow 私有结果。
+        request: 当前 adapter typed request。
+        source_repository: relative artifact locator 的 storage owner。
 
     Returns:
-        runtime 下载结果摘要。
+        保留全部 operation-local document rows 的 typed 摘要。
 
     Raises:
-        ValueError: 结果字段类型非法时抛出。
+        ValueError: 结果缺少必填字段、字段类型非法或身份不一致时抛出。
+        OSError: locator 查询失败时由 storage owner 抛出。
     """
 
-    filings = result.get("filings", [])
-    if not isinstance(filings, list):
-        raise ValueError("SEC 下载结果 filings 字段必须是列表")
-    written_document_ids: list[str] = []
-    downloaded_count = 0
-    skipped_count = 0
-    rejected_count = 0
-    failed_count = 0
-    for item in filings:
-        if not isinstance(item, dict):
-            failed_count += 1
-            continue
-        status = str(item.get("status", "")).strip()
-        if status == _SEC_STATUS_DOWNLOADED:
-            downloaded_count += 1
-            document_id = str(item.get("document_id", "")).strip()
-            if document_id:
-                written_document_ids.append(document_id)
-            continue
-        if _is_rejected_filing_result(item):
-            rejected_count += 1
-            continue
-        if status == _SEC_STATUS_SKIPPED:
-            skipped_count += 1
-            continue
-        if status == _SEC_STATUS_FAILED:
-            failed_count += 1
-            continue
-        failed_count += 1
-    return FinsDownloadResultSummary(
-        discovered_count=len(filings),
-        downloaded_count=downloaded_count,
-        skipped_count=skipped_count,
-        rejected_count=rejected_count,
-        failed_count=failed_count,
-        written_document_ids=tuple(written_document_ids),
+    ticker = _required_sec_text(result, "ticker")
+    if ticker != request.normalized_ticker.canonical:
+        raise ValueError("SEC 下载结果 ticker 与 typed request 不一致")
+    filings = _required_sec_mapping_list(result, "filings")
+    rows = tuple(
+        _project_sec_document_row(
+            item,
+            ticker=ticker,
+            source_repository=source_repository,
+        )
+        for item in filings
+    )
+    filters = _project_sec_effective_filters(result, request=request)
+    return _build_sec_typed_summary(
+        ticker=ticker,
+        filters=filters,
+        rows=rows,
     )
 
 
-def _is_rejected_filing_result(item: dict[str, JsonValue]) -> bool:
-    """判断 OLD SEC filing 结果是否代表 rejected artifact。
+def _project_sec_document_row(
+    item: Mapping[str, JsonValue],
+    *,
+    ticker: str,
+    source_repository: SourceDocumentRepositoryProtocol,
+) -> FinsDownloadDocumentResult:
+    """严格投影单个 SEC filing result。
 
     Args:
-        item: OLD SEC filing 结果字典。
+        item: workflow 私有 filing result。
+        ticker: canonical ticker。
+        source_repository: relative locator 查询 owner。
+
+    Returns:
+        typed 单文档结果。
+
+    Raises:
+        ValueError: 必填字段缺失、类型非法或 status 未封闭时抛出。
+        OSError: downloaded locator 查询失败时抛出。
+    """
+
+    document_id = _required_sec_text(item, "document_id")
+    status = _required_sec_text(item, "status")
+    reason_code = _optional_sec_text(item, "reason_code")
+    allow_missing_business_fields = status == _SEC_STATUS_FAILED and reason_code == "missing_form_type"
+    form_or_period = _required_optional_sec_text(
+        item,
+        "form_type",
+        allow_missing=allow_missing_business_fields,
+    )
+    filing_date = _required_optional_sec_text(
+        item,
+        "filing_date",
+        allow_missing=allow_missing_business_fields,
+    )
+    report_date = _required_optional_sec_text(
+        item,
+        "report_date",
+        allow_missing=allow_missing_business_fields,
+    )
+    if status == _SEC_STATUS_DOWNLOADED:
+        locator = source_repository.get_source_document_locator(
+            ticker,
+            document_id,
+            SourceKind.FILING,
+        )
+        return FinsDownloadDocumentResult(
+            document_id=document_id,
+            form_or_period=form_or_period,
+            filing_date=filing_date,
+            report_date=report_date,
+            covered_fiscal_periods=(),
+            disposition=FinsDownloadDocumentDisposition.DOWNLOADED,
+            reason_category=None,
+            reason_message=None,
+            artifact_locator=locator,
+        )
+    if status == _SEC_STATUS_SKIPPED:
+        category = reason_code or _required_sec_text(item, "skip_reason")
+        disposition = (
+            FinsDownloadDocumentDisposition.REJECTED
+            if _is_rejected_filing_result(item)
+            else FinsDownloadDocumentDisposition.SKIPPED
+        )
+        return FinsDownloadDocumentResult(
+            document_id=document_id,
+            form_or_period=form_or_period,
+            filing_date=filing_date,
+            report_date=report_date,
+            covered_fiscal_periods=(),
+            disposition=disposition,
+            reason_category=category,
+            reason_message=_sec_safe_reason_message(disposition),
+            artifact_locator=None,
+        )
+    if status == _SEC_STATUS_REJECTED:
+        category = reason_code or _SEC_REASON_6K_FILTERED
+        return FinsDownloadDocumentResult(
+            document_id=document_id,
+            form_or_period=form_or_period,
+            filing_date=filing_date,
+            report_date=report_date,
+            covered_fiscal_periods=(),
+            disposition=FinsDownloadDocumentDisposition.REJECTED,
+            reason_category=category,
+            reason_message=_sec_safe_reason_message(FinsDownloadDocumentDisposition.REJECTED),
+            artifact_locator=None,
+        )
+    if status == _SEC_STATUS_FAILED:
+        category = reason_code or "sec_document_failed"
+        return FinsDownloadDocumentResult(
+            document_id=document_id,
+            form_or_period=form_or_period,
+            filing_date=filing_date,
+            report_date=report_date,
+            covered_fiscal_periods=(),
+            disposition=FinsDownloadDocumentDisposition.FAILED,
+            reason_category=category,
+            reason_message=_sec_safe_reason_message(FinsDownloadDocumentDisposition.FAILED),
+            artifact_locator=None,
+        )
+    raise ValueError(f"SEC 下载结果 status 未封闭: {status}")
+
+
+def _project_sec_effective_filters(
+    result: Mapping[str, JsonValue],
+    *,
+    request: FinsSourceDownloadAdapterRequest,
+) -> FinsDownloadEffectiveFilters:
+    """严格读取 SEC workflow 实际采用的筛选条件。
+
+    Args:
+        result: SEC workflow 私有结果。
+        request: 当前 typed request，用于核对 mutation flags。
+
+    Returns:
+        typed effective filters。
+
+    Raises:
+        ValueError: filters 字段缺失、类型非法或 flags 与 request 不一致时抛出。
+    """
+
+    filters = _required_sec_mapping(result, "filters")
+    forms = _required_sec_optional_text_list(filters, "forms")
+    overwrite = _required_sec_bool(filters, "overwrite")
+    if overwrite is not request.overwrite_existing:
+        raise ValueError("SEC effective overwrite 与 typed request 不一致")
+    if "rebuild" in filters:
+        rebuild = _required_sec_bool(filters, "rebuild")
+        if rebuild is not request.rebuild_local_artifacts:
+            raise ValueError("SEC effective rebuild 与 typed request 不一致")
+    start_date = _sec_effective_start_date(filters)
+    end_date = _required_optional_sec_text(filters, "end_date", allow_missing=False)
+    return FinsDownloadEffectiveFilters(
+        form_types=forms,
+        start_date=start_date,
+        end_date=end_date,
+        overwrite_existing=overwrite,
+        rebuild_local_artifacts=request.rebuild_local_artifacts,
+    )
+
+
+def _sec_effective_start_date(filters: Mapping[str, JsonValue]) -> str | None:
+    """从 SEC normal/rebuild 私有 filters 读取 effective inclusive 起点。
+
+    Args:
+        filters: workflow 私有 filters。
+
+    Returns:
+        最早 form 窗口起点；显式空起点返回 ``None``。
+
+    Raises:
+        ValueError: start 字段缺失或类型非法时抛出。
+    """
+
+    if "start_date" in filters:
+        return _required_optional_sec_text(filters, "start_date", allow_missing=False)
+    start_dates = _required_sec_mapping(filters, "start_dates")
+    values = tuple(_required_sec_text(start_dates, key) for key in sorted(start_dates))
+    if not values:
+        return None
+    return min(values)
+
+
+def _build_sec_typed_summary(
+    *,
+    ticker: str,
+    filters: FinsDownloadEffectiveFilters,
+    rows: tuple[FinsDownloadDocumentResult, ...],
+) -> FinsDownloadResultSummary:
+    """从同一 typed row tuple 派生 SEC 计数。
+
+    Args:
+        ticker: canonical ticker。
+        filters: effective filters。
+        rows: 完整 document rows。
+
+    Returns:
+        计数与 rows 同源的 typed summary。
+
+    Raises:
+        ValueError: summary 不变量失败时由 contract 抛出。
+    """
+
+    return FinsDownloadResultSummary.from_document_rows(
+        source=FinsDownloadSource.SEC,
+        canonical_ticker=ticker,
+        effective_filters=filters,
+        document_rows=rows,
+        missing_periods=(),
+    )
+
+
+def _is_rejected_filing_result(item: Mapping[str, JsonValue]) -> bool:
+    """判断 SEC filing 结果是否为 rejected artifact。
+
+    Args:
+        item: SEC workflow filing result。
 
     Returns:
         明确 rejected 或 6-K filtered skipped 返回 ``True``。
 
     Raises:
-        无。
+        ValueError: status 或 reason 字段类型非法时抛出。
     """
 
-    status = str(item.get("status", "")).strip()
+    status = _required_sec_text(item, "status")
     if status == _SEC_STATUS_REJECTED:
         return True
     if status != _SEC_STATUS_SKIPPED:
         return False
-    skip_reason = str(item.get("skip_reason", "")).strip()
-    reason_code = str(item.get("reason_code", "")).strip()
+    skip_reason = _optional_sec_text(item, "skip_reason")
+    reason_code = _optional_sec_text(item, "reason_code")
     return skip_reason == _SEC_REASON_6K_FILTERED or reason_code == _SEC_REASON_6K_FILTERED
+
+
+def _sec_safe_reason_message(disposition: FinsDownloadDocumentDisposition) -> str:
+    """为 SEC document disposition 选择不复制 raw provider 文本的说明。
+
+    Args:
+        disposition: typed document disposition。
+
+    Returns:
+        脱敏业务说明。
+
+    Raises:
+        ValueError: downloaded disposition 不需要 reason 时抛出。
+    """
+
+    if disposition is FinsDownloadDocumentDisposition.SKIPPED:
+        return "该文档按下载策略跳过"
+    if disposition is FinsDownloadDocumentDisposition.REJECTED:
+        return "该文档未通过来源筛选规则"
+    if disposition is FinsDownloadDocumentDisposition.FAILED:
+        return "SEC 来源未能完成该文档"
+    raise ValueError("downloaded disposition must not contain a reason")
+
+
+def _required_sec_mapping(
+    value: Mapping[str, JsonValue],
+    key: str,
+) -> Mapping[str, JsonValue]:
+    """读取 SEC 私有结果中的必填 mapping。
+
+    Args:
+        value: 当前 mapping。
+        key: 必填字段名。
+
+    Returns:
+        只读 mapping。
+
+    Raises:
+        ValueError: 字段缺失或类型非法时抛出。
+    """
+
+    if key not in value or not isinstance(value[key], Mapping):
+        raise ValueError(f"SEC 下载结果 {key} 字段必须是对象")
+    raw = value[key]
+    assert isinstance(raw, Mapping)
+    return raw
+
+
+def _required_sec_mapping_list(
+    value: Mapping[str, JsonValue],
+    key: str,
+) -> tuple[Mapping[str, JsonValue], ...]:
+    """读取 SEC 私有结果中的必填 mapping 列表。
+
+    Args:
+        value: 当前 mapping。
+        key: 必填字段名。
+
+    Returns:
+        保持原顺序的 mapping tuple。
+
+    Raises:
+        ValueError: 字段缺失、不是列表或元素不是对象时抛出。
+    """
+
+    if key not in value or not isinstance(value[key], list):
+        raise ValueError(f"SEC 下载结果 {key} 字段必须是列表")
+    raw_items = value[key]
+    assert isinstance(raw_items, list)
+    items: list[Mapping[str, JsonValue]] = []
+    for index, raw_item in enumerate(raw_items):
+        if not isinstance(raw_item, Mapping):
+            raise ValueError(f"SEC 下载结果 {key}[{index}] 必须是对象")
+        items.append(raw_item)
+    return tuple(items)
+
+
+def _required_sec_text(value: Mapping[str, JsonValue], key: str) -> str:
+    """读取 SEC 私有结果中的必填非空文本。
+
+    Args:
+        value: 当前 mapping。
+        key: 必填字段名。
+
+    Returns:
+        去空白文本。
+
+    Raises:
+        ValueError: 字段缺失、类型非法或为空时抛出。
+    """
+
+    if key not in value:
+        raise ValueError(f"SEC 下载结果缺少必填文本字段: {key}")
+    raw = value[key]
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(f"SEC 下载结果缺少必填文本字段: {key}")
+    return raw.strip()
+
+
+def _optional_sec_text(value: Mapping[str, JsonValue], key: str) -> str | None:
+    """严格读取 SEC 私有结果中的可选文本。
+
+    Args:
+        value: 当前 mapping。
+        key: 可选字段名。
+
+    Returns:
+        缺失或 ``None`` 返回 ``None``，否则返回去空白文本。
+
+    Raises:
+        ValueError: 字段存在但不是非空文本时抛出。
+    """
+
+    if key not in value or value[key] is None:
+        return None
+    return _required_sec_text(value, key)
+
+
+def _required_optional_sec_text(
+    value: Mapping[str, JsonValue],
+    key: str,
+    *,
+    allow_missing: bool,
+) -> str | None:
+    """读取允许 ``None`` 但默认要求 key 存在的 SEC 文本。
+
+    Args:
+        value: 当前 mapping。
+        key: 字段名。
+        allow_missing: 特定 closed failure 是否允许字段缺失。
+
+    Returns:
+        ``None`` 或非空文本。
+
+    Raises:
+        ValueError: 必填 key 缺失或值类型非法时抛出。
+    """
+
+    if key not in value:
+        if allow_missing:
+            return None
+        raise ValueError(f"SEC 下载结果缺少字段: {key}")
+    if value[key] is None:
+        return None
+    return _required_sec_text(value, key)
+
+
+def _required_sec_optional_text_list(
+    value: Mapping[str, JsonValue],
+    key: str,
+) -> tuple[str, ...]:
+    """读取可为 ``None`` 的 SEC canonical form 列表。
+
+    Args:
+        value: 当前 mapping。
+        key: 字段名。
+
+    Returns:
+        canonical form tuple；``None`` 返回空 tuple。
+
+    Raises:
+        ValueError: 字段缺失、类型非法或元素非法时抛出。
+    """
+
+    if key not in value:
+        raise ValueError(f"SEC 下载结果缺少字段: {key}")
+    raw = value[key]
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ValueError(f"SEC 下载结果 {key} 字段必须是列表或 null")
+    forms: list[str] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"SEC 下载结果 {key}[{index}] 必须是非空文本")
+        forms.append(item.strip())
+    return tuple(forms)
+
+
+def _required_sec_bool(value: Mapping[str, JsonValue], key: str) -> bool:
+    """读取 SEC 私有结果中的必填布尔字段。
+
+    Args:
+        value: 当前 mapping。
+        key: 必填字段名。
+
+    Returns:
+        布尔值。
+
+    Raises:
+        ValueError: 字段缺失或不是布尔值时抛出。
+    """
+
+    if key not in value or not isinstance(value[key], bool):
+        raise ValueError(f"SEC 下载结果 {key} 字段必须是布尔值")
+    raw = value[key]
+    assert isinstance(raw, bool)
+    return raw
 
 
 def build_sec_download_adapter(
@@ -1987,45 +2394,6 @@ def build_sec_download_adapter(
         max_retries=max_retries,
     )
     return SecDownloadAdapter(pipeline=pipeline)
-
-
-def _cleanup_stale_filing_dirs(
-    repository: FilingMaintenanceRepositoryProtocol,
-    ticker: str,
-    form_windows: dict[str, dt.date],
-    filing_results: list[dict[str, JsonValue]],
-    *,
-    batch: BatchToken,
-) -> int:
-    """删除 filings 目录中多余的文档目录。
-
-    Args:
-        repository: filing 维护仓储。
-        ticker: 股票代码。
-        form_windows: form 到开始日期映射。
-        filing_results: 本次下载 filing 结果。
-        batch: caller 显式传入的 batch capability。
-
-    Returns:
-        被清理的目录数量。
-
-    Raises:
-        OSError: 仓储清理失败时由底层抛出。
-    """
-
-    valid_doc_ids: set[str] = {
-        str(result["document_id"])
-        for result in filing_results
-        if result.get("status") in {"downloaded", "skipped"}
-    }
-    if not valid_doc_ids:
-        return 0
-    return repository.cleanup_stale_filing_documents(
-        ticker,
-        active_form_types=set(form_windows.keys()),
-        valid_document_ids=valid_doc_ids,
-        batch=batch,
-    )
 
 
 __all__ = [

@@ -17,15 +17,10 @@ CLI_PROGRAM_NAME: str = "dayu-cli"
 DEFAULT_WORKSPACE: str = "./workspace"
 DEFAULT_LOG_LEVEL: DiagnosticLogLevel = DiagnosticLogLevel.INFO
 INVALID_UTF8_INVOCATION_DIAGNOSTIC: str = (
-    "command-line arguments must be valid UTF-8 text; "
-    "re-enter the command using UTF-8 input."
+    "command-line arguments must be valid UTF-8 text; re-enter the command using UTF-8 input."
 )
-LOG_LEVEL_SELECTOR_CONFLICT_DIAGNOSTIC: str = (
-    "log level selectors are mutually exclusive"
-)
-QUIET_DEBUG_STREAM_CONFLICT_DIAGNOSTIC: str = (
-    "--debug-stream cannot be combined with --quiet"
-)
+LOG_LEVEL_SELECTOR_CONFLICT_DIAGNOSTIC: str = "log level selectors are mutually exclusive"
+QUIET_DEBUG_STREAM_CONFLICT_DIAGNOSTIC: str = "--debug-stream cannot be combined with --quiet"
 
 _PUBLIC_LOG_LEVEL_SPELLINGS: dict[str, DiagnosticLogLevel] = {
     "debug": DiagnosticLogLevel.DEBUG,
@@ -219,15 +214,9 @@ def build_parser(prog: str = CLI_PROGRAM_NAME) -> argparse.ArgumentParser:
     :raises ValueError: argparse 初始化或参数注册失败时透传底层异常。
     """
 
-    root_common_parent = _build_common_arguments_parent(
-        log_level_selectors_dest=_ROOT_LOG_LEVEL_SELECTORS_DEST
-    )
-    command_common_parent = _build_common_arguments_parent(
-        log_level_selectors_dest=_COMMAND_LOG_LEVEL_SELECTORS_DEST
-    )
-    action_common_parent = _build_common_arguments_parent(
-        log_level_selectors_dest=_ACTION_LOG_LEVEL_SELECTORS_DEST
-    )
+    root_common_parent = _build_common_arguments_parent(log_level_selectors_dest=_ROOT_LOG_LEVEL_SELECTORS_DEST)
+    command_common_parent = _build_common_arguments_parent(log_level_selectors_dest=_COMMAND_LOG_LEVEL_SELECTORS_DEST)
+    action_common_parent = _build_common_arguments_parent(log_level_selectors_dest=_ACTION_LOG_LEVEL_SELECTORS_DEST)
     parser = argparse.ArgumentParser(
         prog=prog,
         description="Dayu 财报分析命令行入口。",
@@ -423,10 +412,7 @@ def _build_common_arguments_parent(
         action="store_true",
         dest="debug_stream",
         default=argparse.SUPPRESS,
-        help=(
-            "额外启用高频 stream delta、SSE、逐 delta ingest 诊断；"
-            "不改变普通日志等级，且不可与 quiet 组合。"
-        ),
+        help=("额外启用高频 stream delta、SSE、逐 delta ingest 诊断；不改变普通日志等级，且不可与 quiet 组合。"),
     )
     return parser
 
@@ -476,9 +462,7 @@ def _parse_public_log_level(value: str) -> DiagnosticLogLevel:
 
     canonical_level = _PUBLIC_LOG_LEVEL_SPELLINGS.get(value)
     if canonical_level is None:
-        raise argparse.ArgumentTypeError(
-            "expected one of: " + ", ".join(LOG_LEVEL_CHOICES)
-        )
+        raise argparse.ArgumentTypeError("expected one of: " + ", ".join(LOG_LEVEL_CHOICES))
     return canonical_level
 
 
@@ -897,12 +881,20 @@ def _register_download_command(
         command_name=COMMAND_DOWNLOAD,
         help_text="下载指定主体的财报文档。",
     )
-    _add_required_ticker_argument(parser)
+    parser.add_argument("--ticker", help="公司代码或财报主体（必填）。")
     parser.add_argument("--forms", nargs="+", help="需要下载的报表类型。")
     parser.add_argument("--start", help="最早 filing 日期。")
     parser.add_argument("--end", help="最晚 filing 日期。")
-    parser.add_argument("--overwrite", action="store_true", help="覆盖已有原始文档。")
-    parser.add_argument("--rebuild", action="store_true", help="重建已处理结果。")
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="覆盖已有原始文档；不可与 --rebuild 同时使用。",
+    )
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="仅基于本地源文件重建下载元数据，不访问远端来源；不可与 --overwrite 同时使用。",
+    )
 
 
 def _register_upload_filing_command(

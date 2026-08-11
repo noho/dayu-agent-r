@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -44,8 +45,12 @@ from dayu.fins.direct_events import (
     FINS_RESULT_EXIT_CANCELLED,
     FINS_RESULT_EXIT_SUCCESS,
     FinsErrorKind,
+    FinsDownloadPublicDocument,
+    FinsDownloadPublicSummary,
     FinsEventDetail,
     FinsOperationKind,
+    FinsPublicFailure,
+    FinsPublicFailureKind,
     FinsResultStatus,
     FinsResultSummary,
 )
@@ -58,8 +63,15 @@ from dayu.fins.ingestion import (
     FinsObservationSnapshot,
     FinsObservationStatus,
 )
-from dayu.fins.ingestion_runtime import (
+from dayu.fins.download_contract import (
+    FinsDownloadDocumentDisposition,
+    FinsDownloadEffectiveFilters,
     FinsDownloadRequest,
+    FinsDownloadSource,
+    FinsDownloadTerminalDisposition,
+    FinsDownloadTransportCategory,
+)
+from dayu.fins.ingestion_runtime import (
     FinsPreprocessRequest,
     FinsUploadRequest,
 )
@@ -233,9 +245,7 @@ def test_fins_wait_poll_adapter_maps_observation_statuses() -> None:
 
     succeeded_poll = adapter.poll_wait(_wait_snapshot(succeeded.handle_id, DOWNLOAD_TOOL_NAME))
     failed_poll = adapter.poll_wait(_wait_snapshot(failed.handle_id, DOWNLOAD_TOOL_NAME))
-    cancelled_poll = adapter.poll_wait(
-        _wait_snapshot(cancelled.handle_id, PREPROCESS_TOOL_NAME)
-    )
+    cancelled_poll = adapter.poll_wait(_wait_snapshot(cancelled.handle_id, PREPROCESS_TOOL_NAME))
     pending_poll = adapter.poll_wait(_wait_snapshot(pending.handle_id, PREPROCESS_TOOL_NAME))
     running_poll = adapter.poll_wait(_wait_snapshot(running.handle_id, DOWNLOAD_TOOL_NAME))
     lost_poll = adapter.poll_wait(_wait_snapshot(lost.handle_id, DOWNLOAD_TOOL_NAME))
@@ -254,6 +264,170 @@ def test_fins_wait_poll_adapter_maps_observation_statuses() -> None:
     assert isinstance(value, Mapping)
     assert value["operation"] == "download"
     assert "job_id" not in value
+
+
+def test_fins_wait_adapter_projects_same_typed_download_object() -> None:
+    """wait adapter 应直接序列化 runtime typed summary，不从 details 或 storage 反推。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: nested download 与 typed object 不一致时抛出。
+    """
+
+    handle = _observation_handle_with_id("abababababababab")
+    download = FinsDownloadPublicSummary(
+        source=FinsDownloadSource.SEC,
+        canonical_ticker="AAPL",
+        effective_filters=FinsDownloadEffectiveFilters(
+            form_types=("10-K",),
+            start_date="2024-01-01",
+            end_date="2024-12-31",
+            overwrite_existing=False,
+            rebuild_local_artifacts=False,
+        ),
+        discovered_count=1,
+        downloaded_count=1,
+        skipped_count=0,
+        rejected_count=0,
+        failed_count=0,
+        document_rows=(
+            FinsDownloadPublicDocument(
+                document_id="fil-downloaded",
+                form_or_period="10-K",
+                filing_date="2024-08-01",
+                report_date="2024-06-30",
+                covered_fiscal_periods=(),
+                disposition=FinsDownloadDocumentDisposition.DOWNLOADED,
+                reason_category=None,
+                reason_message=None,
+                artifact_locator="source/AAPL/fil-downloaded",
+            ),
+        ),
+        missing_periods=(),
+        omitted_count=0,
+        terminal_disposition=FinsDownloadTerminalDisposition.SUCCEEDED,
+    )
+    result = FinsResultSummary(
+        status=FinsResultStatus.SUCCESS,
+        exit_code=FINS_RESULT_EXIT_SUCCESS,
+        title="下载完成",
+        details=(FinsEventDetail(label="ignored", value="must-not-project"),),
+        error_kind=None,
+        error_message=None,
+        download=download,
+    )
+    runtime = _FakeObservationRuntime(
+        snapshots={
+            handle.handle_id: FinsObservationSnapshot(
+                handle=handle,
+                status=FinsObservationStatus.SUCCEEDED,
+                message="succeeded observation",
+                result=result,
+                error_kind=None,
+                retry_after_seconds=None,
+            )
+        }
+    )
+
+    poll = FinsIngestionWaitPollAdapter(runtime=runtime).poll_wait(_wait_snapshot(handle.handle_id, DOWNLOAD_TOOL_NAME))
+
+    assert isinstance(poll, WaitPollReady)
+    assert isinstance(poll.outcome, ResolveWaitCompletedOutcome)
+    value = poll.outcome.result.value
+    assert isinstance(value, Mapping)
+    assert value["download"] == download.to_json_value()
+    download_value = value["download"]
+    assert isinstance(download_value, Mapping)
+    documents_value = download_value["documents"]
+    assert isinstance(documents_value, list)
+    assert len(documents_value) == 1
+    document_value = documents_value[0]
+    assert isinstance(document_value, Mapping)
+    coverage_value = document_value["covered_fiscal_periods"]
+    assert isinstance(coverage_value, list)
+    assert coverage_value == []
+    assert "details" not in value
+    serialized = str(value)
+    assert "must-not-project" not in serialized
+    assert "https://" not in serialized
+    assert "/Users/" not in serialized
+
+
+def test_fins_wait_adapter_failure_contains_same_typed_download_and_failure() -> None:
+    """失败 wait result 应序列化完整 download/failure，而非仅输出泛化错误。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: failure message 缺字段或泄漏内部内容时抛出。
+    """
+
+    handle = _observation_handle_with_id("acacacacacacacac")
+    download = FinsDownloadPublicSummary(
+        source=FinsDownloadSource.SEC,
+        canonical_ticker="AAPL",
+        effective_filters=FinsDownloadEffectiveFilters(
+            form_types=("10-K",),
+            start_date=None,
+            end_date=None,
+            overwrite_existing=False,
+            rebuild_local_artifacts=False,
+        ),
+        discovered_count=0,
+        downloaded_count=0,
+        skipped_count=0,
+        rejected_count=0,
+        failed_count=0,
+        document_rows=(),
+        missing_periods=(),
+        omitted_count=0,
+        terminal_disposition=FinsDownloadTerminalDisposition.FAILED,
+    )
+    failure = FinsPublicFailure(
+        kind=FinsPublicFailureKind.PROVIDER_TRANSPORT,
+        source=FinsDownloadSource.SEC,
+        transport_category=FinsDownloadTransportCategory.CONNECTION,
+        safe_message="无法连接 SEC 来源",
+        retry_hint="请稍后重试；若持续失败，请检查来源服务状态。",
+    )
+    result = FinsResultSummary(
+        status=FinsResultStatus.FAILURE,
+        exit_code=FINS_RESULT_EXIT_FAILURE,
+        title="下载失败",
+        details=(),
+        error_kind=FinsErrorKind.PROVIDER,
+        error_message=failure.safe_message,
+        download=download,
+        failure=failure,
+    )
+    runtime = _FakeObservationRuntime(
+        snapshots={
+            handle.handle_id: FinsObservationSnapshot(
+                handle=handle,
+                status=FinsObservationStatus.FAILED,
+                message="failed observation",
+                result=result,
+                error_kind=FinsErrorKind.PROVIDER,
+                retry_after_seconds=None,
+            )
+        }
+    )
+
+    poll = FinsIngestionWaitPollAdapter(runtime=runtime).poll_wait(_wait_snapshot(handle.handle_id, DOWNLOAD_TOOL_NAME))
+
+    assert isinstance(poll, WaitPollReady)
+    assert isinstance(poll.outcome, ResolveWaitFailedOutcome)
+    message_value = json.loads(poll.outcome.result.message)
+    assert isinstance(message_value, Mapping)
+    assert message_value["download"] == download.to_json_value()
+    assert message_value["failure"] == failure.to_json_value()
+    assert poll.outcome.result.hint == failure.retry_hint
+    serialized = str(message_value)
+    assert "https://" not in serialized
+    assert "/Users/" not in serialized
 
 
 def test_fins_wait_poll_adapter_rejects_failed_result_without_message() -> None:
@@ -291,9 +465,7 @@ def test_fins_wait_poll_adapter_corrupt_and_missing_handles_are_lost() -> None:
     missing = _observation_handle_with_id("9999999999999999")
     adapter = FinsIngestionWaitPollAdapter(runtime=_FakeObservationRuntime(snapshots={}))
 
-    corrupt_poll = adapter.poll_wait(
-        _wait_snapshot("finsjob_00000000000000000000000000000007", DOWNLOAD_TOOL_NAME)
-    )
+    corrupt_poll = adapter.poll_wait(_wait_snapshot("finsjob_00000000000000000000000000000007", DOWNLOAD_TOOL_NAME))
     missing_poll = adapter.poll_wait(_wait_snapshot(missing.handle_id, DOWNLOAD_TOOL_NAME))
 
     assert isinstance(corrupt_poll, WaitPollLost)
@@ -353,9 +525,7 @@ def test_fins_wait_poll_adapter_abandon_cancels_and_cleans_observation() -> None
 
     handle = _observation_handle_with_id("cdcdcdcdcdcdcdcd")
     runtime = _FakeObservationRuntime(
-        snapshots={
-            handle.handle_id: _observation_snapshot(handle, FinsObservationStatus.RUNNING)
-        }
+        snapshots={handle.handle_id: _observation_snapshot(handle, FinsObservationStatus.RUNNING)}
     )
     adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
 
@@ -375,9 +545,7 @@ def test_fins_wait_poll_adapter_abandon_corrupt_token_is_noop() -> None:
     runtime = _FakeObservationRuntime(snapshots={})
     adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
 
-    result = adapter.abandon_wait(
-        _wait_snapshot("finsjob_00000000000000000000000000000009", DOWNLOAD_TOOL_NAME)
-    )
+    result = adapter.abandon_wait(_wait_snapshot("finsjob_00000000000000000000000000000009", DOWNLOAD_TOOL_NAME))
 
     assert isinstance(result, WaitExternalJobLifecycleNoop)
     assert result.reason == "invalid_observation_handle"
@@ -405,9 +573,7 @@ def test_fins_wait_poll_adapter_abandon_lost_snapshot_is_noop() -> None:
 
     handle = _observation_handle_with_id("3434343434343434")
     runtime = _FakeObservationRuntime(
-        snapshots={
-            handle.handle_id: _observation_snapshot(handle, FinsObservationStatus.LOST)
-        }
+        snapshots={handle.handle_id: _observation_snapshot(handle, FinsObservationStatus.LOST)}
     )
     adapter = FinsIngestionWaitPollAdapter(runtime=runtime)
 
@@ -424,9 +590,7 @@ def test_fins_wait_poll_adapter_abandon_non_transient_error_is_noop() -> None:
 
     handle = _observation_handle_with_id("5656565656565656")
     runtime = _FakeObservationRuntime(
-        snapshots={
-            handle.handle_id: _observation_snapshot(handle, FinsObservationStatus.RUNNING)
-        },
+        snapshots={handle.handle_id: _observation_snapshot(handle, FinsObservationStatus.RUNNING)},
         abandon_errors={
             handle.handle_id: FinsObservationPollError(
                 FinsObservationPollErrorKind.PERMANENT_CORRUPT_HANDLE,
@@ -449,9 +613,7 @@ def test_fins_wait_poll_adapter_abandon_cancel_non_transient_error_is_noop() -> 
 
     handle = _observation_handle_with_id("6767676767676767")
     runtime = _FakeObservationRuntime(
-        snapshots={
-            handle.handle_id: _observation_snapshot(handle, FinsObservationStatus.RUNNING)
-        },
+        snapshots={handle.handle_id: _observation_snapshot(handle, FinsObservationStatus.RUNNING)},
         cancel_errors={
             handle.handle_id: FinsObservationPollError(
                 FinsObservationPollErrorKind.PERMANENT_CORRUPT_HANDLE,
@@ -474,9 +636,7 @@ def test_fins_wait_poll_adapter_abandon_transient_unavailable_re_raises() -> Non
 
     handle = _observation_handle_with_id("7878787878787878")
     runtime = _FakeObservationRuntime(
-        snapshots={
-            handle.handle_id: _observation_snapshot(handle, FinsObservationStatus.RUNNING)
-        },
+        snapshots={handle.handle_id: _observation_snapshot(handle, FinsObservationStatus.RUNNING)},
         cancel_errors={
             handle.handle_id: FinsObservationPollError(
                 FinsObservationPollErrorKind.TRANSIENT_UNAVAILABLE,
@@ -554,9 +714,7 @@ def _observation_snapshot(
         message=f"{status.value} observation",
         result=_observation_result(result_status) if status in terminal_statuses else None,
         error_kind=FinsErrorKind.EXECUTION if status is FinsObservationStatus.FAILED else None,
-        retry_after_seconds=0.5
-        if status in {FinsObservationStatus.PENDING, FinsObservationStatus.RUNNING}
-        else None,
+        retry_after_seconds=0.5 if status in {FinsObservationStatus.PENDING, FinsObservationStatus.RUNNING} else None,
     )
 
 

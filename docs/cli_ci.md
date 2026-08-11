@@ -1002,6 +1002,61 @@ durable terminal、文件/日志和 SQLite/EventLog before/after；同一 exit c
 完整 `full-real` 都运行全部 mandatory scenarios；`focused-real` 只用于局部复现/修复验证，不更新全量 coverage、
 registry readiness 或完整 CI 结论。
 
+#### 5.1.5 `dayu-cli download` 第一轮 Mandatory Matrix
+
+`download` 是独立 command campaign。其它命令为了准备真实 corpus 而调用 download，只能证明该 corpus 的来源与可消费性，
+不能替代本节对 download 自身的参数、UI、生成物、失败、取消和恢复语义进行观察与裁决。第一轮必须先从当前 parser、
+Service、Fins runtime、市场 adapter、source-specific workflow 和 storage owner 生成 obligations；下面是最低集合，不是可用
+当前实现行为填充的预期结果清单：
+
+- **公开 invocation**：help、缺少/空/非法/边界 ticker，默认 workspace、`--base/-b/--workspace`、绝对/相对/Unicode/
+  空白/symlink 路径，未知 option、缺少 option value、额外 positional、重复 option、CSV/alias 形态，以及所有共享日志入口。
+  help 中不存在的 source selector 不得由 Agent 编造；若实现内部固定 `auto`，报告只记录该实际装配事实。
+- **市场与真实来源**：US、CN、HK 各至少一条真实成功下载，分别冻结实际 SEC、CNInfo、HKEX source identity、canonical
+  ticker、document id、form/period、filing/report date、primary file、全部业务文件 digest、manifest/meta 和来源 URL。US 还要
+  覆盖国内发行人、foreign issuer、amended/SC13 与 6-K 分类路径；CN/HK 要覆盖至少一个实际 PDF + Docling 产物。
+- **forms 与日期**：无 forms、每个 form family、别名/大小写/中文拼写、多 forms、CSV、重复、空项、非法项、超长和数量
+  边界；无日期、year/year-month/full-date、单边窗口、精确窗口、无结果窗口、非法日期、超长和 start-after-end。默认 form/
+  lookback、SC13 补拉/回溯、CN/HK missing-period 等代码分支必须分别获得真实观察或显式 gap；不得只相信 pure helper 或
+  pipeline summary。默认 form 与 missing-period 必须按市场适用规则生成：A股默认集合是 `FY,H1,Q1,Q3`，制度上不存在的
+  独立 Q2/Q4 不得进入 effective forms 或 missing；港股主板 effective/missing 以年度和中期材料为基础集合，但材料身份统一按
+  `年度报告=FY`、`中期报告=H1`、`中期业绩公告=Q2`、`年度业绩公告=Q4` 分类。Q1/Q3 等其它季度材料按发行人实际披露发现，
+  不得把 Q1～Q4 当作所有发行人的必有 missing 集合。选定发行人实际公开了季度材料时，CI 必须对照发行人/交易所公开来源验证
+  discovery 与分类，不能因为该材料不是 mandatory missing 就允许漏选；腾讯 `0700` 必须覆盖其实际发布的 Q2 与合并年度/Q4业绩材料。
+- **workspace 状态**：fresh、init 后、已有完整 source、部分/损坏 source、目标路径冲突、只读 workspace；每种状态都记录
+  command 开始前是否已产生目录，以及失败后是否存在半发布、旧文档丢失、临时 staging、锁或 recovery residue。
+- **重复、overwrite 与 rebuild**：首次下载、无 overwrite 重复、overwrite、rebuild 分开运行；`--overwrite --rebuild` 与
+  `--rebuild --overwrite` 必须作为互斥 usage error 在业务 operation、网络访问和 workspace 写入前 exit 2。合法场景必须用
+  原始文件/meta/manifest/processed 的 before/after bytes 和 digest 证明实际行为；`--rebuild` 的名称、自报或 help 不能代替
+  downstream processed 状态及后续 `process` 真正消费验证。还要观察 overwrite 在现有目标损坏时能否安全修复，以及失败/
+  空结果/取消是否保留旧文档和非目标文档。
+- **结果分类**：真实覆盖 downloaded、skipped、rejected、failed、zero-match、rejected-only、downloaded+rejected、可达的
+  partial failure。`discovered/downloaded/skipped/rejected/failed` 必须与实际候选、rejection artifact 和 source publication
+  逐项对账；CLI summary、missing-period 占位和已有 rejection 的再次分类都不能自证正确。
+- **并发、中断与恢复**：同 workspace+同 ticker、同 workspace+不同 ticker，very-early Ctrl+C、provider/network wait、文件
+  下载、转换和 publication 各适用阶段的 Ctrl+C；至少一个真实 process crash/kill 后以同一 workspace 重跑。记录屏幕、
+  signal/exit、operation 是否达到 canonical terminal、后台工作是否继续、锁/staging/half-document、旧文档保持和 retry
+  结果。Docling 声明 backend/device fallback 时，每个 attempt 必须从 immutable PDF bytes 新建独立输入 stream；不得复用已被
+  前一 converter 关闭的 stream。真实运行自然触发首 attempt 失败时，必须继续验证后续 attempt 实际成功；若首 attempt 直接成功，
+  记录 `conditional/not-triggered`，由 owner contract test 锁定 attempt-local stream，不得为制造失败增加生产 hook、mock、断网副作用
+  或 observation infrastructure，也不得把该条件路径作为 readiness blocker。harness deadline 导致的 kill 必须与产品取消分开标记。
+- **外部配置与诊断**：有/无 SEC User-Agent、真实 provider transport failure、日志等级、`--log-file`、quiet 和
+  `--debug-stream`。报告必须扫描 stdout/stderr/log/evidence 中的 exact credential/contact canary，只报告名称类别与计数，
+  不回显值；同一 warning 的重复、只写 log 未写屏幕、以及过度泛化的失败文案都交用户裁决。
+- **跨命令消费**：至少一个 US 和一个 CN/HK source 由 production read/process 路径重新加载；若 download 的业务范围只负责
+  source publication，报告应把后续命令仅作为“产物可消费”证明，不在本 campaign 裁决后续命令。反向检查不得绕过
+  `dayu.fins.storage` 私有布局生成 SUT 成功结论。
+- **全层取证**：每个场景保存精确 argv/cwd/非秘密环境/stdin 或按键时间线、stdout/stderr/screen、exit/signal、耗时、
+  filesystem before/after/diff、关键文件内容/digest、日志、Fins public state，以及 Host SQLite、runtime SQLite、legacy
+  ingestion job、EventLog、Tool Trace 的 before/after 或基于代码路径和实际文件扫描的 not-applicable proof。direct command
+  未创建这些 durable facts 时要记录“已查询且不存在”，不能写成“未检查”。
+
+高成本 live download 不要求执行 form × date × market 的无收益全笛卡尔积；允许由同一 owner 的低成本参数场景、pairwise
+组合和代表性真实来源链关闭等价 obligation。但不同 parser/runtime/workflow/storage owner、真实成功/拒绝/失败分类、默认
+业务规则、破坏性副作用、并发、取消和 crash recovery 不能互相抵扣。代码检查发现新的动态分支后必须先扩展 inventory，
+再补跑或登记显式 gap；只有 frozen observed report、用户逐 predicate 裁决、accepted oracle/scenario registry 和 readiness
+proof 全部完成，才能宣称 download 第一轮闭环。
+
 ### 5.2 验证层级
 
 场景按执行成本分为：

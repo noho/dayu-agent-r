@@ -10,12 +10,14 @@ from typing import Optional, Protocol, TypeVar
 
 from dayu.fins.domain.document_models import BatchToken, DownloadRejectionRegistry, SourceHandle
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.download_contract import FinsDownloadProviderError
 from dayu.fins.downloaders.sec_downloader import (
     DownloaderEvent,
     RemoteFileDescriptor,
     SecDownloadCancelledError,
     SecDownloader,
     StoreDownloadedFile,
+    _PrefetchEvent,
     accession_to_no_dash,
     build_source_fingerprint,
 )
@@ -34,6 +36,11 @@ from dayu.fins.storage import (
     BatchingRepositoryProtocol,
     ProcessedDocumentRepositoryProtocol,
     SourceDocumentRepositoryProtocol,
+    SourceIntegrityPreflightError,
+    SourceIntegrityPreflightReason,
+    SourceIntegrityRevisionConflictError,
+    SourceIntegrityStatus,
+    has_same_source_publication_identity,
 )
 from dayu.fins._log import Log
 
@@ -130,6 +137,7 @@ class SecDownloadFilingWorkflowHost(Protocol):
         rejection_category: str,
         selected_primary_document: str,
         source_fingerprint: str,
+        registry_after: DownloadRejectionRegistry,
         cancel_checker: Callable[[], bool] | None = None,
     ) -> Awaitable[tuple[bool, Optional[str]]]:
         """持久化 rejected filing artifact。"""
@@ -155,7 +163,9 @@ class SecDownloadFilingWorkflowHost(Protocol):
 
         ...
 
+
 _AwaitableResult = TypeVar("_AwaitableResult")
+_MAX_SOURCE_IDENTITY_ROUNDS = 3
 
 
 async def _maybe_await(value: Awaitable[_AwaitableResult] | _AwaitableResult) -> _AwaitableResult:
@@ -184,6 +194,7 @@ async def run_download_single_filing_stream(
     index_file_entries: Callable[[Optional[dict[str, JsonValue]]], dict[str, dict[str, JsonValue]]],
     download_version: str,
     cancel_checker: Callable[[], bool] | None = None,
+    _identity_round: int = 0,
 ) -> AsyncIterator[DownloadEvent]:
     """下载单个 filing 并流式产出事件。
 
@@ -204,6 +215,7 @@ async def run_download_single_filing_stream(
         index_file_entries: 旧文件条目索引 helper。
         download_version: 当前下载版本号。
         cancel_checker: 可选协作式取消检查器。
+        _identity_round: 内部 publication identity churn 轮次。
 
     Yields:
         文件级与 filing 级事件。
@@ -215,9 +227,20 @@ async def run_download_single_filing_stream(
     accession_no_dash = accession_to_no_dash(filing.accession_number)
     internal_document_id = filing.accession_number
     document_id = f"fil_{internal_document_id}"
-    previous_meta = host._safe_get_filing_source_meta(ticker=ticker, document_id=document_id)
+    phase_a_integrity = host._source_repository.classify_source_integrity(
+        ticker,
+        document_id,
+        SourceKind.FILING,
+    )
+    previous_meta = (
+        None
+        if phase_a_integrity.status is SourceIntegrityStatus.MISSING
+        else host._safe_get_filing_source_meta(ticker=ticker, document_id=document_id)
+    )
 
-    fast_skip_reason = host._can_skip_fast(previous_meta, overwrite)
+    fast_skip_reason: str | None = None
+    if phase_a_integrity.status is SourceIntegrityStatus.COMPLETE and not overwrite:
+        fast_skip_reason = host._can_skip_fast(previous_meta, overwrite) or "integrity_complete"
     if fast_skip_reason is not None:
         Log.debug(
             f"快速预检跳过: ticker={ticker} document_id={document_id}",
@@ -244,6 +267,8 @@ async def run_download_single_filing_stream(
 
     effective_registry = rejection_registry if rejection_registry is not None else {}
     if is_rejected(effective_registry, document_id, overwrite):
+        if phase_a_integrity.status is SourceIntegrityStatus.REPAIR_REQUIRED:
+            raise SourceIntegrityPreflightError(SourceIntegrityPreflightReason.SELECTED_REJECTED_REPAIR_REQUIRED)
         Log.debug(
             f"拒绝注册表跳过: ticker={ticker} document_id={document_id}",
             module=host.MODULE,
@@ -282,12 +307,35 @@ async def run_download_single_filing_stream(
         )
     except SecDownloadCancelledError:
         return
+    except FinsDownloadProviderError as exc:
+        filing_result = {
+            "document_id": document_id,
+            "internal_document_id": internal_document_id,
+            "status": "failed",
+            "form_type": filing.form_type,
+            "filing_date": filing.filing_date,
+            "report_date": filing.report_date,
+            "error": f"provider_{exc.transport_category.value}",
+            "reason_code": f"provider_{exc.transport_category.value}",
+            "reason_message": exc.safe_message,
+        }
+        yield DownloadEvent(
+            event_type=DownloadEventType.FILING_FAILED,
+            ticker=ticker,
+            document_id=document_id,
+            payload=build_download_filing_event_payload(filing_result),
+        )
+        return
     source_fingerprint = build_source_fingerprint(remote_files)
-    skip_reason = host._can_skip(
-        previous_meta,
-        source_fingerprint,
-        overwrite,
-        remote_files=remote_files,
+    skip_reason = (
+        host._can_skip(
+            previous_meta,
+            source_fingerprint,
+            overwrite,
+            remote_files=remote_files,
+        )
+        if phase_a_integrity.status is SourceIntegrityStatus.COMPLETE
+        else None
     )
     if skip_reason is not None:
         Log.debug(
@@ -327,12 +375,11 @@ async def run_download_single_filing_stream(
             cancel_checker=cancel_checker,
         )
         if not keep:
+            if phase_a_integrity.status is SourceIntegrityStatus.REPAIR_REQUIRED:
+                raise SourceIntegrityPreflightError(SourceIntegrityPreflightReason.SELECTED_REJECTED_REPAIR_REQUIRED)
             if category == "DOWNLOAD_FAILED":
                 Log.warn(
-                    (
-                        "6-K 预下载失败，终止落盘: "
-                        f"ticker={ticker} document_id={document_id} file={selected_name}"
-                    ),
+                    "6-K 预下载筛选失败，未生成可用主文档",
                     module=host.MODULE,
                 )
                 filing_result = {
@@ -361,6 +408,15 @@ async def run_download_single_filing_stream(
                 module=host.MODULE,
             )
             try:
+                registry_after = dict(effective_registry)
+                record_rejection(
+                    registry_after,
+                    document_id,
+                    "6k_filtered",
+                    category,
+                    filing.form_type,
+                    filing.filing_date,
+                )
                 artifact_saved, artifact_error = await host._persist_rejected_filing_artifact(
                     ticker=ticker,
                     cik=cik,
@@ -371,6 +427,7 @@ async def run_download_single_filing_stream(
                     rejection_category=category,
                     selected_primary_document=selected_name or filing.primary_document,
                     source_fingerprint=source_fingerprint,
+                    registry_after=registry_after,
                     cancel_checker=cancel_checker,
                 )
             except SecDownloadCancelledError:
@@ -395,14 +452,8 @@ async def run_download_single_filing_stream(
                 )
                 return
             if rejection_registry is not None:
-                record_rejection(
-                    rejection_registry,
-                    document_id,
-                    "6k_filtered",
-                    category,
-                    filing.form_type,
-                    filing.filing_date,
-                )
+                rejection_registry.clear()
+                rejection_registry.update(registry_after)
             filing_result = {
                 "document_id": document_id,
                 "internal_document_id": internal_document_id,
@@ -424,9 +475,85 @@ async def run_download_single_filing_stream(
             return
         preferred_primary = selected_name
 
+    existing_files = index_file_entries(previous_meta)
+    prefetched_events: list[_PrefetchEvent] = []
+    async for prefetched_event in host._downloader.prefetch_files_stream(
+        remote_files,
+        # repair、missing 与显式 overwrite 都必须取得 unconditional replacement。
+        allow_not_modified=False,
+        existing_files=existing_files,
+        primary_document=filing.primary_document,
+        cancellation_checker=cancel_checker,
+    ):
+        prefetched_events.append(prefetched_event)
+    if cancel_checker is not None and cancel_checker():
+        return
+
     token: BatchToken | None = host._batching_repository.begin_batch(ticker)
     try:
-        existing_files = index_file_entries(previous_meta)
+        phase_b_integrity = host._source_repository.classify_staged_source_integrity(
+            ticker,
+            document_id,
+            SourceKind.FILING,
+            batch=token,
+        )
+        if not has_same_source_publication_identity(
+            phase_a_integrity,
+            phase_b_integrity,
+        ):
+            host._batching_repository.rollback_batch(token)
+            token = None
+            if _identity_round + 1 >= _MAX_SOURCE_IDENTITY_ROUNDS:
+                raise SourceIntegrityRevisionConflictError()
+            async for retry_event in run_download_single_filing_stream(
+                host,
+                ticker=ticker,
+                cik=cik,
+                filing=filing,
+                overwrite=overwrite,
+                rejection_registry=rejection_registry,
+                is_rejected=is_rejected,
+                record_rejection=record_rejection,
+                build_download_filing_event_payload=build_download_filing_event_payload,
+                build_file_result_from_downloader_event=build_file_result_from_downloader_event,
+                summarize_failed_download_file_reasons=summarize_failed_download_file_reasons,
+                has_same_file_name_set=has_same_file_name_set,
+                resolve_download_fiscal_fields=resolve_download_fiscal_fields,
+                index_file_entries=index_file_entries,
+                download_version=download_version,
+                cancel_checker=cancel_checker,
+                _identity_round=_identity_round + 1,
+            ):
+                yield retry_event
+            return
+        if phase_b_integrity.status is SourceIntegrityStatus.COMPLETE and not overwrite:
+            host._batching_repository.rollback_batch(token)
+            token = None
+            filing_result = {
+                "document_id": document_id,
+                "internal_document_id": internal_document_id,
+                "status": "skipped",
+                "form_type": filing.form_type,
+                "filing_date": filing.filing_date,
+                "report_date": filing.report_date,
+                "skip_reason": "integrity_complete",
+                "reason_code": "integrity_complete",
+                "reason_message": "最新 publication 已完整，跳过陈旧预取结果",
+            }
+            yield DownloadEvent(
+                event_type=DownloadEventType.FILING_COMPLETED,
+                ticker=ticker,
+                document_id=document_id,
+                payload=build_download_filing_event_payload(filing_result),
+            )
+            return
+        if phase_b_integrity.status is not SourceIntegrityStatus.MISSING:
+            host._source_repository.reset_source_document(
+                ticker,
+                document_id,
+                SourceKind.FILING,
+                batch=token,
+            )
         file_results: list[DownloadFileResult] = []
         downloaded_payloads: dict[str, bytes] | None = {} if filing.form_type == "6-K" else None
         source_handle = SourceHandle(
@@ -434,18 +561,16 @@ async def run_download_single_filing_stream(
             document_id=document_id,
             source_kind=SourceKind.FILING.value,
         )
-        async for event in host._downloader.download_files_stream(
-            remote_files=remote_files,
-            overwrite=overwrite,
-            store_file=host._build_store_file(
-                source_handle=source_handle,
-                payload_sink=downloaded_payloads,
-            ),
-            batch=token,
-            existing_files=existing_files,
-            primary_document=filing.primary_document,
-            cancellation_checker=cancel_checker,
-        ):
+        store_file = host._build_store_file(
+            source_handle=source_handle,
+            payload_sink=downloaded_payloads,
+        )
+        for prefetched_event in prefetched_events:
+            event = host._downloader.materialize_prefetched_event(
+                prefetched_event,
+                store_file,
+                batch=token,
+            )
             if event.event_type == DownloadEventType.FILE_DOWNLOAD_STARTED.value:
                 yield DownloadEvent(
                     event_type=DownloadEventType.FILE_DOWNLOAD_STARTED,
@@ -575,6 +700,7 @@ async def run_download_single_filing_stream(
             primary_document=primary_document,
             file_entries=file_entries,
             previous_meta=previous_meta,
+            create_source=True,
             source_fingerprint=source_fingerprint,
             download_version=download_version,
             has_xbrl=has_xbrl,

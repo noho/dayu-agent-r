@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Optional
 
 from dayu.documents.processors.source import Source
@@ -29,6 +29,7 @@ from dayu.fins.domain.enums import SourceKind
 from ._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
 from .file_store import FileStore
 from .repository_protocols import SourceDocumentRepositoryProtocol, SourceSnapshotProtocol
+from .source_integrity import SourceIntegrityClassification
 
 
 def _build_source_handle(ticker: str, document_id: str, source_kind: SourceKind) -> SourceHandle:
@@ -506,6 +507,114 @@ class FsSourceDocumentRepository(SourceDocumentRepositoryProtocol):
         """
 
         return self._repository_set.core.get_source_meta(ticker, document_id, source_kind)
+
+    def classify_source_integrity(
+        self,
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+    ) -> SourceIntegrityClassification:
+        """分类单个 published source 的物理完整性。
+
+        Args:
+            ticker: exact external ticker。
+            document_id: exact external document ID。
+            source_kind: filing 或 material。
+
+        Returns:
+            typed published integrity classification。
+
+        Raises:
+            ValueError: identity、meta 或文件声明结构非法时抛出。
+            RuntimeError: publication guard 获取或释放失败时抛出。
+            OSError: published 文件系统读取失败时抛出。
+        """
+
+        return self._repository_set.core.classify_source_integrity(
+            ticker,
+            document_id,
+            source_kind,
+        )
+
+    def classify_staged_source_integrity(
+        self,
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+        *,
+        batch: BatchToken,
+    ) -> SourceIntegrityClassification:
+        """分类真实 open batch staging 内的 source 完整性。
+
+        Args:
+            ticker: exact external ticker。
+            document_id: exact external document ID。
+            source_kind: filing 或 material。
+            batch: 同一 core、ticker 且仍 open 的真实 capability。
+
+        Returns:
+            typed staged integrity classification。
+
+        Raises:
+            ValueError: capability、identity、meta 或文件声明结构非法时抛出。
+            OSError: staging 文件系统读取失败时抛出。
+        """
+
+        return self._repository_set.core.classify_staged_source_integrity(
+            ticker,
+            document_id,
+            source_kind,
+            batch=batch,
+        )
+
+    def list_source_integrity(
+        self,
+        ticker: str,
+    ) -> tuple[SourceIntegrityClassification, ...]:
+        """在一个 publication guard 内列出完整 ticker source integrity。
+
+        Args:
+            ticker: exact external ticker。
+
+        Returns:
+            排序后的 filing+material typed inventory。
+
+        Raises:
+            ValueError: identity、manifest、meta 或文件声明结构非法时抛出。
+            RuntimeError: publication guard 获取或释放失败时抛出。
+            OSError: published 文件系统读取失败时抛出。
+        """
+
+        return self._repository_set.core.list_source_integrity(ticker)
+
+    def get_source_document_locator(
+        self,
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+    ) -> PurePosixPath:
+        """返回 published source 文档目录的 workspace-relative locator。
+
+        Args:
+            ticker: exact external ticker。
+            document_id: exact external document ID。
+            source_kind: filing 或 material 来源类型。
+
+        Returns:
+            storage owner 校验后的相对 POSIX locator。
+
+        Raises:
+            FileNotFoundError: published source meta 不存在时抛出。
+            ValueError: identity、source kind 或 meta 不一致时抛出。
+            RuntimeError: publication guard 获取或释放失败时抛出。
+            OSError: published tree 读取失败时抛出。
+        """
+
+        return self._repository_set.core.get_source_document_locator(
+            ticker,
+            document_id,
+            source_kind,
+        )
 
     def read_source_snapshot(
         self,

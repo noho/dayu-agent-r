@@ -9,16 +9,11 @@ Host、tool/provider 装配不在本 Slice 内。
 from __future__ import annotations
 
 import asyncio
-import json
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
 from pathlib import Path
 from typing import Final, Optional, TypeAlias, cast
 
 from dayu.contracts.json_value import JsonValue
-from dayu.documents.docling_runtime import (
-    DoclingRuntimeInitializationError,
-    convert_pdf_bytes_with_docling,
-)
 from dayu.fins.downloaders.cninfo_downloader import (
     DEFAULT_MAX_RETRIES as CNINFO_DEFAULT_MAX_RETRIES,
     DEFAULT_SLEEP_SECONDS as CNINFO_DEFAULT_SLEEP_SECONDS,
@@ -31,25 +26,31 @@ from dayu.fins.downloaders.hkexnews_downloader import (
     DEFAULT_USER_AGENT as HKEXNEWS_DEFAULT_USER_AGENT,
     HkexnewsDiscoveryClient,
 )
+from dayu.fins.download_contract import (
+    FinsDownloadDocumentDisposition,
+    FinsDownloadDocumentResult,
+    FinsDownloadEffectiveFilters,
+    FinsDownloadResultSummary,
+    FinsDownloadSource,
+)
 from dayu.fins.ingestion_runtime import (
     FinsDownloadProgressEvent,
     FinsDownloadProgressSink,
-    FinsDownloadResultSummary,
     FinsSourceDownloadAdapter,
     FinsSourceDownloadAdapterRequest,
     FinsSourceDownloadAdapterResult,
-    mark_downloaded_processed_rebuild_required,
 )
 from dayu.fins.domain.document_models import FinsIngestMethod
 from dayu.fins.domain.enums import SourceKind
-from dayu.fins.pipelines.cn_download_models import CnMarketKind
+from dayu.fins.pipelines.cn_download_models import CN_FISCAL_PERIOD_ORDER, CnMarketKind
 from dayu.fins.pipelines.cn_download_pdf_gate import (
     CnDownloadPdfGateProtocol,
     NoopCnDownloadPdfGate,
 )
+from dayu.fins.pipelines.cn_docling_process import ProcessCnDoclingConversionRunner
 from dayu.fins.pipelines.cn_download_protocols import (
+    CnDoclingConversionRunner,
     CnReportDiscoveryClientProtocol,
-    PdfToDoclingJsonBytes,
 )
 from dayu.fins.pipelines.cn_download_workflow import run_cn_download_stream_impl
 from dayu.fins.pipelines.docling_upload_service import (
@@ -94,11 +95,16 @@ CN_PIPELINE_NAME: Final[str] = "cn"
 HK_PIPELINE_NAME: Final[str] = "hk"
 _CN_FORMS_ADAPTER_JOINER: Final[str] = ","
 _CN_STATUS_DOWNLOADED: Final[str] = "downloaded"
+_CN_STATUS_SKIPPED: Final[str] = "skipped"
+_CN_STATUS_FAILED: Final[str] = "failed"
+_CN_TERMINAL_OK: Final[str] = "ok"
+_CN_TERMINAL_CANCELLED: Final[str] = "cancelled"
 _ADAPTER_PROGRESS_FILE_STARTED: Final[str] = "download.file_started"
 _ADAPTER_PROGRESS_FILE_COMPLETED: Final[str] = "download.file_completed"
 _ADAPTER_PROGRESS_FILE_SKIPPED: Final[str] = "download.file_skipped"
 _ADAPTER_PROGRESS_FILE_FAILED: Final[str] = "download.file_failed"
 _ADAPTER_PROGRESS_CONVERSION_STARTED: Final[str] = "download.conversion_started"
+_ADAPTER_PROGRESS_CONVERSION_COMPLETED: Final[str] = "download.conversion_completed"
 
 
 CnPipelineDownloadResult: TypeAlias = dict[str, JsonValue]
@@ -213,7 +219,17 @@ def _emit_adapter_download_progress(
         progress_sink(
             FinsDownloadProgressEvent(
                 stage=_ADAPTER_PROGRESS_CONVERSION_STARTED,
-                message="开始 convert",
+                message="开始转换文档",
+                document_id=event.document_id,
+                file_name=_payload_text(event.payload, "name"),
+            )
+        )
+        return
+    if event.event_type == DownloadEventType.CONVERSION_COMPLETED:
+        progress_sink(
+            FinsDownloadProgressEvent(
+                stage=_ADAPTER_PROGRESS_CONVERSION_COMPLETED,
+                message="完成转换文档",
                 document_id=event.document_id,
                 file_name=_payload_text(event.payload, "name"),
             )
@@ -288,40 +304,6 @@ async def collect_cn_upload_result_from_events(
     raise RuntimeError(f"{stream_name} 未返回最终结果")
 
 
-def convert_pdf_bytes_to_docling_json_bytes(raw_data: bytes, stream_name: str) -> bytes:
-    """将 PDF 字节流转换为序列化后的 Docling JSON 字节内容。
-
-    Args:
-        raw_data: PDF 原始字节内容。
-        stream_name: 流名称，建议直接传文件名以保留扩展名。
-
-    Returns:
-        已编码为 UTF-8 的 Docling JSON 字节内容。
-
-    Raises:
-        DoclingRuntimeInitializationError: Docling 依赖缺失或装配失败时抛出。
-        RuntimeError: Docling 转换失败或导出结构非法时抛出。
-    """
-
-    try:
-        result = convert_pdf_bytes_with_docling(
-            raw_data,
-            stream_name=stream_name,
-            do_ocr=True,
-            do_table_structure=True,
-            table_mode="accurate",
-            do_cell_matching=True,
-        )
-    except DoclingRuntimeInitializationError:
-        raise
-    except Exception as exc:  # pragma: no cover - 第三方转换异常兜底
-        raise RuntimeError(f"Docling 转换失败: {stream_name}") from exc
-    payload = cast(JsonValue, result.document.export_to_dict())
-    if not isinstance(payload, Mapping):
-        raise RuntimeError(f"Docling 导出结果非法: {stream_name}")
-    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-
-
 class CnPipeline:
     """CN/HK 下载管线 facade。
 
@@ -338,7 +320,7 @@ class CnPipeline:
         cn_discovery_client: CnReportDiscoveryClientProtocol | None = None,
         hk_discovery_client: CnReportDiscoveryClientProtocol | None = None,
         pdf_download_gate: CnDownloadPdfGateProtocol | None = None,
-        convert_pdf_to_docling_json: PdfToDoclingJsonBytes | None = None,
+        docling_conversion_runner: CnDoclingConversionRunner | None = None,
         batching_repository: BatchingRepositoryProtocol | None = None,
         company_repository: CompanyMetaRepositoryProtocol | None = None,
         source_repository: SourceDocumentRepositoryProtocol | None = None,
@@ -356,7 +338,7 @@ class CnPipeline:
             cn_discovery_client: 可选巨潮 discovery client。
             hk_discovery_client: 可选披露易 discovery client。
             pdf_download_gate: 可选 PDF 下载段 gate。
-            convert_pdf_to_docling_json: 可选 PDF 到 Docling JSON bytes 转换函数。
+            docling_conversion_runner: 可选可取消 Docling conversion runner。
             batching_repository: 可选 batch lifecycle 仓储。
             company_repository: 可选公司元数据仓储。
             source_repository: 可选源文档仓储。
@@ -414,9 +396,7 @@ class CnPipeline:
             max_retries=max_retries,
         )
         self._pdf_download_gate = pdf_download_gate or NoopCnDownloadPdfGate()
-        self._convert_pdf_to_docling_json = (
-            convert_pdf_to_docling_json or convert_pdf_bytes_to_docling_json_bytes
-        )
+        self._docling_conversion_runner = docling_conversion_runner or ProcessCnDoclingConversionRunner()
         self._upload_service = DoclingUploadService(
             source_repository=self._source_repository,
             blob_repository=self._blob_repository,
@@ -567,20 +547,20 @@ class CnPipeline:
         return self._pdf_download_gate
 
     @property
-    def convert_pdf_to_docling_json(self) -> PdfToDoclingJsonBytes:
-        """返回 PDF 到 Docling JSON bytes 转换函数。
+    def docling_conversion_runner(self) -> CnDoclingConversionRunner:
+        """返回可取消 Docling conversion runner。
 
         Args:
             无。
 
         Returns:
-            转换函数。
+            typed conversion runner。
 
         Raises:
             无。
         """
 
-        return self._convert_pdf_to_docling_json
+        return self._docling_conversion_runner
 
     @property
     def user_agent(self) -> Optional[str]:
@@ -640,6 +620,7 @@ class CnPipeline:
         rebuild: bool = False,
         ticker_aliases: Optional[list[str]] = None,
         *,
+        start_is_explicit: bool,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> CnPipelineDownloadResult:
         """执行 CN/HK 下载并同步返回聚合结果。
@@ -652,6 +633,7 @@ class CnPipeline:
             overwrite: 是否强制覆盖。
             rebuild: 是否仅基于本地已下载数据重建 meta。
             ticker_aliases: 可选 ticker alias。
+            start_is_explicit: 起始日期是否来自调用方显式输入。
             cancel_checker: 可选协作式取消检查器。
 
         Returns:
@@ -672,6 +654,7 @@ class CnPipeline:
                     overwrite=overwrite,
                     rebuild=rebuild,
                     ticker_aliases=ticker_aliases,
+                    start_is_explicit=start_is_explicit,
                     cancel_checker=cancel_checker,
                 )
             )
@@ -687,6 +670,7 @@ class CnPipeline:
         rebuild: bool = False,
         ticker_aliases: Optional[list[str]] = None,
         *,
+        start_is_explicit: bool,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> AsyncIterator[DownloadEvent]:
         """执行 CN/HK 下载并流式产出事件。
@@ -699,6 +683,7 @@ class CnPipeline:
             overwrite: 是否强制覆盖。
             rebuild: 是否仅基于本地已下载数据重建 meta。
             ticker_aliases: 可选 ticker alias。
+            start_is_explicit: 起始日期是否来自调用方显式输入。
             cancel_checker: 可选协作式取消检查器。
 
         Yields:
@@ -718,6 +703,7 @@ class CnPipeline:
             overwrite=overwrite,
             rebuild=rebuild,
             ticker_aliases=ticker_aliases,
+            start_is_explicit=start_is_explicit,
             cancel_checker=cancel_checker,
             module=self.MODULE,
             pipeline_name=pipeline_name,
@@ -1342,11 +1328,8 @@ class CnDownloadAdapter(FinsSourceDownloadAdapter):
     def download(self, request: FinsSourceDownloadAdapterRequest) -> FinsSourceDownloadAdapterResult:
         """执行 CN/HK 下载并返回已持久化摘要。
 
-        CN/HK adapter 是 persisted-summary adapter：迁移的 OLD workflow 已经
-        通过 NEW storage repositories 完成 company/source/blob 副作用。
-        ``request.rebuild_processed`` 只代表 NEW processed 重处理治理语义；
-        adapter 在下载摘要确认后按 ``written_document_ids`` 标记既有 processed
-        需要重处理，不映射为 OLD ``CnPipeline.download(rebuild=...)``。
+        CN/HK adapter 是 persisted-summary adapter：现有 ``CnPipeline`` host
+        负责 company/source/blob 与 local-only rebuild 副作用。
 
         Args:
             request: runtime 传入的已归一化下载请求。
@@ -1363,40 +1346,31 @@ class CnDownloadAdapter(FinsSourceDownloadAdapter):
             raise ValueError(
                 f"CN/HK 下载 market 不匹配: expected={self._market} actual={request.normalized_ticker.market}"
             )
-        if request.source not in {self._source, "auto"}:
-            raise ValueError(f"CN/HK 下载来源不匹配: expected={self._source} actual={request.source}")
+        expected_source = FinsDownloadSource.CNINFO if self._market == "CN" else FinsDownloadSource.HKEXNEWS
+        if request.source is not expected_source:
+            raise ValueError(f"CN/HK 下载来源不匹配: expected={expected_source.value} actual={request.source.value}")
         result = _run_async_download_sync(
             collect_cn_download_result_from_events(
                 self._pipeline.download_stream(
                     ticker=request.normalized_ticker.canonical,
                     form_type=_form_type_from_adapter_request(request.form_types),
-                    start_date=request.filed_after,
-                    end_date=request.filed_before,
+                    start_date=request.date_range.start_text,
+                    end_date=request.date_range.end_text,
                     overwrite=request.overwrite_existing,
-                    rebuild=False,
+                    rebuild=request.rebuild_local_artifacts,
+                    start_is_explicit=request.date_range.start_is_explicit,
                     cancel_checker=request.cancellation_checker,
                 ),
                 progress_sink=request.progress_sink,
             )
         )
-        persisted_summary = _summary_from_pipeline_result(result)
-        if request.rebuild_processed:
-            batch = self._pipeline.batching_repository.begin_batch(
-                request.normalized_ticker.canonical
-            )
-            try:
-                mark_downloaded_processed_rebuild_required(
-                    self._pipeline.processed_repository,
-                    ticker=request.normalized_ticker.canonical,
-                    summary=persisted_summary,
-                    batch=batch,
-                )
-            except BaseException:
-                self._pipeline.batching_repository.rollback_batch(batch)
-                raise
-            self._pipeline.batching_repository.commit_batch(batch)
+        persisted_summary = _summary_from_pipeline_result(
+            result,
+            request=request,
+            source_repository=self._pipeline.source_repository,
+        )
         return FinsSourceDownloadAdapterResult(
-            discovered_count=_summary_int(result, "total"),
+            discovered_count=persisted_summary.discovered_count,
             persisted_summary=persisted_summary,
         )
 
@@ -1419,85 +1393,386 @@ def _form_type_from_adapter_request(form_types: tuple[str, ...]) -> Optional[str
     return _CN_FORMS_ADAPTER_JOINER.join(form_types)
 
 
-def _summary_from_pipeline_result(result: Mapping[str, JsonValue]) -> FinsDownloadResultSummary:
-    """把 OLD CN/HK pipeline 结果转换为 runtime 下载摘要。
+def _summary_from_pipeline_result(
+    result: Mapping[str, JsonValue],
+    *,
+    request: FinsSourceDownloadAdapterRequest,
+    source_repository: SourceDocumentRepositoryProtocol,
+) -> FinsDownloadResultSummary:
+    """把 CN/HK workflow 私有结果严格投影为 typed 下载摘要。
 
     Args:
-        result: OLD pipeline 下载结果。
+        result: CN/HK workflow 私有结果。
+        request: 当前 adapter typed request。
+        source_repository: relative locator 的 storage owner。
 
     Returns:
-        runtime 下载结果摘要。
+        rows、missing periods 与 effective filters 完整的 typed summary。
 
     Raises:
-        ValueError: 结果字段类型非法时抛出。
+        ValueError: 必填字段缺失、类型非法或身份不一致时抛出。
+        OSError: locator 查询失败时由 storage owner 抛出。
     """
 
-    filings = result.get("filings", [])
-    if not isinstance(filings, list):
-        raise ValueError("CN/HK 下载结果 filings 字段必须是列表")
-    written_document_ids: list[str] = []
-    for item in filings:
-        if not isinstance(item, Mapping):
-            continue
-        if item.get("status") == _CN_STATUS_DOWNLOADED:
-            document_id = str(item.get("document_id", "")).strip()
-            if document_id:
-                written_document_ids.append(document_id)
-    summary = result.get("summary", {})
-    summary_mapping: Mapping[str, JsonValue] = summary if isinstance(summary, Mapping) else {}
-    return FinsDownloadResultSummary(
-        discovered_count=_summary_int(result, "total"),
-        downloaded_count=_json_int(summary_mapping.get("downloaded"), "summary.downloaded"),
-        skipped_count=_json_int(summary_mapping.get("skipped"), "summary.skipped"),
-        rejected_count=0,
-        failed_count=_json_int(summary_mapping.get("failed"), "summary.failed"),
-        written_document_ids=tuple(written_document_ids),
+    status = _required_cn_text(result, "status")
+    if status not in {_CN_TERMINAL_OK, _CN_TERMINAL_CANCELLED}:
+        raise ValueError(f"CN/HK 下载结果 terminal status 未封闭: {status}")
+    ticker = _required_cn_text(result, "ticker")
+    if ticker != request.normalized_ticker.canonical:
+        raise ValueError("CN/HK 下载结果 ticker 与 typed request 不一致")
+    filings = _required_cn_mapping_list(result, "filings")
+    rows = tuple(
+        _project_cn_document_row(
+            item,
+            ticker=ticker,
+            source_repository=source_repository,
+        )
+        for item in filings
+    )
+    missing_periods = _required_cn_text_list(result, "missing_periods")
+    filters = _project_cn_effective_filters(result, request=request)
+    return FinsDownloadResultSummary.from_document_rows(
+        source=request.source,
+        canonical_ticker=ticker,
+        effective_filters=filters,
+        document_rows=rows,
+        missing_periods=missing_periods,
     )
 
 
-def _summary_int(result: Mapping[str, JsonValue], field_name: str) -> int:
-    """从 OLD 下载结果读取 summary 整数。
+def _project_cn_document_row(
+    item: Mapping[str, JsonValue],
+    *,
+    ticker: str,
+    source_repository: SourceDocumentRepositoryProtocol,
+) -> FinsDownloadDocumentResult:
+    """严格投影单个 CN/HK filing result。
 
     Args:
-        result: OLD pipeline 下载结果。
-        field_name: summary 字段名。
+        item: workflow 私有 filing result。
+        ticker: canonical ticker。
+        source_repository: relative locator 查询 owner。
 
     Returns:
-        非负整数；缺失时返回 0。
+        typed 单文档结果。
 
     Raises:
-        ValueError: 字段无法转换为非负整数时抛出。
+        ValueError: 必填字段缺失、类型非法或 status 未封闭时抛出。
+        OSError: downloaded locator 查询失败时抛出。
     """
 
-    summary = result.get("summary", {})
-    if not isinstance(summary, Mapping):
-        return 0
-    return _json_int(summary.get(field_name), f"summary.{field_name}")
+    document_id = _required_cn_text(item, "document_id")
+    status = _required_cn_text(item, "status")
+    reason_code = _optional_cn_text(item, "reason_code")
+    allow_missing_business_fields = status == _CN_STATUS_FAILED and reason_code == "missing_form_type"
+    form_or_period = _required_optional_cn_text(
+        item,
+        "form_type",
+        allow_missing=allow_missing_business_fields,
+    )
+    filing_date = _required_optional_cn_text(
+        item,
+        "filing_date",
+        allow_missing=allow_missing_business_fields,
+    )
+    report_date = _required_optional_cn_text(
+        item,
+        "report_date",
+        allow_missing=allow_missing_business_fields,
+    )
+    covered_fiscal_periods = _required_cn_covered_fiscal_periods(
+        item,
+        identity_period=form_or_period,
+    )
+    if status == _CN_STATUS_DOWNLOADED:
+        locator = source_repository.get_source_document_locator(
+            ticker,
+            document_id,
+            SourceKind.FILING,
+        )
+        return FinsDownloadDocumentResult(
+            document_id=document_id,
+            form_or_period=form_or_period,
+            filing_date=filing_date,
+            report_date=report_date,
+            covered_fiscal_periods=covered_fiscal_periods,
+            disposition=FinsDownloadDocumentDisposition.DOWNLOADED,
+            reason_category=None,
+            reason_message=None,
+            artifact_locator=locator,
+        )
+    if status == _CN_STATUS_SKIPPED:
+        category = reason_code or _required_cn_text(item, "skip_reason")
+        return FinsDownloadDocumentResult(
+            document_id=document_id,
+            form_or_period=form_or_period,
+            filing_date=filing_date,
+            report_date=report_date,
+            covered_fiscal_periods=covered_fiscal_periods,
+            disposition=FinsDownloadDocumentDisposition.SKIPPED,
+            reason_category=category,
+            reason_message="该文档按下载策略跳过",
+            artifact_locator=None,
+        )
+    if status == _CN_STATUS_FAILED:
+        return FinsDownloadDocumentResult(
+            document_id=document_id,
+            form_or_period=form_or_period,
+            filing_date=filing_date,
+            report_date=report_date,
+            covered_fiscal_periods=covered_fiscal_periods,
+            disposition=FinsDownloadDocumentDisposition.FAILED,
+            reason_category=reason_code or "cn_document_failed",
+            reason_message="财报来源未能完成该文档",
+            artifact_locator=None,
+        )
+    raise ValueError(f"CN/HK 下载结果 status 未封闭: {status}")
 
 
-def _json_int(value: JsonValue | None, field_name: str) -> int:
-    """从 JSON 值读取非负整数。
+def _project_cn_effective_filters(
+    result: Mapping[str, JsonValue],
+    *,
+    request: FinsSourceDownloadAdapterRequest,
+) -> FinsDownloadEffectiveFilters:
+    """严格读取 CN/HK workflow 实际采用的筛选条件。
 
     Args:
-        value: 原始 JSON 值。
-        field_name: 字段名，用于错误说明。
+        result: workflow 私有结果。
+        request: 当前 typed request，用于核对 mutation flags。
 
     Returns:
-        非负整数；空值返回 0。
+        typed effective filters。
 
     Raises:
-        ValueError: 字段无法转换为非负整数时抛出。
+        ValueError: filters 缺失、类型非法或 flags 与 request 不一致时抛出。
     """
 
-    if isinstance(value, list) or isinstance(value, Mapping):
-        raise ValueError(f"CN/HK 下载 {field_name} 不是整数")
-    try:
-        parsed = int(value or 0)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"CN/HK 下载 {field_name} 不是整数") from exc
-    if parsed < 0:
-        raise ValueError(f"CN/HK 下载 {field_name} 不能为负数")
-    return parsed
+    filters = _required_cn_mapping(result, "filters")
+    forms = _required_cn_text_list(filters, "forms")
+    start_dates = _required_cn_mapping(filters, "start_dates")
+    start_values = tuple(_required_cn_text(start_dates, key) for key in sorted(start_dates))
+    start_date = min(start_values) if start_values else None
+    end_date = _required_optional_cn_text(filters, "end_date", allow_missing=False)
+    overwrite = _required_cn_bool(filters, "overwrite")
+    if overwrite is not request.overwrite_existing:
+        raise ValueError("CN/HK effective overwrite 与 typed request 不一致")
+    if "rebuild" in filters:
+        rebuild = _required_cn_bool(filters, "rebuild")
+        if rebuild is not request.rebuild_local_artifacts:
+            raise ValueError("CN/HK effective rebuild 与 typed request 不一致")
+    return FinsDownloadEffectiveFilters(
+        form_types=forms,
+        start_date=start_date,
+        end_date=end_date,
+        overwrite_existing=overwrite,
+        rebuild_local_artifacts=request.rebuild_local_artifacts,
+    )
+
+
+def _required_cn_mapping(
+    value: Mapping[str, JsonValue],
+    key: str,
+) -> Mapping[str, JsonValue]:
+    """读取 CN/HK 私有结果中的必填 mapping。
+
+    Args:
+        value: 当前 mapping。
+        key: 必填字段名。
+
+    Returns:
+        只读 mapping。
+
+    Raises:
+        ValueError: 字段缺失或类型非法时抛出。
+    """
+
+    if key not in value or not isinstance(value[key], Mapping):
+        raise ValueError(f"CN/HK 下载结果 {key} 字段必须是对象")
+    raw = value[key]
+    assert isinstance(raw, Mapping)
+    return raw
+
+
+def _required_cn_mapping_list(
+    value: Mapping[str, JsonValue],
+    key: str,
+) -> tuple[Mapping[str, JsonValue], ...]:
+    """读取 CN/HK 私有结果中的必填 mapping 列表。
+
+    Args:
+        value: 当前 mapping。
+        key: 必填字段名。
+
+    Returns:
+        保持原顺序的 mapping tuple。
+
+    Raises:
+        ValueError: 字段缺失、不是列表或元素不是对象时抛出。
+    """
+
+    if key not in value or not isinstance(value[key], list):
+        raise ValueError(f"CN/HK 下载结果 {key} 字段必须是列表")
+    raw_items = value[key]
+    assert isinstance(raw_items, list)
+    items: list[Mapping[str, JsonValue]] = []
+    for index, raw_item in enumerate(raw_items):
+        if not isinstance(raw_item, Mapping):
+            raise ValueError(f"CN/HK 下载结果 {key}[{index}] 必须是对象")
+        items.append(raw_item)
+    return tuple(items)
+
+
+def _required_cn_text(value: Mapping[str, JsonValue], key: str) -> str:
+    """读取 CN/HK 私有结果中的必填非空文本。
+
+    Args:
+        value: 当前 mapping。
+        key: 必填字段名。
+
+    Returns:
+        去空白文本。
+
+    Raises:
+        ValueError: 字段缺失、类型非法或为空时抛出。
+    """
+
+    if key not in value:
+        raise ValueError(f"CN/HK 下载结果缺少必填文本字段: {key}")
+    raw = value[key]
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(f"CN/HK 下载结果缺少必填文本字段: {key}")
+    return raw.strip()
+
+
+def _optional_cn_text(value: Mapping[str, JsonValue], key: str) -> str | None:
+    """严格读取 CN/HK 私有结果中的可选文本。
+
+    Args:
+        value: 当前 mapping。
+        key: 可选字段名。
+
+    Returns:
+        缺失或 ``None`` 返回 ``None``，否则返回去空白文本。
+
+    Raises:
+        ValueError: 字段存在但不是非空文本时抛出。
+    """
+
+    if key not in value or value[key] is None:
+        return None
+    return _required_cn_text(value, key)
+
+
+def _required_optional_cn_text(
+    value: Mapping[str, JsonValue],
+    key: str,
+    *,
+    allow_missing: bool,
+) -> str | None:
+    """读取允许 ``None`` 但默认要求 key 存在的 CN/HK 文本。
+
+    Args:
+        value: 当前 mapping。
+        key: 字段名。
+        allow_missing: 特定 closed failure 是否允许字段缺失。
+
+    Returns:
+        ``None`` 或非空文本。
+
+    Raises:
+        ValueError: 必填 key 缺失或值类型非法时抛出。
+    """
+
+    if key not in value:
+        if allow_missing:
+            return None
+        raise ValueError(f"CN/HK 下载结果缺少字段: {key}")
+    if value[key] is None:
+        return None
+    return _required_cn_text(value, key)
+
+
+def _required_cn_text_list(
+    value: Mapping[str, JsonValue],
+    key: str,
+) -> tuple[str, ...]:
+    """读取 CN/HK 私有结果中的必填文本列表。
+
+    Args:
+        value: 当前 mapping。
+        key: 字段名。
+
+    Returns:
+        文本 tuple。
+
+    Raises:
+        ValueError: 字段缺失、类型非法或元素非法时抛出。
+    """
+
+    if key not in value or not isinstance(value[key], list):
+        raise ValueError(f"CN/HK 下载结果 {key} 字段必须是列表")
+    raw_items = value[key]
+    assert isinstance(raw_items, list)
+    items: list[str] = []
+    for index, item in enumerate(raw_items):
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"CN/HK 下载结果 {key}[{index}] 必须是非空文本")
+        items.append(item.strip())
+    return tuple(items)
+
+
+def _required_cn_covered_fiscal_periods(
+    value: Mapping[str, JsonValue],
+    *,
+    identity_period: str | None,
+) -> tuple[str, ...]:
+    """严格读取 workflow 的必填覆盖财期投影。
+
+    Args:
+        value: 单文档 workflow 结果。
+        identity_period: 同行身份财期；closed failure 可为 ``None``。
+
+    Returns:
+        canonical ordered 覆盖财期 tuple。
+
+    Raises:
+        ValueError: 字段缺失、为空、重复、顺序非法或不含 identity 时抛出。
+    """
+
+    periods = _required_cn_text_list(value, "covered_fiscal_periods")
+    if not periods:
+        raise ValueError("CN/HK 下载结果 covered_fiscal_periods 不能为空")
+    if any(period not in CN_FISCAL_PERIOD_ORDER for period in periods):
+        raise ValueError("CN/HK 下载结果 covered_fiscal_periods 含非法财期")
+    if len(set(periods)) != len(periods):
+        raise ValueError("CN/HK 下载结果 covered_fiscal_periods 不能重复")
+    canonical = tuple(period for period in CN_FISCAL_PERIOD_ORDER if period in periods)
+    if periods != canonical:
+        raise ValueError("CN/HK 下载结果 covered_fiscal_periods 顺序非法")
+    if identity_period is not None and identity_period not in periods:
+        raise ValueError("CN/HK 下载结果 covered_fiscal_periods 必须包含 identity period")
+    return periods
+
+
+def _required_cn_bool(value: Mapping[str, JsonValue], key: str) -> bool:
+    """读取 CN/HK 私有结果中的必填布尔字段。
+
+    Args:
+        value: 当前 mapping。
+        key: 字段名。
+
+    Returns:
+        布尔值。
+
+    Raises:
+        ValueError: 字段缺失或不是布尔值时抛出。
+    """
+
+    if key not in value or not isinstance(value[key], bool):
+        raise ValueError(f"CN/HK 下载结果 {key} 字段必须是布尔值")
+    raw = value[key]
+    assert isinstance(raw, bool)
+    return raw
 
 
 def _pipeline_name_for_ticker(ticker: str) -> str:
@@ -1676,5 +1951,4 @@ __all__ = [
     "build_hk_download_adapter",
     "collect_cn_download_result_from_events",
     "collect_cn_upload_result_from_events",
-    "convert_pdf_bytes_to_docling_json_bytes",
 ]

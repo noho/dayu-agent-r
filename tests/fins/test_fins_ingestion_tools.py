@@ -24,8 +24,8 @@ from dayu.contracts.tool_outcome import (
     ToolCancelledOutcome,
     ToolFailedOutcome,
 )
+from dayu.fins.download_contract import FinsDownloadRequest
 from dayu.fins.ingestion_runtime import (
-    FinsDownloadRequest,
     FinsIngestionExecutor,
     FinsIngestionRuntime,
     FinsPreprocessRequest,
@@ -86,15 +86,11 @@ _READ_SAMPLE_TOOL_NAME: Final[str] = "list_documents"
 _REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 _PACKAGE_CONFIG_ROOT: Final[Path] = Path(__file__).resolve().parents[2] / "dayu" / "config"
 _DOWNLOAD_TOOLS_PATH: Final[Path] = _REPO_ROOT / "dayu" / "fins" / "tools" / "download_tools.py"
-_PREPROCESS_TOOLS_PATH: Final[Path] = (
-    _REPO_ROOT / "dayu" / "fins" / "tools" / "preprocess_tools.py"
-)
+_PREPROCESS_TOOLS_PATH: Final[Path] = _REPO_ROOT / "dayu" / "fins" / "tools" / "preprocess_tools.py"
 _UPLOAD_TOOLS_PATH: Final[Path] = _REPO_ROOT / "dayu" / "fins" / "tools" / "upload_tools.py"
 _FORBIDDEN_CANCELLED_MESSAGE_FRAGMENTS: Final[tuple[str, ...]] = ("host", "Host")
 _OBSERVATION_TIME: Final[datetime] = datetime(2026, 6, 16, tzinfo=timezone.utc)
-_OBSERVATION_HANDLE_ID: Final[str] = (
-    f"{FINS_OBSERVATION_HANDLE_ID_PREFIX}aaaaaaaaaaaaaaaa"
-)
+_OBSERVATION_HANDLE_ID: Final[str] = f"{FINS_OBSERVATION_HANDLE_ID_PREFIX}aaaaaaaaaaaaaaaa"
 
 
 @pytest.mark.parametrize(
@@ -117,10 +113,7 @@ def test_awaiting_resolution_mode_parser_accepts_closed_typed_modes(
     :raises AssertionError: parser 未返回精确 enum 时抛出。
     """
 
-    assert (
-        parse_awaiting_resolution_mode({"awaiting_resolution_mode": raw_mode})
-        is expected
-    )
+    assert parse_awaiting_resolution_mode({"awaiting_resolution_mode": raw_mode}) is expected
 
 
 @pytest.mark.parametrize(
@@ -233,9 +226,7 @@ def test_observation_handle_corrupt_token_maps_to_lost(token: str) -> None:
         parse_observation_handle_id_token(token)
 
     assert (
-        observation_poll_error_resolution_kind(
-            FinsObservationPollErrorKind.PERMANENT_CORRUPT_HANDLE
-        )
+        observation_poll_error_resolution_kind(FinsObservationPollErrorKind.PERMANENT_CORRUPT_HANDLE)
         is FinsObservationResolutionKind.LOST
     )
 
@@ -244,9 +235,7 @@ def test_process_local_missing_observation_maps_to_lost() -> None:
     """process-local observation source 找不到 handle 时必须分类为 LOST。"""
 
     assert (
-        observation_poll_error_resolution_kind(
-            FinsObservationPollErrorKind.PERMANENT_NOT_FOUND
-        )
+        observation_poll_error_resolution_kind(FinsObservationPollErrorKind.PERMANENT_NOT_FOUND)
         is FinsObservationResolutionKind.LOST
     )
 
@@ -386,9 +375,7 @@ def _observation_snapshot(
         message=f"{status.value} observation",
         result=_observation_result(result_status) if status in terminal_statuses else None,
         error_kind=FinsErrorKind.EXECUTION if status is FinsObservationStatus.FAILED else None,
-        retry_after_seconds=0.5
-        if status in {FinsObservationStatus.PENDING, FinsObservationStatus.RUNNING}
-        else None,
+        retry_after_seconds=0.5 if status in {FinsObservationStatus.PENDING, FinsObservationStatus.RUNNING} else None,
     )
 
 
@@ -821,9 +808,7 @@ def test_workspace_overlay_enables_split_fins_providers(tmp_path: Path) -> None:
 
     workspace_root = _build_workspace(tmp_path)
     _write_split_fins_provider_overlay(tmp_path, workspace_root)
-    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
-        workspace_config_dir=tmp_path / "config"
-    )
+    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(workspace_config_dir=tmp_path / "config")
 
     for provider_id in (_READ_SPEC_ID, _DOWNLOAD_SPEC_ID, _PREPROCESS_SPEC_ID, _UPLOAD_SPEC_ID):
         provider_config = config.tool_discovery.providers[provider_id]
@@ -857,9 +842,7 @@ def test_upload_provider_registers_upload_tool_without_local_file_roots(
     result = upload_provider.discover_tools(
         ToolsDiscoveryProviderSpec(
             spec_id=_UPLOAD_SPEC_ID,
-            location=PythonImportPathProvider(
-                import_path="dayu.fins.tools.upload_provider:discover_tools"
-            ),
+            location=PythonImportPathProvider(import_path="dayu.fins.tools.upload_provider:discover_tools"),
             enabled=True,
             config={
                 "workspace_root": str(workspace_root),
@@ -879,9 +862,7 @@ def test_upload_provider_rejects_missing_workspace_root() -> None:
         upload_provider.discover_tools(
             ToolsDiscoveryProviderSpec(
                 spec_id=_UPLOAD_SPEC_ID,
-                location=PythonImportPathProvider(
-                    import_path="dayu.fins.tools.upload_provider:discover_tools"
-                ),
+                location=PythonImportPathProvider(import_path="dayu.fins.tools.upload_provider:discover_tools"),
                 enabled=True,
                 config={"awaiting_resolution_mode": "poll"},
             )
@@ -956,9 +937,7 @@ def test_preprocess_tool_accepts_material_filters_and_rebuild_flag(
     """
 
     workspace_root = _build_workspace(tmp_path)
-    runtime = DefaultFinsRuntime.create(
-        workspace_root=workspace_root
-    ).get_ingestion_runtime()
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
 
     outcome = asyncio.run(
         FinsPreprocessToolCallable(runtime=runtime)(
@@ -1009,9 +988,7 @@ def test_preprocess_tool_rejects_invalid_source_kind_before_creating_observation
     """
 
     workspace_root = _build_workspace(tmp_path)
-    runtime = DefaultFinsRuntime.create(
-        workspace_root=workspace_root
-    ).get_ingestion_runtime()
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
 
     outcome = asyncio.run(
         FinsPreprocessToolCallable(runtime=runtime)(
@@ -1856,9 +1833,7 @@ def _upload_spec(
 
     return ToolsDiscoveryProviderSpec(
         spec_id=spec_id,
-        location=PythonImportPathProvider(
-            import_path="dayu.fins.tools.upload_provider:discover_tools"
-        ),
+        location=PythonImportPathProvider(import_path="dayu.fins.tools.upload_provider:discover_tools"),
         enabled=True,
         config={
             "workspace_root": str(workspace_root),
@@ -2000,10 +1975,7 @@ def _assert_context_token_bridge(
 
     for node in ast.walk(call_node):
         if isinstance(node, ast.Delete):
-            assert not any(
-                isinstance(target, ast.Name) and target.id == "context"
-                for target in node.targets
-            )
+            assert not any(isinstance(target, ast.Name) and target.id == "context" for target in node.targets)
         if _is_runtime_start_call(node, start_method=start_method):
             has_token_bridge = any(
                 keyword.arg == "cancellation_token"
@@ -2071,8 +2043,4 @@ def _is_runtime_start_call(node: ast.AST, *, start_method: str) -> TypeGuard[ast
         无。
     """
 
-    return (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == start_method
-    )
+    return isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == start_method

@@ -6,16 +6,23 @@ from dayu.contracts.json_value import JsonValue
 
 import asyncio
 import hashlib
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from io import StringIO
 from itertools import repeat
 from pathlib import Path
-from typing import AsyncIterator, BinaryIO, Optional, TypeVar
+from typing import AsyncIterator, BinaryIO, Optional, TypeVar, cast
 
 import httpx
 import pytest
 
 import dayu.runtime.log as runtime_log
+import dayu.fins.downloaders.sec_downloader as sec_downloader_module
+from dayu.fins.download_contract import (
+    FinsDownloadProviderError,
+    FinsDownloadSource,
+    FinsDownloadTransportCategory,
+    SecUserAgentConfigurationError,
+)
 from dayu.fins.downloaders.sec_downloader import (
     BrowseEdgarFiling,
     DEFAULT_MAX_RETRIES,
@@ -31,6 +38,11 @@ from dayu.fins.downloaders.sec_downloader import (
     _SEC_THROTTLE_MAX_RETRIES,
     _SEC_THROTTLE_RECOVERY_SECONDS,
     _SecThrottleReservation,
+    _PrefetchEvent,
+    _PrefetchFailed,
+    _PrefetchedFile,
+    _PrefetchSkipped,
+    _PrefetchStarted,
     _await_if_needed,
     _parse_browse_edgar_atom,
     _parse_browse_edgar_href,
@@ -88,7 +100,7 @@ def _run(awaitable: Awaitable[_RunResult]) -> _RunResult:
 def _create_downloader(tmp_path: Path) -> SecDownloader:
     """创建下载器实例并设置最小重试参数。"""
 
-    downloader = SecDownloader(workspace_root=tmp_path)
+    downloader = SecDownloader(workspace_root=tmp_path, user_agent="UA")
     downloader.configure(user_agent="UA", sleep_seconds=0.0, max_retries=1)
     return downloader
 
@@ -242,7 +254,7 @@ def test_build_source_fingerprint_ignores_transport_level_etag_variants() -> Non
         RemoteFileDescriptor(
             name="b.xml",
             source_url="https://e/b.xml",
-            http_etag="W/\"def456\"",
+            http_etag='W/"def456"',
             http_last_modified="Mon, 01 Jan 2025 00:00:00 GMT",
             remote_size=264_243,
         ),
@@ -330,8 +342,10 @@ def test_resolve_company_success_and_not_found(tmp_path: Path, monkeypatch: pyte
     monkeypatch.setattr(
         downloader,
         "_http_get_bytes",
-        lambda url, cancellation_checker=None: b"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-<feed xmlns=\"http://www.w3.org/2005/Atom\"></feed>""",
+        lambda url, cancellation_checker=None: (
+            b"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<feed xmlns=\"http://www.w3.org/2005/Atom\"></feed>"""
+        ),
     )
     with pytest.raises(RuntimeError, match="无法在 SEC ticker map 中找到"):
         _run(downloader.resolve_company("AAPL"))
@@ -355,9 +369,7 @@ def test_resolve_company_uses_hyphenated_class_share_canonical(
     monkeypatch.setattr(
         downloader,
         "_http_get_bytes",
-        lambda url, cancellation_checker=None: (_ for _ in ()).throw(
-            AssertionError(f"不应访问 browse-edgar: {url}")
-        ),
+        lambda url, cancellation_checker=None: (_ for _ in ()).throw(AssertionError(f"不应访问 browse-edgar: {url}")),
     )
 
     expected = ("1067983", "BERKSHIRE HATHAWAY INC", "0001067983")
@@ -391,17 +403,116 @@ def test_resolve_company_fallback_via_browse_edgar(
     monkeypatch.setattr(
         downloader,
         "_http_get_bytes",
-        lambda url, cancellation_checker=None: b"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+        lambda url, cancellation_checker=None: (
+            b"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <feed xmlns=\"http://www.w3.org/2005/Atom\">
   <entry>
     <title>20-F - Annual report</title>
     <updated>2025-03-01T12:00:00-05:00</updated>
     <link href=\"https://www.sec.gov/Archives/edgar/data/814052/000119312525048701/0001193125-25-048701-index.htm\"/>
   </entry>
-</feed>""",
+</feed>"""
+        ),
     )
 
     assert _run(downloader.resolve_company("tef")) == ("814052", "TELEFONICA S A", "0000814052")
+
+
+def test_browse_company_http_provider_failure_is_operation_fatal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """browse ticker HTTP failure 不得回落成 ticker-not-found。"""
+
+    downloader = _create_downloader(tmp_path)
+    expected = FinsDownloadProviderError(
+        source=FinsDownloadSource.SEC,
+        transport_category=FinsDownloadTransportCategory.CONNECTION,
+        retryable=True,
+        safe_message="无法连接 SEC 来源",
+    )
+    monkeypatch.setattr(
+        downloader,
+        "_http_get_json",
+        lambda url, cancellation_checker=None: {},
+    )
+
+    async def fail_browse(
+        url: str,
+        cancellation_checker: Callable[[], bool] | None = None,
+    ) -> bytes:
+        del url, cancellation_checker
+        raise expected
+
+    monkeypatch.setattr(downloader, "_http_get_bytes", fail_browse)
+    with pytest.raises(FinsDownloadProviderError) as exc_info:
+        _run(downloader.resolve_company("TEF"))
+    assert exc_info.value is expected
+
+
+def test_browse_company_xml_parse_failure_is_typed_protocol(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """browse XML parser failure 必须由 downloader 映射为不可重试 PROTOCOL。"""
+
+    downloader = _create_downloader(tmp_path)
+    monkeypatch.setattr(
+        downloader,
+        "_http_get_json",
+        lambda url, cancellation_checker=None: {},
+    )
+    monkeypatch.setattr(
+        downloader,
+        "_http_get_bytes",
+        lambda url, cancellation_checker=None: b"<invalid",
+    )
+
+    with pytest.raises(FinsDownloadProviderError) as exc_info:
+        _run(downloader.resolve_company("TEF"))
+    assert exc_info.value.source is FinsDownloadSource.SEC
+    assert exc_info.value.transport_category is FinsDownloadTransportCategory.PROTOCOL
+    assert exc_info.value.retryable is False
+
+
+def test_browse_company_submissions_failure_propagates_same_typed_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """browse 命中后的 submissions failure 不得 continue 到空结果。"""
+
+    downloader = _create_downloader(tmp_path)
+    expected = FinsDownloadProviderError(
+        source=FinsDownloadSource.SEC,
+        transport_category=FinsDownloadTransportCategory.TIMEOUT,
+        retryable=True,
+        safe_message="SEC 来源请求超时",
+    )
+
+    async def get_json(
+        url: str,
+        cancellation_checker: Callable[[], bool] | None = None,
+    ) -> dict[str, JsonValue]:
+        del cancellation_checker
+        if url.endswith("company_tickers.json"):
+            return {}
+        raise expected
+
+    monkeypatch.setattr(downloader, "_http_get_json", get_json)
+    monkeypatch.setattr(
+        downloader,
+        "_http_get_bytes",
+        lambda url, cancellation_checker=None: (
+            b"""<feed xmlns="http://www.w3.org/2005/Atom">
+<entry><title>20-F</title><updated>2025-03-01T12:00:00-05:00</updated>
+<link href="https://www.sec.gov/Archives/edgar/data/814052/000119312525048701/0001193125-25-048701-index.htm"/>
+</entry></feed>"""
+        ),
+    )
+
+    with pytest.raises(FinsDownloadProviderError) as exc_info:
+        _run(downloader.resolve_company("TEF"))
+    assert exc_info.value is expected
 
 
 def test_fetch_wrappers_and_blank_filenum(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -458,9 +569,7 @@ SUBJECT COMPANY:
     )
     assert roles == Sc13PartyRoles(filed_by_cik="886982", subject_cik="320193")
     assert captured_urls
-    assert captured_urls[0].endswith(
-        "/886982/000119312524036431/0001193125-24-036431-index-headers.html"
-    )
+    assert captured_urls[0].endswith("/886982/000119312524036431/0001193125-24-036431-index-headers.html")
 
 
 def test_parse_sc13_party_roles_missing_field_returns_none() -> None:
@@ -476,11 +585,11 @@ FILED BY:
     assert _parse_sc13_party_roles_from_index_headers(payload) is None
 
 
-def test_fetch_sc13_party_roles_network_failure_returns_none(
+def test_fetch_sc13_party_roles_provider_failure_propagates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """验证 SC13 方向角色在网络失败时返回 None。"""
+    """SC13 方向角色的 typed provider failure 必须 operation-fatal。"""
 
     downloader = _create_downloader(tmp_path)
 
@@ -489,16 +598,22 @@ def test_fetch_sc13_party_roles_network_failure_returns_none(
         cancellation_checker: Callable[[], bool] | None = None,
     ) -> bytes:
         del url, cancellation_checker
-        raise RuntimeError("boom")
+        raise FinsDownloadProviderError(
+            source=FinsDownloadSource.SEC,
+            transport_category=FinsDownloadTransportCategory.CONNECTION,
+            retryable=True,
+            safe_message="无法连接 SEC 来源",
+        )
 
     monkeypatch.setattr(downloader, "_http_get_bytes", _raise_error)
-    roles = _run(
-        downloader.fetch_sc13_party_roles(
-            archive_cik="886982",
-            accession_number="0001193125-24-036431",
+    with pytest.raises(FinsDownloadProviderError) as exc_info:
+        _run(
+            downloader.fetch_sc13_party_roles(
+                archive_cik="886982",
+                accession_number="0001193125-24-036431",
+            )
         )
-    )
-    assert roles is None
+    assert exc_info.value.transport_category is FinsDownloadTransportCategory.CONNECTION
 
 
 def test_list_filing_files_includes_xbrl_and_exhibits(
@@ -542,6 +657,11 @@ def test_list_filing_files_includes_xbrl_and_exhibits(
                 "status_code": 200,
             },
         )(),
+    )
+    monkeypatch.setattr(
+        downloader,
+        "_try_fetch_primary_linked_html_files",
+        lambda archive_base, primary_document, cancellation_checker=None: [],
     )
 
     descriptors = _run(
@@ -745,9 +865,7 @@ def test_download_files_stream_304_downloaded_and_failed(
             overwrite=False,
             store_file=store_stub,
             batch=_TEST_BATCH,
-            existing_files={
-                "a.htm": {"http_etag": '"etag-a"', "http_last_modified": "Mon, 01 Jan 2025 00:00:00 GMT"}
-            },
+            existing_files={"a.htm": {"http_etag": '"etag-a"', "http_last_modified": "Mon, 01 Jan 2025 00:00:00 GMT"}},
         ):
             events.append(event)
         return events
@@ -816,6 +934,71 @@ def test_download_files_stream_cancel_stops_without_failed_event(tmp_path: Path)
     assert store_stub.calls == []
 
 
+def test_download_files_stream_conditional_cancel_after_transport_stops_without_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """conditional transport 返回后取消必须停止 stream，且不得伪造失败事件。
+
+    Args:
+        tmp_path: 临时目录。
+        monkeypatch: pytest monkeypatch fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 取消被投影为失败、payload 被落盘或异常外泄时抛出。
+    """
+
+    downloader = _create_downloader(tmp_path)
+    descriptor = RemoteFileDescriptor(
+        name="a.htm",
+        source_url="https://example.com/a.htm",
+        http_etag='"etag-a"',
+        http_last_modified=None,
+        remote_size=7,
+        http_status=200,
+    )
+    cancelled = False
+
+    async def _conditional_then_cancel(
+        url: str,
+        etag: Optional[str],
+        last_modified: Optional[str],
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> tuple[int, Optional[bytes]]:
+        """返回 payload 前主动触发下一 checkpoint 的取消。"""
+
+        del url, etag, last_modified, cancellation_checker
+        nonlocal cancelled
+        cancelled = True
+        return 200, b"payload"
+
+    monkeypatch.setattr(downloader, "_http_download_if_modified", _conditional_then_cancel)
+    store_stub = StoreStub()
+
+    async def _collect() -> list[DownloaderEvent]:
+        """完整消费组合 stream。"""
+
+        return [
+            event
+            async for event in downloader.download_files_stream(
+                remote_files=[descriptor],
+                overwrite=False,
+                store_file=store_stub,
+                batch=_TEST_BATCH,
+                existing_files={"a.htm": {"http_etag": '"etag-a"'}},
+                cancellation_checker=lambda: cancelled,
+            )
+        ]
+
+    events = _run(_collect())
+
+    assert [event.event_type for event in events] == ["file_download_started"]
+    assert store_stub.calls == []
+
+
 def test_download_files_stream_http_error_with_overwrite_false(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -865,8 +1048,7 @@ def test_download_files_stream_http_error_with_overwrite_false(
         del etag, last_modified, cancellation_checker
         if url.endswith("failed.xml"):
             raise RuntimeError(
-                "下载失败: url=https://example.com/failed.xml "
-                "error=Server error '503 Service Unavailable'"
+                "下载失败: url=https://example.com/failed.xml error=Server error '503 Service Unavailable'"
             )
         return 200, b"payload-normal"
 
@@ -893,10 +1075,10 @@ def test_download_files_stream_http_error_with_overwrite_false(
         "file_failed",
     ]
     assert store_stub.calls == [("normal.htm", b"payload-normal")]
-    # 验证错误信息被正确记录
-    assert "503 Service Unavailable" in str(events[3].error or "")
+    assert events[3].error == "SEC 文件下载失败"
+    assert "503 Service Unavailable" not in str(events[3].error or "")
     assert events[3].reason_code == "download_error"
-    assert "503 Service Unavailable" in str(events[3].reason_message)
+    assert events[3].reason_message == "SEC 文件下载失败"
 
 
 def test_download_files_aggregates_results(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1029,7 +1211,7 @@ def test_configure_validation_errors(tmp_path: Path) -> None:
         AssertionError: 断言失败时抛出。
     """
 
-    downloader = SecDownloader(workspace_root=tmp_path)
+    downloader = SecDownloader(workspace_root=tmp_path, user_agent="UA")
     with pytest.raises(ValueError, match="max_retries 必须大于 0"):
         downloader.configure(user_agent="UA", sleep_seconds=0.0, max_retries=0)
     with pytest.raises(ValueError, match="sleep_seconds 不能为负数"):
@@ -1145,9 +1327,9 @@ def test_download_files_stream_overwrite_with_failure(tmp_path: Path, monkeypatc
         "file_failed",
     ]
     assert store_stub.calls == [("ok.htm", b"ok")]
-    assert events[3].error == "network down"
+    assert events[3].error == "SEC 文件下载失败"
     assert events[3].reason_code == "download_error"
-    assert events[3].reason_message == "network down"
+    assert events[3].reason_message == "SEC 文件下载失败"
 
 
 def test_download_files_stream_zero_byte_overwrite_false(
@@ -1496,9 +1678,7 @@ def test_http_download_if_modified_branches(tmp_path: Path, monkeypatch: pytest.
             return _Resp()
 
     downloader._client = _Client()  # type: ignore[assignment]
-    status_code_304, payload_304 = _run(
-        downloader._http_download_if_modified("https://example.com/b", '"etag"', "Mon")
-    )
+    status_code_304, payload_304 = _run(downloader._http_download_if_modified("https://example.com/b", '"etag"', "Mon"))
     assert status_code_304 == 304
     assert payload_304 is None
 
@@ -1517,7 +1697,7 @@ def test_http_private_methods_retry_and_failure(tmp_path: Path, monkeypatch: pyt
         AssertionError: 断言失败时抛出。
     """
 
-    downloader = SecDownloader(workspace_root=tmp_path)
+    downloader = SecDownloader(workspace_root=tmp_path, user_agent="UA")
     downloader.configure(user_agent="UA", sleep_seconds=0.0, max_retries=2)
 
     class _ErrClient:
@@ -1537,15 +1717,25 @@ def test_http_private_methods_retry_and_failure(tmp_path: Path, monkeypatch: pyt
             return None
 
     downloader._client = _ErrClient()  # type: ignore[assignment]
-    with pytest.raises(RuntimeError, match="GET JSON 失败"):
+    with pytest.raises(FinsDownloadProviderError) as json_error:
         _run(downloader._http_get_json("https://example.com/a.json"))
-    with pytest.raises(RuntimeError, match="下载失败"):
+    assert json_error.value.transport_category is FinsDownloadTransportCategory.CONNECTION
+    with pytest.raises(FinsDownloadProviderError):
         _run(downloader._http_download("https://example.com/a.bin"))
-    with pytest.raises(RuntimeError, match="GET bytes 失败"):
+    with pytest.raises(FinsDownloadProviderError):
         _run(downloader._http_get_bytes("https://example.com/a.xml"))
-    with pytest.raises(RuntimeError, match="条件下载失败"):
+    with pytest.raises(FinsDownloadProviderError):
         _run(downloader._http_download_if_modified("https://example.com/a.bin", '"etag"', "Mon"))
+    warn_logs: list[str] = []
+    monkeypatch.setattr(
+        sec_downloader_module.Log,
+        "warn",
+        lambda message, *, module: warn_logs.append(f"{module}:{message}"),
+    )
     assert _run(downloader._http_head("https://example.com/a.bin", allow_redirects=True)) is None
+    assert "transport_category=connection" in "\n".join(warn_logs)
+    assert "example.com" not in "\n".join(warn_logs)
+    assert "boom" not in "\n".join(warn_logs)
 
     async def _fake_sleep(seconds: float) -> None:
         _sleep_calls.append(seconds)
@@ -1565,6 +1755,7 @@ def test_http_private_methods_retry_and_failure(tmp_path: Path, monkeypatch: pyt
     # 用 stub 替换 sec_downloader 模块内的 time.monotonic，使 elapsed = 0，
     # 从而 wait = sleep_seconds = 0.2，避免依赖宿主机时钟粒度造成 flaky。
     import dayu.fins.downloaders.sec_downloader as _sd
+
     monkeypatch.setattr(_sd.time, "monotonic", lambda: 1000.0)
     downloader._last_request_time = _sd.time.monotonic()
     _run(downloader._rate_limit())
@@ -1627,7 +1818,7 @@ def test_sec_request_debug_logs_success_response(
     sleep_calls: list[float] = []
     monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
 
-    downloader = SecDownloader(workspace_root=tmp_path)
+    downloader = SecDownloader(workspace_root=tmp_path, user_agent="UA")
     downloader.configure(user_agent="UA", sleep_seconds=0.0, max_retries=1)
     monkeypatch.setattr(downloader, "_reserve_global_request_slot", _fake_reserve)
     downloader._client = _Client()  # type: ignore[assignment]
@@ -1635,8 +1826,9 @@ def test_sec_request_debug_logs_success_response(
     assert _run(downloader._http_get_json("https://example.com/api.json")) == {"ok": True}
 
     log_text = log_stream.getvalue()
-    assert "SEC request reserved: method=GET url=https://example.com/api.json" in log_text
-    assert "SEC response received: method=GET url=https://example.com/api.json" in log_text
+    assert "SEC request reserved: method=GET" in log_text
+    assert "SEC response received: method=GET" in log_text
+    assert "https://example.com" not in log_text
     assert "status_code=200" in log_text
     assert "attempt=1" in log_text
     assert "shared_throttle_wait_seconds=1.250000" in log_text
@@ -1693,7 +1885,7 @@ def test_sec_request_diagnostics_do_not_log_below_debug(
 
             return None
 
-    downloader = SecDownloader(workspace_root=tmp_path)
+    downloader = SecDownloader(workspace_root=tmp_path, user_agent="UA")
     downloader.configure(user_agent="UA", sleep_seconds=0.0, max_retries=1)
     monkeypatch.setattr(downloader, "_reserve_global_request_slot", _fake_reserve)
     downloader._client = _Client()  # type: ignore[assignment]
@@ -1708,8 +1900,11 @@ def test_sec_request_diagnostics_do_not_log_below_debug(
     _run(downloader.close())
 
 
-def test_try_fetch_index_items_and_helper_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """验证 index 拉取失败分支与若干工具函数边界。
+def test_file_evidence_helpers_propagate_provider_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """三种 filing evidence helper 都不得把 provider failure 降级为空证据。
 
     Args:
         tmp_path: pytest 临时目录。
@@ -1724,21 +1919,44 @@ def test_try_fetch_index_items_and_helper_paths(tmp_path: Path, monkeypatch: pyt
 
     downloader = _create_downloader(tmp_path)
 
-    async def _raise_runtime(
+    expected = FinsDownloadProviderError(
+        source=FinsDownloadSource.SEC,
+        transport_category=FinsDownloadTransportCategory.TIMEOUT,
+        retryable=True,
+        safe_message="SEC 来源请求超时",
+    )
+
+    async def _raise_provider_json(
         url: str,
         cancellation_checker: Callable[[], bool] | None = None,
     ) -> dict[str, JsonValue]:
         del url, cancellation_checker
-        raise RuntimeError("bad index")
+        raise expected
 
-    monkeypatch.setattr(downloader, "_http_get_json", _raise_runtime)
-    assert _run(downloader._try_fetch_index_items("320193", "000032019325000001")) == []
-    monkeypatch.setattr(
-        downloader,
-        "_http_get_bytes",
-        lambda url, cancellation_checker=None: b"",
-    )
-    assert _run(downloader._try_fetch_index_header_documents("320193", "000032019325000001")) == []
+    async def _raise_provider_bytes(
+        url: str,
+        cancellation_checker: Callable[[], bool] | None = None,
+    ) -> bytes:
+        del url, cancellation_checker
+        raise expected
+
+    monkeypatch.setattr(downloader, "_http_get_json", _raise_provider_json)
+    with pytest.raises(FinsDownloadProviderError) as index_error:
+        _run(downloader._try_fetch_index_items("320193", "000032019325000001"))
+    assert index_error.value is expected
+
+    monkeypatch.setattr(downloader, "_http_get_bytes", _raise_provider_bytes)
+    with pytest.raises(FinsDownloadProviderError) as header_error:
+        _run(downloader._try_fetch_index_header_documents("320193", "000032019325000001"))
+    assert header_error.value is expected
+    with pytest.raises(FinsDownloadProviderError) as linked_error:
+        _run(
+            downloader._try_fetch_primary_linked_html_files(
+                "https://example.invalid/archive/",
+                "primary.htm",
+            )
+        )
+    assert linked_error.value is expected
 
     assert downloader._build_headers()["User-Agent"] == "UA"
     assert downloader._build_headers()["Accept-Encoding"] == "gzip, deflate"
@@ -1771,13 +1989,36 @@ def test_missing_sec_user_agent_warning_names_config_fact(
     log_stream = StringIO()
     runtime_log.configure(level=runtime_log.LogLevel.WARNING, stream=log_stream)
 
+    class _Client:
+        """统计是否发生 HTTP 调用的客户端桩。"""
+
+        def __init__(self) -> None:
+            """初始化调用计数。"""
+
+            self.calls = 0
+
+        async def get(self, **kwargs: JsonValue) -> httpx.Response:
+            """记录意外的 GET 调用。"""
+
+            del kwargs
+            self.calls += 1
+            return httpx.Response(200)
+
     downloader = SecDownloader(workspace_root=tmp_path)
+    client = _Client()
+    downloader._client = client  # type: ignore[assignment]
+    downloader.configure(user_agent=None, sleep_seconds=0.0, max_retries=1)
+
+    assert "SEC User-Agent 未配置:" not in log_stream.getvalue()
+    with pytest.raises(SecUserAgentConfigurationError):
+        _run(downloader._http_get_json("https://contact-canary.invalid/payload"))
 
     warning_text = log_stream.getvalue()
-    assert SEC_USER_AGENT_ENV in warning_text
+    assert warning_text.count(SEC_USER_AGENT_ENV) == 1
     # 保持拼接形式，避免 Fins 源码扫描把否定断言误判为 CLI 命令名残留。
     assert "dayu" + "-cli" not in warning_text
-    assert downloader._build_headers()["User-Agent"]
+    assert client.calls == 0
+    assert "contact-canary" not in log_stream.getvalue()
 
 
 def test_parse_index_header_document_entries_from_escaped_payload() -> None:
@@ -1849,14 +2090,20 @@ def test_parse_href_and_primary_selector_fallbacks() -> None:
     assert accession == "0000000000-25-000777"
     assert cik == "1000"
 
-    assert _select_primary_from_index_items(
-        items=[{"name": "a.xml"}, {"name": "main.htm"}],
-        form_type="10-K",
-    ) == "main.htm"
-    assert _select_primary_from_index_items(
-        items=[{"name": ""}, {"name": "fallback.bin"}],
-        form_type="10-K",
-    ) == "fallback.bin"
+    assert (
+        _select_primary_from_index_items(
+            items=[{"name": "a.xml"}, {"name": "main.htm"}],
+            form_type="10-K",
+        )
+        == "main.htm"
+    )
+    assert (
+        _select_primary_from_index_items(
+            items=[{"name": ""}, {"name": "fallback.bin"}],
+            form_type="10-K",
+        )
+        == "fallback.bin"
+    )
 
 
 def test_parse_retry_after() -> None:
@@ -1934,7 +2181,7 @@ def test_throttle_retry_on_503(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
 
     monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
 
-    downloader = SecDownloader(workspace_root=tmp_path)
+    downloader = SecDownloader(workspace_root=tmp_path, user_agent="UA")
     downloader.configure(user_agent="UA", sleep_seconds=0.0, max_retries=1)
     downloader._client.get = _mock_get  # type: ignore[assignment]
 
@@ -1944,7 +2191,8 @@ def test_throttle_retry_on_503(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     assert call_count == 3
     # 确保 503 触发了 10 分钟恢复窗口
     assert any(s >= 600.0 for s in sleep_calls)
-    assert "SEC 限流 503: url=https://example.com/api.json" in log_stream.getvalue()
+    assert "SEC 限流 503" in log_stream.getvalue()
+    assert "https://example.com" not in log_stream.getvalue()
     state = _load_sec_throttle_state(downloader._throttle_state_path)
     assert state.cooldown_until > 0
 
@@ -1973,7 +2221,7 @@ def test_conditional_download_reuses_shared_throttle_retry_strategy(
 
     monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
 
-    downloader = SecDownloader(workspace_root=tmp_path)
+    downloader = SecDownloader(workspace_root=tmp_path, user_agent="UA")
     downloader.configure(user_agent="UA", sleep_seconds=0.0, max_retries=1)
     downloader._client.get = _mock_get  # type: ignore[assignment]
 
@@ -2015,3 +2263,162 @@ def test_rate_limit_uses_shared_state_across_instances(
     state = _load_sec_throttle_state(downloader_a._throttle_state_path)
     assert state.next_request_at == pytest.approx(1000.24)
     assert state.cooldown_until == pytest.approx(0.0)
+
+
+def test_download_files_stream_materializes_only_shared_prefetch_core(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """组合 API 必须只消费 typed prefetch core 并由唯一 materializer 调 callback。"""
+
+    downloader = _create_downloader(tmp_path)
+    downloaded = RemoteFileDescriptor(
+        name="downloaded.htm",
+        source_url="https://example.com/downloaded.htm",
+        http_etag="etag",
+        http_last_modified=None,
+        remote_size=7,
+        http_status=200,
+    )
+    skipped = RemoteFileDescriptor(
+        name="skipped.xml",
+        source_url="https://example.com/skipped.xml",
+        http_etag="etag-old",
+        http_last_modified=None,
+        remote_size=3,
+        http_status=200,
+    )
+    failed = RemoteFileDescriptor(
+        name="failed.xsd",
+        source_url="https://example.com/failed.xsd",
+        http_etag=None,
+        http_last_modified=None,
+        remote_size=None,
+        http_status=503,
+    )
+    observed_allow_not_modified: list[bool] = []
+
+    async def fake_prefetch(
+        remote_files: list[RemoteFileDescriptor],
+        *,
+        allow_not_modified: bool,
+        existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
+        primary_document: Optional[str] = None,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> AsyncIterator[_PrefetchEvent]:
+        """返回完整 control/payload variant matrix。"""
+
+        del remote_files, existing_files, primary_document, cancellation_checker
+        observed_allow_not_modified.append(allow_not_modified)
+        yield _PrefetchStarted(descriptor=downloaded)
+        yield _PrefetchedFile(
+            descriptor=downloaded,
+            http_status=200,
+            content=b"payload",
+        )
+        yield _PrefetchStarted(descriptor=skipped)
+        yield _PrefetchSkipped(
+            descriptor=skipped,
+            http_status=304,
+            reason_code="not_modified",
+            reason_message="未修改",
+        )
+        yield _PrefetchStarted(descriptor=failed)
+        yield _PrefetchFailed(
+            descriptor=failed,
+            http_status=503,
+            reason_code="provider_unavailable",
+            reason_message="来源暂不可用",
+            error="来源暂不可用",
+        )
+
+    monkeypatch.setattr(downloader, "prefetch_files_stream", fake_prefetch)
+    store = StoreStub()
+
+    async def collect() -> list[DownloaderEvent]:
+        """收集真实组合 API 输出。"""
+
+        return [
+            event
+            async for event in downloader.download_files_stream(
+                [downloaded, skipped, failed],
+                overwrite=False,
+                store_file=store,
+                batch=_TEST_BATCH,
+            )
+        ]
+
+    events = _run(collect())
+
+    assert observed_allow_not_modified == [True]
+    assert store.calls == [("downloaded.htm", b"payload")]
+    assert [event.event_type for event in events] == [
+        "file_download_started",
+        "file_downloaded",
+        "file_download_started",
+        "file_skipped",
+        "file_download_started",
+        "file_failed",
+    ]
+
+
+def test_download_files_stream_aclose_finalizes_shared_prefetch_generator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """组合 stream 提前关闭时必须同步 finalize 内层 prefetch generator。"""
+
+    downloader = _create_downloader(tmp_path)
+    descriptor = RemoteFileDescriptor(
+        name="primary.htm",
+        source_url="https://example.com/primary.htm",
+        http_etag=None,
+        http_last_modified=None,
+        remote_size=None,
+        http_status=200,
+    )
+    finalized: list[bool] = []
+
+    async def fake_prefetch(
+        remote_files: list[RemoteFileDescriptor],
+        *,
+        allow_not_modified: bool,
+        existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
+        primary_document: Optional[str] = None,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> AsyncIterator[_PrefetchEvent]:
+        """产生首个事件，并在 generator finalization 时记录事实。"""
+
+        del allow_not_modified, existing_files, primary_document, cancellation_checker
+        try:
+            yield _PrefetchStarted(descriptor=remote_files[0])
+            yield _PrefetchedFile(
+                descriptor=remote_files[0],
+                http_status=200,
+                content=b"payload",
+            )
+        finally:
+            finalized.append(True)
+
+    monkeypatch.setattr(downloader, "prefetch_files_stream", fake_prefetch)
+
+    async def consume_one_then_close() -> DownloaderEvent:
+        """读取一个事件后显式关闭真实组合 generator。"""
+
+        stream = cast(
+            AsyncGenerator[DownloaderEvent, None],
+            downloader.download_files_stream(
+                [descriptor],
+                overwrite=True,
+                store_file=StoreStub(),
+                batch=_TEST_BATCH,
+            ),
+        )
+        first = await anext(stream)
+        await stream.aclose()
+        return first
+
+    first = _run(consume_one_then_close())
+
+    assert first.event_type == "file_download_started"
+    assert finalized == [True]

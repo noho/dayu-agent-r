@@ -12,8 +12,8 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timezone
-from pathlib import Path
-from threading import Event, Lock as ThreadingLock, Thread
+from pathlib import Path, PurePosixPath
+from threading import Event, Lock as ThreadingLock, Thread, current_thread, enumerate as enumerate_threads
 from typing import cast
 
 import pytest
@@ -23,6 +23,8 @@ from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.source import Source
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.fins import ticker_normalization
+import dayu.fins.download_contract as download_contract
+from dayu.fins.downloaders.sec_downloader import SEC_USER_AGENT_ENV
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins import ingestion_runtime
 from dayu.fins.direct_events import (
@@ -30,6 +32,7 @@ from dayu.fins.direct_events import (
     FinsEvent,
     FinsEventType,
     FinsOperationKind,
+    FinsPublicFailureKind,
     FinsResultStatus,
 )
 from dayu.fins.direct_event_text import (
@@ -43,6 +46,17 @@ from dayu.fins.direct_event_text import (
     wait_cancelled_hint,
     wait_cancelled_message,
     wait_failed_hint,
+)
+from dayu.fins.download_contract import (
+    FinsDownloadDocumentDisposition,
+    FinsDownloadDocumentResult,
+    FinsDownloadEffectiveFilters,
+    FinsDownloadProviderError,
+    FinsDownloadResultSummary,
+    FinsDownloadSource,
+    FinsDownloadTerminalDisposition,
+    FinsDownloadTransportCategory,
+    build_fins_download_request,
 )
 from dayu.fins.ingestion_events import (
     FinsIngestionJobEventAppend,
@@ -68,8 +82,6 @@ from dayu.fins.ingestion_runtime import (
     FinsDownloadedFile,
     FinsDownloadedSourceDocument,
     FinsDownloadProgressEvent,
-    FinsDownloadRequest,
-    FinsDownloadResultSummary,
     FinsJobCancellationChecker,
     FinsIngestionExecutor,
     FinsIngestionOperationKind,
@@ -106,6 +118,130 @@ from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_
 from dayu.fins.storage.repository_protocols import SourceSnapshotProtocol
 from dayu.fins.ticker_normalization import NormalizedTicker
 from dayu.fins.tools.read_runtime import FinsReadRuntime
+import dayu.runtime.log as runtime_log
+
+
+def _typed_download_summary(
+    *,
+    canonical_ticker: str = "AAPL",
+    downloaded_ids: tuple[str, ...] = (),
+    skipped_ids: tuple[str, ...] = (),
+    rejected_ids: tuple[str, ...] = (),
+    failed_ids: tuple[str, ...] = (),
+    rebuild_local_artifacts: bool = False,
+) -> FinsDownloadResultSummary:
+    """构造满足 owner-level 守恒约束的测试下载摘要。
+
+    Args:
+        canonical_ticker: canonical ticker。
+        downloaded_ids: 下载成功文档 ID。
+        skipped_ids: 跳过文档 ID。
+        rejected_ids: 拒绝文档 ID。
+        failed_ids: 失败文档 ID。
+        rebuild_local_artifacts: effective local rebuild 标记。
+
+    Returns:
+        计数与 typed rows 同源的下载摘要。
+
+    Raises:
+        ValueError: 输入违反生产契约时抛出。
+    """
+
+    rows = tuple(
+        FinsDownloadDocumentResult(
+            document_id=document_id,
+            form_or_period="10-K",
+            filing_date="2024-08-01",
+            report_date="2024-06-30",
+            covered_fiscal_periods=(),
+            disposition=FinsDownloadDocumentDisposition.DOWNLOADED,
+            reason_category=None,
+            reason_message=None,
+            artifact_locator=PurePosixPath("source", document_id),
+        )
+        for document_id in downloaded_ids
+    )
+    rows += tuple(
+        FinsDownloadDocumentResult(
+            document_id=document_id,
+            form_or_period="10-K",
+            filing_date="2024-08-01",
+            report_date="2024-06-30",
+            covered_fiscal_periods=(),
+            disposition=disposition,
+            reason_category=reason_category,
+            reason_message=reason_message,
+            artifact_locator=None,
+        )
+        for disposition, reason_category, reason_message, document_ids in (
+            (FinsDownloadDocumentDisposition.SKIPPED, "already_present", "本地已存在完整文档", skipped_ids),
+            (FinsDownloadDocumentDisposition.REJECTED, "form_filter", "文档不符合筛选条件", rejected_ids),
+            (FinsDownloadDocumentDisposition.FAILED, "provider_failure", "来源未能完成文档下载", failed_ids),
+        )
+        for document_id in document_ids
+    )
+    return FinsDownloadResultSummary.from_document_rows(
+        source=FinsDownloadSource.SEC,
+        canonical_ticker=canonical_ticker,
+        effective_filters=FinsDownloadEffectiveFilters(
+            form_types=(),
+            start_date=None,
+            end_date=None,
+            overwrite_existing=False,
+            rebuild_local_artifacts=rebuild_local_artifacts,
+        ),
+        document_rows=rows,
+    )
+
+
+def test_public_download_json_preserves_cn_coverage_and_sec_empty_array() -> None:
+    """runtime public projection 与 JSON serializer 原样保留 coverage array。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: CN coverage 被重算或 SEC 空数组缺失时抛出。
+    """
+
+    cn_row = FinsDownloadDocumentResult(
+        document_id="fil-cn-q4",
+        form_or_period="Q4",
+        filing_date="2025-03-31",
+        report_date=None,
+        covered_fiscal_periods=("FY", "Q4"),
+        disposition=FinsDownloadDocumentDisposition.SKIPPED,
+        reason_category="already_present",
+        reason_message="本地已有完整文档",
+        artifact_locator=None,
+    )
+    cn_summary = FinsDownloadResultSummary.from_document_rows(
+        source=FinsDownloadSource.HKEXNEWS,
+        canonical_ticker="0005",
+        effective_filters=FinsDownloadEffectiveFilters(
+            form_types=("FY", "H1"),
+            start_date=None,
+            end_date=None,
+            overwrite_existing=False,
+            rebuild_local_artifacts=False,
+        ),
+        document_rows=(cn_row,),
+        missing_periods=("FY", "H1"),
+    )
+    sec_summary = _typed_download_summary(canonical_ticker="AAPL", skipped_ids=("fil-sec",))
+
+    cn_json = ingestion_runtime._public_download_summary(cn_summary).to_json_value()
+    sec_json = ingestion_runtime._public_download_summary(sec_summary).to_json_value()
+    cn_round_trip = json.loads(json.dumps(cn_json, ensure_ascii=False))
+    sec_round_trip = json.loads(json.dumps(sec_json, ensure_ascii=False))
+
+    assert cn_round_trip["documents"][0]["form_or_period"] == "Q4"
+    assert cn_round_trip["documents"][0]["covered_fiscal_periods"] == ["FY", "Q4"]
+    assert sec_round_trip["documents"][0]["form_or_period"] == "10-K"
+    assert sec_round_trip["documents"][0]["covered_fiscal_periods"] == []
 
 
 class _CommitFailingDownloadBatchingRepository(FsBatchingRepository):
@@ -321,9 +457,7 @@ def test_direct_event_text_helper_owns_progress_and_wait_copy() -> None:
     assert wait_failed_hint() == "请检查财报处理摘要，必要时重新发起对应操作。"
     assert wait_cancelled_message() == "财报处理已取消。"
     assert wait_cancelled_hint() == "如仍需要该财报资料，请重新发起对应操作。"
-    visible_wait_text = " ".join(
-        (wait_failed_hint(), wait_cancelled_message(), wait_cancelled_hint())
-    )
+    visible_wait_text = " ".join((wait_failed_hint(), wait_cancelled_message(), wait_cancelled_hint()))
     for forbidden in ("Host", "Engine", "wait", "poll", "runtime", "Fins ingestion"):
         assert forbidden not in visible_wait_text
 
@@ -578,14 +712,7 @@ class _PersistedSummaryDownloadAdapter(FinsSourceDownloadAdapter):
         """
 
         self.requests: list[FinsSourceDownloadAdapterRequest] = []
-        self.summary = summary or FinsDownloadResultSummary(
-            discovered_count=1,
-            downloaded_count=0,
-            skipped_count=1,
-            rejected_count=0,
-            failed_count=0,
-            written_document_ids=(),
-        )
+        self.summary = summary or _typed_download_summary(skipped_ids=("aapl-existing-10k",))
 
     def download(self, request: FinsSourceDownloadAdapterRequest) -> FinsSourceDownloadAdapterResult:
         """记录请求并返回已持久化摘要。
@@ -602,6 +729,64 @@ class _PersistedSummaryDownloadAdapter(FinsSourceDownloadAdapter):
 
         self.requests.append(request)
         return FinsSourceDownloadAdapterResult(discovered_count=1, persisted_summary=self.summary)
+
+
+class _ProviderFailureDownloadAdapter(FinsSourceDownloadAdapter):
+    """抛出 owner-mapped provider transport error 的测试 adapter。"""
+
+    def download(self, request: FinsSourceDownloadAdapterRequest) -> FinsSourceDownloadAdapterResult:
+        """抛出不携带底层敏感内容的 typed provider failure。
+
+        Args:
+            request: runtime 传入的下载请求。
+
+        Returns:
+            永不返回。
+
+        Raises:
+            FinsDownloadProviderError: 固定 connection 分类失败。
+        """
+
+        assert request.source is FinsDownloadSource.SEC
+        raw_error = RuntimeError("contact-canary@example.invalid https://provider.invalid /Users/private/raw.json")
+        raise FinsDownloadProviderError(
+            source=FinsDownloadSource.SEC,
+            transport_category=FinsDownloadTransportCategory.CONNECTION,
+            retryable=True,
+            safe_message="无法连接 SEC 来源",
+        ) from raw_error
+
+
+class _OperationFailureDownloadAdapter(FinsSourceDownloadAdapter):
+    """原样抛出预构造 storage/execution exception 的测试 adapter。"""
+
+    def __init__(self, failure: Exception) -> None:
+        """保存 adapter 调用时应抛出的异常。
+
+        Args:
+            failure: 预构造 owner exception。
+
+        Raises:
+            无。
+        """
+
+        self.failure = failure
+
+    def download(self, request: FinsSourceDownloadAdapterRequest) -> FinsSourceDownloadAdapterResult:
+        """原样抛出预构造异常。
+
+        Args:
+            request: runtime typed request。
+
+        Returns:
+            永不返回。
+
+        Raises:
+            Exception: 预构造 owner exception。
+        """
+
+        del request
+        raise self.failure
 
 
 class _ProgressReportingDownloadAdapter(FinsSourceDownloadAdapter):
@@ -632,7 +817,15 @@ class _ProgressReportingDownloadAdapter(FinsSourceDownloadAdapter):
             request.progress_sink(
                 FinsDownloadProgressEvent(
                     stage="download.conversion_started",
-                    message="开始 convert",
+                    message="开始转换文档",
+                    document_id="fil-test",
+                    file_name="sample-10k_docling.json",
+                )
+            )
+            request.progress_sink(
+                FinsDownloadProgressEvent(
+                    stage="download.conversion_completed",
+                    message="完成转换文档",
                     document_id="fil-test",
                     file_name="sample-10k_docling.json",
                 )
@@ -647,14 +840,7 @@ class _ProgressReportingDownloadAdapter(FinsSourceDownloadAdapter):
             )
         return FinsSourceDownloadAdapterResult(
             discovered_count=1,
-            persisted_summary=FinsDownloadResultSummary(
-                discovered_count=1,
-                downloaded_count=1,
-                skipped_count=0,
-                rejected_count=0,
-                failed_count=0,
-                written_document_ids=("fil-test",),
-            ),
+            persisted_summary=_typed_download_summary(downloaded_ids=("fil-test",)),
         )
 
 
@@ -678,11 +864,7 @@ class _CancellationAwareDownloadAdapter(FinsSourceDownloadAdapter):
         request.cancellation_checker()
         return FinsSourceDownloadAdapterResult(
             discovered_count=1,
-            persisted_summary=FinsDownloadResultSummary(
-                discovered_count=1,
-                downloaded_count=1,
-                written_document_ids=("aapl-cancel-aware-10k",),
-            ),
+            persisted_summary=_typed_download_summary(downloaded_ids=("aapl-cancel-aware-10k",)),
         )
 
 
@@ -706,6 +888,9 @@ class _ConsumerAbortDownloadAdapter(FinsSourceDownloadAdapter):
         self.allow_cancellation_check = Event()
         self.cancellation_checks: tuple[bool, ...] = ()
         self.late_progress_returned = Event()
+        self.producer_thread_name: str | None = None
+        self.producer_thread_ident: int | None = None
+        self.producer_thread: Thread | None = None
 
     def download(self, request: FinsSourceDownloadAdapterRequest) -> FinsSourceDownloadAdapterResult:
         """等待 consumer abort，再观察取消并尝试一次 late progress。
@@ -721,12 +906,14 @@ class _ConsumerAbortDownloadAdapter(FinsSourceDownloadAdapter):
             ValueError: late progress 事件违反 typed contract 时抛出。
         """
 
+        producer_thread = current_thread()
+        self.producer_thread = producer_thread
+        self.producer_thread_name = producer_thread.name
+        self.producer_thread_ident = producer_thread.ident
         self.entered.set()
         if not self.allow_cancellation_check.wait(timeout=1.0):
             raise TimeoutError("consumer abort cancellation check was not released")
-        self.cancellation_checks = self.cancellation_checks + (
-            request.cancellation_checker(),
-        )
+        self.cancellation_checks = self.cancellation_checks + (request.cancellation_checker(),)
         if request.progress_sink is not None:
             request.progress_sink(
                 FinsDownloadProgressEvent(
@@ -739,11 +926,7 @@ class _ConsumerAbortDownloadAdapter(FinsSourceDownloadAdapter):
         self.late_progress_returned.set()
         return FinsSourceDownloadAdapterResult(
             discovered_count=1,
-            persisted_summary=FinsDownloadResultSummary(
-                discovered_count=1,
-                downloaded_count=1,
-                written_document_ids=("fil-late-after-abort",),
-            ),
+            persisted_summary=_typed_download_summary(downloaded_ids=("fil-late-after-abort",)),
         )
 
 
@@ -858,21 +1041,21 @@ class _BlockingArtifactUploadRunner(FinsUploadRunner):
             )
             self.source_repository.create_source_document(
                 SourceDocumentUpsertRequest(
-                ticker=request.ticker,
-                document_id=self.document_id,
-                internal_document_id=self.document_id,
-                form_type="10-K",
-                primary_document=filename,
-                meta={
-                    "fiscal_year": 2024,
-                    "fiscal_period": "FY",
-                    "filing_date": "2024-11-01",
-                    "report_date": "2024-09-28",
-                    "amended": False,
-                    "ingest_method": "upload",
-                    "source_provider": FinsSourceProvider.USER_UPLOAD.to_storage_value(),
-                },
-                files=[file_meta],
+                    ticker=request.ticker,
+                    document_id=self.document_id,
+                    internal_document_id=self.document_id,
+                    form_type="10-K",
+                    primary_document=filename,
+                    meta={
+                        "fiscal_year": 2024,
+                        "fiscal_period": "FY",
+                        "filing_date": "2024-11-01",
+                        "report_date": "2024-09-28",
+                        "amended": False,
+                        "ingest_method": "upload",
+                        "source_provider": FinsSourceProvider.USER_UPLOAD.to_storage_value(),
+                    },
+                    files=[file_meta],
                 ),
                 SourceKind.FILING,
                 batch=batch,
@@ -993,6 +1176,167 @@ class _NeverCancelledToken(CancellationToken):
         """
 
         return None
+
+
+class _MutableCancellationToken(CancellationToken):
+    """由测试 barrier 显式请求取消的 token。"""
+
+    def __init__(self, *, cancelled: bool = False) -> None:
+        """初始化取消状态。
+
+        Args:
+            cancelled: 是否从首个 checkpoint 开始已取消。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self._cancelled = Event()
+        if cancelled:
+            self._cancelled.set()
+
+    def request_cancel(self) -> None:
+        """请求取消。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self._cancelled.set()
+
+    def is_cancelled(self) -> bool:
+        """返回当前取消状态。
+
+        Returns:
+            已请求取消时返回 ``True``。
+        """
+
+        return self._cancelled.is_set()
+
+    def cancel_reason(self) -> str | None:
+        """返回测试取消原因。
+
+        Returns:
+            已取消时返回固定原因，否则返回 ``None``。
+        """
+
+        return "test-cancelled" if self.is_cancelled() else None
+
+    def requested_at(self) -> datetime | None:
+        """返回测试取消时间。
+
+        Returns:
+            已取消时返回固定 UTC 时间，否则返回 ``None``。
+        """
+
+        if not self.is_cancelled():
+            return None
+        return datetime(2026, 8, 10, tzinfo=timezone.utc)
+
+
+class _CancellationThenFailureDownloadAdapter(FinsSourceDownloadAdapter):
+    """在取消 barrier 后抛出 provider 异常的竞态测试 adapter。"""
+
+    def __init__(self) -> None:
+        """初始化跨线程 barrier 与 producer 证据。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.entered = Event()
+        self.release_failure = Event()
+        self.producer_thread_ident: int | None = None
+        self.producer_thread: Thread | None = None
+
+    def download(self, request: FinsSourceDownloadAdapterRequest) -> FinsSourceDownloadAdapterResult:
+        """等待 owner 请求取消后抛出迟到失败。
+
+        Args:
+            request: runtime 传入的 typed request。
+
+        Returns:
+            永不返回。
+
+        Raises:
+            TimeoutError: 测试未在有界时间内释放 barrier。
+            RuntimeError: 固定的迟到 provider 失败。
+        """
+
+        del request
+        self.producer_thread = current_thread()
+        self.producer_thread_ident = self.producer_thread.ident
+        self.entered.set()
+        if not self.release_failure.wait(timeout=1.0):
+            raise TimeoutError("late provider failure barrier was not released")
+        raise RuntimeError("late provider failure")
+
+
+class _ConsumerTaskCancelledDownloadAdapter(FinsSourceDownloadAdapter):
+    """在有界轮询中观察 consumer task cancellation 的 adapter。"""
+
+    def __init__(self) -> None:
+        """初始化 ready/observed/finished barriers 与线程证据。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.entered = Event()
+        self.cancellation_observed = Event()
+        self.finished = Event()
+        self.producer_thread_ident: int | None = None
+        self.producer_thread: Thread | None = None
+
+    def download(self, request: FinsSourceDownloadAdapterRequest) -> FinsSourceDownloadAdapterResult:
+        """等待 runtime owner 把 consumer task cancellation 投影到 checker。
+
+        Args:
+            request: runtime 传入的 typed request。
+
+        Returns:
+            固定 persisted summary。
+
+        Raises:
+            TimeoutError: owner 未在有界期限内请求取消。
+        """
+
+        self.producer_thread = current_thread()
+        self.producer_thread_ident = self.producer_thread.ident
+        self.entered.set()
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if request.cancellation_checker():
+                self.cancellation_observed.set()
+                self.finished.set()
+                return FinsSourceDownloadAdapterResult(
+                    discovered_count=1,
+                    persisted_summary=_typed_download_summary(downloaded_ids=("consumer-cancelled",)),
+                )
+            time.sleep(0.01)
+        self.finished.set()
+        raise TimeoutError("consumer task cancellation was not observed")
 
 
 class _ClaimRaceJobStore:
@@ -1368,9 +1712,8 @@ def test_default_runtime_instances_share_workspace_job_store_without_singleton(t
     second_ingestion = _build_ingestion_runtime(workspace_root, executor=second_executor)
 
     start = first_ingestion.start_download(
-        FinsDownloadRequest(
+        build_fins_download_request(
             ticker="AAPL",
-            source="sec",
             form_types=("10-K",),
         )
     )
@@ -1412,18 +1755,16 @@ def test_start_download_persists_queued_record_and_uses_public_ticker_normalizat
         calls.append(raw)
         return original_normalize(raw)
 
-    monkeypatch.setattr(ticker_normalization, "normalize_ticker", normalize_spy)
+    monkeypatch.setattr(download_contract, "normalize_ticker", normalize_spy)
 
-    start = runtime.start_download(
-        FinsDownloadRequest(
-            ticker="aapl.us",
-            source="sec",
-            form_types=("10-K", "10-Q"),
-            filed_after="2024-01-01",
-            filed_before="2024-12-31",
-            overwrite_existing=True,
-        )
+    request = build_fins_download_request(
+        ticker="aapl.us",
+        form_types=("10-K", "10-Q"),
+        start="2024-01-01",
+        end="2024-12-31",
+        overwrite_existing=True,
     )
+    start = runtime.start_download(request)
     record = runtime.read_job(start.job_id)
 
     assert calls == ["aapl.us"]
@@ -1476,7 +1817,6 @@ def test_store_downloaded_document_overwrite_failure_rolls_back_target_scope(tmp
             ticker="AAPL",
             document=document,
             overwrite_existing=True,
-            rebuild_processed=False,
         )
 
     assert runtime.source_repository.get_source_meta("AAPL", "aapl-2024-10k", SourceKind.FILING) == old_meta
@@ -1507,7 +1847,6 @@ def test_store_downloaded_document_create_failure_leaves_document_absent(tmp_pat
             ticker="AAPL",
             document=document,
             overwrite_existing=False,
-            rebuild_processed=False,
         )
 
     with pytest.raises(FileNotFoundError):
@@ -1561,7 +1900,6 @@ def test_store_downloaded_document_commit_failure_does_not_caller_rollback(tmp_p
             ticker="AAPL",
             document=document,
             overwrite_existing=False,
-            rebuild_processed=False,
         )
 
     assert batching_repository.caller_rollback_calls == 0
@@ -1630,8 +1968,7 @@ def test_store_rejected_artifact_double_failure_preserves_operation_identity(
     assert exc_info.value is operation_error
     assert exc_info.value.__cause__ is rollback_error
     assert exc_info.value.__notes__ == [
-        "rollback_batch failed; recovery evidence retained: "
-        "injected rejected artifact rollback failure"
+        "rollback_batch failed; recovery evidence retained: injected rejected artifact rollback failure"
     ]
     assert batching_repository.rollback_calls == 1
 
@@ -1684,8 +2021,7 @@ def test_preprocess_double_failure_preserves_operation_identity(
     assert exc_info.value is operation_error
     assert exc_info.value.__cause__ is rollback_error
     assert exc_info.value.__notes__ == [
-        "rollback_batch failed; recovery evidence retained: "
-        "injected preprocess rollback failure"
+        "rollback_batch failed; recovery evidence retained: injected preprocess rollback failure"
     ]
     assert batching_repository.rollback_calls == 1
 
@@ -1697,7 +2033,7 @@ def test_start_download_allows_sec_amended_form_type(tmp_path: Path) -> None:
     executor = _HoldingExecutor()
     runtime = _build_ingestion_runtime(workspace_root, executor=executor)
 
-    start = runtime.start_download(FinsDownloadRequest(ticker="AAPL", form_types=("10-K/A",)))
+    start = runtime.start_download(build_fins_download_request(ticker="AAPL", form_types=("10-K/A",)))
     record = runtime.read_job(start.job_id)
 
     assert record.status is FinsIngestionJobStatus.QUEUED
@@ -1714,7 +2050,10 @@ def test_download_start_cancel_between_create_and_submit_marks_job_cancelled_and
     runtime = _build_ingestion_runtime(workspace_root, executor=executor)
     token = _CancelOnSecondCheckToken()
 
-    start = runtime.start_download(FinsDownloadRequest(ticker="AAPL"), cancellation_token=token)
+    start = runtime.start_download(
+        build_fins_download_request(ticker="AAPL"),
+        cancellation_token=token,
+    )
     record = runtime.read_job(start.job_id)
 
     assert start.status is FinsIngestionJobStatus.CANCELLED
@@ -1723,14 +2062,14 @@ def test_download_start_cancel_between_create_and_submit_marks_job_cancelled_and
     assert executor.operations == []
 
 
-def test_start_download_still_rejects_path_separator_in_source(tmp_path: Path) -> None:
-    """下载来源标识仍应拒绝路径分隔符，避免 source-like 字段被当作路径片段。"""
+def test_download_request_rejects_csv_ticker_before_runtime(tmp_path: Path) -> None:
+    """下载 request owner 应在 runtime 前拒绝 CSV ticker。"""
 
     workspace_root = tmp_path / "fins-workspace"
-    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+    with pytest.raises(ValueError, match="只接受一个公司代码"):
+        build_fins_download_request(ticker="AAPL,MSFT")
 
-    with pytest.raises(ValueError, match="source 不得包含路径分隔符"):
-        runtime.start_download(FinsDownloadRequest(ticker="AAPL", source="../sec"))
+    assert not workspace_root.exists()
 
 
 def test_start_download_fake_adapter_writes_source_document_through_storage(tmp_path: Path) -> None:
@@ -1742,10 +2081,10 @@ def test_start_download_fake_adapter_writes_source_document_through_storage(tmp_
     ingestion = _build_ingestion_runtime(
         workspace_root,
         executor=executor,
-        download_adapters={("fake", "US"): adapter},
+        download_adapters={("sec", "US"): adapter},
     )
 
-    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="FAKE", form_types=("10-K",)))
+    start = ingestion.start_download(build_fins_download_request(ticker="AAPL", form_types=("10-K",)))
     executor.run_all()
     record = ingestion.read_job(start.job_id)
     progress_events = _progress_events(ingestion, start.job_id)
@@ -1770,7 +2109,7 @@ def test_start_download_fake_adapter_writes_source_document_through_storage(tmp_
         "download.completed",
     ]
     assert progress_events[0].payload["ticker"] == "AAPL"
-    assert progress_events[0].payload["source"] == "fake"
+    assert progress_events[0].payload["source"] == "sec"
     assert progress_events[0].payload["form_types"] == ["10-K"]
     assert progress_events[1].payload["downloaded_count"] == 1
     assert progress_events[1].payload["written_document_count"] == 1
@@ -1788,11 +2127,11 @@ async def test_direct_download_stream_writes_storage_and_does_not_create_job_rec
     ingestion = _build_ingestion_runtime(
         workspace_root,
         executor=executor,
-        download_adapters={("fake", "US"): adapter},
+        download_adapters={("sec", "US"): adapter},
     )
 
     events = await _collect_direct_events(
-        ingestion.download(FinsDownloadRequest(ticker="AAPL", source="FAKE", form_types=("10-K",)))
+        ingestion.download(build_fins_download_request(ticker="AAPL", form_types=("10-K",)))
     )
     runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
     source_meta = runtime.source_repository.get_source_meta("AAPL", "aapl-fake-10k", SourceKind.FILING)
@@ -1824,12 +2163,10 @@ async def test_direct_download_projects_adapter_file_progress_events(
     ingestion = _build_ingestion_runtime(
         workspace_root,
         executor=_HoldingExecutor(),
-        download_adapters={("fake", "US"): adapter},
+        download_adapters={("sec", "US"): adapter},
     )
 
-    events = await _collect_direct_events(
-        ingestion.download(FinsDownloadRequest(ticker="AAPL", source="FAKE"))
-    )
+    events = await _collect_direct_events(ingestion.download(build_fins_download_request(ticker="AAPL")))
     progress_events = [event for event in events if event.event_type is FinsEventType.PROGRESS]
     file_progress = [
         event
@@ -1839,7 +2176,7 @@ async def test_direct_download_projects_adapter_file_progress_events(
     conversion_progress = [
         event
         for event in progress_events
-        if event.progress is not None and event.progress.stage == "download.conversion_started"
+        if event.progress is not None and event.progress.stage.startswith("download.conversion_")
     ]
 
     file_progress_details: list[tuple[str, str | None, str]] = []
@@ -1850,8 +2187,13 @@ async def test_direct_download_projects_adapter_file_progress_events(
         ("download.file_started", "sample-10k.htm", "开始下载"),
         ("download.file_completed", "sample-10k.htm", "完成下载"),
     ]
-    assert [(event.document_label, event.message) for event in conversion_progress] == [
-        ("sample-10k_docling.json", "开始 convert"),
+    conversion_progress_details: list[tuple[str, str | None, str]] = []
+    for event in conversion_progress:
+        assert event.progress is not None
+        conversion_progress_details.append((event.progress.stage, event.document_label, event.message))
+    assert conversion_progress_details == [
+        ("download.conversion_started", "sample-10k_docling.json", "开始转换文档"),
+        ("download.conversion_completed", "sample-10k_docling.json", "完成转换文档"),
     ]
 
 
@@ -1863,47 +2205,46 @@ async def test_direct_download_result_details_preserve_exclusive_skipped_count(
 
     workspace_root = tmp_path / "fins-workspace"
     adapter = _PersistedSummaryDownloadAdapter(
-        FinsDownloadResultSummary(
-            discovered_count=18,
-            downloaded_count=15,
-            skipped_count=1,
-            rejected_count=2,
-            failed_count=0,
-            written_document_ids=tuple(f"fil-{index}" for index in range(15)),
+        _typed_download_summary(
+            canonical_ticker="FUTU",
+            downloaded_ids=tuple(f"fil-{index}" for index in range(15)),
+            skipped_ids=("fil-skipped",),
+            rejected_ids=("fil-rejected-1", "fil-rejected-2"),
         )
     )
     ingestion = _build_ingestion_runtime(
         workspace_root,
         executor=_HoldingExecutor(),
-        download_adapters={("fake", "US"): adapter},
+        download_adapters={("sec", "US"): adapter},
     )
 
-    events = await _collect_direct_events(
-        ingestion.download(FinsDownloadRequest(ticker="FUTU", source="FAKE"))
-    )
+    events = await _collect_direct_events(ingestion.download(build_fins_download_request(ticker="FUTU")))
     result_event = events[-1]
 
     assert result_event.result is not None
-    assert {detail.label: detail.value for detail in result_event.result.details} == {
-        "discovered": "18",
-        "downloaded": "15",
-        "skipped": "1",
-        "rejected": "2",
-        "failed": "0",
-        "written documents": "15",
-    }
+    assert result_event.result.details == ()
+    assert result_event.result.download is not None
+    assert result_event.result.download.discovered_count == 18
+    assert result_event.result.download.downloaded_count == 15
+    assert result_event.result.download.skipped_count == 1
+    assert result_event.result.download.rejected_count == 2
+    assert result_event.result.download.failed_count == 0
+    assert len(result_event.result.download.document_rows) == 10
+    assert result_event.result.download.omitted_count == 8
 
 
 @pytest.mark.asyncio
-async def test_direct_download_unsupported_source_returns_failure_result(tmp_path: Path) -> None:
-    """direct download adapter 失败应收口为 FAILURE RESULT，不得静默结束。"""
+async def test_direct_download_missing_adapter_returns_failure_result(tmp_path: Path) -> None:
+    """direct download 缺少目标 adapter 时应收口为 FAILURE RESULT。"""
 
     workspace_root = tmp_path / "fins-workspace"
-    ingestion = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
-
-    events = await _collect_direct_events(
-        ingestion.download(FinsDownloadRequest(ticker="AAPL", source="unknown"))
+    ingestion = _build_ingestion_runtime(
+        workspace_root,
+        executor=_HoldingExecutor(),
+        download_adapters={},
     )
+
+    events = await _collect_direct_events(ingestion.download(build_fins_download_request(ticker="AAPL")))
 
     assert events[0].event_type is FinsEventType.PROGRESS
     assert events[-1].event_type is FinsEventType.RESULT
@@ -1911,7 +2252,158 @@ async def test_direct_download_unsupported_source_returns_failure_result(tmp_pat
     assert events[-1].result.status is FinsResultStatus.FAILURE
     assert events[-1].result.exit_code == 1
     assert events[-1].result.error_message is not None
-    assert "不支持的下载来源" in events[-1].result.error_message
+    assert events[-1].result.error_message == "下载执行失败"
+    assert events[-1].result.download is not None
+    assert events[-1].result.download.discovered_count == 0
+    assert events[-1].result.failure is not None
+    assert events[-1].result.failure.safe_message == "下载执行失败"
+
+
+@pytest.mark.asyncio
+async def test_direct_download_projects_typed_provider_failure_without_raw_cause(
+    tmp_path: Path,
+) -> None:
+    """runtime 应投影 owner 分类且不读取 typed error 的敏感异常链。
+
+    Args:
+        tmp_path: runtime workspace 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: failure 分类、空摘要或脱敏边界漂移时抛出。
+    """
+
+    ingestion = _build_ingestion_runtime(
+        tmp_path / "fins-workspace",
+        executor=_HoldingExecutor(),
+        download_adapters={("sec", "US"): _ProviderFailureDownloadAdapter()},
+    )
+
+    events = await _collect_direct_events(ingestion.download(build_fins_download_request(ticker="AAPL")))
+    result = events[-1].result
+
+    assert result is not None
+    assert result.status is FinsResultStatus.FAILURE
+    assert result.error_kind is FinsErrorKind.PROVIDER
+    assert result.download is not None
+    assert result.download.discovered_count == 0
+    assert result.download.omitted_count == 0
+    assert result.download.terminal_disposition is FinsDownloadTerminalDisposition.FAILED
+    assert result.failure is not None
+    assert result.failure.transport_category is FinsDownloadTransportCategory.CONNECTION
+    serialized = str(result)
+    assert "contact-canary" not in serialized
+    assert "https://provider.invalid" not in serialized
+    assert "/Users/private" not in serialized
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "expected_error_kind", "expected_failure_kind", "expected_safe_message"),
+    [
+        (
+            OSError("/Users/private/contact-canary/source.json"),
+            FinsErrorKind.STORAGE,
+            FinsPublicFailureKind.STORAGE,
+            "下载产物读写失败",
+        ),
+        (
+            RuntimeError("raw https://secret.invalid/payload contact-canary@example.invalid"),
+            FinsErrorKind.EXECUTION,
+            FinsPublicFailureKind.EXECUTION,
+            "下载执行失败",
+        ),
+    ],
+)
+async def test_direct_download_projects_storage_and_execution_without_raw_text(
+    tmp_path: Path,
+    failure: Exception,
+    expected_error_kind: FinsErrorKind,
+    expected_failure_kind: FinsPublicFailureKind,
+    expected_safe_message: str,
+) -> None:
+    """runtime 只按异常 owner 类型投影 storage/execution，不复制 raw text。"""
+
+    ingestion = _build_ingestion_runtime(
+        tmp_path / "fins-workspace",
+        executor=_HoldingExecutor(),
+        download_adapters={
+            ("sec", "US"): _OperationFailureDownloadAdapter(failure),
+        },
+    )
+
+    events = await _collect_direct_events(ingestion.download(build_fins_download_request(ticker="AAPL")))
+    result = events[-1].result
+
+    assert result is not None
+    assert result.error_kind is expected_error_kind
+    assert result.failure is not None
+    assert result.failure.kind is expected_failure_kind
+    assert result.failure.safe_message == expected_safe_message
+    serialized = str(result)
+    assert "secret.invalid" not in serialized
+    assert "contact-canary" not in serialized
+    assert "/Users/private" not in serialized
+
+
+@pytest.mark.parametrize(
+    ("terminal", "is_allowed"),
+    [
+        (FinsDownloadTerminalDisposition.SUCCEEDED, True),
+        (FinsDownloadTerminalDisposition.FAILED, True),
+        (FinsDownloadTerminalDisposition.CANCELLED, True),
+        (FinsDownloadTerminalDisposition.PARTIAL_FAILURE, False),
+    ],
+)
+def test_download_summary_zero_candidate_terminal_override_matrix(
+    terminal: FinsDownloadTerminalDisposition,
+    is_allowed: bool,
+) -> None:
+    """零候选只接受正常 SUCCEEDED 或显式 FAILED/CANCELLED override。"""
+
+    def build_summary() -> FinsDownloadResultSummary:
+        """用当前 terminal 构造零候选 owner summary。"""
+
+        return FinsDownloadResultSummary(
+            source=FinsDownloadSource.SEC,
+            canonical_ticker="AAPL",
+            effective_filters=FinsDownloadEffectiveFilters(
+                form_types=(),
+                start_date=None,
+                end_date=None,
+                overwrite_existing=False,
+                rebuild_local_artifacts=False,
+            ),
+            discovered_count=0,
+            downloaded_count=0,
+            skipped_count=0,
+            rejected_count=0,
+            failed_count=0,
+            document_rows=(),
+            terminal_disposition=terminal,
+            missing_periods=(),
+        )
+
+    if is_allowed:
+        summary = build_summary()
+        assert summary.terminal_disposition is terminal
+    else:
+        with pytest.raises(ValueError, match="terminal_disposition"):
+            build_summary()
+
+
+def test_terminal_derivation_asserts_impossible_mixed_failure_counts() -> None:
+    """defensive discovered_count witness 非正时必须 assert，不得静默 fallback。"""
+
+    with pytest.raises(AssertionError, match="discovered_count"):
+        download_contract._terminal_disposition_from_counts(
+            discovered_count=0,
+            downloaded_count=1,
+            rejected_count=0,
+            failed_count=1,
+        )
 
 
 @pytest.mark.asyncio
@@ -1923,13 +2415,13 @@ async def test_direct_download_uses_operation_scoped_cancellation_token(tmp_path
     ingestion = _build_ingestion_runtime(
         workspace_root,
         executor=executor,
-        download_adapters={("cancel", "US"): _CancellationAwareDownloadAdapter()},
+        download_adapters={("sec", "US"): _CancellationAwareDownloadAdapter()},
     )
     token = _CancelOnSecondCheckToken()
 
     events = await _collect_direct_events(
         ingestion.download(
-            FinsDownloadRequest(ticker="AAPL", source="cancel"),
+            build_fins_download_request(ticker="AAPL"),
             cancellation_token=token,
         )
     )
@@ -1940,13 +2432,14 @@ async def test_direct_download_uses_operation_scoped_cancellation_token(tmp_path
     assert events[-1].result is not None
     assert events[-1].result.status is FinsResultStatus.CANCELLED
     assert events[-1].result.exit_code == 130
+    assert sum(event.event_type is FinsEventType.RESULT for event in events) == 1
 
 
 @pytest.mark.asyncio
-async def test_direct_consumer_abort_closes_raw_bridge_and_requests_cancellation(
+async def test_direct_download_very_early_cancel_skips_adapter_and_joins_thread(
     tmp_path: Path,
 ) -> None:
-    """consumer abort 必须经真实 raw generator finally 请求取消并阻止 late event。
+    """在 operation task 启动前已取消必须产生唯一终态并清理线程。
 
     Args:
         tmp_path: pytest 临时目录夹具。
@@ -1955,34 +2448,225 @@ async def test_direct_consumer_abort_closes_raw_bridge_and_requests_cancellation
         无。
 
     Raises:
+        AssertionError: adapter 被调用、终态非唯一或线程遗留时抛出。
+    """
+
+    adapter = _PersistedSummaryDownloadAdapter()
+    ingestion = _build_ingestion_runtime(
+        tmp_path / "fins-workspace",
+        executor=_HoldingExecutor(),
+        download_adapters={("sec", "US"): adapter},
+    )
+    events = await asyncio.wait_for(
+        _collect_direct_events(
+            ingestion.download(
+                build_fins_download_request(ticker="AAPL"),
+                cancellation_token=_MutableCancellationToken(cancelled=True),
+            )
+        ),
+        timeout=1.0,
+    )
+
+    result_events = tuple(event for event in events if event.event_type is FinsEventType.RESULT)
+    assert adapter.requests == []
+    assert len(result_events) == 1
+    assert result_events[0].result is not None
+    assert result_events[0].result.status is FinsResultStatus.CANCELLED
+    assert all(thread.name != "fins-direct-download" for thread in enumerate_threads())
+
+
+@pytest.mark.asyncio
+async def test_direct_cancel_wins_late_provider_failure_and_exhausts_after_join(
+    tmp_path: Path,
+) -> None:
+    """已生效取消必须压过迟到 provider 失败并在 join 后 clean exhaust。
+
+    Args:
+        tmp_path: pytest 临时目录夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 竞态终态、数量或线程 cleanup 不符合契约时抛出。
+    """
+
+    adapter = _CancellationThenFailureDownloadAdapter()
+    token = _MutableCancellationToken()
+    ingestion = _build_ingestion_runtime(
+        tmp_path / "fins-workspace",
+        executor=_HoldingExecutor(),
+        download_adapters={("sec", "US"): adapter},
+    )
+    collection_task = asyncio.create_task(
+        _collect_direct_events(
+            ingestion.download(
+                build_fins_download_request(ticker="AAPL"),
+                cancellation_token=token,
+            )
+        )
+    )
+    assert await asyncio.to_thread(adapter.entered.wait, 1.0)
+    token.request_cancel()
+    adapter.release_failure.set()
+
+    events = await asyncio.wait_for(collection_task, timeout=1.0)
+
+    result_events = tuple(event for event in events if event.event_type is FinsEventType.RESULT)
+    assert len(result_events) == 1
+    assert result_events[0].result is not None
+    assert result_events[0].result.status is FinsResultStatus.CANCELLED
+    assert adapter.producer_thread_ident is not None
+    assert adapter.producer_thread is not None
+    assert not adapter.producer_thread.is_alive()
+
+
+def test_direct_terminal_state_is_atomic_and_ignores_late_cancel_or_result() -> None:
+    """终态提交后的取消或第二终态不得改写 canonical outcome。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 原子终态仲裁失效时抛出。
+    """
+
+    state = ingestion_runtime._DirectStreamCancellationState.create()
+
+    assert state.claim_terminal(FinsResultStatus.SUCCESS) is FinsResultStatus.SUCCESS
+    assert not state.request_cancel()
+    assert state.claim_terminal(FinsResultStatus.FAILURE) is None
+
+    cancelled_state = ingestion_runtime._DirectStreamCancellationState.create()
+    assert cancelled_state.request_cancel()
+    assert cancelled_state.claim_terminal(FinsResultStatus.FAILURE) is FinsResultStatus.CANCELLED
+    assert cancelled_state.claim_terminal(FinsResultStatus.CANCELLED) is None
+
+    aborted_state = ingestion_runtime._DirectStreamCancellationState.create()
+    aborted_state.request_consumer_abort()
+    assert aborted_state.is_cancelled()
+    assert not aborted_state.request_cancel()
+    assert aborted_state.claim_terminal(FinsResultStatus.CANCELLED) is None
+    assert aborted_state._terminal_status is None
+
+
+@pytest.mark.asyncio
+async def test_direct_consumer_abort_closes_raw_bridge_and_requests_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """consumer abort 必须经真实 raw generator finally 请求取消并阻止 late event。
+
+    Args:
+        tmp_path: pytest 临时目录夹具。
+        monkeypatch: pytest monkeypatch 夹具。
+
+    Returns:
+        无。
+
+    Raises:
         AssertionError: raw close、取消因果链或 late-publication fence 失效时抛出。
     """
 
+    cancellation_states = _record_direct_cancellation_states(monkeypatch)
     workspace_root = tmp_path / "fins-workspace"
     adapter = _ConsumerAbortDownloadAdapter()
     ingestion = _build_ingestion_runtime(
         workspace_root,
         executor=_HoldingExecutor(),
-        download_adapters={("abort", "US"): adapter},
+        download_adapters={("sec", "US"): adapter},
     )
-    stream = ingestion.download(
-        FinsDownloadRequest(ticker="AAPL", source="abort")
-    )
+    stream = ingestion.download(build_fins_download_request(ticker="AAPL"))
 
     first_event = await anext(stream)
     assert first_event.event_type is FinsEventType.PROGRESS
     assert await asyncio.to_thread(adapter.entered.wait, 1.0)
 
-    await stream.aclose()
-    await stream.aclose()
-    adapter.allow_cancellation_check.set()
+    close_started = asyncio.Event()
 
-    assert await asyncio.to_thread(adapter.late_progress_returned.wait, 1.0)
+    async def close_stream() -> None:
+        """关闭 stream 并暴露 close task 已进入 owner boundary。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            BaseException: stream cleanup 异常原样透传。
+        """
+
+        close_started.set()
+        await stream.aclose()
+
+    close_task = asyncio.create_task(close_stream())
+    await asyncio.wait_for(close_started.wait(), timeout=1.0)
+    assert not close_task.done()
+    adapter.allow_cancellation_check.set()
+    await asyncio.wait_for(close_task, timeout=1.0)
+    await stream.aclose()
+
+    assert adapter.late_progress_returned.is_set()
     assert adapter.cancellation_checks == (True,)
+    assert adapter.producer_thread_name == "fins-direct-download"
+    assert adapter.producer_thread_ident is not None
+    assert adapter.producer_thread is not None
+    assert not adapter.producer_thread.is_alive()
+    assert len(cancellation_states) == 1
+    assert cancellation_states[0].is_consumer_aborted()
+    assert cancellation_states[0]._terminal_status is None
     with pytest.raises(StopAsyncIteration):
         await anext(stream)
     with pytest.raises(RuntimeError):
         _ = stream.terminal_result
+
+
+@pytest.mark.asyncio
+async def test_direct_consumer_task_cancel_waits_for_producer_cleanup_and_thread_join(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """consumer task cancellation 必须由 raw owner 等待 producer cleanup 与 join。
+
+    Args:
+        tmp_path: pytest 临时目录夹具。
+        monkeypatch: pytest monkeypatch 夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: cancellation 未传递、cleanup 未完成或线程遗留时抛出。
+    """
+
+    cancellation_states = _record_direct_cancellation_states(monkeypatch)
+    adapter = _ConsumerTaskCancelledDownloadAdapter()
+    ingestion = _build_ingestion_runtime(
+        tmp_path / "fins-workspace",
+        executor=_HoldingExecutor(),
+        download_adapters={("sec", "US"): adapter},
+    )
+    stream = ingestion.download(build_fins_download_request(ticker="AAPL"))
+    collection_task = asyncio.create_task(_collect_direct_events(stream))
+    assert await asyncio.to_thread(adapter.entered.wait, 1.0)
+
+    collection_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(collection_task, timeout=1.0)
+
+    assert adapter.cancellation_observed.is_set()
+    assert adapter.finished.is_set()
+    assert adapter.producer_thread_ident is not None
+    assert adapter.producer_thread is not None
+    assert not adapter.producer_thread.is_alive()
+    assert len(cancellation_states) == 1
+    assert cancellation_states[0].is_consumer_aborted()
+    assert cancellation_states[0]._terminal_status is None
+    await stream.aclose()
 
 
 def test_start_download_production_adapter_boundary_emits_progress_events(
@@ -2012,19 +2696,15 @@ def test_start_download_production_adapter_boundary_emits_progress_events(
         """
 
         del adapter
-        assert request.source == "sec"
+        assert request.source is FinsDownloadSource.SEC
         return FinsSourceDownloadAdapterResult(
             discovered_count=1,
-            persisted_summary=FinsDownloadResultSummary(
-                discovered_count=1,
-                downloaded_count=1,
-                written_document_ids=("aapl-production-10k",),
-            ),
+            persisted_summary=_typed_download_summary(downloaded_ids=("aapl-production-10k",)),
         )
 
     monkeypatch.setattr(SecDownloadAdapter, "download", fake_sec_download)
 
-    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="sec"))
+    start = ingestion.start_download(build_fins_download_request(ticker="AAPL"))
     record = _wait_terminal(ingestion, start.job_id)
     progress_events = _progress_events(ingestion, start.job_id)
 
@@ -2044,23 +2724,19 @@ def test_start_download_failed_count_emits_completed_with_failures_progress(tmp_
 
     workspace_root = tmp_path / "fins-workspace"
     adapter = _PersistedSummaryDownloadAdapter(
-        FinsDownloadResultSummary(
-            discovered_count=2,
-            downloaded_count=1,
-            skipped_count=0,
-            rejected_count=0,
-            failed_count=1,
-            written_document_ids=("aapl-partial-10k",),
+        _typed_download_summary(
+            downloaded_ids=("aapl-partial-10k",),
+            failed_ids=("aapl-failed-10q",),
         )
     )
     executor = _HoldingExecutor()
     ingestion = _build_ingestion_runtime(
         workspace_root,
         executor=executor,
-        download_adapters={("persisted", "US"): adapter},
+        download_adapters={("sec", "US"): adapter},
     )
 
-    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="persisted"))
+    start = ingestion.start_download(build_fins_download_request(ticker="AAPL"))
     executor.run_all()
     record = ingestion.read_job(start.job_id)
     progress_events = _progress_events(ingestion, start.job_id)
@@ -2075,19 +2751,25 @@ def test_start_download_failed_count_emits_completed_with_failures_progress(tmp_
     assert progress_events[1].payload["downloaded_count"] == 1
 
 
-def test_start_download_unsupported_source_writes_failed_terminal_record(tmp_path: Path) -> None:
-    """无 adapter 的 market/source 应返回明确 unsupported-source 失败。"""
+def test_start_download_missing_adapter_writes_failed_terminal_record(tmp_path: Path) -> None:
+    """无目标 adapter 时应返回明确 unsupported-source 失败。"""
 
     workspace_root = tmp_path / "fins-workspace"
-    ingestion = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
-
-    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="unknown"))
-    record = _wait_terminal(ingestion, start.job_id)
+    executor = _HoldingExecutor()
+    ingestion = _build_ingestion_runtime(
+        workspace_root,
+        executor=executor,
+        download_adapters={},
+    )
+    start = ingestion.start_download(build_fins_download_request(ticker="AAPL"))
+    executor.run_all()
+    record = ingestion.read_job(start.job_id)
 
     assert record.status is FinsIngestionJobStatus.FAILED
-    assert record.result_summary["failed_count"] == 1
+    assert record.result_summary["discovered_count"] == 0
+    assert record.result_summary["failed_count"] == 0
     assert "不支持的下载来源" in str(record.failure_summary["message"])
-    assert "source=unknown" in str(record.failure_summary["message"])
+    assert "source=sec" in str(record.failure_summary["message"])
     assert "market=US" in str(record.failure_summary["message"])
 
 
@@ -2111,6 +2793,41 @@ def test_default_runtime_registers_production_download_adapters(tmp_path: Path) 
     assert auto_hk_adapter is hk_adapter
 
 
+@pytest.mark.asyncio
+async def test_default_runtime_logs_missing_sec_user_agent_only_at_download_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """单次 production download 应在首次请求前记录一次缺配置诊断。
+
+    Args:
+        tmp_path: pytest 临时目录夹具。
+        monkeypatch: pytest 环境变量隔离夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 装配期报警、单次请求重复报警或失败分类漂移时抛出。
+    """
+
+    monkeypatch.delenv(SEC_USER_AGENT_ENV, raising=False)
+    log_stream = io.StringIO()
+    runtime_log.configure(level=runtime_log.LogLevel.WARNING, stream=log_stream)
+    ingestion = DefaultFinsRuntime.create(workspace_root=tmp_path / "fins-workspace").get_ingestion_runtime()
+
+    assert "SEC User-Agent 未配置:" not in log_stream.getvalue()
+
+    events = await _collect_direct_events(ingestion.download(build_fins_download_request(ticker="AAPL")))
+    result = events[-1].result
+
+    assert log_stream.getvalue().count("SEC User-Agent 未配置:") == 1
+    assert result is not None
+    assert result.status is FinsResultStatus.FAILURE
+    assert result.failure is not None
+    assert result.failure.transport_category is FinsDownloadTransportCategory.UNCONFIGURED
+
+
 def test_start_download_repeated_request_skips_existing_source_document(tmp_path: Path) -> None:
     """重复语义请求应由 runtime storage 语义确定性跳过已有源文档。"""
 
@@ -2120,13 +2837,13 @@ def test_start_download_repeated_request_skips_existing_source_document(tmp_path
     ingestion = _build_ingestion_runtime(
         workspace_root,
         executor=executor,
-        download_adapters={("fake", "US"): adapter},
+        download_adapters={("sec", "US"): adapter},
     )
 
-    first = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="fake"))
+    first = ingestion.start_download(build_fins_download_request(ticker="AAPL"))
     executor.run_all()
     first_record = ingestion.read_job(first.job_id)
-    second = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="fake"))
+    second = ingestion.start_download(build_fins_download_request(ticker="AAPL"))
     executor.run_all()
     second_record = ingestion.read_job(second.job_id)
 
@@ -2147,10 +2864,10 @@ def test_start_download_persists_rejected_filing_artifact(tmp_path: Path) -> Non
     ingestion = _build_ingestion_runtime(
         workspace_root,
         executor=executor,
-        download_adapters={("fake", "US"): adapter},
+        download_adapters={("sec", "US"): adapter},
     )
 
-    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="fake"))
+    start = ingestion.start_download(build_fins_download_request(ticker="AAPL"))
     executor.run_all()
     record = ingestion.read_job(start.job_id)
     runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
@@ -2175,33 +2892,47 @@ def test_start_download_persists_rejected_filing_artifact(tmp_path: Path) -> Non
     assert content == b"<html>rejected</html>"
 
 
-def test_start_download_persisted_summary_adapter_receives_rebuild_processed(tmp_path: Path) -> None:
-    """persisted-summary adapter 应接收 NEW rebuild_processed 治理标记并记录请求。"""
+def test_start_download_persisted_summary_adapter_receives_local_rebuild(tmp_path: Path) -> None:
+    """下载 adapter 应接收 local rebuild 标记并记录请求。
+
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 断言失败时抛出。
+    """
 
     workspace_root = tmp_path / "fins-workspace"
-    adapter = _PersistedSummaryDownloadAdapter()
+    adapter = _PersistedSummaryDownloadAdapter(
+        _typed_download_summary(
+            skipped_ids=("aapl-existing-10k",),
+            rebuild_local_artifacts=True,
+        )
+    )
     executor = _HoldingExecutor()
     ingestion = _build_ingestion_runtime(
         workspace_root,
         executor=executor,
-        download_adapters={("persisted", "US"): adapter},
+        download_adapters={("sec", "US"): adapter},
     )
 
     start = ingestion.start_download(
-        FinsDownloadRequest(
+        build_fins_download_request(
             ticker="AAPL",
-            source="persisted",
-            rebuild_processed=True,
+            rebuild_local_artifacts=True,
         )
     )
     executor.run_all()
     record = ingestion.read_job(start.job_id)
 
     assert record.status is FinsIngestionJobStatus.SUCCEEDED
-    assert record.request_summary["rebuild_processed"] is True
+    assert record.request_summary["rebuild_local_artifacts"] is True
     assert record.result_summary["skipped_count"] == 1
     assert len(adapter.requests) == 1
-    assert adapter.requests[0].rebuild_processed is True
+    assert adapter.requests[0].rebuild_local_artifacts is True
 
 
 def test_start_preprocess_persists_queued_record_and_uses_public_ticker_normalization(
@@ -2341,10 +3072,13 @@ def test_preprocess_request_round_trips_hierarchical_document_id_through_storage
 
     assert record.status is FinsIngestionJobStatus.SUCCEEDED
     assert record.result_summary["processed_document_ids"] == [document_id]
-    assert runtime.processed_repository.get_processed_meta(
-        "AAPL",
-        document_id,
-    )["document_id"] == document_id
+    assert (
+        runtime.processed_repository.get_processed_meta(
+            "AAPL",
+            document_id,
+        )["document_id"]
+        == document_id
+    )
 
 
 def test_preprocess_start_cancel_between_create_and_submit_marks_job_cancelled_and_does_not_submit(
@@ -2781,7 +3515,7 @@ def test_upload_requests_use_source_kind_for_filing_material_discrimination(tmp_
 def test_result_summaries_allow_slash_in_document_ids() -> None:
     """结果摘要中的 document-id 类字段应允许业务合法斜杠。"""
 
-    download_summary = FinsDownloadResultSummary(written_document_ids=("sec/aapl-2024-10ka",))
+    download_summary = _typed_download_summary(downloaded_ids=("sec/aapl-2024-10ka",))
     preprocess_summary = FinsPreprocessResultSummary(
         selected_count=1,
         processed_count=1,
@@ -2856,7 +3590,7 @@ def test_prepare_observed_operations_do_not_submit_until_activation(tmp_path: Pa
     runtime = _build_ingestion_runtime(workspace_root, executor=executor)
 
     download = runtime.prepare_observed_download(
-        FinsDownloadRequest(ticker="AAPL"),
+        build_fins_download_request(ticker="AAPL"),
         cancellation_token=_NeverCancelledToken(),
     )
     preprocess = runtime.prepare_observed_preprocess(
@@ -2884,7 +3618,7 @@ def test_activate_observation_is_idempotent_for_same_handle(tmp_path: Path) -> N
     executor = _HoldingExecutor()
     runtime = _build_ingestion_runtime(workspace_root, executor=executor)
     handle = runtime.prepare_observed_download(
-        FinsDownloadRequest(ticker="AAPL"),
+        build_fins_download_request(ticker="AAPL"),
         cancellation_token=_NeverCancelledToken(),
     )
 
@@ -2935,7 +3669,7 @@ def test_abandon_cancelled_prepared_observation_releases_handle_before_activatio
     executor = _HoldingExecutor()
     runtime = _build_ingestion_runtime(workspace_root, executor=executor)
     handle = runtime.prepare_observed_download(
-        FinsDownloadRequest(ticker="AAPL"),
+        build_fins_download_request(ticker="AAPL"),
         cancellation_token=_NeverCancelledToken(),
     )
 
@@ -2960,10 +3694,10 @@ def test_abandoned_observation_does_not_pollute_repeat_download_observation(
     runtime = _build_ingestion_runtime(
         workspace_root,
         executor=executor,
-        download_adapters={("fake", "US"): adapter},
+        download_adapters={("sec", "US"): adapter},
     )
     first = runtime.prepare_observed_download(
-        FinsDownloadRequest(ticker="AAPL", source="fake"),
+        build_fins_download_request(ticker="AAPL"),
         cancellation_token=_NeverCancelledToken(),
     )
 
@@ -2971,7 +3705,7 @@ def test_abandoned_observation_does_not_pollute_repeat_download_observation(
     first_cancelled = asyncio.run(runtime.cancel_observation(first))
     asyncio.run(runtime.abandon_observation(first))
     second = runtime.prepare_observed_download(
-        FinsDownloadRequest(ticker="AAPL", source="fake"),
+        build_fins_download_request(ticker="AAPL"),
         cancellation_token=_NeverCancelledToken(),
     )
     runtime.activate_observation(second)
@@ -2984,7 +3718,7 @@ def test_abandoned_observation_does_not_pollute_repeat_download_observation(
     assert second_polled.status is FinsObservationStatus.SUCCEEDED
     assert second_polled.result is not None
     assert second_polled.result.status is FinsResultStatus.SUCCESS
-    assert [request.source for request in adapter.requests] == ["fake"]
+    assert [request.source for request in adapter.requests] == [FinsDownloadSource.SEC]
 
 
 def test_abandon_submitted_observation_cancels_and_keeps_storage_artifacts(
@@ -3104,7 +3838,7 @@ def test_activation_submit_failure_terminalizes_prepared_observation(
         executor=_FailingSubmitExecutor(OSError("submit unavailable")),
     )
     handle = runtime.prepare_observed_download(
-        FinsDownloadRequest(ticker="AAPL"),
+        build_fins_download_request(ticker="AAPL"),
         cancellation_token=_NeverCancelledToken(),
     )
 
@@ -3176,6 +3910,7 @@ def test_observed_producer_without_result_uses_helper_failure_message(
         normalized=normalized,
         source="fake",
         source_kind=SourceKind.FILING,
+        download_request=build_fins_download_request(ticker="AAPL"),
         cancellation_token=_NeverCancelledToken(),
         producer=quiet_producer,
     )
@@ -3252,10 +3987,10 @@ def test_job_events_record_queued_running_and_terminal_sequence(tmp_path: Path) 
     ingestion = _build_ingestion_runtime(
         workspace_root,
         executor=executor,
-        download_adapters={("fake", "US"): adapter},
+        download_adapters={("sec", "US"): adapter},
     )
 
-    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="fake"))
+    start = ingestion.start_download(build_fins_download_request(ticker="AAPL"))
     queued_events = ingestion.read_job_events(start.job_id)
     executor.run_all()
     record = ingestion.read_job(start.job_id)
@@ -3334,7 +4069,7 @@ def test_job_event_store_concurrent_append_allocates_unique_monotonic_sequences(
     workspace_root = tmp_path / "fins-workspace"
     executor = _HoldingExecutor()
     ingestion = _build_ingestion_runtime(workspace_root, executor=executor)
-    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL"))
+    start = ingestion.start_download(build_fins_download_request(ticker="AAPL"))
     append_count = 40
 
     def append_progress(index: int) -> int:
@@ -3388,13 +4123,12 @@ def test_job_event_sidecar_skips_corrupted_rows_and_append_continues(
     workspace_root = tmp_path / "fins-workspace"
     executor = _HoldingExecutor()
     ingestion = _build_ingestion_runtime(workspace_root, executor=executor)
-    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL"))
+    start = ingestion.start_download(build_fins_download_request(ticker="AAPL"))
     event_path = _job_event_file(workspace_root, start.job_id)
     leaked_payload_value = "SHOULD_NOT_APPEAR_IN_WARNING"
     original_text = event_path.read_text(encoding="utf-8")
     event_path.write_text(
-        f'{original_text}{{"payload":"{leaked_payload_value}"\n'
-        f'["{leaked_payload_value}"]\n',
+        f'{original_text}{{"payload":"{leaked_payload_value}"\n["{leaked_payload_value}"]\n',
         encoding="utf-8",
     )
 
@@ -3437,7 +4171,7 @@ def test_job_event_sidecar_still_rejects_non_monotonic_valid_records(tmp_path: P
     workspace_root = tmp_path / "fins-workspace"
     executor = _HoldingExecutor()
     ingestion = _build_ingestion_runtime(workspace_root, executor=executor)
-    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL"))
+    start = ingestion.start_download(build_fins_download_request(ticker="AAPL"))
     event_path = _job_event_file(workspace_root, start.job_id)
     queued_event_text = event_path.read_text(encoding="utf-8")
     event_path.write_text(f"{queued_event_text}{queued_event_text}", encoding="utf-8")
@@ -3452,7 +4186,7 @@ def test_job_event_append_rejects_non_json_compatible_payload(tmp_path: Path) ->
     workspace_root = tmp_path / "fins-workspace"
     executor = _HoldingExecutor()
     ingestion = _build_ingestion_runtime(workspace_root, executor=executor)
-    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL"))
+    start = ingestion.start_download(build_fins_download_request(ticker="AAPL"))
 
     with pytest.raises(ValueError, match="不是 JSON-compatible"):
         ingestion.job_store.append_job_event(
@@ -3484,9 +4218,9 @@ def test_non_terminal_event_append_failure_warns_and_job_still_succeeds(
     ingestion = _build_ingestion_runtime(
         workspace_root,
         executor=executor,
-        download_adapters={("fake", "US"): adapter},
+        download_adapters={("sec", "US"): adapter},
     )
-    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="fake"))
+    start = ingestion.start_download(build_fins_download_request(ticker="AAPL"))
     original_append = ingestion_runtime.FsFinsIngestionJobStore.append_job_event
 
     def raise_for_running_event(
@@ -3553,9 +4287,9 @@ def test_terminal_event_append_failure_warns_without_rolling_back_terminal_recor
     ingestion = _build_ingestion_runtime(
         workspace_root,
         executor=executor,
-        download_adapters={("fake", "US"): adapter},
+        download_adapters={("sec", "US"): adapter},
     )
-    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="fake"))
+    start = ingestion.start_download(build_fins_download_request(ticker="AAPL"))
     original_append = ingestion_runtime.FsFinsIngestionJobStore.append_job_event
 
     def raise_for_terminal_event(
@@ -4177,7 +4911,7 @@ def test_start_download_cancel_immediately_before_success_terminalization_writes
     ingestion = _build_ingestion_runtime(
         workspace_root,
         executor=executor,
-        download_adapters={("fake", "US"): adapter},
+        download_adapters={("sec", "US"): adapter},
     )
     original_save = ingestion.job_store.save_succeeded_or_cancelled
 
@@ -4215,7 +4949,7 @@ def test_start_download_cancel_immediately_before_success_terminalization_writes
         cancel_before_success_terminalization,
     )
 
-    start = ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="fake"))
+    start = ingestion.start_download(build_fins_download_request(ticker="AAPL"))
     executor.run_all()
     record = ingestion.read_job(start.job_id)
 
@@ -4237,9 +4971,9 @@ def test_runners_return_for_preterminalized_jobs_without_executing(
     download_ingestion = _build_ingestion_runtime(
         download_workspace,
         executor=download_executor,
-        download_adapters={("fake", "US"): download_adapter},
+        download_adapters={("sec", "US"): download_adapter},
     )
-    download_start = download_ingestion.start_download(FinsDownloadRequest(ticker="AAPL", source="fake"))
+    download_start = download_ingestion.start_download(build_fins_download_request(ticker="AAPL"))
     download_ingestion.job_store.save_job(
         replace(
             download_start.record,
@@ -4489,7 +5223,7 @@ def test_job_store_removes_temp_file_when_atomic_replace_fails(
     monkeypatch.setattr(ingestion_runtime.os, "replace", raise_replace)
 
     with pytest.raises(OSError, match="replace failed"):
-        runtime.start_download(FinsDownloadRequest(ticker="AAPL"))
+        runtime.start_download(build_fins_download_request(ticker="AAPL"))
 
     assert jobs_dir.is_dir()
     assert tuple(jobs_dir.glob(".*.tmp")) == ()
@@ -4744,6 +5478,50 @@ def _progress_events(
         for event in ingestion.read_job_events(job_id, after_sequence=0, limit=1000)
         if event.event_type is FinsIngestionJobEventType.PROGRESS
     )
+
+
+def _record_direct_cancellation_states(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[ingestion_runtime._DirectStreamCancellationState]:
+    """记录 direct stream 真实使用的 cancellation owner state。
+
+    Args:
+        monkeypatch: pytest monkeypatch 夹具。
+
+    Returns:
+        按创建顺序记录的 state 列表。
+
+    Raises:
+        无。
+    """
+
+    states: list[ingestion_runtime._DirectStreamCancellationState] = []
+
+    def create_state(
+        _state_type: type[ingestion_runtime._DirectStreamCancellationState],
+    ) -> ingestion_runtime._DirectStreamCancellationState:
+        """创建并记录一个真实 owner state。
+
+        Args:
+            _state_type: 被替换 classmethod 传入的 state 类型。
+
+        Returns:
+            新的 cancellation state。
+
+        Raises:
+            无。
+        """
+
+        state = ingestion_runtime._DirectStreamCancellationState(_lock=ThreadingLock())
+        states.append(state)
+        return state
+
+    monkeypatch.setattr(
+        ingestion_runtime._DirectStreamCancellationState,
+        "create",
+        classmethod(create_state),
+    )
+    return states
 
 
 async def _collect_direct_events(events: AsyncIterator[FinsEvent]) -> tuple[FinsEvent, ...]:

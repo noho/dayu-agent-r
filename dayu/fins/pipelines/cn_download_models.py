@@ -38,6 +38,16 @@ CnFiscalPeriod: TypeAlias = FiscalPeriod
 不是用相邻累计期间冒充。
 """
 
+CN_FISCAL_PERIOD_ORDER: Final[tuple[CnFiscalPeriod, ...]] = (
+    "FY",
+    "H1",
+    "Q1",
+    "Q2",
+    "Q3",
+    "Q4",
+)
+"""CN/HK 下载链路唯一的 canonical 财期顺序。"""
+
 CnSourceProvider = Literal["cninfo", "hkexnews"]
 """CN/HK 报告来源 provider 字面量。"""
 
@@ -113,14 +123,64 @@ class CnReportQuery:
         normalized_ticker: 已归一化的 canonical ticker（``NormalizedTicker.canonical``）。
         start_date: 窗口起点，``YYYY-MM-DD``。
         end_date: 窗口终点，``YYYY-MM-DD``，包含。
-        target_periods: 期望的财期集合；空集合在解析阶段已替换为默认 forms。
+        discovery_periods: provider 必须发现的 canonical 财期集合；空集合已在
+            policy 解析阶段被拒绝或替换为市场默认 discovery 范围。
     """
 
     market: CnMarketKind
     normalized_ticker: str
     start_date: str
     end_date: str
-    target_periods: tuple[CnFiscalPeriod, ...]
+    discovery_periods: tuple[CnFiscalPeriod, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CnReportPeriodProjection:
+    """单份 CN/HK 报告的身份财期与覆盖财期投影。
+
+    Attributes:
+        identity_period: 报告自身唯一身份财期；用于 ID、窗口、missing、form 与
+            report kind。
+        covered_periods: 报告内容覆盖的 canonical 财期；仅用于向外投影，不能
+            代替独立报告满足 missing baseline。
+
+    Raises:
+        TypeError: 字段类型非法时抛出。
+        ValueError: 覆盖集合为空、重复、顺序非法或不含身份财期时抛出。
+    """
+
+    identity_period: CnFiscalPeriod
+    covered_periods: tuple[CnFiscalPeriod, ...]
+
+    def __post_init__(self) -> None:
+        """校验身份与覆盖财期的 canonical contract。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            TypeError: 字段类型非法时抛出。
+            ValueError: 覆盖集合为空、重复、顺序非法或不含身份财期时抛出。
+        """
+
+        if not isinstance(self.identity_period, str) or self.identity_period not in CN_FISCAL_PERIOD_ORDER:
+            raise TypeError("identity_period 必须是 canonical CN/HK 财期")
+        if not isinstance(self.covered_periods, tuple):
+            raise TypeError("covered_periods 必须是 tuple")
+        if not self.covered_periods:
+            raise ValueError("covered_periods 不能为空")
+        if any(not isinstance(period, str) or period not in CN_FISCAL_PERIOD_ORDER for period in self.covered_periods):
+            raise TypeError("covered_periods 必须只包含 canonical CN/HK 财期")
+        if len(set(self.covered_periods)) != len(self.covered_periods):
+            raise ValueError("covered_periods 不能重复")
+        canonical = tuple(period for period in CN_FISCAL_PERIOD_ORDER if period in self.covered_periods)
+        if self.covered_periods != canonical:
+            raise ValueError("covered_periods 必须采用 canonical 财期顺序")
+        if self.identity_period not in self.covered_periods:
+            raise ValueError("covered_periods 必须包含 identity_period")
 
 
 @dataclass(frozen=True)
@@ -141,7 +201,7 @@ class CnReportCandidate:
         filing_date: 公告披露日期，``YYYY-MM-DD``。
         fiscal_year: 推断财年；``fiscal_year_source`` 在 source meta 标记为
             ``"title_or_category_inferred"``。
-        fiscal_period: 推断财期；季度、半年报与年报互不折叠。
+        period_projection: 身份财期与覆盖财期投影。
         amended: 是否修订/更正版本。
         content_length: HEAD 返回的 ``Content-Length``；为 ``None`` 表示
             HEAD 不可用或服务端未返回。
@@ -156,7 +216,7 @@ class CnReportCandidate:
     language: CnLanguage
     filing_date: str
     fiscal_year: int
-    fiscal_period: CnFiscalPeriod
+    period_projection: CnReportPeriodProjection
     amended: bool
     content_length: Optional[int]
     etag: Optional[str]
@@ -252,6 +312,7 @@ class DownloadedReportAsset:
 
 
 __all__ = [
+    "CN_FISCAL_PERIOD_ORDER",
     "CN_PIPELINE_DOWNLOAD_VERSION",
     "CnDownloadCancelledError",
     "CnCompanyProfile",
@@ -261,6 +322,7 @@ __all__ = [
     "CnMarketKind",
     "CnReportCandidate",
     "CnReportHeadMeta",
+    "CnReportPeriodProjection",
     "CnReportQuery",
     "CnSourceProvider",
     "CninfoRawAnnouncement",

@@ -4,14 +4,17 @@ from __future__ import annotations
 
 from dayu.contracts.json_value import JsonValue
 
+import asyncio
 import json
 import logging
 import datetime as dt
 from collections.abc import AsyncIterator, Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from io import BytesIO
-from pathlib import Path
-from typing import Optional, cast
+from pathlib import Path, PurePosixPath
+from threading import Event
+from typing import Literal, Optional, cast
 
 import pytest
 
@@ -22,6 +25,12 @@ from dayu.fins.downloaders.sec_downloader import (
     Sc13PartyRoles,
     SecDownloader,
     StoreDownloadedFile,
+    SecDownloadCancelledError,
+    _PrefetchEvent,
+    _PrefetchFailed,
+    _PrefetchedFile,
+    _PrefetchSkipped,
+    _PrefetchStarted,
     build_source_fingerprint,
 )
 from dayu.fins.domain.document_models import (
@@ -36,6 +45,12 @@ from dayu.fins.domain.document_models import (
     SourceHandle,
 )
 from dayu.fins.ingestion_runtime import FinsSourceDownloadAdapterRequest
+from dayu.fins.download_contract import (
+    FinsDownloadDateRange,
+    FinsDownloadProviderError,
+    FinsDownloadSource,
+    FinsDownloadTransportCategory,
+)
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.pipelines import sec_download_filing_workflow as _sec_download_filing_workflow
 from dayu.fins.pipelines import sec_download_state as _sec_download_state
@@ -66,12 +81,16 @@ from dayu.fins.pipelines.sec_sc13_filtering import SC13_FORMS as _SC13_FORMS, SC
 from dayu.fins.storage import (
     FsBatchingRepository,
     FsDocumentBlobRepository,
-    FsFilingMaintenanceRepository,
     FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
+    SourceIntegrityPreflightError,
+    SourceIntegrityPreflightReason,
 )
 from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
-from dayu.fins.storage.repository_protocols import SourceSnapshotProtocol
+from dayu.fins.storage.repository_protocols import (
+    SourceDocumentRepositoryProtocol,
+    SourceSnapshotProtocol,
+)
 from dayu.fins.ticker_normalization import normalize_ticker
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 
@@ -167,10 +186,7 @@ def test_normalize_sec_primary_document_preserves_single_filename() -> None:
         AssertionError: helper 改写合法单文件名时抛出。
     """
 
-    assert (
-        _sec_filing_collection._normalize_sec_primary_document_name("aapl-20240928.htm")
-        == "aapl-20240928.htm"
-    )
+    assert _sec_filing_collection._normalize_sec_primary_document_name("aapl-20240928.htm") == "aapl-20240928.htm"
 
 
 @pytest.mark.parametrize(
@@ -541,8 +557,25 @@ class _RecordingSecPipelineForAdapter:
             workspace_root,
             repository_set=repository_set,
         )
+        self._source_repository = FsSourceDocumentRepository(
+            workspace_root,
+            repository_set=repository_set,
+        )
         self.document_id = document_id
         self.recorded_rebuild_values: list[bool] = []
+
+    @property
+    def source_repository(self) -> SourceDocumentRepositoryProtocol:
+        """返回测试 pipeline 使用的 source repository。
+
+        Returns:
+            source repository。
+
+        Raises:
+            无。
+        """
+
+        return self._source_repository
 
     async def download_stream(
         self,
@@ -553,6 +586,7 @@ class _RecordingSecPipelineForAdapter:
         overwrite: bool = False,
         rebuild: bool = False,
         *,
+        start_is_explicit: bool,
         cancel_checker: Optional[Callable[[], bool]] = None,
     ) -> AsyncIterator[DownloadEvent]:
         """记录 OLD rebuild 参数并返回完成事件。
@@ -564,6 +598,7 @@ class _RecordingSecPipelineForAdapter:
             end_date: 结束披露日期。
             overwrite: 是否覆盖。
             rebuild: OLD 本地 rebuild 标记。
+            start_is_explicit: 起始日期是否来自调用方显式输入。
             cancel_checker: 取消检查器。
 
         Yields:
@@ -573,17 +608,34 @@ class _RecordingSecPipelineForAdapter:
             无。
         """
 
-        del form_type, start_date, end_date, overwrite, cancel_checker
+        del start_is_explicit, cancel_checker
         self.recorded_rebuild_values.append(rebuild)
+        form_values: list[JsonValue] = [] if form_type is None else [item for item in form_type.split(",")]
+        filters: dict[str, JsonValue] = {
+            "forms": form_values,
+            "start_date": start_date,
+            "end_date": end_date,
+            "overwrite": overwrite,
+            "rebuild": rebuild,
+        }
         result: sec_pipeline.SecPipelineDownloadResult = {
             "pipeline": "sec_download",
             "action": "download",
             "status": "ok",
             "ticker": ticker,
             "market_profile": {},
-            "filters": {},
+            "filters": filters,
             "warnings": [],
-            "filings": [{"document_id": self.document_id, "status": "downloaded"}],
+            "filings": [
+                {
+                    "document_id": self.document_id,
+                    "status": "skipped",
+                    "reason_code": "already_downloaded_complete",
+                    "form_type": "10-K",
+                    "filing_date": "2024-08-01",
+                    "report_date": "2024-06-30",
+                }
+            ],
             "summary": {
                 "total": 1,
                 "downloaded": 1,
@@ -855,6 +907,102 @@ class StubDownloader:
                 results.append(item)
         return results
 
+    async def prefetch_files_stream(
+        self,
+        remote_files: list[RemoteFileDescriptor],
+        *,
+        allow_not_modified: bool,
+        existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
+        primary_document: Optional[str] = None,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> AsyncIterator[_PrefetchEvent]:
+        """按固定测试结果产生 storage-neutral typed prefetch variants。
+
+        Args:
+            remote_files: 远端 descriptors。
+            allow_not_modified: 是否允许 304；测试按固定结果投影。
+            existing_files: 既有文件映射。
+            primary_document: 主文档名。
+            cancellation_checker: 可选取消检查器。
+
+        Yields:
+            started 与固定终态 prefetch variants。
+
+        Raises:
+            无。
+        """
+
+        del allow_not_modified, existing_files, primary_document, cancellation_checker
+        self.download_files_called = True
+        descriptors = {item.name: item for item in remote_files}
+        for item in self._download_results:
+            name = str(item.get("name", ""))
+            descriptor = descriptors.get(name)
+            if descriptor is None:
+                base = remote_files[0]
+                descriptor = RemoteFileDescriptor(
+                    name=name,
+                    source_url=str(item.get("source_url") or base.source_url),
+                    http_etag=base.http_etag,
+                    http_last_modified=base.http_last_modified,
+                    remote_size=base.remote_size,
+                    http_status=base.http_status,
+                )
+            yield _PrefetchStarted(descriptor=descriptor)
+            status = item.get("status")
+            if status == "downloaded":
+                payload = self._content_by_name.get(name, f"dummy:{name}".encode())
+                yield _PrefetchedFile(
+                    descriptor=descriptor,
+                    http_status=descriptor.http_status or 200,
+                    content=payload,
+                )
+            elif status == "skipped":
+                yield _PrefetchSkipped(
+                    descriptor=descriptor,
+                    http_status=304,
+                    reason_code="not_modified",
+                    reason_message="远端文件未修改，跳过重新下载",
+                )
+            else:
+                reason = str(item.get("reason_message") or "")
+                yield _PrefetchFailed(
+                    descriptor=descriptor,
+                    http_status=descriptor.http_status,
+                    reason_code=str(item.get("reason_code") or "download_failed"),
+                    reason_message=reason,
+                    error=reason,
+                )
+
+    def materialize_prefetched_event(
+        self,
+        event: _PrefetchEvent,
+        store_file: StoreDownloadedFile,
+        *,
+        batch: BatchToken,
+    ) -> DownloaderEvent:
+        """复用 production 唯一 materializer 处理测试 prefetch variant。
+
+        Args:
+            event: typed prefetch variant。
+            store_file: 真实 test storage callback。
+            batch: 真实 open batch capability。
+
+        Returns:
+            production mapping 产生的 downloader event。
+
+        Raises:
+            OSError: test storage callback 失败时抛出。
+            ValueError: batch 非法时抛出。
+        """
+
+        return SecDownloader.materialize_prefetched_event(
+            cast(SecDownloader, self),
+            event,
+            store_file,
+            batch=batch,
+        )
+
     async def download_files_stream(
         self,
         remote_files: list[RemoteFileDescriptor],
@@ -908,7 +1056,9 @@ class StubDownloader:
             raw_file_meta = item.get("file_meta")
             file_meta = raw_file_meta if isinstance(raw_file_meta, FileObjectMeta) else None
             raw_http_status = item.get("http_status")
-            http_status = raw_http_status if isinstance(raw_http_status, int) and not isinstance(raw_http_status, bool) else None
+            http_status = (
+                raw_http_status if isinstance(raw_http_status, int) and not isinstance(raw_http_status, bool) else None
+            )
             if status == "downloaded":
                 event_type = "file_downloaded"
             elif status == "skipped":
@@ -974,7 +1124,6 @@ class StubDownloader:
         del count, cancellation_checker
         self.browse_calls.append(filenum)
         return self._browse_entries
-
 
     def resolve_primary_document(
         self,
@@ -1102,6 +1251,85 @@ class StreamStubDownloader(StubDownloader):
                 reason_message=str(item.get("reason_message", "download failed")),
                 error=str(item.get("error", "download failed")),
             )
+
+
+class BarrierPrefetchDownloader(StubDownloader):
+    """用 Event 精确控制 Phase A prefetch 与 writer publication 顺序的测试下载器。"""
+
+    def __init__(
+        self,
+        *,
+        role: Literal["first", "second"],
+        submissions: dict[str, JsonValue],
+        remote_files: list[RemoteFileDescriptor],
+        download_results: list[DownloadFileResult],
+        first_prefetch_payload: bytes,
+        retry_payload: bytes,
+        second_prefetch_complete: Event,
+        first_source_committed: Event,
+    ) -> None:
+        """初始化 deterministic prefetch barrier。
+
+        Args:
+            role: first writer 或 second writer。
+            submissions: 固定 submissions。
+            remote_files: 固定 descriptors。
+            download_results: 固定文件结果。
+            first_prefetch_payload: 第一轮 payload。
+            retry_payload: identity churn 后重试 payload。
+            second_prefetch_complete: second 第一轮预取完成事件。
+            first_source_committed: first source commit 完成事件。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        super().__init__(
+            submissions=submissions,
+            remote_files=remote_files,
+            download_results=download_results,
+        )
+        self.role = role
+        self.first_prefetch_payload = first_prefetch_payload
+        self.retry_payload = retry_payload
+        self.second_prefetch_complete = second_prefetch_complete
+        self.first_source_committed = first_source_committed
+        self.prefetch_rounds = 0
+
+    async def prefetch_files_stream(
+        self,
+        remote_files: list[RemoteFileDescriptor],
+        *,
+        allow_not_modified: bool,
+        existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
+        primary_document: Optional[str] = None,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> AsyncIterator[_PrefetchEvent]:
+        """在第二 writer 旧预取完成与第一 writer commit 两处放置 Event barrier。"""
+
+        self.prefetch_rounds += 1
+        if self.role == "first":
+            ready = await asyncio.to_thread(self.second_prefetch_complete.wait, 5)
+            if not ready:
+                raise TimeoutError("second writer prefetch barrier 未到达")
+        payload = self.retry_payload if self.prefetch_rounds > 1 else self.first_prefetch_payload
+        self._content_by_name = {remote_files[0].name: payload}
+        async for event in super().prefetch_files_stream(
+            remote_files,
+            allow_not_modified=allow_not_modified,
+            existing_files=existing_files,
+            primary_document=primary_document,
+            cancellation_checker=cancellation_checker,
+        ):
+            yield event
+        if self.role == "second" and self.prefetch_rounds == 1:
+            self.second_prefetch_complete.set()
+            committed = await asyncio.to_thread(self.first_source_committed.wait, 5)
+            if not committed:
+                raise TimeoutError("first writer source commit barrier 未释放")
 
 
 class RebuildOnlyDownloader:
@@ -1252,7 +1480,40 @@ def _build_submissions() -> dict[str, JsonValue]:
                 "primaryDocument": ["sample-10k.htm"],
             },
             "files": [],
-        }
+        },
+    }
+
+
+def _build_single_filing_submissions(
+    *,
+    accession_number: str,
+    primary_document: str,
+) -> dict[str, JsonValue]:
+    """构造一个指定 accession identity 的 SEC submissions。
+
+    Args:
+        accession_number: 精确 accession number。
+        primary_document: 精确主文档名。
+
+    Returns:
+        只包含指定 filing 的 submissions JSON。
+
+    Raises:
+        无。
+    """
+
+    return {
+        "tickers": ["AAPL", "APC"],
+        "filings": {
+            "recent": {
+                "form": ["10-K"],
+                "filingDate": ["2025-02-01"],
+                "reportDate": ["2024-12-31"],
+                "accessionNumber": [accession_number],
+                "primaryDocument": [primary_document],
+            },
+            "files": [],
+        },
     }
 
 
@@ -1304,6 +1565,237 @@ def _make_descriptor(etag: str) -> RemoteFileDescriptor:
         remote_size=100,
         http_status=200,
     )
+
+
+def test_sec_download_filing_provider_evidence_failure_is_unique_failed_row_and_continues(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """file evidence typed failure 只终止当前 filing，且下一 filing 可完成。"""
+
+    expected = FinsDownloadProviderError(
+        source=FinsDownloadSource.SEC,
+        transport_category=FinsDownloadTransportCategory.PROTOCOL,
+        retryable=False,
+        safe_message="SEC 来源响应格式不符合预期",
+    )
+    downloader = StreamStubDownloader(
+        submissions=_build_submissions(),
+        remote_files=[_make_descriptor("etag-v1")],
+        download_results=[
+            {
+                "name": "sample-10k.htm",
+                "status": "downloaded",
+                "path": "sample-10k.htm",
+                "source_url": "https://example.invalid/sample-10k.htm",
+                "http_etag": "etag-v1",
+                "http_last_modified": "Mon, 01 Jan 2025 00:00:00 GMT",
+            }
+        ],
+    )
+    original_list = downloader.list_filing_files
+    list_calls = 0
+
+    def fail_first_list(
+        cik: str,
+        accession_no_dash: str,
+        primary_document: str,
+        form_type: str,
+        include_xbrl: bool = True,
+        include_exhibits: bool = True,
+        include_http_metadata: bool = True,
+        cancellation_checker: Callable[[], bool] | None = None,
+    ) -> list[RemoteFileDescriptor]:
+        """首次抛 typed evidence failure，第二次返回有效列表。"""
+
+        nonlocal list_calls
+        list_calls += 1
+        if list_calls == 1:
+            raise expected
+        return original_list(
+            cik=cik,
+            accession_no_dash=accession_no_dash,
+            primary_document=primary_document,
+            form_type=form_type,
+            include_xbrl=include_xbrl,
+            include_exhibits=include_exhibits,
+            include_http_metadata=include_http_metadata,
+            cancellation_checker=cancellation_checker,
+        )
+
+    monkeypatch.setattr(downloader, "list_filing_files", fail_first_list)
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=downloader,
+        processor_registry=build_fins_processor_registry(),
+    )
+    begin_calls = 0
+    original_begin = pipeline._batching_repository.begin_batch
+
+    def record_begin(ticker: str) -> BatchToken:
+        """记录 filing mutation batch 启动次数。"""
+
+        nonlocal begin_calls
+        begin_calls += 1
+        return original_begin(ticker)
+
+    monkeypatch.setattr(pipeline._batching_repository, "begin_batch", record_begin)
+    first = _sec_filing_collection.FilingRecord(
+        form_type="10-K",
+        filing_date="2025-02-01",
+        report_date="2024-12-31",
+        accession_number="0000000000-25-000001",
+        primary_document="sample-10k.htm",
+    )
+    second = _sec_filing_collection.FilingRecord(
+        form_type="10-K",
+        filing_date="2025-03-01",
+        report_date="2024-12-31",
+        accession_number="0000000000-25-000002",
+        primary_document="sample-10k.htm",
+    )
+    rejection_registry: dict[str, DownloadRejectionEntry] = {}
+
+    async def collect(filing: _sec_filing_collection.FilingRecord) -> list[DownloadEvent]:
+        """直接消费 single-filing owner 事件。"""
+
+        return [
+            event
+            async for event in pipeline._download_single_filing_stream(
+                ticker="AAPL",
+                cik="320193",
+                filing=filing,
+                overwrite=False,
+                rejection_registry=rejection_registry,
+            )
+        ]
+
+    first_events = asyncio.run(collect(first))
+    assert [event.event_type for event in first_events] == [DownloadEventType.FILING_FAILED]
+    first_result = first_events[0].payload["filing_result"]
+    assert isinstance(first_result, dict)
+    assert first_result["status"] == "failed"
+    assert first_result["reason_code"] == "provider_protocol"
+    assert first_result["reason_message"] == expected.safe_message
+    assert rejection_registry == {}
+    assert begin_calls == 0
+
+    second_events = asyncio.run(collect(second))
+    terminal_types = [
+        event.event_type
+        for event in second_events
+        if event.event_type in {DownloadEventType.FILING_COMPLETED, DownloadEventType.FILING_FAILED}
+    ]
+    assert terminal_types == [DownloadEventType.FILING_COMPLETED]
+    assert begin_calls == 1
+    assert list_calls == 2
+
+
+def test_sec_download_filing_6k_preview_provider_failure_stays_local_and_safe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """6-K preview typed failure 形成唯一 FAILED row、固定日志并允许下一 filing。"""
+
+    expected = FinsDownloadProviderError(
+        source=FinsDownloadSource.SEC,
+        transport_category=FinsDownloadTransportCategory.CONNECTION,
+        retryable=True,
+        safe_message="无法连接 SEC 来源",
+    )
+    descriptor = RemoteFileDescriptor(
+        name="sample-6k.htm",
+        source_url="https://secret.invalid/raw-preview",
+        http_etag=None,
+        http_last_modified=None,
+        remote_size=100,
+        http_status=200,
+        sec_document_type="6-K",
+    )
+    downloader = StreamStubDownloader(
+        submissions=_build_foreign_submissions(),
+        remote_files=[descriptor],
+        download_results=[
+            {
+                "name": descriptor.name,
+                "status": "downloaded",
+                "source_url": descriptor.source_url,
+            }
+        ],
+    )
+
+    def fail_preview(
+        url: str,
+        cancellation_checker: Callable[[], bool] | None = None,
+    ) -> bytes:
+        """模拟携带 raw URL/contact 的真实 provider failure。"""
+
+        del url, cancellation_checker
+        raise expected from RuntimeError("raw https://secret.invalid/payload contact-canary@example.invalid")
+
+    logs: list[str] = []
+    monkeypatch.setattr(downloader, "fetch_file_bytes", fail_preview)
+    monkeypatch.setattr(
+        sec_pipeline.Log,
+        "warn",
+        lambda message, *, module: logs.append(f"{module}:{message}"),
+    )
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=downloader,
+        processor_registry=build_fins_processor_registry(),
+    )
+    preview = asyncio.run(
+        pipeline._precheck_6k_filter(
+            remote_files=[descriptor],
+            primary_document=descriptor.name,
+            ticker="FUTU",
+            document_id="fil_0000000000-25-000101",
+        )
+    )
+    assert preview == (False, "DOWNLOAD_FAILED", descriptor.name)
+
+    six_k = _sec_filing_collection.FilingRecord(
+        form_type="6-K",
+        filing_date="2025-08-01",
+        report_date="2024-12-31",
+        accession_number="0000000000-25-000101",
+        primary_document=descriptor.name,
+    )
+    later = _sec_filing_collection.FilingRecord(
+        form_type="10-K",
+        filing_date="2025-09-01",
+        report_date="2024-12-31",
+        accession_number="0000000000-25-000102",
+        primary_document=descriptor.name,
+    )
+
+    async def collect(filing: _sec_filing_collection.FilingRecord) -> list[DownloadEvent]:
+        """直接消费 single-filing owner 事件。"""
+
+        return [
+            event
+            async for event in pipeline._download_single_filing_stream(
+                ticker="FUTU",
+                cik="320193",
+                filing=filing,
+                overwrite=False,
+                rejection_registry={},
+            )
+        ]
+
+    failed_events = asyncio.run(collect(six_k))
+    assert [event.event_type for event in failed_events] == [DownloadEventType.FILING_FAILED]
+    failed_result = failed_events[0].payload["filing_result"]
+    assert isinstance(failed_result, dict)
+    assert failed_result["reason_code"] == "6k_prefetch_failed"
+    later_events = asyncio.run(collect(later))
+    assert later_events[-1].event_type is DownloadEventType.FILING_COMPLETED
+    serialized_logs = "\n".join(logs)
+    assert "transport_category=connection" in serialized_logs
+    assert "secret.invalid" not in serialized_logs
+    assert "contact-canary" not in serialized_logs
+    assert "raw " not in serialized_logs
 
 
 def _seed_complete_sec_source(
@@ -1747,7 +2239,7 @@ def test_sec_pipeline_download_writes_meta_and_manifest(tmp_path: Path) -> None:
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
     )
-    result = pipeline.download(ticker="AAPL", overwrite=False)
+    result = pipeline.download(ticker="AAPL", overwrite=False, start_is_explicit=False)
 
     assert result["summary"]["downloaded"] == 1
     meta_path = _source_meta_path(tmp_path, "AAPL", "fil_0000000000-25-000001")
@@ -1795,6 +2287,7 @@ def test_sec_pipeline_download_merges_cli_aliases_with_sec_aliases(tmp_path: Pat
         ticker="AAPL",
         overwrite=False,
         ticker_aliases=["AAPL", "AAPL.SW", "APC"],
+        start_is_explicit=False,
     )
 
     company_meta_path = _company_meta_path(tmp_path, "AAPL")
@@ -1877,6 +2370,12 @@ def test_sec_pipeline_rebuild_local_meta_manifest_without_redownload(tmp_path: P
     batching_repository.commit_batch(batch)
     meta_path = _source_meta_path(tmp_path, ticker, document_id)
     manifest_path = _filing_manifest_path(tmp_path, ticker)
+    source_handle = SourceHandle(
+        ticker=ticker,
+        document_id=document_id,
+        source_kind=SourceKind.FILING.value,
+    )
+    source_bytes_before = blob_repository.read_file_bytes(source_handle, "sample-10k.htm")
 
     downloader = RebuildOnlyDownloader()
     pipeline = SecPipeline(
@@ -1885,7 +2384,7 @@ def test_sec_pipeline_rebuild_local_meta_manifest_without_redownload(tmp_path: P
         processor_registry=build_fins_processor_registry(),
     )
 
-    result = pipeline.download(ticker=ticker, rebuild=True)
+    result = pipeline.download(ticker=ticker, rebuild=True, start_is_explicit=False)
 
     assert result["summary"]["downloaded"] == 1
     assert result["summary"]["failed"] == 0
@@ -1899,7 +2398,8 @@ def test_sec_pipeline_rebuild_local_meta_manifest_without_redownload(tmp_path: P
     assert rebuilt_meta["source_fingerprint"]
     assert rebuilt_meta["download_version"] == SEC_PIPELINE_DOWNLOAD_VERSION
     rebuilt_processed_meta = processed_repository.get_processed_meta(ticker, document_id)
-    assert rebuilt_processed_meta["reprocess_required"] is True
+    assert rebuilt_processed_meta["reprocess_required"] is False
+    assert blob_repository.read_file_bytes(source_handle, "sample-10k.htm") == source_bytes_before
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert len(manifest["documents"]) == 1
@@ -1943,10 +2443,6 @@ def test_sec_rebuild_rolls_back_once_and_reraises_cancellation_identity(
         tmp_path,
         repository_set=repository_set,
     )
-    processed_repository = FsProcessedDocumentRepository(
-        tmp_path,
-        repository_set=repository_set,
-    )
     cancellation = cancellation_type("injected rebuild cancellation")
     monkeypatch.setattr(
         source_repository,
@@ -1958,7 +2454,6 @@ def test_sec_rebuild_rolls_back_once_and_reraises_cancellation_identity(
         _sec_rebuild_workflow.rebuild_single_local_filing(
             batching_repository=batching_repository,
             source_repository=source_repository,
-            processed_repository=processed_repository,
             ticker="AAPL",
             document_id="fil_0000000000-25-000001",
             previous_meta=_sec_rebuild_previous_meta(),
@@ -2000,10 +2495,6 @@ def test_sec_rebuild_operation_and_rollback_failure_preserve_primary_exception(
         tmp_path,
         repository_set=repository_set,
     )
-    processed_repository = FsProcessedDocumentRepository(
-        tmp_path,
-        repository_set=repository_set,
-    )
     monkeypatch.setattr(
         source_repository,
         "update_source_document",
@@ -2014,7 +2505,6 @@ def test_sec_rebuild_operation_and_rollback_failure_preserve_primary_exception(
         _sec_rebuild_workflow.rebuild_single_local_filing(
             batching_repository=batching_repository,
             source_repository=source_repository,
-            processed_repository=processed_repository,
             ticker="AAPL",
             document_id="fil_0000000000-25-000001",
             previous_meta=_sec_rebuild_previous_meta(),
@@ -2025,8 +2515,7 @@ def test_sec_rebuild_operation_and_rollback_failure_preserve_primary_exception(
     assert exc_info.value is operation_error
     assert exc_info.value.__cause__ is rollback_error
     assert exc_info.value.__notes__ == [
-        "rollback_batch failed; recovery evidence retained: "
-        "injected rebuild rollback failure"
+        "rollback_batch failed; recovery evidence retained: injected rebuild rollback failure"
     ]
     assert batching_repository.rollback_calls == 1
 
@@ -2059,10 +2548,6 @@ def test_sec_rebuild_ordinary_failure_with_successful_rollback_returns_failed_re
         tmp_path,
         repository_set=repository_set,
     )
-    processed_repository = FsProcessedDocumentRepository(
-        tmp_path,
-        repository_set=repository_set,
-    )
     monkeypatch.setattr(
         source_repository,
         "update_source_document",
@@ -2072,7 +2557,6 @@ def test_sec_rebuild_ordinary_failure_with_successful_rollback_returns_failed_re
     result = _sec_rebuild_workflow.rebuild_single_local_filing(
         batching_repository=batching_repository,
         source_repository=source_repository,
-        processed_repository=processed_repository,
         ticker="AAPL",
         document_id="fil_0000000000-25-000001",
         previous_meta=_sec_rebuild_previous_meta(),
@@ -2204,7 +2688,7 @@ def test_sec_pipeline_download_prefers_dei_fiscal_when_available(
         processor_registry=build_fins_processor_registry(),
     )
 
-    pipeline.download(ticker="AAPL", overwrite=False)
+    pipeline.download(ticker="AAPL", overwrite=False, start_is_explicit=False)
 
     meta_path = _source_meta_path(tmp_path, "AAPL", "fil_0000000000-25-000001")
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -2498,29 +2982,38 @@ def test_sec_fiscal_helper_contract_matrix() -> None:
         file_map,
         candidates=("_ins.xml",),
     ) == Path("c_ins.xml")
-    assert _sec_fiscal_fields._pick_download_xbrl_file(
-        file_map,
-        candidates=("_missing.xml",),
-    ) is None
+    assert (
+        _sec_fiscal_fields._pick_download_xbrl_file(
+            file_map,
+            candidates=("_missing.xml",),
+        )
+        is None
+    )
     assert _sec_fiscal_fields._pick_download_xbrl_file(
         file_map,
         candidates=("_missing.xml",),
         xml_fallback=True,
     ) == Path("b.xml")
-    assert _sec_fiscal_fields._mapping_get_case_insensitive(
-        {"DocumentFiscalYearFocus": "2024"},
-        ("documentfiscalyearfocus",),
-    ) == "2024"
+    assert (
+        _sec_fiscal_fields._mapping_get_case_insensitive(
+            {"DocumentFiscalYearFocus": "2024"},
+            ("documentfiscalyearfocus",),
+        )
+        == "2024"
+    )
     assert _sec_fiscal_fields._mapping_get_case_insensitive([], ("missing",)) is None
     assert _sec_fiscal_fields._pick_first_non_empty((None, " ", "FY")) == "FY"
     assert _sec_fiscal_fields._pick_first_non_empty((None, " ")) is None
     assert _sec_fiscal_fields._infer_download_fiscal_fields("10-K", "2024-12-31") == (2024, "FY")
     assert _sec_fiscal_fields._infer_download_fiscal_fields("6-K/A", "2024-12-31") == (None, None)
-    assert _sec_fiscal_fields._resolve_fiscal_period_fallback(
-        form_type="10-Q",
-        fiscal_year=2024,
-        fiscal_year_from_report_date=True,
-    ) is None
+    assert (
+        _sec_fiscal_fields._resolve_fiscal_period_fallback(
+            form_type="10-Q",
+            fiscal_year=2024,
+            fiscal_year_from_report_date=True,
+        )
+        is None
+    )
     assert _sec_fiscal_fields._coerce_optional_int(None) is None
     assert _sec_fiscal_fields._coerce_optional_int(True) is None
     assert _sec_fiscal_fields._coerce_optional_int(2024) == 2024
@@ -2564,9 +3057,7 @@ def test_sec_fiscal_payload_and_query_extractors_fail_closed() -> None:
     assert _sec_fiscal_fields._extract_fiscal_from_xbrl_query(
         _XbrlQueryFixtureProcessor(RuntimeError("query failed"))
     ) == (None, None)
-    assert _sec_fiscal_fields._extract_fiscal_from_xbrl_query(
-        _XbrlQueryFixtureProcessor({"facts": []})
-    ) == (None, None)
+    assert _sec_fiscal_fields._extract_fiscal_from_xbrl_query(_XbrlQueryFixtureProcessor({"facts": []})) == (None, None)
     assert _sec_fiscal_fields._extract_fiscal_from_xbrl_query(
         _XbrlQueryFixtureProcessor(
             {
@@ -2619,7 +3110,7 @@ def test_sec_pipeline_skip_when_meta_matches(tmp_path: Path) -> None:
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
     )
-    result = pipeline.download(ticker="AAPL", overwrite=False)
+    result = pipeline.download(ticker="AAPL", overwrite=False, start_is_explicit=False)
 
     assert result["summary"]["skipped"] == 1
     assert downloader.download_files_called is False
@@ -2658,7 +3149,7 @@ def test_sec_pipeline_skip_with_etag_gzip_variant_without_re_download(tmp_path: 
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
     )
-    result = pipeline.download(ticker="AAPL", overwrite=False)
+    result = pipeline.download(ticker="AAPL", overwrite=False, start_is_explicit=False)
 
     assert result["summary"]["skipped"] == 1
     assert result["summary"]["downloaded"] == 0
@@ -2670,9 +3161,9 @@ def test_sec_pipeline_skip_with_etag_gzip_variant_without_re_download(tmp_path: 
 @pytest.mark.parametrize(
     ("existing_download_version", "expected_status", "expected_skip_reason"),
     [
-        (SEC_PIPELINE_DOWNLOAD_VERSION, "skipped", "not_modified"),
-        ("legacy-download-version", "downloaded", None),
-        (None, "downloaded", None),
+        (SEC_PIPELINE_DOWNLOAD_VERSION, "skipped", "integrity_complete"),
+        ("legacy-download-version", "skipped", "integrity_complete"),
+        (None, "skipped", "integrity_complete"),
     ],
 )
 def test_sec_pipeline_all_files_not_modified_respects_download_version(
@@ -2722,18 +3213,18 @@ def test_sec_pipeline_all_files_not_modified_respects_download_version(
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
     )
-    result = pipeline.download(ticker="AAPL", overwrite=False)
+    result = pipeline.download(ticker="AAPL", overwrite=False, start_is_explicit=False)
     after_text = meta_path.read_text(encoding="utf-8")
 
-    assert downloader.download_files_called is True
+    assert downloader.download_files_called is False
     assert result["filings"][0]["status"] == expected_status
     assert result["filings"][0].get("skip_reason") == expected_skip_reason
-    if expected_skip_reason == "not_modified":
+    if expected_skip_reason == "integrity_complete":
         assert result["summary"]["skipped"] == 1
         assert result["summary"]["downloaded"] == 0
         assert before_text == after_text
-        assert result["filings"][0]["reason_code"] == "not_modified"
-        assert "未修改" in str(result["filings"][0]["reason_message"])
+        assert result["filings"][0]["reason_code"] == "integrity_complete"
+        assert "完整" in str(result["filings"][0]["reason_message"])
         return
 
     assert result["summary"]["skipped"] == 0
@@ -2774,7 +3265,7 @@ def test_sec_pipeline_failed_filing_does_not_write_meta(tmp_path: Path) -> None:
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
     )
-    result = pipeline.download(ticker="AAPL", overwrite=False)
+    result = pipeline.download(ticker="AAPL", overwrite=False, start_is_explicit=False)
 
     assert result["summary"]["failed"] == 1
     meta_path = _source_meta_path(tmp_path, "AAPL", "fil_0000000000-25-000001")
@@ -2851,14 +3342,14 @@ def test_sec_pipeline_remote_change_marks_reprocess(tmp_path: Path) -> None:
     )
 
     # 非 overwrite 模式下，快速预检会直接跳过（不发远端请求）
-    result_skip = pipeline.download(ticker="AAPL", overwrite=False)
+    result_skip = pipeline.download(ticker="AAPL", overwrite=False, start_is_explicit=False)
     assert result_skip["summary"]["skipped"] == 1
     assert result_skip["summary"]["downloaded"] == 0
     # 快速预检跳过时不应调用 list_filing_files（避免 SEC HEAD 请求）
     assert downloader.list_filing_files_call_count == 0
 
     # overwrite=True 仅替换当前目标文档，仍使用 previous_meta 递增版本。
-    result = pipeline.download(ticker="AAPL", overwrite=True)
+    result = pipeline.download(ticker="AAPL", overwrite=True, start_is_explicit=False)
 
     assert result["summary"]["downloaded"] == 1
     updated_meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -2868,29 +3359,48 @@ def test_sec_pipeline_remote_change_marks_reprocess(tmp_path: Path) -> None:
     assert processed_meta["reprocess_required"] is True
 
 
-def test_sec_cleanup_stale_filing_dirs_keeps_existing_docs_when_result_empty(tmp_path: Path) -> None:
-    """本轮没有有效目标 document_id 时不得清理旧 filing。"""
+def test_sec_ordinary_download_keeps_unselected_historical_document(tmp_path: Path) -> None:
+    """普通 SEC 下载不得清理本轮未选择的历史 source 文档。
 
-    meta_path = _seed_complete_sec_source(
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非目标历史文档被删除或目标下载失败时抛出。
+    """
+
+    historical_meta_path = _seed_complete_sec_source(
         workspace_root=tmp_path,
-        document_id="fil_old",
+        document_id="fil_0000000000-23-000099",
+        download_version="legacy-download-version",
     )
-    repository_set = build_fs_repository_set(workspace_root=tmp_path)
-    batching_repository = FsBatchingRepository(tmp_path, repository_set=repository_set)
-    repository = FsFilingMaintenanceRepository(tmp_path, repository_set=repository_set)
-    batch = batching_repository.begin_batch("AAPL")
-
-    cleaned = sec_pipeline._cleanup_stale_filing_dirs(
-        repository,
-        "AAPL",
-        {"10-K": dt.date(2024, 1, 1)},
-        [],
-        batch=batch,
+    downloader = StubDownloader(
+        submissions=_build_submissions(),
+        remote_files=[_make_descriptor("etag-current")],
+        download_results=[
+            {
+                "name": "sample-10k.htm",
+                "status": "downloaded",
+                "path": "sample-10k.htm",
+                "source_url": "https://example.com/sample-10k.htm",
+                "http_etag": "etag-current",
+                "http_last_modified": "Mon, 01 Jan 2025 00:00:00 GMT",
+            }
+        ],
     )
-    batching_repository.commit_batch(batch)
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=downloader,
+        processor_registry=build_fins_processor_registry(),
+    )
 
-    assert cleaned == 0
-    assert meta_path.exists()
+    result = pipeline.download(ticker="AAPL", overwrite=False, start_is_explicit=False)
+
+    assert result["summary"]["downloaded"] == 1
+    assert historical_meta_path.exists()
 
 
 def test_sec_pipeline_download_parses_year_month_date_inputs(tmp_path: Path) -> None:
@@ -2931,6 +3441,7 @@ def test_sec_pipeline_download_parses_year_month_date_inputs(tmp_path: Path) -> 
         start_date="2024",
         end_date="2025-02",
         overwrite=False,
+        start_is_explicit=True,
     )
 
     start_dates = _require_json_mapping(result["filters"]["start_dates"])
@@ -2984,7 +3495,7 @@ def test_sec_pipeline_download_resolves_foreign_issuer_from_submissions(tmp_path
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
     )
-    result = pipeline.download(ticker="TCOM", overwrite=False)
+    result = pipeline.download(ticker="TCOM", overwrite=False, start_is_explicit=False)
 
     assert result["summary"]["downloaded"] == 1
     forms = _require_json_list(result["filters"]["forms"])
@@ -3062,14 +3573,11 @@ def test_sec_pipeline_filters_6k_excluded(
     )
     caplog.set_level(logging.INFO, logger="dayu.fins.FINS.SEC_PIPELINE")
 
-    result = pipeline.download(ticker="TCOM", overwrite=False)
+    result = pipeline.download(ticker="TCOM", overwrite=False, start_is_explicit=False)
 
     assert result["summary"]["skipped"] == 0
     assert result["summary"]["rejected"] == 1
-    assert (
-        "美股下载完成: ticker=TCOM total=1 downloaded=0 skipped=0 rejected=1 failed=0"
-        in caplog.text
-    )
+    assert "美股下载完成: ticker=TCOM total=1 downloaded=0 skipped=0 rejected=1 failed=0" in caplog.text
     assert downloader.download_files_called is True
     meta_path = _source_meta_path(tmp_path, "TCOM", "fil_0000000000-25-000101")
     assert not meta_path.exists()
@@ -3144,12 +3652,11 @@ def test_sec_download_adapter_counts_6k_filtered_as_rejected_in_persisted_summar
     result = adapter.download(
         FinsSourceDownloadAdapterRequest(
             normalized_ticker=normalize_ticker("TCOM"),
-            source="sec",
+            source=FinsDownloadSource.SEC,
             form_types=(),
-            filed_after=None,
-            filed_before=None,
+            date_range=FinsDownloadDateRange(None, None, False, False),
             overwrite_existing=False,
-            rebuild_processed=False,
+            rebuild_local_artifacts=False,
             cancellation_checker=_NeverCancelled(),
         )
     )
@@ -3170,32 +3677,46 @@ def test_sec_download_adapter_summary_classifies_skipped_and_rejected_exclusivel
         "status": "ok",
         "ticker": "ATAT",
         "market_profile": {},
-        "filters": {},
+        "filters": {
+            "forms": ["10-K"],
+            "start_date": None,
+            "end_date": None,
+            "overwrite": False,
+            "rebuild": False,
+        },
         "warnings": [],
         "filings": [
             {
                 "document_id": "fil-downloaded",
                 "status": "downloaded",
+                "form_type": "10-K",
+                "filing_date": "2024-08-01",
+                "report_date": "2024-06-30",
             },
             {
                 "document_id": "fil-already-complete",
                 "status": "skipped",
                 "skip_reason": "already_downloaded_complete",
                 "reason_code": "already_downloaded_complete",
+                "form_type": "10-K",
+                "filing_date": "2024-08-01",
+                "report_date": "2024-06-30",
             },
             {
                 "document_id": "fil-filtered-6k",
                 "status": "skipped",
                 "skip_reason": "6k_filtered",
                 "reason_code": "6k_filtered",
+                "form_type": "6-K",
+                "filing_date": "2024-08-02",
+                "report_date": "2024-06-30",
             },
             {
                 "document_id": "fil-failed",
                 "status": "failed",
-            },
-            {
-                "document_id": "fil-unknown-status",
-                "status": "provider_new_status",
+                "form_type": "10-Q",
+                "filing_date": "2024-08-03",
+                "report_date": "2024-06-30",
             },
         ],
         "summary": {
@@ -3210,30 +3731,72 @@ def test_sec_download_adapter_summary_classifies_skipped_and_rejected_exclusivel
         },
     }
 
-    summary = sec_pipeline._summary_from_pipeline_result(result)
+    class _LocatorRepository:
+        """只为 downloaded row 提供 relative locator 的仓储桩。"""
 
-    assert summary.discovered_count == 5
+        def get_source_document_locator(
+            self,
+            ticker: str,
+            document_id: str,
+            source_kind: SourceKind,
+        ) -> PurePosixPath:
+            """返回与输入身份对应的 relative locator。"""
+
+            assert ticker == "ATAT"
+            assert source_kind is SourceKind.FILING
+            return PurePosixPath("source", document_id)
+
+    request = FinsSourceDownloadAdapterRequest(
+        normalized_ticker=normalize_ticker("ATAT"),
+        source=FinsDownloadSource.SEC,
+        form_types=("10-K",),
+        date_range=FinsDownloadDateRange(None, None, False, False),
+        overwrite_existing=False,
+        rebuild_local_artifacts=False,
+        cancellation_checker=_NeverCancelled(),
+    )
+    summary = sec_pipeline._summary_from_pipeline_result(
+        cast(dict[str, JsonValue], result),
+        request=request,
+        source_repository=cast(SourceDocumentRepositoryProtocol, _LocatorRepository()),
+    )
+
+    assert summary.discovered_count == 4
     assert summary.downloaded_count == 1
     assert summary.skipped_count == 1
     assert summary.rejected_count == 1
-    assert summary.failed_count == 2
+    assert summary.failed_count == 1
+    assert all(row.covered_fiscal_periods == () for row in summary.document_rows)
     assert summary.discovered_count == (
-        summary.downloaded_count
-        + summary.skipped_count
-        + summary.rejected_count
-        + summary.failed_count
+        summary.downloaded_count + summary.skipped_count + summary.rejected_count + summary.failed_count
     )
     assert (
         summary.discovered_count
-        == summary.downloaded_count
-        + summary.skipped_count
-        + summary.rejected_count
-        + summary.failed_count
+        == summary.downloaded_count + summary.skipped_count + summary.rejected_count + summary.failed_count
     )
+    invalid_result = cast(dict[str, JsonValue], dict(result))
+    invalid_result["filings"] = [
+        {
+            "document_id": "fil-unknown-status",
+            "status": "provider_new_status",
+            "form_type": "10-K",
+            "filing_date": "2024-08-04",
+            "report_date": "2024-06-30",
+        }
+    ]
+    with pytest.raises(ValueError, match="status 未封闭"):
+        sec_pipeline._summary_from_pipeline_result(
+            invalid_result,
+            request=request,
+            source_repository=cast(
+                SourceDocumentRepositoryProtocol,
+                _LocatorRepository(),
+            ),
+        )
 
 
-def test_sec_adapter_marks_processed_rebuild_for_written_documents(tmp_path: Path) -> None:
-    """SEC adapter 应消费 rebuild_processed 并标记已写入文档的 processed。"""
+def test_sec_adapter_local_rebuild_does_not_mutate_processed_documents(tmp_path: Path) -> None:
+    """SEC local rebuild 应走现有 pipeline 且不标记 processed 重处理。"""
 
     document_id = "fil_sec_rebuild"
     pipeline = _RecordingSecPipelineForAdapter(tmp_path, document_id)
@@ -3257,20 +3820,19 @@ def test_sec_adapter_marks_processed_rebuild_for_written_documents(tmp_path: Pat
     adapter.download(
         FinsSourceDownloadAdapterRequest(
             normalized_ticker=normalize_ticker("AAPL"),
-            source="sec",
+            source=FinsDownloadSource.SEC,
             form_types=("10-K",),
-            filed_after=None,
-            filed_before=None,
+            date_range=FinsDownloadDateRange(None, None, False, False),
             overwrite_existing=False,
-            rebuild_processed=True,
+            rebuild_local_artifacts=True,
             cancellation_checker=_NeverCancelled(),
         )
     )
 
     processed_meta = pipeline._processed_repository.get_processed_meta("AAPL", document_id)
 
-    assert pipeline.recorded_rebuild_values == [False]
-    assert processed_meta["reprocess_required"] is True
+    assert pipeline.recorded_rebuild_values == [True]
+    assert processed_meta["reprocess_required"] is False
 
 
 def test_sec_pipeline_keeps_6k_results_release(tmp_path: Path) -> None:
@@ -3338,7 +3900,7 @@ def test_sec_pipeline_keeps_6k_results_release(tmp_path: Path) -> None:
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
     )
-    result = pipeline.download(ticker="TCOM", overwrite=False)
+    result = pipeline.download(ticker="TCOM", overwrite=False, start_is_explicit=False)
 
     assert result["summary"]["downloaded"] == 1
     assert downloader.download_files_called is True
@@ -3386,7 +3948,7 @@ def test_sec_pipeline_keeps_primary_only_6k_results_release(tmp_path: Path) -> N
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
     )
-    result = pipeline.download(ticker="TCOM", overwrite=False)
+    result = pipeline.download(ticker="TCOM", overwrite=False, start_is_explicit=False)
 
     assert result["summary"]["downloaded"] == 1
     assert downloader.download_files_called is True
@@ -3397,7 +3959,7 @@ def test_sec_pipeline_keeps_primary_only_6k_results_release(tmp_path: Path) -> N
 
 
 def test_sec_pipeline_promotes_positive_6k_exhibit_when_cover_is_excluded(tmp_path: Path) -> None:
-    """验证 6-K 封面被排除时，会提升同 filing 的季度正文 exhibit。 
+    """验证 6-K 封面被排除时，会提升同 filing 的季度正文 exhibit。
 
     Args:
         tmp_path: 临时目录。
@@ -3448,13 +4010,9 @@ def test_sec_pipeline_promotes_positive_6k_exhibit_when_cover_is_excluded(tmp_pa
             },
         ],
         content_by_name={
-            "sample-6k.htm": (
-                b"FORM 6-K\nEXHIBIT INDEX\n"
-                b"Exhibit 99.1 - ANNUAL GENERAL MEETING Announcement\n"
-            ),
+            "sample-6k.htm": (b"FORM 6-K\nEXHIBIT INDEX\nExhibit 99.1 - ANNUAL GENERAL MEETING Announcement\n"),
             "d123dex991.htm": (
-                b"Press Release\n"
-                b"TCOM Announces Fourth Quarter and Full Year 2024 Unaudited Financial Results\n"
+                b"Press Release\nTCOM Announces Fourth Quarter and Full Year 2024 Unaudited Financial Results\n"
             ),
         },
     )
@@ -3463,7 +4021,7 @@ def test_sec_pipeline_promotes_positive_6k_exhibit_when_cover_is_excluded(tmp_pa
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
     )
-    result = pipeline.download(ticker="TCOM", overwrite=False)
+    result = pipeline.download(ticker="TCOM", overwrite=False, start_is_explicit=False)
 
     assert result["summary"]["downloaded"] == 1
     assert downloader.download_files_called is True
@@ -3519,9 +4077,7 @@ def test_sec_pipeline_repairs_cover_primary_when_attachment_has_core_statements(
         ],
         content_by_name={
             "form6-k.htm": (
-                b"FORM 6-K\n"
-                b"Financial Results and Business Updates\n"
-                b"Company reported strong quarterly performance\n"
+                b"FORM 6-K\nFinancial Results and Business Updates\nCompany reported strong quarterly performance\n"
             ),
             "ex99-1.htm": b"EX-99.1\nCompany quarterly results attachment\n",
         },
@@ -3566,7 +4122,7 @@ def test_sec_pipeline_repairs_cover_primary_when_attachment_has_core_statements(
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
     )
-    result = pipeline.download(ticker="ALVO", overwrite=False)
+    result = pipeline.download(ticker="ALVO", overwrite=False, start_is_explicit=False)
 
     assert result["summary"]["downloaded"] == 1
     meta_path = _source_meta_path(tmp_path, "ALVO", "fil_0000000000-25-000101")
@@ -3619,13 +4175,9 @@ def test_sec_pipeline_rolls_back_when_prepared_primary_selection_raises(
             },
         ],
         content_by_name={
-            "sample-6k.htm": (
-                b"FORM 6-K\nEXHIBIT INDEX\n"
-                b"Exhibit 99.1 - ANNUAL GENERAL MEETING Announcement\n"
-            ),
+            "sample-6k.htm": (b"FORM 6-K\nEXHIBIT INDEX\nExhibit 99.1 - ANNUAL GENERAL MEETING Announcement\n"),
             "d123dex991.htm": (
-                b"Press Release\n"
-                b"TCOM Announces Fourth Quarter and Full Year 2024 Unaudited Financial Results\n"
+                b"Press Release\nTCOM Announces Fourth Quarter and Full Year 2024 Unaudited Financial Results\n"
             ),
         },
     )
@@ -3654,7 +4206,7 @@ def test_sec_pipeline_rolls_back_when_prepared_primary_selection_raises(
         processor_registry=build_fins_processor_registry(),
     )
     with pytest.raises(RuntimeError, match="boom"):
-        pipeline.download(ticker="TCOM", overwrite=False)
+        pipeline.download(ticker="TCOM", overwrite=False, start_is_explicit=False)
 
     meta_path = _source_meta_path(tmp_path, "TCOM", "fil_0000000000-25-000101")
     assert not meta_path.exists()
@@ -3932,7 +4484,7 @@ def test_sec_pipeline_warns_missing_sc13(tmp_path: Path) -> None:
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
     )
-    result = pipeline.download(ticker="AAPL", overwrite=False)
+    result = pipeline.download(ticker="AAPL", overwrite=False, start_is_explicit=False)
 
     warnings = result.get("warnings") or []
     assert any("SC 13D/G" in item for item in warnings)
@@ -3978,7 +4530,7 @@ def test_sec_pipeline_sc13_direction_filters_gs_like_records(tmp_path: Path) -> 
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
     )
-    result = pipeline.download(ticker="GS", form_type="SC13D/G", overwrite=False)
+    result = pipeline.download(ticker="GS", form_type="SC13D/G", overwrite=False, start_is_explicit=False)
 
     assert result["summary"]["total"] == 0
     assert result["summary"]["downloaded"] == 0
@@ -3993,6 +4545,77 @@ def test_sec_pipeline_sc13_direction_filters_gs_like_records(tmp_path: Path) -> 
         "GS",
         "fil_0000000000-25-000702",
     ).exists()
+
+
+def test_sec_pipeline_sc13_transport_failure_publishes_registry_only(
+    tmp_path: Path,
+) -> None:
+    """SC13 rejected artifact transport failure 必须保留 registry-only durable 语义。
+
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: transport typed failure 未回退到 registry-only 或伪造 artifact 时抛出。
+    """
+
+    accession_number = "0000000000-25-000703"
+    document_id = f"fil_{accession_number}"
+    submissions: dict[str, JsonValue] = {
+        "filings": {
+            "recent": {
+                "form": ["SC 13G"],
+                "filingDate": ["2025-08-12"],
+                "reportDate": [""],
+                "accessionNumber": [accession_number],
+                "primaryDocument": ["sc13g-failed.htm"],
+                "fileNumber": ["005-10003"],
+            },
+            "files": [],
+        }
+    }
+    descriptor = RemoteFileDescriptor(
+        name="sc13g-failed.htm",
+        source_url="https://example.com/sc13g-failed.htm",
+        http_etag=None,
+        http_last_modified=None,
+        remote_size=None,
+        http_status=503,
+    )
+    downloader = StubDownloader(
+        submissions=submissions,
+        remote_files=[descriptor],
+        download_results=[
+            {
+                "name": descriptor.name,
+                "status": "failed",
+                "source_url": descriptor.source_url,
+                "reason_code": "provider_unavailable",
+                "reason_message": "来源暂不可用",
+            }
+        ],
+        sc13_roles_by_accession={accession_number: ("320193", "999999")},
+    )
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=downloader,
+        processor_registry=build_fins_processor_registry(),
+    )
+
+    result = pipeline.download(
+        ticker="GS",
+        form_type="SC13D/G",
+        overwrite=False,
+        start_is_explicit=False,
+    )
+
+    registry_payload = json.loads(_download_rejections_path(tmp_path, "GS").read_text(encoding="utf-8"))
+    assert result["summary"]["total"] == 0
+    assert registry_payload[document_id]["reason"] == "sc13_direction_rejected"
+    assert not _rejected_meta_path(tmp_path, "GS", document_id).exists()
 
 
 def test_sec_pipeline_sc13_direction_keeps_aapl_like_records(tmp_path: Path) -> None:
@@ -4049,7 +4672,14 @@ def test_sec_pipeline_sc13_direction_keeps_aapl_like_records(tmp_path: Path) -> 
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
     )
-    result = pipeline.download(ticker="AAPL", form_type="SC13D/G", overwrite=False)
+    result = pipeline.download(
+        ticker="AAPL",
+        form_type="SC13D/G",
+        start_date="2025-01-01",
+        end_date="2026-12-31",
+        overwrite=False,
+        start_is_explicit=False,
+    )
 
     assert result["summary"]["downloaded"] == 1
     kept_meta = _source_meta_path(tmp_path, "AAPL", "fil_0000000000-25-000801")
@@ -4127,7 +4757,7 @@ def test_sec_pipeline_supplements_sc13_from_browse(tmp_path: Path) -> None:
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
     )
-    result = pipeline.download(ticker="AAPL", form_type="SC13D/G", overwrite=False)
+    result = pipeline.download(ticker="AAPL", form_type="SC13D/G", overwrite=False, start_is_explicit=False)
 
     assert result["summary"]["downloaded"] == 1
     assert downloader.browse_calls == ["005-12345"]
@@ -4201,7 +4831,7 @@ def test_sec_pipeline_sc13_keeps_latest_per_filer(tmp_path: Path) -> None:
         processor_registry=build_fins_processor_registry(),
     )
 
-    result = pipeline.download(ticker="AAPL", form_type="SC13D/G", overwrite=False)
+    result = pipeline.download(ticker="AAPL", form_type="SC13D/G", overwrite=False, start_is_explicit=False)
 
     assert result["summary"]["downloaded"] == 1
     old_meta = _source_meta_path(tmp_path, "AAPL", "fil_0000000000-25-000777")
@@ -4279,7 +4909,7 @@ def test_sc13_no_retry_when_found_in_initial_window(tmp_path: Path) -> None:
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
     )
-    result = pipeline.download(ticker="AAPL", form_type="SC13D/G", overwrite=False)
+    result = pipeline.download(ticker="AAPL", form_type="SC13D/G", overwrite=False, start_is_explicit=False)
 
     # 找到了 SC 13G，无需重试 → browse_calls 不应被调用（submissions 无 005- filenum 除自身外）
     assert result["summary"]["downloaded"] == 1
@@ -4334,13 +4964,75 @@ def test_sc13_retry_expands_window_and_finds_filing(tmp_path: Path) -> None:
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
     )
-    result = pipeline.download(ticker="AAPL", form_type="SC13D/G", overwrite=False)
+    result = pipeline.download(ticker="AAPL", form_type="SC13D/G", overwrite=False, start_is_explicit=False)
 
     # 初始1年窗口找不到（2024-01-15 在1年+60天之外），重试后应找到
     assert result["summary"]["downloaded"] >= 1
     warnings = result.get("warnings") or []
     # 找到了 SC 13G，不应有缺失警告
     assert not any("SC 13D/G" in w for w in warnings)
+
+
+def test_sc13_explicit_start_never_expands_lower_bound(tmp_path: Path) -> None:
+    """显式 SC13 起点必须阻止渐进回溯选择更早 filing。
+
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 窗口外 filing 被下载或持久化时抛出。
+    """
+
+    old_accession = "0000000000-24-000050"
+    submissions: dict[str, JsonValue] = {
+        "filings": {
+            "recent": {
+                "form": ["SC 13G"],
+                "filingDate": ["2024-01-15"],
+                "reportDate": [""],
+                "accessionNumber": [old_accession],
+                "primaryDocument": ["sc13g-old.htm"],
+                "fileNumber": ["005-67890"],
+            },
+            "files": [],
+        }
+    }
+    downloader = StubDownloader(
+        submissions=submissions,
+        remote_files=[_make_descriptor("etag-old")],
+        download_results=[
+            {
+                "name": "sc13g-old.htm",
+                "status": "downloaded",
+                "path": "sc13g-old.htm",
+                "source_url": "https://example.com/sc13g-old.htm",
+                "http_etag": "etag-old",
+                "http_last_modified": "Mon, 01 Jan 2024 00:00:00 GMT",
+            }
+        ],
+    )
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=downloader,
+        processor_registry=build_fins_processor_registry(),
+    )
+
+    result = pipeline.download(
+        ticker="AAPL",
+        form_type="SC13D/G",
+        start_date="2025-01-01",
+        end_date="2026-12-31",
+        overwrite=False,
+        start_is_explicit=True,
+    )
+
+    assert result["summary"]["downloaded"] == 0
+    assert result["summary"]["rejected"] == 0
+    assert downloader.download_files_called is False
+    assert not _source_meta_path(tmp_path, "AAPL", f"fil_{old_accession}").exists()
 
 
 def test_sc13_retry_warns_after_max_retries(tmp_path: Path) -> None:
@@ -4390,8 +5082,437 @@ def test_sc13_retry_warns_after_max_retries(tmp_path: Path) -> None:
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
     )
-    result = pipeline.download(ticker="AAPL", overwrite=False)
+    result = pipeline.download(ticker="AAPL", overwrite=False, start_is_explicit=False)
 
     # 最大重试后仍无 SC 13 → 应有缺失警告
     warnings = result.get("warnings") or []
     assert any("SC 13D/G" in w for w in warnings)
+
+
+@pytest.mark.parametrize("corruption", ["size", "digest", "missing"])
+def test_sec_top_level_repairs_selected_corruption_before_company_mutation(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    """真实 SEC top-level overwrite=False 必须修复唯一 selected corruption。"""
+
+    meta_path = _seed_complete_sec_source(workspace_root=tmp_path)
+    payload_path = meta_path.parent / "sample-10k.htm"
+    old_payload = payload_path.read_bytes()
+    if corruption == "size":
+        payload_path.write_bytes(old_payload + b"-corrupt")
+    elif corruption == "digest":
+        payload_path.write_bytes(b"X" * len(old_payload))
+    else:
+        payload_path.unlink()
+    replacement = b"<html>repaired</html>"
+    downloader = StubDownloader(
+        submissions=_build_submissions(),
+        remote_files=[_make_descriptor("etag-repair")],
+        download_results=[
+            {
+                "name": "sample-10k.htm",
+                "status": "downloaded",
+                "source_url": "https://example.com/sample-10k.htm",
+                "http_etag": "etag-repair",
+            }
+        ],
+        content_by_name={"sample-10k.htm": replacement},
+    )
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=downloader,
+        processor_registry=build_fins_processor_registry(),
+    )
+
+    result = pipeline.download(
+        ticker="AAPL",
+        overwrite=False,
+        start_is_explicit=False,
+    )
+
+    assert result["summary"]["downloaded"] == 1
+    with pipeline._source_repository.read_source_snapshot(
+        "AAPL",
+        "fil_0000000000-25-000001",
+        SourceKind.FILING,
+        materialize_files=True,
+    ) as snapshot:
+        with snapshot.get_primary_source().open() as stream:
+            assert stream.read() == replacement
+
+
+def test_sec_top_level_unselected_corruption_fails_before_company_batch(
+    tmp_path: Path,
+) -> None:
+    """未选中 corruption 必须在任何 company/source/rejection mutation 前 typed fail closed。"""
+
+    meta_path = _seed_complete_sec_source(
+        workspace_root=tmp_path,
+        document_id="fil_unselected",
+    )
+    (meta_path.parent / "sample-10k.htm").unlink()
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=StubDownloader(
+            submissions=_build_submissions(),
+            remote_files=[_make_descriptor("etag")],
+            download_results=[],
+        ),
+        processor_registry=build_fins_processor_registry(),
+    )
+
+    with pytest.raises(SourceIntegrityPreflightError) as exc_info:
+        pipeline.download(
+            ticker="AAPL",
+            overwrite=False,
+            start_is_explicit=False,
+        )
+
+    assert exc_info.value.reason is SourceIntegrityPreflightReason.UNSELECTED_REPAIR_REQUIRED
+    with pytest.raises(FileNotFoundError):
+        pipeline._company_repository.get_company_meta("AAPL")
+
+
+def test_sec_same_target_overwrite_discards_stale_prefetch_and_last_writer_wins(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同 target 双 overwrite 都成功，后 writer 必须丢弃旧 payload 并重新预取。"""
+
+    second_prefetch_complete = Event()
+    first_source_committed = Event()
+    remote_files = [_make_descriptor("etag-race")]
+    download_results: list[DownloadFileResult] = [
+        {
+            "name": "sample-10k.htm",
+            "status": "downloaded",
+            "source_url": "https://example.com/sample-10k.htm",
+        }
+    ]
+    first_downloader = BarrierPrefetchDownloader(
+        role="first",
+        submissions=_build_submissions(),
+        remote_files=remote_files,
+        download_results=download_results,
+        first_prefetch_payload=b"writer-a",
+        retry_payload=b"unused-a",
+        second_prefetch_complete=second_prefetch_complete,
+        first_source_committed=first_source_committed,
+    )
+    second_downloader = BarrierPrefetchDownloader(
+        role="second",
+        submissions=_build_submissions(),
+        remote_files=remote_files,
+        download_results=download_results,
+        first_prefetch_payload=b"writer-b-stale",
+        retry_payload=b"writer-b-final",
+        second_prefetch_complete=second_prefetch_complete,
+        first_source_committed=first_source_committed,
+    )
+    first_pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=first_downloader,
+        processor_registry=build_fins_processor_registry(),
+    )
+    second_pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=second_downloader,
+        processor_registry=build_fins_processor_registry(),
+    )
+    original_first_commit = first_pipeline._batching_repository.commit_batch
+
+    def observe_first_source_commit(batch: BatchToken) -> None:
+        """在真实 commit 后仅当 target 已完整时释放 second writer。"""
+
+        original_first_commit(batch)
+        classification = first_pipeline._source_repository.classify_source_integrity(
+            "AAPL",
+            "fil_0000000000-25-000001",
+            SourceKind.FILING,
+        )
+        if classification.status.value == "complete":
+            first_source_committed.set()
+
+    monkeypatch.setattr(
+        first_pipeline._batching_repository,
+        "commit_batch",
+        observe_first_source_commit,
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(
+            first_pipeline.download,
+            "AAPL",
+            overwrite=True,
+            start_is_explicit=False,
+        )
+        second_future = executor.submit(
+            second_pipeline.download,
+            "AAPL",
+            overwrite=True,
+            start_is_explicit=False,
+        )
+        first_result = first_future.result(timeout=10)
+        second_result = second_future.result(timeout=10)
+
+    assert first_result["summary"]["downloaded"] == 1
+    assert second_result["summary"]["downloaded"] == 1
+    assert first_downloader.prefetch_rounds == 1
+    assert second_downloader.prefetch_rounds == 2
+    with second_pipeline._source_repository.read_source_snapshot(
+        "AAPL",
+        "fil_0000000000-25-000001",
+        SourceKind.FILING,
+        materialize_files=True,
+    ) as snapshot:
+        with snapshot.get_primary_source().open() as stream:
+            assert stream.read() == b"writer-b-final"
+
+
+def test_sec_different_target_overwrite_writers_publish_union(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同 ticker 不同 target writer 必须从 latest tree 发布最终 union。"""
+
+    second_prefetch_complete = Event()
+    first_source_committed = Event()
+    first_descriptor = RemoteFileDescriptor(
+        name="sample-10k-a.htm",
+        source_url="https://example.com/sample-10k-a.htm",
+        http_etag="etag-a",
+        http_last_modified=None,
+        remote_size=None,
+        http_status=200,
+    )
+    second_descriptor = RemoteFileDescriptor(
+        name="sample-10k-b.htm",
+        source_url="https://example.com/sample-10k-b.htm",
+        http_etag="etag-b",
+        http_last_modified=None,
+        remote_size=None,
+        http_status=200,
+    )
+    first_downloader = BarrierPrefetchDownloader(
+        role="first",
+        submissions=_build_single_filing_submissions(
+            accession_number="0000000000-25-000001",
+            primary_document=first_descriptor.name,
+        ),
+        remote_files=[first_descriptor],
+        download_results=[
+            {
+                "name": first_descriptor.name,
+                "status": "downloaded",
+                "source_url": first_descriptor.source_url,
+            }
+        ],
+        first_prefetch_payload=b"target-a",
+        retry_payload=b"unused-a",
+        second_prefetch_complete=second_prefetch_complete,
+        first_source_committed=first_source_committed,
+    )
+    second_downloader = BarrierPrefetchDownloader(
+        role="second",
+        submissions=_build_single_filing_submissions(
+            accession_number="0000000000-25-000002",
+            primary_document=second_descriptor.name,
+        ),
+        remote_files=[second_descriptor],
+        download_results=[
+            {
+                "name": second_descriptor.name,
+                "status": "downloaded",
+                "source_url": second_descriptor.source_url,
+            }
+        ],
+        first_prefetch_payload=b"target-b",
+        retry_payload=b"unused-b",
+        second_prefetch_complete=second_prefetch_complete,
+        first_source_committed=first_source_committed,
+    )
+    first_pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=first_downloader,
+        processor_registry=build_fins_processor_registry(),
+    )
+    second_pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=second_downloader,
+        processor_registry=build_fins_processor_registry(),
+    )
+    original_first_commit = first_pipeline._batching_repository.commit_batch
+
+    def release_second_after_first_source(batch: BatchToken) -> None:
+        """在 target A 真实 publication 后释放 target B。"""
+
+        original_first_commit(batch)
+        try:
+            first_pipeline._source_repository.get_source_meta(
+                "AAPL",
+                "fil_0000000000-25-000001",
+                SourceKind.FILING,
+            )
+        except FileNotFoundError:
+            return
+        first_source_committed.set()
+
+    monkeypatch.setattr(
+        first_pipeline._batching_repository,
+        "commit_batch",
+        release_second_after_first_source,
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(
+            first_pipeline.download,
+            "AAPL",
+            overwrite=True,
+            start_is_explicit=False,
+        )
+        second_future = executor.submit(
+            second_pipeline.download,
+            "AAPL",
+            overwrite=True,
+            start_is_explicit=False,
+        )
+        first_result = first_future.result(timeout=10)
+        second_result = second_future.result(timeout=10)
+
+    assert first_result["summary"]["downloaded"] == 1
+    assert second_result["summary"]["downloaded"] == 1
+    assert first_downloader.prefetch_rounds == 1
+    assert second_downloader.prefetch_rounds == 1
+    for document_id, expected in (
+        ("fil_0000000000-25-000001", b"target-a"),
+        ("fil_0000000000-25-000002", b"target-b"),
+    ):
+        with second_pipeline._source_repository.read_source_snapshot(
+            "AAPL",
+            document_id,
+            SourceKind.FILING,
+            materialize_files=True,
+        ) as snapshot:
+            with snapshot.get_primary_source().open() as stream:
+                assert stream.read() == expected
+
+
+def test_rejected_prefetch_cancelled_before_begin_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """rejected prefetch 返回后取消必须发生在 begin_batch 前。"""
+
+    descriptor = RemoteFileDescriptor(
+        name="sample-6k.htm",
+        source_url="https://example.com/sample-6k.htm",
+        http_etag="etag-rejected",
+        http_last_modified=None,
+        remote_size=None,
+        http_status=200,
+    )
+    downloader = StubDownloader(
+        submissions=_build_foreign_submissions(),
+        remote_files=[descriptor],
+        download_results=[
+            {
+                "name": descriptor.name,
+                "status": "downloaded",
+                "source_url": descriptor.source_url,
+            }
+        ],
+    )
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=downloader,
+        processor_registry=build_fins_processor_registry(),
+    )
+    begin_called = False
+
+    def observe_begin(ticker: str) -> BatchToken:
+        """记录任何越过取消 gate 的 batch 开启。"""
+
+        del ticker
+        nonlocal begin_called
+        begin_called = True
+        raise AssertionError("取消后不得 begin_batch")
+
+    monkeypatch.setattr(pipeline._batching_repository, "begin_batch", observe_begin)
+    filing = _sec_filing_collection.FilingRecord(
+        form_type="6-K",
+        filing_date="2025-08-01",
+        report_date="2024-12-31",
+        accession_number="0000000000-25-000101",
+        primary_document=descriptor.name,
+    )
+
+    with pytest.raises(SecDownloadCancelledError):
+        asyncio.run(
+            pipeline._persist_rejected_filing_artifact(
+                ticker="TCOM",
+                cik="320193",
+                filing=filing,
+                remote_files=[descriptor],
+                overwrite=True,
+                rejection_reason="6k_filtered",
+                rejection_category="EXCLUDE_NON_QUARTERLY",
+                selected_primary_document=descriptor.name,
+                source_fingerprint="fingerprint",
+                registry_after={},
+                cancel_checker=lambda: True,
+            )
+        )
+
+    assert downloader.download_files_called is True
+    assert begin_called is False
+
+
+def test_sec_selected_repair_that_6k_policy_rejects_fails_before_mutation(
+    tmp_path: Path,
+) -> None:
+    """selected repair 在 6-K Phase A 被拒时必须保留全部 old facts。"""
+
+    document_id = "fil_0000000000-25-000101"
+    meta_path = _seed_complete_sec_source(
+        workspace_root=tmp_path,
+        ticker="TCOM",
+        document_id=document_id,
+    )
+    payload_path = meta_path.parent / "sample-10k.htm"
+    payload_path.write_bytes(payload_path.read_bytes() + b"-corrupt")
+    old_meta = meta_path.read_bytes()
+    old_payload = payload_path.read_bytes()
+    descriptor = RemoteFileDescriptor(
+        name="sample-6k.htm",
+        source_url="https://example.com/sample-6k.htm",
+        http_etag="etag-6k-reject",
+        http_last_modified=None,
+        remote_size=None,
+        http_status=200,
+    )
+    downloader = StubDownloader(
+        submissions=_build_foreign_submissions(),
+        remote_files=[descriptor],
+        download_results=[
+            {
+                "name": descriptor.name,
+                "status": "downloaded",
+                "source_url": descriptor.source_url,
+            }
+        ],
+        content_by_name={descriptor.name: b"Annual general meeting voting results."},
+    )
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=downloader,
+        processor_registry=build_fins_processor_registry(),
+    )
+
+    with pytest.raises(SourceIntegrityPreflightError) as exc_info:
+        pipeline.download(ticker="TCOM", overwrite=False, start_is_explicit=False)
+
+    assert exc_info.value.reason is SourceIntegrityPreflightReason.SELECTED_REJECTED_REPAIR_REQUIRED
+    assert meta_path.read_bytes() == old_meta
+    assert payload_path.read_bytes() == old_payload
+    assert not _company_meta_path(tmp_path, "TCOM").exists()
+    assert not _download_rejections_path(tmp_path, "TCOM").exists()
+    assert not _rejected_meta_path(tmp_path, "TCOM", document_id).exists()

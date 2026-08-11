@@ -13,13 +13,16 @@ from dayu.contracts.json_value import JsonValue
 from dayu.fins.downloaders.hkexnews_downloader import HkexnewsDiscoveryClient
 from dayu.fins.domain.document_models import CompanyMeta, now_iso8601
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.ingestion_runtime import FinsDownloadProgressEvent
 from dayu.fins.pipelines.cn_download_models import (
     CnCompanyProfile,
     CnReportCandidate,
+    CnReportPeriodProjection,
     CnReportQuery,
     DownloadedReportAsset,
 )
-from dayu.fins.pipelines.cn_pipeline import CnPipeline
+from dayu.fins.pipelines.cn_download_protocols import CnDoclingConversionRunner
+from dayu.fins.pipelines.cn_pipeline import CnPipeline, collect_cn_download_result_from_events
 from dayu.fins.pipelines.download_events import DownloadEventType
 from dayu.fins.pipelines.upload_company_meta import RESOLVER_VERSION
 from dayu.fins.pipelines.upload_filing_events import UploadFilingEventType
@@ -50,6 +53,7 @@ class _PipelineDownloadFakeDiscoveryClient:
     """CnPipeline wrapper 测试用 CN fake discovery client。"""
 
     temp_dir: Path
+    candidates: tuple[CnReportCandidate, ...] | None = None
     download_calls: int = 0
     cancellation_checkpoints: list[Callable[[], None] | None] = field(default_factory=list)
 
@@ -98,7 +102,7 @@ class _PipelineDownloadFakeDiscoveryClient:
         self.cancellation_checkpoints.append(cancellation_checkpoint)
         if cancellation_checkpoint is not None:
             cancellation_checkpoint()
-        return (
+        default_candidates = (
             CnReportCandidate(
                 provider="cninfo",
                 source_id="A1",
@@ -107,13 +111,14 @@ class _PipelineDownloadFakeDiscoveryClient:
                 language="zh",
                 filing_date="2026-04-01",
                 fiscal_year=2025,
-                fiscal_period="FY",
+                period_projection=CnReportPeriodProjection(identity_period="FY", covered_periods=("FY",)),
                 amended=False,
                 content_length=len(_PDF_BYTES),
                 etag='"v1"',
                 last_modified="Wed, 01 Apr 2026 00:00:00 GMT",
             ),
         )
+        return self.candidates if self.candidates is not None else default_candidates
 
     def download_report_pdf(self, candidate: CnReportCandidate) -> DownloadedReportAsset:
         """返回内存 PDF 资产。
@@ -200,7 +205,7 @@ class _PipelineDownloadFakeHkDiscoveryClient:
                 language="en",
                 filing_date="2025-04-08",
                 fiscal_year=2024,
-                fiscal_period="FY",
+                period_projection=CnReportPeriodProjection(identity_period="FY", covered_periods=("FY",)),
                 amended=False,
                 content_length=len(_PDF_BYTES),
                 etag='"hk-v1"',
@@ -232,17 +237,24 @@ class _PipelineDownloadFakeHkDiscoveryClient:
 
 
 @dataclass
-class _PipelineDownloadFakeConverter:
-    """CnPipeline wrapper 测试用 Docling fake。"""
+class _PipelineDownloadFakeConversionRunner(CnDoclingConversionRunner):
+    """CnPipeline wrapper 测试用 typed Docling runner。"""
 
     calls: int = 0
 
-    def __call__(self, raw_data: bytes, stream_name: str) -> bytes:
+    async def convert_pdf_to_docling_json(
+        self,
+        pdf_bytes: bytes,
+        stream_name: str,
+        *,
+        cancellation_checker: Callable[[], bool],
+    ) -> bytes:
         """返回固定 Docling JSON。
 
         Args:
-            raw_data: PDF 字节。
+            pdf_bytes: PDF 字节。
             stream_name: 流名称。
+            cancellation_checker: operation-scoped 取消检查器。
 
         Returns:
             Docling JSON 字节。
@@ -251,7 +263,8 @@ class _PipelineDownloadFakeConverter:
             无。
         """
 
-        del raw_data, stream_name
+        del pdf_bytes, stream_name
+        assert cancellation_checker() is False
         self.calls += 1
         return _DOCLING_BYTES
 
@@ -326,11 +339,11 @@ def test_download_runs_cn_workflow_with_injected_discovery_client(tmp_path: Path
     """
 
     discovery = _PipelineDownloadFakeDiscoveryClient(temp_dir=tmp_path)
-    converter = _PipelineDownloadFakeConverter()
+    runner = _PipelineDownloadFakeConversionRunner()
     pipeline = CnPipeline(
         workspace_root=tmp_path,
         cn_discovery_client=discovery,
-        convert_pdf_to_docling_json=converter,
+        docling_conversion_runner=runner,
     )
     cancel_checker = _never_cancel
 
@@ -340,6 +353,7 @@ def test_download_runs_cn_workflow_with_injected_discovery_client(tmp_path: Path
         start_date="2025-01-01",
         end_date="2026-12-31",
         overwrite=True,
+        start_is_explicit=True,
         cancel_checker=cancel_checker,
     )
 
@@ -354,7 +368,7 @@ def test_download_runs_cn_workflow_with_injected_discovery_client(tmp_path: Path
     assert len(discovery.cancellation_checkpoints) == 1
     assert discovery.cancellation_checkpoints[0] is not None
     assert discovery.cancellation_checkpoints[0] is not cancel_checker
-    assert converter.calls == 1
+    assert runner.calls == 1
 
 
 def test_default_hk_discovery_client_is_hkexnews(tmp_path: Path) -> None:
@@ -391,11 +405,11 @@ def test_download_runs_hk_workflow_with_injected_discovery_client(tmp_path: Path
     """
 
     discovery = _PipelineDownloadFakeHkDiscoveryClient(temp_dir=tmp_path)
-    converter = _PipelineDownloadFakeConverter()
+    runner = _PipelineDownloadFakeConversionRunner()
     pipeline = CnPipeline(
         workspace_root=tmp_path,
         hk_discovery_client=discovery,
-        convert_pdf_to_docling_json=converter,
+        docling_conversion_runner=runner,
     )
     cancel_checker = _never_cancel
 
@@ -405,6 +419,7 @@ def test_download_runs_hk_workflow_with_injected_discovery_client(tmp_path: Path
         start_date="2024-01-01",
         end_date="2025-12-31",
         overwrite=True,
+        start_is_explicit=True,
         cancel_checker=cancel_checker,
     )
 
@@ -422,7 +437,7 @@ def test_download_runs_hk_workflow_with_injected_discovery_client(tmp_path: Path
     assert len(discovery.cancellation_checkpoints) == 1
     assert discovery.cancellation_checkpoints[0] is not None
     assert discovery.cancellation_checkpoints[0] is not cancel_checker
-    assert converter.calls == 1
+    assert runner.calls == 1
 
 
 @pytest.mark.asyncio
@@ -442,11 +457,11 @@ async def test_download_stream_runs_cn_workflow_with_injected_discovery_client(
     """
 
     discovery = _PipelineDownloadFakeDiscoveryClient(temp_dir=tmp_path)
-    converter = _PipelineDownloadFakeConverter()
+    runner = _PipelineDownloadFakeConversionRunner()
     pipeline = CnPipeline(
         workspace_root=tmp_path,
         cn_discovery_client=discovery,
-        convert_pdf_to_docling_json=converter,
+        docling_conversion_runner=runner,
     )
 
     events = [
@@ -457,6 +472,7 @@ async def test_download_stream_runs_cn_workflow_with_injected_discovery_client(
             start_date="2025-01-01",
             end_date="2026-12-31",
             overwrite=False,
+            start_is_explicit=True,
         )
     ]
 
@@ -467,6 +483,7 @@ async def test_download_stream_runs_cn_workflow_with_injected_discovery_client(
         DownloadEventType.FILE_DOWNLOAD_STARTED,
         DownloadEventType.FILE_DOWNLOADED,
         DownloadEventType.CONVERSION_STARTED,
+        DownloadEventType.CONVERSION_COMPLETED,
         DownloadEventType.FILING_COMPLETED,
         DownloadEventType.PIPELINE_COMPLETED,
     ]
@@ -477,7 +494,109 @@ async def test_download_stream_runs_cn_workflow_with_injected_discovery_client(
     assert result["status"] == "ok"
     assert summary["downloaded"] == 1
     assert discovery.download_calls == 1
-    assert converter.calls == 1
+    assert runner.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_hk_adapter_progress_sink_projects_conversion_lifecycle(tmp_path: Path) -> None:
+    """HK adapter 应按真实 workflow 顺序投影完整文档转换生命周期。
+
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 转换完成事件缺失、乱序或业务字段漂移时抛出。
+    """
+
+    pipeline = CnPipeline(
+        workspace_root=tmp_path,
+        hk_discovery_client=_PipelineDownloadFakeHkDiscoveryClient(temp_dir=tmp_path),
+        docling_conversion_runner=_PipelineDownloadFakeConversionRunner(),
+    )
+    progress_events: list[FinsDownloadProgressEvent] = []
+
+    result = await collect_cn_download_result_from_events(
+        pipeline.download_stream(
+            ticker="0700",
+            form_type="FY",
+            start_date="2024-01-01",
+            end_date="2025-12-31",
+            overwrite=False,
+            start_is_explicit=True,
+        ),
+        progress_sink=progress_events.append,
+    )
+    conversion_progress = [event for event in progress_events if event.stage.startswith("download.conversion_")]
+
+    assert result["status"] == "ok"
+    assert [(event.stage, event.message) for event in conversion_progress] == [
+        ("download.conversion_started", "开始转换文档"),
+        ("download.conversion_completed", "完成转换文档"),
+    ]
+    assert conversion_progress[0].document_id is not None
+    assert conversion_progress[0].document_id == conversion_progress[1].document_id
+    assert conversion_progress[0].file_name is not None
+    assert conversion_progress[0].file_name == conversion_progress[1].file_name
+
+
+def test_download_non_explicit_nonempty_start_keeps_default_business_limit(tmp_path: Path) -> None:
+    """未来默认起点非空时，CN pipeline 仍须启用默认 FY 五年限制。
+
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: workflow 从日期非空错误反推显式性时抛出。
+    """
+
+    candidates = tuple(
+        CnReportCandidate(
+            provider="cninfo",
+            source_id=f"A{fiscal_year}",
+            source_url=f"https://static.cninfo.test/A{fiscal_year}.pdf",
+            title=f"平安银行：{fiscal_year}年年度报告",
+            language="zh",
+            filing_date=f"{fiscal_year + 1}-04-01",
+            fiscal_year=fiscal_year,
+            period_projection=CnReportPeriodProjection(identity_period="FY", covered_periods=("FY",)),
+            amended=False,
+            content_length=len(_PDF_BYTES),
+            etag=f'"v{fiscal_year}"',
+            last_modified=f"Wed, 01 Apr {fiscal_year + 1} 00:00:00 GMT",
+        )
+        for fiscal_year in range(2025, 2019, -1)
+    )
+    discovery = _PipelineDownloadFakeDiscoveryClient(
+        temp_dir=tmp_path,
+        candidates=candidates,
+    )
+    runner = _PipelineDownloadFakeConversionRunner()
+    pipeline = CnPipeline(
+        workspace_root=tmp_path,
+        cn_discovery_client=discovery,
+        docling_conversion_runner=runner,
+    )
+
+    result = pipeline.download(
+        ticker="000001",
+        form_type="FY",
+        start_date="2020-01-01",
+        end_date="2026-12-31",
+        overwrite=False,
+        start_is_explicit=False,
+    )
+
+    summary = result["summary"]
+    assert isinstance(summary, dict)
+    assert summary["downloaded"] == 5
+    assert discovery.download_calls == 5
+    assert runner.calls == 5
 
 
 @pytest.mark.asyncio

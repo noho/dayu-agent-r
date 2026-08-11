@@ -11,19 +11,20 @@ import asyncio
 import sys
 from collections.abc import AsyncIterator, Callable
 from io import BytesIO
-from typing import cast
+from typing import Literal, TypeAlias, cast
 
 from dayu.fins.domain.document_models import BatchToken, SourceHandle
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.download_contract import FinsDownloadProviderError
 from dayu.fins.pipelines.cn_download_pdf_gate import CnDownloadPdfGateProtocol
 from dayu.fins.pipelines.cn_download_models import (
-    CN_PIPELINE_DOWNLOAD_VERSION,
     CnDownloadCancelledError,
     CnCompanyProfile,
     CnReportCandidate,
     DownloadedReportAsset,
 )
 from dayu.fins.pipelines.cn_download_protocols import (
+    CnDoclingConversionRunner,
     CnReportDiscoveryClientProtocol,
 )
 from dayu.fins.pipelines.cn_download_source_upsert import (
@@ -34,7 +35,6 @@ from dayu.fins.pipelines.cn_download_source_upsert import (
     build_remote_fingerprint,
     commit_cn_filing_source_document,
 )
-from dayu.fins.pipelines.cn_download_staging import has_blob_file
 from dayu.fins.pipelines.cn_form_utils import build_cn_filing_ids
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.storage import (
@@ -42,6 +42,10 @@ from dayu.fins.storage import (
     DocumentBlobRepositoryProtocol,
     ProcessedDocumentRepositoryProtocol,
     SourceDocumentRepositoryProtocol,
+    SourceIntegrityClassification,
+    SourceIntegrityRevisionConflictError,
+    SourceIntegrityStatus,
+    has_same_source_publication_identity,
 )
 from dayu.fins._log import Log
 
@@ -49,10 +53,32 @@ _PDF_CONTENT_TYPE = "application/pdf"
 _JSON_CONTENT_TYPE = "application/json"
 _SOURCE_LABEL_ORIGINAL = "original"
 _SOURCE_LABEL_DOCLING = "docling"
+_MAX_SOURCE_IDENTITY_ROUNDS = 3
+_CnPhaseBResult: TypeAlias = Literal["committed", "retry", "skip"]
 
 
 class CnDownloadFilingError(RuntimeError):
     """CN/HK 单 filing 下载失败。"""
+
+
+def project_cn_filing_failure(error: Exception) -> tuple[str, str]:
+    """把 CN/HK 单 filing 异常投影为封闭原因与安全说明。
+
+    Args:
+        error: 单 filing 阶段抛出的异常。
+
+    Returns:
+        稳定原因码与不含 URL、raw exception 或绝对路径的安全说明。
+
+    Raises:
+        无。
+    """
+
+    if isinstance(error, FinsDownloadProviderError):
+        return f"provider_{error.transport_category.value}", error.safe_message
+    if isinstance(error, OSError):
+        return "storage_failed", "下载产物读写失败"
+    return "filing_execution_failed", "财报文档执行失败"
 
 
 def _download_report_pdf_with_gate(
@@ -89,13 +115,14 @@ async def run_cn_download_single_filing_stream(
     processed_repository: ProcessedDocumentRepositoryProtocol,
     discovery_client: CnReportDiscoveryClientProtocol,
     pdf_download_gate: CnDownloadPdfGateProtocol,
-    convert_pdf_to_docling_json: Callable[[bytes, str], bytes],
+    docling_conversion_runner: CnDoclingConversionRunner,
     ticker: str,
     profile: CnCompanyProfile,
     candidate: CnReportCandidate,
     overwrite: bool,
     cancel_checker: Callable[[], bool] | None,
     module: str,
+    _identity_round: int = 0,
 ) -> AsyncIterator[DownloadEvent]:
     """执行单个 CN/HK filing 下载阶段机。
 
@@ -106,13 +133,14 @@ async def run_cn_download_single_filing_stream(
         processed_repository: processed 文档仓储。
         discovery_client: 当前市场 downloader。
         pdf_download_gate: PDF 下载段 gate。
-        convert_pdf_to_docling_json: PDF -> Docling JSON 转换函数。
+        docling_conversion_runner: 可取消 PDF -> Docling JSON conversion runner。
         ticker: 已归一化 ticker。
         profile: 公司基础元数据。
         candidate: 远端候选报告。
         overwrite: 是否强制覆盖；为 ``True`` 时禁止复用和 skip。
         cancel_checker: 可选取消检查函数。
         module: 日志模块名。
+        _identity_round: 内部 publication identity churn 轮次。
 
     Yields:
         单 filing 的文件级与终态下载事件。``FILING_STARTED`` 由上层 workflow
@@ -126,29 +154,42 @@ async def run_cn_download_single_filing_stream(
     _raise_if_cancelled(module=module, ticker=ticker, document_id="", cancel_checker=cancel_checker)
     document_id, internal_document_id = build_cn_filing_ids(
         ticker=ticker,
-        form_type=candidate.fiscal_period,
+        form_type=candidate.period_projection.identity_period,
         fiscal_year=candidate.fiscal_year,
-        fiscal_period=candidate.fiscal_period,
+        fiscal_period=candidate.period_projection.identity_period,
         amended=candidate.amended,
     )
     pdf_filename = f"{document_id}.pdf"
     docling_filename = f"{document_id}_docling.json"
-    previous_meta = _safe_get_source_meta(
-        source_repository=source_repository,
-        ticker=ticker,
-        document_id=document_id,
+    phase_a_integrity = source_repository.classify_source_integrity(
+        ticker,
+        document_id,
+        SourceKind.FILING,
+    )
+    previous_meta = (
+        None
+        if phase_a_integrity.status is SourceIntegrityStatus.MISSING
+        else _safe_get_source_meta(
+            source_repository=source_repository,
+            ticker=ticker,
+            document_id=document_id,
+        )
     )
     previous_completed_meta = _resolve_previous_completed_meta(
         previous_meta=previous_meta,
         overwrite=overwrite,
     )
     remote_fingerprint = build_remote_fingerprint(candidate)
-    skip_result = _resolve_fast_skip_result(
-        previous_meta=previous_meta,
-        remote_fingerprint=remote_fingerprint,
-        overwrite=overwrite,
-    )
-    if skip_result is not None:
+    if phase_a_integrity.status is SourceIntegrityStatus.COMPLETE and not overwrite:
+        skip_result = _build_filing_result(
+            document_id=document_id,
+            status="skipped",
+            candidate=candidate,
+            reason_code="integrity_complete",
+            reason_message="本地 source 完整，跳过远端传输",
+            downloaded_files=0,
+            skipped_files=2,
+        )
         yield DownloadEvent(
             event_type=DownloadEventType.FILING_COMPLETED,
             ticker=ticker,
@@ -182,6 +223,7 @@ async def run_cn_download_single_filing_stream(
     except CnDownloadCancelledError:
         raise
     except Exception as exc:
+        reason_code, reason_message = project_cn_filing_failure(exc)
         yield DownloadEvent(
             event_type=DownloadEventType.FILE_FAILED,
             ticker=ticker,
@@ -190,16 +232,16 @@ async def run_cn_download_single_filing_stream(
                 "name": pdf_filename,
                 "stage": "pdf_download_failed",
                 "status": "failed",
-                "reason_code": "pdf_download_failed",
-                "reason_message": str(exc),
+                "reason_code": reason_code,
+                "reason_message": reason_message,
             },
         )
         failed = _build_filing_result(
             document_id=document_id,
             status="failed",
             candidate=candidate,
-            reason_code="pdf_download_failed",
-            reason_message=str(exc),
+            reason_code=reason_code,
+            reason_message=reason_message,
             downloaded_files=0,
             skipped_files=0,
         )
@@ -213,55 +255,6 @@ async def run_cn_download_single_filing_stream(
     _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
     pdf_bytes = asset.pdf_bytes
     pdf_sha256 = asset.sha256
-
-    can_skip_by_pdf_sha = existing_handle is not None and _can_skip_by_pdf_sha(
-        previous_meta=previous_meta,
-        overwrite=overwrite,
-        pdf_sha256=pdf_sha256,
-        blob_repository=blob_repository,
-        handle=existing_handle,
-        docling_filename=docling_filename,
-    )
-    if can_skip_by_pdf_sha:
-        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
-        primary_document = _read_required_text(previous_meta, "primary_document")
-        file_entries = _read_file_entries(previous_meta)
-        source_fingerprint = _read_required_text(previous_meta, "source_fingerprint")
-        _commit_cn_filing_metadata_batch(
-            batching_repository=batching_repository,
-            source_repository=source_repository,
-            processed_repository=processed_repository,
-            ticker=ticker,
-            document_id=document_id,
-            internal_document_id=internal_document_id,
-            form_type=candidate.fiscal_period,
-            primary_document=primary_document,
-            file_entries=file_entries,
-            candidate=candidate,
-            profile=profile,
-            pdf_sha256=pdf_sha256,
-            remote_fingerprint=remote_fingerprint,
-            source_fingerprint=source_fingerprint,
-            previous_completed_meta=previous_completed_meta,
-            cancel_checker=cancel_checker,
-            module=module,
-        )
-        skipped = _build_filing_result(
-            document_id=document_id,
-            status="skipped",
-            candidate=candidate,
-            reason_code="pdf_sha256_matched",
-            reason_message="PDF 内容与完成态一致且 Docling JSON 存在，跳过重新处理",
-            downloaded_files=0,
-            skipped_files=2,
-        )
-        yield DownloadEvent(
-            event_type=DownloadEventType.FILING_COMPLETED,
-            ticker=ticker,
-            document_id=document_id,
-            payload=_filing_event_payload(skipped),
-        )
-        return
 
     yield DownloadEvent(
         event_type=DownloadEventType.FILE_DOWNLOADED,
@@ -302,24 +295,25 @@ async def run_cn_download_single_filing_stream(
         try:
             Log.info(
                 f"开始 Docling 转换: ticker={ticker} document_id={document_id} "
-                f"form={candidate.fiscal_period} filing_date={candidate.filing_date} "
+                f"form={candidate.period_projection.identity_period} filing_date={candidate.filing_date} "
                 f"source_file={pdf_filename}",
                 module=module,
             )
-            docling_json_bytes = await asyncio.to_thread(
-                convert_pdf_to_docling_json,
+            docling_json_bytes = await docling_conversion_runner.convert_pdf_to_docling_json(
                 pdf_bytes,
                 pdf_filename,
+                cancellation_checker=_required_cancellation_checker(cancel_checker),
             )
         except CnDownloadCancelledError:
             raise
         except Exception as exc:
+            reason_code, reason_message = project_cn_filing_failure(exc)
             failed = _build_filing_result(
                 document_id=document_id,
                 status="failed",
                 candidate=candidate,
-                reason_code="docling_convert_failed",
-                reason_message=str(exc),
+                reason_code=reason_code,
+                reason_message=reason_message,
                 downloaded_files=1,
                 skipped_files=0,
             )
@@ -331,6 +325,22 @@ async def run_cn_download_single_filing_stream(
             )
             return
         _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
+        yield DownloadEvent(
+            event_type=DownloadEventType.CONVERSION_COMPLETED,
+            ticker=ticker,
+            document_id=document_id,
+            payload={
+                "name": docling_filename,
+                "source_name": pdf_filename,
+                "stage": "docling_conversion_completed",
+            },
+        )
+        _raise_if_cancelled(
+            module=module,
+            ticker=ticker,
+            document_id=document_id,
+            cancel_checker=cancel_checker,
+        )
         reused_docling = False
         converted = True
     else:
@@ -343,7 +353,7 @@ async def run_cn_download_single_filing_stream(
         docling_json_bytes=docling_json_bytes,
     )
     _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
-    _commit_cn_filing_assets_batch(
+    phase_b_result = _commit_cn_filing_assets_batch(
         batching_repository=batching_repository,
         source_repository=source_repository,
         blob_repository=blob_repository,
@@ -351,7 +361,6 @@ async def run_cn_download_single_filing_stream(
         ticker=ticker,
         document_id=document_id,
         internal_document_id=internal_document_id,
-        form_type=candidate.fiscal_period,
         pdf_filename=pdf_filename,
         docling_filename=docling_filename,
         pdf_bytes=pdf_bytes,
@@ -363,9 +372,47 @@ async def run_cn_download_single_filing_stream(
         source_fingerprint=source_fingerprint,
         previous_completed_meta=previous_completed_meta,
         source_meta_exists=previous_meta is not None,
+        phase_a_integrity=phase_a_integrity,
+        overwrite=overwrite,
         cancel_checker=cancel_checker,
         module=module,
     )
+    if phase_b_result == "retry":
+        async for retry_event in _retry_cn_filing_after_identity_change(
+            batching_repository=batching_repository,
+            source_repository=source_repository,
+            blob_repository=blob_repository,
+            processed_repository=processed_repository,
+            discovery_client=discovery_client,
+            pdf_download_gate=pdf_download_gate,
+            docling_conversion_runner=docling_conversion_runner,
+            ticker=ticker,
+            profile=profile,
+            candidate=candidate,
+            overwrite=overwrite,
+            cancel_checker=cancel_checker,
+            module=module,
+            identity_round=_identity_round,
+        ):
+            yield retry_event
+        return
+    if phase_b_result == "skip":
+        skipped = _build_filing_result(
+            document_id=document_id,
+            status="skipped",
+            candidate=candidate,
+            reason_code="integrity_complete",
+            reason_message="最新 publication 已完整，跳过陈旧预取结果",
+            downloaded_files=0,
+            skipped_files=2,
+        )
+        yield DownloadEvent(
+            event_type=DownloadEventType.FILING_COMPLETED,
+            ticker=ticker,
+            document_id=document_id,
+            payload=_filing_event_payload(skipped),
+        )
+        return
     downloaded = _build_filing_result(
         document_id=document_id,
         status="downloaded",
@@ -386,6 +433,70 @@ async def run_cn_download_single_filing_stream(
     )
 
 
+async def _retry_cn_filing_after_identity_change(
+    *,
+    batching_repository: BatchingRepositoryProtocol,
+    source_repository: SourceDocumentRepositoryProtocol,
+    blob_repository: DocumentBlobRepositoryProtocol,
+    processed_repository: ProcessedDocumentRepositoryProtocol,
+    discovery_client: CnReportDiscoveryClientProtocol,
+    pdf_download_gate: CnDownloadPdfGateProtocol,
+    docling_conversion_runner: CnDoclingConversionRunner,
+    ticker: str,
+    profile: CnCompanyProfile,
+    candidate: CnReportCandidate,
+    overwrite: bool,
+    cancel_checker: Callable[[], bool] | None,
+    module: str,
+    identity_round: int,
+) -> AsyncIterator[DownloadEvent]:
+    """丢弃旧 PDF/Docling payload 并重新执行下一轮 identity-first acquisition。
+
+    Args:
+        batching_repository: batch lifecycle 仓储。
+        source_repository: source 仓储。
+        blob_repository: blob 仓储。
+        processed_repository: processed 仓储。
+        discovery_client: 当前市场 provider client。
+        pdf_download_gate: PDF 下载 gate。
+        docling_conversion_runner: Docling conversion owner。
+        ticker: canonical ticker。
+        profile: 公司 profile。
+        candidate: 已选 candidate；重试不得重新 discovery。
+        overwrite: 原始 request-level overwrite policy。
+        cancel_checker: 可选取消检查器。
+        module: 日志模块名。
+        identity_round: 已完成的内部 churn 轮次索引。
+
+    Yields:
+        下一轮单 filing 事件。
+
+    Raises:
+        SourceIntegrityRevisionConflictError: 三轮 identity churn 耗尽时抛出。
+    """
+
+    next_round = identity_round + 1
+    if next_round >= _MAX_SOURCE_IDENTITY_ROUNDS:
+        raise SourceIntegrityRevisionConflictError()
+    async for event in run_cn_download_single_filing_stream(
+        batching_repository=batching_repository,
+        source_repository=source_repository,
+        blob_repository=blob_repository,
+        processed_repository=processed_repository,
+        discovery_client=discovery_client,
+        pdf_download_gate=pdf_download_gate,
+        docling_conversion_runner=docling_conversion_runner,
+        ticker=ticker,
+        profile=profile,
+        candidate=candidate,
+        overwrite=overwrite,
+        cancel_checker=cancel_checker,
+        module=module,
+        _identity_round=next_round,
+    ):
+        yield event
+
+
 def _commit_cn_filing_assets_batch(
     *,
     batching_repository: BatchingRepositoryProtocol,
@@ -395,7 +506,6 @@ def _commit_cn_filing_assets_batch(
     ticker: str,
     document_id: str,
     internal_document_id: str,
-    form_type: str,
     pdf_filename: str,
     docling_filename: str,
     pdf_bytes: bytes,
@@ -407,9 +517,11 @@ def _commit_cn_filing_assets_batch(
     source_fingerprint: str,
     previous_completed_meta: JsonObject | None,
     source_meta_exists: bool,
+    phase_a_integrity: SourceIntegrityClassification,
+    overwrite: bool,
     cancel_checker: Callable[[], bool] | None,
     module: str,
-) -> None:
+) -> _CnPhaseBResult:
     """在一个 caller-owned batch 内提交 CN/HK filing 的全部持久态。
 
     Args:
@@ -420,7 +532,6 @@ def _commit_cn_filing_assets_batch(
         ticker: 已归一化 ticker。
         document_id: 文档 ID。
         internal_document_id: 内部文档 ID。
-        form_type: 财期 form type。
         pdf_filename: PDF 对象名。
         docling_filename: Docling JSON 对象名。
         pdf_bytes: 已在 batch 外完成下载或复用读取的 PDF 字节。
@@ -432,11 +543,13 @@ def _commit_cn_filing_assets_batch(
         source_fingerprint: PDF 与 Docling 内容 fingerprint。
         previous_completed_meta: batch 前的上一版完成态 meta。
         source_meta_exists: batch 前是否存在待替换 source document。
+        phase_a_integrity: 锁外 payload acquisition 前的 target identity。
+        overwrite: 原始 request-level overwrite policy。
         cancel_checker: 可选同步取消检查器。
         module: 日志模块名。
 
     Returns:
-        无；返回时 storage ``COMMITTED`` 已成立。
+        committed、retry 或 skip 的封闭 Phase B 结果。
 
     Raises:
         CnDownloadCancelledError: batch 内阶段边界命中取消时抛出并回滚。
@@ -447,6 +560,23 @@ def _commit_cn_filing_assets_batch(
     token = batching_repository.begin_batch(ticker)
     commit_started = False
     try:
+        phase_b_integrity = source_repository.classify_staged_source_integrity(
+            ticker,
+            document_id,
+            SourceKind.FILING,
+            batch=token,
+        )
+        if not has_same_source_publication_identity(
+            phase_a_integrity,
+            phase_b_integrity,
+        ):
+            batching_repository.rollback_batch(token)
+            commit_started = True
+            return "retry"
+        if phase_b_integrity.status is SourceIntegrityStatus.COMPLETE and not overwrite:
+            batching_repository.rollback_batch(token)
+            commit_started = True
+            return "skip"
         _raise_if_cancelled(
             module=module,
             ticker=ticker,
@@ -523,7 +653,6 @@ def _commit_cn_filing_assets_batch(
             ticker=ticker,
             document_id=document_id,
             internal_document_id=internal_document_id,
-            form_type=form_type,
             primary_document=docling_filename,
             file_entries=file_entries,
             candidate=candidate,
@@ -544,100 +673,7 @@ def _commit_cn_filing_assets_batch(
         # commit_batch 开始后 token 由 storage owner 消费，caller 不再回滚。
         commit_started = True
         batching_repository.commit_batch(token)
-    finally:
-        if not commit_started:
-            _rollback_cn_batch_preserving_primary(
-                batching_repository=batching_repository,
-                token=token,
-                operation_error=sys.exception(),
-            )
-
-
-def _commit_cn_filing_metadata_batch(
-    *,
-    batching_repository: BatchingRepositoryProtocol,
-    source_repository: SourceDocumentRepositoryProtocol,
-    processed_repository: ProcessedDocumentRepositoryProtocol,
-    ticker: str,
-    document_id: str,
-    internal_document_id: str,
-    form_type: str,
-    primary_document: str,
-    file_entries: list[JsonObject],
-    candidate: CnReportCandidate,
-    profile: CnCompanyProfile,
-    pdf_sha256: str,
-    remote_fingerprint: str,
-    source_fingerprint: str,
-    previous_completed_meta: JsonObject | None,
-    cancel_checker: Callable[[], bool] | None,
-    module: str,
-) -> None:
-    """在 caller-owned batch 内提交 PDF-SHA skip 的最终 meta 与 marker。
-
-    Args:
-        batching_repository: batch lifecycle 唯一仓储。
-        source_repository: source 文档仓储及 batch owner 入口。
-        processed_repository: processed marker 仓储。
-        ticker: 已归一化 ticker。
-        document_id: 文档 ID。
-        internal_document_id: 内部文档 ID。
-        form_type: 财期 form type。
-        primary_document: 既有 Docling JSON 主文件名。
-        file_entries: 既有完成态文件条目。
-        candidate: 远端候选报告。
-        profile: 公司基础元数据。
-        pdf_sha256: PDF SHA-256。
-        remote_fingerprint: 当前远端 fingerprint。
-        source_fingerprint: 既有内容 fingerprint。
-        previous_completed_meta: batch 前的完成态 meta。
-        cancel_checker: 可选同步取消检查器。
-        module: 日志模块名。
-
-    Returns:
-        无；返回时 storage ``COMMITTED`` 已成立。
-
-    Raises:
-        CnDownloadCancelledError: batch 内命中取消时抛出并回滚。
-        OSError: meta、processed、commit 或 rollback 失败时抛出。
-        RuntimeError: batch/token owner 契约不成立时抛出。
-    """
-
-    token = batching_repository.begin_batch(ticker)
-    commit_started = False
-    try:
-        _raise_if_cancelled(
-            module=module,
-            ticker=ticker,
-            document_id=document_id,
-            cancel_checker=cancel_checker,
-        )
-        commit_cn_filing_source_document(
-            source_repository=source_repository,
-            processed_repository=processed_repository,
-            ticker=ticker,
-            document_id=document_id,
-            internal_document_id=internal_document_id,
-            form_type=form_type,
-            primary_document=primary_document,
-            file_entries=file_entries,
-            candidate=candidate,
-            profile=profile,
-            pdf_sha256=pdf_sha256,
-            remote_fingerprint=remote_fingerprint,
-            source_fingerprint=source_fingerprint,
-            previous_completed_meta=previous_completed_meta,
-            source_meta_exists=True,
-            batch=token,
-        )
-        _raise_if_cancelled(
-            module=module,
-            ticker=ticker,
-            document_id=document_id,
-            cancel_checker=cancel_checker,
-        )
-        commit_started = True
-        batching_repository.commit_batch(token)
+        return "committed"
     finally:
         if not commit_started:
             _rollback_cn_batch_preserving_primary(
@@ -673,10 +709,7 @@ def _rollback_cn_batch_preserving_primary(
         batching_repository.rollback_batch(token)
     except Exception as rollback_error:
         if operation_error is not None:
-            operation_error.add_note(
-                "rollback_batch failed; recovery evidence retained: "
-                f"{rollback_error}"
-            )
+            operation_error.add_note(f"rollback_batch failed; recovery evidence retained: {rollback_error}")
             raise operation_error from rollback_error
         raise
 
@@ -694,36 +727,6 @@ def _safe_get_source_meta(
     except FileNotFoundError:
         return None
     return {str(key): _coerce_json_value(value) for key, value in meta.items()}
-
-
-def _resolve_fast_skip_result(
-    *,
-    previous_meta: JsonObject | None,
-    remote_fingerprint: str,
-    overwrite: bool,
-) -> JsonObject | None:
-    """判断是否可在下载 PDF 前 fast skip。"""
-
-    if overwrite or previous_meta is None:
-        return None
-    if previous_meta.get("ingest_complete") is not True:
-        return None
-    if previous_meta.get("download_version") != CN_PIPELINE_DOWNLOAD_VERSION:
-        return None
-    if previous_meta.get("remote_fingerprint") != remote_fingerprint:
-        return None
-    return {
-        "document_id": str(previous_meta.get("document_id") or ""),
-        "status": "skipped",
-        "form_type": str(previous_meta.get("form_type") or ""),
-        "filing_date": str(previous_meta.get("filing_date") or ""),
-        "report_date": None,
-        "downloaded_files": 0,
-        "skipped_files": 2,
-        "reason_code": "remote_fingerprint_matched",
-        "reason_message": "远端 fingerprint 与本地完成态一致，跳过下载",
-        "skip_reason": "remote_fingerprint_matched",
-    }
 
 
 def _resolve_previous_completed_meta(
@@ -785,54 +788,6 @@ def _resolve_reusable_docling(
         return None
 
 
-def _can_skip_by_pdf_sha(
-    *,
-    previous_meta: JsonObject | None,
-    overwrite: bool,
-    pdf_sha256: str,
-    blob_repository: DocumentBlobRepositoryProtocol,
-    handle: SourceHandle,
-    docling_filename: str,
-) -> bool:
-    """判断完成态 PDF 内容未变时是否可跳过。"""
-
-    if overwrite or previous_meta is None:
-        return False
-    if previous_meta.get("ingest_complete") is not True:
-        return False
-    if previous_meta.get("download_version") != CN_PIPELINE_DOWNLOAD_VERSION:
-        return False
-    if previous_meta.get("pdf_sha256") != pdf_sha256:
-        return False
-    return has_blob_file(blob_repository=blob_repository, handle=handle, filename=docling_filename)
-
-
-def _read_file_entries(meta: JsonObject | None) -> list[JsonObject]:
-    """读取完成态 meta 中的文件条目。
-
-    Args:
-        meta: source meta。
-
-    Returns:
-        可传给 source upsert 的文件条目列表。
-
-    Raises:
-        CnDownloadFilingError: meta 缺失或 ``files`` 字段不是对象列表时抛出。
-    """
-
-    if meta is None:
-        raise CnDownloadFilingError("缺少 source meta，无法读取 files")
-    raw_files = meta.get("files")
-    if not isinstance(raw_files, list):
-        raise CnDownloadFilingError("source meta.files 必须为 list")
-    entries: list[JsonObject] = []
-    for raw_item in raw_files:
-        if not isinstance(raw_item, dict):
-            raise CnDownloadFilingError("source meta.files 条目必须为 JSON 对象")
-        entries.append({str(key): _coerce_json_value(value) for key, value in raw_item.items()})
-    return entries
-
-
 def _build_filing_result(
     *,
     document_id: str,
@@ -848,11 +803,12 @@ def _build_filing_result(
     payload: JsonObject = {
         "document_id": document_id,
         "status": status,
-        "form_type": candidate.fiscal_period,
+        "form_type": candidate.period_projection.identity_period,
         "filing_date": candidate.filing_date,
         "report_date": None,
         "fiscal_year": candidate.fiscal_year,
-        "fiscal_period": candidate.fiscal_period,
+        "fiscal_period": candidate.period_projection.identity_period,
+        "covered_fiscal_periods": list(candidate.period_projection.covered_periods),
         "downloaded_files": downloaded_files,
         "skipped_files": skipped_files,
         "failed_files": [],
@@ -881,25 +837,6 @@ def _filing_event_payload(filing_result: JsonObject) -> dict[str, JsonValue]:
     payload: dict[str, JsonValue] = dict(filing_result)
     payload["filing_result"] = cast(JsonValue, filing_result)
     return payload
-
-
-def _read_required_text(meta: JsonObject | None, key: str) -> str:
-    """读取必填文本 meta 字段。"""
-
-    if meta is None:
-        raise CnDownloadFilingError(f"缺少 source meta，无法读取 {key}")
-    value = _optional_text(meta.get(key))
-    if value is None:
-        raise CnDownloadFilingError(f"source meta 缺少 {key}")
-    return value
-
-
-def _optional_text(value: JsonValue) -> str | None:
-    """把值收窄为非空字符串。"""
-
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    return None
 
 
 def _coerce_json_value(value: JsonValue) -> JsonValue:
@@ -942,7 +879,41 @@ def _raise_if_cancelled(
     raise CnDownloadCancelledError("操作已被取消")
 
 
+def _required_cancellation_checker(
+    cancel_checker: Callable[[], bool] | None,
+) -> Callable[[], bool]:
+    """把 optional workflow checker 收敛为 runner 必需的 callable。
+
+    Args:
+        cancel_checker: workflow 调用方提供的可选取消检查器。
+
+    Returns:
+        原 checker，或稳定返回 ``False`` 的 module-level checker。
+
+    Raises:
+        无。
+    """
+
+    if cancel_checker is None:
+        return _never_cancelled
+    return cancel_checker
+
+
+def _never_cancelled() -> bool:
+    """返回未取消的稳定信号。
+
+    Returns:
+        始终为 ``False``。
+
+    Raises:
+        无。
+    """
+
+    return False
+
+
 __all__ = [
     "CnDownloadFilingError",
+    "project_cn_filing_failure",
     "run_cn_download_single_filing_stream",
 ]

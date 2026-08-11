@@ -254,8 +254,34 @@ dayu-cli download --ticker 0700 --rebuild
 ```
 
 可用参数以 `dayu-cli download --help` 为准：`--forms`、`--start`、`--end`、
-`--overwrite` 和 `--rebuild`。下载、上传和预处理命令会输出 direct progress 与
-终态摘要；`Ctrl-C` 请求取消当前 direct operation。财报保存在
+`--overwrite` 和 `--rebuild`。命令会先完成静态用法校验，再解析或创建 workspace、
+启动下载运行期或访问数据提供方；非法 ticker、表单或日期窗口以用法错误退出码 `2`
+结束，并且不会产生 workspace 或下载运行期副作用。
+
+`--ticker` 只接受一个 ticker，并统一转换为市场对应的规范写法；`--forms` 会按市场
+规范化并稳定去重，SEC 表单还会统一大小写。`--start` 与 `--end` 接受 `YYYY`、
+`YYYY-MM` 或 `YYYY-MM-DD`，分别展开为所给期间的起始日和结束日，形成包含边界的日期
+窗口。下载 SEC 文件前必须提供合规的 User-Agent 身份，例如：
+
+```bash
+export SEC_USER_AGENT="Your Organization contact@example.com"
+```
+
+`--overwrite` 只替换本轮选中的单个目标文档，不会清空 ticker 下的其它已下载文档；
+空结果、失败或取消也不会删除非目标旧文档。`--rebuild` 只根据已经下载到本地的源文档
+重建下载元数据和 manifest，不发送数据提供方请求，也不新增、删除或替换源文档内容。
+两者是互斥模式，不能在同一命令中同时使用。
+
+未传 `--forms` 时，CN 默认请求 `FY H1 Q1 Q3`；HK 的必需基线是 `FY H1`，同时会发现
+来源实际披露的 Q1～Q4 可选业绩材料。缺失期间只针对当前市场适用的必需基线计算：例如
+HK 的中期业绩可显示覆盖 H1，但不能代替独立中期报告消除 H1 missing；末期业绩同样不能
+代替独立年报消除 FY missing。
+
+下载、上传和预处理命令会显示执行进度及最终摘要。下载摘要包含规范 ticker、实际表单与
+日期窗口、overwrite/rebuild 状态，以及发现、下载、跳过、拒绝、失败和缺失期间信息；
+每个下载文档行还会显示来源声明的 `covered_fiscal_periods` 数组。
+下载期间按下 `Ctrl-C` 会请求协作取消并等待当前操作收口；取消终态使用规范退出码
+`130`，不会用内部取消原因替代用户可见摘要。财报保存在
 `<workspace>/portfolio/<规范 ticker>/`，例如 AAPL 对应
 `workspace/portfolio/AAPL/`。
 

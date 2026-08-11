@@ -81,6 +81,34 @@ FISCAL_PERIODS: Final[frozenset[FiscalPeriod]] = frozenset(
 )
 """Fins 通用财期集合。"""
 
+_FISCAL_PERIOD_FILTER_ALIASES: Final[dict[str, FiscalPeriod]] = {
+    "FY": "FY",
+    "ANNUAL": "FY",
+    "年报": "FY",
+    "年度报告": "FY",
+    "H1": "H1",
+    "1H": "H1",
+    "半年报": "H1",
+    "中报": "H1",
+    "Q1": "Q1",
+    "1Q": "Q1",
+    "一季报": "Q1",
+    "一季度报告": "Q1",
+    "Q2": "Q2",
+    "2Q": "Q2",
+    "二季报": "Q2",
+    "二季度报告": "Q2",
+    "Q3": "Q3",
+    "3Q": "Q3",
+    "三季报": "Q3",
+    "三季度报告": "Q3",
+    "Q4": "Q4",
+    "4Q": "Q4",
+    "四季报": "Q4",
+    "四季度报告": "Q4",
+}
+"""CN/HK 下载筛选 token 到 canonical 财期的唯一映射。"""
+
 _FISCAL_PERIOD_RECENCY_ORDER: Final[tuple[str, ...]] = ("", "Q1", "Q2", "H1", "Q3", "Q4", "FY")
 """财期在同一财年内的固定业务顺序；空字符串占据未知值的 rank 0。"""
 
@@ -267,6 +295,33 @@ def normalize_fiscal_period(value: Optional[str], *, field_name: str = "fiscal_p
     if normalized not in FISCAL_PERIODS:
         raise ValueError(f"{field_name} 非法: {value}")
     return cast(FiscalPeriod, normalized)
+
+
+def parse_fiscal_period_filter_value(
+    value: str,
+    *,
+    field_name: str = "form_type",
+) -> FiscalPeriod:
+    """解析 CN/HK 下载筛选使用的财期别名。
+
+    Args:
+        value: 原始财期筛选文本。
+        field_name: 错误信息使用的字段名。
+
+    Returns:
+        canonical 财期。
+
+    Raises:
+        ValueError: 输入为空或不属于支持的财期别名时抛出。
+    """
+
+    normalized = value.strip().upper()
+    if not normalized:
+        raise ValueError(f"{field_name} 不能为空")
+    period = _FISCAL_PERIOD_FILTER_ALIASES.get(normalized)
+    if period is None:
+        raise ValueError(f"{field_name} 不支持: {value}")
+    return period
 
 
 def normalize_fiscal_year(value: JsonValue | None, *, field_name: str = "fiscal_year") -> int | None:

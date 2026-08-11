@@ -31,11 +31,26 @@ import re
 import sys
 import time
 from dataclasses import dataclass
+from enum import StrEnum
 from html.parser import HTMLParser
 from io import BytesIO
 from pathlib import Path
 from collections.abc import Iterator, Mapping, Sequence
-from typing import AsyncIterator, Awaitable, BinaryIO, Callable, Final, Literal, Optional, Protocol, TextIO, TypeAlias, TypeVar, cast, overload
+from typing import (
+    AsyncIterator,
+    Awaitable,
+    BinaryIO,
+    Callable,
+    Final,
+    Literal,
+    Optional,
+    Protocol,
+    TextIO,
+    TypeAlias,
+    TypeVar,
+    cast,
+    overload,
+)
 from urllib.parse import urlparse
 from xml.etree import ElementTree as ET
 
@@ -47,6 +62,12 @@ if sys.platform != "win32":
 from dayu.fins._log import Log
 from dayu.fins._converters import normalize_optional_text, optional_int
 from dayu.fins.domain.document_models import BatchToken, FileObjectMeta
+from dayu.fins.download_contract import (
+    FinsDownloadProviderError,
+    FinsDownloadSource,
+    FinsDownloadTransportCategory,
+    SecUserAgentConfigurationError,
+)
 from dayu.fins.ticker_normalization import try_normalize_ticker
 
 DownloadFileResultValue: TypeAlias = JsonValue | FileObjectMeta
@@ -87,6 +108,7 @@ class StoreDownloadedFile(Protocol):
 
         ...
 
+
 SEC_USER_AGENT_ENV: Final[str] = "SEC_USER_AGENT"
 SEC_TICKER_MAP_URL: Final[str] = "https://www.sec.gov/files/company_tickers.json"
 SEC_SUBMISSIONS_URL: Final[str] = "https://data.sec.gov/submissions/CIK{cik10}.json"
@@ -98,12 +120,10 @@ BROWSE_EDGAR_ATOM_URL: Final[str] = (
     "action=getcompany&filenum={filenum}&owner=include&count={count}&output=atom"
 )
 BROWSE_EDGAR_TICKER_ATOM_URL: Final[str] = (
-    "https://www.sec.gov/cgi-bin/browse-edgar?"
-    "action=getcompany&CIK={ticker}&owner=exclude&count={count}&output=atom"
+    "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={ticker}&owner=exclude&count={count}&output=atom"
 )
 
 DEFAULT_SLEEP_SECONDS: Final[float] = 0.2
-_UNCONFIGURED_USER_AGENT: Final[str] = "DayuAgent/1.0 unconfigured@example.com"
 DEFAULT_REQUEST_TIMEOUT_SECONDS: Final[int] = 30
 DEFAULT_MAX_RETRIES: Final[int] = 3
 RETRY_BACKOFF_BASE_SECONDS: Final[float] = 0.8
@@ -182,8 +202,78 @@ class DownloaderEvent:
     error: Optional[str] = None
 
 
+@dataclass(frozen=True, slots=True)
+class _PrefetchStarted:
+    """SEC transport 已开始处理一个 descriptor。"""
+
+    descriptor: RemoteFileDescriptor
+    kind: Literal["started"] = "started"
+
+
+@dataclass(frozen=True, slots=True)
+class _PrefetchedFile:
+    """尚未触达 storage 的非空 immutable SEC payload。"""
+
+    descriptor: RemoteFileDescriptor
+    http_status: int
+    content: bytes
+    kind: Literal["prefetched"] = "prefetched"
+
+    def __post_init__(self) -> None:
+        """校验 payload 非空且为 immutable bytes。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: content 为空时抛出。
+            TypeError: content 不是 bytes 时抛出。
+        """
+
+        if not isinstance(self.content, bytes):
+            raise TypeError("prefetched SEC content 必须为 immutable bytes")
+        if not self.content:
+            raise ValueError("prefetched SEC content 不得为空")
+
+
+@dataclass(frozen=True, slots=True)
+class _PrefetchSkipped:
+    """conditional SEC transport 返回 304。"""
+
+    descriptor: RemoteFileDescriptor
+    http_status: Literal[304]
+    reason_code: Literal["not_modified"]
+    reason_message: str
+    kind: Literal["skipped"] = "skipped"
+
+
+@dataclass(frozen=True, slots=True)
+class _PrefetchFailed:
+    """不携带 payload 的 path/contact-free SEC transport failure。"""
+
+    descriptor: RemoteFileDescriptor
+    http_status: Optional[int]
+    reason_code: str
+    reason_message: str
+    error: str
+    kind: Literal["failed"] = "failed"
+
+
+_PrefetchEvent: TypeAlias = _PrefetchStarted | _PrefetchedFile | _PrefetchSkipped | _PrefetchFailed
+
+
 class SecDownloadCancelledError(Exception):
     """SEC 下载在协作式检查点观察到取消请求。"""
+
+
+class SecUserAgentState(StrEnum):
+    """SEC downloader 组合期解析出的身份配置状态。"""
+
+    CONFIGURED = "configured"
+    UNCONFIGURED = "unconfigured"
 
 
 @dataclass(frozen=True)
@@ -203,33 +293,30 @@ class _SecThrottleReservation:
     cooldown_hit: bool
 
 
-def _build_empty_content_failure_event(
+def _build_empty_content_prefetch_failure(
     descriptor: RemoteFileDescriptor,
     http_status: Optional[int],
-) -> DownloaderEvent:
-    """构造 0 字节下载失败事件。
+) -> _PrefetchFailed:
+    """构造不含 storage 语义的 0 字节 transport failure。
 
     Args:
         descriptor: 当前远端文件描述。
-        http_status: 本次下载对应的 HTTP 状态码。
+        http_status: 本次 transport HTTP 状态码。
 
     Returns:
-        `empty_content` 类型的失败事件。
+        typed empty-content prefetch failure。
 
     Raises:
         无。
     """
 
-    return DownloaderEvent(
-        event_type="file_failed",
-        name=descriptor.name,
-        source_url=descriptor.source_url,
-        http_etag=descriptor.http_etag,
-        http_last_modified=descriptor.http_last_modified,
+    message = "下载内容为 0 字节，视为下载失败"
+    return _PrefetchFailed(
+        descriptor=descriptor,
         http_status=http_status,
         reason_code="empty_content",
-        reason_message="下载内容为 0 字节，视为下载失败",
-        error="下载内容为 0 字节，视为下载失败",
+        reason_message=message,
+        error=message,
     )
 
 
@@ -745,7 +832,6 @@ def hash_file_sha256(file_path: Path) -> str:
     return sha256.hexdigest()
 
 
-
 def _load_sec_throttle_state(state_path: Path) -> _SecThrottleState:
     """读取 SEC 共享限流状态。
 
@@ -859,6 +945,124 @@ def _resolve_sec_throttle_delay(response: httpx.Response) -> float:
     return max(_parse_retry_after(response), _SEC_THROTTLE_RECOVERY_SECONDS)
 
 
+def _sec_transport_category(
+    error: Exception | None,
+) -> FinsDownloadTransportCategory:
+    """把 SEC HTTP owner 捕获的异常映射为封闭 transport 分类。
+
+    Args:
+        error: 重试耗尽时保留的底层异常。
+
+    Returns:
+        不含 endpoint、payload 或异常文本的 transport 分类。
+
+    Raises:
+        无。
+    """
+
+    if isinstance(error, httpx.TimeoutException):
+        return FinsDownloadTransportCategory.TIMEOUT
+    if isinstance(error, httpx.NetworkError):
+        return FinsDownloadTransportCategory.CONNECTION
+    if isinstance(error, httpx.HTTPStatusError):
+        return FinsDownloadTransportCategory.HTTP_STATUS
+    if isinstance(error, (httpx.ProtocolError, ValueError)):
+        return FinsDownloadTransportCategory.PROTOCOL
+    return FinsDownloadTransportCategory.UNKNOWN
+
+
+def _sec_transport_retryable(
+    error: Exception | None,
+    *,
+    category: FinsDownloadTransportCategory,
+) -> bool:
+    """判断 SEC transport 分类是否适合稍后重试。
+
+    Args:
+        error: 重试耗尽时的底层异常。
+        category: 已解析 transport 分类。
+
+    Returns:
+        timeout/connection、服务端 HTTP 状态或 unknown 返回 ``True``。
+
+    Raises:
+        无。
+    """
+
+    if category in {
+        FinsDownloadTransportCategory.TIMEOUT,
+        FinsDownloadTransportCategory.CONNECTION,
+        FinsDownloadTransportCategory.UNKNOWN,
+    }:
+        return True
+    if isinstance(error, httpx.HTTPStatusError):
+        return error.response.status_code >= 500
+    return False
+
+
+def _sec_transport_safe_message(category: FinsDownloadTransportCategory) -> str:
+    """为 SEC transport 分类选择脱敏用户说明。
+
+    Args:
+        category: 已解析 transport 分类。
+
+    Returns:
+        不含 URL、raw payload、联系值或路径的安全说明。
+
+    Raises:
+        无。
+    """
+
+    if category is FinsDownloadTransportCategory.TIMEOUT:
+        return "SEC 来源请求超时"
+    if category is FinsDownloadTransportCategory.CONNECTION:
+        return "无法连接 SEC 来源"
+    if category is FinsDownloadTransportCategory.HTTP_STATUS:
+        return "SEC 来源返回不可接受的 HTTP 状态"
+    if category is FinsDownloadTransportCategory.PROTOCOL:
+        return "SEC 来源响应格式不符合预期"
+    return "SEC 来源请求失败"
+
+
+def _sec_protocol_failure() -> FinsDownloadProviderError:
+    """构造 SEC provider 响应解析边界的脱敏协议失败。
+
+    Args:
+        无。
+
+    Returns:
+        不可重试的 SEC typed protocol failure。
+
+    Raises:
+        无。
+    """
+
+    return FinsDownloadProviderError(
+        source=FinsDownloadSource.SEC,
+        transport_category=FinsDownloadTransportCategory.PROTOCOL,
+        retryable=False,
+        safe_message="SEC 来源响应格式不符合预期",
+    )
+
+
+def _sec_file_failure_facts(error: RuntimeError) -> tuple[str, str]:
+    """把文件级异常投影为固定、脱敏的失败事实。
+
+    Args:
+        error: 文件下载边界捕获的 runtime failure。
+
+    Returns:
+        ``(reason_code, safe_message)``。
+
+    Raises:
+        无。
+    """
+
+    if isinstance(error, FinsDownloadProviderError):
+        return f"provider_{error.transport_category.value}", error.safe_message
+    return "download_error", "SEC 文件下载失败"
+
+
 class SecDownloader:
     """SEC 下载器。"""
 
@@ -868,12 +1072,14 @@ class SecDownloader:
         self,
         workspace_root: Path,
         client: Optional[httpx.AsyncClient] = None,
+        user_agent: Optional[str] = None,
     ) -> None:
         """初始化下载器。
 
         Args:
             workspace_root: 工作区根目录。
             client: 可选 `httpx.AsyncClient`（便于测试注入）。
+            user_agent: 可选显式 SEC 身份；未提供时只读取一次环境变量。
 
         Returns:
             无。
@@ -889,13 +1095,13 @@ class SecDownloader:
         self._sleep_seconds = DEFAULT_SLEEP_SECONDS
         self._request_timeout_seconds = DEFAULT_REQUEST_TIMEOUT_SECONDS
         self._max_retries = DEFAULT_MAX_RETRIES
-        self._user_agent = self._resolve_user_agent(None)
+        self._user_agent_state, self._user_agent = self._resolve_user_agent(user_agent)
         self._last_request_time: float = 0.0  # 上次请求时间（monotonic clock）
         self._throttle_state_dir = _build_sec_throttle_dir(self.workspace_root)
         self._throttle_state_path = self._throttle_state_dir / _GLOBAL_SEC_THROTTLE_STATE_FILENAME
         self._throttle_lock_path = self._throttle_state_dir / _GLOBAL_SEC_THROTTLE_LOCK_FILENAME
         Log.debug(
-            f"初始化 SecDownloader: workspace_root={self.workspace_root}",
+            f"初始化 SecDownloader: configured={self._user_agent_state is SecUserAgentState.CONFIGURED}",
             module=self.MODULE,
         )
 
@@ -967,9 +1173,13 @@ class SecDownloader:
             raise ValueError("sleep_seconds 不能为负数")
         self._max_retries = max_retries
         self._sleep_seconds = sleep_seconds
-        self._user_agent = self._resolve_user_agent(user_agent)
+        configured_value = None if user_agent is None else user_agent.strip()
+        if configured_value and configured_value != self._user_agent:
+            raise ValueError("SEC User-Agent 必须在 downloader 构造时一次性配置")
         Log.debug(
-            f"更新下载配置: ua={self._user_agent} sleep_seconds={self._sleep_seconds} max_retries={self._max_retries}",
+            "更新下载配置: "
+            f"configured={self._user_agent_state is SecUserAgentState.CONFIGURED} "
+            f"sleep_seconds={self._sleep_seconds} max_retries={self._max_retries}",
             module=self.MODULE,
         )
 
@@ -1042,26 +1252,11 @@ class SecDownloader:
         if not normalized_ticker:
             return None
         url = BROWSE_EDGAR_TICKER_ATOM_URL.format(ticker=normalized_ticker, count=count)
-        try:
-            payload = await _await_if_needed(
-                self._http_get_bytes(url, cancellation_checker=cancellation_checker)
-            )
-        except SecDownloadCancelledError:
-            raise
-        except RuntimeError as exc:
-            Log.warn(
-                f"browse-edgar ticker 反查失败: ticker={normalized_ticker} error={exc}",
-                module=self.MODULE,
-            )
-            return None
+        payload = await _await_if_needed(self._http_get_bytes(url, cancellation_checker=cancellation_checker))
         try:
             entries = _parse_browse_edgar_atom(payload)
         except RuntimeError as exc:
-            Log.warn(
-                f"browse-edgar XML 解析失败，跳过 ticker={normalized_ticker}: {exc}",
-                module=self.MODULE,
-            )
-            return None
+            raise _sec_protocol_failure() from exc
         if not entries:
             return None
         for entry in entries:
@@ -1071,22 +1266,12 @@ class SecDownloader:
             # SEC 下游接口使用无前导零/10位两种 CIK 形式，这里统一构造。
             cik = str(int(raw_cik))
             cik10 = cik.zfill(10)
-            try:
-                submissions = await _await_if_needed(
-                    self.fetch_submissions(
-                        cik10,
-                        cancellation_checker=cancellation_checker,
-                    )
+            submissions = await _await_if_needed(
+                self.fetch_submissions(
+                    cik10,
+                    cancellation_checker=cancellation_checker,
                 )
-            except RuntimeError as exc:
-                Log.warn(
-                    (
-                        "browse-edgar ticker 命中后拉取 submissions 失败: "
-                        f"ticker={normalized_ticker} cik10={cik10} error={exc}"
-                    ),
-                    module=self.MODULE,
-                )
-                continue
+            )
             company_name = str(submissions.get("name", "")).strip()
             return cik, (company_name or normalized_ticker), cik10
         return None
@@ -1111,9 +1296,7 @@ class SecDownloader:
         """
 
         url = SEC_SUBMISSIONS_URL.format(cik10=cik10)
-        return await _await_if_needed(
-            self._http_get_json(url, cancellation_checker=cancellation_checker)
-        )
+        return await _await_if_needed(self._http_get_json(url, cancellation_checker=cancellation_checker))
 
     async def fetch_json(
         self,
@@ -1134,9 +1317,7 @@ class SecDownloader:
             SecDownloadCancelledError: 取消检查点观察到取消请求时抛出。
         """
 
-        return await _await_if_needed(
-            self._http_get_json(url, cancellation_checker=cancellation_checker)
-        )
+        return await _await_if_needed(self._http_get_json(url, cancellation_checker=cancellation_checker))
 
     async def fetch_browse_edgar_filenum(
         self,
@@ -1163,9 +1344,7 @@ class SecDownloader:
         if not normalized:
             return []
         url = BROWSE_EDGAR_ATOM_URL.format(filenum=normalized, count=count)
-        payload = await _await_if_needed(
-            self._http_get_bytes(url, cancellation_checker=cancellation_checker)
-        )
+        payload = await _await_if_needed(self._http_get_bytes(url, cancellation_checker=cancellation_checker))
         return _parse_browse_edgar_atom(payload)
 
     async def resolve_primary_document(
@@ -1192,9 +1371,7 @@ class SecDownloader:
         """
 
         index_url = ARCHIVES_INDEX_JSON.format(cik=str(int(cik)), accession_no_dash=accession_no_dash)
-        index_json = await _await_if_needed(
-            self._http_get_json(index_url, cancellation_checker=cancellation_checker)
-        )
+        index_json = await _await_if_needed(self._http_get_json(index_url, cancellation_checker=cancellation_checker))
         directory = _json_mapping(index_json.get("directory"))
         items = _json_mapping_list(directory.get("item"))
         primary = _select_primary_from_index_items(items, form_type)
@@ -1219,9 +1396,10 @@ class SecDownloader:
             cancellation_checker: 可选协作式取消检查器。
 
         Returns:
-            解析成功时返回 `Sc13PartyRoles`；网络失败或字段缺失返回 `None`。
+            解析成功时返回 `Sc13PartyRoles`；字段缺失返回 `None`。
 
         Raises:
+            FinsDownloadProviderError: 来源请求失败时抛出。
             SecDownloadCancelledError: 取消检查点观察到取消请求时抛出。
         """
 
@@ -1235,21 +1413,7 @@ class SecDownloader:
             accession_no_dash=accession_no_dash,
             accession=normalized_accession,
         )
-        try:
-            payload = await _await_if_needed(
-                self._http_get_bytes(url, cancellation_checker=cancellation_checker)
-            )
-        except SecDownloadCancelledError:
-            raise
-        except RuntimeError as exc:
-            Log.warn(
-                (
-                    "SC13 index-headers 抓取失败: "
-                    f"archive_cik={normalized_archive_cik} accession={normalized_accession} error={exc}"
-                ),
-                module=self.MODULE,
-            )
-            return None
+        payload = await _await_if_needed(self._http_get_bytes(url, cancellation_checker=cancellation_checker))
         return _parse_sc13_party_roles_from_index_headers(payload)
 
     async def fetch_file_bytes(
@@ -1271,9 +1435,7 @@ class SecDownloader:
             SecDownloadCancelledError: 取消检查点观察到取消请求时抛出。
         """
 
-        return await _await_if_needed(
-            self._http_download(url, cancellation_checker=cancellation_checker)
-        )
+        return await _await_if_needed(self._http_download(url, cancellation_checker=cancellation_checker))
 
     async def list_filing_files(
         self,
@@ -1383,53 +1545,52 @@ class SecDownloader:
             )
         return descriptors
 
-    async def download_files_stream(
+    async def prefetch_files_stream(
         self,
         remote_files: list[RemoteFileDescriptor],
-        overwrite: bool,
-        store_file: StoreDownloadedFile,
         *,
-        batch: BatchToken,
+        allow_not_modified: bool,
         existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
         primary_document: Optional[str] = None,
         cancellation_checker: Optional[Callable[[], bool]] = None,
-    ) -> AsyncIterator[DownloaderEvent]:
-        """下载远端文件列表并流式返回文件级事件。
+    ) -> AsyncIterator[_PrefetchEvent]:
+        """执行 storage-neutral SEC transport 并返回 typed intermediate。
 
         Args:
             remote_files: 远端文件描述列表。
-            overwrite: 是否覆盖下载。
-            store_file: 文件存储回调（入参：文件名、二进制流）。
-            batch: 每次回调 invocation 显式传入的 batch capability。
+            allow_not_modified: 是否允许 conditional request 与 304。
             existing_files: 既有文件元数据映射（按文件名）。
-            primary_document: 主文档文件名（如 *.htm）；若指定且该文件下载为 0 字节，
-                立即停止生成器，后续文件不再下载，确保整个 filing 不落盘。
+            primary_document: 主文档文件名；其 0 字节会终止后续 transport。
             cancellation_checker: 可选协作式取消检查器。
 
         Yields:
-            文件级下载事件。
+            started、prefetched、skipped 或 failed 私有 typed variant。
 
         Raises:
-            OSError: 本地落盘失败时抛出。
+            RuntimeError: cancellation checker 或 transport helper 抛出未被本方法
+                归类的运行时错误时原样传播。
+
+        取消语义:
+            任一协作式取消检查点命中后，本 stream 正常停止枚举，不为取消伪造
+            ``failed`` variant；首个 descriptor 前取消会产生空 stream，中途取消
+            可能保留已经 yield 的事件前缀。完整消费本 stream 的调用方必须在循环
+            结束后立即再次执行同一个 ``cancellation_checker`` checkpoint；迭代结束
+            本身只表示不再有 transport event，不表示操作成功。
         """
 
         previous_map = existing_files or {}
         for descriptor in remote_files:
-            _raise_if_download_cancelled(cancellation_checker)
-            yield DownloaderEvent(
-                event_type="file_download_started",
-                name=descriptor.name,
-                source_url=descriptor.source_url,
-                http_etag=descriptor.http_etag,
-                http_last_modified=descriptor.http_last_modified,
-                http_status=descriptor.http_status,
-            )
+            try:
+                _raise_if_download_cancelled(cancellation_checker)
+            except SecDownloadCancelledError:
+                return
+            yield _PrefetchStarted(descriptor=descriptor)
             previous = previous_map.get(descriptor.name, {})
             previous_etag = str(previous.get("http_etag") or previous.get("etag") or "").strip() or None
             previous_last_modified = (
                 str(previous.get("http_last_modified") or previous.get("last_modified") or "").strip() or None
             )
-            if not overwrite:
+            if allow_not_modified:
                 try:
                     status_code, payload = await _await_if_needed(
                         self._http_download_if_modified(
@@ -1442,65 +1603,49 @@ class SecDownloader:
                 except SecDownloadCancelledError:
                     return
                 except RuntimeError as exc:
-                    # 捕获下载异常（如503等HTTP错误），转换为file_failed事件
-                    yield DownloaderEvent(
-                        event_type="file_failed",
-                        name=descriptor.name,
-                        source_url=descriptor.source_url,
-                        http_etag=descriptor.http_etag,
-                        http_last_modified=descriptor.http_last_modified,
+                    reason_code, safe_message = _sec_file_failure_facts(exc)
+                    yield _PrefetchFailed(
+                        descriptor=descriptor,
                         http_status=None,
-                        reason_code="download_error",
-                        reason_message=str(exc),
-                        error=str(exc),
+                        reason_code=reason_code,
+                        reason_message=safe_message,
+                        error=safe_message,
                     )
                     continue
                 if status_code == 304:
-                    yield DownloaderEvent(
-                        event_type="file_skipped",
-                        name=descriptor.name,
-                        source_url=descriptor.source_url,
-                        http_etag=descriptor.http_etag,
-                        http_last_modified=descriptor.http_last_modified,
+                    yield _PrefetchSkipped(
+                        descriptor=descriptor,
                         http_status=304,
                         reason_code="not_modified",
                         reason_message="远端文件未修改，跳过重新下载",
                     )
                     continue
                 if payload is None:
-                    yield DownloaderEvent(
-                        event_type="file_failed",
-                        name=descriptor.name,
-                        source_url=descriptor.source_url,
-                        http_etag=descriptor.http_etag,
-                        http_last_modified=descriptor.http_last_modified,
+                    message = "下载失败，未返回内容"
+                    yield _PrefetchFailed(
+                        descriptor=descriptor,
                         http_status=status_code,
                         reason_code="empty_response",
-                        reason_message="下载失败，未返回内容",
-                        error="下载失败，未返回内容",
+                        reason_message=message,
+                        error=message,
                     )
                     continue
-                _raise_if_download_cancelled(cancellation_checker)
+                try:
+                    _raise_if_download_cancelled(cancellation_checker)
+                except SecDownloadCancelledError:
+                    return
                 if len(payload) == 0:
-                    yield _build_empty_content_failure_event(descriptor, status_code)
+                    yield _build_empty_content_prefetch_failure(
+                        descriptor,
+                        status_code,
+                    )
                     if _should_abort_after_empty_primary(descriptor.name, primary_document):
-                        # 主文档 0 字节：整个 filing 无效，中止下载，确保后续文件不落盘。
                         return
                     continue
-                file_meta = store_file(
-                    descriptor.name,
-                    _to_binary_stream(payload),
-                    batch=batch,
-                )
-                _raise_if_download_cancelled(cancellation_checker)
-                yield DownloaderEvent(
-                    event_type="file_downloaded",
-                    name=descriptor.name,
-                    source_url=descriptor.source_url,
-                    http_etag=descriptor.http_etag,
-                    http_last_modified=descriptor.http_last_modified,
+                yield _PrefetchedFile(
+                    descriptor=descriptor,
                     http_status=status_code,
-                    file_meta=file_meta,
+                    content=bytes(payload),
                 )
                 continue
             try:
@@ -1512,40 +1657,142 @@ class SecDownloader:
                 )
                 _raise_if_download_cancelled(cancellation_checker)
                 if len(payload) == 0:
-                    yield _build_empty_content_failure_event(descriptor, descriptor.http_status)
+                    yield _build_empty_content_prefetch_failure(
+                        descriptor,
+                        descriptor.http_status,
+                    )
                     if _should_abort_after_empty_primary(descriptor.name, primary_document):
-                        # 主文档 0 字节：整个 filing 无效，中止下载，确保后续文件不落盘。
                         return
                     continue
-                file_meta = store_file(
-                    descriptor.name,
-                    _to_binary_stream(payload),
-                    batch=batch,
-                )
-                _raise_if_download_cancelled(cancellation_checker)
-                yield DownloaderEvent(
-                    event_type="file_downloaded",
-                    name=descriptor.name,
-                    source_url=descriptor.source_url,
-                    http_etag=descriptor.http_etag,
-                    http_last_modified=descriptor.http_last_modified,
-                    http_status=descriptor.http_status,
-                    file_meta=file_meta,
+                yield _PrefetchedFile(
+                    descriptor=descriptor,
+                    http_status=(descriptor.http_status if descriptor.http_status is not None else 200),
+                    content=bytes(payload),
                 )
             except SecDownloadCancelledError:
                 return
             except RuntimeError as exc:
-                yield DownloaderEvent(
-                    event_type="file_failed",
-                    name=descriptor.name,
-                    source_url=descriptor.source_url,
-                    http_etag=descriptor.http_etag,
-                    http_last_modified=descriptor.http_last_modified,
+                reason_code, safe_message = _sec_file_failure_facts(exc)
+                yield _PrefetchFailed(
+                    descriptor=descriptor,
                     http_status=descriptor.http_status,
-                    reason_code="download_error",
-                    reason_message=str(exc),
-                    error=str(exc),
+                    reason_code=reason_code,
+                    reason_message=safe_message,
+                    error=safe_message,
                 )
+
+    def materialize_prefetched_event(
+        self,
+        event: _PrefetchEvent,
+        store_file: StoreDownloadedFile,
+        *,
+        batch: BatchToken,
+    ) -> DownloaderEvent:
+        """唯一地把 typed prefetch intermediate 投影为 downloader event。
+
+        Args:
+            event: storage-neutral private prefetch variant。
+            store_file: persistence owner 提供的真实文件写入 callback。
+            batch: callback 必须消费的真实 open batch capability。
+
+        Returns:
+            保持既有 observable fields 的 downloader event。
+
+        Raises:
+            OSError: payload 落盘失败时抛出。
+            ValueError: batch capability 或 storage mutation 非法时抛出。
+        """
+
+        descriptor = event.descriptor
+        if isinstance(event, _PrefetchStarted):
+            return DownloaderEvent(
+                event_type="file_download_started",
+                name=descriptor.name,
+                source_url=descriptor.source_url,
+                http_etag=descriptor.http_etag,
+                http_last_modified=descriptor.http_last_modified,
+                http_status=descriptor.http_status,
+            )
+        if isinstance(event, _PrefetchSkipped):
+            return DownloaderEvent(
+                event_type="file_skipped",
+                name=descriptor.name,
+                source_url=descriptor.source_url,
+                http_etag=descriptor.http_etag,
+                http_last_modified=descriptor.http_last_modified,
+                http_status=event.http_status,
+                reason_code=event.reason_code,
+                reason_message=event.reason_message,
+            )
+        if isinstance(event, _PrefetchFailed):
+            return DownloaderEvent(
+                event_type="file_failed",
+                name=descriptor.name,
+                source_url=descriptor.source_url,
+                http_etag=descriptor.http_etag,
+                http_last_modified=descriptor.http_last_modified,
+                http_status=event.http_status,
+                reason_code=event.reason_code,
+                reason_message=event.reason_message,
+                error=event.error,
+            )
+        file_meta = store_file(
+            descriptor.name,
+            _to_binary_stream(event.content),
+            batch=batch,
+        )
+        return DownloaderEvent(
+            event_type="file_downloaded",
+            name=descriptor.name,
+            source_url=descriptor.source_url,
+            http_etag=descriptor.http_etag,
+            http_last_modified=descriptor.http_last_modified,
+            http_status=event.http_status,
+            file_meta=file_meta,
+        )
+
+    async def download_files_stream(
+        self,
+        remote_files: list[RemoteFileDescriptor],
+        overwrite: bool,
+        store_file: StoreDownloadedFile,
+        *,
+        batch: BatchToken,
+        existing_files: Optional[dict[str, dict[str, JsonValue]]] = None,
+        primary_document: Optional[str] = None,
+        cancellation_checker: Optional[Callable[[], bool]] = None,
+    ) -> AsyncIterator[DownloaderEvent]:
+        """通过唯一 prefetch core 下载并以真实 batch materialize 文件。
+
+        Args:
+            remote_files: 远端文件描述列表。
+            overwrite: 是否禁用 conditional reuse。
+            store_file: persistence owner 的真实文件写入 callback。
+            batch: 每次 callback invocation 显式传入的真实 capability。
+            existing_files: 既有文件元数据映射。
+            primary_document: 主文档文件名。
+            cancellation_checker: 可选协作式取消检查器。
+
+        Yields:
+            唯一 materializer 产生的文件级 downloader event。
+
+        Raises:
+            OSError: 本地落盘失败时抛出。
+            ValueError: batch capability 非法时抛出。
+        """
+
+        async for event in self.prefetch_files_stream(
+            remote_files,
+            allow_not_modified=not overwrite,
+            existing_files=existing_files,
+            primary_document=primary_document,
+            cancellation_checker=cancellation_checker,
+        ):
+            yield self.materialize_prefetched_event(
+                event,
+                store_file,
+                batch=batch,
+            )
 
     async def download_files(
         self,
@@ -1673,12 +1920,10 @@ class SecDownloader:
         while attempt_index < self._max_retries:
             _raise_if_download_cancelled(cancellation_checker)
             await self._refresh_owned_client_for_current_loop()
-            throttle_reservation = await self._rate_limit(
-                cancellation_checker=cancellation_checker
-            )
+            throttle_reservation = await self._rate_limit(cancellation_checker=cancellation_checker)
             _raise_if_download_cancelled(cancellation_checker)
             Log.debug(
-                f"{_SEC_REQUEST_RESERVED_LOG_EVENT}: method={method} url={url} "
+                f"{_SEC_REQUEST_RESERVED_LOG_EVENT}: method={method} "
                 f"attempt={attempt_index + 1} max_retries={self._max_retries} "
                 f"throttle_retries_remaining={throttle_retries_remaining} "
                 f"shared_throttle_wait_seconds={throttle_reservation.shared_wait_seconds:.6f} "
@@ -1701,7 +1946,7 @@ class SecDownloader:
                         follow_redirects=allow_redirects,
                     )
                 Log.debug(
-                    f"{_SEC_RESPONSE_RECEIVED_LOG_EVENT}: method={method} url={url} "
+                    f"{_SEC_RESPONSE_RECEIVED_LOG_EVENT}: method={method} "
                     f"status_code={response.status_code} attempt={attempt_index + 1} "
                     f"max_retries={self._max_retries} "
                     f"throttle_retries_remaining={throttle_retries_remaining} "
@@ -1715,7 +1960,7 @@ class SecDownloader:
                     delay = _resolve_sec_throttle_delay(response)
                     self._register_global_throttle_cooldown(delay)
                     Log.warn(
-                        f"SEC 限流 {response.status_code}: url={url} 等待 {delay:.1f}s",
+                        f"SEC 限流 {response.status_code}: 等待 {delay:.1f}s",
                         module=self.MODULE,
                     )
                     await _sleep_with_cancel_check(delay, cancellation_checker)
@@ -1726,11 +1971,12 @@ class SecDownloader:
             except handled_exceptions as exc:
                 last_exception = exc
                 Log.debug(
-                    f"{attempt_log_prefix}: method={method} url={url} "
+                    f"{attempt_log_prefix}: method={method} "
                     f"attempt={attempt_index + 1} "
                     f"shared_throttle_wait_seconds={throttle_reservation.shared_wait_seconds:.6f} "
                     f"effective_min_interval_seconds={throttle_reservation.min_interval_seconds:.6f} "
-                    f"cooldown_hit={throttle_reservation.cooldown_hit} error={exc}",
+                    f"cooldown_hit={throttle_reservation.cooldown_hit} "
+                    f"transport_category={_sec_transport_category(exc).value}",
                     module=self.MODULE,
                 )
                 await self._retry_backoff(
@@ -1738,7 +1984,14 @@ class SecDownloader:
                     cancellation_checker=cancellation_checker,
                 )
                 attempt_index += 1
-        raise RuntimeError(f"{failure_prefix}: url={url} error={last_exception}")
+        del failure_prefix
+        category = _sec_transport_category(last_exception)
+        raise FinsDownloadProviderError(
+            source=FinsDownloadSource.SEC,
+            transport_category=category,
+            retryable=_sec_transport_retryable(last_exception, category=category),
+            safe_message=_sec_transport_safe_message(category),
+        )
 
     async def _refresh_owned_client_for_current_loop(self) -> None:
         """确保 owned HTTP client 不跨已关闭事件循环复用。
@@ -1876,7 +2129,11 @@ class SecDownloader:
                 allow_redirects=allow_redirects,
                 cancellation_checker=cancellation_checker,
             )
-        except RuntimeError:
+        except FinsDownloadProviderError as exc:
+            Log.warn(
+                f"HEAD 元数据请求失败: transport_category={exc.transport_category.value}",
+                module=self.MODULE,
+            )
             return None
 
     async def _http_download(
@@ -1951,9 +2208,10 @@ class SecDownloader:
             cancellation_checker: 可选协作式取消检查器。
 
         Returns:
-            index.json 的 item 列表；失败时返回空列表。
+            index.json 的 item 列表。
 
         Raises:
+            FinsDownloadProviderError: 来源请求或响应协议失败时抛出。
             SecDownloadCancelledError: 取消检查点观察到取消请求时抛出。
         """
 
@@ -1961,15 +2219,7 @@ class SecDownloader:
             cik=str(int(cik)),
             accession_no_dash=accession_no_dash,
         )
-        try:
-            index_json = await _await_if_needed(
-                self._http_get_json(index_url, cancellation_checker=cancellation_checker)
-            )
-        except SecDownloadCancelledError:
-            raise
-        except RuntimeError as exc:
-            Log.warn(f"读取 index.json 失败: {index_url} error={exc}", module=self.MODULE)
-            return []
+        index_json = await _await_if_needed(self._http_get_json(index_url, cancellation_checker=cancellation_checker))
         directory = _json_mapping(index_json.get("directory"))
         return _json_mapping_list(directory.get("item"))
 
@@ -1987,9 +2237,10 @@ class SecDownloader:
             cancellation_checker: 可选协作式取消检查器。
 
         Returns:
-            文档条目列表；请求失败或解析失败时返回空列表。
+            文档条目列表。
 
         Raises:
+            FinsDownloadProviderError: 来源请求或响应协议失败时抛出。
             SecDownloadCancelledError: 取消检查点观察到取消请求时抛出。
         """
 
@@ -1999,21 +2250,12 @@ class SecDownloader:
             accession_no_dash=accession_no_dash,
             accession=accession,
         )
-        try:
-            payload = await _await_if_needed(
-                self._http_get_bytes(
-                    index_headers_url,
-                    cancellation_checker=cancellation_checker,
-                )
+        payload = await _await_if_needed(
+            self._http_get_bytes(
+                index_headers_url,
+                cancellation_checker=cancellation_checker,
             )
-        except SecDownloadCancelledError:
-            raise
-        except RuntimeError as exc:
-            Log.warn(
-                f"读取 index-headers 失败: {index_headers_url} error={exc}",
-                module=self.MODULE,
-            )
-            return []
+        )
         return _parse_index_header_document_entries(payload)
 
     async def _try_fetch_primary_linked_html_files(
@@ -2030,43 +2272,39 @@ class SecDownloader:
             cancellation_checker: 可选协作式取消检查器。
 
         Returns:
-            归一化后的相对 HTML 文件名列表；请求失败时返回空列表。
+            归一化后的相对 HTML 文件名列表。
 
         Raises:
+            FinsDownloadProviderError: 来源请求失败时抛出。
             SecDownloadCancelledError: 取消检查点观察到取消请求时抛出。
         """
 
         primary_document_url = archive_base + primary_document
-        try:
-            payload = await _await_if_needed(
-                self._http_get_bytes(
-                    primary_document_url,
-                    cancellation_checker=cancellation_checker,
-                )
+        payload = await _await_if_needed(
+            self._http_get_bytes(
+                primary_document_url,
+                cancellation_checker=cancellation_checker,
             )
-        except SecDownloadCancelledError:
-            raise
-        except RuntimeError as exc:
-            Log.warn(
-                f"读取主文档补链失败: {primary_document_url} error={exc}",
-                module=self.MODULE,
-            )
-            return []
+        )
         return extract_same_filing_linked_html_files(
             payload=payload,
             primary_document=primary_document,
         )
 
-    def _resolve_user_agent(self, configured_user_agent: Optional[str]) -> str:
+    def _resolve_user_agent(
+        self,
+        configured_user_agent: Optional[str],
+    ) -> tuple[SecUserAgentState, str | None]:
         """解析 User-Agent。
 
-        优先级：显式传入 > 环境变量 SEC_USER_AGENT > 未配置 fallback（附警告）。
+        优先级为显式传入、环境变量 ``SEC_USER_AGENT``、typed 未配置状态。
+        本方法只在 downloader composition 中调用一次。
 
         Args:
             configured_user_agent: 显式传入的 User-Agent。
 
         Returns:
-            最终 User-Agent。
+            typed 配置状态与可选 User-Agent。
 
         Raises:
             无。
@@ -2074,13 +2312,8 @@ class SecDownloader:
 
         value = (configured_user_agent or os.environ.get(SEC_USER_AGENT_ENV) or "").strip()
         if value:
-            return value
-        Log.warning(
-            f"SEC User-Agent 未配置。SEC 要求提供真实联系信息，否则可能限流或封禁。"
-            f"请通过环境变量 {SEC_USER_AGENT_ENV} 或调用方/部署配置提供。",
-            module=self.MODULE,
-        )
-        return _UNCONFIGURED_USER_AGENT
+            return SecUserAgentState.CONFIGURED, value
+        return SecUserAgentState.UNCONFIGURED, None
 
     def _build_headers(self) -> dict[str, str]:
         """构建请求头。
@@ -2089,11 +2322,19 @@ class SecDownloader:
             无。
 
         Returns:
-            请求头字典。
+            只含已配置 SEC 身份的请求头字典。
 
         Raises:
-            无。
+            SecUserAgentConfigurationError: composition 未解析出合规身份时抛出。
         """
+
+        if self._user_agent_state is SecUserAgentState.UNCONFIGURED:
+            Log.warning(
+                f"SEC User-Agent 未配置: configured=false; 请通过环境变量 {SEC_USER_AGENT_ENV} 或部署配置提供合规身份。",
+                module=self.MODULE,
+            )
+            raise SecUserAgentConfigurationError()
+        assert self._user_agent is not None
 
         return {
             "User-Agent": self._user_agent,

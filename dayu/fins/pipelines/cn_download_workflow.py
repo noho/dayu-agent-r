@@ -15,11 +15,13 @@ from typing import TypeAlias, cast
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.pipelines.cn_download_company_meta import upsert_company_meta_for_cn_download
 from dayu.fins.pipelines.cn_download_filing_workflow import (
-    CnDownloadFilingError,
+    project_cn_filing_failure,
     run_cn_download_single_filing_stream,
 )
 from dayu.fins.pipelines.cn_download_models import (
     CnDownloadCancelledError,
+    CnCompanyProfile,
+    CnFiscalPeriod,
     CnMarketKind,
     CnReportCandidate,
     CnReportQuery,
@@ -33,12 +35,17 @@ from dayu.fins.pipelines.cn_form_utils import (
     PeriodDownloadWindow,
     build_cn_filing_ids,
     resolve_period_windows,
-    resolve_target_periods,
+    resolve_download_period_policy,
     resolve_window,
 )
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
+from dayu.fins.storage import (
+    SelectedSourceRepairRequired,
+    SourceIntegrityRevisionConflictError,
+    classify_source_integrity_preflight,
+)
 from dayu.fins._log import Log
-from dayu.fins.ticker_normalization import try_normalize_ticker
+from dayu.fins.ticker_normalization import ticker_to_company_id, try_normalize_ticker
 
 JsonObject: TypeAlias = dict[str, JsonValue]
 
@@ -53,6 +60,7 @@ async def run_cn_download_stream_impl(
     overwrite: bool,
     rebuild: bool,
     ticker_aliases: list[str] | None,
+    start_is_explicit: bool,
     cancel_checker: Callable[[], bool] | None,
     module: str,
     pipeline_name: str,
@@ -68,6 +76,7 @@ async def run_cn_download_stream_impl(
         overwrite: 是否强制覆盖。
         rebuild: 是否仅基于本地已下载数据重建 `meta/manifest`。
         ticker_aliases: 可选 ticker alias。
+        start_is_explicit: 起始日期是否来自调用方显式输入。
         cancel_checker: 可选取消检查函数。
         module: 日志模块名。
         pipeline_name: pipeline 名称。
@@ -86,9 +95,9 @@ async def run_cn_download_stream_impl(
         raise ValueError(f"CN/HK download 不支持 ticker={ticker!r}")
     market = _coerce_market(normalized.market)
     normalized_ticker = normalized.canonical
-    periods = resolve_target_periods(form_type, market)
+    period_policy = resolve_download_period_policy(form_type, market)
     period_windows = resolve_period_windows(
-        target_periods=periods.target_periods,
+        discovery_periods=period_policy.discovery_periods,
         start_date=start_date,
         end_date=end_date,
     )
@@ -105,58 +114,30 @@ async def run_cn_download_stream_impl(
                 "rebuild": True,
             },
         )
-        try:
-            rebuild_result = rebuild_cn_download_artifacts(
-                host=host,
-                ticker=normalized_ticker,
-                market=market,
-                form_type=form_type,
-                start_date=start_date,
-                end_date=end_date,
-                overwrite=overwrite,
-                pipeline_name=pipeline_name,
-                cancel_checker=cancel_checker,
-            )
-        except Exception as exc:
-            failed = _build_result(
-                pipeline_name=pipeline_name,
-                status="failed",
-                ticker=normalized_ticker,
-                reason_code=_reason_code_from_exception(exc),
-                message=str(exc),
-                filings=[],
-            )
-            yield DownloadEvent(
-                event_type=DownloadEventType.PIPELINE_COMPLETED,
-                ticker=normalized_ticker,
-                payload={"result": failed},
-            )
-            return
+        rebuild_result = rebuild_cn_download_artifacts(
+            host=host,
+            ticker=normalized_ticker,
+            market=market,
+            form_type=form_type,
+            start_date=start_date,
+            end_date=end_date,
+            overwrite=overwrite,
+            pipeline_name=pipeline_name,
+            cancel_checker=cancel_checker,
+        )
         raw_filings = rebuild_result.get("filings")
         rebuild_filings = raw_filings if isinstance(raw_filings, list) else []
         for raw_filing in rebuild_filings:
             try:
                 if _is_cancel_requested(cancel_checker):
                     break
-            except Exception as exc:
-                rebuild_result = _build_result(
-                    pipeline_name=pipeline_name,
-                    status="failed",
-                    ticker=normalized_ticker,
-                    reason_code=_reason_code_from_exception(exc),
-                    message=str(exc),
-                    filings=[],
-                )
+            except CnDownloadCancelledError:
                 break
             if not isinstance(raw_filing, dict):
                 continue
             filing_result: JsonObject = dict(raw_filing)
             status = str(filing_result.get("status", "failed"))
-            event_type = (
-                DownloadEventType.FILING_FAILED
-                if status == "failed"
-                else DownloadEventType.FILING_COMPLETED
-            )
+            event_type = DownloadEventType.FILING_FAILED if status == "failed" else DownloadEventType.FILING_COMPLETED
             document_id = str(filing_result.get("document_id", ""))
             yield DownloadEvent(
                 event_type=event_type,
@@ -196,7 +177,7 @@ async def run_cn_download_stream_impl(
         normalized_ticker=normalized_ticker,
         start_date=window.start_date,
         end_date=window.end_date,
-        target_periods=periods.target_periods,
+        discovery_periods=period_policy.discovery_periods,
     )
     cancellation_checkpoint: Callable[[], None] | None = None
     if cancel_checker is not None:
@@ -209,27 +190,15 @@ async def run_cn_download_stream_impl(
         )
     filings: list[JsonObject] = []
     warnings: list[str] = []
-    notes = list(periods.notes)
+    notes: list[str] = []
     company_info: JsonObject = {}
+    missing_periods: tuple[str, ...] = ()
     try:
         _raise_if_cancelled(module=module, ticker=normalized_ticker, document_id="", cancel_checker=cancel_checker)
         profile = discovery.resolve_company(query)
         _raise_if_cancelled(module=module, ticker=normalized_ticker, document_id="", cancel_checker=cancel_checker)
-        company_batch = host.batching_repository.begin_batch(normalized_ticker)
-        try:
-            company_meta = upsert_company_meta_for_cn_download(
-                repository=host.company_meta_repository,
-                profile=profile,
-                normalized_ticker=normalized_ticker,
-                ticker_aliases=ticker_aliases,
-                batch=company_batch,
-            )
-        except BaseException:
-            host.batching_repository.rollback_batch(company_batch)
-            raise
-        host.batching_repository.commit_batch(company_batch)
         company_info = {
-            "company_id": company_meta.company_id,
+            "company_id": ticker_to_company_id(normalized),
             "provider_company_id": profile.company_id,
             "company_name": profile.company_name,
             "market": market,
@@ -249,23 +218,37 @@ async def run_cn_download_stream_impl(
         selected = _select_candidates_for_a4(
             candidates,
             period_windows=period_windows,
-            use_default_business_limits=start_date is None,
+            use_default_business_limits=not start_is_explicit,
         )
-        missing_periods = _resolve_missing_periods(periods.target_periods, selected)
-        for period in missing_periods:
-            skipped = _build_missing_period_result(period=period)
-            filings.append(skipped)
-            _log_filing_download_result(
-                module=module,
-                ticker=normalized_ticker,
-                filing_result=skipped,
+        accepted_filing_ids = frozenset(_candidate_document_id(normalized_ticker, candidate) for candidate in selected)
+        preflight = classify_source_integrity_preflight(
+            host.source_repository.list_source_integrity(normalized_ticker),
+            accepted_filing_ids=accepted_filing_ids,
+            rejected_filing_ids=frozenset(),
+        )
+        repair_document_id: str | None = None
+        if isinstance(preflight, SelectedSourceRepairRequired):
+            repair_document_id = preflight.target.document_id
+            selected = tuple(
+                sorted(
+                    selected,
+                    key=lambda item: (_candidate_document_id(normalized_ticker, item) != repair_document_id,),
+                )
             )
-            yield DownloadEvent(
-                event_type=DownloadEventType.FILING_COMPLETED,
-                ticker=normalized_ticker,
-                payload=_filing_event_payload(skipped),
-            )
+        missing_periods = _resolve_missing_periods(
+            period_policy.missing_eligible_periods,
+            selected,
+        )
         cancelled = False
+        repair_gate_completed = False
+        if repair_document_id is None:
+            _publish_cn_company_after_repair(
+                host=host,
+                profile=profile,
+                normalized_ticker=normalized_ticker,
+                ticker_aliases=ticker_aliases,
+            )
+            repair_gate_completed = True
         for candidate in selected:
             if cancel_checker is not None and cancel_checker():
                 notes.append("cancelled")
@@ -277,13 +260,15 @@ async def run_cn_download_stream_impl(
                 ticker=normalized_ticker,
                 document_id=document_id,
                 payload={
-                    "form_type": candidate.fiscal_period,
+                    "form_type": candidate.period_projection.identity_period,
                     "filing_date": candidate.filing_date,
                     "fiscal_year": candidate.fiscal_year,
-                    "fiscal_period": candidate.fiscal_period,
+                    "fiscal_period": candidate.period_projection.identity_period,
+                    "covered_fiscal_periods": list(candidate.period_projection.covered_periods),
                     "source_id": candidate.source_id,
                 },
             )
+            filing_terminal_status: str | None = None
             try:
                 async for event in run_cn_download_single_filing_stream(
                     batching_repository=host.batching_repository,
@@ -292,7 +277,7 @@ async def run_cn_download_stream_impl(
                     processed_repository=host.processed_repository,
                     discovery_client=discovery,
                     pdf_download_gate=host.pdf_download_gate,
-                    convert_pdf_to_docling_json=host.convert_pdf_to_docling_json,
+                    docling_conversion_runner=host.docling_conversion_runner,
                     ticker=normalized_ticker,
                     profile=profile,
                     candidate=candidate,
@@ -306,6 +291,7 @@ async def run_cn_download_stream_impl(
                         DownloadEventType.FILING_FAILED,
                     }:
                         filing_result: JsonObject = dict(item)
+                        filing_terminal_status = str(filing_result.get("status", "failed"))
                         filings.append(filing_result)
                         _log_filing_download_result(
                             module=module,
@@ -318,12 +304,14 @@ async def run_cn_download_stream_impl(
                 cancelled = True
                 break
             except Exception as exc:
+                reason_code, reason_message = project_cn_filing_failure(exc)
                 failed_item = _build_candidate_failed_result(
                     ticker=normalized_ticker,
                     candidate=candidate,
-                    reason_code=_reason_code_from_exception(exc),
-                    reason_message=str(exc),
+                    reason_code=reason_code,
+                    reason_message=reason_message,
                 )
+                filing_terminal_status = "failed"
                 filings.append(failed_item)
                 _log_filing_download_result(
                     module=module,
@@ -336,42 +324,38 @@ async def run_cn_download_stream_impl(
                     document_id=str(failed_item["document_id"]),
                     payload=_filing_event_payload(failed_item),
                 )
+            if document_id == repair_document_id and not repair_gate_completed:
+                if filing_terminal_status == "failed":
+                    # 单 filing owner 已投影失败；repair gate 直接终止，company 保持旧值。
+                    break
+                post_repair = classify_source_integrity_preflight(
+                    host.source_repository.list_source_integrity(normalized_ticker),
+                    accepted_filing_ids=accepted_filing_ids,
+                    rejected_filing_ids=frozenset(),
+                )
+                if isinstance(post_repair, SelectedSourceRepairRequired):
+                    raise SourceIntegrityRevisionConflictError
+                _raise_if_cancelled(
+                    module=module,
+                    ticker=normalized_ticker,
+                    document_id=document_id,
+                    cancel_checker=cancel_checker,
+                )
+                _publish_cn_company_after_repair(
+                    host=host,
+                    profile=profile,
+                    normalized_ticker=normalized_ticker,
+                    ticker_aliases=ticker_aliases,
+                )
+                repair_gate_completed = True
     except CnDownloadCancelledError:
         notes.append("cancelled")
         cancelled = True
-    except Exception as exc:
-        failed = _build_result(
-            pipeline_name=pipeline_name,
-            status="failed",
-            ticker=normalized_ticker,
-            reason_code=_reason_code_from_exception(exc),
-            message=str(exc),
-            filings=filings,
-        )
-        yield DownloadEvent(
-            event_type=DownloadEventType.PIPELINE_COMPLETED,
-            ticker=normalized_ticker,
-            payload={"result": failed},
-        )
-        return
 
     try:
         final_cancelled = cancelled or _is_cancel_requested(cancel_checker)
-    except Exception as exc:
-        failed = _build_result(
-            pipeline_name=pipeline_name,
-            status="failed",
-            ticker=normalized_ticker,
-            reason_code=_reason_code_from_exception(exc),
-            message=str(exc),
-            filings=filings,
-        )
-        yield DownloadEvent(
-            event_type=DownloadEventType.PIPELINE_COMPLETED,
-            ticker=normalized_ticker,
-            payload={"result": failed},
-        )
-        return
+    except CnDownloadCancelledError:
+        final_cancelled = True
 
     elapsed_ms = int((time.perf_counter() - started_at) * 1000)
     summary = _build_summary(filings=filings, elapsed_ms=elapsed_ms)
@@ -381,14 +365,15 @@ async def run_cn_download_stream_impl(
         ticker=normalized_ticker,
         company_info=company_info,
         filters={
-            "forms": list(periods.target_periods),
-            "start_dates": {period: window.start_date for period in periods.target_periods},
+            "forms": list(period_policy.effective_periods),
+            "start_dates": {item.fiscal_period: item.start_date for item in period_windows},
             "end_date": window.end_date,
             "overwrite": overwrite,
         },
         warnings=warnings,
         notes=notes,
         filings=filings,
+        missing_periods=missing_periods,
         summary=summary,
     )
     Log.info(
@@ -417,6 +402,44 @@ def _select_discovery_client(
     return host.cn_discovery_client if market == "CN" else host.hk_discovery_client
 
 
+def _publish_cn_company_after_repair(
+    *,
+    host: CnDownloadWorkflowHost,
+    profile: CnCompanyProfile,
+    normalized_ticker: str,
+    ticker_aliases: list[str] | None,
+) -> None:
+    """在 whole-tree clean gate 后以独立 atomic batch 发布 company meta。
+
+    Args:
+        host: CN/HK workflow host。
+        profile: provider 已解析的公司 profile。
+        normalized_ticker: canonical ticker。
+        ticker_aliases: request 传入的可选 aliases。
+
+    Returns:
+        无。
+
+    Raises:
+        OSError: company storage batch 失败时抛出。
+        ValueError: company facts 或 batch capability 非法时抛出。
+    """
+
+    company_batch = host.batching_repository.begin_batch(normalized_ticker)
+    try:
+        upsert_company_meta_for_cn_download(
+            repository=host.company_meta_repository,
+            profile=profile,
+            normalized_ticker=normalized_ticker,
+            ticker_aliases=ticker_aliases,
+            batch=company_batch,
+        )
+    except BaseException:
+        host.batching_repository.rollback_batch(company_batch)
+        raise
+    host.batching_repository.commit_batch(company_batch)
+
+
 def _is_cancel_requested(cancel_checker: Callable[[], bool] | None) -> bool:
     """安全检查取消信号。
 
@@ -428,17 +451,12 @@ def _is_cancel_requested(cancel_checker: Callable[[], bool] | None) -> bool:
 
     Raises:
         CnDownloadCancelledError: ``cancel_checker`` 主动抛出取消异常时原样传播。
-        RuntimeError: ``cancel_checker`` 自身失败时抛出。
+        Exception: provider、storage 或 execution 异常原样传播。
     """
 
     if cancel_checker is None:
         return False
-    try:
-        return cancel_checker()
-    except Exception as exc:
-        if isinstance(exc, CnDownloadCancelledError):
-            raise
-        raise RuntimeError(f"取消检查失败: {exc}") from exc
+    return cancel_checker()
 
 
 def _raise_if_cancelled(
@@ -507,7 +525,7 @@ def _select_candidates_for_a4(
     windows = {item.fiscal_period: item for item in period_windows}
     preselected: list[CnReportCandidate] = []
     for candidate in candidates:
-        window = windows.get(candidate.fiscal_period)
+        window = windows.get(candidate.period_projection.identity_period)
         if window is None:
             continue
         if window.start_date <= candidate.filing_date <= window.end_date:
@@ -528,10 +546,10 @@ def _apply_default_business_limits(
     fy_count = 0
     selected: list[CnReportCandidate] = []
     for candidate in candidates:
-        end_year = end_years.get(candidate.fiscal_period)
+        end_year = end_years.get(candidate.period_projection.identity_period)
         if end_year is None:
             continue
-        if candidate.fiscal_period == "FY":
+        if candidate.period_projection.identity_period == "FY":
             if fy_count >= 5:
                 continue
             fy_count += 1
@@ -549,32 +567,24 @@ def _year_from_iso_date(value: str) -> int:
 
 
 def _resolve_missing_periods(
-    requested: tuple[str, ...],
+    missing_eligible_periods: tuple[CnFiscalPeriod, ...],
     selected: tuple[CnReportCandidate, ...],
-) -> tuple[str, ...]:
-    """计算无候选的请求 period。"""
+) -> tuple[CnFiscalPeriod, ...]:
+    """只按 missing eligibility 与候选 identity period 计算缺失财期。
 
-    found = {item.fiscal_period for item in selected}
-    return tuple(period for period in requested if period not in found)
+    Args:
+        missing_eligible_periods: policy owner 允许报告 missing 的 canonical 财期。
+        selected: workflow 已选择的候选；仅消费其 identity fiscal period。
 
+    Returns:
+        保持 policy canonical 顺序的缺失财期 tuple。
 
-def _build_missing_period_result(*, period: str) -> JsonObject:
-    """构建 period 缺失 skipped 结果。"""
+    Raises:
+        无。
+    """
 
-    return {
-        "document_id": "",
-        "status": "skipped",
-        "form_type": period,
-        "filing_date": None,
-        "report_date": None,
-        "downloaded_files": 0,
-        "skipped_files": 0,
-        "failed_files": [],
-        "has_xbrl": False,
-        "reason_code": "candidate_not_found",
-        "reason_message": "主源未返回对应财期报告",
-        "skip_reason": "candidate_not_found",
-    }
+    found = {item.period_projection.identity_period for item in selected}
+    return tuple(period for period in missing_eligible_periods if period not in found)
 
 
 def _build_candidate_failed_result(
@@ -602,11 +612,12 @@ def _build_candidate_failed_result(
     return {
         "document_id": _candidate_document_id(ticker, candidate),
         "status": "failed",
-        "form_type": candidate.fiscal_period,
+        "form_type": candidate.period_projection.identity_period,
         "filing_date": candidate.filing_date,
         "report_date": None,
         "fiscal_year": candidate.fiscal_year,
-        "fiscal_period": candidate.fiscal_period,
+        "fiscal_period": candidate.period_projection.identity_period,
+        "covered_fiscal_periods": list(candidate.period_projection.covered_periods),
         "downloaded_files": 0,
         "skipped_files": 0,
         "failed_files": [],
@@ -754,9 +765,31 @@ def _build_result(
     warnings: list[str] | None = None,
     notes: list[str] | None = None,
     filings: list[JsonObject] | None = None,
+    missing_periods: tuple[str, ...] = (),
     summary: JsonObject | None = None,
 ) -> JsonObject:
-    """构建 pipeline download 结果。"""
+    """构建 pipeline download 结果。
+
+    Args:
+        pipeline_name: 来源 pipeline 名称。
+        status: pipeline 终态。
+        ticker: canonical ticker。
+        reason_code: 可选失败原因码。
+        message: 可选失败说明。
+        company_info: 公司业务事实。
+        filters: 生效筛选条件。
+        warnings: 用户可读 warning。
+        notes: pipeline notes。
+        filings: 真实 provider candidates 的结果。
+        missing_periods: 主源没有候选的请求财期；不属于 document outcome。
+        summary: 从真实 filing 结果计算的计数。
+
+    Returns:
+        统一 pipeline download 结果。
+
+    Raises:
+        无。
+    """
 
     warning_values: list[JsonValue] = list(warnings or [])
     note_values: list[JsonValue] = list(notes or [])
@@ -773,7 +806,9 @@ def _build_result(
         "warnings": warning_values,
         "notes": note_values,
         "filings": filing_values,
-        "summary": summary or {
+        "missing_periods": list(missing_periods),
+        "summary": summary
+        or {
             "total": 0,
             "downloaded": 0,
             "skipped": 0,
@@ -801,20 +836,12 @@ def _candidate_document_id(ticker: str, candidate: CnReportCandidate) -> str:
 
     document_id, _ = build_cn_filing_ids(
         ticker=ticker,
-        form_type=candidate.fiscal_period,
+        form_type=candidate.period_projection.identity_period,
         fiscal_year=candidate.fiscal_year,
-        fiscal_period=candidate.fiscal_period,
+        fiscal_period=candidate.period_projection.identity_period,
         amended=candidate.amended,
     )
     return document_id
-
-
-def _reason_code_from_exception(exc: Exception) -> str:
-    """把异常映射为稳定 reason code。"""
-
-    if isinstance(exc, CnDownloadFilingError):
-        return "filing_download_failed"
-    return "cn_download_failed"
 
 
 __all__ = ["run_cn_download_stream_impl"]

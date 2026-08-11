@@ -37,6 +37,10 @@ from dayu.fins.direct_events import (
     FinsResultSummary,
 )
 from dayu.fins.direct_events import ValidatedFinsEventStream
+from dayu.fins.download_contract import (
+    FinsDownloadRequest,
+    build_fins_download_request,
+)
 from dayu.fins.domain.enums import SourceKind
 from dayu.service.fins_direct import (
     FINS_DIRECT_EXIT_FAILURE,
@@ -66,7 +70,7 @@ def _raise_cli_consumer_error(
 class _FakeFinsDirectService:
     """CLI 测试用 FinsDirectCommandService 替身。"""
 
-    download_requests: list[_DownloadCall]
+    download_requests: list[FinsDownloadRequest]
     process_requests: list[_ProcessCall]
     process_filing_requests: list[_ProcessSpecificCall]
     process_material_requests: list[_ProcessSpecificCall]
@@ -107,11 +111,7 @@ class _FakeFinsDirectService:
         self.process_material_requests = []
         self.upload_filing_requests = []
         self.upload_material_requests = []
-        self.events = (
-            (_progress_event(FinsOperationKind.DOWNLOAD), _result_event())
-            if events is None
-            else events
-        )
+        self.events = (_progress_event(FinsOperationKind.DOWNLOAD), _result_event()) if events is None else events
         self.stream_error = stream_error
         self.close_error = close_error
         self.stream_calls = []
@@ -124,38 +124,19 @@ class _FakeFinsDirectService:
 
     def download(
         self,
+        request: FinsDownloadRequest,
         *,
-        ticker: str,
-        form_types: tuple[str, ...] = (),
-        filed_after: str | None = None,
-        filed_before: str | None = None,
-        overwrite_existing: bool = False,
-        rebuild_processed: bool = False,
         cancellation_token: fins_command._CliFinsCancellationToken | None = None,
     ) -> ValidatedFinsEventStream:
         """记录 download 参数并返回 fake stream。
 
-        :param ticker: canonical ticker。
-        :param form_types: 表单过滤条件。
-        :param filed_after: 最早 filing 日期。
-        :param filed_before: 最晚 filing 日期。
-        :param overwrite_existing: 是否覆盖已有文档。
-        :param rebuild_processed: 是否重建 processed 产物。
+        :param request: 已完成静态校验的下载请求。
         :param cancellation_token: CLI operation 取消 token。
         :returns: Fins direct event stream。
         :raises Exception: 不主动抛出异常。
         """
 
-        self.download_requests.append(
-            _DownloadCall(
-                ticker=ticker,
-                form_types=form_types,
-                filed_after=filed_after,
-                filed_before=filed_before,
-                overwrite_existing=overwrite_existing,
-                rebuild_processed=rebuild_processed,
-            )
-        )
+        self.download_requests.append(request)
         return self._stream(
             FinsOperationKind.DOWNLOAD,
             cancellation_token,
@@ -442,6 +423,59 @@ class _FakeFinsDirectService:
                 raise self.close_error
 
 
+class _ObservedCliCancellationToken(fins_command._CliFinsCancellationToken):
+    """使用 async barrier 观察 CLI 取消请求的测试 token。"""
+
+    def __init__(self) -> None:
+        """初始化请求计数与 barrier。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        super().__init__()
+        self.request_count = 0
+        self.requested = asyncio.Event()
+
+    def request_cancel(self, reason: str) -> None:
+        """记录请求并调用 production token 的幂等真源。
+
+        :param reason: 取消原因。
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        self.request_count += 1
+        super().request_cancel(reason)
+        self.requested.set()
+
+
+class _ObservedCliSigintMonitor(CliSigintMonitor):
+    """暴露每次 ``wait_next`` 已被 owner 消费的测试 monitor。"""
+
+    def __init__(self) -> None:
+        """初始化已消费计数队列。
+
+        :returns: ``None``。
+        :raises Exception: 不主动抛出异常。
+        """
+
+        super().__init__()
+        self.observed_counts: asyncio.Queue[int] = asyncio.Queue()
+
+    async def wait_next(self, observed_count: int) -> int:
+        """等待下一次 SIGINT 并记录 owner 已消费计数。
+
+        :param observed_count: 调用方已观察计数。
+        :returns: 新的 SIGINT 计数。
+        :raises asyncio.CancelledError: 等待 task 被取消时透传。
+        """
+
+        next_count = await super().wait_next(observed_count)
+        await self.observed_counts.put(next_count)
+        return next_count
+
+
 @pytest.fixture()
 def fake_service(monkeypatch: pytest.MonkeyPatch) -> _FakeFinsDirectService:
     """安装 fake Fins direct service factory。
@@ -465,6 +499,30 @@ def fake_service(monkeypatch: pytest.MonkeyPatch) -> _FakeFinsDirectService:
 
     monkeypatch.setattr(fins_command, "FINS_DIRECT_SERVICE_FACTORY", factory)
     return service
+
+
+def _recording_direct_service_factory(
+    workspace_root: Path,
+    *,
+    service: _FakeFinsDirectService,
+    factory_calls: list[Path],
+) -> fins_command.FinsDirectCommandService:
+    """记录不应发生的 factory 调用并返回指定测试 Service。
+
+    Args:
+        workspace_root: CLI 传入的 workspace root。
+        service: 发生调用时应返回的测试 Service。
+        factory_calls: 记录调用路径的列表。
+
+    Returns:
+        转换为 production 接口类型的测试 Service。
+
+    Raises:
+        无。
+    """
+
+    factory_calls.append(workspace_root)
+    return cast(fins_command.FinsDirectCommandService, service)
 
 
 @pytest.mark.parametrize(
@@ -492,9 +550,9 @@ def test_live_fins_commands_render_progress_and_terminal_summary(
     assert exit_code == EXIT_SUCCESS
     assert fake_service.stream_calls
     assert "Fins progress" in captured.out
-    assert "message=\"download live progress\"" in captured.out
+    assert 'message="download live progress"' in captured.out
     assert "Fins succeeded" in captured.out
-    assert "processed_count=\"1\"" in captured.out
+    assert 'processed_count="1"' in captured.out
     assert "Fins direct event received" not in captured.out
     assert "Fins direct event detail" not in captured.out
     assert captured.err == ""
@@ -603,9 +661,7 @@ def test_fins_direct_default_log_file_keeps_verbose_diagnostics_suppressed(
 
     log_file = tmp_path / "dayu.log"
 
-    exit_code = cli_main.main(
-        ("download", "--ticker", "AAPL", "--log-file", str(log_file))
-    )
+    exit_code = cli_main.main(("download", "--ticker", "AAPL", "--log-file", str(log_file)))
 
     captured = capsys.readouterr()
     log_text = log_file.read_text(encoding="utf-8")
@@ -723,38 +779,267 @@ def test_output_keeps_absolute_paths_visible_and_bounded() -> None:
     assert len(rendered) == 120
 
 
-def test_download_command_maps_args_to_service(
-    fake_service: _FakeFinsDirectService,
+def test_download_help_explains_mutually_exclusive_mutation_modes(
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """download CLI 参数必须转换为 Service direct stream 方法参数。"""
+    """download help 应分别说明 overwrite 与 rebuild 不可组合。
+
+    Args:
+        capsys: pytest 标准输出捕获夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 任一 option、互斥说明或退出码不符合契约时抛出。
+    """
+
+    exit_code = cli_main.main(("download", "--help"))
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_SUCCESS
+    assert "--overwrite" in captured.out
+    assert "覆盖已有原始文档；不可与 --rebuild 同时使用。" in captured.out
+    assert "--rebuild" in captured.out
+    assert "不访问远端来源；不可与 --overwrite 同时使用。" in captured.out
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize(
+    ("mutation_flag", "expected_overwrite", "expected_rebuild"),
+    (
+        ("--overwrite", True, False),
+        ("--rebuild", False, True),
+    ),
+)
+def test_download_command_maps_single_mutation_mode_to_service(
+    fake_service: _FakeFinsDirectService,
+    mutation_flag: str,
+    expected_overwrite: bool,
+    expected_rebuild: bool,
+) -> None:
+    """download CLI 应分别把合法单一变更模式映射到 Service。
+
+    Args:
+        fake_service: direct service 测试替身。
+        mutation_flag: 当前用例传入的变更模式 flag。
+        expected_overwrite: request 中预期的 overwrite 值。
+        expected_rebuild: request 中预期的 rebuild 值。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: CLI 参数映射或退出码不符合契约时抛出。
+    """
 
     exit_code = cli_main.main(
         (
             "download",
             "--ticker",
-            "AAPL,MSFT",
+            "aapl.us",
             "--forms",
-            "10-K,10-Q",
+            "10-k",
+            "10-Q",
             "--start",
             "2024-01-01",
             "--end",
             "2024-12-31",
-            "--overwrite",
-            "--rebuild",
+            mutation_flag,
         )
     )
 
     assert exit_code == EXIT_SUCCESS
     assert fake_service.download_requests == [
-        _DownloadCall(
-            ticker="AAPL",
+        build_fins_download_request(
+            ticker="aapl.us",
             form_types=("10-K", "10-Q"),
-            filed_after="2024-01-01",
-            filed_before="2024-12-31",
-            overwrite_existing=True,
-            rebuild_processed=True,
+            start="2024-01-01",
+            end="2024-12-31",
+            overwrite_existing=expected_overwrite,
+            rebuild_local_artifacts=expected_rebuild,
         )
     ]
+
+
+@pytest.mark.parametrize(
+    ("download_args", "expected_message"),
+    (
+        ((), "--ticker 不能为空，请提供一个公司代码"),
+        (("--ticker", "AAPL,MSFT"), "只接受一个公司代码"),
+        (("--ticker", "AAPL", "--forms", "UNKNOWN"), "--forms 不支持"),
+        (("--ticker", "AAPL", "--start", "2024/01/01"), "--start 格式错误"),
+        (
+            ("--ticker", "AAPL", "--start", "2025", "--end", "2024"),
+            "--start 不能晚于 --end",
+        ),
+    ),
+)
+def test_download_static_usage_error_precedes_workspace_and_service_factory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    download_args: tuple[str, ...],
+    expected_message: str,
+) -> None:
+    """静态 download usage error 应 exit 2 且不解析出任何 workspace 副作用。
+
+    Args:
+        tmp_path: pytest 临时目录夹具。
+        monkeypatch: factory 替换夹具。
+        capsys: 标准流捕获夹具。
+        download_args: 当前非法 download 参数。
+        expected_message: 预期中文错误片段。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: factory 被调用、workspace 被创建或退出语义错误时抛出。
+    """
+
+    workspace_root = tmp_path / "must-not-exist"
+    factory_calls: list[Path] = []
+
+    def forbidden_factory(path: Path) -> fins_command.FinsDirectCommandService:
+        """记录不应发生的 Service factory 调用。
+
+        Args:
+            path: CLI 传入的 workspace root。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: factory 一旦被调用即抛出。
+        """
+
+        factory_calls.append(path)
+        raise AssertionError("usage error 不得构造 Service")
+
+    monkeypatch.setattr(fins_command, "FINS_DIRECT_SERVICE_FACTORY", forbidden_factory)
+
+    exit_code = cli_main.main(("download", "--base", str(workspace_root), *download_args))
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_USAGE_ERROR
+    assert expected_message in captured.err
+    if download_args == ():
+        assert captured.err == ("dayu-cli download: --ticker 不能为空，请提供一个公司代码\n")
+    assert factory_calls == []
+    assert not workspace_root.exists()
+
+
+@pytest.mark.parametrize(
+    "mutation_flags",
+    (
+        ("--overwrite", "--rebuild"),
+        ("--rebuild", "--overwrite"),
+    ),
+)
+def test_download_mutation_mode_conflict_precedes_all_side_effects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    mutation_flags: tuple[str, str],
+) -> None:
+    """两种冲突 argv 顺序都应在 workspace、factory 与 operation 前 exit 2。
+
+    Args:
+        tmp_path: pytest 临时目录夹具。
+        monkeypatch: factory 替换夹具。
+        capsys: 标准流捕获夹具。
+        mutation_flags: 当前用例的冲突 flag 顺序。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 冲突未前置拒绝或产生任一副作用时抛出。
+    """
+
+    workspace_root = tmp_path / "must-not-exist"
+    service = _FakeFinsDirectService()
+    factory_calls: list[Path] = []
+    recording_factory = partial(
+        _recording_direct_service_factory,
+        service=service,
+        factory_calls=factory_calls,
+    )
+
+    monkeypatch.setattr(fins_command, "FINS_DIRECT_SERVICE_FACTORY", recording_factory)
+
+    exit_code = cli_main.main(
+        (
+            "download",
+            "--base",
+            str(workspace_root),
+            "--ticker",
+            "AAPL",
+            *mutation_flags,
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_USAGE_ERROR
+    assert captured.err == ("dayu-cli download: --overwrite 与 --rebuild 不能同时使用；请只选择一种下载变更模式\n")
+    assert factory_calls == []
+    assert service.download_requests == []
+    assert service.stream_calls == []
+    assert not workspace_root.exists()
+
+
+def test_download_repeated_ticker_is_last_wins(
+    fake_service: _FakeFinsDirectService,
+) -> None:
+    """重复 ``--ticker`` 应由 argparse 保持 last-wins 并传递最终 canonical ticker。
+
+    Args:
+        fake_service: direct service 测试替身。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 未使用最后一个 ticker 或 canonicalization 失败时抛出。
+    """
+
+    exit_code = cli_main.main(("download", "--ticker", "MSFT", "--ticker", "aapl.us"))
+
+    assert exit_code == EXIT_SUCCESS
+    assert len(fake_service.download_requests) == 1
+    assert fake_service.download_requests[0].normalized_ticker.canonical == "AAPL"
+
+
+def test_download_path_does_not_reuse_upload_ticker_csv_parser() -> None:
+    """download 专用 builder 不得调用保留 alias 语义的 ``_parse_ticker_csv``。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: download 与 upload/preprocess ticker ownership 混用时抛出。
+    """
+
+    source = Path(fins_command.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    calls_by_function: dict[str, set[str]] = {}
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        calls_by_function[node.name] = {
+            child.func.id
+            for child in ast.walk(node)
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+        }
+
+    assert "_parse_ticker_csv" not in calls_by_function["_prevalidate_download_request"]
+    assert "_parse_ticker_csv" not in calls_by_function["_download_stream"]
+    assert "_parse_ticker_csv" in calls_by_function["_upload_filing_stream"]
+    assert "_parse_ticker_csv" in calls_by_function["_run_upload_filings_from"]
 
 
 def test_upload_commands_map_args_and_validate_files(
@@ -768,46 +1053,52 @@ def test_upload_commands_map_args_and_validate_files(
     filing_file.write_text("filing", encoding="utf-8")
     material_file.write_text("<html></html>", encoding="utf-8")
 
-    assert cli_main.main(
-        (
-            "upload_filing",
-            "--ticker",
-            "AAPL,MSFT",
-            "--action",
-            "update",
-            "--files",
-            str(filing_file),
-            "--fiscal-year",
-            "2024",
-            "--fiscal-period",
-            "FY",
-            "--amended",
-            "--filing-date",
-            "2025-01-30",
-            "--report-date",
-            "2024-12-31",
-            "--company-name",
-            "Apple",
-            "--overwrite",
+    assert (
+        cli_main.main(
+            (
+                "upload_filing",
+                "--ticker",
+                "AAPL,MSFT",
+                "--action",
+                "update",
+                "--files",
+                str(filing_file),
+                "--fiscal-year",
+                "2024",
+                "--fiscal-period",
+                "FY",
+                "--amended",
+                "--filing-date",
+                "2025-01-30",
+                "--report-date",
+                "2024-12-31",
+                "--company-name",
+                "Apple",
+                "--overwrite",
+            )
         )
-    ) == EXIT_SUCCESS
-    assert cli_main.main(
-        (
-            "upload_material",
-            "--ticker",
-            "MSFT,GOOG",
-            "--forms",
-            "8-K",
-            "--material-name",
-            "Investor Day",
-            "--files",
-            str(material_file),
-            "--document-id",
-            "doc-1",
-            "--internal-document-id",
-            "internal-1",
+        == EXIT_SUCCESS
+    )
+    assert (
+        cli_main.main(
+            (
+                "upload_material",
+                "--ticker",
+                "MSFT,GOOG",
+                "--forms",
+                "8-K",
+                "--material-name",
+                "Investor Day",
+                "--files",
+                str(material_file),
+                "--document-id",
+                "doc-1",
+                "--internal-document-id",
+                "internal-1",
+            )
         )
-    ) == EXIT_SUCCESS
+        == EXIT_SUCCESS
+    )
 
     assert fake_service.upload_filing_requests == [
         _UploadFilingCall(
@@ -850,24 +1141,23 @@ def test_process_commands_map_to_service(
 ) -> None:
     """process / process_filing / process_material 必须映射到 direct stream 方法。"""
 
-    assert cli_main.main(
-        (
-            "process",
-            "--ticker",
-            "AAPL,MSFT",
-            "--document-id",
-            "doc-1,doc-2",
-            "--document-id",
-            "doc-3",
-            "--overwrite",
+    assert (
+        cli_main.main(
+            (
+                "process",
+                "--ticker",
+                "AAPL,MSFT",
+                "--document-id",
+                "doc-1,doc-2",
+                "--document-id",
+                "doc-3",
+                "--overwrite",
+            )
         )
-    ) == EXIT_SUCCESS
-    assert cli_main.main(
-        ("process_filing", "--ticker", "AAPL", "--document-id", "filing-1")
-    ) == EXIT_SUCCESS
-    assert cli_main.main(
-        ("process_material", "--ticker", "AAPL", "--document-id", "material-1")
-    ) == EXIT_SUCCESS
+        == EXIT_SUCCESS
+    )
+    assert cli_main.main(("process_filing", "--ticker", "AAPL", "--document-id", "filing-1")) == EXIT_SUCCESS
+    assert cli_main.main(("process_material", "--ticker", "AAPL", "--document-id", "material-1")) == EXIT_SUCCESS
 
     assert fake_service.process_requests == [
         _ProcessCall(
@@ -931,12 +1221,8 @@ def test_terminal_failed_and_cancelled_status_exit_mapping(
 ) -> None:
     """CLI 必须使用 FinsResultSummary 的退出码映射。"""
 
-    failed_service = _FakeFinsDirectService(
-        events=(_result_event(status=FinsResultStatus.FAILURE),)
-    )
-    cancelled_service = _FakeFinsDirectService(
-        events=(_result_event(status=FinsResultStatus.CANCELLED),)
-    )
+    failed_service = _FakeFinsDirectService(events=(_result_event(status=FinsResultStatus.FAILURE),))
+    cancelled_service = _FakeFinsDirectService(events=(_result_event(status=FinsResultStatus.CANCELLED),))
 
     monkeypatch.setattr(
         fins_command,
@@ -994,10 +1280,7 @@ def test_fins_owned_missing_result_uses_existing_cli_error_presentation(
     assert cli_main.main(("download", "--ticker", "AAPL")) == EXIT_FAILURE
 
     captured = capsys.readouterr()
-    assert (
-        "dayu-cli download: Fins direct stream ended without RESULT"
-        in captured.err
-    )
+    assert "dayu-cli download: Fins direct stream ended without RESULT" in captured.err
     assert "Fins failure" not in captured.err
     assert service.closed_streams == 1
 
@@ -1034,10 +1317,7 @@ def test_fins_owned_duplicate_result_uses_existing_cli_error_presentation(
     assert cli_main.main(("download", "--ticker", "AAPL")) == EXIT_FAILURE
 
     captured = capsys.readouterr()
-    assert (
-        "dayu-cli download: Fins direct stream produced multiple RESULT events"
-        in captured.err
-    )
+    assert "dayu-cli download: Fins direct stream produced multiple RESULT events" in captured.err
     assert "Fins failure" not in captured.err
     assert "failed" not in captured.err
     assert service.closed_streams == 1
@@ -1066,7 +1346,7 @@ async def test_fins_owned_protocol_error_object_reaches_cli_consumer_unchanged()
         events=(_progress_event(FinsOperationKind.DOWNLOAD),),
         stream_error=owner_error,
     )
-    stream = service.download(ticker="AAPL")
+    stream = service.download(build_fins_download_request(ticker="AAPL"))
 
     with pytest.raises(FinsDirectStreamProtocolError) as captured:
         await fins_command._consume_fins_direct_events(stream)
@@ -1199,9 +1479,7 @@ async def test_cli_stream_owner_preserves_consumer_error_and_cleanup_cause(
     )
 
     with pytest.raises(RuntimeError) as captured:
-        await fins_command._run_fins_direct_command_async(
-            parse_cli_args(("download", "--ticker", "AAPL"))
-        )
+        await fins_command._run_fins_direct_command_async(parse_cli_args(("download", "--ticker", "AAPL")))
 
     assert captured.value is primary_error
     assert captured.value.__cause__ is close_error
@@ -1236,9 +1514,7 @@ async def test_cli_stream_owner_external_cancellation_closes_once_with_cleanup_c
         ),
     )
     command_task = asyncio.create_task(
-        fins_command._run_fins_direct_command_async(
-            parse_cli_args(("download", "--ticker", "AAPL"))
-        )
+        fins_command._run_fins_direct_command_async(parse_cli_args(("download", "--ticker", "AAPL")))
     )
     await service.first_event_yielded.wait()
 
@@ -1265,7 +1541,7 @@ async def test_cli_event_task_drain_keeps_close_cause_when_child_already_done() 
         pause_after_first_event=True,
     )
     event_task = asyncio.create_task(
-        fins_command._consume_fins_direct_events(service.download(ticker="AAPL"))
+        fins_command._consume_fins_direct_events(service.download(build_fins_download_request(ticker="AAPL")))
     )
     await service.first_event_yielded.wait()
     event_task.cancel()
@@ -1295,7 +1571,7 @@ async def test_cli_event_task_drain_deduplicates_same_primary_close_cause() -> N
         pause_after_first_event=True,
     )
     event_task = asyncio.create_task(
-        fins_command._consume_fins_direct_events(service.download(ticker="AAPL"))
+        fins_command._consume_fins_direct_events(service.download(build_fins_download_request(ticker="AAPL")))
     )
     await service.first_event_yielded.wait()
     event_task.cancel()
@@ -1314,18 +1590,25 @@ async def test_cli_event_task_drain_deduplicates_same_primary_close_cause() -> N
 
 
 @pytest.mark.asyncio
-async def test_cli_stream_owner_sigint_local_exit_closes_once(
+async def test_cli_stream_owner_sigint_waits_for_canonical_cancelled_terminal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """SIGINT 本地退出必须经过 stream 创建者的确定性 close boundary。
+    """SIGINT 只请求 token，退出码必须来自 canonical cancelled terminal。
 
     :param monkeypatch: pytest monkeypatch 夹具。
     :returns: ``None``。
-    :raises AssertionError: 本地退出码、取消或关闭次数不符合契约时抛出。
+    :raises AssertionError: canonical 退出码、取消或关闭次数不符合契约时抛出。
     """
 
-    service = _FakeFinsDirectService(pause_after_first_event=True)
-    monitor = CliSigintMonitor()
+    service = _FakeFinsDirectService(
+        events=(
+            _progress_event(FinsOperationKind.DOWNLOAD),
+            _result_event(status=FinsResultStatus.CANCELLED),
+        ),
+        pause_after_first_event=True,
+    )
+    monitor = _ObservedCliSigintMonitor()
+    token = _ObservedCliCancellationToken()
     monkeypatch.setattr(
         fins_command,
         "FINS_DIRECT_SERVICE_FACTORY",
@@ -1335,14 +1618,15 @@ async def test_cli_stream_owner_sigint_local_exit_closes_once(
         ),
     )
     monkeypatch.setattr(fins_command, "CliSigintMonitor", lambda: monitor)
+    monkeypatch.setattr(fins_command, "_CliFinsCancellationToken", lambda: token)
     command_task = asyncio.create_task(
-        fins_command._run_fins_direct_command_async(
-            parse_cli_args(("download", "--ticker", "AAPL"))
-        )
+        fins_command._run_fins_direct_command_async(parse_cli_args(("download", "--ticker", "AAPL")))
     )
     await service.first_event_yielded.wait()
 
     monitor.notify()
+    await asyncio.wait_for(token.requested.wait(), timeout=1.0)
+    service.release_stream.set()
     exit_code = await command_task
 
     assert exit_code == EXIT_KEYBOARD_INTERRUPT
@@ -1355,7 +1639,7 @@ async def test_cli_stream_owner_sigint_local_exit_closes_once(
 async def test_cli_stream_owner_sigint_close_failure_propagates_without_primary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """SIGINT 本地退出的 raw close 失败应以同一 cleanup error 原样传播。
+    """SIGINT request-and-wait 期间的 raw close 失败应原样传播。
 
     :param monkeypatch: pytest monkeypatch 夹具。
     :returns: ``None``。
@@ -1364,10 +1648,15 @@ async def test_cli_stream_owner_sigint_close_failure_propagates_without_primary(
 
     close_error = OSError("raw generator close failed")
     service = _FakeFinsDirectService(
+        events=(
+            _progress_event(FinsOperationKind.DOWNLOAD),
+            _result_event(status=FinsResultStatus.CANCELLED),
+        ),
         close_error=close_error,
         pause_after_first_event=True,
     )
     monitor = CliSigintMonitor()
+    token = _ObservedCliCancellationToken()
     monkeypatch.setattr(
         fins_command,
         "FINS_DIRECT_SERVICE_FACTORY",
@@ -1377,14 +1666,15 @@ async def test_cli_stream_owner_sigint_close_failure_propagates_without_primary(
         ),
     )
     monkeypatch.setattr(fins_command, "CliSigintMonitor", lambda: monitor)
+    monkeypatch.setattr(fins_command, "_CliFinsCancellationToken", lambda: token)
     command_task = asyncio.create_task(
-        fins_command._run_fins_direct_command_async(
-            parse_cli_args(("download", "--ticker", "AAPL"))
-        )
+        fins_command._run_fins_direct_command_async(parse_cli_args(("download", "--ticker", "AAPL")))
     )
     await service.first_event_yielded.wait()
 
     monitor.notify()
+    await asyncio.wait_for(token.requested.wait(), timeout=1.0)
+    service.release_stream.set()
     with pytest.raises(OSError) as captured:
         await command_task
 
@@ -1395,21 +1685,27 @@ async def test_cli_stream_owner_sigint_close_failure_propagates_without_primary(
 
 
 @pytest.mark.asyncio
-async def test_sigint_cancels_stream_task_without_job_id(
+async def test_sigint_requests_token_and_waits_without_job_id(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """第一次 SIGINT 必须取消当前 stream task，不调用 job cancel 语义。"""
+    """第一次 SIGINT 只请求 token 并等待 Fins owner 终态。"""
 
     service = _FakeFinsDirectService(
-        events=(_progress_event(FinsOperationKind.DOWNLOAD), _result_event()),
+        events=(
+            _progress_event(FinsOperationKind.DOWNLOAD),
+            _result_event(status=FinsResultStatus.CANCELLED),
+        ),
         pause_after_first_event=True,
     )
-    token = fins_command._CliFinsCancellationToken()
-    monitor = CliSigintMonitor()
+    token = _ObservedCliCancellationToken()
+    monitor = _ObservedCliSigintMonitor()
 
     wait_task = asyncio.create_task(
         fins_command._wait_for_terminal_handling_sigint(
-            events=service.download(ticker="AAPL", cancellation_token=token),
+            events=service.download(
+                build_fins_download_request(ticker="AAPL"),
+                cancellation_token=token,
+            ),
             cancellation_token=token,
             sigint_monitor=monitor,
             command_name="download",
@@ -1417,15 +1713,24 @@ async def test_sigint_cancels_stream_task_without_job_id(
     )
     await service.first_event_yielded.wait()
     monitor.notify()
+    assert await asyncio.wait_for(monitor.observed_counts.get(), timeout=1.0) == 1
+    await asyncio.wait_for(token.requested.wait(), timeout=1.0)
+    assert not wait_task.done()
+    monitor.notify()
+    assert await asyncio.wait_for(monitor.observed_counts.get(), timeout=1.0) == 2
+    assert token.request_count == 1
+    service.release_stream.set()
 
     result = await wait_task
 
-    assert isinstance(result, fins_command._CliDirectLocalExit)
+    assert result.status is FinsResultStatus.CANCELLED
     assert result.exit_code == FINS_DIRECT_EXIT_KEYBOARD_INTERRUPT
     assert token.is_cancelled()
     assert service.closed_streams == 1
     captured = capsys.readouterr()
     assert "Fins operation cancel requested" in captured.err
+    assert "Fins cancelled" in captured.err
+    assert "local process exiting" not in captured.err
     assert "job_id" not in captured.err
 
 
@@ -1433,23 +1738,22 @@ async def test_sigint_cancels_stream_task_without_job_id(
 async def test_cancel_race_does_not_override_terminal_result() -> None:
     """取消注入后 stream 返回 terminal RESULT 时不得覆盖最终结果。"""
 
+    progress_delivered = asyncio.Event()
+    release_terminal = asyncio.Event()
+
     async def terminal_stream_after_cancel() -> AsyncGenerator[FinsEvent, None]:
         """取消注入后仍返回已经形成的 terminal result。
 
         :returns: Fins direct event stream。
-        :raises asyncio.CancelledError: 测试失败路径中透传取消。
+        :raises Exception: 不主动抛出异常。
         """
 
+        progress_delivered.set()
         yield _progress_event(FinsOperationKind.DOWNLOAD)
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            yield _result_event(status=FinsResultStatus.SUCCESS)
-            return
-
+        await release_terminal.wait()
         yield _result_event(status=FinsResultStatus.SUCCESS)
 
-    token = fins_command._CliFinsCancellationToken()
+    token = _ObservedCliCancellationToken()
     monitor = CliSigintMonitor()
     stream = ValidatedFinsEventStream(
         terminal_stream_after_cancel(),
@@ -1464,8 +1768,11 @@ async def test_cancel_race_does_not_override_terminal_result() -> None:
             command_name="download",
         )
     )
-    await asyncio.sleep(0)
+    await asyncio.wait_for(progress_delivered.wait(), timeout=1.0)
     monitor.notify()
+    await asyncio.wait_for(token.requested.wait(), timeout=1.0)
+    assert not wait_task.done()
+    release_terminal.set()
 
     result = await wait_task
 
@@ -1482,30 +1789,19 @@ def test_keyboard_interrupt_before_stream_exits_130(
     class _InterruptingService(_FakeFinsDirectService):
         def download(
             self,
+            request: FinsDownloadRequest,
             *,
-            ticker: str,
-            form_types: tuple[str, ...] = (),
-            filed_after: str | None = None,
-            filed_before: str | None = None,
-            overwrite_existing: bool = False,
-            rebuild_processed: bool = False,
             cancellation_token: fins_command._CliFinsCancellationToken | None = None,
         ) -> ValidatedFinsEventStream:
             """模拟打开 stream 前中断。
 
-            :param ticker: canonical ticker。
-            :param form_types: 表单过滤条件。
-            :param filed_after: 最早 filing 日期。
-            :param filed_before: 最晚 filing 日期。
-            :param overwrite_existing: 是否覆盖已有文档。
-            :param rebuild_processed: 是否重建 processed 产物。
+            :param request: 已完成静态校验的下载请求。
             :param cancellation_token: CLI operation 取消 token。
             :returns: 正常路径不会返回。
             :raises KeyboardInterrupt: 始终抛出。
             """
 
-            del ticker, form_types, filed_after, filed_before
-            del overwrite_existing, rebuild_processed, cancellation_token
+            del request, cancellation_token
             raise KeyboardInterrupt
 
     service = _InterruptingService()
@@ -1554,21 +1850,22 @@ def test_upload_filings_from_does_not_start_live_stream(
 
     source_dir = tmp_path / "source"
     source_dir.mkdir()
-    (source_dir / "2024FY AAPL Annual Report.pdf").write_text(
-        "filing", encoding="utf-8"
-    )
+    (source_dir / "2024FY AAPL Annual Report.pdf").write_text("filing", encoding="utf-8")
 
-    assert cli_main.main(
-        (
-            "upload_filings_from",
-            "--base",
-            str(tmp_path / "workspace"),
-            "--ticker",
-            "AAPL",
-            "--from",
-            str(source_dir),
+    assert (
+        cli_main.main(
+            (
+                "upload_filings_from",
+                "--base",
+                str(tmp_path / "workspace"),
+                "--ticker",
+                "AAPL",
+                "--from",
+                str(source_dir),
+            )
         )
-    ) == EXIT_SUCCESS
+        == EXIT_SUCCESS
+    )
 
     captured = capsys.readouterr()
     script = tmp_path / "workspace" / "upload_filings_AAPL.sh"
@@ -1591,30 +1888,15 @@ def test_cli_does_not_import_fins_storage_directly() -> None:
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
-                    if alias.name == "dayu.fins.storage" or alias.name.startswith(
-                        "dayu.fins.storage."
-                    ):
+                    if alias.name == "dayu.fins.storage" or alias.name.startswith("dayu.fins.storage."):
                         violations.append((str(file_path), alias.name))
             elif isinstance(node, ast.ImportFrom):
                 if node.module is not None and (
-                    node.module == "dayu.fins.storage"
-                    or node.module.startswith("dayu.fins.storage.")
+                    node.module == "dayu.fins.storage" or node.module.startswith("dayu.fins.storage.")
                 ):
                     violations.append((str(file_path), node.module))
 
     assert violations == []
-
-
-@dataclass(frozen=True, slots=True)
-class _DownloadCall:
-    """download service call 记录。"""
-
-    ticker: str
-    form_types: tuple[str, ...]
-    filed_after: str | None
-    filed_before: str | None
-    overwrite_existing: bool
-    rebuild_processed: bool
 
 
 @dataclass(frozen=True, slots=True)

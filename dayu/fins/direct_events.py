@@ -13,7 +13,18 @@ from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+from pathlib import PurePosixPath
 from typing import Final, NoReturn
+
+from dayu.contracts.json_value import JsonValue
+from dayu.fins.download_contract import (
+    FinsDownloadDocumentDisposition,
+    FinsDownloadEffectiveFilters,
+    FinsDownloadSource,
+    FinsDownloadTerminalDisposition,
+    FinsDownloadTransportCategory,
+)
+from dayu.fins.domain.filing_semantics import FISCAL_PERIODS
 
 FINS_RESULT_EXIT_SUCCESS: Final[int] = 0
 FINS_RESULT_EXIT_FAILURE: Final[int] = 1
@@ -26,15 +37,11 @@ _MAX_STAGE_CHARS: Final[int] = 120
 _MAX_DOCUMENT_LABEL_CHARS: Final[int] = 120
 _MAX_SHORT_FIELD_CHARS: Final[int] = 80
 
-_FINS_JOB_ID_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"\bfinsjob_[0-9a-fA-F]{32}\b"
-)
+_FINS_JOB_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"\bfinsjob_[0-9a-fA-F]{32}\b")
 _ABSOLUTE_POSIX_PATH_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"(?:^|[\s='\":])/(?:[A-Za-z0-9._-]+/)+[A-Za-z0-9._-]+"
 )
-_ABSOLUTE_WINDOWS_PATH_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"(?:^|[\s='\":])[A-Za-z]:\\"
-)
+_ABSOLUTE_WINDOWS_PATH_PATTERN: Final[re.Pattern[str]] = re.compile(r"(?:^|[\s='\":])[A-Za-z]:\\")
 _DISALLOWED_TEXT_FRAGMENTS: Final[tuple[str, ...]] = (
     "job_id",
     "job id",
@@ -52,12 +59,8 @@ _DISALLOWED_TEXT_FRAGMENTS: Final[tuple[str, ...]] = (
     "财报正文",
 )
 _MISSING_RESULT_MESSAGE: Final[str] = "Fins direct stream ended without RESULT"
-_DUPLICATE_RESULT_MESSAGE: Final[str] = (
-    "Fins direct stream produced multiple RESULT events"
-)
-_EVENT_AFTER_RESULT_MESSAGE: Final[str] = (
-    "Fins direct stream produced an event after RESULT"
-)
+_DUPLICATE_RESULT_MESSAGE: Final[str] = "Fins direct stream produced multiple RESULT events"
+_EVENT_AFTER_RESULT_MESSAGE: Final[str] = "Fins direct stream produced an event after RESULT"
 _TERMINAL_RESULT_NOT_AVAILABLE_MESSAGE: Final[str] = (
     "Fins direct terminal result is not available before clean stream exhaustion"
 )
@@ -133,9 +136,7 @@ class FinsDirectStreamProtocolError(ValueError):
         """
 
         if not isinstance(reason, FinsDirectStreamProtocolErrorKind):
-            raise TypeError(
-                "reason must be FinsDirectStreamProtocolErrorKind"
-            )
+            raise TypeError("reason must be FinsDirectStreamProtocolErrorKind")
         if not isinstance(operation_kind, FinsOperationKind):
             raise TypeError("operation_kind must be FinsOperationKind")
         if not message.strip():
@@ -155,6 +156,338 @@ class FinsErrorKind(str, Enum):
     EXECUTION = "execution"
     CANCELLED = "cancelled"
     UNKNOWN = "unknown"
+
+
+class FinsPublicFailureKind(str, Enum):
+    """下载 public terminal 的封闭失败分类。"""
+
+    CONFIGURATION = "configuration"
+    PROVIDER_TRANSPORT = "provider_transport"
+    STORAGE = "storage"
+    EXECUTION = "execution"
+
+
+@dataclass(frozen=True, slots=True)
+class FinsPublicFailure:
+    """下载 terminal 对 CLI 与 LLM 共享的脱敏失败对象。
+
+    Attributes:
+        kind: 封闭失败分类。
+        source: resolved 下载来源。
+        transport_category: provider/configuration 失败的 transport 分类。
+        safe_message: 不含敏感 transport 内容的用户可读说明。
+        retry_hint: 用户可读恢复建议。
+    """
+
+    kind: FinsPublicFailureKind
+    source: FinsDownloadSource
+    transport_category: FinsDownloadTransportCategory | None
+    safe_message: str
+    retry_hint: str
+
+    def __post_init__(self) -> None:
+        """校验 public failure 字段。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            TypeError: enum 字段类型非法时抛出。
+            ValueError: 文本不安全或 transport 分类组合非法时抛出。
+        """
+
+        if not isinstance(self.kind, FinsPublicFailureKind):
+            raise TypeError("kind must be FinsPublicFailureKind")
+        if not isinstance(self.source, FinsDownloadSource):
+            raise TypeError("source must be FinsDownloadSource")
+        if self.transport_category is not None and not isinstance(
+            self.transport_category,
+            FinsDownloadTransportCategory,
+        ):
+            raise TypeError("transport_category must be FinsDownloadTransportCategory")
+        if (
+            self.kind
+            in {
+                FinsPublicFailureKind.CONFIGURATION,
+                FinsPublicFailureKind.PROVIDER_TRANSPORT,
+            }
+            and self.transport_category is None
+        ):
+            raise ValueError("provider/configuration failure requires transport_category")
+        if self.kind in {FinsPublicFailureKind.STORAGE, FinsPublicFailureKind.EXECUTION} and (
+            self.transport_category is not None
+        ):
+            raise ValueError("storage/execution failure must not contain transport_category")
+        _validate_safe_text(
+            self.safe_message,
+            field_name="failure.safe_message",
+            max_chars=_MAX_MESSAGE_CHARS,
+            allow_empty=False,
+        )
+        _validate_safe_text(
+            self.retry_hint,
+            field_name="failure.retry_hint",
+            max_chars=_MAX_MESSAGE_CHARS,
+            allow_empty=False,
+        )
+
+    def to_json_value(self) -> dict[str, JsonValue]:
+        """转换为 CLI/wait 可共享的 JSON-compatible 业务字段。
+
+        Returns:
+            自解释 failure JSON 对象。
+
+        Raises:
+            无。
+        """
+
+        return {
+            "classification": self.kind.value,
+            "source": self.source.value,
+            "transport_category": (None if self.transport_category is None else self.transport_category.value),
+            "message": self.safe_message,
+            "retry_hint": self.retry_hint,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class FinsDownloadPublicDocument:
+    """public terminal 中的单个有界下载文档行。
+
+    Attributes:
+        document_id: provider candidate 的业务文档 ID。
+        form_or_period: canonical form 或身份财期。
+        filing_date: 可选披露日期。
+        report_date: 可选报告期日期。
+        covered_fiscal_periods: 上游 typed contract 原样投影的覆盖财期。
+        disposition: 互斥结果分类。
+        reason_category: 可选稳定原因分类。
+        reason_message: 可选脱敏原因说明。
+        artifact_locator: 可选 workspace-relative source locator。
+    """
+
+    document_id: str
+    form_or_period: str | None
+    filing_date: str | None
+    report_date: str | None
+    covered_fiscal_periods: tuple[str, ...]
+    disposition: FinsDownloadDocumentDisposition
+    reason_category: str | None
+    reason_message: str | None
+    artifact_locator: str | None
+
+    def __post_init__(self) -> None:
+        """校验 public 文档行。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            TypeError: disposition 类型非法时抛出。
+            ValueError: 文本或 locator 不安全时抛出。
+        """
+
+        _validate_safe_text(
+            self.document_id,
+            field_name="download.row.document_id",
+            max_chars=_MAX_DOCUMENT_LABEL_CHARS,
+            allow_empty=False,
+        )
+        _validate_optional_safe_text(self.form_or_period, "download.row.form_or_period")
+        _validate_optional_safe_text(self.filing_date, "download.row.filing_date")
+        _validate_optional_safe_text(self.report_date, "download.row.report_date")
+        if not isinstance(self.covered_fiscal_periods, tuple):
+            raise TypeError("covered_fiscal_periods must be tuple")
+        if any(not isinstance(period, str) or period not in FISCAL_PERIODS for period in self.covered_fiscal_periods):
+            raise ValueError("covered_fiscal_periods must contain canonical fiscal periods")
+        if len(set(self.covered_fiscal_periods)) != len(self.covered_fiscal_periods):
+            raise ValueError("covered_fiscal_periods must not contain duplicates")
+        if not isinstance(self.disposition, FinsDownloadDocumentDisposition):
+            raise TypeError("disposition must be FinsDownloadDocumentDisposition")
+        _validate_optional_safe_text(self.reason_category, "download.row.reason_category")
+        _validate_optional_safe_text(self.reason_message, "download.row.reason_message")
+        if (self.reason_category is None) is not (self.reason_message is None):
+            raise ValueError("reason_category and reason_message must be provided together")
+        if (
+            self.disposition
+            in {
+                FinsDownloadDocumentDisposition.SKIPPED,
+                FinsDownloadDocumentDisposition.REJECTED,
+                FinsDownloadDocumentDisposition.FAILED,
+            }
+            and self.reason_category is None
+        ):
+            raise ValueError("non-downloaded public row must contain a reason")
+        if self.artifact_locator is not None:
+            _validate_safe_text(
+                self.artifact_locator,
+                field_name="download.row.artifact_locator",
+                max_chars=_MAX_DETAIL_CHARS,
+                allow_empty=False,
+            )
+            locator = PurePosixPath(self.artifact_locator)
+            if locator.is_absolute() or ".." in locator.parts:
+                raise ValueError("artifact_locator must be workspace-relative")
+            if self.disposition is not FinsDownloadDocumentDisposition.DOWNLOADED:
+                raise ValueError("only downloaded public rows may contain artifact_locator")
+        if self.disposition is FinsDownloadDocumentDisposition.DOWNLOADED and self.artifact_locator is None:
+            raise ValueError("downloaded public row requires artifact_locator")
+
+    def to_json_value(self) -> dict[str, JsonValue]:
+        """转换为自解释 JSON-compatible 文档行。
+
+        Returns:
+            public 文档行 JSON 对象。
+
+        Raises:
+            无。
+        """
+
+        return {
+            "document_id": self.document_id,
+            "form_or_period": self.form_or_period,
+            "filing_date": self.filing_date,
+            "report_date": self.report_date,
+            "covered_fiscal_periods": list(self.covered_fiscal_periods),
+            "disposition": self.disposition.value,
+            "reason_category": self.reason_category,
+            "reason_message": self.reason_message,
+            "artifact_locator": self.artifact_locator,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class FinsDownloadPublicSummary:
+    """CLI 与 wait adapter 共享的 bounded 下载 terminal 真源。"""
+
+    source: FinsDownloadSource
+    canonical_ticker: str
+    effective_filters: FinsDownloadEffectiveFilters
+    discovered_count: int
+    downloaded_count: int
+    skipped_count: int
+    rejected_count: int
+    failed_count: int
+    document_rows: tuple[FinsDownloadPublicDocument, ...]
+    missing_periods: tuple[str, ...]
+    omitted_count: int
+    terminal_disposition: FinsDownloadTerminalDisposition
+
+    def __post_init__(self) -> None:
+        """校验 public summary 的计数与省略不变量。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            TypeError: typed 字段非法时抛出。
+            ValueError: 计数、row、missing period 或 omitted 不守恒时抛出。
+        """
+
+        if not isinstance(self.source, FinsDownloadSource):
+            raise TypeError("source must be FinsDownloadSource")
+        if not isinstance(self.effective_filters, FinsDownloadEffectiveFilters):
+            raise TypeError("effective_filters must be FinsDownloadEffectiveFilters")
+        if not isinstance(self.terminal_disposition, FinsDownloadTerminalDisposition):
+            raise TypeError("terminal_disposition must be FinsDownloadTerminalDisposition")
+        _validate_safe_text(
+            self.canonical_ticker,
+            field_name="download.canonical_ticker",
+            max_chars=_MAX_SHORT_FIELD_CHARS,
+            allow_empty=False,
+        )
+        counts = (
+            self.discovered_count,
+            self.downloaded_count,
+            self.skipped_count,
+            self.rejected_count,
+            self.failed_count,
+            self.omitted_count,
+        )
+        if any(count < 0 for count in counts):
+            raise ValueError("download public counts must be non-negative")
+        if self.discovered_count != sum(counts[1:5]):
+            raise ValueError("public discovered_count must equal disposition counts")
+        if len(self.document_rows) + self.omitted_count != self.discovered_count:
+            raise ValueError("document_rows plus omitted_count must equal discovered_count")
+        for row in self.document_rows:
+            if not isinstance(row, FinsDownloadPublicDocument):
+                raise TypeError("document_rows must contain FinsDownloadPublicDocument")
+        visible_counts = {
+            disposition: sum(row.disposition is disposition for row in self.document_rows)
+            for disposition in FinsDownloadDocumentDisposition
+        }
+        total_counts = {
+            FinsDownloadDocumentDisposition.DOWNLOADED: self.downloaded_count,
+            FinsDownloadDocumentDisposition.SKIPPED: self.skipped_count,
+            FinsDownloadDocumentDisposition.REJECTED: self.rejected_count,
+            FinsDownloadDocumentDisposition.FAILED: self.failed_count,
+        }
+        if any(
+            visible_counts[disposition] > total_counts[disposition] for disposition in FinsDownloadDocumentDisposition
+        ):
+            raise ValueError("visible document disposition count exceeds total count")
+        expected_terminal = _download_terminal_disposition(
+            downloaded_count=self.downloaded_count,
+            rejected_count=self.rejected_count,
+            failed_count=self.failed_count,
+        )
+        # 公开对象只允许表达 adapter 启动前的零候选失败/取消，不接受伪造的 partial。
+        empty_terminal_override = self.discovered_count == 0 and self.terminal_disposition in {
+            FinsDownloadTerminalDisposition.FAILED,
+            FinsDownloadTerminalDisposition.CANCELLED,
+        }
+        if self.terminal_disposition is not expected_terminal and not empty_terminal_override:
+            raise ValueError("terminal_disposition does not match public counts")
+        for period in self.missing_periods:
+            _validate_safe_text(
+                period,
+                field_name="download.missing_period",
+                max_chars=_MAX_SHORT_FIELD_CHARS,
+                allow_empty=False,
+            )
+
+    def to_json_value(self) -> dict[str, JsonValue]:
+        """转换为 CLI/wait 共用的自解释 JSON-compatible 对象。
+
+        Returns:
+            nested download 业务对象。
+
+        Raises:
+            无。
+        """
+
+        return {
+            "source": self.source.value,
+            "ticker": self.canonical_ticker,
+            "filters": {
+                "forms": list(self.effective_filters.form_types),
+                "start_date": self.effective_filters.start_date,
+                "end_date": self.effective_filters.end_date,
+                "overwrite": self.effective_filters.overwrite_existing,
+                "rebuild": self.effective_filters.rebuild_local_artifacts,
+            },
+            "counts": {
+                "discovered": self.discovered_count,
+                "downloaded": self.downloaded_count,
+                "skipped": self.skipped_count,
+                "rejected": self.rejected_count,
+                "failed": self.failed_count,
+            },
+            "documents": [row.to_json_value() for row in self.document_rows],
+            "missing_periods": list(self.missing_periods),
+            "omitted_count": self.omitted_count,
+            "terminal_disposition": self.terminal_disposition.value,
+        }
 
 
 class _ValidatedStreamState(str, Enum):
@@ -259,6 +592,8 @@ class FinsResultSummary:
         details: 有界、业务可读详情列表。
         error_kind: 失败分类；成功时通常为 ``None``。
         error_message: 用户可读失败说明；成功时通常为 ``None``。
+        download: download 操作的 bounded public 业务对象。
+        failure: download 失败的 closed public failure。
     """
 
     status: FinsResultStatus
@@ -267,6 +602,8 @@ class FinsResultSummary:
     details: tuple[FinsEventDetail, ...]
     error_kind: FinsErrorKind | None
     error_message: str | None
+    download: FinsDownloadPublicSummary | None = None
+    failure: FinsPublicFailure | None = None
 
     def __post_init__(self) -> None:
         """校验终态摘要字段。
@@ -297,6 +634,30 @@ class FinsResultSummary:
                 max_chars=_MAX_MESSAGE_CHARS,
                 allow_empty=False,
             )
+        if self.download is not None and not isinstance(
+            self.download,
+            FinsDownloadPublicSummary,
+        ):
+            raise TypeError("download must be FinsDownloadPublicSummary")
+        if self.failure is not None:
+            if not isinstance(self.failure, FinsPublicFailure):
+                raise TypeError("failure must be FinsPublicFailure")
+            if self.status is not FinsResultStatus.FAILURE:
+                raise ValueError("public failure is only valid for FAILURE result")
+        if self.download is not None:
+            if self.status is FinsResultStatus.FAILURE:
+                if self.failure is None:
+                    raise ValueError("failed download result requires public failure")
+                if self.download.terminal_disposition is not FinsDownloadTerminalDisposition.FAILED:
+                    raise ValueError("failed download result requires failed disposition")
+            elif self.status is FinsResultStatus.CANCELLED:
+                if self.download.terminal_disposition is not FinsDownloadTerminalDisposition.CANCELLED:
+                    raise ValueError("cancelled download result requires cancelled disposition")
+            elif self.download.terminal_disposition in {
+                FinsDownloadTerminalDisposition.FAILED,
+                FinsDownloadTerminalDisposition.CANCELLED,
+            }:
+                raise ValueError("successful download result has incompatible disposition")
 
 
 @dataclass(frozen=True, slots=True)
@@ -679,6 +1040,30 @@ def _validate_optional_short_text(value: str | None, field_name: str) -> None:
     )
 
 
+def _validate_optional_safe_text(value: str | None, field_name: str) -> None:
+    """校验 public download row 中的可选文本。
+
+    Args:
+        value: 可选文本。
+        field_name: 错误说明使用的字段名。
+
+    Returns:
+        无。
+
+    Raises:
+        ValueError: 文本为空、过长或包含禁止内容时抛出。
+    """
+
+    if value is None:
+        return
+    _validate_safe_text(
+        value,
+        field_name=field_name,
+        max_chars=_MAX_DETAIL_CHARS,
+        allow_empty=False,
+    )
+
+
 def _validate_safe_text(
     value: str,
     *,
@@ -706,6 +1091,8 @@ def _validate_safe_text(
     if len(value) > max_chars:
         raise ValueError(f"{field_name} exceeds {max_chars} characters")
     lower = value.lower()
+    if "://" in lower:
+        raise ValueError(f"{field_name} contains a URL")
     for fragment in _DISALLOWED_TEXT_FRAGMENTS:
         if fragment in lower:
             raise ValueError(f"{field_name} contains disallowed internal text")
@@ -717,18 +1104,49 @@ def _validate_safe_text(
         raise ValueError(f"{field_name} contains an absolute path")
 
 
+def _download_terminal_disposition(
+    *,
+    downloaded_count: int,
+    rejected_count: int,
+    failed_count: int,
+) -> FinsDownloadTerminalDisposition:
+    """从 public counts 机械派生下载终态。
+
+    Args:
+        downloaded_count: 下载成功数。
+        rejected_count: 业务拒绝数。
+        failed_count: 下载失败数。
+
+    Returns:
+        与 owner-level summary 相同规则的终态分类。
+
+    Raises:
+        无。
+    """
+
+    if failed_count == 0:
+        return FinsDownloadTerminalDisposition.SUCCEEDED
+    if downloaded_count == 0 and rejected_count == 0:
+        return FinsDownloadTerminalDisposition.FAILED
+    return FinsDownloadTerminalDisposition.PARTIAL_FAILURE
+
+
 __all__: tuple[str, ...] = (
     "FINS_RESULT_EXIT_CANCELLED",
     "FINS_RESULT_EXIT_FAILURE",
     "FINS_RESULT_EXIT_SUCCESS",
     "FinsDirectStreamProtocolError",
     "FinsDirectStreamProtocolErrorKind",
+    "FinsDownloadPublicDocument",
+    "FinsDownloadPublicSummary",
     "FinsErrorKind",
     "FinsEvent",
     "FinsEventDetail",
     "FinsEventType",
     "FinsOperationKind",
     "FinsProgress",
+    "FinsPublicFailure",
+    "FinsPublicFailureKind",
     "FinsResultStatus",
     "FinsResultSummary",
     "ValidatedFinsEventStream",

@@ -34,16 +34,33 @@ from dayu.fins.direct_events import (
     FINS_RESULT_EXIT_CANCELLED,
     FINS_RESULT_EXIT_FAILURE,
     FINS_RESULT_EXIT_SUCCESS,
+    FinsDownloadPublicDocument,
+    FinsDownloadPublicSummary,
     FinsErrorKind,
     FinsEvent,
     FinsEventDetail,
     FinsEventType,
     FinsOperationKind,
     FinsProgress,
+    FinsPublicFailure,
+    FinsPublicFailureKind,
     FinsResultStatus,
     FinsResultSummary,
 )
 from dayu.fins.direct_events import ValidatedFinsEventStream
+from dayu.fins.download_contract import (
+    FINS_DOWNLOAD_PUBLIC_MAX_DOCUMENT_ROWS,
+    FinsDownloadDateRange,
+    FinsDownloadDocumentDisposition,
+    FinsDownloadDocumentResult,
+    FinsDownloadEffectiveFilters,
+    FinsDownloadProviderError,
+    FinsDownloadRequest,
+    FinsDownloadResultSummary as _FinsDownloadResultSummary,
+    FinsDownloadSource,
+    FinsDownloadTerminalDisposition,
+    FinsDownloadTransportCategory,
+)
 from dayu.fins.direct_event_text import (
     direct_download_no_source_documents_message,
     direct_failure_message,
@@ -92,7 +109,6 @@ from dayu.fins.ticker_normalization import Market as NormalizedTickerMarket
 from dayu.fins.ticker_normalization import NormalizedTicker
 from dayu.runtime.filelock import file_lock
 
-_DEFAULT_DOWNLOAD_SOURCE: Final[str] = "auto"
 _DOWNLOAD_INGEST_METHOD: Final[FinsIngestMethod] = FinsIngestMethod.DOWNLOAD
 _DOWNLOAD_REJECTION_CLASSIFICATION_VERSION: Final[str] = "fins-download-runtime-v1"
 _JOB_ID_PREFIX: Final[str] = "finsjob_"
@@ -106,9 +122,7 @@ _MAX_TEXT_CHARS: Final[int] = 240
 _MAX_TUPLE_ITEMS: Final[int] = 100
 _MAX_PREPROCESS_DOCUMENTS: Final[int] = 50
 _EMPTY_SUMMARY: Final[dict[str, JsonValue]] = {}
-_ROLLBACK_FAILURE_NOTE_PREFIX: Final[str] = (
-    "rollback_batch failed; recovery evidence retained"
-)
+_ROLLBACK_FAILURE_NOTE_PREFIX: Final[str] = "rollback_batch failed; recovery evidence retained"
 _NORMALIZED_MARKET_VALUES: Final[frozenset[NormalizedTickerMarket]] = frozenset(
     cast(tuple[NormalizedTickerMarket, ...], get_args(NormalizedTickerMarket))
 )
@@ -165,17 +179,13 @@ def _rollback_batch_before_commit(
         batching_repository.rollback_batch(batch)
     except BaseException as rollback_error:
         if operation_error is not None:
-            operation_error.add_note(
-                f"{_ROLLBACK_FAILURE_NOTE_PREFIX}: {rollback_error}"
-            )
+            operation_error.add_note(f"{_ROLLBACK_FAILURE_NOTE_PREFIX}: {rollback_error}")
             raise operation_error from rollback_error
         raise
 
 
 _JOB_EVENT_SIDECAR_KIND: Final[str] = "fins_ingestion_job_event"
-_JOB_EVENT_SIDECAR_ROW_SKIPPED_LOG_EVENT: Final[
-    str
-] = "fins.ingestion.job_event_sidecar_row_skipped"
+_JOB_EVENT_SIDECAR_ROW_SKIPPED_LOG_EVENT: Final[str] = "fins.ingestion.job_event_sidecar_row_skipped"
 _JOB_EVENT_SIDECAR_ROW_SKIPPED_SUMMARY: Final[str] = "malformed_or_invalid_event_row"
 _DEFAULT_JOB_EVENT_READ_LIMIT: Final[int] = 100
 _MAX_JOB_EVENT_READ_LIMIT: Final[int] = 1000
@@ -224,6 +234,7 @@ _PAYLOAD_FILE_NAME: Final[str] = "file_name"
 _DIRECT_EVENT_QUEUE_MAX_SIZE: Final[int] = 32
 _DIRECT_QUEUE_GET_TIMEOUT_SECONDS: Final[float] = 0.05
 _DIRECT_QUEUE_PUT_TIMEOUT_SECONDS: Final[float] = 0.05
+
 
 class FinsIngestionOperationKind(str, Enum):
     """Fins ingestion job 操作类型。"""
@@ -279,31 +290,6 @@ class _UnsupportedDownloadSourceError(RuntimeError):
 
 class FinsIngestionStartCancelledError(RuntimeError):
     """启动 ingestion job 前观察到调用方取消。"""
-
-
-@dataclass(frozen=True)
-class FinsDownloadRequest:
-    """下载任务请求。
-
-    Attributes:
-        ticker: 用户提供的 ticker 文本，运行时会先调用公共 ticker 归一化 API。
-        source: 下载来源标识；S1 仅持久化摘要，不选择真实 adapter。
-        form_types: 可选财报表单过滤条件。
-        filed_after: 可选起始披露日期字符串。
-        filed_before: 可选结束披露日期字符串。
-        overwrite_existing: 是否允许覆盖已存在源文档。
-        rebuild_processed: 下载后是否要求后续重建 processed 产物；source-specific
-            adapter 必须按自身仓储语义处理该治理标记，不得假设它等同于来源侧
-            下载工作流的本地重建开关。
-    """
-
-    ticker: str
-    source: str = _DEFAULT_DOWNLOAD_SOURCE
-    form_types: tuple[str, ...] = ()
-    filed_after: str | None = None
-    filed_before: str | None = None
-    overwrite_existing: bool = False
-    rebuild_processed: bool = False
 
 
 @dataclass(frozen=True)
@@ -420,23 +406,21 @@ class FinsSourceDownloadAdapterRequest:
 
     Attributes:
         normalized_ticker: 已由公共 API 归一化的 ticker。
-        source: 已归一化的来源标识。
+        source: 由 ticker 市场解析的来源。
         form_types: 表单过滤条件。
-        filed_after: 可选起始披露日期字符串。
-        filed_before: 可选结束披露日期字符串。
+        date_range: 已展开的 inclusive 日期边界与显式性。
         overwrite_existing: 是否允许覆盖已存在源文档。
-        rebuild_processed: 下载后是否要求后续重建 processed 产物。
+        rebuild_local_artifacts: 是否只基于本地 source 重建下载产物。
         cancellation_checker: runtime 提供的协作式取消检查器。
         progress_sink: 可选同步进度回调；adapter 仅用它上报业务进度，不负责 CLI 渲染。
     """
 
     normalized_ticker: NormalizedTicker
-    source: str
+    source: FinsDownloadSource
     form_types: tuple[str, ...]
-    filed_after: str | None
-    filed_before: str | None
+    date_range: FinsDownloadDateRange
     overwrite_existing: bool
-    rebuild_processed: bool
+    rebuild_local_artifacts: bool
     cancellation_checker: FinsJobCancellationChecker
     progress_sink: FinsDownloadProgressSink | None = None
 
@@ -459,7 +443,7 @@ class FinsSourceDownloadAdapterResult:
     documents: tuple[FinsDownloadedSourceDocument, ...] = ()
     rejected_artifacts: tuple[FinsRejectedFilingDownloadArtifact, ...] = ()
     failed_count: int = 0
-    persisted_summary: FinsDownloadResultSummary | None = None
+    persisted_summary: _FinsDownloadResultSummary | None = None
 
 
 class FinsSourceDownloadAdapter(Protocol):
@@ -513,9 +497,9 @@ _UPLOAD_ACTION_VALUES: Final[frozenset[str]] = frozenset(
     }
 )
 _UPLOAD_RESULT_STATUS_FAILED: Final[str] = "failed"
-_UNSUPPORTED_UPLOAD_RUNTIME_MESSAGE: Final[
-    str
-] = "不支持的上传运行时 (unsupported upload runtime): production upload runner 尚未装配"
+_UNSUPPORTED_UPLOAD_RUNTIME_MESSAGE: Final[str] = (
+    "不支持的上传运行时 (unsupported upload runtime): production upload runner 尚未装配"
+)
 
 
 @dataclass(frozen=True)
@@ -593,55 +577,6 @@ class FinsUploadMaterialRequest:
 
 
 FinsUploadRequest = FinsUploadFilingRequest | FinsUploadMaterialRequest
-
-
-@dataclass(frozen=True)
-class FinsDownloadResultSummary:
-    """下载任务结果摘要。
-
-    Attributes:
-        discovered_count: 发现的候选文档数量。
-        downloaded_count: 下载成功数量。
-        skipped_count: 跳过数量。
-        rejected_count: 拒绝数量。
-        failed_count: 失败数量。
-        written_document_ids: 已写入的源文档 ID。
-    """
-
-    discovered_count: int = 0
-    downloaded_count: int = 0
-    skipped_count: int = 0
-    rejected_count: int = 0
-    failed_count: int = 0
-    written_document_ids: tuple[str, ...] = ()
-
-    def to_json_summary(self) -> dict[str, JsonValue]:
-        """转换为 JSON-compatible 摘要。
-
-        Args:
-            无。
-
-        Returns:
-            只包含计数和源文档 ID 的 JSON-compatible 字典。
-
-        Raises:
-            ValueError: 文档 ID 数量或长度超过 job record 边界时抛出。
-        """
-
-        return {
-            "discovered_count": self.discovered_count,
-            "downloaded_count": self.downloaded_count,
-            "skipped_count": self.skipped_count,
-            "rejected_count": self.rejected_count,
-            "failed_count": self.failed_count,
-            "written_document_ids": list(
-                _bounded_text_tuple(
-                    self.written_document_ids,
-                    "written_document_ids",
-                    reject_path_separators=False,
-                )
-            ),
-        }
 
 
 @dataclass(frozen=True)
@@ -1256,10 +1191,12 @@ class _RuntimeJobCancellationChecker:
 
 @dataclass
 class _DirectStreamCancellationState:
-    """direct stream 单次执行的本地取消状态。"""
+    """direct stream 单次执行的取消与终态仲裁状态。"""
 
     _lock: Lock
-    _cancelled: bool = False
+    _cancellation_requested: bool = False
+    _consumer_aborted: bool = False
+    _terminal_status: FinsResultStatus | None = None
 
     @classmethod
     def create(cls) -> "_DirectStreamCancellationState":
@@ -1277,8 +1214,27 @@ class _DirectStreamCancellationState:
 
         return cls(_lock=Lock())
 
-    def request_cancel(self) -> None:
+    def request_cancel(self) -> bool:
         """请求取消当前 direct stream。
+
+        Args:
+            无。
+
+        Returns:
+            取消在终态提交前首次生效时返回 ``True``。
+
+        Raises:
+            无。
+        """
+
+        with self._lock:
+            if self._consumer_aborted or self._terminal_status is not None or self._cancellation_requested:
+                return False
+            self._cancellation_requested = True
+            return True
+
+    def request_consumer_abort(self) -> None:
+        """标记 consumer 已放弃读取并请求 producer 停止。
 
         Args:
             无。
@@ -1291,7 +1247,7 @@ class _DirectStreamCancellationState:
         """
 
         with self._lock:
-            self._cancelled = True
+            self._consumer_aborted = True
 
     def is_cancelled(self) -> bool:
         """读取当前是否已请求取消。
@@ -1307,7 +1263,44 @@ class _DirectStreamCancellationState:
         """
 
         with self._lock:
-            return self._cancelled
+            return self._cancellation_requested or self._consumer_aborted
+
+    def is_consumer_aborted(self) -> bool:
+        """读取 consumer 是否已放弃当前 stream。
+
+        Args:
+            无。
+
+        Returns:
+            consumer 已放弃读取时返回 ``True``。
+
+        Raises:
+            无。
+        """
+
+        with self._lock:
+            return self._consumer_aborted
+
+    def claim_terminal(self, requested_status: FinsResultStatus) -> FinsResultStatus | None:
+        """原子提交唯一终态，并使已生效取消优先。
+
+        Args:
+            requested_status: producer 请求提交的终态。
+
+        Returns:
+            实际获得的终态；已有终态或 consumer 已 abort 时
+            返回 ``None``。
+
+        Raises:
+            无。
+        """
+
+        with self._lock:
+            if self._consumer_aborted or self._terminal_status is not None:
+                return None
+            resolved_status = FinsResultStatus.CANCELLED if self._cancellation_requested else requested_status
+            self._terminal_status = resolved_status
+            return resolved_status
 
 
 @dataclass(frozen=True)
@@ -1330,9 +1323,9 @@ class _DirectCancellationChecker:
             无。
         """
 
-        if self.cancellation_state.is_cancelled():
-            return True
-        return self.cancellation_token is not None and self.cancellation_token.is_cancelled()
+        if self.cancellation_token is not None and self.cancellation_token.is_cancelled():
+            self.cancellation_state.request_cancel()
+        return self.cancellation_state.is_cancelled()
 
 
 @dataclass(frozen=True)
@@ -1389,6 +1382,7 @@ class _FinsIngestionExecutionContext:
     exchange: NormalizedTickerExchange | None
     source: str | None
     source_kind: SourceKind | None
+    download_request: FinsDownloadRequest | None
     cancellation_checker: FinsJobCancellationChecker
     job_record: FinsIngestionJobRecord | None
     direct_queue: Queue[_DirectStreamQueueItem] | None
@@ -2162,8 +2156,8 @@ class FinsIngestionRuntime:
             OSError: 仓储读写失败时由底层实现抛出。
         """
 
-        normalized = ticker_normalization.normalize_ticker(request.ticker)
-        source = _normalize_download_source(request.source)
+        normalized = request.normalized_ticker
+        source = request.source.value
         return ValidatedFinsEventStream(
             self._run_direct_stream(
                 operation_kind=FinsIngestionOperationKind.DOWNLOAD,
@@ -2171,11 +2165,12 @@ class FinsIngestionRuntime:
                 normalized=normalized,
                 source=source,
                 source_kind=None,
+                download_request=request,
                 cancellation_token=cancellation_token,
                 producer=_DirectDownloadProducer(
                     runtime=self,
                     normalized=normalized,
-                    request=replace(request, source=source),
+                    request=request,
                 ),
             ),
             operation_kind=FinsOperationKind.DOWNLOAD,
@@ -2210,6 +2205,7 @@ class FinsIngestionRuntime:
                 normalized=normalized,
                 source=None,
                 source_kind=request.source_kind,
+                download_request=None,
                 cancellation_token=cancellation_token,
                 producer=_DirectPreprocessProducer(
                     runtime=self,
@@ -2249,6 +2245,7 @@ class FinsIngestionRuntime:
                 normalized=normalized,
                 source=None,
                 source_kind=normalized_request.source_kind,
+                download_request=None,
                 cancellation_token=cancellation_token,
                 producer=_DirectUploadProducer(
                     runtime=self,
@@ -2305,19 +2302,20 @@ class FinsIngestionRuntime:
         """
 
         _raise_if_start_cancelled(cancellation_token)
-        normalized = ticker_normalization.normalize_ticker(request.ticker)
-        source = _normalize_download_source(request.source)
+        normalized = request.normalized_ticker
+        source = request.source.value
         return self._prepare_observed_stream(
             direct_operation_kind=FinsOperationKind.DOWNLOAD,
             operation_kind=FinsIngestionOperationKind.DOWNLOAD,
             normalized=normalized,
             source=source,
             source_kind=None,
+            download_request=request,
             cancellation_token=cancellation_token,
             producer=_DirectDownloadProducer(
                 runtime=self,
                 normalized=normalized,
-                request=replace(request, source=source),
+                request=request,
             ),
         )
 
@@ -2375,6 +2373,7 @@ class FinsIngestionRuntime:
             normalized=normalized,
             source=None,
             source_kind=request.source_kind,
+            download_request=None,
             cancellation_token=cancellation_token,
             producer=_DirectPreprocessProducer(runtime=self, request=request),
         )
@@ -2434,6 +2433,7 @@ class FinsIngestionRuntime:
             normalized=normalized,
             source=None,
             source_kind=normalized_request.source_kind,
+            download_request=None,
             cancellation_token=cancellation_token,
             producer=_DirectUploadProducer(runtime=self, request=normalized_request),
         )
@@ -2485,6 +2485,7 @@ class FinsIngestionRuntime:
                     record.message = "Observation was cancelled before activation."
                     record.result = _observation_cancelled_result(
                         operation_kind=record.handle.operation_kind,
+                        download_request=record.context.download_request,
                     )
             return self._observation_snapshot_locked(record)
 
@@ -2505,7 +2506,7 @@ class FinsIngestionRuntime:
         with self._observation_lock:
             record = self._observations.pop(handle.handle_id, None)
             if record is not None:
-                record.cancellation_state.request_cancel()
+                record.cancellation_state.request_consumer_abort()
 
     def activate_observation(self, handle: FinsObservationHandle) -> None:
         """激活已登记的 process-local observation 并提交后台执行器。
@@ -2561,6 +2562,7 @@ class FinsIngestionRuntime:
         normalized: NormalizedTicker,
         source: str | None,
         source_kind: SourceKind | None,
+        download_request: FinsDownloadRequest | None,
         cancellation_token: CancellationToken,
         producer: Callable[[_FinsIngestionExecutionContext], None],
     ) -> FinsObservationHandle:
@@ -2572,6 +2574,7 @@ class FinsIngestionRuntime:
             normalized: 已归一化 ticker。
             source: 可选下载来源。
             source_kind: 可选源文档类型。
+            download_request: download 操作的 typed request；其它操作为 ``None``。
             cancellation_token: operation-scoped 取消 token。
             producer: 复用 direct path 的同步业务 producer。
 
@@ -2593,6 +2596,7 @@ class FinsIngestionRuntime:
             exchange=normalized.exchange,
             source=source,
             source_kind=source_kind,
+            download_request=download_request,
             cancellation_checker=_DirectCancellationChecker(
                 cancellation_token=cancellation_token,
                 cancellation_state=cancellation_state,
@@ -2687,6 +2691,7 @@ class FinsIngestionRuntime:
                     record.message = "Observation finished without a result."
                     record.result = _observation_failure_result(
                         operation_kind=record.handle.operation_kind,
+                        download_request=record.context.download_request,
                     )
                 continue
             if item.event_type is FinsEventType.PROGRESS:
@@ -2707,6 +2712,7 @@ class FinsIngestionRuntime:
         normalized: NormalizedTicker,
         source: str | None,
         source_kind: SourceKind | None,
+        download_request: FinsDownloadRequest | None,
         cancellation_token: CancellationToken | None,
         producer: Callable[[_FinsIngestionExecutionContext], None],
     ) -> AsyncGenerator[FinsEvent, None]:
@@ -2718,6 +2724,7 @@ class FinsIngestionRuntime:
             normalized: 已归一化 ticker。
             source: 可选下载来源。
             source_kind: 可选源文档类型。
+            download_request: download 操作的 typed request；其它操作为 ``None``。
             cancellation_token: operation-scoped 取消 token。
             producer: 同步业务 producer。
 
@@ -2728,8 +2735,69 @@ class FinsIngestionRuntime:
             Exception: producer 异常转换失败时由底层构造或 queue 操作抛出。
         """
 
-        queue: Queue[_DirectStreamQueueItem] = Queue(maxsize=_DIRECT_EVENT_QUEUE_MAX_SIZE)
         cancellation_state = _DirectStreamCancellationState.create()
+        output_queue: asyncio.Queue[_DirectStreamQueueItem] = asyncio.Queue()
+        operation_task = asyncio.create_task(
+            self._run_direct_stream_operation(
+                operation_kind=operation_kind,
+                direct_operation_kind=direct_operation_kind,
+                normalized=normalized,
+                source=source,
+                source_kind=source_kind,
+                download_request=download_request,
+                cancellation_token=cancellation_token,
+                cancellation_state=cancellation_state,
+                producer=producer,
+                output_queue=output_queue,
+            )
+        )
+        try:
+            while True:
+                item = await output_queue.get()
+                if isinstance(item, _DirectStreamProducerDone):
+                    break
+                yield item
+        finally:
+            if not operation_task.done():
+                cancellation_state.request_consumer_abort()
+            await asyncio.shield(operation_task)
+
+    async def _run_direct_stream_operation(
+        self,
+        *,
+        operation_kind: FinsIngestionOperationKind,
+        direct_operation_kind: FinsOperationKind,
+        normalized: NormalizedTicker,
+        source: str | None,
+        source_kind: SourceKind | None,
+        download_request: FinsDownloadRequest | None,
+        cancellation_token: CancellationToken | None,
+        cancellation_state: _DirectStreamCancellationState,
+        producer: Callable[[_FinsIngestionExecutionContext], None],
+        output_queue: asyncio.Queue[_DirectStreamQueueItem],
+    ) -> None:
+        """唯一拥有 direct producer 线程并把有界队列泵到 async 流。
+
+        Args:
+            operation_kind: runtime 内部操作类型。
+            direct_operation_kind: 用户可见 direct 操作类型。
+            normalized: 已归一化 ticker。
+            source: 可选下载来源。
+            source_kind: 可选源文档类型。
+            download_request: download 操作的 typed request。
+            cancellation_token: operation-scoped 取消 token。
+            cancellation_state: 取消、consumer abort 与终态仲裁真源。
+            producer: 同步业务 producer。
+            output_queue: 仅向 async generator 交付事件的本地队列。
+
+        Returns:
+            无。
+
+        Raises:
+            Exception: 线程启动、queue pump 或线程 join 失败时抛出。
+        """
+
+        queue: Queue[_DirectStreamQueueItem] = Queue(maxsize=_DIRECT_EVENT_QUEUE_MAX_SIZE)
         context = _FinsIngestionExecutionContext(
             operation_kind=operation_kind,
             direct_operation_kind=direct_operation_kind,
@@ -2738,6 +2806,7 @@ class FinsIngestionRuntime:
             exchange=normalized.exchange,
             source=source,
             source_kind=source_kind,
+            download_request=download_request,
             cancellation_checker=_DirectCancellationChecker(
                 cancellation_token=cancellation_token,
                 cancellation_state=cancellation_state,
@@ -2750,23 +2819,23 @@ class FinsIngestionRuntime:
             target=self._run_direct_stream_producer,
             name=f"fins-direct-{operation_kind.value}",
             args=(context, producer),
-            daemon=True,
+            daemon=False,
         )
-        thread.start()
+        thread_started = False
         try:
+            thread.start()
+            thread_started = True
             while True:
-                item = await asyncio.to_thread(
-                    _direct_queue_get,
-                    queue,
-                    thread,
-                )
+                item = await asyncio.to_thread(_direct_queue_get, queue, thread)
                 if item is None:
                     continue
                 if isinstance(item, _DirectStreamProducerDone):
                     break
-                yield item
+                await output_queue.put(item)
         finally:
-            cancellation_state.request_cancel()
+            if thread_started:
+                await asyncio.to_thread(thread.join)
+            await output_queue.put(_DirectStreamProducerDone())
 
     def _run_direct_stream_producer(
         self,
@@ -2789,13 +2858,40 @@ class FinsIngestionRuntime:
         try:
             producer(context)
         except Exception as exc:
-            error_kind = _classify_direct_error(exc)
+            error_kind = _classify_direct_error(
+                exc,
+                operation_kind=context.direct_operation_kind,
+            )
+            download_summary = (
+                None
+                if context.download_request is None
+                else _public_download_summary(
+                    _empty_download_summary_from_request(
+                        context.download_request,
+                        terminal_disposition=FinsDownloadTerminalDisposition.FAILED,
+                    )
+                )
+            )
+            public_failure = (
+                None
+                if context.download_request is None
+                else _download_public_failure_from_exception(
+                    exc,
+                    request=context.download_request,
+                )
+            )
             self._emit_direct_result(
                 context,
                 status=FinsResultStatus.FAILURE,
                 details=(),
                 error_kind=error_kind,
-                error_message=_safe_direct_error_message(exc, error_kind=error_kind),
+                error_message=(
+                    public_failure.safe_message
+                    if public_failure is not None
+                    else _safe_direct_error_message(exc, error_kind=error_kind)
+                ),
+                download=download_summary,
+                failure=public_failure,
             )
         finally:
             _put_direct_queue(context, _DirectStreamProducerDone())
@@ -2831,7 +2927,7 @@ class FinsIngestionRuntime:
             payload={
                 _PAYLOAD_TICKER: context.normalized_ticker,
                 _PAYLOAD_MARKET: context.market,
-                _PAYLOAD_SOURCE: request.source,
+                _PAYLOAD_SOURCE: request.source.value,
             },
         )
         if context.cancellation_checker():
@@ -2842,20 +2938,31 @@ class FinsIngestionRuntime:
             self._emit_direct_cancelled_result(context)
             return
         if summary.failed_count > 0 and summary.downloaded_count == 0 and summary.rejected_count == 0:
+            failure = FinsPublicFailure(
+                kind=FinsPublicFailureKind.EXECUTION,
+                source=summary.source,
+                transport_category=None,
+                safe_message=direct_download_no_source_documents_message(),
+                retry_hint="请检查文档失败分类后重试；若持续失败，请检查运行日志中的脱敏分类。",
+            )
             self._emit_direct_result(
                 context,
                 status=FinsResultStatus.FAILURE,
-                details=_download_result_details(summary),
-                error_kind=FinsErrorKind.PROVIDER,
-                error_message=direct_download_no_source_documents_message(),
+                details=(),
+                error_kind=FinsErrorKind.EXECUTION,
+                error_message=failure.safe_message,
+                download=_public_download_summary(summary),
+                failure=failure,
             )
             return
         self._emit_direct_result(
             context,
             status=FinsResultStatus.SUCCESS,
-            details=_download_result_details(summary),
+            details=(),
             error_kind=None,
             error_message=None,
+            download=_public_download_summary(summary),
+            failure=None,
         )
 
     def _produce_direct_preprocess(
@@ -3022,16 +3129,14 @@ class FinsIngestionRuntime:
             OSError: job record 持久化失败，或 create 后取消桥接落盘失败时抛出。
         """
 
-        normalized = ticker_normalization.normalize_ticker(request.ticker)
-        source = _normalize_download_source(request.source)
+        normalized = request.normalized_ticker
+        source = request.source.value
         request_summary: dict[str, JsonValue] = {
-            "form_types": list(
-                _bounded_text_tuple(request.form_types, "form_types", reject_path_separators=False)
-            ),
-            "filed_after": _optional_bounded_text(request.filed_after, "filed_after"),
-            "filed_before": _optional_bounded_text(request.filed_before, "filed_before"),
+            "form_types": list(_bounded_text_tuple(request.form_types, "form_types", reject_path_separators=False)),
+            "filed_after": request.date_range.start_text,
+            "filed_before": request.date_range.end_text,
             "overwrite_existing": request.overwrite_existing,
-            "rebuild_processed": request.rebuild_processed,
+            "rebuild_local_artifacts": request.rebuild_local_artifacts,
         }
         _raise_if_start_cancelled(cancellation_token)
         with self._start_lock:
@@ -3049,7 +3154,7 @@ class FinsIngestionRuntime:
                 lambda: self._run_download_job(
                     job_id=start.job_id,
                     normalized=normalized,
-                    request=replace(request, source=source),
+                    request=request,
                 ),
             )
             return start
@@ -3085,9 +3190,7 @@ class FinsIngestionRuntime:
             "document_ids": list(
                 _bounded_text_tuple(request.document_ids, "document_ids", reject_path_separators=False)
             ),
-            "form_types": list(
-                _bounded_text_tuple(request.form_types, "form_types", reject_path_separators=False)
-            ),
+            "form_types": list(_bounded_text_tuple(request.form_types, "form_types", reject_path_separators=False)),
             "rebuild_processed": request.rebuild_processed,
         }
         _raise_if_start_cancelled(cancellation_token)
@@ -3368,7 +3471,7 @@ class FinsIngestionRuntime:
                 return
             self._save_succeeded(latest, summary.to_json_summary())
         except _UnsupportedDownloadSourceError as exc:
-            self._save_download_unsupported(job_id, str(exc))
+            self._save_download_unsupported(job_id, request=request, message=str(exc))
         except Exception as exc:
             self._save_failed_from_exception(job_id, exc)
 
@@ -3499,6 +3602,7 @@ class FinsIngestionRuntime:
             exchange=record.exchange,
             source=record.source,
             source_kind=record.source_kind,
+            download_request=None,
             cancellation_checker=_RuntimeJobCancellationChecker(
                 job_store=self.job_store,
                 job_id=record.job_id,
@@ -3657,7 +3761,7 @@ class FinsIngestionRuntime:
         context: _FinsIngestionExecutionContext,
         normalized: NormalizedTicker,
         request: FinsDownloadRequest,
-    ) -> FinsDownloadResultSummary:
+    ) -> _FinsDownloadResultSummary:
         """执行单个下载请求。
 
         Args:
@@ -3674,15 +3778,14 @@ class FinsIngestionRuntime:
             OSError: 仓储读取或写入失败时抛出。
         """
 
-        adapter = self._select_download_adapter(source=request.source, market=normalized.market)
+        adapter = self._select_download_adapter(source=request.source.value, market=normalized.market)
         adapter_request = FinsSourceDownloadAdapterRequest(
             normalized_ticker=normalized,
             source=request.source,
             form_types=_bounded_text_tuple(request.form_types, "form_types", reject_path_separators=False),
-            filed_after=_optional_bounded_text(request.filed_after, "filed_after"),
-            filed_before=_optional_bounded_text(request.filed_before, "filed_before"),
+            date_range=request.date_range,
             overwrite_existing=request.overwrite_existing,
-            rebuild_processed=request.rebuild_processed,
+            rebuild_local_artifacts=request.rebuild_local_artifacts,
             cancellation_checker=context.cancellation_checker,
             progress_sink=_DownloadProgressEmitter(self, context),
         )
@@ -3698,6 +3801,10 @@ class FinsIngestionRuntime:
             if adapter_result.documents or adapter_result.rejected_artifacts:
                 raise ValueError("adapter persisted_summary 不得与 documents/rejected_artifacts 同时返回")
             summary = _bounded_download_summary(adapter_result.persisted_summary)
+            _validate_download_summary_request_identity(
+                summary,
+                request=request,
+            )
             self._emit_context_progress(
                 context,
                 source_event_type=_download_completed_progress_type(summary),
@@ -3706,22 +3813,43 @@ class FinsIngestionRuntime:
                 payload=_download_context_summary_progress_payload(context, adapter_request, summary),
             )
             return summary
-        downloaded_ids: list[str] = []
-        skipped_count = 0
-        rejected_count = 0
+        document_rows: list[FinsDownloadDocumentResult] = []
 
         for document in adapter_result.documents:
             if context.cancellation_checker():
                 break
-            if self._store_downloaded_document(
+            stored = self._store_downloaded_document(
                 ticker=normalized.canonical,
                 document=document,
                 overwrite_existing=request.overwrite_existing,
-                rebuild_processed=request.rebuild_processed,
-            ):
-                downloaded_ids.append(document.document_id)
+            )
+            if stored:
+                disposition = FinsDownloadDocumentDisposition.DOWNLOADED
+                reason_category = None
+                reason_message = None
+                locator = self.source_repository.get_source_document_locator(
+                    normalized.canonical,
+                    document.document_id,
+                    document.source_kind,
+                )
             else:
-                skipped_count += 1
+                disposition = FinsDownloadDocumentDisposition.SKIPPED
+                reason_category = "already_exists"
+                reason_message = "本地已有完整下载结果，跳过重新下载"
+                locator = None
+            document_rows.append(
+                FinsDownloadDocumentResult(
+                    document_id=document.document_id,
+                    form_or_period=document.form_type,
+                    filing_date=_optional_download_meta_text(document.meta, "filing_date"),
+                    report_date=_optional_download_meta_text(document.meta, "report_date"),
+                    covered_fiscal_periods=(),
+                    disposition=disposition,
+                    reason_category=reason_category,
+                    reason_message=reason_message,
+                    artifact_locator=locator,
+                )
+            )
 
         for artifact in adapter_result.rejected_artifacts:
             if context.cancellation_checker():
@@ -3730,15 +3858,43 @@ class FinsIngestionRuntime:
                 ticker=normalized.canonical,
                 artifact=artifact,
             )
-            rejected_count += 1
+            document_rows.append(
+                FinsDownloadDocumentResult(
+                    document_id=artifact.document_id,
+                    form_or_period=artifact.form_type,
+                    filing_date=artifact.filing_date,
+                    report_date=artifact.report_date,
+                    covered_fiscal_periods=(),
+                    disposition=FinsDownloadDocumentDisposition.REJECTED,
+                    reason_category=artifact.rejection_category,
+                    reason_message=artifact.rejection_reason,
+                    artifact_locator=None,
+                )
+            )
 
-        summary = FinsDownloadResultSummary(
-            discovered_count=_non_negative_count(adapter_result.discovered_count, "discovered_count"),
-            downloaded_count=len(downloaded_ids),
-            skipped_count=skipped_count,
-            rejected_count=rejected_count,
-            failed_count=_non_negative_count(adapter_result.failed_count, "failed_count"),
-            written_document_ids=tuple(downloaded_ids),
+        failed_count = _non_negative_count(adapter_result.failed_count, "failed_count")
+        if failed_count != 0:
+            raise ValueError("非 persisted adapter 不得返回缺少 typed document rows 的 failed_count")
+        discovered_count = _non_negative_count(
+            adapter_result.discovered_count,
+            "discovered_count",
+        )
+        if discovered_count != len(document_rows):
+            raise ValueError("adapter discovered_count 必须与 typed document rows 数量一致")
+        rows = tuple(document_rows)
+
+        summary = _FinsDownloadResultSummary.from_document_rows(
+            source=request.source,
+            canonical_ticker=normalized.canonical,
+            effective_filters=FinsDownloadEffectiveFilters(
+                form_types=request.form_types,
+                start_date=request.date_range.start_text,
+                end_date=request.date_range.end_text,
+                overwrite_existing=request.overwrite_existing,
+                rebuild_local_artifacts=request.rebuild_local_artifacts,
+            ),
+            document_rows=rows,
+            missing_periods=(),
         )
         self._emit_context_progress(
             context,
@@ -3779,7 +3935,6 @@ class FinsIngestionRuntime:
         ticker: str,
         document: FinsDownloadedSourceDocument,
         overwrite_existing: bool,
-        rebuild_processed: bool,
     ) -> bool:
         """保存单个下载文档。
 
@@ -3787,7 +3942,6 @@ class FinsIngestionRuntime:
             ticker: 标准化 ticker。
             document: adapter 返回的源文档。
             overwrite_existing: 是否覆盖已有源文档。
-            rebuild_processed: 是否标记已有 processed 产物需重处理。
 
         Returns:
             写入时返回 ``True``；已有且不覆盖时返回 ``False``。
@@ -3844,13 +3998,6 @@ class FinsIngestionRuntime:
                 document.source_kind,
                 batch=token,
             )
-            if rebuild_processed:
-                _mark_processed_reprocess_required_if_present(
-                    self.processed_repository,
-                    ticker,
-                    document_id,
-                    batch=token,
-                )
             # commit_batch 调用开始即由 storage owner 消费 token；提交失败后
             # caller 不得尝试二次 rollback。
             commit_started = True
@@ -3887,7 +4034,9 @@ class FinsIngestionRuntime:
             _bounded_text(downloaded_file.filename, "filename"),
             BytesIO(downloaded_file.content),
             batch=batch,
-            content_type=_optional_bounded_text(downloaded_file.content_type, "content_type", reject_path_separators=False),
+            content_type=_optional_bounded_text(
+                downloaded_file.content_type, "content_type", reject_path_separators=False
+            ),
             metadata=_bounded_metadata(downloaded_file.metadata),
         )
 
@@ -3926,50 +4075,52 @@ class FinsIngestionRuntime:
             )
             self.filing_maintenance_repository.upsert_rejected_filing_artifact(
                 RejectedFilingArtifactUpsertRequest(
-                ticker=ticker,
-                document_id=document_id,
-                internal_document_id=_bounded_text(
-                    artifact.internal_document_id,
-                    "rejected_internal_document_id",
-                    reject_path_separators=False,
-                ),
-                accession_number=_bounded_text(
-                    artifact.accession_number,
-                    "accession_number",
-                    reject_path_separators=False,
-                ),
-                company_id=_bounded_text(artifact.company_id, "company_id", reject_path_separators=False),
-                form_type=_bounded_text(artifact.form_type, "rejected_form_type", reject_path_separators=False),
-                filing_date=_bounded_text(artifact.filing_date, "filing_date", reject_path_separators=False),
-                report_date=_optional_bounded_text(artifact.report_date, "report_date", reject_path_separators=False),
-                primary_document=_bounded_text(artifact.primary_document, "rejected_primary_document"),
-                selected_primary_document=_bounded_text(
-                    artifact.selected_primary_document,
-                    "selected_primary_document",
-                ),
-                rejection_reason=_bounded_text(
-                    artifact.rejection_reason,
-                    "rejection_reason",
-                    reject_path_separators=False,
-                ),
-                rejection_category=_bounded_text(
-                    artifact.rejection_category,
-                    "rejection_category",
-                    reject_path_separators=False,
-                ),
-                classification_version=_DOWNLOAD_REJECTION_CLASSIFICATION_VERSION,
-                source_fingerprint=_bounded_text(
-                    artifact.source_fingerprint,
-                    "source_fingerprint",
-                    reject_path_separators=False,
-                ),
-                files=list(file_entries),
-                fiscal_year=artifact.fiscal_year,
-                fiscal_period=_optional_bounded_text(artifact.fiscal_period, "fiscal_period"),
-                report_kind=_optional_bounded_text(artifact.report_kind, "report_kind"),
-                amended=artifact.amended,
-                has_xbrl=artifact.has_xbrl,
-                ingest_method=_DOWNLOAD_INGEST_METHOD,
+                    ticker=ticker,
+                    document_id=document_id,
+                    internal_document_id=_bounded_text(
+                        artifact.internal_document_id,
+                        "rejected_internal_document_id",
+                        reject_path_separators=False,
+                    ),
+                    accession_number=_bounded_text(
+                        artifact.accession_number,
+                        "accession_number",
+                        reject_path_separators=False,
+                    ),
+                    company_id=_bounded_text(artifact.company_id, "company_id", reject_path_separators=False),
+                    form_type=_bounded_text(artifact.form_type, "rejected_form_type", reject_path_separators=False),
+                    filing_date=_bounded_text(artifact.filing_date, "filing_date", reject_path_separators=False),
+                    report_date=_optional_bounded_text(
+                        artifact.report_date, "report_date", reject_path_separators=False
+                    ),
+                    primary_document=_bounded_text(artifact.primary_document, "rejected_primary_document"),
+                    selected_primary_document=_bounded_text(
+                        artifact.selected_primary_document,
+                        "selected_primary_document",
+                    ),
+                    rejection_reason=_bounded_text(
+                        artifact.rejection_reason,
+                        "rejection_reason",
+                        reject_path_separators=False,
+                    ),
+                    rejection_category=_bounded_text(
+                        artifact.rejection_category,
+                        "rejection_category",
+                        reject_path_separators=False,
+                    ),
+                    classification_version=_DOWNLOAD_REJECTION_CLASSIFICATION_VERSION,
+                    source_fingerprint=_bounded_text(
+                        artifact.source_fingerprint,
+                        "source_fingerprint",
+                        reject_path_separators=False,
+                    ),
+                    files=list(file_entries),
+                    fiscal_year=artifact.fiscal_year,
+                    fiscal_period=_optional_bounded_text(artifact.fiscal_period, "fiscal_period"),
+                    report_kind=_optional_bounded_text(artifact.report_kind, "report_kind"),
+                    amended=artifact.amended,
+                    has_xbrl=artifact.has_xbrl,
+                    ingest_method=_DOWNLOAD_INGEST_METHOD,
                 ),
                 batch=batch,
             )
@@ -4024,7 +4175,9 @@ class FinsIngestionRuntime:
             filename,
             BytesIO(downloaded_file.content),
             batch=batch,
-            content_type=_optional_bounded_text(downloaded_file.content_type, "content_type", reject_path_separators=False),
+            content_type=_optional_bounded_text(
+                downloaded_file.content_type, "content_type", reject_path_separators=False
+            ),
             metadata=_bounded_metadata(downloaded_file.metadata),
         )
         return SourceFileEntry(
@@ -4275,11 +4428,18 @@ class FinsIngestionRuntime:
         self._append_terminal_job_event_warn(saved)
         return saved
 
-    def _save_download_unsupported(self, job_id: str, message: str) -> None:
+    def _save_download_unsupported(
+        self,
+        job_id: str,
+        *,
+        request: FinsDownloadRequest,
+        message: str,
+    ) -> None:
         """把 unsupported-source 下载结果保存为 failed 终态。
 
         Args:
             job_id: opaque job id。
+            request: owner 已校验的下载请求。
             message: 有界失败说明。
 
         Returns:
@@ -4296,12 +4456,14 @@ class FinsIngestionRuntime:
             self._save_failed(
                 record,
                 message=message,
-                result_summary=FinsDownloadResultSummary(failed_count=1).to_json_summary(),
+                result_summary=_empty_download_summary_from_request(
+                    request,
+                    terminal_disposition=FinsDownloadTerminalDisposition.FAILED,
+                ).to_json_summary(),
             )
         except Exception as terminal_exc:
             _LOGGER.warning(
-                "fins.ingestion.download_unsupported_terminalization_failed "
-                "job_id=%s error_type=%s",
+                "fins.ingestion.download_unsupported_terminalization_failed job_id=%s error_type=%s",
                 job_id,
                 type(terminal_exc).__name__,
                 exc_info=True,
@@ -4329,8 +4491,7 @@ class FinsIngestionRuntime:
             self._save_failed(record, message=str(exc) or type(exc).__name__)
         except Exception as terminal_exc:
             _LOGGER.warning(
-                "fins.ingestion.failed_terminalization_failed "
-                "job_id=%s error_type=%s original_error_type=%s",
+                "fins.ingestion.failed_terminalization_failed job_id=%s error_type=%s original_error_type=%s",
                 job_id,
                 type(terminal_exc).__name__,
                 type(exc).__name__,
@@ -4503,6 +4664,8 @@ class FinsIngestionRuntime:
         details: tuple[FinsEventDetail, ...],
         error_kind: FinsErrorKind | None,
         error_message: str | None,
+        download: FinsDownloadPublicSummary | None = None,
+        failure: FinsPublicFailure | None = None,
     ) -> None:
         """向 direct stream 投递唯一终态 RESULT。
 
@@ -4512,6 +4675,8 @@ class FinsIngestionRuntime:
             details: 有界业务摘要详情。
             error_kind: 可选失败分类。
             error_message: 可选失败说明。
+            download: download 操作的 bounded public summary。
+            failure: download 失败的 closed public failure。
 
         Returns:
             无。
@@ -4522,6 +4687,31 @@ class FinsIngestionRuntime:
 
         if context.direct_queue is None:
             return
+        cancellation_state = context.cancellation_state
+        if cancellation_state is not None:
+            context.cancellation_checker()
+        resolved_status = status if cancellation_state is None else cancellation_state.claim_terminal(status)
+        if resolved_status is None:
+            return
+        status = resolved_status
+        if status is FinsResultStatus.CANCELLED:
+            details = ()
+            error_kind = FinsErrorKind.CANCELLED
+            error_message = direct_failure_message(
+                error_kind=FinsErrorKind.CANCELLED,
+                fallback_message=None,
+            )
+            download = (
+                None
+                if context.download_request is None
+                else _public_download_summary(
+                    _empty_download_summary_from_request(
+                        context.download_request,
+                        terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED,
+                    )
+                )
+            )
+            failure = None
         exit_code = _direct_exit_code(status)
         title = direct_result_title(
             operation_kind=context.direct_operation_kind,
@@ -4543,6 +4733,8 @@ class FinsIngestionRuntime:
                 details=details,
                 error_kind=error_kind,
                 error_message=error_message,
+                download=download,
+                failure=failure,
             ),
         )
         _put_direct_queue(context, event)
@@ -4569,6 +4761,17 @@ class FinsIngestionRuntime:
                 error_kind=FinsErrorKind.CANCELLED,
                 fallback_message=None,
             ),
+            download=(
+                None
+                if context.download_request is None
+                else _public_download_summary(
+                    _empty_download_summary_from_request(
+                        context.download_request,
+                        terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED,
+                    )
+                )
+            ),
+            failure=None,
         )
 
     def _append_job_event_warn(
@@ -4673,7 +4876,7 @@ def _put_direct_queue(
         return False
     while True:
         cancellation_state = context.cancellation_state
-        if cancellation_state is not None and cancellation_state.is_cancelled():
+        if cancellation_state is not None and cancellation_state.is_consumer_aborted():
             # consumer 已结束时丢弃后续事件，避免同步 producer 卡在无人读取的队列上。
             return False
         try:
@@ -4872,27 +5075,145 @@ def _direct_exit_code(status: FinsResultStatus) -> int:
     assert_never(status)
 
 
-def _download_result_details(summary: FinsDownloadResultSummary) -> tuple[FinsEventDetail, ...]:
-    """构造下载 direct result 详情。
+def _public_download_summary(
+    summary: _FinsDownloadResultSummary,
+) -> FinsDownloadPublicSummary:
+    """从 operation-local typed rows 构造唯一 bounded public summary。
 
     Args:
-        summary: 下载结果摘要。
+        summary: source adapter 返回的完整 typed summary。
 
     Returns:
-        有界业务可读详情。
+        CLI 与 wait adapter 共享的 bounded public object。
 
     Raises:
-        ValueError: 摘要字段非法时抛出。
+        ValueError: public summary 不变量失败时由 contract 抛出。
     """
 
-    bounded = _bounded_download_summary(summary)
-    return (
-        FinsEventDetail("discovered", str(bounded.discovered_count)),
-        FinsEventDetail("downloaded", str(bounded.downloaded_count)),
-        FinsEventDetail("skipped", str(bounded.skipped_count)),
-        FinsEventDetail("rejected", str(bounded.rejected_count)),
-        FinsEventDetail("failed", str(bounded.failed_count)),
-        FinsEventDetail("written documents", str(len(bounded.written_document_ids))),
+    public_rows = tuple(
+        FinsDownloadPublicDocument(
+            document_id=row.document_id,
+            form_or_period=row.form_or_period,
+            filing_date=row.filing_date,
+            report_date=row.report_date,
+            covered_fiscal_periods=row.covered_fiscal_periods,
+            disposition=row.disposition,
+            reason_category=row.reason_category,
+            reason_message=row.reason_message,
+            artifact_locator=(None if row.artifact_locator is None else row.artifact_locator.as_posix()),
+        )
+        for row in summary.document_rows[:FINS_DOWNLOAD_PUBLIC_MAX_DOCUMENT_ROWS]
+    )
+    omitted_count = summary.discovered_count - len(public_rows)
+    return FinsDownloadPublicSummary(
+        source=summary.source,
+        canonical_ticker=summary.canonical_ticker,
+        effective_filters=summary.effective_filters,
+        discovered_count=summary.discovered_count,
+        downloaded_count=summary.downloaded_count,
+        skipped_count=summary.skipped_count,
+        rejected_count=summary.rejected_count,
+        failed_count=summary.failed_count,
+        document_rows=public_rows,
+        missing_periods=summary.missing_periods,
+        omitted_count=omitted_count,
+        terminal_disposition=summary.terminal_disposition,
+    )
+
+
+def _empty_download_summary_from_request(
+    request: FinsDownloadRequest,
+    *,
+    terminal_disposition: FinsDownloadTerminalDisposition,
+) -> _FinsDownloadResultSummary:
+    """为 adapter 完成前的失败/取消构造同源空下载摘要。
+
+    Args:
+        request: 已完成静态校验的 download request。
+        terminal_disposition: adapter 完成前由 runtime owner 确定的失败或取消终态。
+
+    Returns:
+        只承诺 request 已知 filters、零 candidate 的 typed summary。
+
+    Raises:
+        ValueError: contract 不变量失败时抛出。
+    """
+
+    return _FinsDownloadResultSummary(
+        source=request.source,
+        canonical_ticker=request.normalized_ticker.canonical,
+        effective_filters=FinsDownloadEffectiveFilters(
+            form_types=request.form_types,
+            start_date=request.date_range.start_text,
+            end_date=request.date_range.end_text,
+            overwrite_existing=request.overwrite_existing,
+            rebuild_local_artifacts=request.rebuild_local_artifacts,
+        ),
+        discovered_count=0,
+        downloaded_count=0,
+        skipped_count=0,
+        rejected_count=0,
+        failed_count=0,
+        document_rows=(),
+        terminal_disposition=terminal_disposition,
+        missing_periods=(),
+    )
+
+
+def _download_public_failure_from_exception(
+    exc: Exception,
+    *,
+    request: FinsDownloadRequest,
+) -> FinsPublicFailure:
+    """把 download owner exception 映射为 closed public failure。
+
+    Args:
+        exc: source adapter/runtime owner 抛出的异常。
+        request: 当前 typed request。
+
+    Returns:
+        不复制 raw exception、URL、路径或 provider payload 的 public failure。
+
+    Raises:
+        ValueError: public failure contract 校验失败时抛出。
+    """
+
+    if isinstance(exc, FinsDownloadProviderError):
+        kind = (
+            FinsPublicFailureKind.CONFIGURATION
+            if exc.transport_category is FinsDownloadTransportCategory.UNCONFIGURED
+            else FinsPublicFailureKind.PROVIDER_TRANSPORT
+        )
+        retry_hint = (
+            "请检查来源身份配置后重新发起下载。"
+            if kind is FinsPublicFailureKind.CONFIGURATION
+            else (
+                "请稍后重试；若持续失败，请检查来源服务状态。"
+                if exc.retryable
+                else "请检查请求筛选条件或来源响应状态后重试。"
+            )
+        )
+        return FinsPublicFailure(
+            kind=kind,
+            source=exc.source,
+            transport_category=exc.transport_category,
+            safe_message=exc.safe_message,
+            retry_hint=retry_hint,
+        )
+    if isinstance(exc, OSError):
+        return FinsPublicFailure(
+            kind=FinsPublicFailureKind.STORAGE,
+            source=request.source,
+            transport_category=None,
+            safe_message="下载产物读写失败",
+            retry_hint="请确认工作区可读写后重新发起下载。",
+        )
+    return FinsPublicFailure(
+        kind=FinsPublicFailureKind.EXECUTION,
+        source=request.source,
+        transport_category=None,
+        safe_message="下载执行失败",
+        retry_hint="请重新发起下载；若持续失败，请检查运行日志中的脱敏分类。",
     )
 
 
@@ -5010,11 +5331,16 @@ def _optional_upload_result_bool(result: Mapping[str, JsonValue], key: str) -> b
     raise ValueError(f"upload pipeline result 字段必须是布尔值: {key}")
 
 
-def _classify_direct_error(exc: Exception) -> FinsErrorKind:
+def _classify_direct_error(
+    exc: Exception,
+    *,
+    operation_kind: FinsOperationKind,
+) -> FinsErrorKind:
     """把 runtime 异常归类为 direct error kind。
 
     Args:
         exc: runtime 异常。
+        operation_kind: 当前 direct operation。
 
     Returns:
         direct 失败分类。
@@ -5023,6 +5349,12 @@ def _classify_direct_error(exc: Exception) -> FinsErrorKind:
         无。
     """
 
+    if isinstance(exc, FinsDownloadProviderError):
+        return FinsErrorKind.PROVIDER
+    if operation_kind is FinsOperationKind.DOWNLOAD:
+        if isinstance(exc, OSError):
+            return FinsErrorKind.STORAGE
+        return FinsErrorKind.EXECUTION
     if isinstance(exc, _UnsupportedDownloadSourceError | ValueError | FileNotFoundError):
         return FinsErrorKind.USER_INPUT
     if isinstance(exc, OSError):
@@ -5189,11 +5521,16 @@ def _observation_error_kind(
     return None
 
 
-def _observation_failure_result(*, operation_kind: FinsOperationKind) -> FinsResultSummary:
+def _observation_failure_result(
+    *,
+    operation_kind: FinsOperationKind,
+    download_request: FinsDownloadRequest | None,
+) -> FinsResultSummary:
     """构造 observation producer 异常收口失败摘要。
 
     Args:
         operation_kind: observation 对应的 direct 业务操作类型。
+        download_request: download typed request；其它 operation 为 ``None``。
 
     Returns:
         Fins result summary。
@@ -5215,17 +5552,40 @@ def _observation_failure_result(*, operation_kind: FinsOperationKind) -> FinsRes
             error_kind=FinsErrorKind.EXECUTION,
             fallback_message=None,
         ),
+        download=(
+            None
+            if download_request is None
+            else _public_download_summary(
+                _empty_download_summary_from_request(
+                    download_request,
+                    terminal_disposition=FinsDownloadTerminalDisposition.FAILED,
+                )
+            )
+        ),
+        failure=(
+            None
+            if download_request is None
+            else FinsPublicFailure(
+                kind=FinsPublicFailureKind.EXECUTION,
+                source=download_request.source,
+                transport_category=None,
+                safe_message="下载执行未产生完整终态结果",
+                retry_hint="请重新发起下载；若持续失败，请检查运行环境。",
+            )
+        ),
     )
 
 
 def _observation_cancelled_result(
     *,
     operation_kind: FinsOperationKind,
+    download_request: FinsDownloadRequest | None,
 ) -> FinsResultSummary:
     """构造 observation prepare 阶段取消摘要。
 
     Args:
         operation_kind: observation 对应的 direct 业务操作类型。
+        download_request: download typed request；其它 operation 为 ``None``。
 
     Returns:
         Fins result summary。
@@ -5247,6 +5607,17 @@ def _observation_cancelled_result(
             error_kind=FinsErrorKind.CANCELLED,
             fallback_message=None,
         ),
+        download=(
+            None
+            if download_request is None
+            else _public_download_summary(
+                _empty_download_summary_from_request(
+                    download_request,
+                    terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED,
+                )
+            )
+        ),
+        failure=None,
     )
 
 
@@ -5488,6 +5859,31 @@ def _optional_text_from_meta(meta: DocumentMeta, field_name: str) -> str | None:
     return text or None
 
 
+def _optional_download_meta_text(
+    meta: Mapping[str, JsonValue],
+    field_name: str,
+) -> str | None:
+    """严格读取 generic download document meta 的可选文本。
+
+    Args:
+        meta: typed adapter document 携带的业务 meta。
+        field_name: 可选字段名。
+
+    Returns:
+        缺失或 ``None`` 返回 ``None``；否则返回非空文本。
+
+    Raises:
+        ValueError: 字段存在但不是非空文本时抛出。
+    """
+
+    if field_name not in meta or meta[field_name] is None:
+        return None
+    value = meta[field_name]
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"download document meta {field_name} 必须是非空文本")
+    return value.strip()
+
+
 def _processed_exists(
     repository: ProcessedDocumentRepositoryProtocol,
     ticker: str,
@@ -5544,66 +5940,6 @@ def _source_document_exists(
     return True
 
 
-def _mark_processed_reprocess_required_if_present(
-    repository: ProcessedDocumentRepositoryProtocol,
-    ticker: str,
-    document_id: str,
-    *,
-    batch: BatchToken,
-) -> None:
-    """若 processed 文档存在，则标记需要重处理。
-
-    Args:
-        repository: processed 仓储协议。
-        ticker: 标准化 ticker。
-        document_id: 文档 ID。
-        batch: caller 显式传入的 batch capability。
-
-    Returns:
-        无。
-
-    Raises:
-        OSError: 底层仓储写入失败时抛出。
-        ValueError: 元数据格式非法时抛出。
-    """
-
-    if not _processed_exists(repository, ticker, document_id):
-        return
-    repository.mark_processed_reprocess_required(ticker, document_id, True, batch=batch)
-
-
-def mark_downloaded_processed_rebuild_required(
-    repository: ProcessedDocumentRepositoryProtocol,
-    *,
-    ticker: str,
-    summary: FinsDownloadResultSummary,
-    batch: BatchToken,
-) -> None:
-    """按下载摘要标记已写入文档的 processed 产物需要重处理。
-
-    Args:
-        repository: processed 仓储协议。
-        ticker: 标准化 ticker。
-        summary: 下载 adapter 持久化摘要。
-        batch: caller 显式传入的 batch capability。
-
-    Returns:
-        无。
-
-    Raises:
-        OSError: 底层仓储写入失败时抛出。
-        ValueError: processed 元数据格式或文档 ID 非法时抛出。
-    """
-
-    for document_id in summary.written_document_ids:
-        _mark_processed_reprocess_required_if_present(
-            repository,
-            ticker,
-            document_id,
-            batch=batch,
-        )
-
-
 def _download_document_meta(meta: Mapping[str, JsonValue]) -> DocumentMeta:
     """构建下载源文档 meta。
 
@@ -5622,22 +5958,6 @@ def _download_document_meta(meta: Mapping[str, JsonValue]) -> DocumentMeta:
     result["ingest_method"] = _DOWNLOAD_INGEST_METHOD.to_storage_value()
     result["ingest_complete"] = True
     return result
-
-
-def _normalize_download_source(source: str) -> str:
-    """归一化下载来源标识。
-
-    Args:
-        source: 原始来源标识。
-
-    Returns:
-        小写后的来源标识。
-
-    Raises:
-        ValueError: 来源标识为空、过长或包含路径分隔符时抛出。
-    """
-
-    return _bounded_text(source, "source").lower()
 
 
 def _normalize_upload_request(request: FinsUploadRequest) -> FinsUploadRequest:
@@ -5835,9 +6155,9 @@ def _bounded_metadata(metadata: Mapping[str, str]) -> dict[str, str]:
         raise ValueError("metadata 元素数量超出上限")
     result: dict[str, str] = {}
     for key, value in metadata.items():
-        result[
-            _bounded_text(key, "metadata_key", reject_path_separators=False)
-        ] = _bounded_text(value, "metadata_value", reject_path_separators=False)
+        result[_bounded_text(key, "metadata_key", reject_path_separators=False)] = _bounded_text(
+            value, "metadata_value", reject_path_separators=False
+        )
     return result
 
 
@@ -5860,31 +6180,59 @@ def _non_negative_count(value: int, field_name: str) -> int:
     return value
 
 
-def _bounded_download_summary(summary: FinsDownloadResultSummary) -> FinsDownloadResultSummary:
-    """校验 adapter 已持久化下载摘要。
+def _bounded_download_summary(
+    summary: _FinsDownloadResultSummary,
+) -> _FinsDownloadResultSummary:
+    """确认 adapter 已返回 download contract owner 的 typed 摘要。
 
     Args:
         summary: adapter 返回的下载摘要。
 
     Returns:
-        字段已校验的下载摘要。
+        原 typed 摘要实例。
 
     Raises:
-        ValueError: 计数为负或文档 ID 越界时抛出。
+        TypeError: adapter 返回值不是下载结果 contract 时抛出。
     """
 
-    return FinsDownloadResultSummary(
-        discovered_count=_non_negative_count(summary.discovered_count, "discovered_count"),
-        downloaded_count=_non_negative_count(summary.downloaded_count, "downloaded_count"),
-        skipped_count=_non_negative_count(summary.skipped_count, "skipped_count"),
-        rejected_count=_non_negative_count(summary.rejected_count, "rejected_count"),
-        failed_count=_non_negative_count(summary.failed_count, "failed_count"),
-        written_document_ids=_bounded_text_tuple(
-            summary.written_document_ids,
-            "written_document_ids",
-            reject_path_separators=False,
-        ),
-    )
+    if not isinstance(summary, _FinsDownloadResultSummary):
+        raise TypeError("persisted_summary must use the download result contract")
+    return summary
+
+
+def _validate_download_summary_request_identity(
+    summary: _FinsDownloadResultSummary,
+    *,
+    request: FinsDownloadRequest,
+) -> None:
+    """校验 adapter summary 没有漂移 typed request 身份与 mutation flags。
+
+    Args:
+        summary: source adapter typed summary。
+        request: runtime 传入 adapter 的 typed request。
+
+    Returns:
+        无。
+
+    Raises:
+        ValueError: source、ticker、显式 filters 或 mutation flags 不一致时抛出。
+    """
+
+    if summary.source is not request.source:
+        raise ValueError("download summary source 与 typed request 不一致")
+    if summary.canonical_ticker != request.normalized_ticker.canonical:
+        raise ValueError("download summary ticker 与 typed request 不一致")
+    filters = summary.effective_filters
+    if filters.overwrite_existing is not request.overwrite_existing:
+        raise ValueError("download summary overwrite 与 typed request 不一致")
+    if filters.rebuild_local_artifacts is not request.rebuild_local_artifacts:
+        raise ValueError("download summary rebuild 与 typed request 不一致")
+    if request.form_types and frozenset(filters.form_types) != frozenset(request.form_types):
+        raise ValueError("download summary forms 与 typed request 不一致")
+    if request.date_range.start_is_explicit and (filters.start_date != request.date_range.start_text):
+        raise ValueError("download summary explicit start 与 typed request 不一致")
+    if request.date_range.end_is_explicit and filters.end_date != request.date_range.end_text:
+        raise ValueError("download summary explicit end 与 typed request 不一致")
 
 
 def _bounded_preprocess_summary(summary: FinsPreprocessResultSummary) -> FinsPreprocessResultSummary:
@@ -5943,10 +6291,7 @@ def _bounded_preprocess_summary(summary: FinsPreprocessResultSummary) -> FinsPre
     if bounded.not_supported_count != len(not_supported_ids):
         raise ValueError("not_supported_count 必须等于 not_supported_document_ids 数量")
     categorized_count = (
-        bounded.processed_count
-        + bounded.skipped_count
-        + bounded.failed_count
-        + bounded.not_supported_count
+        bounded.processed_count + bounded.skipped_count + bounded.failed_count + bounded.not_supported_count
     )
     if categorized_count > bounded.selected_count:
         raise ValueError("预处理分类计数总和不得超过 selected_count")
@@ -5973,7 +6318,7 @@ def _download_context_request_progress_payload(
     return {
         _PAYLOAD_TICKER: context.normalized_ticker,
         _PAYLOAD_MARKET: context.market,
-        _PAYLOAD_SOURCE: _bounded_text(request.source, _PAYLOAD_SOURCE),
+        _PAYLOAD_SOURCE: request.source.value,
         _PAYLOAD_FORM_TYPES: list(
             _bounded_text_tuple(
                 request.form_types,
@@ -5987,7 +6332,7 @@ def _download_context_request_progress_payload(
 def _download_context_summary_progress_payload(
     context: _FinsIngestionExecutionContext,
     request: FinsSourceDownloadAdapterRequest,
-    summary: FinsDownloadResultSummary,
+    summary: _FinsDownloadResultSummary,
 ) -> dict[str, JsonValue]:
     """构建下载 completed progress payload。
 
@@ -6018,7 +6363,7 @@ def _download_context_summary_progress_payload(
     return payload
 
 
-def _download_completed_progress_type(summary: FinsDownloadResultSummary) -> str:
+def _download_completed_progress_type(summary: _FinsDownloadResultSummary) -> str:
     """根据下载摘要选择 completed progress 标签。
 
     Args:
@@ -6378,8 +6723,7 @@ def _warn_malformed_event_sidecar_row(*, line_number: int, error_type: str) -> N
     """
 
     _LOGGER.warning(
-        "%s sidecar_kind=%s sidecar_suffix=%s line_number=%s "
-        "error_type=%s error_summary=%s",
+        "%s sidecar_kind=%s sidecar_suffix=%s line_number=%s error_type=%s error_summary=%s",
         _JOB_EVENT_SIDECAR_ROW_SKIPPED_LOG_EVENT,
         _JOB_EVENT_SIDECAR_KIND,
         _JOB_EVENT_FILE_SUFFIX,
@@ -6891,10 +7235,8 @@ def _job_start_from_record(record: FinsIngestionJobRecord) -> FinsIngestionJobSt
 __all__ = [
     "FinsDownloadedFile",
     "FinsDownloadedSourceDocument",
-    "FinsDownloadRequest",
     "FinsDownloadProgressEvent",
     "FinsDownloadProgressSink",
-    "FinsDownloadResultSummary",
     "FinsJobCancellationChecker",
     "FinsIngestionJobRecord",
     "FinsIngestionJobStart",
