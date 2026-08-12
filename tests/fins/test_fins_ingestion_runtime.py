@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -100,8 +101,12 @@ from dayu.fins.ingestion_runtime import (
     FinsUploadResultSummary,
     FinsUploadRunner,
 )
-from dayu.fins.pipelines.cn_pipeline import CnDownloadAdapter
-from dayu.fins.pipelines.sec_pipeline import SecDownloadAdapter
+from dayu.fins.pipelines.cn_pipeline import CnDownloadAdapter, CnPipeline
+from dayu.fins.pipelines.docling_process_converter import (
+    DoclingConversionConfig,
+    DoclingConversionResult,
+)
+from dayu.fins.pipelines.sec_pipeline import SecDownloadAdapter, SecPipeline
 from dayu.fins.service_runtime import DefaultFinsRuntime, ProductionFinsUploadRunner
 from dayu.fins.storage import (
     BatchingRepositoryProtocol,
@@ -946,6 +951,7 @@ class _FakeUploadRunner(FinsUploadRunner):
         self.result_summary = result_summary
         self.requests: list[FinsUploadRequest] = []
         self.cancellation_checks: list[bool] = []
+        self.cancellation_tokens: list[FinsJobCancellationChecker] = []
 
     def run_upload(
         self,
@@ -968,6 +974,7 @@ class _FakeUploadRunner(FinsUploadRunner):
         """
 
         self.requests.append(request)
+        self.cancellation_tokens.append(cancellation_checker)
         self.cancellation_checks.append(cancellation_checker())
         return self.result_summary
 
@@ -1077,22 +1084,78 @@ class _BlockingArtifactUploadRunner(FinsUploadRunner):
         )
 
 
-def _upload_runtime_converter(raw_data: bytes, stream_name: str) -> dict[str, JsonValue]:
-    """runtime production upload 测试用 Docling converter。
+class _UploadRuntimeConverter:
+    """runtime production upload 测试用 typed Docling converter。"""
+
+    async def convert_to_json_bytes(
+        self,
+        input_bytes: bytes,
+        stream_name: str,
+        *,
+        config: DoclingConversionConfig,
+        cancellation: CancellationToken | None,
+    ) -> DoclingConversionResult:
+        """返回固定 Docling JSON bytes。
+
+        Args:
+            input_bytes: 上传文件字节。
+            stream_name: 上传文件名。
+            config: 闭合转换配置。
+            cancellation: canonical token。
+
+        Returns:
+            typed conversion result。
+
+        Raises:
+            无。
+        """
+
+        del input_bytes, config, cancellation
+        data = ('{"name": "' + stream_name + '", "format": "docling"}').encode()
+        return DoclingConversionResult(data, len(data), hashlib.sha256(data).hexdigest())
+
+
+def _inject_upload_runtime_converter(
+    default_runtime: DefaultFinsRuntime,
+    runtime: ingestion_runtime.FinsIngestionRuntime,
+) -> None:
+    """通过 public constructor injection 替换测试 upload runner。
 
     Args:
-        raw_data: 上传文件字节。
-        stream_name: 上传文件名。
+        default_runtime: 持有共享 repositories 的默认运行时。
+        runtime: 待装配 production runner 的 ingestion runtime。
 
     Returns:
-        固定 Docling JSON 对象。
+        无。
 
     Raises:
-        无。
+        OSError: pipeline 初始化失败时抛出。
     """
 
-    del raw_data
-    return {"name": stream_name, "format": "docling"}
+    converter = _UploadRuntimeConverter()
+    runtime.upload_runner = ProductionFinsUploadRunner(
+        sec_pipeline=SecPipeline(
+            workspace_root=default_runtime.workspace_root,
+            processor_registry=default_runtime.processor_registry,
+            batching_repository=default_runtime.batching_repository,
+            company_repository=default_runtime.company_repository,
+            source_repository=default_runtime.source_repository,
+            processed_repository=default_runtime.processed_repository,
+            blob_repository=default_runtime.blob_repository,
+            filing_maintenance_repository=default_runtime.filing_maintenance_repository,
+            docling_converter=converter,
+        ),
+        cn_pipeline=CnPipeline(
+            workspace_root=default_runtime.workspace_root,
+            batching_repository=default_runtime.batching_repository,
+            company_repository=default_runtime.company_repository,
+            source_repository=default_runtime.source_repository,
+            processed_repository=default_runtime.processed_repository,
+            blob_repository=default_runtime.blob_repository,
+            filing_maintenance_repository=default_runtime.filing_maintenance_repository,
+            docling_converter=converter,
+        ),
+    )
 
 
 class _CancelOnSecondCheckToken(CancellationToken):
@@ -2553,6 +2616,86 @@ def test_direct_terminal_state_is_atomic_and_ignores_late_cancel_or_result() -> 
     assert aborted_state._terminal_status is None
 
 
+def test_direct_checker_freezes_external_reason_and_time_across_threads() -> None:
+    """direct composite token 必须跨线程保存首次外部取消事实。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: reason/time 可见性或稳定性漂移时抛出。
+    """
+
+    external_token = _MutableCancellationToken()
+    state = ingestion_runtime._DirectStreamCancellationState.create()
+    checker = ingestion_runtime._DirectCancellationChecker(
+        cancellation_token=external_token,
+        cancellation_state=state,
+    )
+    start = Event()
+    observed = Event()
+    worker_results: list[bool] = []
+
+    def observe_from_worker() -> None:
+        """等待主线程请求取消后从 producer 线程观察。
+
+        Returns:
+            无。
+        """
+
+        start.wait(timeout=1.0)
+        worker_results.append(checker.is_cancelled())
+        observed.set()
+
+    worker = Thread(target=observe_from_worker)
+    worker.start()
+    external_token.request_cancel()
+    start.set()
+    assert observed.wait(timeout=1.0)
+    worker.join(timeout=1.0)
+
+    assert worker_results == [True]
+    assert checker() is True
+    assert checker.cancel_reason() == "test-cancelled"
+    assert checker.requested_at() == datetime(2026, 8, 10, tzinfo=timezone.utc)
+
+
+def test_durable_checker_freezes_first_persisted_cancellation_record(tmp_path: Path) -> None:
+    """durable composite token 必须以首次 cancelling record 为 reason/time 真源。
+
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: durable reason/time 或 ``__call__`` 委托语义漂移时抛出。
+    """
+
+    executor = _HoldingExecutor()
+    runtime = _build_ingestion_runtime(tmp_path / "fins-workspace", executor=executor)
+    start = runtime.start_preprocess(FinsPreprocessRequest(ticker="AAPL"))
+    checker = ingestion_runtime._RuntimeJobCancellationChecker(
+        job_store=runtime.job_store,
+        job_id=start.job_id,
+    )
+
+    assert checker() is False
+    assert checker.cancel_reason() is None
+    assert checker.requested_at() is None
+    cancelling = runtime.request_cancel(start.job_id)
+    expected_time = datetime.fromisoformat(cancelling.updated_at.replace("Z", "+00:00"))
+
+    assert checker.is_cancelled() is True
+    assert checker() is True
+    assert checker.cancel_reason() == "job_cancel_requested"
+    assert checker.requested_at() == expected_time
+
+
 @pytest.mark.asyncio
 async def test_direct_consumer_abort_closes_raw_bridge_and_requests_cancellation(
     tmp_path: Path,
@@ -3380,10 +3523,11 @@ def test_default_runtime_start_upload_sec_filing_uses_production_runner(tmp_path
     """
 
     workspace_root = tmp_path / "fins-workspace"
-    ingestion = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+    default_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    ingestion = default_runtime.get_ingestion_runtime()
+    _inject_upload_runtime_converter(default_runtime, ingestion)
     upload_runner = ingestion.upload_runner
     assert isinstance(upload_runner, ProductionFinsUploadRunner)
-    upload_runner.sec_pipeline._upload_service._convert_with_docling = _upload_runtime_converter
     filing_file = tmp_path / "aapl-10q.pdf"
     filing_file.write_text("runtime sec filing", encoding="utf-8")
 
@@ -3434,10 +3578,11 @@ def test_default_runtime_start_upload_cn_material_uses_production_runner(tmp_pat
     """
 
     workspace_root = tmp_path / "fins-workspace"
-    ingestion = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+    default_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    ingestion = default_runtime.get_ingestion_runtime()
+    _inject_upload_runtime_converter(default_runtime, ingestion)
     upload_runner = ingestion.upload_runner
     assert isinstance(upload_runner, ProductionFinsUploadRunner)
-    upload_runner.cn_pipeline._upload_service._convert_with_docling = _upload_runtime_converter
     material_file = tmp_path / "deck.pdf"
     material_file.write_text("runtime cn material", encoding="utf-8")
 

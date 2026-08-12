@@ -5,10 +5,12 @@ from __future__ import annotations
 import hashlib
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 
 import pytest
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.fins.domain.document_models import FinsSourceProvider, ProcessedCreateRequest
@@ -35,7 +37,10 @@ from dayu.fins.pipelines.cn_download_models import (
     CnReportQuery,
     DownloadedReportAsset,
 )
-from dayu.fins.pipelines.cn_download_protocols import CnDoclingConversionRunner
+from dayu.fins.pipelines.docling_process_converter import (
+    DoclingConversionConfig,
+    DoclingConversionResult,
+)
 import dayu.fins.pipelines.cn_pipeline as cn_pipeline_module
 from dayu.fins.pipelines.cn_pipeline import (
     CN_DOWNLOAD_SOURCE,
@@ -45,7 +50,7 @@ from dayu.fins.pipelines.cn_pipeline import (
     CnPipelineDownloadResult,
 )
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
-from dayu.fins.service_runtime import DefaultFinsRuntime
+from dayu.fins.service_runtime import DefaultFinsRuntime, ProductionFinsUploadRunner
 from dayu.fins.storage import (
     FsBatchingRepository,
     FsCompanyMetaRepository,
@@ -59,6 +64,49 @@ from dayu.fins.ticker_normalization import Exchange, NormalizedTicker
 
 _PDF_BYTES = b"%PDF-1.7\n" + b"1" * 2048
 _DOCLING_BYTES = b'{"document": "runtime-ok"}'
+
+
+class _NeverCancelledChecker(CancellationToken):
+    """始终未取消并保留 callable checkpoint 的测试 checker。"""
+
+    def __call__(self) -> bool:
+        """委托 canonical 方法。
+
+        Returns:
+            始终返回 ``False``。
+        """
+
+        return self.is_cancelled()
+
+    def is_cancelled(self) -> bool:
+        """返回取消状态。
+
+        Returns:
+            始终返回 ``False``。
+        """
+
+        return False
+
+    def cancel_reason(self) -> str | None:
+        """返回取消原因。
+
+        Returns:
+            始终返回 ``None``。
+        """
+
+        return None
+
+    def requested_at(self) -> datetime | None:
+        """返回取消时间。
+
+        Returns:
+            始终返回 ``None``。
+        """
+
+        return None
+
+
+_NEVER_CANCELLED_CHECKER = _NeverCancelledChecker()
 
 
 def _cn_projection_request() -> FinsSourceDownloadAdapterRequest:
@@ -83,7 +131,7 @@ def _cn_projection_request() -> FinsSourceDownloadAdapterRequest:
         date_range=FinsDownloadDateRange(None, None, False, False),
         overwrite_existing=False,
         rebuild_local_artifacts=False,
-        cancellation_checker=lambda: False,
+        cancellation_checker=_NEVER_CANCELLED_CHECKER,
     )
 
 
@@ -243,24 +291,26 @@ class _RuntimeFakeDiscoveryClient:
 
 
 @dataclass
-class _RuntimeFakeConversionRunner(CnDoclingConversionRunner):
+class _RuntimeFakeConversionRunner:
     """runtime 接入测试用 typed Docling runner。"""
 
     calls: int = 0
 
-    async def convert_pdf_to_docling_json(
+    async def convert_to_json_bytes(
         self,
-        pdf_bytes: bytes,
+        input_bytes: bytes,
         stream_name: str,
         *,
-        cancellation_checker: Callable[[], bool],
-    ) -> bytes:
+        config: DoclingConversionConfig,
+        cancellation: CancellationToken | None,
+    ) -> DoclingConversionResult:
         """返回固定 Docling JSON 字节。
 
         Args:
             pdf_bytes: PDF 字节。
             stream_name: 流名称。
-            cancellation_checker: operation-scoped 取消检查器。
+            config: 闭合转换配置。
+            cancellation: canonical 取消 token。
 
         Returns:
             Docling JSON 字节。
@@ -269,10 +319,15 @@ class _RuntimeFakeConversionRunner(CnDoclingConversionRunner):
             无。
         """
 
-        del pdf_bytes, stream_name
-        assert cancellation_checker() is False
+        del input_bytes, stream_name, config
+        assert cancellation is not None
+        assert cancellation.is_cancelled() is False
         self.calls += 1
-        return _DOCLING_BYTES
+        return DoclingConversionResult(
+            json_bytes=_DOCLING_BYTES,
+            size=len(_DOCLING_BYTES),
+            sha256=hashlib.sha256(_DOCLING_BYTES).hexdigest(),
+        )
 
 
 class _RecordingPipeline(CnPipeline):
@@ -301,7 +356,7 @@ class _RecordingPipeline(CnPipeline):
                 title="unused",
                 source_id="unused",
             ),
-            docling_conversion_runner=_RuntimeFakeConversionRunner(),
+            docling_converter=_RuntimeFakeConversionRunner(),
         )
         self.recorded_rebuild_values: list[bool] = []
         self.result_filings: list[JsonValue] = []
@@ -559,6 +614,49 @@ def test_default_runtime_registers_cn_hk_download_adapters(tmp_path: Path) -> No
     assert runtime.download_adapters[(HK_DOWNLOAD_SOURCE, "HK")] is runtime.download_adapters[("auto", "HK")]
 
 
+def test_default_runtime_injects_one_converter_into_all_fins_paths(tmp_path: Path) -> None:
+    """默认装配必须让四类 Fins caller 观察同一 converter identity。
+
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: converter 或独立 pipeline identity 漂移时抛出。
+    """
+
+    runtime = DefaultFinsRuntime.create(workspace_root=tmp_path).get_ingestion_runtime()
+    cn_adapter = runtime.download_adapters[(CN_DOWNLOAD_SOURCE, "CN")]
+    hk_adapter = runtime.download_adapters[(HK_DOWNLOAD_SOURCE, "HK")]
+    upload_runner = runtime.upload_runner
+    assert isinstance(cn_adapter, CnDownloadAdapter)
+    assert isinstance(hk_adapter, CnDownloadAdapter)
+    assert isinstance(upload_runner, ProductionFinsUploadRunner)
+
+    cn_download_pipeline = cn_adapter._pipeline
+    hk_download_pipeline = hk_adapter._pipeline
+    cn_upload_pipeline = upload_runner.cn_pipeline
+    sec_upload_pipeline = upload_runner.sec_pipeline
+    converter = cn_download_pipeline._docling_converter
+
+    assert (
+        len(
+            {
+                id(cn_download_pipeline),
+                id(hk_download_pipeline),
+                id(cn_upload_pipeline),
+            }
+        )
+        == 3
+    )
+    assert hk_download_pipeline._docling_converter is converter
+    assert cn_upload_pipeline._docling_converter is converter
+    assert cn_upload_pipeline._upload_service._docling_converter is converter
+    assert sec_upload_pipeline._upload_service._docling_converter is converter
+
+
 def test_cn_hk_adapter_factories_use_source_specific_downloader_defaults(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -594,6 +692,7 @@ def test_cn_hk_adapter_factories_use_source_specific_downloader_defaults(
         processed_repository=repositories.processed_repository,
         blob_repository=repositories.blob_repository,
         filing_maintenance_repository=repositories.filing_maintenance_repository,
+        docling_converter=_RuntimeFakeConversionRunner(),
     )
     hk_adapter = cn_pipeline_module.build_hk_download_adapter(
         workspace_root=repositories.workspace_root,
@@ -603,6 +702,7 @@ def test_cn_hk_adapter_factories_use_source_specific_downloader_defaults(
         processed_repository=repositories.processed_repository,
         blob_repository=repositories.blob_repository,
         filing_maintenance_repository=repositories.filing_maintenance_repository,
+        docling_converter=_RuntimeFakeConversionRunner(),
     )
 
     assert cn_adapter._pipeline.sleep_seconds == cn_sleep_seconds
@@ -635,7 +735,7 @@ def test_cn_adapter_routes_local_rebuild_to_existing_pipeline(tmp_path: Path) ->
             date_range=FinsDownloadDateRange(None, None, False, False),
             overwrite_existing=False,
             rebuild_local_artifacts=True,
-            cancellation_checker=lambda: False,
+            cancellation_checker=_NEVER_CANCELLED_CHECKER,
         )
     )
 
@@ -735,7 +835,7 @@ def test_cn_rebuild_projection_requires_exact_missing_periods_field(
         date_range=FinsDownloadDateRange(None, None, False, False),
         overwrite_existing=False,
         rebuild_local_artifacts=True,
-        cancellation_checker=lambda: False,
+        cancellation_checker=_NEVER_CANCELLED_CHECKER,
     )
     result = _cn_projection_result([])
     result["status"] = "ok"
@@ -787,7 +887,7 @@ def test_cn_adapter_rejects_invalid_binding_and_request_identity(tmp_path: Path)
                 date_range=FinsDownloadDateRange(None, None, False, False),
                 overwrite_existing=False,
                 rebuild_local_artifacts=False,
-                cancellation_checker=lambda: False,
+                cancellation_checker=_NEVER_CANCELLED_CHECKER,
             )
         )
     with pytest.raises(ValueError, match="来源不匹配"):
@@ -804,7 +904,7 @@ def test_cn_adapter_rejects_invalid_binding_and_request_identity(tmp_path: Path)
                 date_range=FinsDownloadDateRange(None, None, False, False),
                 overwrite_existing=False,
                 rebuild_local_artifacts=False,
-                cancellation_checker=lambda: False,
+                cancellation_checker=_NEVER_CANCELLED_CHECKER,
             )
         )
 
@@ -1014,7 +1114,7 @@ def test_cn_hk_adapter_local_rebuild_does_not_mutate_processed_documents(
             date_range=FinsDownloadDateRange(None, None, False, False),
             overwrite_existing=False,
             rebuild_local_artifacts=True,
-            cancellation_checker=lambda: False,
+            cancellation_checker=_NEVER_CANCELLED_CHECKER,
         )
     )
 
@@ -1074,7 +1174,7 @@ def _build_runtime_with_cn_hk_adapters(
         filing_maintenance_repository=repositories.filing_maintenance_repository,
         cn_discovery_client=cn_discovery,
         hk_discovery_client=hk_discovery,
-        docling_conversion_runner=runner,
+        docling_converter=runner,
     )
     runtime = FinsIngestionRuntime.create(
         batching_repository=repositories.batching_repository,

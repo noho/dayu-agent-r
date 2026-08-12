@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import gc
+import hashlib
+import json
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -68,6 +70,7 @@ from dayu.fins.processors.source_text import (
 )
 from dayu.fins.processors.ten_q_processor import TenQFormProcessor
 from dayu.fins.processors.ten_k_processor import TenKFormProcessor
+from dayu.fins.pipelines.docling_process_converter import DoclingConversionResult
 from dayu.fins.storage import (
     FsBatchingRepository,
     FsCompanyMetaRepository,
@@ -88,6 +91,53 @@ from dayu.fins.tools.read_runtime_helpers import (
 )
 
 _LOCK_REGISTRY_CACHE_CAPACITY: Final[int] = 4
+
+
+def test_shared_converter_utf8_json_fixture_is_readable_by_source_decoder() -> None:
+    """shared converter 的唯一 JSON bytes 必须可被 process/read 解码链消费。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: UTF-8、digest 或 JSON 读取契约漂移时抛出。
+    """
+
+    json_bytes = json.dumps(
+        {"document": "年度财报", "tables": []},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    fixture = DoclingConversionResult(
+        json_bytes=json_bytes,
+        size=len(json_bytes),
+        sha256=hashlib.sha256(json_bytes).hexdigest(),
+    )
+
+    decoded = decode_source_bytes(fixture.json_bytes)
+    assert json.loads(decoded) == {"document": "年度财报", "tables": []}
+
+
+def test_web_fetch_docling_import_graph_remains_documents_only() -> None:
+    """web fetch 的 Docling 路径不得反向依赖 Fins shared converter。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: web import graph 被迁入 Fins owner 时抛出。
+    """
+
+    source = Path("dayu/tools/web/web_fetch_orchestrator.py").read_text(encoding="utf-8")
+    assert "from dayu.documents.docling_runtime import" in source
+    assert "dayu.fins.pipelines.docling_process_converter" not in source
+
+
 _LOCK_REGISTRY_MISSING_KEY_COUNT: Final[int] = 64
 _LOCK_REGISTRY_VALID_DOCUMENT_COUNT: Final[int] = 12
 
@@ -1318,10 +1368,7 @@ def _append_virtual_section(
 
 def _build_virtual_postprocess_probe(
     processor_type: (
-        type[TenQFormProcessor]
-        | type[BsTenQFormProcessor]
-        | type[TenKFormProcessor]
-        | type[BsTenKFormProcessor]
+        type[TenQFormProcessor] | type[BsTenQFormProcessor] | type[TenKFormProcessor] | type[BsTenKFormProcessor]
     ),
     harness: _VirtualHarness,
     monkeypatch: pytest.MonkeyPatch,
@@ -1826,9 +1873,7 @@ def _assert_processor_matches_base_public_contract(
     base_tables = SecProcessor.list_tables(processor)
     assert processor.list_sections() == base_sections
     assert processor.list_tables() == base_tables
-    assert [table["table_ref"] for table in processor.list_tables()] == [
-        table["table_ref"] for table in base_tables
-    ]
+    assert [table["table_ref"] for table in processor.list_tables()] == [table["table_ref"] for table in base_tables]
     assert [table["section_ref"] for table in processor.list_tables()] == [
         table["section_ref"] for table in base_tables
     ]
@@ -1900,9 +1945,7 @@ def test_ten_k_public_processor_assigns_tables_without_marker_capability(
     assert len(tables) == 1
     assert tables[0]["section_ref"] in {section["ref"] for section in sections}
     assert tables[0]["table_ref"] in {
-        table_ref
-        for section in sections
-        for table_ref in processor.read_section(section["ref"])["tables"]
+        table_ref for section in sections for table_ref in processor.read_section(section["ref"])["tables"]
     }
     _assert_processor_matches_base_public_contract(processor)
 
@@ -2270,10 +2313,7 @@ def test_both_ten_k_paths_migrate_to_shared_refresh_without_behavior_drift(
 def test_report_form_second_postprocess_keeps_base_fallback_terminal(
     monkeypatch: pytest.MonkeyPatch,
     processor_type: (
-        type[TenKFormProcessor]
-        | type[BsTenKFormProcessor]
-        | type[TenQFormProcessor]
-        | type[BsTenQFormProcessor]
+        type[TenKFormProcessor] | type[BsTenKFormProcessor] | type[TenQFormProcessor] | type[BsTenQFormProcessor]
     ),
 ) -> None:
     """四条 report-form 路径二次 postprocess 都不得重入 fallback proof。
@@ -2510,12 +2550,15 @@ def test_cross_document_diagnosis_does_not_reuse_stale_cached_processor(tmp_path
     _read_runtime_processor_for_document(runtime, "doc-2")
     _update_source(repository, fingerprint="doc-2-revision-two", document_id="doc-2")
 
-    assert runtime._diagnose_cross_document_locator(
-        ticker="AAPL",
-        current_document_id="doc-1",
-        kind="ref",
-        locator="s_0001",
-    ) is None
+    assert (
+        runtime._diagnose_cross_document_locator(
+            ticker="AAPL",
+            current_document_id="doc-1",
+            kind="ref",
+            locator="s_0001",
+        )
+        is None
+    )
     assert runtime._processor_cache.size() == 0
 
 
@@ -2619,11 +2662,7 @@ def test_sustained_storage_change_maps_once_to_source_changed_during_read(
                 repository,
                 fingerprint="sustained-b" if publish_b else "sustained-a",
                 payload=b"version-b" if publish_b else b"version-a",
-                source_provider=(
-                    FinsSourceProvider.USER_UPLOAD
-                    if publish_b
-                    else FinsSourceProvider.SEC_EDGAR
-                ),
+                source_provider=(FinsSourceProvider.USER_UPLOAD if publish_b else FinsSourceProvider.SEC_EDGAR),
             )
             publication_barrier.wait()
         with pytest.raises(FinsReadBusinessError) as error_info:
@@ -2820,9 +2859,7 @@ def test_creation_lock_registry_reclaims_missing_and_evicted_document_keys(
         tmp_path,
         processor_cache_max_entries=_LOCK_REGISTRY_CACHE_CAPACITY,
     )
-    missing_document_ids = tuple(
-        f"missing-{index}" for index in range(_LOCK_REGISTRY_MISSING_KEY_COUNT)
-    )
+    missing_document_ids = tuple(f"missing-{index}" for index in range(_LOCK_REGISTRY_MISSING_KEY_COUNT))
     for document_id in missing_document_ids:
         with pytest.raises(FileNotFoundError):
             _read_runtime_processor_for_document(runtime, document_id)
@@ -2831,9 +2868,7 @@ def test_creation_lock_registry_reclaims_missing_and_evicted_document_keys(
     assert runtime._processor_cache.size() == 0
     assert len(runtime._creation_locks) == 0
 
-    added_document_ids = tuple(
-        f"doc-{index}" for index in range(2, _LOCK_REGISTRY_VALID_DOCUMENT_COUNT + 1)
-    )
+    added_document_ids = tuple(f"doc-{index}" for index in range(2, _LOCK_REGISTRY_VALID_DOCUMENT_COUNT + 1))
     _create_test_source_documents(repository, added_document_ids)
     valid_document_ids = ("doc-1", *added_document_ids)
     for document_id in valid_document_ids:
@@ -2843,9 +2878,7 @@ def test_creation_lock_registry_reclaims_missing_and_evicted_document_keys(
     assert registry.create_count == _LOCK_REGISTRY_VALID_DOCUMENT_COUNT
     assert runtime._processor_cache.size() == _LOCK_REGISTRY_CACHE_CAPACITY
     assert len(runtime._creation_locks) == 0
-    assert sum(root.exists() for root in repository.full_snapshot_roots) == (
-        _LOCK_REGISTRY_CACHE_CAPACITY
-    )
+    assert sum(root.exists() for root in repository.full_snapshot_roots) == (_LOCK_REGISTRY_CACHE_CAPACITY)
     runtime.close()
     assert all(not root.exists() for root in repository.full_snapshot_roots)
 
@@ -2867,6 +2900,7 @@ def test_cache_eviction_defers_snapshot_close_until_active_borrow_releases(tmp_p
     old_borrow = runtime._borrow_processor(ticker="AAPL", document_id="doc-1")
     old_root = old_borrow.snapshot.get_primary_source().materialize().parent
     with ThreadPoolExecutor(max_workers=1) as executor:
+
         def _publish_and_read() -> DocumentProcessor:
             """发布 B 并借用新 processor。"""
 

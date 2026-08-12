@@ -130,6 +130,9 @@ _NORMALIZED_EXCHANGE_VALUES: Final[frozenset[NormalizedTickerExchange]] = frozen
     cast(tuple[NormalizedTickerExchange, ...], get_args(NormalizedTickerExchange))
 )
 _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
+_DURABLE_CANCELLATION_REASON: Final[str] = "job_cancel_requested"
+_DIRECT_CANCELLATION_REASON: Final[str] = "direct_cancel_requested"
+_DIRECT_CONSUMER_ABORT_REASON: Final[str] = "direct_consumer_aborted"
 
 _KEY_JOB_ID: Final[str] = "job_id"
 _KEY_OPERATION_KIND: Final[str] = "operation_kind"
@@ -421,7 +424,7 @@ class FinsSourceDownloadAdapterRequest:
     date_range: FinsDownloadDateRange
     overwrite_existing: bool
     rebuild_local_artifacts: bool
-    cancellation_checker: FinsJobCancellationChecker
+    cancellation_checker: Callable[[], bool]
     progress_sink: FinsDownloadProgressSink | None = None
 
 
@@ -803,7 +806,7 @@ class FinsUploadResultSummary:
         }
 
 
-class FinsJobCancellationChecker(Protocol):
+class FinsJobCancellationChecker(CancellationToken, Protocol):
     """Fins 后台 job 协作式取消检查协议。"""
 
     def __call__(self) -> bool:
@@ -1160,12 +1163,15 @@ class FinsIngestionThreadExecutor:
         thread.start()
 
 
-@dataclass(frozen=True)
+@dataclass
 class _RuntimeJobCancellationChecker:
     """基于 job store 的 Fins job 取消检查器。"""
 
     job_store: FinsIngestionJobStore
     job_id: str
+    _lock: Lock = field(default_factory=Lock, init=False, repr=False)
+    _cancel_reason: str | None = field(default=None, init=False, repr=False)
+    _requested_at: datetime | None = field(default=None, init=False, repr=False)
 
     def __call__(self) -> bool:
         """返回当前 job 是否已请求取消。
@@ -1182,11 +1188,77 @@ class _RuntimeJobCancellationChecker:
             ValueError: job record 非法时抛出。
         """
 
+        return self.is_cancelled()
+
+    def is_cancelled(self) -> bool:
+        """读取 durable record 并冻结首次取消事实。
+
+        Args:
+            无。
+
+        Returns:
+            job 已处于 cancelling 或 cancelled 时返回 ``True``。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+            OSError: job store 读取失败时抛出。
+            ValueError: job record 或时间字段非法时抛出。
+        """
+
+        with self._lock:
+            if self._cancel_reason is not None:
+                return True
         record = self.job_store.read_job(self.job_id)
-        return record.cancellation_requested or record.status in {
+        cancelled = record.cancellation_requested or record.status in {
             FinsIngestionJobStatus.CANCELLING,
             FinsIngestionJobStatus.CANCELLED,
         }
+        if not cancelled:
+            return False
+        requested_at = _parse_cancellation_requested_at(record.updated_at)
+        with self._lock:
+            if self._cancel_reason is None:
+                self._cancel_reason = _DURABLE_CANCELLATION_REASON
+                self._requested_at = requested_at
+        return True
+
+    def cancel_reason(self) -> str | None:
+        """返回首次观察到的 durable 取消原因。
+
+        Args:
+            无。
+
+        Returns:
+            已观察取消时返回固定原因，否则返回 ``None``。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+            OSError: job store 读取失败时抛出。
+            ValueError: job record 或时间字段非法时抛出。
+        """
+
+        self.is_cancelled()
+        with self._lock:
+            return self._cancel_reason
+
+    def requested_at(self) -> datetime | None:
+        """返回首次 persisted cancelling record 的更新时间。
+
+        Args:
+            无。
+
+        Returns:
+            已观察取消时返回 UTC 时间，否则返回 ``None``。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+            OSError: job store 读取失败时抛出。
+            ValueError: job record 或时间字段非法时抛出。
+        """
+
+        self.is_cancelled()
+        with self._lock:
+            return self._requested_at
 
 
 @dataclass
@@ -1197,6 +1269,8 @@ class _DirectStreamCancellationState:
     _cancellation_requested: bool = False
     _consumer_aborted: bool = False
     _terminal_status: FinsResultStatus | None = None
+    _cancel_reason: str | None = None
+    _requested_at: datetime | None = None
 
     @classmethod
     def create(cls) -> "_DirectStreamCancellationState":
@@ -1214,11 +1288,17 @@ class _DirectStreamCancellationState:
 
         return cls(_lock=Lock())
 
-    def request_cancel(self) -> bool:
+    def request_cancel(
+        self,
+        *,
+        reason: str = _DIRECT_CANCELLATION_REASON,
+        requested_at: datetime | None = None,
+    ) -> bool:
         """请求取消当前 direct stream。
 
         Args:
-            无。
+            reason: 首次取消的稳定原因。
+            requested_at: 取消请求时间；未提供时使用当前 UTC 时间。
 
         Returns:
             取消在终态提交前首次生效时返回 ``True``。
@@ -1231,6 +1311,8 @@ class _DirectStreamCancellationState:
             if self._consumer_aborted or self._terminal_status is not None or self._cancellation_requested:
                 return False
             self._cancellation_requested = True
+            self._cancel_reason = reason
+            self._requested_at = requested_at or datetime.now(timezone.utc)
             return True
 
     def request_consumer_abort(self) -> None:
@@ -1248,6 +1330,9 @@ class _DirectStreamCancellationState:
 
         with self._lock:
             self._consumer_aborted = True
+            if self._cancel_reason is None:
+                self._cancel_reason = _DIRECT_CONSUMER_ABORT_REASON
+                self._requested_at = datetime.now(timezone.utc)
 
     def is_cancelled(self) -> bool:
         """读取当前是否已请求取消。
@@ -1280,6 +1365,38 @@ class _DirectStreamCancellationState:
 
         with self._lock:
             return self._consumer_aborted
+
+    def cancel_reason(self) -> str | None:
+        """读取首次生效的 direct 取消原因。
+
+        Args:
+            无。
+
+        Returns:
+            已取消时返回稳定原因，否则返回 ``None``。
+
+        Raises:
+            无。
+        """
+
+        with self._lock:
+            return self._cancel_reason
+
+    def requested_at(self) -> datetime | None:
+        """读取首次生效的 direct 取消时间。
+
+        Args:
+            无。
+
+        Returns:
+            已取消时返回 UTC 时间，否则返回 ``None``。
+
+        Raises:
+            无。
+        """
+
+        with self._lock:
+            return self._requested_at
 
     def claim_terminal(self, requested_status: FinsResultStatus) -> FinsResultStatus | None:
         """原子提交唯一终态，并使已生效取消优先。
@@ -1323,9 +1440,59 @@ class _DirectCancellationChecker:
             无。
         """
 
+        return self.is_cancelled()
+
+    def is_cancelled(self) -> bool:
+        """观察外部 token，并把首次取消事实写入 locked state。
+
+        Args:
+            无。
+
+        Returns:
+            本地 stream 被关闭或外部 token 已取消时返回 ``True``。
+
+        Raises:
+            无。
+        """
+
         if self.cancellation_token is not None and self.cancellation_token.is_cancelled():
-            self.cancellation_state.request_cancel()
+            self.cancellation_state.request_cancel(
+                reason=self.cancellation_token.cancel_reason() or _DIRECT_CANCELLATION_REASON,
+                requested_at=self.cancellation_token.requested_at(),
+            )
         return self.cancellation_state.is_cancelled()
+
+    def cancel_reason(self) -> str | None:
+        """返回 locked state 中的首次取消原因。
+
+        Args:
+            无。
+
+        Returns:
+            已取消时返回原因，否则返回 ``None``。
+
+        Raises:
+            无。
+        """
+
+        self.is_cancelled()
+        return self.cancellation_state.cancel_reason()
+
+    def requested_at(self) -> datetime | None:
+        """返回 locked state 中的首次取消时间。
+
+        Args:
+            无。
+
+        Returns:
+            已取消时返回 UTC 时间，否则返回 ``None``。
+
+        Raises:
+            无。
+        """
+
+        self.is_cancelled()
+        return self.cancellation_state.requested_at()
 
 
 @dataclass(frozen=True)
@@ -5724,6 +5891,25 @@ def _utc_now() -> str:
     """
 
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _parse_cancellation_requested_at(value: str) -> datetime:
+    """解析 durable job record 的取消请求时间。
+
+    Args:
+        value: 首次 observed cancelling record 的 ISO-8601 ``updated_at``。
+
+    Returns:
+        带时区的 UTC ``datetime``。
+
+    Raises:
+        ValueError: 文本不是带时区的 ISO-8601 时间时抛出。
+    """
+
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("cancellation requested_at 必须包含时区")
+    return parsed.astimezone(timezone.utc)
 
 
 def _bounded_text(value: str, field_name: str, *, reject_path_separators: bool = True) -> str:

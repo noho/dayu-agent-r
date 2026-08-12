@@ -13,6 +13,7 @@ from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
 from pathlib import Path
 from typing import Final, Optional, TypeAlias, cast
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.downloaders.cninfo_downloader import (
     DEFAULT_MAX_RETRIES as CNINFO_DEFAULT_MAX_RETRIES,
@@ -47,22 +48,24 @@ from dayu.fins.pipelines.cn_download_pdf_gate import (
     CnDownloadPdfGateProtocol,
     NoopCnDownloadPdfGate,
 )
-from dayu.fins.pipelines.cn_docling_process import ProcessCnDoclingConversionRunner
 from dayu.fins.pipelines.cn_download_protocols import (
-    CnDoclingConversionRunner,
     CnReportDiscoveryClientProtocol,
 )
 from dayu.fins.pipelines.cn_download_workflow import run_cn_download_stream_impl
 from dayu.fins.pipelines.docling_upload_service import (
     DoclingUploadService,
-    UploadCancellationChecker,
     UploadOperationResult,
     build_cn_filing_ids,
     build_material_ids,
+    commit_prepared_upload_batch,
     derive_report_kind,
     normalize_cn_fiscal_period,
     resolve_upload_action,
     validate_material_upload_ids,
+)
+from dayu.fins.pipelines.docling_process_converter import (
+    DoclingConverter,
+    ProcessDoclingConverter,
 )
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.pipelines.upload_company_meta import build_upload_company_id, upsert_company_meta_for_upload
@@ -320,7 +323,7 @@ class CnPipeline:
         cn_discovery_client: CnReportDiscoveryClientProtocol | None = None,
         hk_discovery_client: CnReportDiscoveryClientProtocol | None = None,
         pdf_download_gate: CnDownloadPdfGateProtocol | None = None,
-        docling_conversion_runner: CnDoclingConversionRunner | None = None,
+        docling_converter: DoclingConverter | None = None,
         batching_repository: BatchingRepositoryProtocol | None = None,
         company_repository: CompanyMetaRepositoryProtocol | None = None,
         source_repository: SourceDocumentRepositoryProtocol | None = None,
@@ -338,7 +341,7 @@ class CnPipeline:
             cn_discovery_client: 可选巨潮 discovery client。
             hk_discovery_client: 可选披露易 discovery client。
             pdf_download_gate: 可选 PDF 下载段 gate。
-            docling_conversion_runner: 可选可取消 Docling conversion runner。
+            docling_converter: 可选共享 Docling converter；未提供时构造 production 实现。
             batching_repository: 可选 batch lifecycle 仓储。
             company_repository: 可选公司元数据仓储。
             source_repository: 可选源文档仓储。
@@ -396,10 +399,11 @@ class CnPipeline:
             max_retries=max_retries,
         )
         self._pdf_download_gate = pdf_download_gate or NoopCnDownloadPdfGate()
-        self._docling_conversion_runner = docling_conversion_runner or ProcessCnDoclingConversionRunner()
+        self._docling_converter = docling_converter or ProcessDoclingConverter()
         self._upload_service = DoclingUploadService(
             source_repository=self._source_repository,
             blob_repository=self._blob_repository,
+            docling_converter=self._docling_converter,
         )
 
     @property
@@ -547,20 +551,20 @@ class CnPipeline:
         return self._pdf_download_gate
 
     @property
-    def docling_conversion_runner(self) -> CnDoclingConversionRunner:
-        """返回可取消 Docling conversion runner。
+    def docling_conversion_runner(self) -> DoclingConverter:
+        """返回共享 Docling converter。
 
         Args:
             无。
 
         Returns:
-            typed conversion runner。
+            typed converter。
 
         Raises:
             无。
         """
 
-        return self._docling_conversion_runner
+        return self._docling_converter
 
     @property
     def user_agent(self) -> Optional[str]:
@@ -621,7 +625,7 @@ class CnPipeline:
         ticker_aliases: Optional[list[str]] = None,
         *,
         start_is_explicit: bool,
-        cancel_checker: Optional[Callable[[], bool]] = None,
+        cancel_checker: Callable[[], bool] | None = None,
     ) -> CnPipelineDownloadResult:
         """执行 CN/HK 下载并同步返回聚合结果。
 
@@ -671,7 +675,7 @@ class CnPipeline:
         ticker_aliases: Optional[list[str]] = None,
         *,
         start_is_explicit: bool,
-        cancel_checker: Optional[Callable[[], bool]] = None,
+        cancel_checker: Callable[[], bool] | None = None,
     ) -> AsyncIterator[DownloadEvent]:
         """执行 CN/HK 下载并流式产出事件。
 
@@ -725,7 +729,7 @@ class CnPipeline:
         ticker_aliases: Optional[list[str]] = None,
         overwrite: bool = False,
         *,
-        cancellation_checker: UploadCancellationChecker | None = None,
+        cancellation_checker: CancellationToken | None = None,
     ) -> CnPipelineUploadResult:
         """执行 CN/HK 财报上传并同步返回聚合结果。
 
@@ -787,7 +791,7 @@ class CnPipeline:
         ticker_aliases: Optional[list[str]] = None,
         overwrite: bool = False,
         *,
-        cancellation_checker: UploadCancellationChecker | None = None,
+        cancellation_checker: CancellationToken | None = None,
     ) -> AsyncIterator[UploadFilingEvent]:
         """执行流式 CN/HK 财报上传。
 
@@ -867,7 +871,7 @@ class CnPipeline:
                 self._batching_repository.rollback_batch(company_batch)
                 raise
             self._batching_repository.commit_batch(company_batch)
-            prepared_upload = self._upload_service.prepare_upload(
+            prepared_upload = await self._upload_service.prepare_upload(
                 ticker=normalized_ticker,
                 source_kind=SourceKind.FILING,
                 action=resolved_action,
@@ -876,7 +880,7 @@ class CnPipeline:
                 form_type=form_type,
                 files=files,
                 overwrite=overwrite,
-                cancellation_checker=cancellation_checker,
+                cancellation=cancellation_checker,
                 meta={
                     "company_id": normalized_company_id,
                     "ingest_method": FinsIngestMethod.UPLOAD.to_storage_value(),
@@ -891,19 +895,13 @@ class CnPipeline:
             if isinstance(prepared_upload, UploadOperationResult):
                 upload_result = prepared_upload
             else:
-                document_batch = self._batching_repository.begin_batch(normalized_ticker)
-                try:
-                    upload_result = self._upload_service.publish_prepared_upload(
-                        prepared_upload,
-                        batch=document_batch,
-                    )
-                except BaseException:
-                    self._batching_repository.rollback_batch(document_batch)
-                    raise
-                if upload_result.status == "cancelled":
-                    self._batching_repository.rollback_batch(document_batch)
-                else:
-                    self._batching_repository.commit_batch(document_batch)
+                upload_result = commit_prepared_upload_batch(
+                    service=self._upload_service,
+                    batching_repository=self._batching_repository,
+                    batch=self._batching_repository.begin_batch(normalized_ticker),
+                    prepared=prepared_upload,
+                    cancellation=cancellation_checker,
+                )
             for file_event in upload_result.file_events:
                 yield UploadFilingEvent(
                     event_type=_map_upload_file_event_to_filing_event_type(file_event),
@@ -982,7 +980,7 @@ class CnPipeline:
         ticker_aliases: Optional[list[str]] = None,
         overwrite: bool = False,
         *,
-        cancellation_checker: UploadCancellationChecker | None = None,
+        cancellation_checker: CancellationToken | None = None,
     ) -> CnPipelineUploadResult:
         """执行 CN/HK 材料上传并同步返回聚合结果。
 
@@ -1053,7 +1051,7 @@ class CnPipeline:
         ticker_aliases: Optional[list[str]] = None,
         overwrite: bool = False,
         *,
-        cancellation_checker: UploadCancellationChecker | None = None,
+        cancellation_checker: CancellationToken | None = None,
     ) -> AsyncIterator[UploadMaterialEvent]:
         """执行流式 CN/HK 材料上传。
 
@@ -1143,7 +1141,7 @@ class CnPipeline:
                 self._batching_repository.rollback_batch(company_batch)
                 raise
             self._batching_repository.commit_batch(company_batch)
-            prepared_upload = self._upload_service.prepare_upload(
+            prepared_upload = await self._upload_service.prepare_upload(
                 ticker=normalized_ticker,
                 source_kind=SourceKind.MATERIAL,
                 action=resolved_action,
@@ -1152,7 +1150,7 @@ class CnPipeline:
                 form_type=form_type,
                 files=file_list,
                 overwrite=overwrite,
-                cancellation_checker=cancellation_checker,
+                cancellation=cancellation_checker,
                 meta={
                     "company_id": normalized_company_id,
                     "ingest_method": FinsIngestMethod.UPLOAD.to_storage_value(),
@@ -1166,19 +1164,13 @@ class CnPipeline:
             if isinstance(prepared_upload, UploadOperationResult):
                 upload_result = prepared_upload
             else:
-                document_batch = self._batching_repository.begin_batch(normalized_ticker)
-                try:
-                    upload_result = self._upload_service.publish_prepared_upload(
-                        prepared_upload,
-                        batch=document_batch,
-                    )
-                except BaseException:
-                    self._batching_repository.rollback_batch(document_batch)
-                    raise
-                if upload_result.status == "cancelled":
-                    self._batching_repository.rollback_batch(document_batch)
-                else:
-                    self._batching_repository.commit_batch(document_batch)
+                upload_result = commit_prepared_upload_batch(
+                    service=self._upload_service,
+                    batching_repository=self._batching_repository,
+                    batch=self._batching_repository.begin_batch(normalized_ticker),
+                    prepared=prepared_upload,
+                    cancellation=cancellation_checker,
+                )
             for file_event in upload_result.file_events:
                 yield UploadMaterialEvent(
                     event_type=_map_upload_file_event_to_material_event_type(file_event),
@@ -1853,6 +1845,7 @@ def build_cn_download_adapter(
     processed_repository: ProcessedDocumentRepositoryProtocol,
     blob_repository: DocumentBlobRepositoryProtocol,
     filing_maintenance_repository: FilingMaintenanceRepositoryProtocol,
+    docling_converter: DoclingConverter,
     user_agent: Optional[str] = None,
     sleep_seconds: float | None = None,
     max_retries: int | None = None,
@@ -1867,6 +1860,7 @@ def build_cn_download_adapter(
         processed_repository: processed 仓储。
         blob_repository: 文件对象仓储。
         filing_maintenance_repository: filing 维护仓储。
+        docling_converter: 与其它 Fins 路径共享的 Docling converter。
         user_agent: 可选 HTTP User-Agent。
         sleep_seconds: 请求间隔秒数。
         max_retries: 下载重试次数。
@@ -1886,6 +1880,7 @@ def build_cn_download_adapter(
         processed_repository=processed_repository,
         blob_repository=blob_repository,
         filing_maintenance_repository=filing_maintenance_repository,
+        docling_converter=docling_converter,
         user_agent=user_agent,
         sleep_seconds=CNINFO_DEFAULT_SLEEP_SECONDS if sleep_seconds is None else sleep_seconds,
         max_retries=CNINFO_DEFAULT_MAX_RETRIES if max_retries is None else max_retries,
@@ -1902,6 +1897,7 @@ def build_hk_download_adapter(
     processed_repository: ProcessedDocumentRepositoryProtocol,
     blob_repository: DocumentBlobRepositoryProtocol,
     filing_maintenance_repository: FilingMaintenanceRepositoryProtocol,
+    docling_converter: DoclingConverter,
     user_agent: Optional[str] = None,
     sleep_seconds: float | None = None,
     max_retries: int | None = None,
@@ -1916,6 +1912,7 @@ def build_hk_download_adapter(
         processed_repository: processed 仓储。
         blob_repository: 文件对象仓储。
         filing_maintenance_repository: filing 维护仓储。
+        docling_converter: 与其它 Fins 路径共享的 Docling converter。
         user_agent: 可选 HTTP User-Agent。
         sleep_seconds: 请求间隔秒数。
         max_retries: 下载重试次数。
@@ -1935,6 +1932,7 @@ def build_hk_download_adapter(
         processed_repository=processed_repository,
         blob_repository=blob_repository,
         filing_maintenance_repository=filing_maintenance_repository,
+        docling_converter=docling_converter,
         user_agent=user_agent,
         sleep_seconds=HKEXNEWS_DEFAULT_SLEEP_SECONDS if sleep_seconds is None else sleep_seconds,
         max_retries=HKEXNEWS_DEFAULT_MAX_RETRIES if max_retries is None else max_retries,

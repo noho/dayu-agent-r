@@ -2,33 +2,51 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
 
-from dayu.contracts.json_value import JsonValue
+from dayu.contracts.cancellation import CancellationToken
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.pipelines.sec_pipeline import SecPipeline
+from dayu.fins.pipelines.docling_process_converter import (
+    DoclingConversionConfig,
+    DoclingConversionResult,
+)
 from dayu.fins.pipelines.upload_material_events import UploadMaterialEventType
 from dayu.fins.processors.registry import build_fins_processor_registry
 
 
-def _convert_docling_stub(raw_data: bytes, stream_name: str) -> dict[str, JsonValue]:
-    """返回固定 Docling 转换结果。
+class _FakeDoclingConverter:
+    """SEC material 测试用 typed converter。"""
 
-    Args:
-        raw_data: 输入原始字节。
-        stream_name: 输入流名称。
+    async def convert_to_json_bytes(
+        self,
+        input_bytes: bytes,
+        stream_name: str,
+        *,
+        config: DoclingConversionConfig,
+        cancellation: CancellationToken | None,
+    ) -> DoclingConversionResult:
+        """返回固定 typed JSON bytes。
 
-    Returns:
-        固定结构化结果。
+        Args:
+            input_bytes: 输入字节。
+            stream_name: 输入名称。
+            config: 闭合转换配置。
+            cancellation: canonical token。
 
-    Raises:
-        无。
-    """
+        Returns:
+            typed conversion result。
 
-    del raw_data
-    return {"name": stream_name, "format": "docling"}
+        Raises:
+            无。
+        """
+
+        del input_bytes, config, cancellation
+        data = ('{"name": "' + stream_name + '", "format": "docling"}').encode()
+        return DoclingConversionResult(data, len(data), hashlib.sha256(data).hexdigest())
 
 
 @pytest.mark.asyncio
@@ -48,8 +66,8 @@ async def test_upload_material_stream_uploads_docling_files(tmp_path: Path) -> N
     pipeline = SecPipeline(
         workspace_root=tmp_path,
         processor_registry=build_fins_processor_registry(),
+        docling_converter=_FakeDoclingConverter(),
     )
-    pipeline._upload_service._convert_with_docling = _convert_docling_stub
     material_file = tmp_path / "material.pdf"
     material_file.write_text("demo material", encoding="utf-8")
 
@@ -111,8 +129,8 @@ async def test_upload_material_stream_auto_action_and_overwrite_reset(tmp_path: 
     pipeline = SecPipeline(
         workspace_root=tmp_path,
         processor_registry=build_fins_processor_registry(),
+        docling_converter=_FakeDoclingConverter(),
     )
-    pipeline._upload_service._convert_with_docling = _convert_docling_stub
     old_file = tmp_path / "deck_old.pdf"
     new_file = tmp_path / "deck_new.pdf"
     old_file.write_text("old material", encoding="utf-8")

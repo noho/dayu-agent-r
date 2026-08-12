@@ -10,6 +10,7 @@ from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import Protocol, TypeAlias
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.document_models import FinsIngestMethod
 from dayu.fins.domain.enums import SourceKind
@@ -17,9 +18,9 @@ from dayu.fins.downloaders.sec_downloader import SecDownloader
 from dayu.fins.pipelines.docling_upload_service import (
     DoclingUploadService,
     UploadOperationResult,
-    UploadCancellationChecker,
     build_material_ids,
     build_sec_filing_ids,
+    commit_prepared_upload_batch,
     derive_report_kind,
     resolve_upload_action,
     validate_material_upload_ids,
@@ -135,7 +136,7 @@ async def run_upload_filing_stream(
     company_name: str | None = None,
     ticker_aliases: list[str] | None = None,
     overwrite: bool = False,
-    cancellation_checker: UploadCancellationChecker | None = None,
+    cancellation_checker: CancellationToken | None = None,
 ) -> AsyncIterator[UploadFilingEvent]:
     """执行流式财报上传。
 
@@ -215,7 +216,7 @@ async def run_upload_filing_stream(
             host._batching_repository.rollback_batch(company_batch)
             raise
         host._batching_repository.commit_batch(company_batch)
-        prepared_upload = host._upload_service.prepare_upload(
+        prepared_upload = await host._upload_service.prepare_upload(
             ticker=normalized_ticker,
             source_kind=SourceKind.FILING,
             action=normalized_action,
@@ -224,7 +225,7 @@ async def run_upload_filing_stream(
             form_type=filing_form_type,
             files=files,
             overwrite=overwrite,
-            cancellation_checker=cancellation_checker,
+            cancellation=cancellation_checker,
             meta={
                 "company_id": normalized_company_id,
                 "ingest_method": FinsIngestMethod.UPLOAD.to_storage_value(),
@@ -239,19 +240,13 @@ async def run_upload_filing_stream(
         if isinstance(prepared_upload, UploadOperationResult):
             upload_result = prepared_upload
         else:
-            document_batch = host._batching_repository.begin_batch(normalized_ticker)
-            try:
-                upload_result = host._upload_service.publish_prepared_upload(
-                    prepared_upload,
-                    batch=document_batch,
-                )
-            except BaseException:
-                host._batching_repository.rollback_batch(document_batch)
-                raise
-            if upload_result.status == "cancelled":
-                host._batching_repository.rollback_batch(document_batch)
-            else:
-                host._batching_repository.commit_batch(document_batch)
+            upload_result = commit_prepared_upload_batch(
+                service=host._upload_service,
+                batching_repository=host._batching_repository,
+                batch=host._batching_repository.begin_batch(normalized_ticker),
+                prepared=prepared_upload,
+                cancellation=cancellation_checker,
+            )
         for file_event in upload_result.file_events:
             yield UploadFilingEvent(
                 event_type=_map_upload_file_event_to_filing_event_type(file_event),
@@ -330,7 +325,7 @@ async def run_upload_material_stream(
     company_name: str | None = None,
     ticker_aliases: list[str] | None = None,
     overwrite: bool = False,
-    cancellation_checker: UploadCancellationChecker | None = None,
+    cancellation_checker: CancellationToken | None = None,
 ) -> AsyncIterator[UploadMaterialEvent]:
     """执行流式材料上传。
 
@@ -425,7 +420,7 @@ async def run_upload_material_stream(
             host._batching_repository.rollback_batch(company_batch)
             raise
         host._batching_repository.commit_batch(company_batch)
-        prepared_upload = host._upload_service.prepare_upload(
+        prepared_upload = await host._upload_service.prepare_upload(
             ticker=normalized_ticker,
             source_kind=SourceKind.MATERIAL,
             action=normalized_action,
@@ -434,7 +429,7 @@ async def run_upload_material_stream(
             form_type=form_type,
             files=file_list,
             overwrite=overwrite,
-            cancellation_checker=cancellation_checker,
+            cancellation=cancellation_checker,
             meta={
                 "company_id": normalized_company_id,
                 "ingest_method": FinsIngestMethod.UPLOAD.to_storage_value(),
@@ -448,19 +443,13 @@ async def run_upload_material_stream(
         if isinstance(prepared_upload, UploadOperationResult):
             upload_result = prepared_upload
         else:
-            document_batch = host._batching_repository.begin_batch(normalized_ticker)
-            try:
-                upload_result = host._upload_service.publish_prepared_upload(
-                    prepared_upload,
-                    batch=document_batch,
-                )
-            except BaseException:
-                host._batching_repository.rollback_batch(document_batch)
-                raise
-            if upload_result.status == "cancelled":
-                host._batching_repository.rollback_batch(document_batch)
-            else:
-                host._batching_repository.commit_batch(document_batch)
+            upload_result = commit_prepared_upload_batch(
+                service=host._upload_service,
+                batching_repository=host._batching_repository,
+                batch=host._batching_repository.begin_batch(normalized_ticker),
+                prepared=prepared_upload,
+                cancellation=cancellation_checker,
+            )
         for file_event in upload_result.file_events:
             yield UploadMaterialEvent(
                 event_type=_map_upload_file_event_to_material_event_type(file_event),

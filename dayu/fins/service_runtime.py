@@ -475,6 +475,9 @@ class DefaultFinsRuntime:
                 build_hk_download_adapter,
             )
             from dayu.fins.pipelines.sec_pipeline import SEC_DOWNLOAD_SOURCE, SecPipeline, build_sec_download_adapter
+            from dayu.fins.pipelines.docling_process_converter import ProcessDoclingConverter
+
+            docling_converter = ProcessDoclingConverter()
 
             sec_download_adapter = build_sec_download_adapter(
                 workspace_root=self.workspace_root,
@@ -494,6 +497,7 @@ class DefaultFinsRuntime:
                 processed_repository=self.processed_repository,
                 blob_repository=self.blob_repository,
                 filing_maintenance_repository=self.filing_maintenance_repository,
+                docling_converter=docling_converter,
             )
             hk_download_adapter = build_hk_download_adapter(
                 workspace_root=self.workspace_root,
@@ -503,6 +507,7 @@ class DefaultFinsRuntime:
                 processed_repository=self.processed_repository,
                 blob_repository=self.blob_repository,
                 filing_maintenance_repository=self.filing_maintenance_repository,
+                docling_converter=docling_converter,
             )
             # 下载 adapter 保留 source-specific downloader defaults 与 adapter identity；
             # upload runner 使用 production facade，但共享同一组 repository/job store。
@@ -515,6 +520,7 @@ class DefaultFinsRuntime:
                 processed_repository=self.processed_repository,
                 blob_repository=self.blob_repository,
                 filing_maintenance_repository=self.filing_maintenance_repository,
+                docling_converter=docling_converter,
             )
             cn_upload_pipeline = CnPipeline(
                 workspace_root=self.workspace_root,
@@ -524,6 +530,7 @@ class DefaultFinsRuntime:
                 processed_repository=self.processed_repository,
                 blob_repository=self.blob_repository,
                 filing_maintenance_repository=self.filing_maintenance_repository,
+                docling_converter=docling_converter,
             )
             upload_runner = ProductionFinsUploadRunner(
                 sec_pipeline=sec_upload_pipeline,

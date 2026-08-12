@@ -8,6 +8,7 @@ rebuild。process、CLI、Host、tool/provider 装配不在本 Slice 内。
 
 from __future__ import annotations
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 
 import asyncio
@@ -47,7 +48,8 @@ from dayu.fins.ingestion_runtime import (
     FinsSourceDownloadAdapterRequest,
     FinsSourceDownloadAdapterResult,
 )
-from dayu.fins.pipelines.docling_upload_service import DoclingUploadService, UploadCancellationChecker
+from dayu.fins.pipelines.docling_process_converter import DoclingConverter, ProcessDoclingConverter
+from dayu.fins.pipelines.docling_upload_service import DoclingUploadService
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.pipelines.sec_6k_rules import (
     _has_6k_exhibit_candidate,
@@ -484,6 +486,7 @@ class SecPipeline:
         blob_repository: DocumentBlobRepositoryProtocol | None = None,
         filing_maintenance_repository: FilingMaintenanceRepositoryProtocol | None = None,
         batching_repository: BatchingRepositoryProtocol | None = None,
+        docling_converter: DoclingConverter | None = None,
         user_agent: Optional[str] = None,
         sleep_seconds: float = DEFAULT_SLEEP_SECONDS,
         max_retries: int = DEFAULT_MAX_RETRIES,
@@ -500,6 +503,7 @@ class SecPipeline:
             blob_repository: 可选文件对象仓储。
             filing_maintenance_repository: 可选 filing 维护仓储。
             batching_repository: 可选 batch lifecycle 仓储。
+            docling_converter: 可选共享 Docling converter；未提供时构造 production 实现。
             user_agent: SEC User-Agent。
             sleep_seconds: SEC 请求间隔秒数。
             max_retries: SEC 下载重试次数。
@@ -551,6 +555,7 @@ class SecPipeline:
         self._upload_service = DoclingUploadService(
             source_repository=self._source_repository,
             blob_repository=self._blob_repository,
+            docling_converter=docling_converter or ProcessDoclingConverter(),
         )
 
     @property
@@ -738,7 +743,7 @@ class SecPipeline:
         ticker_aliases: Optional[list[str]] = None,
         overwrite: bool = False,
         *,
-        cancellation_checker: UploadCancellationChecker | None = None,
+        cancellation_checker: CancellationToken | None = None,
     ) -> SecPipelineUploadResult:
         """执行 SEC 财报上传并同步返回聚合结果。
 
@@ -800,7 +805,7 @@ class SecPipeline:
         ticker_aliases: Optional[list[str]] = None,
         overwrite: bool = False,
         *,
-        cancellation_checker: UploadCancellationChecker | None = None,
+        cancellation_checker: CancellationToken | None = None,
     ) -> AsyncIterator["UploadFilingEvent"]:
         """执行流式 SEC 财报上传。
 
@@ -862,7 +867,7 @@ class SecPipeline:
         ticker_aliases: Optional[list[str]] = None,
         overwrite: bool = False,
         *,
-        cancellation_checker: UploadCancellationChecker | None = None,
+        cancellation_checker: CancellationToken | None = None,
     ) -> SecPipelineUploadResult:
         """执行 SEC 材料上传并同步返回聚合结果。
 
@@ -933,7 +938,7 @@ class SecPipeline:
         ticker_aliases: Optional[list[str]] = None,
         overwrite: bool = False,
         *,
-        cancellation_checker: UploadCancellationChecker | None = None,
+        cancellation_checker: CancellationToken | None = None,
     ) -> AsyncIterator["UploadMaterialEvent"]:
         """执行流式 SEC 材料上传。
 

@@ -5,11 +5,12 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
-from dayu.contracts.json_value import JsonValue
+from dayu.contracts.cancellation import CancellationToken
 from dayu.fins.downloaders.hkexnews_downloader import HkexnewsDiscoveryClient
 from dayu.fins.domain.document_models import CompanyMeta, now_iso8601
 from dayu.fins.domain.enums import SourceKind
@@ -21,8 +22,11 @@ from dayu.fins.pipelines.cn_download_models import (
     CnReportQuery,
     DownloadedReportAsset,
 )
-from dayu.fins.pipelines.cn_download_protocols import CnDoclingConversionRunner
 from dayu.fins.pipelines.cn_pipeline import CnPipeline, collect_cn_download_result_from_events
+from dayu.fins.pipelines.docling_process_converter import (
+    DoclingConversionConfig,
+    DoclingConversionResult,
+)
 from dayu.fins.pipelines.download_events import DownloadEventType
 from dayu.fins.pipelines.upload_company_meta import RESOLVER_VERSION
 from dayu.fins.pipelines.upload_filing_events import UploadFilingEventType
@@ -32,20 +36,53 @@ _PDF_BYTES = b"%PDF-1.7\n" + b"0" * 2048
 _DOCLING_BYTES = b'{"document": "ok"}'
 
 
-def _never_cancel() -> bool:
-    """返回未取消的稳定测试信号。
+class _NeverCancelledToken(CancellationToken):
+    """始终未取消的 canonical 测试 token。"""
 
-    Args:
-        无。
+    def __call__(self) -> bool:
+        """委托 canonical 观察方法。
 
-    Returns:
-        始终为 ``False``。
+        Returns:
+            始终返回 ``False``。
+        """
 
-    Raises:
-        无。
-    """
+        return self.is_cancelled()
 
-    return False
+    def is_cancelled(self) -> bool:
+        """返回未取消的稳定测试信号。
+
+        Args:
+            无。
+
+        Returns:
+            始终为 ``False``。
+
+        Raises:
+            无。
+        """
+
+        return False
+
+    def cancel_reason(self) -> str | None:
+        """返回取消原因。
+
+        Returns:
+            始终返回 ``None``。
+        """
+
+        return None
+
+    def requested_at(self) -> datetime | None:
+        """返回取消时间。
+
+        Returns:
+            始终返回 ``None``。
+        """
+
+        return None
+
+
+_never_cancel = _NeverCancelledToken()
 
 
 @dataclass
@@ -237,24 +274,27 @@ class _PipelineDownloadFakeHkDiscoveryClient:
 
 
 @dataclass
-class _PipelineDownloadFakeConversionRunner(CnDoclingConversionRunner):
+class _PipelineDownloadFakeConversionRunner:
     """CnPipeline wrapper 测试用 typed Docling runner。"""
 
     calls: int = 0
+    cancellations: list[CancellationToken | None] = field(default_factory=list)
 
-    async def convert_pdf_to_docling_json(
+    async def convert_to_json_bytes(
         self,
-        pdf_bytes: bytes,
+        input_bytes: bytes,
         stream_name: str,
         *,
-        cancellation_checker: Callable[[], bool],
-    ) -> bytes:
+        config: DoclingConversionConfig,
+        cancellation: CancellationToken | None,
+    ) -> DoclingConversionResult:
         """返回固定 Docling JSON。
 
         Args:
             pdf_bytes: PDF 字节。
             stream_name: 流名称。
-            cancellation_checker: operation-scoped 取消检查器。
+            config: 闭合转换配置。
+            cancellation: canonical 取消 token。
 
         Returns:
             Docling JSON 字节。
@@ -263,28 +303,15 @@ class _PipelineDownloadFakeConversionRunner(CnDoclingConversionRunner):
             无。
         """
 
-        del pdf_bytes, stream_name
-        assert cancellation_checker() is False
+        del input_bytes, stream_name, config
+        assert cancellation is None or cancellation.is_cancelled() is False
         self.calls += 1
-        return _DOCLING_BYTES
-
-
-def _convert_docling_stub(raw_data: bytes, stream_name: str) -> dict[str, JsonValue]:
-    """返回固定 Docling 转换结果。
-
-    Args:
-        raw_data: 输入原始字节。
-        stream_name: 输入流名称。
-
-    Returns:
-        固定结构化结果。
-
-    Raises:
-        无。
-    """
-
-    del raw_data
-    return {"name": stream_name, "format": "docling"}
+        self.cancellations.append(cancellation)
+        return DoclingConversionResult(
+            json_bytes=_DOCLING_BYTES,
+            size=len(_DOCLING_BYTES),
+            sha256=hashlib.sha256(_DOCLING_BYTES).hexdigest(),
+        )
 
 
 def _seed_cn_upload_company_meta(
@@ -343,7 +370,7 @@ def test_download_runs_cn_workflow_with_injected_discovery_client(tmp_path: Path
     pipeline = CnPipeline(
         workspace_root=tmp_path,
         cn_discovery_client=discovery,
-        docling_conversion_runner=runner,
+        docling_converter=runner,
     )
     cancel_checker = _never_cancel
 
@@ -369,6 +396,7 @@ def test_download_runs_cn_workflow_with_injected_discovery_client(tmp_path: Path
     assert discovery.cancellation_checkpoints[0] is not None
     assert discovery.cancellation_checkpoints[0] is not cancel_checker
     assert runner.calls == 1
+    assert runner.cancellations == [cancel_checker]
 
 
 def test_default_hk_discovery_client_is_hkexnews(tmp_path: Path) -> None:
@@ -409,7 +437,7 @@ def test_download_runs_hk_workflow_with_injected_discovery_client(tmp_path: Path
     pipeline = CnPipeline(
         workspace_root=tmp_path,
         hk_discovery_client=discovery,
-        docling_conversion_runner=runner,
+        docling_converter=runner,
     )
     cancel_checker = _never_cancel
 
@@ -438,6 +466,7 @@ def test_download_runs_hk_workflow_with_injected_discovery_client(tmp_path: Path
     assert discovery.cancellation_checkpoints[0] is not None
     assert discovery.cancellation_checkpoints[0] is not cancel_checker
     assert runner.calls == 1
+    assert runner.cancellations == [cancel_checker]
 
 
 @pytest.mark.asyncio
@@ -461,7 +490,7 @@ async def test_download_stream_runs_cn_workflow_with_injected_discovery_client(
     pipeline = CnPipeline(
         workspace_root=tmp_path,
         cn_discovery_client=discovery,
-        docling_conversion_runner=runner,
+        docling_converter=runner,
     )
 
     events = [
@@ -514,7 +543,7 @@ async def test_hk_adapter_progress_sink_projects_conversion_lifecycle(tmp_path: 
     pipeline = CnPipeline(
         workspace_root=tmp_path,
         hk_discovery_client=_PipelineDownloadFakeHkDiscoveryClient(temp_dir=tmp_path),
-        docling_conversion_runner=_PipelineDownloadFakeConversionRunner(),
+        docling_converter=_PipelineDownloadFakeConversionRunner(),
     )
     progress_events: list[FinsDownloadProgressEvent] = []
 
@@ -580,7 +609,7 @@ def test_download_non_explicit_nonempty_start_keeps_default_business_limit(tmp_p
     pipeline = CnPipeline(
         workspace_root=tmp_path,
         cn_discovery_client=discovery,
-        docling_conversion_runner=runner,
+        docling_converter=runner,
     )
 
     result = pipeline.download(
@@ -613,8 +642,10 @@ async def test_upload_filing_stream_uploads_files_with_docling(tmp_path: Path) -
         AssertionError: 断言失败时抛出。
     """
 
-    pipeline = CnPipeline(workspace_root=tmp_path)
-    pipeline._upload_service._convert_with_docling = _convert_docling_stub
+    pipeline = CnPipeline(
+        workspace_root=tmp_path,
+        docling_converter=_PipelineDownloadFakeConversionRunner(),
+    )
     filing_file = tmp_path / "annual.pdf"
     filing_file.write_text("demo cn filing", encoding="utf-8")
 
@@ -672,8 +703,10 @@ async def test_upload_filing_stream_refreshes_stale_company_meta(tmp_path: Path)
         AssertionError: 断言失败时抛出。
     """
 
-    pipeline = CnPipeline(workspace_root=tmp_path)
-    pipeline._upload_service._convert_with_docling = _convert_docling_stub
+    pipeline = CnPipeline(
+        workspace_root=tmp_path,
+        docling_converter=_PipelineDownloadFakeConversionRunner(),
+    )
     _seed_cn_upload_company_meta(
         pipeline=pipeline,
         company_name="旧贵州茅台",
@@ -722,8 +755,10 @@ async def test_upload_material_stream_uploads_files_with_docling(tmp_path: Path)
         AssertionError: 断言失败时抛出。
     """
 
-    pipeline = CnPipeline(workspace_root=tmp_path)
-    pipeline._upload_service._convert_with_docling = _convert_docling_stub
+    pipeline = CnPipeline(
+        workspace_root=tmp_path,
+        docling_converter=_PipelineDownloadFakeConversionRunner(),
+    )
     material_file = tmp_path / "deck.pdf"
     material_file.write_text("demo cn material", encoding="utf-8")
 
@@ -775,8 +810,10 @@ async def test_upload_filing_stream_auto_resolves_create_update_skip(tmp_path: P
         AssertionError: 断言失败时抛出。
     """
 
-    pipeline = CnPipeline(workspace_root=tmp_path)
-    pipeline._upload_service._convert_with_docling = _convert_docling_stub
+    pipeline = CnPipeline(
+        workspace_root=tmp_path,
+        docling_converter=_PipelineDownloadFakeConversionRunner(),
+    )
     filing_file = tmp_path / "annual.pdf"
     filing_file.write_text("demo cn filing", encoding="utf-8")
 
@@ -831,8 +868,10 @@ async def test_upload_material_stream_overwrite_resets_single_document(tmp_path:
         AssertionError: 断言失败时抛出。
     """
 
-    pipeline = CnPipeline(workspace_root=tmp_path)
-    pipeline._upload_service._convert_with_docling = _convert_docling_stub
+    pipeline = CnPipeline(
+        workspace_root=tmp_path,
+        docling_converter=_PipelineDownloadFakeConversionRunner(),
+    )
     old_file = tmp_path / "deck_old.pdf"
     new_file = tmp_path / "deck_new.pdf"
     old_file.write_text("old material", encoding="utf-8")

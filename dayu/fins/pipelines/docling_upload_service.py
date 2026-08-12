@@ -10,17 +10,15 @@ from __future__ import annotations
 import hashlib
 import json
 import mimetypes
-from collections.abc import Callable, Mapping
+import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Final, Literal, TypeAlias, cast
+from typing import Final, Literal, TypeAlias
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
-from dayu.documents.docling_runtime import (
-    DoclingRuntimeInitializationError,
-    convert_pdf_bytes_with_docling,
-)
 from dayu.fins._log import Log
 from dayu.fins.domain.document_models import (
     BatchToken,
@@ -32,12 +30,19 @@ from dayu.fins.domain.document_models import (
     now_iso8601,
 )
 from dayu.fins.domain.enums import SourceKind
-from dayu.fins.storage import DocumentBlobRepositoryProtocol, SourceDocumentRepositoryProtocol
+from dayu.fins.pipelines.docling_process_converter import (
+    DEFAULT_FINS_DOCLING_CONVERSION_CONFIG,
+    DoclingConversionCancelledError,
+    DoclingConverter,
+)
+from dayu.fins.storage import (
+    BatchingRepositoryProtocol,
+    DocumentBlobRepositoryProtocol,
+    SourceDocumentRepositoryProtocol,
+)
 from dayu.fins.ticker_normalization import try_normalize_ticker
 
 JsonObject: TypeAlias = dict[str, JsonValue]
-DoclingUploadConverter: TypeAlias = Callable[[bytes, str], JsonObject]
-UploadCancellationChecker: TypeAlias = Callable[[], bool]
 
 SUPPORTED_UPLOAD_SUFFIXES: Final[frozenset[str]] = frozenset(
     {
@@ -138,12 +143,9 @@ class _PreparedAssetMutation:
     meta: JsonObject
     source_fingerprint: str
     document_version: str
-    cancellation_checker: UploadCancellationChecker | None
 
 
-PreparedDoclingUpload: TypeAlias = (
-    UploadOperationResult | _PreparedDeleteMutation | _PreparedAssetMutation
-)
+PreparedDoclingUpload: TypeAlias = UploadOperationResult | _PreparedDeleteMutation | _PreparedAssetMutation
 """Docling 转换完成后交给 top-level publication owner 的 typed plan。"""
 
 
@@ -157,14 +159,14 @@ class DoclingUploadService:
         source_repository: SourceDocumentRepositoryProtocol,
         blob_repository: DocumentBlobRepositoryProtocol,
         *,
-        convert_with_docling: DoclingUploadConverter | None = None,
+        docling_converter: DoclingConverter,
     ) -> None:
         """初始化服务。
 
         Args:
             source_repository: 源文档仓储实现。
             blob_repository: 文档文件对象仓储实现。
-            convert_with_docling: 可选 Docling 转换函数。
+            docling_converter: Fins 共享 Docling 转换器。
 
         Returns:
             无。
@@ -177,11 +179,13 @@ class DoclingUploadService:
             raise ValueError("source_repository 不能为空")
         if blob_repository is None:
             raise ValueError("blob_repository 不能为空")
+        if docling_converter is None:
+            raise ValueError("docling_converter 不能为空")
         self._source_repository = source_repository
         self._blob_repository = blob_repository
-        self._convert_with_docling = convert_with_docling or _convert_bytes_with_docling
+        self._docling_converter = docling_converter
 
-    def prepare_upload(
+    async def prepare_upload(
         self,
         *,
         ticker: str,
@@ -193,7 +197,7 @@ class DoclingUploadService:
         files: list[Path],
         overwrite: bool,
         meta: Mapping[str, JsonValue],
-        cancellation_checker: UploadCancellationChecker | None = None,
+        cancellation: CancellationToken | None,
     ) -> PreparedDoclingUpload:
         """完成读取与 Docling 转换，生成待发布计划。
 
@@ -207,7 +211,7 @@ class DoclingUploadService:
             files: 上传文件列表。
             overwrite: 是否强制覆盖。
             meta: 业务元数据字段。
-            cancellation_checker: 可选协作式取消检查器。
+            cancellation: 公共取消观察 token；``None`` 表示无取消源。
 
         Returns:
             无需写入时返回最终结果；否则返回等待 caller 短事务发布的 typed plan。
@@ -230,7 +234,7 @@ class DoclingUploadService:
             raise ValueError("internal_document_id 不能为空")
         if not form_type.strip():
             raise ValueError("form_type 不能为空")
-        if _is_cancelled(cancellation_checker):
+        if _is_cancelled(cancellation):
             return _build_cancelled_result(document_id=document_id, internal_document_id=internal_document_id)
 
         if normalized_action == "delete":
@@ -245,7 +249,7 @@ class DoclingUploadService:
         previous_meta = self._safe_get_document_meta(normalized_ticker, document_id, source_kind)
         if normalized_action == "update" and previous_meta is None and not overwrite:
             raise FileNotFoundError(f"Document not found for update: {document_id}")
-        if _is_cancelled(cancellation_checker):
+        if _is_cancelled(cancellation):
             return _build_cancelled_result(document_id=document_id, internal_document_id=internal_document_id)
 
         original_assets = self._build_original_assets(validated_files)
@@ -268,12 +272,18 @@ class DoclingUploadService:
                 },
             )
 
-        pending_assets, conversion_events = self._build_pending_assets(
-            validated_files,
-            original_assets,
-            cancellation_checker=cancellation_checker,
-        )
-        if _is_cancelled(cancellation_checker):
+        try:
+            pending_assets, conversion_events = await self._build_pending_assets(
+                validated_files,
+                original_assets,
+                cancellation=cancellation,
+            )
+        except DoclingConversionCancelledError:
+            return _build_cancelled_result(
+                document_id=document_id,
+                internal_document_id=internal_document_id,
+            )
+        if _is_cancelled(cancellation):
             return _build_cancelled_result(document_id=document_id, internal_document_id=internal_document_id)
         current_version = _resolve_document_version(previous_meta, source_fingerprint)
         staging_meta = self._build_upsert_meta(
@@ -296,7 +306,6 @@ class DoclingUploadService:
             meta=staging_meta,
             source_fingerprint=source_fingerprint,
             document_version=current_version,
-            cancellation_checker=cancellation_checker,
         )
 
     def publish_prepared_upload(
@@ -304,12 +313,14 @@ class DoclingUploadService:
         prepared: PreparedDoclingUpload,
         *,
         batch: BatchToken,
+        cancellation: CancellationToken | None,
     ) -> UploadOperationResult:
         """在 caller-owned 短事务内发布已准备的 Docling 计划。
 
         Args:
             prepared: ``prepare_upload`` 返回的 typed plan。
             batch: caller 显式传入的 batch capability。
+            cancellation: 公共取消观察 token；``None`` 表示无取消源。
 
         Returns:
             上传操作结果；取消结果要求 caller rollback，其他写入结果可 commit。
@@ -354,7 +365,7 @@ class DoclingUploadService:
             meta=prepared.meta,
             source_fingerprint=prepared.source_fingerprint,
             document_version=prepared.document_version,
-            cancellation_checker=prepared.cancellation_checker,
+            cancellation=cancellation,
             batch=batch,
         )
         if result.status == "uploaded":
@@ -384,7 +395,7 @@ class DoclingUploadService:
         meta: JsonObject,
         source_fingerprint: str,
         document_version: str,
-        cancellation_checker: UploadCancellationChecker | None,
+        cancellation: CancellationToken | None,
         batch: BatchToken,
     ) -> UploadOperationResult:
         """在 storage owner 边界写入上传文件和最终 source meta。
@@ -403,7 +414,7 @@ class DoclingUploadService:
             meta: 本次写入的 source meta。
             source_fingerprint: 本次上传源指纹。
             document_version: 本次文档版本。
-            cancellation_checker: 可选协作式取消检查器。
+            cancellation: 公共取消观察 token；``None`` 表示无取消源。
             batch: caller 显式传入的 batch capability。
 
         Returns:
@@ -437,7 +448,7 @@ class DoclingUploadService:
             source_kind=source_kind.value,
         )
         for asset in pending_assets:
-            if _is_cancelled(cancellation_checker):
+            if _is_cancelled(cancellation):
                 return _build_cancelled_result(
                     document_id=document_id,
                     internal_document_id=internal_document_id,
@@ -465,7 +476,7 @@ class DoclingUploadService:
         primary_document = _pick_primary_docling_file(stored_entries)
         if primary_document is None:
             raise RuntimeError("未生成 docling 主文件，无法写入 primary_document")
-        if _is_cancelled(cancellation_checker):
+        if _is_cancelled(cancellation):
             return _build_cancelled_result(
                 document_id=document_id,
                 internal_document_id=internal_document_id,
@@ -482,7 +493,7 @@ class DoclingUploadService:
             meta=meta,
             batch=batch,
         )
-        if _is_cancelled(cancellation_checker):
+        if _is_cancelled(cancellation):
             return _build_cancelled_result(
                 document_id=document_id,
                 internal_document_id=internal_document_id,
@@ -628,19 +639,19 @@ class DoclingUploadService:
             )
         return assets
 
-    def _build_pending_assets(
+    async def _build_pending_assets(
         self,
         files: list[Path],
         original_assets: list[_PendingFileAsset],
         *,
-        cancellation_checker: UploadCancellationChecker | None,
+        cancellation: CancellationToken | None,
     ) -> tuple[list[_PendingFileAsset], list[UploadFileEventPayload]]:
         """构建待上传资产列表与转换阶段事件。
 
         Args:
             files: 源文件列表。
             original_assets: 已读取完成的原始文件资产列表。
-            cancellation_checker: 可选协作式取消检查器。
+            cancellation: 公共取消观察 token；``None`` 表示无取消源。
 
         Returns:
             待上传资产列表与转换阶段事件列表。
@@ -656,7 +667,7 @@ class DoclingUploadService:
         assets = list(original_assets)
         conversion_events: list[UploadFileEventPayload] = []
         for file_path, original_asset in zip(files, original_assets):
-            if _is_cancelled(cancellation_checker):
+            if _is_cancelled(cancellation):
                 break
             conversion_events.append(
                 UploadFileEventPayload(
@@ -668,10 +679,15 @@ class DoclingUploadService:
                     },
                 )
             )
-            docling_payload = self._convert_with_docling(original_asset.data, file_path.name)
-            docling_data = json.dumps(docling_payload, ensure_ascii=False, indent=2).encode("utf-8")
+            conversion = await self._docling_converter.convert_to_json_bytes(
+                original_asset.data,
+                file_path.name,
+                config=DEFAULT_FINS_DOCLING_CONVERSION_CONFIG,
+                cancellation=cancellation,
+            )
+            docling_data = conversion.json_bytes
             docling_name = f"{file_path.stem}{DOCLING_FILE_SUFFIX}"
-            docling_sha256 = hashlib.sha256(docling_data).hexdigest()
+            docling_sha256 = conversion.sha256
             assets.append(
                 _PendingFileAsset(
                     name=docling_name,
@@ -780,38 +796,90 @@ class DoclingUploadService:
         )
 
 
-def _convert_bytes_with_docling(raw_data: bytes, stream_name: str) -> JsonObject:
-    """使用 Docling 将字节流转换为结构化 JSON。
+def commit_prepared_upload_batch(
+    *,
+    service: DoclingUploadService,
+    batching_repository: BatchingRepositoryProtocol,
+    batch: BatchToken,
+    prepared: _PreparedDeleteMutation | _PreparedAssetMutation,
+    cancellation: CancellationToken | None,
+) -> UploadOperationResult:
+    """发布并提交一个 caller-owned 文档 batch。
+
+    本函数是上传 publication 生命周期的唯一 owner。最终取消检查返回的瞬间
+    是 cancel 与 commit 的线性化点；进入 ``commit_batch`` 后 capability 已转交
+    storage owner，调用方不再读取消状态，也不再回滚。
 
     Args:
-        raw_data: 文件原始字节内容。
-        stream_name: 流名称。
+        service: 只负责向 caller-owned batch 写入 staged mutation 的上传服务。
+        batching_repository: batch 生命周期仓储。
+        batch: 尚未交给 ``commit_batch`` 的 caller-owned capability。
+        prepared: 已完成转换与业务校验的 mutation。
+        cancellation: 公共取消观察 token；``None`` 表示无取消源。
 
     Returns:
-        Docling 导出的结构化字典。
+        commit 正常返回后的完成结果，或 precommit 取消并回滚后的取消结果。
 
     Raises:
-        DoclingRuntimeInitializationError: Docling 装配失败时抛出。
-        RuntimeError: Docling 转换失败或导出结构非法时抛出。
+        BaseException: staged write、最终 checkpoint、rollback 或 commit 失败时抛出；
+            commit 已开始后的异常不会触发 caller rollback。
+    """
+
+    batch_terminal_started = False
+    try:
+        result = service.publish_prepared_upload(
+            prepared,
+            batch=batch,
+            cancellation=cancellation,
+        )
+        if result.status == "cancelled" or _is_cancelled(cancellation):
+            batch_terminal_started = True
+            batching_repository.rollback_batch(batch)
+            return _build_cancelled_result(
+                document_id=prepared.document_id,
+                internal_document_id=prepared.internal_document_id,
+            )
+        # 先转移 capability 所有权，再进入 storage commit；从此不再读取取消或回滚。
+        batch_terminal_started = True
+        batching_repository.commit_batch(batch)
+        return result
+    finally:
+        if not batch_terminal_started:
+            _rollback_precommit_upload_batch(
+                batching_repository=batching_repository,
+                batch=batch,
+                operation_error=sys.exception(),
+            )
+
+
+def _rollback_precommit_upload_batch(
+    *,
+    batching_repository: BatchingRepositoryProtocol,
+    batch: BatchToken,
+    operation_error: BaseException | None,
+) -> None:
+    """恰好一次回滚尚由 caller 持有的上传 batch。
+
+    Args:
+        batching_repository: batch 生命周期仓储。
+        batch: 尚未进入 commit 的 capability。
+        operation_error: 当前正在传播的原始异常；正常路径为 ``None``。
+
+    Returns:
+        rollback 成功时返回 ``None``。
+
+    Raises:
+        BaseException: rollback 失败时保留原始异常为主异常；没有原始异常时
+            原样抛出 rollback 异常。
     """
 
     try:
-        result = convert_pdf_bytes_with_docling(
-            raw_data,
-            stream_name=stream_name,
-            do_ocr=True,
-            do_table_structure=True,
-            table_mode="accurate",
-            do_cell_matching=True,
-        )
-    except DoclingRuntimeInitializationError:
+        batching_repository.rollback_batch(batch)
+    except BaseException as rollback_error:
+        if operation_error is not None:
+            operation_error.add_note(f"rollback_batch failed; recovery evidence retained: {rollback_error}")
+            raise operation_error from rollback_error
         raise
-    except Exception as exc:  # pragma: no cover - 第三方转换异常兜底
-        raise RuntimeError(f"Docling 转换失败: {stream_name}") from exc
-    payload = cast(JsonValue, result.document.export_to_dict())
-    if not isinstance(payload, Mapping):
-        raise RuntimeError(f"Docling 导出结果非法: {stream_name}")
-    return dict(payload)
 
 
 def _validate_source_files(files: list[Path]) -> list[Path]:
@@ -1341,11 +1409,11 @@ def _build_cancelled_result(*, document_id: str, internal_document_id: str) -> U
     )
 
 
-def _is_cancelled(cancellation_checker: UploadCancellationChecker | None) -> bool:
+def _is_cancelled(cancellation: CancellationToken | None) -> bool:
     """读取协作式取消状态。
 
     Args:
-        cancellation_checker: 可选取消检查器。
+        cancellation: 公共取消观察 token；``None`` 表示无取消源。
 
     Returns:
         已取消返回 ``True``，否则返回 ``False``。
@@ -1354,7 +1422,7 @@ def _is_cancelled(cancellation_checker: UploadCancellationChecker | None) -> boo
         OSError: 取消检查读取失败时由具体实现抛出。
     """
 
-    return bool(cancellation_checker is not None and cancellation_checker())
+    return bool(cancellation is not None and cancellation.is_cancelled())
 
 
 def _text_meta(meta: Mapping[str, JsonValue], key: str) -> str:
@@ -1379,7 +1447,6 @@ def _text_meta(meta: Mapping[str, JsonValue], key: str) -> str:
 
 __all__ = [
     "DOCLING_FILE_SUFFIX",
-    "DoclingUploadConverter",
     "DoclingUploadService",
     "SUPPORTED_UPLOAD_SUFFIXES",
     "UPLOAD_ACTIONS",
@@ -1389,6 +1456,7 @@ __all__ = [
     "build_cn_filing_ids",
     "build_material_ids",
     "build_sec_filing_ids",
+    "commit_prepared_upload_batch",
     "derive_report_kind",
     "normalize_cn_fiscal_period",
     "resolve_upload_action",

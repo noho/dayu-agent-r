@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from collections.abc import Callable
+from threading import Event, Thread
 from typing import BinaryIO, Optional
 
 import pytest
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.document_models import (
     BatchToken,
@@ -31,9 +35,15 @@ from dayu.fins.pipelines.docling_upload_service import (
     build_cn_filing_ids,
     build_material_ids,
     build_sec_filing_ids,
+    commit_prepared_upload_batch,
     derive_report_kind,
     normalize_cn_fiscal_period,
     validate_material_upload_ids,
+)
+from dayu.fins.pipelines.docling_process_converter import (
+    DoclingConversionCancelledError,
+    DoclingConversionConfig,
+    DoclingConversionResult,
 )
 from dayu.fins.storage import (
     FsBatchingRepository,
@@ -61,6 +71,7 @@ class _SpyUploadSourceRepository(FsSourceDocumentRepository):
 
         super().__init__(workspace_root, repository_set=repository_set)
         self._events = events
+
 
 class _FailingFinalUploadSourceRepository(_SpyUploadSourceRepository):
     """在 final create 阶段失败的 source 仓储 spy。"""
@@ -236,6 +247,114 @@ class _RollbackFailingUploadBatchingRepository(FsBatchingRepository):
         raise OSError("forced rollback failure")
 
 
+class _CommitBarrierBatchingRepository(FsBatchingRepository):
+    """在 ownership transfer 后阻塞 commit 的竞态测试仓储。"""
+
+    def __init__(self, workspace_root: Path, repository_set: _FsRepositorySet) -> None:
+        """初始化 commit barrier。
+
+        Args:
+            workspace_root: 测试工作区。
+            repository_set: 共享仓储集合。
+
+        Returns:
+            无。
+        """
+
+        super().__init__(workspace_root, repository_set=repository_set)
+        self.commit_entered = Event()
+        self.allow_commit_return = Event()
+        self.rollback_calls = 0
+
+    def commit_batch(self, batch: BatchToken) -> None:
+        """在真实 commit 前等待测试释放。
+
+        Args:
+            batch: 已转交 storage owner 的 capability。
+
+        Returns:
+            无。
+
+        Raises:
+            TimeoutError: 测试未释放 barrier 时抛出。
+            OSError: 真实 commit 失败时抛出。
+        """
+
+        self.commit_entered.set()
+        if not self.allow_commit_return.wait(timeout=1.0):
+            raise TimeoutError("commit barrier was not released")
+        super().commit_batch(batch)
+
+    def rollback_batch(self, batch: BatchToken) -> None:
+        """记录 caller rollback。
+
+        Args:
+            batch: caller-owned capability。
+
+        Returns:
+            无。
+
+        Raises:
+            OSError: 真实 rollback 失败时抛出。
+        """
+
+        self.rollback_calls += 1
+        super().rollback_batch(batch)
+
+
+class _MutableToken(CancellationToken):
+    """由 Event 驱动并记录观察次数的 canonical token。"""
+
+    def __init__(self) -> None:
+        """初始化未取消状态。
+
+        Returns:
+            无。
+        """
+
+        self.cancelled = Event()
+        self.read_count = 0
+
+    def request_cancel(self) -> None:
+        """请求取消。
+
+        Returns:
+            无。
+        """
+
+        self.cancelled.set()
+
+    def is_cancelled(self) -> bool:
+        """记录并返回取消状态。
+
+        Returns:
+            当前 Event 状态。
+        """
+
+        self.read_count += 1
+        return self.cancelled.is_set()
+
+    def cancel_reason(self) -> str | None:
+        """返回测试取消原因。
+
+        Returns:
+            已取消时返回固定原因，否则返回 ``None``。
+        """
+
+        return "test_cancelled" if self.cancelled.is_set() else None
+
+    def requested_at(self) -> datetime | None:
+        """返回测试取消时间。
+
+        Returns:
+            已取消时返回固定 UTC 时间，否则返回 ``None``。
+        """
+
+        if not self.cancelled.is_set():
+            return None
+        return datetime(2026, 8, 12, tzinfo=timezone.utc)
+
+
 class _BlobFirstUploadBlobRepository(FsDocumentBlobRepository):
     """证明 create blob 写入时 published source 仍不存在的仓储 spy。"""
 
@@ -287,7 +406,7 @@ class _BlobFirstUploadBlobRepository(FsDocumentBlobRepository):
         )
 
 
-class _CancelOnNthCheck:
+class _CancelOnNthCheck(CancellationToken):
     """第 N 次检查起返回取消的测试检查器。"""
 
     def __init__(self, cancel_at: int) -> None:
@@ -324,23 +443,113 @@ class _CancelOnNthCheck:
         self.calls += 1
         return self.calls >= self.cancel_at
 
+    def is_cancelled(self) -> bool:
+        """委托既有 checkpoint 计数。
 
-def _convert_docling_stub(raw_data: bytes, stream_name: str) -> dict[str, JsonValue]:
-    """返回固定 Docling 转换结果。
+        Returns:
+            达到指定检查次数后返回 ``True``。
+        """
 
-    Args:
-        raw_data: 输入原始字节。
-        stream_name: 输入流名称。
+        return self()
 
-    Returns:
-        固定结构化结果。
+    def cancel_reason(self) -> str | None:
+        """返回测试取消原因。
 
-    Raises:
-        无。
-    """
+        Returns:
+            已取消时返回固定原因，否则返回 ``None``。
+        """
 
-    del raw_data
-    return {"name": stream_name, "source": "docling"}
+        return "test_cancelled" if self.calls >= self.cancel_at else None
+
+    def requested_at(self) -> datetime | None:
+        """返回测试取消时间。
+
+        Returns:
+            已取消时返回固定 UTC 时间，否则返回 ``None``。
+        """
+
+        if self.calls < self.cancel_at:
+            return None
+        return datetime(2026, 8, 12, tzinfo=timezone.utc)
+
+
+class _FakeDoclingConverter:
+    """记录调用并返回 typed Docling JSON bytes 的测试 converter。"""
+
+    def __init__(self, calls: list[str] | None = None) -> None:
+        """初始化 converter。
+
+        Args:
+            calls: 可选调用记录列表。
+
+        Returns:
+            无。
+        """
+
+        self.calls = calls
+
+    async def convert_to_json_bytes(
+        self,
+        input_bytes: bytes,
+        stream_name: str,
+        *,
+        config: DoclingConversionConfig,
+        cancellation: CancellationToken | None,
+    ) -> DoclingConversionResult:
+        """返回与 public converter contract 一致的结果。
+
+        Args:
+            input_bytes: 输入字节。
+            stream_name: 输入名称。
+            config: 闭合转换配置。
+            cancellation: canonical token。
+
+        Returns:
+            typed JSON bytes 结果。
+
+        Raises:
+            无。
+        """
+
+        del input_bytes, config, cancellation
+        if self.calls is not None:
+            self.calls.append(stream_name)
+        data = ('{"name": "' + stream_name + '", "source": "docling"}').encode()
+        return DoclingConversionResult(
+            json_bytes=data,
+            size=len(data),
+            sha256=hashlib.sha256(data).hexdigest(),
+        )
+
+
+class _CancelledDoclingConverter:
+    """模拟 shared converter 已安全收口取消的 typed fake。"""
+
+    async def convert_to_json_bytes(
+        self,
+        input_bytes: bytes,
+        stream_name: str,
+        *,
+        config: DoclingConversionConfig,
+        cancellation: CancellationToken | None,
+    ) -> DoclingConversionResult:
+        """抛出 shared converter cancellation。
+
+        Args:
+            input_bytes: 输入字节。
+            stream_name: 输入名称。
+            config: 闭合转换配置。
+            cancellation: canonical token。
+
+        Returns:
+            不返回。
+
+        Raises:
+            DoclingConversionCancelledError: 始终抛出。
+        """
+
+        del input_bytes, stream_name, config, cancellation
+        raise DoclingConversionCancelledError()
 
 
 def _publish_prepared_upload(
@@ -349,6 +558,7 @@ def _publish_prepared_upload(
     batching_repository: FsBatchingRepository,
     ticker: str,
     prepared: PreparedDoclingUpload,
+    cancellation: CancellationToken | None = None,
 ) -> UploadOperationResult:
     """按 production top-level owner 规则发布 prepared upload。
 
@@ -367,24 +577,13 @@ def _publish_prepared_upload(
 
     if isinstance(prepared, UploadOperationResult):
         return prepared
-    batch = batching_repository.begin_batch(ticker)
-    try:
-        result = service.publish_prepared_upload(prepared, batch=batch)
-    except BaseException as operation_error:
-        try:
-            batching_repository.rollback_batch(batch)
-        except Exception as rollback_error:
-            operation_error.add_note(
-                "rollback_batch failed; recovery evidence retained: "
-                f"{rollback_error}"
-            )
-            raise operation_error from rollback_error
-        raise
-    if result.status == "cancelled":
-        batching_repository.rollback_batch(batch)
-    else:
-        batching_repository.commit_batch(batch)
-    return result
+    return commit_prepared_upload_batch(
+        service=service,
+        batching_repository=batching_repository,
+        batch=batching_repository.begin_batch(ticker),
+        prepared=prepared,
+        cancellation=cancellation,
+    )
 
 
 def _execute_upload(
@@ -400,7 +599,7 @@ def _execute_upload(
     files: list[Path],
     overwrite: bool,
     meta: dict[str, JsonValue],
-    cancellation_checker: Callable[[], bool] | None = None,
+    cancellation_checker: CancellationToken | None = None,
 ) -> UploadOperationResult:
     """准备上传并由测试 top-level owner 执行短 publication transaction。
 
@@ -425,23 +624,26 @@ def _execute_upload(
         BaseException: prepare、publication、rollback 或 commit 失败时传播。
     """
 
-    prepared = service.prepare_upload(
-        ticker=ticker,
-        source_kind=source_kind,
-        action=action,
-        document_id=document_id,
-        internal_document_id=internal_document_id,
-        form_type=form_type,
-        files=files,
-        overwrite=overwrite,
-        meta=meta,
-        cancellation_checker=cancellation_checker,
+    prepared = asyncio.run(
+        service.prepare_upload(
+            ticker=ticker,
+            source_kind=source_kind,
+            action=action,
+            document_id=document_id,
+            internal_document_id=internal_document_id,
+            form_type=form_type,
+            files=files,
+            overwrite=overwrite,
+            meta=meta,
+            cancellation=cancellation_checker,
+        )
     )
     return _publish_prepared_upload(
         service=service,
         batching_repository=batching_repository,
         ticker=ticker,
         prepared=prepared,
+        cancellation=cancellation_checker,
     )
 
 
@@ -465,7 +667,7 @@ def _build_service_context(tmp_path: Path) -> _UploadServiceContext:
     service = DoclingUploadService(
         source_repository=source_repository,
         blob_repository=blob_repository,
-        convert_with_docling=_convert_docling_stub,
+        docling_converter=_FakeDoclingConverter(),
     )
     return _UploadServiceContext(
         batching_repository=batching_repository,
@@ -516,6 +718,52 @@ def test_execute_upload_create_material_success(tmp_path: Path) -> None:
     assert len(meta["files"]) == 2
 
 
+def test_prepare_maps_shared_converter_cancel_without_starting_publication(tmp_path: Path) -> None:
+    """converter cancel 必须收敛为 cancelled plan 且不创建 document batch。
+
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: converter cancel 被投影为失败或产生 publication 时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching_repository = _BatchIdentityUploadBatchingRepository(tmp_path, repository_set, [])
+    source_repository = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    service = DoclingUploadService(
+        source_repository=source_repository,
+        blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=repository_set),
+        docling_converter=_CancelledDoclingConverter(),
+    )
+    sample_file = tmp_path / "deck.pdf"
+    sample_file.write_text("cancelled", encoding="utf-8")
+
+    prepared = asyncio.run(
+        service.prepare_upload(
+            ticker="AAPL",
+            source_kind=SourceKind.MATERIAL,
+            action="create",
+            document_id="mat_cancelled",
+            internal_document_id="mat_cancelled",
+            form_type="MATERIAL_OTHER",
+            files=[sample_file],
+            overwrite=False,
+            meta={"material_name": "Deck", "ingest_method": "upload"},
+            cancellation=None,
+        )
+    )
+
+    assert isinstance(prepared, UploadOperationResult)
+    assert prepared.status == "cancelled"
+    assert batching_repository.begin_calls == 0
+    with pytest.raises(FileNotFoundError):
+        source_repository.get_source_meta("AAPL", "mat_cancelled", SourceKind.MATERIAL)
+
+
 def test_execute_upload_writes_blobs_before_single_complete_source(tmp_path: Path) -> None:
     """上传 create 必须 blob-first，写 blob 时 published source 尚不存在。"""
 
@@ -527,7 +775,7 @@ def test_execute_upload_writes_blobs_before_single_complete_source(tmp_path: Pat
     service = DoclingUploadService(
         source_repository=source_repository,
         blob_repository=blob_repository,
-        convert_with_docling=_convert_docling_stub,
+        docling_converter=_FakeDoclingConverter(),
     )
     sample_file = tmp_path / "deck.pdf"
     sample_file.write_text("hello", encoding="utf-8")
@@ -573,7 +821,7 @@ def test_execute_upload_uses_one_caller_batch_for_blobs_and_final_meta(tmp_path:
     service = DoclingUploadService(
         source_repository=source_repository,
         blob_repository=blob_repository,
-        convert_with_docling=_convert_docling_stub,
+        docling_converter=_FakeDoclingConverter(),
     )
     sample_file = tmp_path / "deck.pdf"
     sample_file.write_text("hello", encoding="utf-8")
@@ -619,7 +867,7 @@ def test_execute_upload_commit_failure_does_not_call_caller_rollback(tmp_path: P
     service = DoclingUploadService(
         source_repository=source_repository,
         blob_repository=blob_repository,
-        convert_with_docling=_convert_docling_stub,
+        docling_converter=_FakeDoclingConverter(),
     )
     sample_file = tmp_path / "deck.pdf"
     sample_file.write_text("hello", encoding="utf-8")
@@ -648,6 +896,87 @@ def test_execute_upload_commit_failure_does_not_call_caller_rollback(tmp_path: P
         )
 
 
+def test_commit_winner_ignores_cancel_after_ownership_transfer(tmp_path: Path) -> None:
+    """commit ownership transfer 后的取消不得触发读取、rollback 或结果改写。
+
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: commit winner 线性化语义漂移时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching_repository = _CommitBarrierBatchingRepository(tmp_path, repository_set)
+    source_repository = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    service = DoclingUploadService(
+        source_repository=source_repository,
+        blob_repository=blob_repository,
+        docling_converter=_FakeDoclingConverter(),
+    )
+    token = _MutableToken()
+    sample_file = tmp_path / "deck.pdf"
+    sample_file.write_text("commit winner", encoding="utf-8")
+    prepared = asyncio.run(
+        service.prepare_upload(
+            ticker="AAPL",
+            source_kind=SourceKind.MATERIAL,
+            action="create",
+            document_id="mat_commit_winner",
+            internal_document_id="mat_commit_winner",
+            form_type="MATERIAL_OTHER",
+            files=[sample_file],
+            overwrite=False,
+            meta={"material_name": "Deck", "ingest_method": "upload"},
+            cancellation=token,
+        )
+    )
+    assert not isinstance(prepared, UploadOperationResult)
+    results: list[UploadOperationResult] = []
+
+    def commit_from_worker() -> None:
+        """在工作线程执行 publication helper。
+
+        Returns:
+            无。
+        """
+
+        results.append(
+            commit_prepared_upload_batch(
+                service=service,
+                batching_repository=batching_repository,
+                batch=batching_repository.begin_batch("AAPL"),
+                prepared=prepared,
+                cancellation=token,
+            )
+        )
+
+    worker = Thread(target=commit_from_worker)
+    worker.start()
+    assert batching_repository.commit_entered.wait(timeout=1.0)
+    reads_at_transfer = token.read_count
+    token.request_cancel()
+    batching_repository.allow_commit_return.set()
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert [result.status for result in results] == ["uploaded"]
+    assert token.read_count == reads_at_transfer
+    assert batching_repository.rollback_calls == 0
+    assert (
+        source_repository.get_source_meta(
+            "AAPL",
+            "mat_commit_winner",
+            SourceKind.MATERIAL,
+        )["ingest_complete"]
+        is True
+    )
+
+
 def test_execute_upload_operation_and_rollback_failure_preserve_both_errors(tmp_path: Path) -> None:
     """operation 与 rollback 双失败时 primary、note 与 cause 必须同时保留。"""
 
@@ -662,7 +991,7 @@ def test_execute_upload_operation_and_rollback_failure_preserve_both_errors(tmp_
     service = DoclingUploadService(
         source_repository=source_repository,
         blob_repository=blob_repository,
-        convert_with_docling=_convert_docling_stub,
+        docling_converter=_FakeDoclingConverter(),
     )
     sample_file = tmp_path / "deck.pdf"
     sample_file.write_text("hello", encoding="utf-8")
@@ -692,13 +1021,13 @@ def test_execute_upload_create_final_failure_leaves_document_absent(tmp_path: Pa
 
     events: list[str] = []
     repository_set = build_fs_repository_set(workspace_root=tmp_path)
-    batching_repository = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    batching_repository = _BatchIdentityUploadBatchingRepository(tmp_path, repository_set, events)
     source_repository = _FailingFinalUploadSourceRepository(tmp_path, repository_set, events)
     blob_repository = _BlobFirstUploadBlobRepository(tmp_path, repository_set, source_repository, events)
     service = DoclingUploadService(
         source_repository=source_repository,
         blob_repository=blob_repository,
-        convert_with_docling=_convert_docling_stub,
+        docling_converter=_FakeDoclingConverter(),
     )
     sample_file = tmp_path / "deck.pdf"
     sample_file.write_text("hello", encoding="utf-8")
@@ -722,6 +1051,8 @@ def test_execute_upload_create_final_failure_leaves_document_absent(tmp_path: Pa
     assert events[0].startswith("store:")
     assert events[-1] == "create_failed"
     assert blob_repository.observed_source_absent == [True, True]
+    assert batching_repository.rollback_calls == 1
+    assert batching_repository.commit_calls == 0
     with pytest.raises(FileNotFoundError):
         source_repository.get_source_meta("AAPL", "mat_failed", SourceKind.MATERIAL)
     assert blob_repository.list_entries(handle) == []
@@ -742,24 +1073,6 @@ def test_execute_upload_skips_when_source_fingerprint_matches(tmp_path: Path) ->
 
     calls: list[str] = []
 
-    def counting_converter(raw_data: bytes, stream_name: str) -> dict[str, JsonValue]:
-        """记录转换调用并返回固定结果。
-
-        Args:
-            raw_data: 输入原始字节。
-            stream_name: 输入流名称。
-
-        Returns:
-            固定结构化结果。
-
-        Raises:
-            无。
-        """
-
-        del raw_data
-        calls.append(stream_name)
-        return {"name": stream_name, "source": "docling"}
-
     repository_set = build_fs_repository_set(workspace_root=tmp_path)
     batching_repository = FsBatchingRepository(tmp_path, repository_set=repository_set)
     source_repository = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
@@ -767,7 +1080,7 @@ def test_execute_upload_skips_when_source_fingerprint_matches(tmp_path: Path) ->
     service = DoclingUploadService(
         source_repository=source_repository,
         blob_repository=blob_repository,
-        convert_with_docling=counting_converter,
+        docling_converter=_FakeDoclingConverter(calls),
     )
     sample_file = tmp_path / "deck.pdf"
     sample_file.write_text("hello", encoding="utf-8")
@@ -865,7 +1178,7 @@ def test_execute_upload_update_failure_keeps_previous_document(
     seed_service = DoclingUploadService(
         source_repository=seed_source_repository,
         blob_repository=seed_blob_repository,
-        convert_with_docling=_convert_docling_stub,
+        docling_converter=_FakeDoclingConverter(),
     )
     old_file = tmp_path / "deck.pdf"
     old_file.write_text("old", encoding="utf-8")
@@ -890,7 +1203,7 @@ def test_execute_upload_update_failure_keeps_previous_document(
     failing_service = DoclingUploadService(
         source_repository=failing_source_repository,
         blob_repository=seed_blob_repository,
-        convert_with_docling=_convert_docling_stub,
+        docling_converter=_FakeDoclingConverter(),
     )
     new_file = tmp_path / "deck-new.pdf"
     new_file.write_text("new", encoding="utf-8")

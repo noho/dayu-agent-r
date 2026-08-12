@@ -8,12 +8,14 @@ import json
 from collections.abc import AsyncGenerator, Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from types import TracebackType
 from typing import BinaryIO, Optional, cast
 
 import pytest
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.document_models import (
     BatchToken,
@@ -48,7 +50,12 @@ from dayu.fins.pipelines.cn_download_models import (
     DownloadedReportAsset,
 )
 from dayu.fins.pipelines.cn_download_pdf_gate import CnDownloadPdfGateProtocol
-from dayu.fins.pipelines.cn_download_protocols import CnDoclingConversionRunner
+from dayu.fins.pipelines.docling_process_converter import (
+    DoclingConversionCancelledError,
+    DoclingConversionConfig,
+    DoclingConversionResult,
+    DoclingConverter,
+)
 from dayu.fins.pipelines.cn_form_utils import (
     CnDownloadPeriodPolicy,
     build_cn_filing_ids,
@@ -494,24 +501,26 @@ class _FirstCandidateFailureDiscoveryClient(_FakeDiscoveryClient):
 
 
 @dataclass
-class _FakeConverter(CnDoclingConversionRunner):
+class _FakeConverter:
     """typed Docling conversion fake。"""
 
     calls: int = 0
 
-    async def convert_pdf_to_docling_json(
+    async def convert_to_json_bytes(
         self,
-        pdf_bytes: bytes,
+        input_bytes: bytes,
         stream_name: str,
         *,
-        cancellation_checker: Callable[[], bool],
-    ) -> bytes:
+        config: DoclingConversionConfig,
+        cancellation: CancellationToken | None,
+    ) -> DoclingConversionResult:
         """返回固定 Docling JSON。
 
         Args:
             pdf_bytes: PDF 字节。
             stream_name: 流名称。
-            cancellation_checker: operation-scoped 取消检查器。
+            config: 闭合转换配置。
+            cancellation: canonical 取消 token。
 
         Returns:
             Docling JSON 字节。
@@ -520,31 +529,37 @@ class _FakeConverter(CnDoclingConversionRunner):
             无。
         """
 
-        del pdf_bytes, stream_name, cancellation_checker
+        del input_bytes, stream_name, config, cancellation
         self.calls += 1
-        return _DOCLING_BYTES
+        return DoclingConversionResult(
+            json_bytes=_DOCLING_BYTES,
+            size=len(_DOCLING_BYTES),
+            sha256=hashlib.sha256(_DOCLING_BYTES).hexdigest(),
+        )
 
 
 @dataclass
-class _FailingConverter(CnDoclingConversionRunner):
+class _FailingConverter:
     """按配置抛出预构造异常的 typed Docling runner。"""
 
     failure: Exception
     calls: int = 0
 
-    async def convert_pdf_to_docling_json(
+    async def convert_to_json_bytes(
         self,
-        pdf_bytes: bytes,
+        input_bytes: bytes,
         stream_name: str,
         *,
-        cancellation_checker: Callable[[], bool],
-    ) -> bytes:
+        config: DoclingConversionConfig,
+        cancellation: CancellationToken | None,
+    ) -> DoclingConversionResult:
         """抛出预构造异常。
 
         Args:
             pdf_bytes: PDF 字节。
             stream_name: 流名称。
-            cancellation_checker: operation-scoped 取消检查器。
+            config: 闭合转换配置。
+            cancellation: canonical 取消 token。
 
         Returns:
             不返回。
@@ -553,7 +568,7 @@ class _FailingConverter(CnDoclingConversionRunner):
             Exception: 原样抛出 ``failure``。
         """
 
-        del pdf_bytes, stream_name, cancellation_checker
+        del input_bytes, stream_name, config, cancellation
         self.calls += 1
         raise self.failure
 
@@ -583,25 +598,27 @@ class _FilingFailureProjectionSpy:
 
 
 @dataclass
-class _CancelAfterConvertConverter(CnDoclingConversionRunner):
+class _CancelAfterConvertConverter:
     """转换返回前触发取消的 typed Docling runner。"""
 
     cancel_state: "_CancelState"
     calls: int = 0
 
-    async def convert_pdf_to_docling_json(
+    async def convert_to_json_bytes(
         self,
-        pdf_bytes: bytes,
+        input_bytes: bytes,
         stream_name: str,
         *,
-        cancellation_checker: Callable[[], bool],
-    ) -> bytes:
+        config: DoclingConversionConfig,
+        cancellation: CancellationToken | None,
+    ) -> DoclingConversionResult:
         """返回固定 Docling JSON 并设置取消状态。
 
         Args:
             pdf_bytes: PDF 字节。
             stream_name: 流名称。
-            cancellation_checker: operation-scoped 取消检查器。
+            config: 闭合转换配置。
+            cancellation: canonical 取消 token。
 
         Returns:
             Docling JSON 字节。
@@ -610,14 +627,18 @@ class _CancelAfterConvertConverter(CnDoclingConversionRunner):
             无。
         """
 
-        del pdf_bytes, stream_name, cancellation_checker
+        del input_bytes, stream_name, config, cancellation
         self.calls += 1
         self.cancel_state.cancelled = True
-        return _DOCLING_BYTES
+        return DoclingConversionResult(
+            json_bytes=_DOCLING_BYTES,
+            size=len(_DOCLING_BYTES),
+            sha256=hashlib.sha256(_DOCLING_BYTES).hexdigest(),
+        )
 
 
 @dataclass
-class _CancelState:
+class _CancelState(CancellationToken):
     """测试用取消状态。"""
 
     cancelled: bool = False
@@ -636,6 +657,33 @@ class _CancelState:
         """
 
         return self.cancelled
+
+    def is_cancelled(self) -> bool:
+        """返回当前取消状态。
+
+        Returns:
+            已取消时返回 ``True``。
+        """
+
+        return self.cancelled
+
+    def cancel_reason(self) -> str | None:
+        """返回测试取消原因。
+
+        Returns:
+            已取消时返回固定原因，否则返回 ``None``。
+        """
+
+        return "test_cancelled" if self.cancelled else None
+
+    def requested_at(self) -> datetime | None:
+        """返回测试取消时间。
+
+        Returns:
+            本测试不需要时间，返回 ``None``。
+        """
+
+        return None
 
 
 @dataclass
@@ -723,19 +771,21 @@ class _GateAwareConverter(_FakeConverter):
 
     gate: _RecordingPdfGate = field(default_factory=_RecordingPdfGate)
 
-    async def convert_pdf_to_docling_json(
+    async def convert_to_json_bytes(
         self,
-        pdf_bytes: bytes,
+        input_bytes: bytes,
         stream_name: str,
         *,
-        cancellation_checker: Callable[[], bool],
-    ) -> bytes:
+        config: DoclingConversionConfig,
+        cancellation: CancellationToken | None,
+    ) -> DoclingConversionResult:
         """断言转换阶段没有持有 PDF 下载 gate。
 
         Args:
             pdf_bytes: PDF 字节。
             stream_name: 流名称。
-            cancellation_checker: operation-scoped 取消检查器。
+            config: 闭合转换配置。
+            cancellation: canonical 取消 token。
 
         Returns:
             Docling JSON 字节。
@@ -745,10 +795,11 @@ class _GateAwareConverter(_FakeConverter):
         """
 
         assert self.gate.active is False
-        return await super().convert_pdf_to_docling_json(
-            pdf_bytes,
+        return await super().convert_to_json_bytes(
+            input_bytes,
             stream_name,
-            cancellation_checker=cancellation_checker,
+            config=config,
+            cancellation=cancellation,
         )
 
 
@@ -804,7 +855,7 @@ def _build_pipeline(
     tmp_path: Path,
     discovery: _FakeDiscoveryClient,
     hk_discovery: _FakeDiscoveryClient | None = None,
-    converter: CnDoclingConversionRunner,
+    converter: DoclingConverter,
     pdf_download_gate: CnDownloadPdfGateProtocol | None = None,
     repository_set: _FsRepositorySet | None = None,
     batching_repository: FsBatchingRepository | None = None,
@@ -853,7 +904,7 @@ def _build_pipeline(
         cn_discovery_client=discovery,
         hk_discovery_client=hk_discovery,
         pdf_download_gate=pdf_download_gate,
-        docling_conversion_runner=converter,
+        docling_converter=converter,
     )
 
 
@@ -2588,7 +2639,7 @@ def test_cn_single_filing_owner_projects_closed_failure_pair(
             candidates=(candidate,),
             failure=failure,
         )
-        converter: CnDoclingConversionRunner = _FakeConverter()
+        converter: DoclingConverter = _FakeConverter()
     elif stage == "docling":
         discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(candidate,))
         converter = _FailingConverter(failure=failure)
@@ -2816,6 +2867,33 @@ def test_cn_docling_conversion_failure_leaves_document_absent(tmp_path: Path) ->
             document_id,
             SourceKind.FILING,
         )
+
+
+def test_cn_docling_converter_cancel_maps_to_download_cancelled(tmp_path: Path) -> None:
+    """shared converter cancel 必须在 workflow 边界映射为 CN/HK cancelled。
+
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: cancel 被投影为 failed 或产生半发布时抛出。
+    """
+
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(_candidate(),))
+    pipeline = _build_pipeline(
+        tmp_path=tmp_path,
+        discovery=discovery,
+        converter=_FailingConverter(failure=DoclingConversionCancelledError()),
+    )
+
+    result = _final_result(_collect_events(pipeline, start_is_explicit=True))
+
+    assert result["status"] == "cancelled"
+    assert result["filings"] == []
+    assert pipeline.source_repository.list_source_document_ids("600519", SourceKind.FILING) == []
 
 
 def test_cn_download_cancel_after_pdf_download_does_not_start_docling(

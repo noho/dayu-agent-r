@@ -31,6 +31,7 @@ from dayu.fins.pipelines.cn_download_models import (
     CnReportQuery,
     DownloadedReportAsset,
 )
+from dayu.fins.pipelines.docling_process_converter import DoclingConverter
 from dayu.fins.storage import (
     BatchingRepositoryProtocol,
     CompanyMetaRepositoryProtocol,
@@ -39,35 +40,6 @@ from dayu.fins.storage import (
     ProcessedDocumentRepositoryProtocol,
     SourceDocumentRepositoryProtocol,
 )
-
-
-class CnDoclingConversionRunner(Protocol):
-    """CN/HK 下载链路的可取消 Docling 转换协议。"""
-
-    async def convert_pdf_to_docling_json(
-        self,
-        pdf_bytes: bytes,
-        stream_name: str,
-        *,
-        cancellation_checker: Callable[[], bool],
-    ) -> bytes:
-        """把 PDF bytes 转换为 Docling JSON bytes。
-
-        Args:
-            pdf_bytes: 待转换的 PDF 原始字节。
-            stream_name: 不含路径的输入流名称。
-            cancellation_checker: operation-scoped 取消检查器。
-
-        Returns:
-            已完成转换并校验的 Docling JSON bytes。
-
-        Raises:
-            CnDownloadCancelledError: conversion 期间收到取消请求时抛出。
-            RuntimeError: 子进程执行、输出校验或清理失败时抛出。
-            OSError: 临时文件创建、读取或清理失败时抛出。
-        """
-
-        ...
 
 
 class CnReportDiscoveryClientProtocol(Protocol):
@@ -225,8 +197,18 @@ class CnDownloadWorkflowHost(Protocol):
         ...
 
     @property
-    def docling_conversion_runner(self) -> CnDoclingConversionRunner:
-        """返回 operation-scoped 可取消 Docling conversion runner。"""
+    def docling_conversion_runner(self) -> DoclingConverter:
+        """返回共享 Docling converter。
+
+        Args:
+            无。
+
+        Returns:
+            无跨调用可变状态的 typed converter。
+
+        Raises:
+            无。
+        """
 
         ...
 
@@ -250,7 +232,6 @@ class CnDownloadWorkflowHost(Protocol):
 
 
 __all__ = [
-    "CnDoclingConversionRunner",
     "CnDownloadWorkflowHost",
     "CnReportDiscoveryClientProtocol",
 ]

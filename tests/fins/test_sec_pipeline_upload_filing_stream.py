@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
 
-from dayu.contracts.json_value import JsonValue
+from dayu.contracts.cancellation import CancellationToken
 from dayu.fins.domain.document_models import BatchToken, CompanyMeta, CompanyMetaInventoryEntry, now_iso8601
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.pipelines.sec_pipeline import SecPipeline
+from dayu.fins.pipelines.docling_process_converter import (
+    DoclingConversionConfig,
+    DoclingConversionResult,
+)
 from dayu.fins.pipelines.upload_filing_events import UploadFilingEventType
 from dayu.fins.pipelines.upload_company_meta import (
     RESOLVER_VERSION,
@@ -100,22 +105,35 @@ class _SpyCompanyMetaRepository:
         return None
 
 
-def _convert_docling_stub(raw_data: bytes, stream_name: str) -> dict[str, JsonValue]:
-    """返回固定 Docling 转换结果。
+class _FakeDoclingConverter:
+    """SEC filing 测试用 typed converter。"""
 
-    Args:
-        raw_data: 输入原始字节。
-        stream_name: 输入流名称。
+    async def convert_to_json_bytes(
+        self,
+        input_bytes: bytes,
+        stream_name: str,
+        *,
+        config: DoclingConversionConfig,
+        cancellation: CancellationToken | None,
+    ) -> DoclingConversionResult:
+        """返回固定 typed JSON bytes。
 
-    Returns:
-        固定结构化结果。
+        Args:
+            input_bytes: 输入字节。
+            stream_name: 输入名称。
+            config: 闭合转换配置。
+            cancellation: canonical token。
 
-    Raises:
-        无。
-    """
+        Returns:
+            typed conversion result。
 
-    del raw_data
-    return {"name": stream_name, "format": "docling"}
+        Raises:
+            无。
+        """
+
+        del input_bytes, config, cancellation
+        data = ('{"name": "' + stream_name + '", "format": "docling"}').encode()
+        return DoclingConversionResult(data, len(data), hashlib.sha256(data).hexdigest())
 
 
 def _seed_sec_upload_company_meta(
@@ -183,10 +201,13 @@ def test_upload_company_meta_ticker_aliases_use_canonical_owner(
         AssertionError: alias owner 未被消费或去重顺序漂移时抛出。
     """
 
-    assert _normalize_ticker_aliases(
-        canonical_ticker=canonical_ticker,
-        ticker_aliases=raw_aliases,
-    ) == expected
+    assert (
+        _normalize_ticker_aliases(
+            canonical_ticker=canonical_ticker,
+            ticker_aliases=raw_aliases,
+        )
+        == expected
+    )
 
 
 def test_upload_company_meta_invalid_ticker_alias_fails_before_repository_write() -> None:
@@ -235,8 +256,8 @@ async def test_upload_filing_stream_uploads_docling_files(tmp_path: Path) -> Non
     pipeline = SecPipeline(
         workspace_root=tmp_path,
         processor_registry=build_fins_processor_registry(),
+        docling_converter=_FakeDoclingConverter(),
     )
-    pipeline._upload_service._convert_with_docling = _convert_docling_stub
     filing_file = tmp_path / "filing.pdf"
     filing_file.write_text("demo filing", encoding="utf-8")
 
@@ -299,8 +320,8 @@ async def test_upload_filing_stream_preserves_same_version_company_meta(tmp_path
     pipeline = SecPipeline(
         workspace_root=tmp_path,
         processor_registry=build_fins_processor_registry(),
+        docling_converter=_FakeDoclingConverter(),
     )
-    pipeline._upload_service._convert_with_docling = _convert_docling_stub
     _seed_sec_upload_company_meta(
         pipeline=pipeline,
         company_name="Existing Apple",
@@ -348,8 +369,8 @@ async def test_upload_filing_stream_refreshes_stale_company_meta(tmp_path: Path)
     pipeline = SecPipeline(
         workspace_root=tmp_path,
         processor_registry=build_fins_processor_registry(),
+        docling_converter=_FakeDoclingConverter(),
     )
-    pipeline._upload_service._convert_with_docling = _convert_docling_stub
     _seed_sec_upload_company_meta(
         pipeline=pipeline,
         company_name="Stale Apple",
@@ -398,8 +419,8 @@ async def test_upload_filing_stream_stale_company_meta_requires_company_name(tmp
     pipeline = SecPipeline(
         workspace_root=tmp_path,
         processor_registry=build_fins_processor_registry(),
+        docling_converter=_FakeDoclingConverter(),
     )
-    pipeline._upload_service._convert_with_docling = _convert_docling_stub
     _seed_sec_upload_company_meta(
         pipeline=pipeline,
         company_name="Stale Apple",
@@ -452,8 +473,8 @@ async def test_upload_filing_stream_auto_action_and_overwrite_reset(tmp_path: Pa
     pipeline = SecPipeline(
         workspace_root=tmp_path,
         processor_registry=build_fins_processor_registry(),
+        docling_converter=_FakeDoclingConverter(),
     )
-    pipeline._upload_service._convert_with_docling = _convert_docling_stub
     old_file = tmp_path / "q1_old.pdf"
     new_file = tmp_path / "q1_new.pdf"
     old_file.write_text("old filing", encoding="utf-8")
