@@ -214,6 +214,10 @@ _PROGRESS_PREPROCESS_DOCUMENT_SKIPPED: Final[str] = "preprocess.document_skipped
 _PROGRESS_PREPROCESS_DOCUMENT_FAILED: Final[str] = "preprocess.document_failed"
 _PROGRESS_PREPROCESS_DOCUMENT_NOT_SUPPORTED: Final[str] = "preprocess.document_not_supported"
 _PROGRESS_PREPROCESS_COMPLETED: Final[str] = "preprocess.completed"
+_UPLOAD_RESULT_STATUS_OK: Final[str] = "ok"
+_UPLOAD_RESULT_STATUS_SKIPPED: Final[str] = "skipped"
+_UPLOAD_RESULT_STATUS_DELETED: Final[str] = "deleted"
+_UPLOAD_RESULT_STATUS_FAILED: Final[str] = "failed"
 _PAYLOAD_TICKER: Final[str] = "ticker"
 _PAYLOAD_MARKET: Final[str] = "market"
 _PAYLOAD_SOURCE: Final[str] = "source"
@@ -263,6 +267,66 @@ class FinsPreprocessResultStatus(str, Enum):
 
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+
+
+class FinsUploadTerminalDisposition(str, Enum):
+    """上传 workflow 已接受的闭集终态语义。"""
+
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+_UPLOAD_TERMINAL_DISPOSITIONS: Final[dict[str, FinsUploadTerminalDisposition]] = {
+    _UPLOAD_RESULT_STATUS_OK: FinsUploadTerminalDisposition.COMPLETED,
+    _UPLOAD_RESULT_STATUS_SKIPPED: FinsUploadTerminalDisposition.COMPLETED,
+    _UPLOAD_RESULT_STATUS_DELETED: FinsUploadTerminalDisposition.COMPLETED,
+    _UPLOAD_RESULT_STATUS_FAILED: FinsUploadTerminalDisposition.FAILED,
+    FinsUploadTerminalDisposition.CANCELLED.value: FinsUploadTerminalDisposition.CANCELLED,
+}
+
+
+def _upload_terminal_disposition_from_status(status: str) -> FinsUploadTerminalDisposition:
+    """把 exact upload summary status 映射为闭集终态。
+
+    Args:
+        status: production pipeline 或 runtime summary 的原始状态。
+
+    Returns:
+        与状态严格对应的上传终态。
+
+    Raises:
+        ValueError: 状态不在 production upload status 闭集时抛出。
+    """
+
+    disposition = _UPLOAD_TERMINAL_DISPOSITIONS.get(status)
+    if disposition is None:
+        raise ValueError(f"未知 upload status: {status!r}")
+    return disposition
+
+
+def _direct_upload_result_status(
+    disposition: FinsUploadTerminalDisposition,
+) -> FinsResultStatus:
+    """把 upload workflow 终态映射为 direct RESULT 状态。
+
+    Args:
+        disposition: workflow 已接受的 upload 闭集终态。
+
+    Returns:
+        与 disposition 严格对应的 direct RESULT 状态。
+
+    Raises:
+        AssertionError: 运行时收到类型系统闭集之外的 disposition 时抛出。
+    """
+
+    if disposition is FinsUploadTerminalDisposition.COMPLETED:
+        return FinsResultStatus.SUCCESS
+    if disposition is FinsUploadTerminalDisposition.FAILED:
+        return FinsResultStatus.FAILURE
+    if disposition is FinsUploadTerminalDisposition.CANCELLED:
+        return FinsResultStatus.CANCELLED
+    assert_never(disposition)
 
 
 _TERMINAL_STATUSES = frozenset(
@@ -499,7 +563,6 @@ _UPLOAD_ACTION_VALUES: Final[frozenset[str]] = frozenset(
         _UPLOAD_ACTION_DELETE,
     }
 )
-_UPLOAD_RESULT_STATUS_FAILED: Final[str] = "failed"
 _UNSUPPORTED_UPLOAD_RUNTIME_MESSAGE: Final[str] = (
     "不支持的上传运行时 (unsupported upload runtime): production upload runner 尚未装配"
 )
@@ -719,8 +782,10 @@ class FinsUploadPipelineResult:
             ValueError: 必填字段缺失、字段类型非法或文本字段为空时抛出。
         """
 
+        status = _required_upload_result_status(result)
+        _upload_terminal_disposition_from_status(status)
         return cls(
-            status=_required_upload_result_text(result, "status"),
+            status=status,
             document_id=_optional_upload_result_text(result, "document_id"),
             internal_document_id=_optional_upload_result_text(result, "internal_document_id"),
             primary_document=_optional_upload_result_text(result, "primary_document"),
@@ -758,6 +823,36 @@ class FinsUploadResultSummary:
     skip_reason: str | None = None
     document_version: str | None = None
     source_fingerprint: str | None = None
+
+    def __post_init__(self) -> None:
+        """校验 runtime upload summary 的 exact status。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: status 不在 production upload status 闭集时抛出。
+        """
+
+        _upload_terminal_disposition_from_status(self.status)
+
+    def terminal_disposition(self) -> FinsUploadTerminalDisposition:
+        """返回 upload summary 已接受的闭集终态。
+
+        Args:
+            无。
+
+        Returns:
+            与 exact status 对应的上传终态。
+
+        Raises:
+            ValueError: status 不在 production upload status 闭集时抛出。
+        """
+
+        return _upload_terminal_disposition_from_status(self.status)
 
     def to_json_summary(self) -> dict[str, JsonValue]:
         """转换为 JSON-compatible 摘要。
@@ -985,6 +1080,34 @@ class FinsIngestionJobStore(Protocol):
             FileNotFoundError: job id 不存在时抛出。
             OSError: 文件系统读写失败时抛出。
             ValueError: job id 或 record 字段非法时抛出。
+        """
+        ...
+
+    def save_accepted_upload_terminal_if_active(
+        self,
+        job_id: str,
+        *,
+        disposition: FinsUploadTerminalDisposition,
+        result_summary: dict[str, JsonValue],
+        failure_summary: dict[str, JsonValue],
+        finished_at: str,
+    ) -> FinsIngestionJobRecord:
+        """原子保存 workflow 已接受的 completed 或 failed upload 终态。
+
+        Args:
+            job_id: opaque job id。
+            disposition: workflow 已 first-commit 的 completed 或 failed 终态。
+            result_summary: 与 disposition 一致的 upload 结果摘要。
+            failure_summary: failed 时的有界失败摘要；completed 时必须为空。
+            finished_at: 本次终态写入时间。
+
+        Returns:
+            已持久化的最终 job record；若已有终态则原样返回。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+            OSError: 文件系统读写失败时抛出。
+            ValueError: disposition、摘要字段或 job operation 不符合 upload contract 时抛出。
         """
         ...
 
@@ -1419,6 +1542,30 @@ class _DirectStreamCancellationState:
             self._terminal_status = resolved_status
             return resolved_status
 
+    def claim_upload_summary(
+        self,
+        disposition: FinsUploadTerminalDisposition,
+    ) -> FinsResultStatus | None:
+        """原子提交 upload workflow 已 first-commit 的唯一终态。
+
+        Args:
+            disposition: runner summary 已接受的闭集终态。
+
+        Returns:
+            与 disposition 对应的 direct 终态；已有终态或 consumer 已 abort 时返回
+            ``None``。
+
+        Raises:
+            无。
+        """
+
+        with self._lock:
+            if self._consumer_aborted or self._terminal_status is not None:
+                return None
+            terminal_status = _direct_upload_result_status(disposition)
+            self._terminal_status = terminal_status
+            return terminal_status
+
 
 @dataclass(frozen=True)
 class _DirectCancellationChecker:
@@ -1836,6 +1983,61 @@ class FsFinsIngestionJobStore:
             )
             self._write_record_locked(cancelled)
             return cancelled
+
+    def save_accepted_upload_terminal_if_active(
+        self,
+        job_id: str,
+        *,
+        disposition: FinsUploadTerminalDisposition,
+        result_summary: dict[str, JsonValue],
+        failure_summary: dict[str, JsonValue],
+        finished_at: str,
+    ) -> FinsIngestionJobRecord:
+        """原子保存 workflow 已接受的 completed 或 failed upload 终态。
+
+        Args:
+            job_id: opaque job id。
+            disposition: workflow 已 first-commit 的 completed 或 failed 终态。
+            result_summary: 与 disposition 一致的 upload 结果摘要。
+            failure_summary: failed 时的有界失败摘要；completed 时必须为空。
+            finished_at: 本次终态写入时间。
+
+        Returns:
+            已持久化的最终 job record；若已有终态则原样返回。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+            RuntimeFileLockError: 文件锁获取失败时抛出。
+            OSError: 文件系统读写失败时抛出。
+            ValueError: disposition、摘要字段或 job operation 不符合 upload contract 时抛出。
+        """
+
+        _validate_accepted_upload_terminal_fields(
+            disposition=disposition,
+            result_summary=result_summary,
+            failure_summary=failure_summary,
+        )
+        with file_lock(self.root_dir / _LOCK_FILE_NAME):
+            record = self._read_record_locked(job_id)
+            if record.operation_kind is not FinsIngestionOperationKind.UPLOAD:
+                raise ValueError("accepted upload terminal 只能保存 upload job")
+            if record.status in _TERMINAL_STATUSES:
+                return record
+            terminal_status = (
+                FinsIngestionJobStatus.SUCCEEDED
+                if disposition is FinsUploadTerminalDisposition.COMPLETED
+                else FinsIngestionJobStatus.FAILED
+            )
+            terminal = replace(
+                record,
+                status=terminal_status,
+                updated_at=finished_at,
+                finished_at=finished_at,
+                result_summary=result_summary,
+                failure_summary=failure_summary,
+            )
+            self._write_record_locked(terminal)
+            return terminal
 
     def save_failed_or_cancelled_if_active(
         self,
@@ -3244,32 +3446,22 @@ class FinsIngestionRuntime:
             request,
             cancellation_checker=context.cancellation_checker,
         )
-        self._emit_context_progress(
-            context,
-            source_event_type=_upload_completed_progress_type(summary),
-            message=direct_progress_message(stage=_upload_completed_progress_type(summary)),
-            document_id=summary.document_id or _upload_request_document_id(request),
-            payload=_upload_context_summary_progress_payload(context, request, summary),
+        disposition = summary.terminal_disposition()
+        terminal_progress, terminal_result = _direct_upload_terminal_events(
+            context=context,
+            request=request,
+            summary=summary,
+            disposition=disposition,
+            emitted_at=datetime.now(timezone.utc),
         )
-        if context.cancellation_checker():
-            self._emit_direct_cancelled_result(context)
+        cancellation_state = context.cancellation_state
+        if cancellation_state is None:
+            raise RuntimeError("direct upload 缺少 terminal claim owner")
+        if cancellation_state.claim_upload_summary(disposition) is None:
             return
-        if summary.status.strip().lower() == _UPLOAD_RESULT_STATUS_FAILED:
-            self._emit_direct_result(
-                context,
-                status=FinsResultStatus.FAILURE,
-                details=_upload_result_details(summary),
-                error_kind=FinsErrorKind.EXECUTION,
-                error_message=direct_upload_failed_status_message(),
-            )
-            return
-        self._emit_direct_result(
-            context,
-            status=FinsResultStatus.SUCCESS,
-            details=_upload_result_details(summary),
-            error_kind=None,
-            error_message=None,
-        )
+        if terminal_progress is not None:
+            _put_direct_queue(context, terminal_progress)
+        _put_direct_queue(context, terminal_result)
 
     def start_download(
         self,
@@ -3690,18 +3882,45 @@ class FinsIngestionRuntime:
                 request,
                 cancellation_checker=context.cancellation_checker,
             )
-            self._emit_context_progress(
-                context,
-                source_event_type=_upload_completed_progress_type(summary),
-                message=direct_progress_message(stage=_upload_completed_progress_type(summary)),
-                document_id=summary.document_id or _upload_request_document_id(request),
-                payload=_upload_context_summary_progress_payload(context, request, summary),
-            )
-            latest = self.job_store.read_job(job_id)
-            if latest.cancellation_requested or latest.status is FinsIngestionJobStatus.CANCELLING:
-                self._save_cancelled(latest)
-                return
-            self._save_succeeded(latest, summary.to_json_summary())
+            disposition = summary.terminal_disposition()
+            finished_at = _utc_now()
+            if disposition is FinsUploadTerminalDisposition.CANCELLED:
+                saved = self.job_store.save_cancelled_if_active(
+                    job_id,
+                    finished_at=finished_at,
+                )
+            else:
+                failure_summary: dict[str, JsonValue] = {}
+                if disposition is FinsUploadTerminalDisposition.FAILED:
+                    failure_summary = {
+                        _KEY_MESSAGE: _bounded_text(
+                            direct_upload_failed_status_message(),
+                            "failure_message",
+                            reject_path_separators=False,
+                        )
+                    }
+                saved = self.job_store.save_accepted_upload_terminal_if_active(
+                    job_id,
+                    disposition=disposition,
+                    result_summary=summary.to_json_summary(),
+                    failure_summary=failure_summary,
+                    finished_at=finished_at,
+                )
+            saved_disposition = _upload_terminal_disposition_from_job_record(saved)
+            if saved_disposition is not FinsUploadTerminalDisposition.CANCELLED:
+                progress_type = _upload_completed_progress_type(saved_disposition)
+                self._emit_progress_event(
+                    saved,
+                    source_event_type=progress_type,
+                    message=direct_progress_message(stage=progress_type),
+                    document_id=_upload_persisted_document_id(saved, request=request),
+                    payload=_upload_context_persisted_summary_progress_payload(
+                        context,
+                        request,
+                        saved,
+                    ),
+                )
+            self._append_terminal_job_event_warn(saved)
         except Exception as exc:
             self._save_failed_from_exception(job_id, exc)
 
@@ -4785,6 +5004,7 @@ class FinsIngestionRuntime:
             message=message,
             document_id=document_id,
             payload=payload,
+            emitted_at=datetime.now(timezone.utc),
         )
         _put_direct_queue(context, event)
 
@@ -4860,49 +5080,56 @@ class FinsIngestionRuntime:
         resolved_status = status if cancellation_state is None else cancellation_state.claim_terminal(status)
         if resolved_status is None:
             return
-        status = resolved_status
-        if status is FinsResultStatus.CANCELLED:
-            details = ()
-            error_kind = FinsErrorKind.CANCELLED
-            error_message = direct_failure_message(
-                error_kind=FinsErrorKind.CANCELLED,
-                fallback_message=None,
-            )
-            download = (
-                None
-                if context.download_request is None
-                else _public_download_summary(
-                    _empty_download_summary_from_request(
-                        context.download_request,
-                        terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED,
-                    )
-                )
-            )
-            failure = None
-        exit_code = _direct_exit_code(status)
-        title = direct_result_title(
-            operation_kind=context.direct_operation_kind,
-            status=status,
+        self._emit_claimed_direct_result(
+            context,
+            status=resolved_status,
+            details=details,
+            error_kind=error_kind,
+            error_message=error_message,
+            download=download,
+            failure=failure,
         )
-        event = FinsEvent(
-            event_type=FinsEventType.RESULT,
-            operation_kind=context.direct_operation_kind,
-            message=title,
+
+    def _emit_claimed_direct_result(
+        self,
+        context: _FinsIngestionExecutionContext,
+        *,
+        status: FinsResultStatus,
+        details: tuple[FinsEventDetail, ...],
+        error_kind: FinsErrorKind | None,
+        error_message: str | None,
+        download: FinsDownloadPublicSummary | None = None,
+        failure: FinsPublicFailure | None = None,
+    ) -> None:
+        """投递已经由 direct state 原子 claim 的 RESULT。
+
+        Args:
+            context: direct stream 执行上下文。
+            status: 已 claim 的 canonical 终态。
+            details: 有界业务摘要详情。
+            error_kind: 可选失败分类。
+            error_message: 可选失败说明。
+            download: download 操作的 bounded public summary。
+            failure: download 失败的 closed public failure。
+
+        Returns:
+            无。
+
+        Raises:
+            无。legacy job context 不投递 direct RESULT。
+        """
+
+        if context.direct_queue is None:
+            return
+        event = _direct_result_event(
+            context=context,
+            status=status,
+            details=details,
+            error_kind=error_kind,
+            error_message=error_message,
+            download=download,
+            failure=failure,
             emitted_at=datetime.now(timezone.utc),
-            ticker=context.normalized_ticker,
-            filing_kind=_direct_filing_kind(context.source_kind),
-            document_label=None,
-            progress=None,
-            result=FinsResultSummary(
-                status=status,
-                exit_code=exit_code,
-                title=title,
-                details=details,
-                error_kind=error_kind,
-                error_message=error_message,
-                download=download,
-                failure=failure,
-            ),
         )
         _put_direct_queue(context, event)
 
@@ -5060,6 +5287,7 @@ def _direct_progress_event(
     message: str,
     document_id: str | None,
     payload: Mapping[str, JsonValue],
+    emitted_at: datetime,
 ) -> FinsEvent:
     """构造用户可见 direct progress event。
 
@@ -5069,6 +5297,7 @@ def _direct_progress_event(
         message: 用户可读进度说明。
         document_id: 可选业务文档 ID。
         payload: 有界业务摘要。
+        emitted_at: 调用方提供的带时区事件构造时间。
 
     Returns:
         Fins direct progress event。
@@ -5082,7 +5311,7 @@ def _direct_progress_event(
         event_type=FinsEventType.PROGRESS,
         operation_kind=context.direct_operation_kind,
         message=message,
-        emitted_at=datetime.now(timezone.utc),
+        emitted_at=emitted_at,
         ticker=context.normalized_ticker,
         filing_kind=_direct_filing_kind(context.source_kind),
         document_label=_direct_document_label(document_id),
@@ -5093,6 +5322,134 @@ def _direct_progress_event(
         ),
         result=None,
     )
+
+
+def _direct_result_event(
+    *,
+    context: _FinsIngestionExecutionContext,
+    status: FinsResultStatus,
+    details: tuple[FinsEventDetail, ...],
+    error_kind: FinsErrorKind | None,
+    error_message: str | None,
+    download: FinsDownloadPublicSummary | None,
+    failure: FinsPublicFailure | None,
+    emitted_at: datetime,
+) -> FinsEvent:
+    """纯构造一个通过 public contract 校验的 direct RESULT 事件。
+
+    Args:
+        context: direct stream 执行上下文，只读取业务投影字段。
+        status: 待投影的 canonical 终态。
+        details: 有界业务摘要详情。
+        error_kind: 可选失败分类。
+        error_message: 可选失败说明。
+        download: download 操作的 bounded public summary。
+        failure: download 失败的 closed public failure。
+        emitted_at: 调用方提供的带时区事件构造时间。
+
+    Returns:
+        已完成全部 typed contract 校验、尚未入队的 RESULT 事件。
+
+    Raises:
+        TypeError: public event 字段类型不符合 contract 时抛出。
+        ValueError: public event 字段组合、长度或安全文本不符合 contract 时抛出。
+    """
+
+    if status is FinsResultStatus.CANCELLED:
+        details = ()
+        error_kind = FinsErrorKind.CANCELLED
+        error_message = direct_failure_message(
+            error_kind=FinsErrorKind.CANCELLED,
+            fallback_message=None,
+        )
+        download = (
+            None
+            if context.download_request is None
+            else _public_download_summary(
+                _empty_download_summary_from_request(
+                    context.download_request,
+                    terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED,
+                )
+            )
+        )
+        failure = None
+    exit_code = _direct_exit_code(status)
+    title = direct_result_title(
+        operation_kind=context.direct_operation_kind,
+        status=status,
+    )
+    return FinsEvent(
+        event_type=FinsEventType.RESULT,
+        operation_kind=context.direct_operation_kind,
+        message=title,
+        emitted_at=emitted_at,
+        ticker=context.normalized_ticker,
+        filing_kind=_direct_filing_kind(context.source_kind),
+        document_label=None,
+        progress=None,
+        result=FinsResultSummary(
+            status=status,
+            exit_code=exit_code,
+            title=title,
+            details=details,
+            error_kind=error_kind,
+            error_message=error_message,
+            download=download,
+            failure=failure,
+        ),
+    )
+
+
+def _direct_upload_terminal_events(
+    *,
+    context: _FinsIngestionExecutionContext,
+    request: FinsUploadRequest,
+    summary: FinsUploadResultSummary,
+    disposition: FinsUploadTerminalDisposition,
+    emitted_at: datetime,
+) -> tuple[FinsEvent | None, FinsEvent]:
+    """纯构造同一 upload disposition 的可见 progress 与 RESULT。
+
+    Args:
+        context: direct upload 执行上下文，只读取业务投影字段。
+        request: 已归一化上传请求。
+        summary: runner 返回且已通过 status owner 校验的结果摘要。
+        disposition: summary 对应的闭集终态。
+        emitted_at: 调用方提供的带时区事件构造时间。
+
+    Returns:
+        ``(progress, result)``；cancelled 的 progress 为 ``None``，其余终态
+        返回同一 disposition 派生且尚未入队的完整事件组。
+
+    Raises:
+        TypeError: public event 字段类型不符合 contract 时抛出。
+        ValueError: 请求、摘要或 public event 投影不符合有界 contract 时抛出。
+    """
+
+    progress_event: FinsEvent | None = None
+    if disposition is not FinsUploadTerminalDisposition.CANCELLED:
+        progress_type = _upload_completed_progress_type(disposition)
+        progress_event = _direct_progress_event(
+            context=context,
+            source_event_type=progress_type,
+            message=direct_progress_message(stage=progress_type),
+            document_id=summary.document_id or _upload_request_document_id(request),
+            payload=_upload_context_summary_progress_payload(context, request, summary),
+            emitted_at=emitted_at,
+        )
+    result_event = _direct_result_event(
+        context=context,
+        status=_direct_upload_result_status(disposition),
+        details=(() if disposition is FinsUploadTerminalDisposition.CANCELLED else _upload_result_details(summary)),
+        error_kind=(FinsErrorKind.EXECUTION if disposition is FinsUploadTerminalDisposition.FAILED else None),
+        error_message=(
+            direct_upload_failed_status_message() if disposition is FinsUploadTerminalDisposition.FAILED else None
+        ),
+        download=None,
+        failure=None,
+        emitted_at=emitted_at,
+    )
+    return (progress_event, result_event)
 
 
 def _direct_progress_units(
@@ -5452,6 +5809,25 @@ def _required_upload_result_text(result: Mapping[str, JsonValue], key: str) -> s
     if isinstance(value, str) and value.strip():
         return value.strip()
     raise ValueError(f"upload pipeline result 缺少必填文本字段: {key}")
+
+
+def _required_upload_result_status(result: Mapping[str, JsonValue]) -> str:
+    """从 pipeline result 读取不做归一化的 upload status。
+
+    Args:
+        result: pipeline 上传结果。
+
+    Returns:
+        pipeline 提供的原始 status 字符串。
+
+    Raises:
+        ValueError: status 缺失或类型非法时抛出。
+    """
+
+    status = result.get(_KEY_STATUS)
+    if not isinstance(status, str):
+        raise ValueError("upload pipeline result 缺少必填文本字段: status")
+    return status
 
 
 def _optional_upload_result_text(result: Mapping[str, JsonValue], key: str) -> str | None:
@@ -6652,22 +7028,107 @@ def _upload_context_summary_progress_payload(
     return payload
 
 
-def _upload_completed_progress_type(summary: FinsUploadResultSummary) -> str:
-    """根据上传摘要选择 completed progress 标签。
+def _upload_terminal_disposition_from_job_record(
+    record: FinsIngestionJobRecord,
+) -> FinsUploadTerminalDisposition:
+    """从最终 upload job record 读取并校验 canonical disposition。
 
     Args:
-        summary: 上传结果摘要。
+        record: atomic terminal save 返回的最终 upload job record。
 
     Returns:
-        failed 状态返回 completed_with_failures，否则返回 completed。
+        与最终 record status/result summary 一致的 upload disposition。
 
     Raises:
-        无。
+        ValueError: record 不是 upload terminal，或 status 与结果摘要不一致时抛出。
     """
 
-    if summary.status.strip().lower() == _UPLOAD_RESULT_STATUS_FAILED:
+    if record.operation_kind is not FinsIngestionOperationKind.UPLOAD:
+        raise ValueError("upload terminal projection 只能消费 upload job record")
+    if record.status is FinsIngestionJobStatus.CANCELLED:
+        return FinsUploadTerminalDisposition.CANCELLED
+    if record.status is FinsIngestionJobStatus.SUCCEEDED:
+        expected = FinsUploadTerminalDisposition.COMPLETED
+    elif record.status is FinsIngestionJobStatus.FAILED:
+        expected = FinsUploadTerminalDisposition.FAILED
+    else:
+        raise ValueError("upload terminal projection 必须消费 terminal job record")
+    actual = _upload_terminal_disposition_from_status(_required_str(record.result_summary, _KEY_STATUS))
+    if actual is not expected:
+        raise ValueError("upload job status 与 result_summary status 不一致")
+    return actual
+
+
+def _upload_persisted_document_id(
+    record: FinsIngestionJobRecord,
+    *,
+    request: FinsUploadRequest,
+) -> str | None:
+    """从最终 upload record 投影 progress document id。
+
+    Args:
+        record: atomic terminal save 返回的最终 upload job record。
+        request: 当前 upload 请求，用于结果未声明 ID 时提供请求业务 ID。
+
+    Returns:
+        最终结果中的 document id；缺失时返回请求的业务 document id。
+
+    Raises:
+        ValueError: persisted document id 类型非法或越界时抛出。
+    """
+
+    document_id = _optional_str(record.result_summary, _KEY_DOCUMENT_ID)
+    if document_id is not None:
+        return _bounded_text(document_id, _KEY_DOCUMENT_ID, reject_path_separators=False)
+    return _upload_request_document_id(request)
+
+
+def _upload_context_persisted_summary_progress_payload(
+    context: _FinsIngestionExecutionContext,
+    request: FinsUploadRequest,
+    record: FinsIngestionJobRecord,
+) -> dict[str, JsonValue]:
+    """从最终 upload record 构建 completed progress payload。
+
+    Args:
+        context: 当前 durable upload 执行上下文。
+        request: 当前 upload 请求。
+        record: atomic terminal save 返回的最终 upload job record。
+
+    Returns:
+        与最终 record 同源的有界 progress payload。
+
+    Raises:
+        ValueError: persisted upload status/document id 非法时抛出。
+    """
+
+    _upload_terminal_disposition_from_job_record(record)
+    payload = _upload_context_request_progress_payload(context, request)
+    payload[_PAYLOAD_UPLOAD_STATUS] = _required_str(record.result_summary, _KEY_STATUS)
+    document_id = _upload_persisted_document_id(record, request=request)
+    if document_id is not None:
+        payload[_KEY_DOCUMENT_ID] = document_id
+    return payload
+
+
+def _upload_completed_progress_type(disposition: FinsUploadTerminalDisposition) -> str:
+    """根据上传终态选择 completed progress 标签。
+
+    Args:
+        disposition: 已被 direct claim 或 durable save 接受的 upload 终态。
+
+    Returns:
+        failed 返回 completed_with_failures，completed 返回 completed。
+
+    Raises:
+        ValueError: cancelled disposition 被错误投影为 completed progress 时抛出。
+    """
+
+    if disposition is FinsUploadTerminalDisposition.FAILED:
         return _PROGRESS_UPLOAD_COMPLETED_WITH_FAILURES
-    return _PROGRESS_UPLOAD_COMPLETED
+    if disposition is FinsUploadTerminalDisposition.COMPLETED:
+        return _PROGRESS_UPLOAD_COMPLETED
+    raise ValueError("cancelled upload terminal 不得投影 completed progress")
 
 
 def _preprocess_selected_progress_payload(
@@ -6892,6 +7353,41 @@ def _assert_bounded_summary(summary: Mapping[str, JsonValue], field_name: str) -
     encoded = json.dumps(summary, ensure_ascii=False, sort_keys=True)
     if len(encoded) > _MAX_SUMMARY_JSON_CHARS:
         raise ValueError(f"{field_name} 超出大小上限")
+
+
+def _validate_accepted_upload_terminal_fields(
+    *,
+    disposition: FinsUploadTerminalDisposition,
+    result_summary: Mapping[str, JsonValue],
+    failure_summary: Mapping[str, JsonValue],
+) -> None:
+    """校验 accepted upload terminal 与持久化摘要严格一致。
+
+    Args:
+        disposition: workflow 已 first-commit 的 upload 终态。
+        result_summary: 待持久化的 upload 结果摘要。
+        failure_summary: 待持久化的失败摘要。
+
+    Returns:
+        无。
+
+    Raises:
+        ValueError: disposition 非法、摘要越界或字段与 disposition 不一致时抛出。
+    """
+
+    if disposition is FinsUploadTerminalDisposition.CANCELLED:
+        raise ValueError("accepted upload terminal 不接受 cancelled disposition")
+    _assert_bounded_summary(result_summary, "result_summary")
+    _assert_bounded_summary(failure_summary, "failure_summary")
+    summary_disposition = _upload_terminal_disposition_from_status(_required_str(result_summary, _KEY_STATUS))
+    if summary_disposition is not disposition:
+        raise ValueError("upload result_summary status 与 terminal disposition 不一致")
+    if disposition is FinsUploadTerminalDisposition.COMPLETED:
+        if failure_summary:
+            raise ValueError("completed upload terminal 不得包含 failure_summary")
+        return
+    if not failure_summary:
+        raise ValueError("failed upload terminal 必须包含 failure_summary")
 
 
 def _warn_malformed_event_sidecar_row(*, line_number: int, error_type: str) -> None:
@@ -7444,5 +7940,6 @@ __all__ = [
     "FinsUploadRequest",
     "FinsUploadResultSummary",
     "FinsUploadRunner",
+    "FinsUploadTerminalDisposition",
     "FsFinsIngestionJobStore",
 ]

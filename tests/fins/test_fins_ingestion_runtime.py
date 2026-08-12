@@ -100,6 +100,7 @@ from dayu.fins.ingestion_runtime import (
     FinsUploadRequest,
     FinsUploadResultSummary,
     FinsUploadRunner,
+    FinsUploadTerminalDisposition,
 )
 from dayu.fins.pipelines.cn_pipeline import CnDownloadAdapter, CnPipeline
 from dayu.fins.pipelines.docling_process_converter import (
@@ -979,6 +980,63 @@ class _FakeUploadRunner(FinsUploadRunner):
         return self.result_summary
 
 
+class _BarrierUploadRunner(FinsUploadRunner):
+    """用同步 barrier 控制 final checkpoint 或 commit 后窗口的上传 runner。"""
+
+    def __init__(
+        self,
+        *,
+        accepted_summary: FinsUploadResultSummary,
+        observe_cancel_before_summary: bool,
+    ) -> None:
+        """初始化可控上传边界。
+
+        Args:
+            accepted_summary: 未在 final checkpoint 接受取消时返回的 summary。
+            observe_cancel_before_summary: 释放 barrier 后是否执行 final cancellation checkpoint。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.accepted_summary = accepted_summary
+        self.observe_cancel_before_summary = observe_cancel_before_summary
+        self.boundary_reached = Event()
+        self.release_summary = Event()
+
+    def run_upload(
+        self,
+        request: FinsUploadRequest,
+        *,
+        cancellation_checker: FinsJobCancellationChecker,
+    ) -> FinsUploadResultSummary:
+        """在测试指定的 final checkpoint 或 commit 后边界返回 summary。
+
+        Args:
+            request: runtime 传入的上传请求。
+            cancellation_checker: runtime 提供的 canonical 取消检查器。
+
+        Returns:
+            final checkpoint 前取消时返回 cancelled，否则返回 accepted summary。
+
+        Raises:
+            TimeoutError: 测试未在有界期限内释放 barrier 时抛出。
+        """
+
+        self.boundary_reached.set()
+        if not self.release_summary.wait(timeout=1.0):
+            raise TimeoutError("upload summary barrier 未释放")
+        if self.observe_cancel_before_summary and cancellation_checker():
+            return FinsUploadResultSummary(
+                source_kind=request.source_kind,
+                status="cancelled",
+            )
+        return self.accepted_summary
+
+
 class _BlockingArtifactUploadRunner(FinsUploadRunner):
     """写入源文档后阻塞的 observed upload runner。"""
 
@@ -1078,7 +1136,7 @@ class _BlockingArtifactUploadRunner(FinsUploadRunner):
             source_kind=SourceKind.FILING,
             document_id=self.document_id,
             internal_document_id=self.document_id,
-            status="uploaded",
+            status="ok",
             uploaded_files=(f"{self.document_id}.md",),
             primary_document=f"{self.document_id}.md",
         )
@@ -1540,6 +1598,52 @@ class _ClaimRaceJobStore:
         )
         self._record = cancelled
         return cancelled
+
+    def save_accepted_upload_terminal_if_active(
+        self,
+        job_id: str,
+        *,
+        disposition: FinsUploadTerminalDisposition,
+        result_summary: dict[str, JsonValue],
+        failure_summary: dict[str, JsonValue],
+        finished_at: str,
+    ) -> ingestion_runtime.FinsIngestionJobRecord:
+        """保存测试用 accepted upload terminal，且不重读取消状态。
+
+        Args:
+            job_id: opaque job id。
+            disposition: 已接受的 completed 或 failed disposition。
+            result_summary: upload 结果摘要。
+            failure_summary: upload 失败摘要。
+            finished_at: 终态写入时间。
+
+        Returns:
+            已保存的最终 job record。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+            ValueError: disposition 不是 completed/failed 时抛出。
+        """
+
+        record = self._require_record(job_id)
+        if _is_terminal_job_status(record.status):
+            return record
+        if disposition is FinsUploadTerminalDisposition.CANCELLED:
+            raise ValueError("accepted upload terminal 不接受 cancelled")
+        terminal = replace(
+            record,
+            status=(
+                FinsIngestionJobStatus.SUCCEEDED
+                if disposition is FinsUploadTerminalDisposition.COMPLETED
+                else FinsIngestionJobStatus.FAILED
+            ),
+            updated_at=finished_at,
+            finished_at=finished_at,
+            result_summary=result_summary,
+            failure_summary=failure_summary,
+        )
+        self._record = terminal
+        return terminal
 
     def save_failed_or_cancelled_if_active(
         self,
@@ -2616,6 +2720,338 @@ def test_direct_terminal_state_is_atomic_and_ignores_late_cancel_or_result() -> 
     assert aborted_state._terminal_status is None
 
 
+@pytest.mark.parametrize(
+    ("disposition", "expected_status"),
+    (
+        (FinsUploadTerminalDisposition.COMPLETED, FinsResultStatus.SUCCESS),
+        (FinsUploadTerminalDisposition.FAILED, FinsResultStatus.FAILURE),
+        (FinsUploadTerminalDisposition.CANCELLED, FinsResultStatus.CANCELLED),
+    ),
+)
+def test_direct_upload_summary_claim_is_single_terminal_and_ignores_late_cancel(
+    disposition: FinsUploadTerminalDisposition,
+    expected_status: FinsResultStatus,
+) -> None:
+    """accepted upload summary 必须单 lock claim，且不被 late cancel 改写。
+
+    Args:
+        disposition: runner 已 first-commit 的 summary disposition。
+        expected_status: 对应 direct RESULT status。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: claim、late cancel 或第二终态行为不符合契约时抛出。
+    """
+
+    state = ingestion_runtime._DirectStreamCancellationState.create()
+    assert state.request_cancel()
+    assert state.claim_upload_summary(disposition) is expected_status
+    assert state.claim_upload_summary(disposition) is None
+
+    claimed_state = ingestion_runtime._DirectStreamCancellationState.create()
+    assert claimed_state.claim_upload_summary(disposition) is expected_status
+    assert not claimed_state.request_cancel()
+    assert claimed_state.claim_terminal(FinsResultStatus.CANCELLED) is None
+
+
+@pytest.mark.asyncio
+async def test_direct_upload_projection_failure_before_claim_emits_single_failure_result(
+    tmp_path: Path,
+) -> None:
+    """accepted 事件构造失败必须在 claim 前收口为唯一 FAILURE RESULT。
+
+    Args:
+        tmp_path: pytest 临时目录夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: summary 边界、事件序列或单终态语义不符合契约时抛出。
+    """
+
+    oversized_direct_label = "D" * 121
+    summary = FinsUploadResultSummary(
+        source_kind=SourceKind.FILING,
+        document_id=oversized_direct_label,
+        status="ok",
+    )
+    assert summary.to_json_summary()["document_id"] == oversized_direct_label
+    runtime = _build_ingestion_runtime(
+        tmp_path / "fins-workspace",
+        executor=_HoldingExecutor(),
+        upload_runner=_FakeUploadRunner(summary),
+    )
+
+    events = await _collect_direct_events(runtime.upload(FinsUploadFilingRequest(ticker="AAPL")))
+    progress_stages = tuple(event.progress.stage for event in events if event.progress is not None)
+    results = tuple(event.result for event in events if event.result is not None)
+
+    assert progress_stages == ("upload.preparing", "upload.started")
+    assert len(results) == 1
+    assert results[0].status is FinsResultStatus.FAILURE
+    assert results[0].error_kind is FinsErrorKind.USER_INPUT
+    assert all(result.status is not FinsResultStatus.SUCCESS for result in results)
+
+
+@pytest.mark.asyncio
+async def test_direct_upload_cancel_before_final_checkpoint_returns_only_cancelled_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """时点 a：final checkpoint 前取消只能投影 cancelled，不得投影 completed。
+
+    Args:
+        tmp_path: pytest 临时目录夹具。
+        monkeypatch: pytest monkeypatch 夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: barrier、事件序列或单终态不符合契约时抛出。
+    """
+
+    states = _record_direct_cancellation_states(monkeypatch)
+    runner = _BarrierUploadRunner(
+        accepted_summary=FinsUploadResultSummary(source_kind=SourceKind.FILING, status="ok"),
+        observe_cancel_before_summary=True,
+    )
+    runtime = _build_ingestion_runtime(
+        tmp_path / "fins-workspace",
+        executor=_HoldingExecutor(),
+        upload_runner=runner,
+    )
+    collection = asyncio.create_task(_collect_direct_events(runtime.upload(FinsUploadFilingRequest(ticker="AAPL"))))
+    assert await asyncio.to_thread(runner.boundary_reached.wait, 1.0)
+    assert len(states) == 1
+    assert states[0].request_cancel()
+    runner.release_summary.set()
+
+    events = await asyncio.wait_for(collection, timeout=1.0)
+    progress_types = tuple(event.progress.stage for event in events if event.progress is not None)
+    results = tuple(event.result for event in events if event.result is not None)
+
+    assert progress_types == ("upload.preparing", "upload.started")
+    assert len(results) == 1
+    assert results[0].status is FinsResultStatus.CANCELLED
+    assert results[0].exit_code == 130
+
+
+@pytest.mark.asyncio
+async def test_direct_upload_cancel_after_commit_before_summary_keeps_completed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """时点 b：publication commit 后、summary 返回前取消不得改写 completed。
+
+    Args:
+        tmp_path: pytest 临时目录夹具。
+        monkeypatch: pytest monkeypatch 夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: barrier、progress/result 同源或 late cancel 行为漂移时抛出。
+    """
+
+    states = _record_direct_cancellation_states(monkeypatch)
+    runner = _BarrierUploadRunner(
+        accepted_summary=FinsUploadResultSummary(source_kind=SourceKind.FILING, status="ok"),
+        observe_cancel_before_summary=False,
+    )
+    runtime = _build_ingestion_runtime(
+        tmp_path / "fins-workspace",
+        executor=_HoldingExecutor(),
+        upload_runner=runner,
+    )
+    collection = asyncio.create_task(_collect_direct_events(runtime.upload(FinsUploadFilingRequest(ticker="AAPL"))))
+    assert await asyncio.to_thread(runner.boundary_reached.wait, 1.0)
+    assert len(states) == 1
+    assert states[0].request_cancel()
+    runner.release_summary.set()
+
+    events = await asyncio.wait_for(collection, timeout=1.0)
+    progress_types = tuple(event.progress.stage for event in events if event.progress is not None)
+    results = tuple(event.result for event in events if event.result is not None)
+
+    assert progress_types == ("upload.preparing", "upload.started", "upload.completed")
+    assert len(results) == 1
+    assert results[0].status is FinsResultStatus.SUCCESS
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_progress", "expected_result"),
+    (
+        ("ok", "upload.completed", FinsResultStatus.SUCCESS),
+        ("failed", "upload.completed_with_failures", FinsResultStatus.FAILURE),
+    ),
+)
+@pytest.mark.parametrize("cancel_before_claim", (True, False))
+@pytest.mark.asyncio
+async def test_direct_upload_cancel_around_summary_claim_keeps_progress_result_atomic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    expected_progress: str,
+    expected_result: FinsResultStatus,
+    cancel_before_claim: bool,
+) -> None:
+    """时点 c/d：claim 前后取消不拆分 accepted progress 与 RESULT。
+
+    Args:
+        tmp_path: pytest 临时目录夹具。
+        monkeypatch: pytest monkeypatch 夹具。
+        status: accepted upload summary status。
+        expected_progress: 预期 completed progress 类型。
+        expected_result: 预期 direct RESULT status。
+        cancel_before_claim: ``True`` 控制 claim 前窗口，否则控制 claim 后窗口。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: barrier、single claim 或 progress/result 投影不符合契约时抛出。
+    """
+
+    states = _record_direct_cancellation_states(monkeypatch)
+    claim_boundary = Event()
+    release_claim = Event()
+    original_claim = ingestion_runtime._DirectStreamCancellationState.claim_upload_summary
+
+    def controlled_claim(
+        state: ingestion_runtime._DirectStreamCancellationState,
+        disposition: FinsUploadTerminalDisposition,
+    ) -> FinsResultStatus | None:
+        """在 summary claim 前或后暂停 producer。
+
+        Args:
+            state: direct stream cancellation/terminal owner。
+            disposition: runner 返回的 accepted upload disposition。
+
+        Returns:
+            原 owner 的 single-claim 结果。
+
+        Raises:
+            AssertionError: barrier 未在期限内释放时抛出。
+        """
+
+        if cancel_before_claim:
+            claim_boundary.set()
+            assert release_claim.wait(timeout=1.0)
+            return original_claim(state, disposition)
+        claimed = original_claim(state, disposition)
+        claim_boundary.set()
+        assert release_claim.wait(timeout=1.0)
+        return claimed
+
+    monkeypatch.setattr(
+        ingestion_runtime._DirectStreamCancellationState,
+        "claim_upload_summary",
+        controlled_claim,
+    )
+    runtime = _build_ingestion_runtime(
+        tmp_path / "fins-workspace",
+        executor=_HoldingExecutor(),
+        upload_runner=_FakeUploadRunner(FinsUploadResultSummary(source_kind=SourceKind.FILING, status=status)),
+    )
+    collection = asyncio.create_task(_collect_direct_events(runtime.upload(FinsUploadFilingRequest(ticker="AAPL"))))
+    assert await asyncio.to_thread(claim_boundary.wait, 1.0)
+    assert len(states) == 1
+    cancel_accepted = states[0].request_cancel()
+    release_claim.set()
+
+    events = await asyncio.wait_for(collection, timeout=1.0)
+    progress_types = tuple(event.progress.stage for event in events if event.progress is not None)
+    results = tuple(event.result for event in events if event.result is not None)
+
+    assert cancel_accepted is cancel_before_claim
+    assert progress_types == ("upload.preparing", "upload.started", expected_progress)
+    assert len(results) == 1
+    assert results[0].status is expected_result
+
+
+def test_direct_upload_cancel_before_and_after_summary_claim_keeps_accepted_terminal() -> None:
+    """时点 c/d：summary claim 前后取消都不得改写已接受的 completed/failed。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: Event barrier 下的 claim 或单终态不符合契约时抛出。
+    """
+
+    before_claim_state = ingestion_runtime._DirectStreamCancellationState.create()
+    before_claim_entered = Event()
+    release_before_claim = Event()
+    before_claim_result: list[FinsResultStatus | None] = []
+
+    def claim_after_release() -> None:
+        """在测试释放前暂停 completed summary claim。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: barrier 未在期限内释放时抛出。
+        """
+
+        before_claim_entered.set()
+        assert release_before_claim.wait(timeout=1.0)
+        before_claim_result.append(before_claim_state.claim_upload_summary(FinsUploadTerminalDisposition.COMPLETED))
+
+    before_claim_thread = Thread(target=claim_after_release)
+    before_claim_thread.start()
+    assert before_claim_entered.wait(timeout=1.0)
+    assert before_claim_state.request_cancel()
+    release_before_claim.set()
+    before_claim_thread.join(timeout=1.0)
+
+    after_claim_state = ingestion_runtime._DirectStreamCancellationState.create()
+    after_claim_completed = Event()
+    release_after_claim = Event()
+    after_claim_result: list[FinsResultStatus | None] = []
+
+    def hold_after_claim() -> None:
+        """在 failed summary 已 claim 后暂停返回。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: barrier 未在期限内释放时抛出。
+        """
+
+        after_claim_result.append(after_claim_state.claim_upload_summary(FinsUploadTerminalDisposition.FAILED))
+        after_claim_completed.set()
+        assert release_after_claim.wait(timeout=1.0)
+
+    after_claim_thread = Thread(target=hold_after_claim)
+    after_claim_thread.start()
+    assert after_claim_completed.wait(timeout=1.0)
+    assert not after_claim_state.request_cancel()
+    release_after_claim.set()
+    after_claim_thread.join(timeout=1.0)
+
+    assert not before_claim_thread.is_alive()
+    assert before_claim_result == [FinsResultStatus.SUCCESS]
+    assert not after_claim_thread.is_alive()
+    assert after_claim_result == [FinsResultStatus.FAILURE]
+    assert after_claim_state.claim_terminal(FinsResultStatus.CANCELLED) is None
+
+
 def test_direct_checker_freezes_external_reason_and_time_across_threads() -> None:
     """direct composite token 必须跨线程保存首次外部取消事实。
 
@@ -3255,7 +3691,7 @@ def test_start_upload_persists_queued_record_and_uses_public_ticker_normalizatio
         FinsUploadResultSummary(
             source_kind=SourceKind.FILING,
             document_id="aapl-2024-10k",
-            status="uploaded",
+            status="ok",
         )
     )
     runtime = _build_ingestion_runtime(workspace_root, executor=executor, upload_runner=runner)
@@ -3374,7 +3810,7 @@ def test_start_upload_with_runner_writes_bounded_result_summary(tmp_path: Path) 
             source_kind=SourceKind.MATERIAL,
             document_id="aapl-investor-day",
             internal_document_id="aapl-investor-day-internal",
-            status="uploaded",
+            status="ok",
             uploaded_files=("primary.pdf",),
             primary_document="primary.pdf",
             deleted=False,
@@ -3404,7 +3840,7 @@ def test_start_upload_with_runner_writes_bounded_result_summary(tmp_path: Path) 
     assert record.result_summary["source_kind"] == "material"
     assert record.result_summary["document_id"] == "aapl-investor-day"
     assert record.result_summary["internal_document_id"] == "aapl-investor-day-internal"
-    assert record.result_summary["status"] == "uploaded"
+    assert record.result_summary["status"] == "ok"
     assert record.result_summary["uploaded_files"] == ["primary.pdf"]
     assert record.result_summary["primary_document"] == "primary.pdf"
     assert record.result_summary["deleted"] is False
@@ -3422,7 +3858,7 @@ def test_start_upload_with_runner_writes_bounded_result_summary(tmp_path: Path) 
     assert progress_events[0].payload["source_kind"] == "material"
     assert progress_events[0].payload["file_count"] == 1
     assert progress_events[1].document_id == "aapl-investor-day"
-    assert progress_events[1].payload["upload_status"] == "uploaded"
+    assert progress_events[1].payload["upload_status"] == "ok"
 
 
 @pytest.mark.asyncio
@@ -3434,7 +3870,7 @@ async def test_direct_upload_stream_omits_paths_job_ids_and_raw_payload_text(tmp
         FinsUploadResultSummary(
             source_kind=SourceKind.FILING,
             document_id="aapl-2024-10k",
-            status="uploaded",
+            status="ok",
             uploaded_files=("primary.pdf",),
             primary_document="primary.pdf",
         )
@@ -3498,8 +3934,9 @@ def test_start_upload_failed_status_emits_completed_with_failures_progress(tmp_p
     record = runtime.read_job(start.job_id)
     progress_events = _progress_events(runtime, start.job_id)
 
-    assert record.status is FinsIngestionJobStatus.SUCCEEDED
+    assert record.status is FinsIngestionJobStatus.FAILED
     assert record.result_summary["status"] == "failed"
+    assert record.failure_summary == {"message": direct_upload_failed_status_message()}
     assert [event.source_event_type for event in progress_events] == [
         "upload.started",
         "upload.completed_with_failures",
@@ -3507,6 +3944,569 @@ def test_start_upload_failed_status_emits_completed_with_failures_progress(tmp_p
     assert progress_events[1].message == "上传已完成，存在失败"
     assert progress_events[1].document_id == "aapl-investor-day"
     assert progress_events[1].payload["upload_status"] == "failed"
+
+
+@pytest.mark.parametrize(
+    ("status", "projection_status", "expected_job_status"),
+    (
+        ("ok", "failed", FinsIngestionJobStatus.SUCCEEDED),
+        ("failed", "ok", FinsIngestionJobStatus.FAILED),
+    ),
+)
+def test_durable_upload_projection_failure_preserves_accepted_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    projection_status: str,
+    expected_job_status: FinsIngestionJobStatus,
+) -> None:
+    """accepted terminal 保存后的投影异常不得改写 record 或追加终态事件。
+
+    Args:
+        tmp_path: pytest 临时目录夹具。
+        monkeypatch: pytest monkeypatch 夹具。
+        status: runner 返回的 accepted upload status。
+        projection_status: fake store 返回给投影层的不一致 status。
+        expected_job_status: 已持久化 record 的预期终态。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: fallback 未读取 durable 真源、终态被改写或追加事件时抛出。
+    """
+
+    executor = _HoldingExecutor()
+    runtime = _build_ingestion_runtime(
+        tmp_path / "fins-workspace",
+        executor=executor,
+        upload_runner=_FakeUploadRunner(FinsUploadResultSummary(source_kind=SourceKind.FILING, status=status)),
+    )
+    start = runtime.start_upload(FinsUploadFilingRequest(ticker="AAPL"))
+    original_save = ingestion_runtime.FsFinsIngestionJobStore.save_accepted_upload_terminal_if_active
+    original_read = ingestion_runtime.FsFinsIngestionJobStore.read_job
+    accepted_records: list[ingestion_runtime.FinsIngestionJobRecord] = []
+    fallback_reads: list[ingestion_runtime.FinsIngestionJobRecord] = []
+
+    def save_then_return_invalid_projection_record(
+        store: ingestion_runtime.FsFinsIngestionJobStore,
+        job_id: str,
+        *,
+        disposition: FinsUploadTerminalDisposition,
+        result_summary: dict[str, JsonValue],
+        failure_summary: dict[str, JsonValue],
+        finished_at: str,
+    ) -> ingestion_runtime.FinsIngestionJobRecord:
+        """先由真实 store 保存终态，再向投影层返回不一致的 fake record。
+
+        Args:
+            store: 文件系统 job store。
+            job_id: opaque job id。
+            disposition: workflow 已接受的 upload disposition。
+            result_summary: upload 结果摘要。
+            failure_summary: upload 失败摘要。
+            finished_at: 终态写入时间。
+
+        Returns:
+            仅供投影消费、status 与 durable record 不一致的 fake record。
+
+        Raises:
+            OSError: 真实 store 保存失败时抛出。
+            ValueError: 真实 store contract 校验失败时抛出。
+        """
+
+        saved = original_save(
+            store,
+            job_id,
+            disposition=disposition,
+            result_summary=result_summary,
+            failure_summary=failure_summary,
+            finished_at=finished_at,
+        )
+        accepted_records.append(saved)
+        return replace(
+            saved,
+            result_summary={**saved.result_summary, "status": projection_status},
+        )
+
+    def record_fallback_read(
+        store: ingestion_runtime.FsFinsIngestionJobStore,
+        job_id: str,
+    ) -> ingestion_runtime.FinsIngestionJobRecord:
+        """记录异常收口从 durable owner 重读的终态。
+
+        Args:
+            store: 文件系统 job store。
+            job_id: opaque job id。
+
+        Returns:
+            durable owner 中的真实 job record。
+
+        Raises:
+            FileNotFoundError: job id 不存在时抛出。
+            OSError: 文件系统读取失败时抛出。
+            ValueError: durable record 非法时抛出。
+        """
+
+        record = original_read(store, job_id)
+        if accepted_records:
+            fallback_reads.append(record)
+        return record
+
+    monkeypatch.setattr(
+        ingestion_runtime.FsFinsIngestionJobStore,
+        "save_accepted_upload_terminal_if_active",
+        save_then_return_invalid_projection_record,
+    )
+    monkeypatch.setattr(
+        ingestion_runtime.FsFinsIngestionJobStore,
+        "read_job",
+        record_fallback_read,
+    )
+
+    executor.run_all()
+
+    store = cast(ingestion_runtime.FsFinsIngestionJobStore, runtime.job_store)
+    record = original_read(store, start.job_id)
+    events = runtime.read_job_events(start.job_id, after_sequence=0, limit=100)
+    terminal_events = tuple(
+        event
+        for event in events
+        if event.event_type
+        in {
+            FinsIngestionJobEventType.JOB_SUCCEEDED,
+            FinsIngestionJobEventType.JOB_FAILED,
+            FinsIngestionJobEventType.JOB_CANCELLED,
+        }
+    )
+
+    assert len(accepted_records) == 1
+    assert fallback_reads == accepted_records
+    assert record == accepted_records[0]
+    assert record.status is expected_job_status
+    assert record.result_summary["status"] == status
+    assert terminal_events == ()
+
+
+def test_durable_upload_cancel_before_final_checkpoint_saves_only_cancelled(
+    tmp_path: Path,
+) -> None:
+    """时点 a：durable runner final checkpoint 前取消只保存 cancelled。
+
+    Args:
+        tmp_path: pytest 临时目录夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: barrier、record 或 event 单终态不符合契约时抛出。
+    """
+
+    executor = _HoldingExecutor()
+    runner = _BarrierUploadRunner(
+        accepted_summary=FinsUploadResultSummary(source_kind=SourceKind.FILING, status="ok"),
+        observe_cancel_before_summary=True,
+    )
+    runtime = _build_ingestion_runtime(
+        tmp_path / "fins-workspace",
+        executor=executor,
+        upload_runner=runner,
+    )
+    start = runtime.start_upload(FinsUploadFilingRequest(ticker="AAPL"))
+    operation_thread = Thread(target=executor.run_all)
+    operation_thread.start()
+    assert runner.boundary_reached.wait(timeout=1.0)
+    runtime.request_cancel(start.job_id)
+    runner.release_summary.set()
+    operation_thread.join(timeout=1.0)
+
+    record = runtime.read_job(start.job_id)
+    events = runtime.read_job_events(start.job_id, after_sequence=0, limit=100)
+    progress_types = tuple(
+        event.source_event_type for event in events if event.event_type is FinsIngestionJobEventType.PROGRESS
+    )
+    terminal_types = tuple(
+        event.event_type
+        for event in events
+        if event.event_type
+        in {
+            FinsIngestionJobEventType.JOB_SUCCEEDED,
+            FinsIngestionJobEventType.JOB_FAILED,
+            FinsIngestionJobEventType.JOB_CANCELLED,
+        }
+    )
+
+    assert not operation_thread.is_alive()
+    assert record.status is FinsIngestionJobStatus.CANCELLED
+    assert progress_types == ("upload.started",)
+    assert terminal_types == (FinsIngestionJobEventType.JOB_CANCELLED,)
+
+
+def test_durable_upload_cancel_after_commit_before_summary_keeps_completed(
+    tmp_path: Path,
+) -> None:
+    """时点 b：durable publication commit 后、summary 返回前取消保持 completed。
+
+    Args:
+        tmp_path: pytest 临时目录夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: barrier、record 或 event 投影不符合契约时抛出。
+    """
+
+    executor = _HoldingExecutor()
+    runner = _BarrierUploadRunner(
+        accepted_summary=FinsUploadResultSummary(source_kind=SourceKind.FILING, status="ok"),
+        observe_cancel_before_summary=False,
+    )
+    runtime = _build_ingestion_runtime(
+        tmp_path / "fins-workspace",
+        executor=executor,
+        upload_runner=runner,
+    )
+    start = runtime.start_upload(FinsUploadFilingRequest(ticker="AAPL"))
+    operation_thread = Thread(target=executor.run_all)
+    operation_thread.start()
+    assert runner.boundary_reached.wait(timeout=1.0)
+    runtime.request_cancel(start.job_id)
+    runner.release_summary.set()
+    operation_thread.join(timeout=1.0)
+
+    record = runtime.read_job(start.job_id)
+    progress_events = _progress_events(runtime, start.job_id)
+
+    assert not operation_thread.is_alive()
+    assert record.status is FinsIngestionJobStatus.SUCCEEDED
+    assert record.cancellation_requested
+    assert record.result_summary["status"] == "ok"
+    assert [event.source_event_type for event in progress_events] == [
+        "upload.started",
+        "upload.completed",
+    ]
+    assert progress_events[-1].status is FinsIngestionJobStatus.SUCCEEDED
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_job_status", "expected_progress", "expected_terminal"),
+    (
+        (
+            "ok",
+            FinsIngestionJobStatus.SUCCEEDED,
+            "upload.completed",
+            FinsIngestionJobEventType.JOB_SUCCEEDED,
+        ),
+        (
+            "failed",
+            FinsIngestionJobStatus.FAILED,
+            "upload.completed_with_failures",
+            FinsIngestionJobEventType.JOB_FAILED,
+        ),
+    ),
+)
+def test_durable_upload_cancel_before_atomic_save_keeps_accepted_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    expected_job_status: FinsIngestionJobStatus,
+    expected_progress: str,
+    expected_terminal: FinsIngestionJobEventType,
+) -> None:
+    """时点 c：accepted summary 返回后、atomic save 前取消不得改写终态。
+
+    Args:
+        tmp_path: pytest 临时目录夹具。
+        monkeypatch: pytest monkeypatch 夹具。
+        status: accepted upload summary status。
+        expected_job_status: 预期 durable job status。
+        expected_progress: 预期 completed progress 类型。
+        expected_terminal: 预期 terminal event 类型。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: save barrier、record 或 event 投影不符合契约时抛出。
+    """
+
+    save_entered = Event()
+    release_save = Event()
+    original_save = ingestion_runtime.FsFinsIngestionJobStore.save_accepted_upload_terminal_if_active
+
+    def save_after_release(
+        store: ingestion_runtime.FsFinsIngestionJobStore,
+        job_id: str,
+        *,
+        disposition: FinsUploadTerminalDisposition,
+        result_summary: dict[str, JsonValue],
+        failure_summary: dict[str, JsonValue],
+        finished_at: str,
+    ) -> ingestion_runtime.FinsIngestionJobRecord:
+        """在 accepted terminal 原子保存前等待测试释放。
+
+        Args:
+            store: 文件系统 job store。
+            job_id: opaque job id。
+            disposition: accepted upload disposition。
+            result_summary: upload 结果摘要。
+            failure_summary: upload 失败摘要。
+            finished_at: 终态写入时间。
+
+        Returns:
+            原 owner 保存的最终 record。
+
+        Raises:
+            AssertionError: barrier 未在期限内释放时抛出。
+            OSError: 原 owner 文件系统写入失败时抛出。
+            ValueError: 原 owner contract 校验失败时抛出。
+        """
+
+        save_entered.set()
+        assert release_save.wait(timeout=1.0)
+        return original_save(
+            store,
+            job_id,
+            disposition=disposition,
+            result_summary=result_summary,
+            failure_summary=failure_summary,
+            finished_at=finished_at,
+        )
+
+    monkeypatch.setattr(
+        ingestion_runtime.FsFinsIngestionJobStore,
+        "save_accepted_upload_terminal_if_active",
+        save_after_release,
+    )
+    executor = _HoldingExecutor()
+    runtime = _build_ingestion_runtime(
+        tmp_path / "fins-workspace",
+        executor=executor,
+        upload_runner=_FakeUploadRunner(FinsUploadResultSummary(source_kind=SourceKind.FILING, status=status)),
+    )
+    start = runtime.start_upload(FinsUploadFilingRequest(ticker="AAPL"))
+    operation_thread = Thread(target=executor.run_all)
+    operation_thread.start()
+    assert save_entered.wait(timeout=1.0)
+    runtime.request_cancel(start.job_id)
+    release_save.set()
+    operation_thread.join(timeout=1.0)
+
+    record = runtime.read_job(start.job_id)
+    events = runtime.read_job_events(start.job_id, after_sequence=0, limit=100)
+
+    assert not operation_thread.is_alive()
+    assert record.status is expected_job_status
+    assert record.cancellation_requested
+    assert record.result_summary["status"] == status
+    assert [event.source_event_type for event in _progress_events(runtime, start.job_id)] == [
+        "upload.started",
+        expected_progress,
+    ]
+    assert [event.event_type for event in events].count(expected_terminal) == 1
+    assert [event.event_type for event in events].count(FinsIngestionJobEventType.JOB_CANCELLED) == 0
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_job_status", "expected_progress"),
+    (
+        ("ok", FinsIngestionJobStatus.SUCCEEDED, "upload.completed"),
+        ("failed", FinsIngestionJobStatus.FAILED, "upload.completed_with_failures"),
+    ),
+)
+def test_durable_upload_cancel_after_atomic_save_keeps_single_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    expected_job_status: FinsIngestionJobStatus,
+    expected_progress: str,
+) -> None:
+    """时点 d：atomic save 后取消不得改变 record 或制造第二终态。
+
+    Args:
+        tmp_path: pytest 临时目录夹具。
+        monkeypatch: pytest monkeypatch 夹具。
+        status: accepted upload summary status。
+        expected_job_status: 预期 durable job status。
+        expected_progress: 预期 completed progress 类型。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: save barrier、record 或单终态不符合契约时抛出。
+    """
+
+    save_completed = Event()
+    release_projection = Event()
+    original_save = ingestion_runtime.FsFinsIngestionJobStore.save_accepted_upload_terminal_if_active
+
+    def save_then_hold(
+        store: ingestion_runtime.FsFinsIngestionJobStore,
+        job_id: str,
+        *,
+        disposition: FinsUploadTerminalDisposition,
+        result_summary: dict[str, JsonValue],
+        failure_summary: dict[str, JsonValue],
+        finished_at: str,
+    ) -> ingestion_runtime.FinsIngestionJobRecord:
+        """原子保存 accepted terminal 后暂停 progress/event 投影。
+
+        Args:
+            store: 文件系统 job store。
+            job_id: opaque job id。
+            disposition: accepted upload disposition。
+            result_summary: upload 结果摘要。
+            failure_summary: upload 失败摘要。
+            finished_at: 终态写入时间。
+
+        Returns:
+            原 owner 保存的最终 record。
+
+        Raises:
+            AssertionError: barrier 未在期限内释放时抛出。
+            OSError: 原 owner 文件系统写入失败时抛出。
+            ValueError: 原 owner contract 校验失败时抛出。
+        """
+
+        saved = original_save(
+            store,
+            job_id,
+            disposition=disposition,
+            result_summary=result_summary,
+            failure_summary=failure_summary,
+            finished_at=finished_at,
+        )
+        save_completed.set()
+        assert release_projection.wait(timeout=1.0)
+        return saved
+
+    monkeypatch.setattr(
+        ingestion_runtime.FsFinsIngestionJobStore,
+        "save_accepted_upload_terminal_if_active",
+        save_then_hold,
+    )
+    executor = _HoldingExecutor()
+    runtime = _build_ingestion_runtime(
+        tmp_path / "fins-workspace",
+        executor=executor,
+        upload_runner=_FakeUploadRunner(FinsUploadResultSummary(source_kind=SourceKind.FILING, status=status)),
+    )
+    start = runtime.start_upload(FinsUploadFilingRequest(ticker="AAPL"))
+    operation_thread = Thread(target=executor.run_all)
+    operation_thread.start()
+    assert save_completed.wait(timeout=1.0)
+    after_terminal_cancel = runtime.request_cancel(start.job_id)
+    release_projection.set()
+    operation_thread.join(timeout=1.0)
+
+    record = runtime.read_job(start.job_id)
+    events = runtime.read_job_events(start.job_id, after_sequence=0, limit=100)
+    terminal_events = tuple(
+        event
+        for event in events
+        if event.event_type
+        in {
+            FinsIngestionJobEventType.JOB_SUCCEEDED,
+            FinsIngestionJobEventType.JOB_FAILED,
+            FinsIngestionJobEventType.JOB_CANCELLED,
+        }
+    )
+
+    assert not operation_thread.is_alive()
+    assert after_terminal_cancel.status is expected_job_status
+    assert record.status is expected_job_status
+    assert not record.cancellation_requested
+    assert [event.source_event_type for event in _progress_events(runtime, start.job_id)] == [
+        "upload.started",
+        expected_progress,
+    ]
+    assert len(terminal_events) == 1
+    assert terminal_events[0].status is expected_job_status
+
+
+def test_accepted_upload_terminal_store_rejects_mismatch_and_preserves_existing_terminal(
+    tmp_path: Path,
+) -> None:
+    """upload atomic store 只接受匹配字段，并且不得覆盖已有 terminal。
+
+    Args:
+        tmp_path: pytest 临时目录夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: strict validation 或 existing-terminal 原子语义不符合契约时抛出。
+    """
+
+    executor = _HoldingExecutor()
+    runtime = _build_ingestion_runtime(tmp_path / "fins-workspace", executor=executor)
+    start = runtime.start_upload(FinsUploadFilingRequest(ticker="AAPL"))
+    store = runtime.job_store
+    completed_summary = FinsUploadResultSummary(
+        source_kind=SourceKind.FILING,
+        status="ok",
+    ).to_json_summary()
+    failed_summary = FinsUploadResultSummary(
+        source_kind=SourceKind.FILING,
+        status="failed",
+    ).to_json_summary()
+    finished_at = datetime.now(timezone.utc).isoformat()
+
+    with pytest.raises(ValueError, match="不接受 cancelled"):
+        store.save_accepted_upload_terminal_if_active(
+            start.job_id,
+            disposition=FinsUploadTerminalDisposition.CANCELLED,
+            result_summary={"status": "cancelled"},
+            failure_summary={},
+            finished_at=finished_at,
+        )
+    with pytest.raises(ValueError, match="不一致"):
+        store.save_accepted_upload_terminal_if_active(
+            start.job_id,
+            disposition=FinsUploadTerminalDisposition.COMPLETED,
+            result_summary=failed_summary,
+            failure_summary={},
+            finished_at=finished_at,
+        )
+    with pytest.raises(ValueError, match="必须包含 failure_summary"):
+        store.save_accepted_upload_terminal_if_active(
+            start.job_id,
+            disposition=FinsUploadTerminalDisposition.FAILED,
+            result_summary=failed_summary,
+            failure_summary={},
+            finished_at=finished_at,
+        )
+    with pytest.raises(ValueError, match="不得包含 failure_summary"):
+        store.save_accepted_upload_terminal_if_active(
+            start.job_id,
+            disposition=FinsUploadTerminalDisposition.COMPLETED,
+            result_summary=completed_summary,
+            failure_summary={"message": "unexpected"},
+            finished_at=finished_at,
+        )
+
+    saved = store.save_accepted_upload_terminal_if_active(
+        start.job_id,
+        disposition=FinsUploadTerminalDisposition.COMPLETED,
+        result_summary=completed_summary,
+        failure_summary={},
+        finished_at=finished_at,
+    )
+    preserved = store.save_accepted_upload_terminal_if_active(
+        start.job_id,
+        disposition=FinsUploadTerminalDisposition.FAILED,
+        result_summary=failed_summary,
+        failure_summary={"message": "late failure"},
+        finished_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+    assert saved.status is FinsIngestionJobStatus.SUCCEEDED
+    assert preserved == saved
+    assert runtime.read_job(start.job_id) == saved
 
 
 def test_default_runtime_start_upload_sec_filing_uses_production_runner(tmp_path: Path) -> None:
@@ -3624,7 +4624,7 @@ def test_upload_request_and_result_summaries_enforce_bounds(tmp_path: Path) -> N
     with pytest.raises(ValueError, match="uploaded_files 元素数量超出上限"):
         FinsUploadResultSummary(
             source_kind=SourceKind.FILING,
-            status="uploaded",
+            status="ok",
             uploaded_files=too_many_files,
         ).to_json_summary()
     assert executor.operations == []
@@ -3668,7 +4668,7 @@ def test_result_summaries_allow_slash_in_document_ids() -> None:
     )
     upload_summary = FinsUploadResultSummary(
         source_kind=SourceKind.FILING,
-        status="uploaded",
+        status="ok",
         document_id="sec/aapl-2024-10ka",
         internal_document_id="sec/aapl-2024-10ka-internal",
     )
@@ -3725,6 +4725,63 @@ def test_upload_pipeline_result_requires_status() -> None:
 
     with pytest.raises(ValueError, match="status"):
         FinsUploadPipelineResult.from_pipeline_json({"document_id": "aapl-2024-10k"})
+
+
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    (
+        ("ok", FinsUploadTerminalDisposition.COMPLETED),
+        ("skipped", FinsUploadTerminalDisposition.COMPLETED),
+        ("deleted", FinsUploadTerminalDisposition.COMPLETED),
+        ("failed", FinsUploadTerminalDisposition.FAILED),
+        ("cancelled", FinsUploadTerminalDisposition.CANCELLED),
+    ),
+)
+def test_upload_status_owner_maps_only_exact_production_statuses(
+    status: str,
+    expected: FinsUploadTerminalDisposition,
+) -> None:
+    """pipeline result 与 runtime summary 必须复用同一个 exact status owner。
+
+    Args:
+        status: 合法 production upload status。
+        expected: 对应的 closed terminal disposition。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 两个 owner boundary 的映射不一致时抛出。
+    """
+
+    pipeline_result = FinsUploadPipelineResult.from_pipeline_json({"status": status})
+    summary = FinsUploadResultSummary(source_kind=SourceKind.FILING, status=status)
+
+    assert pipeline_result.status == status
+    assert summary.terminal_disposition() is expected
+
+
+@pytest.mark.parametrize(
+    "status",
+    ("uploaded", "unknown", "OK", " ok", "ok ", "", "CANCELLED"),
+)
+def test_upload_status_owner_rejects_unknown_case_and_whitespace_variants(status: str) -> None:
+    """upload status owner 不得 loose parse、兼容 alias 或默认成功。
+
+    Args:
+        status: 非法或非 exact status。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: pipeline 或 summary boundary 未抛 ``ValueError`` 时抛出。
+    """
+
+    with pytest.raises(ValueError, match="upload status"):
+        FinsUploadPipelineResult.from_pipeline_json({"status": status})
+    with pytest.raises(ValueError, match="upload status"):
+        FinsUploadResultSummary(source_kind=SourceKind.FILING, status=status)
 
 
 def test_prepare_observed_operations_do_not_submit_until_activation(tmp_path: Path) -> None:
@@ -4187,7 +5244,7 @@ def test_job_event_sidecar_omits_paths_payload_bodies_and_raw_provider_payloads(
         FinsUploadResultSummary(
             source_kind=SourceKind.FILING,
             document_id="aapl-2024-10k",
-            status="uploaded",
+            status="ok",
         )
     )
     ingestion = _build_ingestion_runtime(workspace_root, executor=executor, upload_runner=runner)
@@ -4499,7 +5556,7 @@ def test_progress_event_append_failure_warns_and_job_still_succeeds(
         FinsUploadResultSummary(
             source_kind=SourceKind.FILING,
             document_id="aapl-2024-10k",
-            status="uploaded",
+            status="ok",
         )
     )
     ingestion = _build_ingestion_runtime(

@@ -314,6 +314,8 @@ dayu-cli upload_material --help
 三个上传命令的 `--action` 默认都是 `auto`。单份上传还可显式使用
 `create`、`update` 或 `delete`；批量脚本只会生成 `auto`、`create` 或 `update`。
 
+上传期间第一次按下 `Ctrl-C` 只会请求一次协作取消，命令会继续等待并展示上传运行期给出的最终结果。若取消在文档发布前生效，最终显示 cancelled 并退出 `130`，不会先显示 completed；若文档发布或确定的跳过/删除结果已经完成，随后到达的 `Ctrl-C` 不会把该结果改写为 cancelled，也不会回滚已发布内容。
+
 ### 5.3 从目录生成批量上传脚本
 
 `upload_filings_from` 扫描和分类本地文件，生成当前平台可直接执行的脚本；生成阶段不上传文件：

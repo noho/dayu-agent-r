@@ -1592,10 +1592,12 @@ async def test_cli_event_task_drain_deduplicates_same_primary_close_cause() -> N
 @pytest.mark.asyncio
 async def test_cli_stream_owner_sigint_waits_for_canonical_cancelled_terminal(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """SIGINT 只请求 token，退出码必须来自 canonical cancelled terminal。
 
     :param monkeypatch: pytest monkeypatch 夹具。
+    :param capsys: pytest 标准输出捕获夹具。
     :returns: ``None``。
     :raises AssertionError: canonical 退出码、取消或关闭次数不符合契约时抛出。
     """
@@ -1625,14 +1627,23 @@ async def test_cli_stream_owner_sigint_waits_for_canonical_cancelled_terminal(
     await service.first_event_yielded.wait()
 
     monitor.notify()
+    assert await asyncio.wait_for(monitor.observed_counts.get(), timeout=1.0) == 1
     await asyncio.wait_for(token.requested.wait(), timeout=1.0)
+    assert token.request_count == 1
+    assert not command_task.done()
+    monitor.notify()
+    assert await asyncio.wait_for(monitor.observed_counts.get(), timeout=1.0) == 2
+    assert token.request_count == 1
     service.release_stream.set()
     exit_code = await command_task
+    captured = capsys.readouterr()
 
     assert exit_code == EXIT_KEYBOARD_INTERRUPT
     assert service.cancellation_tokens[0] is not None
     assert service.cancellation_tokens[0].is_cancelled()
     assert service.closed_streams == 1
+    assert "download live progress" in captured.out
+    assert "Fins cancelled" in captured.err
 
 
 @pytest.mark.asyncio
