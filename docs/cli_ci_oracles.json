@@ -2470,27 +2470,482 @@
       },
       "supersedes": null,
       "superseded_by": null
+    },
+    {
+      "oracle_id": "cli.upload_filing.document-publication",
+      "version": 1,
+      "status": "accepted",
+      "category": "behavioral",
+      "scope": {
+        "command": "upload_filing",
+        "scenes": [],
+        "surfaces": [
+          "argv-workspace-and-logging",
+          "filing-action-publication-and-integrity",
+          "ticker-alias-date-period-and-company-identity",
+          "format-conversion-multi-file-and-primary",
+          "stdout-stderr-summary-and-durable-boundary",
+          "concurrency-cancel-crash-and-cross-command-consumption"
+        ]
+      },
+      "predicates": [
+        {
+          "predicate_id": "upload_filing.public-surface",
+          "expected": [
+            "公开命令面只包含 help 展示的 upload_filing 参数，--ticker 必填；不存在 --source/--config/--document-id/--infer/--ci。",
+            "未知参数、缺少值与额外 positional 在 parser 边界 exit 2。"
+          ],
+          "forbidden": [
+            "暴露内部 source 或为历史入口保留隐藏兼容参数。"
+          ]
+        },
+        {
+          "predicate_id": "upload_filing.workspace-and-log-wiring",
+          "expected": [
+            "默认 workspace、--base/--workspace/-b、重复 --base last-wins、symlink base 与共享日志参数遵循公共 CLI owner。",
+            "quiet 只关闭诊断日志而保留业务进度和终态；无模型流的 direct command 不伪造 debug stream；quiet 与 debug-stream 冲突 exit 2。"
+          ],
+          "forbidden": [
+            "不同 direct command 各自实现漂移的 workspace 或日志选择规则。"
+          ]
+        },
+        {
+          "predicate_id": "upload_filing.validation-side-effects",
+          "expected": [
+            "全部 usage validation 在 workspace 业务 mutation 前完成。",
+            "create/update 的 company meta 与 source publication 处于同一原子业务边界；正常 handled failure 不留下 skeleton、孤立 company meta 或半 source。"
+          ],
+          "forbidden": [
+            "先创建业务目录、锁、company meta 或 job 再报告可预先识别的用户输入错误。"
+          ]
+        },
+        {
+          "predicate_id": "upload_filing.error-classification",
+          "expected": [
+            "用户可在启动工作前修正的缺参或非法值使用 exit 2 和具体可行动提示。",
+            "文件内容不可解析、仓储或运行期失败使用 exit 1；取消使用 exit 130。"
+          ],
+          "forbidden": [
+            "把 typed 用户错误降级成 generic runtime failure，或把内容/运行期错误伪装为 parser usage error。"
+          ]
+        },
+        {
+          "predicate_id": "upload_filing.action-core",
+          "expected": [
+            "auto fresh=create、相同完整输入=skip、同一 filing 内容变化=update；create existing 失败，create+overwrite 原子替换。",
+            "update 无论是否 overwrite 都要求目标存在；upsert 只由 auto 拥有。",
+            "delete 是可重复 logical delete；amended 是独立 filing identity；可判定的 existing 冲突在昂贵转换前失败。"
+          ],
+          "forbidden": [
+            "update missing + overwrite 静默创建，或用本地文件名替代 filing identity。"
+          ]
+        },
+        {
+          "predicate_id": "upload_filing.renamed-update",
+          "expected": [
+            "同一 filing 内容变化时，本地输入文件改名不阻止 update；完整文件集合以 old-or-new 原子方式替换，旧业务文件被移除。"
+          ],
+          "forbidden": [
+            "因 basename/stem 变化拒绝同一 filing 的合法更新或残留旧文件。"
+          ]
+        },
+        {
+          "predicate_id": "upload_filing.auto-after-delete",
+          "expected": [
+            "用户再次提供完整文件对 deleted source 执行 auto 时，恢复或重新创建可用 source。"
+          ],
+          "forbidden": [
+            "exit 0/skipped 但 source 仍保持 deleted。"
+          ]
+        },
+        {
+          "predicate_id": "upload_filing.irrelevant-and-repeated-options",
+          "expected": [
+            "重复单值 --action/--ticker 采用 argparse last-wins。",
+            "delete 的无效文件组合必须明确拒绝或明确忽略；summary 只报告实际存储/删除数量。"
+          ],
+          "forbidden": [
+            "把被忽略的请求文件计作 uploaded_files。"
+          ]
+        },
+        {
+          "predicate_id": "upload_filing.date-and-year-domain",
+          "expected": [
+            "filing-date/report-date 必须是实际存在的 ISO YYYY-MM-DD calendar date；fiscal-year 必须是业务有效的正四位年份。",
+            "与 download 语义相同的 calendar/year 校验复用同一公共真源；download 独有的 year/year-month 边界展开仍由 download wrapper 拥有。"
+          ],
+          "forbidden": [
+            "持久化非法日期、0、负数或超过四位的 fiscal year，或在 download/upload 重复实现漂移的日期合法性。"
+          ]
+        },
+        {
+          "predicate_id": "upload_filing.ticker-and-alias",
+          "expected": [
+            "US/CN/HK ticker canonicalization 与长度边界保持统一；纯语法变体由 ticker normalizer 处理。",
+            "CSV 第一项是 canonical corpus，后续项是用户明确声明的同一公司查询 alias；系统按声明保存并使 list_documents 路由到该 canonical corpus。",
+            "用户负责 alias 与现实公司的关系是否正确；系统不联网证明、不猜测也不纠正该业务声明。",
+            "alias 的解析、归一化、持久化和查询投影由同一 Company Identity/CompanyMeta contract 驱动；同一 workspace 内映射必须确定且不随入口漂移。"
+          ],
+          "forbidden": [
+            "把用户声明错误归为产品错误，或静默丢弃 accepted alias。",
+            "upload、resolver、storage 与 list_documents 使用互不相容的 alias grammar 或路由规则。"
+          ]
+        },
+        {
+          "predicate_id": "upload_filing.fiscal-period-domain",
+          "expected": [
+            "fiscal-period 是 FY/H1/Q1/Q2/Q3/Q4 封闭集合，输入先 strip 并 uppercase。"
+          ],
+          "forbidden": [
+            "持久化集合外财期或由市场入口各自发明不一致枚举。"
+          ]
+        },
+        {
+          "predicate_id": "upload_filing.format-owner",
+          "expected": [
+            "converter capability 是 help、CLI 与 Service 文件格式集合的单一 contract。",
+            "只宣称真实 converter 可处理的格式；XBRL companion 可作为附件保存，不强制每个附件都做 Docling 转换。"
+          ],
+          "forbidden": [
+            "CLI 接受但 Service/converter 拒绝，或真实 converter 支持但 CLI 预先拒绝。",
+            "用扩展名伪装内容能力或保留无真实能力的 legacy 格式。"
+          ]
+        },
+        {
+          "predicate_id": "upload_filing.malformed-and-empty-input",
+          "expected": [
+            "空文件在发布前拒绝；任一必需转换输入损坏时整批原子失败且不发布 filing。",
+            "用户 stderr 只显示文件名和有界可理解原因，完整第三方 traceback 仅进入 debug log。"
+          ],
+          "forbidden": [
+            "接受空文件、部分发布混合批次或向普通 stderr 原样倾倒第三方 traceback。"
+          ]
+        },
+        {
+          "predicate_id": "upload_filing.multi-file-and-primary",
+          "expected": [
+            "最多接受 100 个不同输入文件；重复路径在转换前 exit 2；输出 identity 不发生 basename/stem collision。",
+            "多文件 filing 必须有显式且稳定的 primary 规则；只有 primary 的下游消费结果可称为已 process，附件不得误报。"
+          ],
+          "forbidden": [
+            "靠偶然输入顺序或文件系统顺序选择 primary，或让同 stem/basename 覆盖。"
+          ]
+        },
+        {
+          "predicate_id": "upload_filing.real-market-cross-command",
+          "expected": [
+            "US/CN/HK 真实输入发布完整 originals、Docling meta/manifest，并可由 production process_filing 通过 dayu.fins.storage 消费。",
+            "CLI summary 只是屏幕事实，实际文件、public repository 和 downstream 结果才是成功依据。"
+          ],
+          "forbidden": [
+            "用 fake corpus、私有路径读取或 CLI 自报替代真实 publication/消费证明。"
+          ]
+        },
+        {
+          "predicate_id": "upload_filing.existing-source-integrity",
+          "expected": [
+            "existing source 的 original、Docling、meta、manifest 任一完整性不一致均 fail-closed。",
+            "用户已提供完整本地输入且 auto 可安全重建时，原子恢复可修复状态，不要求用户理解内部损坏类型。"
+          ],
+          "forbidden": [
+            "在完整性错误上继续 skip，或显示成功而实物/meta/manifest 不同源。"
+          ]
+        },
+        {
+          "predicate_id": "upload_filing.sigint-cancellation",
+          "expected": [
+            "very-early 与 Docling 阶段一次 Ctrl+C 请求协作取消，终止转换工作，清理后 exit 130；不发布 filing且同 workspace 可重试。",
+            "可中断 Docling converter 收敛为一个公共运行时 owner，供 download、upload 与其它调用方复用。",
+            "屏幕只投影 canonical cancelled terminal。"
+          ],
+          "forbidden": [
+            "等待同步转换自然结束后才取消，留下 worker/半 publication，或先显示 completed 再显示 cancelled。",
+            "download 与 upload 各自维护漂移的子进程中断实现。"
+          ]
+        },
+        {
+          "predicate_id": "upload_filing.kill-recovery",
+          "expected": [
+            "转换中 SIGKILL 不要求优雅输出，但不得留下半发布 filing或阻断恢复的临时状态；相同 workspace/argv 可重试成功。"
+          ],
+          "forbidden": [
+            "把进程 kill 伪装为产品取消或要求 kill 进程生成 canonical terminal。"
+          ]
+        },
+        {
+          "predicate_id": "upload_filing.concurrency",
+          "expected": [
+            "同 ticker 不同 filing 和不同 ticker 并发形成完整并集。",
+            "同一 auto 请求在锁内重读并收敛为 success/skip；每个调用都有非 generic 的合法终态。"
+          ],
+          "forbidden": [
+            "同一请求一个成功、另一个 generic failure，或并发留下半 source。"
+          ]
+        },
+        {
+          "predicate_id": "upload_filing.direct-boundary-and-summary",
+          "expected": [
+            "upload_filing 是 direct Fins operation，不创建 Host Run/Attempt/EventLog/Memory/Tool Trace、Host/runtime SQLite 或 legacy ingestion job。",
+            "summary 区分 requested_files 与 stored_files，typed owner error code/reason 以有界文案投影。"
+          ],
+          "forbidden": [
+            "把请求数量当作实际上传数量，或用 generic failure 隐藏已知 owner reason。"
+          ]
+        },
+        {
+          "predicate_id": "upload_filing.company-meta-refresh",
+          "expected": [
+            "stale resolver company meta 缺 company-name 时 fail-closed；提供显式名称时随新 source 原子刷新。",
+            "已有 fresh canonical company identity 不被单次 filing 静默改名；忽略新名称或 alias update 时给出明确 warning。"
+          ],
+          "forbidden": [
+            "静默改写 fresh identity，或静默忽略用户以为已生效的 metadata 变化。"
+          ]
+        },
+        {
+          "predicate_id": "upload_filing.path-and-name-input",
+          "expected": [
+            "允许指向 CI-owned 普通文件的 symlink、大小写后缀、空格和 Unicode 文件名；发布 resolve 后普通文件的实际 bytes。"
+          ],
+          "forbidden": [
+            "跳过 allowed suffix、普通文件和 digest 边界，或因可正常表示的本地文件名拒绝。"
+          ]
+        }
+      ],
+      "allowed_variants": [
+        "真实 Docling 转换耗时和机器资源消耗可变化，但取消、原子性、文件 identity 与终态不可变化。",
+        "用户可声明任意业务 alias；系统不负责证明它与现实公司相同，但必须按声明一致保存和查询。",
+        "不改变退出码、typed reason、stored facts、artifact locator 和可行动性的终端文案微调。",
+        "多文件附件数量与格式可随输入变化，但 explicit primary、完整 publication 和 summary 守恒不变。"
+      ],
+      "authority_basis": [
+        {
+          "kind": "user-decision",
+          "date": "2026-08-11",
+          "summary": "用户对 UF-O01～UF-O22 未特别指出项接受总控建议，并要求 O09 尽量复用 download 日期/年份逻辑、调查 O10 alias 与 O17 中断。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-08-12",
+          "summary": "用户要求可中断 Docling converter 收敛到一处供多调用方复用；确认 alias 对不同市场代码和 LLM list_documents 查询有业务意义。"
+        },
+        {
+          "kind": "user-decision",
+          "date": "2026-08-12",
+          "summary": "用户裁决：若用户把 MSFT 声明为 DELTA 的 alias，现实映射错误由用户承担，不属于产品自动验证责任。"
+        },
+        {
+          "kind": "design-and-owner-evidence",
+          "summary": "Fins storage/public repository、converter capability、Company Identity 与公共 runtime owner 产生业务语义；CLI 只解析、调用与投影。"
+        }
+      ],
+      "observed_behavior": {
+        "run_ids": [
+          "upload-filing-calibration-20260811-tF6OnN",
+          "upload-filing-supplement-20260811-GHEcbh"
+        ],
+        "report_ids": [
+          "/Users/leo/workspace/.dayu-cli-ci/upload-filing-calibration-20260811-tF6OnN/observed-behavior.md",
+          "/Users/leo/workspace/.dayu-cli-ci/upload-filing-supplement-20260811-GHEcbh/observed-behavior-supplement.json"
+        ],
+        "report_digest_sha256": [
+          "e2d3b58954576a2aa1cec3cbc3809134ad34c81d5147df778cef82e7173232c3",
+          "3d37640009753d72955f44e62fd772ff37ff984b386fe65bb1ca708476a23276"
+        ],
+        "adjudication_artifacts": [
+          {
+            "path": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-adjudication-20260811-r2/oracle-adjudication.md",
+            "sha256": "5d92197814db0e202c77f7e5eb87b1d568ca7fc96532c0b006107d9bc63ba671"
+          },
+          {
+            "path": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-adjudication-20260811-r2/oracle-candidates.json",
+            "sha256": "cbc4ca42635194c3519c0bb2a1a5ba7c1d9cdfde045a746eeb999c5ef52277c2"
+          },
+          {
+            "path": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-adjudication-20260811-r2/secret-scan.json",
+            "sha256": "e6a1d67d3d8c98b1e2609d1c8d9b1e06bc1f6cf91e3f96d67cef87870f01d086"
+          }
+        ],
+        "report_frozen": true,
+        "scenario_refs": [
+          "upload_filing.UF-001-help",
+          "upload_filing.UF-002-missing-ticker",
+          "upload_filing.UF-003-empty-ticker",
+          "upload_filing.UF-004-path-like-ticker",
+          "upload_filing.UF-005-overlong-ticker",
+          "upload_filing.UF-006-empty-csv-item",
+          "upload_filing.UF-007-invalid-action",
+          "upload_filing.UF-008-action-missing-value",
+          "upload_filing.UF-009-extra-positional",
+          "upload_filing.UF-010-source-option-absent",
+          "upload_filing.UF-011-config-option-absent",
+          "upload_filing.UF-012-document-id-option-absent",
+          "upload_filing.UF-013-infer-option-absent",
+          "upload_filing.UF-014-ci-option-absent",
+          "upload_filing.UF-015-missing-fiscal-year",
+          "upload_filing.UF-016-missing-fiscal-period",
+          "upload_filing.UF-017-missing-files",
+          "upload_filing.UF-018-missing-company-name",
+          "upload_filing.UF-019-empty-company-name",
+          "upload_filing.UF-020-fiscal-year-not-int",
+          "upload_filing.UF-021-negative-fiscal-year",
+          "upload_filing.UF-022-empty-fiscal-period",
+          "upload_filing.UF-023-overlong-fiscal-period",
+          "upload_filing.UF-024-cn-invalid-period",
+          "upload_filing.UF-025-files-missing-value",
+          "upload_filing.UF-026-file-missing",
+          "upload_filing.UF-027-file-directory",
+          "upload_filing.UF-028-file-unsupported-bin",
+          "upload_filing.UF-029-base-empty",
+          "upload_filing.UF-030-owner-allows-cli-rejects-doc",
+          "upload_filing.UF-031-owner-allows-cli-rejects-ppt",
+          "upload_filing.UF-032-owner-allows-cli-rejects-pptx",
+          "upload_filing.UF-033-cli-allows-owner-rejects-csv",
+          "upload_filing.UF-034-cli-allows-owner-rejects-json",
+          "upload_filing.UF-035-cli-allows-owner-rejects-xbrl",
+          "upload_filing.UF-036-cli-allows-owner-rejects-xhtml",
+          "upload_filing.UF-037-cli-allows-owner-rejects-xml",
+          "upload_filing.UF-038-cli-allows-owner-rejects-zip",
+          "upload_filing.UF-039-file-count-101",
+          "upload_filing.UF-040-readonly-logical-base-file",
+          "upload_filing.UF-W01-default-workspace",
+          "upload_filing.UF-W02-workspace-alias",
+          "upload_filing.UF-W03-short-base-alias",
+          "upload_filing.UF-W04-repeated-base-last-wins",
+          "upload_filing.UF-W05-symlink-base",
+          "upload_filing.UF-W06-quiet-success",
+          "upload_filing.UF-W07-debug-stream-direct",
+          "upload_filing.UF-W08-debug-log-file",
+          "upload_filing.UF-W09-quiet-debug-stream-conflict",
+          "upload_filing.UF-A01-auto-fresh-create",
+          "upload_filing.UF-A02-auto-identical-skip",
+          "upload_filing.UF-A03-auto-changed-update",
+          "upload_filing.UF-A04-create-existing-fails",
+          "upload_filing.UF-A05-create-existing-overwrite",
+          "upload_filing.UF-A06-update-existing-identical-skip",
+          "upload_filing.UF-A07-update-missing-fails",
+          "upload_filing.UF-A08-update-missing-overwrite-creates",
+          "upload_filing.UF-A09-delete-existing",
+          "upload_filing.UF-A10-delete-already-deleted",
+          "upload_filing.UF-A11-delete-never-existed",
+          "upload_filing.UF-A12-auto-restores-deleted",
+          "upload_filing.UF-A13-amended-separate-document",
+          "upload_filing.UF-A14-delete-with-files-ignored",
+          "upload_filing.UF-A15-repeated-action-last-wins",
+          "upload_filing.UF-A16-repeated-ticker-last-wins",
+          "upload_filing.UF-A17-cross-company-csv-alias",
+          "upload_filing.UF-A18-fresh-company-name-ignored",
+          "upload_filing.UF-A19-invalid-filing-date-stored",
+          "upload_filing.UF-A20-large-fiscal-year",
+          "upload_filing.UF-A21-us-invalid-period",
+          "upload_filing.UF-F01-txt",
+          "upload_filing.UF-F02-markdown",
+          "upload_filing.UF-F03-html",
+          "upload_filing.UF-F04-docx",
+          "upload_filing.UF-F05-xlsx",
+          "upload_filing.UF-F06-xls-ooxml-bytes",
+          "upload_filing.UF-F07-empty-txt",
+          "upload_filing.UF-F08-symlink-file",
+          "upload_filing.UF-F09-uppercase-suffix",
+          "upload_filing.UF-F10-space-unicode-name",
+          "upload_filing.UF-F11-multi-file",
+          "upload_filing.UF-F12-duplicate-same-path",
+          "upload_filing.UF-F13-duplicate-basename",
+          "upload_filing.UF-R01-us-aapl-2025-fy-upload",
+          "upload_filing.UF-R01-us-aapl-2025-fy-process",
+          "upload_filing.UF-R02-cn-600519-2024-fy-upload",
+          "upload_filing.UF-R02-cn-600519-2024-fy-process",
+          "upload_filing.UF-R03-hk-0700-2025-q1-upload",
+          "upload_filing.UF-R03-hk-0700-2025-q1-process",
+          "upload_filing.UF-C01-real-doc",
+          "upload_filing.UF-C02-real-ppt",
+          "upload_filing.UF-C03-real-pptx",
+          "upload_filing.UF-C04-real-xls",
+          "upload_filing.UF-C05-real-msft-multi-file",
+          "upload_filing.UF-C06-real-xbrl-html-xsd",
+          "upload_filing.UF-C07-real-xbrl-html-instance",
+          "upload_filing.UF-C05-real-msft-multi-file-process",
+          "upload_filing.UF-I02-create-before-original-missing",
+          "upload_filing.UF-I02-auto-with-original-missing",
+          "upload_filing.UF-I04-create-before-original-digest-changed",
+          "upload_filing.UF-I04-auto-with-original-digest-changed",
+          "upload_filing.UF-I06-create-before-docling-missing",
+          "upload_filing.UF-I06-auto-with-docling-missing",
+          "upload_filing.UF-I08-create-before-meta-size-digest-mismatch",
+          "upload_filing.UF-I08-auto-with-meta-size-digest-mismatch",
+          "upload_filing.UF-I10-create-before-manifest-missing",
+          "upload_filing.UF-I10-auto-with-manifest-missing",
+          "upload_filing.UF-I11-corrupt-pdf",
+          "upload_filing.UF-I12-valid-plus-corrupt-atomic",
+          "upload_filing.UF-I13-corrupt-docx",
+          "upload_filing.UF-I14-create-company-baseline",
+          "upload_filing.UF-I15-stale-company-refresh",
+          "upload_filing.UF-I16-stale-company-missing-name",
+          "upload_filing.UF-L01-very-early-sigint",
+          "upload_filing.UF-L02-cn-docling-sigint",
+          "upload_filing.UF-L03-cn-retry-after-sigint",
+          "upload_filing.UF-L04-us-docling-sigint",
+          "upload_filing.UF-L05-us-retry-after-sigint",
+          "upload_filing.UF-L06-cn-docling-sigkill",
+          "upload_filing.UF-L07-cn-retry-after-sigkill",
+          "upload_filing.UF-L08-concurrent-same-document",
+          "upload_filing.UF-L09-concurrent-different-documents-same-ticker",
+          "upload_filing.UF-D01-create-baseline",
+          "upload_filing.UF-D02-auto-changed-same-name",
+          "upload_filing.UF-D03-auto-changed-different-name",
+          "upload_filing.UF-D04-multi-distinct-stems",
+          "upload_filing.UF-D05-multi-same-stem",
+          "upload_filing.UF-D06-multi-same-path",
+          "upload_filing.UF-L11-concurrent-valid-different-tickers",
+          "upload_filing.UF-X01-tool-trace-direct-absence",
+          "upload_filing.UFS-001-period-h1",
+          "upload_filing.UFS-002-period-q2",
+          "upload_filing.UFS-003-period-q4",
+          "upload_filing.UFS-004-period-normalization",
+          "upload_filing.UFS-005-ticker-eight-char",
+          "upload_filing.UFS-006-files-count-100",
+          "upload_filing.UFS-007-fiscal-year-zero"
+        ]
+      },
+      "user_adjudication": {
+        "identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
+        "date": "2026-08-12",
+        "result": "accepted",
+        "notes": [
+          "UF-O01～UF-O22 全部完成裁决；未特别指出项按总控建议接受。",
+          "O09 冻结 shared calendar/year owner；O17 冻结公共可中断 Docling converter。",
+          "O10 冻结显式用户 alias 声明的信任边界：系统保证一致保存/查询，不证明现实公司关系。"
+        ]
+      },
+      "applicable_from": {
+        "date": "2026-08-12",
+        "target": "256786b255021ee429a20f22aad726b1ad33916c"
+      },
+      "supersedes": null,
+      "superseded_by": null
     }
   ],
   "readiness_proof": {
-    "proof_version": 4,
-    "generated_at": "2026-08-10T16:00:00Z",
-    "target_commit": "5e1a0d109685a03b6477e2e129e148c8e0127554",
+    "proof_version": 5,
+    "generated_at": "2026-08-12T00:00:00Z",
+    "target_commit": "256786b255021ee429a20f22aad726b1ad33916c",
     "registry_scope": [
       "init",
       "prompt",
       "interactive",
-      "download"
+      "download",
+      "upload_filing"
     ],
     "validation_result": "ready",
-    "accepted_oracle_count": 4,
+    "accepted_oracle_count": 5,
     "superseded_oracle_count": 1,
-    "accepted_predicate_count": 83,
+    "accepted_predicate_count": 105,
     "current_accepted_oracle_refs": [
       "cli.init.workspace-initialization@1",
       "cli.prompt.core-execution@1",
       "cli.interactive.core-execution@2",
-      "cli.download.document-acquisition@1"
+      "cli.download.document-acquisition@1",
+      "cli.upload_filing.document-publication@1"
     ],
     "reference_validation": {
       "missing_exact_oracle_refs": 0,
@@ -2507,9 +2962,10 @@
       "cli.prompt.core-execution@1:user-adjudication:2026-08-02",
       "cli.interactive.core-execution@2:user-adjudication:2026-08-09",
       "interactive.interactive.g06.summary-null@1:user-adjudication:2026-08-09",
-      "cli.download.document-acquisition@1:user-adjudication:2026-08-10"
+      "cli.download.document-acquisition@1:user-adjudication:2026-08-10",
+      "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12"
     ],
-    "scenario_registry_digest_basis": "01c34bce9d706d306533b30368b65dcfbdfd0a009b575f1de0f52b5ca0a16806",
-    "registry_digest_basis": "dc2c5ac1411bb82ef29053468fc0ac052929732605c14f0c9a1beb4e5f7059d6"
+    "scenario_registry_digest_basis": "f17b6bccc66910fafa3b4a003284ed49ea27dd1a37f2dc08ee545e8e8d62c0e5",
+    "registry_digest_basis": "73fc031eca26c30c79f089bce918362cbb397b8ff4aa1592d6831a1636b4a0ec"
   }
 }
