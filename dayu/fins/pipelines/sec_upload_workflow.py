@@ -38,6 +38,7 @@ from dayu.fins.storage import (
     SourceDocumentRepositoryProtocol,
 )
 from dayu.fins.ticker_normalization import normalize_ticker
+from dayu.fins.upload_failure import fins_upload_failure_from_exception
 
 JsonObject: TypeAlias = dict[str, JsonValue]
 
@@ -201,21 +202,6 @@ async def run_upload_filing_stream(
         },
     )
     try:
-        company_batch = host._batching_repository.begin_batch(normalized_ticker)
-        try:
-            upsert_company_meta_for_upload(
-                repository=host._company_repository,
-                ticker=normalized_ticker,
-                action=normalized_action,
-                company_id=company_id,
-                company_name=company_name,
-                ticker_aliases=ticker_aliases,
-                batch=company_batch,
-            )
-        except BaseException:
-            host._batching_repository.rollback_batch(company_batch)
-            raise
-        host._batching_repository.commit_batch(company_batch)
         prepared_upload = await host._upload_service.prepare_upload(
             ticker=normalized_ticker,
             source_kind=SourceKind.FILING,
@@ -240,10 +226,24 @@ async def run_upload_filing_stream(
         if isinstance(prepared_upload, UploadOperationResult):
             upload_result = prepared_upload
         else:
+            publication_batch = host._batching_repository.begin_batch(normalized_ticker)
+            try:
+                upsert_company_meta_for_upload(
+                    repository=host._company_repository,
+                    ticker=normalized_ticker,
+                    action=normalized_action,
+                    company_id=company_id,
+                    company_name=company_name,
+                    ticker_aliases=ticker_aliases,
+                    batch=publication_batch,
+                )
+            except BaseException:
+                host._batching_repository.rollback_batch(publication_batch)
+                raise
             upload_result = commit_prepared_upload_batch(
                 service=host._upload_service,
                 batching_repository=host._batching_repository,
-                batch=host._batching_repository.begin_batch(normalized_ticker),
+                batch=publication_batch,
                 prepared=prepared_upload,
                 cancellation=cancellation_checker,
             )
@@ -280,6 +280,7 @@ async def run_upload_filing_stream(
             payload={"result": result},
         )
     except Exception as exc:
+        failure_reason = fins_upload_failure_from_exception(exc)
         failed_result = host._build_result(
             action="upload_filing",
             ticker=normalized_ticker,
@@ -297,13 +298,14 @@ async def run_upload_filing_stream(
             ticker_aliases=_json_text_list(ticker_aliases),
             overwrite=overwrite,
             status="failed",
-            message=str(exc),
+            message=failure_reason.message,
+            failure=failure_reason.to_json(),
         )
         yield UploadFilingEvent(
             event_type=UploadFilingEventType.UPLOAD_FAILED,
             ticker=normalized_ticker,
             document_id=document_id,
-            payload={"error": str(exc), "result": failed_result},
+            payload={"error": failure_reason.message, "result": failed_result},
         )
 
 
@@ -483,6 +485,7 @@ async def run_upload_material_stream(
             payload={"result": final_result},
         )
     except Exception as exc:
+        failure_reason = fins_upload_failure_from_exception(exc)
         failed_result = host._build_result(
             action="upload_material",
             ticker=normalized_ticker,
@@ -502,13 +505,14 @@ async def run_upload_material_stream(
             company_name=company_name,
             overwrite=overwrite,
             status="failed",
-            message=str(exc),
+            message=failure_reason.message,
+            failure=failure_reason.to_json(),
         )
         yield UploadMaterialEvent(
             event_type=UploadMaterialEventType.UPLOAD_FAILED,
             ticker=normalized_ticker,
             document_id=resolved_document_id,
-            payload={"error": str(exc), "result": failed_result},
+            payload={"error": failure_reason.message, "result": failed_result},
         )
 
 

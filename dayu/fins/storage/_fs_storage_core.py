@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from ._fs_blob_core import _FsBlobMixin
 from ._fs_company_meta_core import _FsCompanyMetaMixin
+from ._fs_filing_upload_state_core import _FsFilingUploadStateMixin
 from ._fs_maintenance_core import _FsMaintenanceMixin
 from ._fs_processed_core import _FsProcessedMixin
 from ._fs_source_document_core import _FsSourceDocumentMixin
@@ -21,6 +22,7 @@ from ._fs_storage_infra import _FsStorageInfra
 
 
 class FsStorageCore(
+    _FsFilingUploadStateMixin,
     _FsCompanyMetaMixin,
     _FsSourceDocumentMixin,
     _FsProcessedMixin,

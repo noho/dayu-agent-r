@@ -47,6 +47,7 @@ from dayu.fins.storage import (
     FsCompanyMetaRepository,
     FsDocumentBlobRepository,
     FsFilingMaintenanceRepository,
+    FsFilingUploadStateRepository,
     FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
     LocalFileStore,
@@ -107,6 +108,114 @@ _ProcessedCleanupCorruption = Literal[
 _StaleMetaCorruption = Literal["missing", "corrupt", "mismatch"]
 _BatchInitializationFailurePoint = Literal["journal", "descriptor", "copy"]
 _SnapshotVersion = Literal["A", "B"]
+
+
+def test_filing_upload_state_fresh_absent_is_pure_and_lock_free(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """fresh absent snapshot 必须在 publication guard 前返回且不创建目录。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest monkeypatch fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 读取创建目录、获取锁或返回非空成员时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    repository = FsFilingUploadStateRepository(workspace_root)
+    core = repository._repository_set.core
+
+    def fail_guard(ticker: str) -> NoReturn:
+        """拒绝 fresh absent 分支获取 publication guard。
+
+        Args:
+            ticker: 请求 ticker。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 始终抛出以暴露错误锁获取。
+        """
+
+        raise AssertionError(f"fresh absent 不得获取 publication guard: {ticker}")
+
+    monkeypatch.setattr(core, "_acquire_publication_guard", fail_guard)
+
+    assert repository.read_filing_upload_state("AAPL", "aapl-2024-fy").company_meta is None
+    assert repository.read_filing_upload_state("AAPL", "aapl-2024-fy").source_meta is None
+    assert not workspace_root.exists()
+
+
+def test_filing_upload_state_reads_company_and_source_from_one_published_version(
+    tmp_path: Path,
+) -> None:
+    """snapshot 必须返回同一 published version 中的 company 与 filing source。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: durable source 不完整或 snapshot 成员不一致时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    company = FsCompanyMetaRepository(workspace_root, repository_set=repository_set)
+    source = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    state = FsFilingUploadStateRepository(workspace_root, repository_set=repository_set)
+    batch = batching.begin_batch("AAPL")
+    company.upsert_company_meta(
+        CompanyMeta(
+            company_id="company-aapl",
+            company_name="Apple Inc.",
+            ticker="AAPL",
+            market="US",
+            resolver_version="test",
+            updated_at=now_iso8601(),
+        ),
+        batch=batch,
+    )
+    handle = SourceHandle("AAPL", "aapl-2024-fy", SourceKind.FILING.value)
+    file_meta = blob.store_file(
+        handle,
+        "report.md",
+        io.BytesIO(b"report"),
+        batch=batch,
+        content_type="text/markdown",
+    )
+    source.create_source_document(
+        SourceDocumentUpsertRequest(
+            ticker="AAPL",
+            document_id="aapl-2024-fy",
+            internal_document_id="aapl-2024-fy",
+            form_type="10-K",
+            primary_document="report.md",
+            meta={"ingest_method": "upload", "source_provider": "user_upload"},
+            files=[file_meta],
+        ),
+        SourceKind.FILING,
+        batch=batch,
+    )
+    batching.commit_batch(batch)
+
+    snapshot = state.read_filing_upload_state("AAPL", "aapl-2024-fy")
+
+    assert snapshot.company_meta is not None
+    assert snapshot.company_meta.company_name == "Apple Inc."
+    assert snapshot.source_meta is not None
+    assert snapshot.source_meta["primary_document"] == "report.md"
 
 
 class _FailingCloseBytesIO(io.BytesIO):

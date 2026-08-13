@@ -50,6 +50,7 @@ from ._fs_identity import (
     _derive_storage_key,
     _ensure_identity_directory,
     _identity_directory_for_read,
+    _identity_directory_if_present_for_read,
     _identity_directory_path,
     _read_identity_descriptor,
     _require_external_identity,
@@ -2592,6 +2593,28 @@ class _FsStorageInfra:
 
         external_ticker = _require_external_identity(ticker, field_name="ticker")
         return _identity_directory_for_read(
+            self.portfolio_root,
+            _TICKER_IDENTITY_NAMESPACE,
+            external_ticker,
+        )
+
+    def _ticker_dir_if_present_for_read(self, ticker: str) -> Path | None:
+        """返回已存在且合法的 published ticker directory。
+
+        Args:
+            ticker: canonical 股票代码。
+
+        Returns:
+            ticker identity directory 存在时返回 canonical locator，否则返回
+            ``None``。
+
+        Raises:
+            ValueError: ticker、identity root 或 descriptor 不合法时抛出。
+            OSError: descriptor 读取失败时抛出。
+        """
+
+        external_ticker = _require_external_identity(ticker, field_name="ticker")
+        return _identity_directory_if_present_for_read(
             self.portfolio_root,
             _TICKER_IDENTITY_NAMESPACE,
             external_ticker,

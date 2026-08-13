@@ -1660,6 +1660,7 @@ def _runtime_with_executor(
         source_repository=base_runtime.source_repository,
         blob_repository=base_runtime.blob_repository,
         filing_maintenance_repository=base_runtime.filing_maintenance_repository,
+        filing_upload_state_repository=base_runtime.filing_upload_state_repository,
         processed_repository=base_runtime.processed_repository,
         processor_registry=base_runtime.processor_registry,
         job_store=base_runtime.ingestion_job_store,

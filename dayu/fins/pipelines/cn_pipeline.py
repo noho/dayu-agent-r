@@ -80,10 +80,12 @@ from dayu.fins.storage import (
     CompanyMetaRepositoryProtocol,
     DocumentBlobRepositoryProtocol,
     FilingMaintenanceRepositoryProtocol,
+    FilingUploadStateRepositoryProtocol,
     FsBatchingRepository,
     FsCompanyMetaRepository,
     FsDocumentBlobRepository,
     FsFilingMaintenanceRepository,
+    FsFilingUploadStateRepository,
     FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
     ProcessedDocumentRepositoryProtocol,
@@ -91,6 +93,7 @@ from dayu.fins.storage import (
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
 from dayu.fins.ticker_normalization import normalize_ticker, try_normalize_ticker
+from dayu.fins.upload_failure import fins_upload_failure_from_exception
 
 CN_DOWNLOAD_SOURCE: Final[str] = "cninfo"
 HK_DOWNLOAD_SOURCE: Final[str] = "hkexnews"
@@ -330,6 +333,7 @@ class CnPipeline:
         processed_repository: ProcessedDocumentRepositoryProtocol | None = None,
         blob_repository: DocumentBlobRepositoryProtocol | None = None,
         filing_maintenance_repository: FilingMaintenanceRepositoryProtocol | None = None,
+        filing_upload_state_repository: FilingUploadStateRepositoryProtocol | None = None,
         user_agent: Optional[str] = None,
         sleep_seconds: float = CNINFO_DEFAULT_SLEEP_SECONDS,
         max_retries: int = CNINFO_DEFAULT_MAX_RETRIES,
@@ -348,6 +352,7 @@ class CnPipeline:
             processed_repository: 可选 processed 文档仓储。
             blob_repository: 可选文件对象仓储。
             filing_maintenance_repository: 可选 filing 维护仓储。
+            filing_upload_state_repository: 可选 filing 上传 published-state 只读仓储。
             user_agent: CN/HK HTTP User-Agent；为空时各 downloader 使用显式默认值。
             sleep_seconds: 连续 HTTP 请求间隔秒数。
             max_retries: 单次 HTTP 请求最大重试次数。
@@ -360,7 +365,10 @@ class CnPipeline:
         """
 
         self._workspace_root = (workspace_root or Path.cwd()).resolve()
-        repository_set = build_fs_repository_set(workspace_root=self._workspace_root)
+        repository_set = build_fs_repository_set(
+            workspace_root=self._workspace_root,
+            create_directories=False,
+        )
         self._batching_repository = batching_repository or FsBatchingRepository(
             self._workspace_root,
             repository_set=repository_set,
@@ -384,6 +392,13 @@ class CnPipeline:
         self._filing_maintenance_repository = filing_maintenance_repository or FsFilingMaintenanceRepository(
             self._workspace_root,
             repository_set=repository_set,
+        )
+        self._filing_upload_state_repository = (
+            filing_upload_state_repository
+            or FsFilingUploadStateRepository(
+                self._workspace_root,
+                repository_set=repository_set,
+            )
         )
         self._user_agent = user_agent
         self._sleep_seconds = sleep_seconds
@@ -856,21 +871,6 @@ class CnPipeline:
             },
         )
         try:
-            company_batch = self._batching_repository.begin_batch(normalized_ticker)
-            try:
-                upsert_company_meta_for_upload(
-                    repository=self._company_repository,
-                    ticker=normalized_ticker,
-                    action=resolved_action,
-                    company_id=company_id,
-                    company_name=company_name,
-                    ticker_aliases=ticker_aliases,
-                    batch=company_batch,
-                )
-            except BaseException:
-                self._batching_repository.rollback_batch(company_batch)
-                raise
-            self._batching_repository.commit_batch(company_batch)
             prepared_upload = await self._upload_service.prepare_upload(
                 ticker=normalized_ticker,
                 source_kind=SourceKind.FILING,
@@ -895,10 +895,24 @@ class CnPipeline:
             if isinstance(prepared_upload, UploadOperationResult):
                 upload_result = prepared_upload
             else:
+                publication_batch = self._batching_repository.begin_batch(normalized_ticker)
+                try:
+                    upsert_company_meta_for_upload(
+                        repository=self._company_repository,
+                        ticker=normalized_ticker,
+                        action=resolved_action,
+                        company_id=company_id,
+                        company_name=company_name,
+                        ticker_aliases=ticker_aliases,
+                        batch=publication_batch,
+                    )
+                except BaseException:
+                    self._batching_repository.rollback_batch(publication_batch)
+                    raise
                 upload_result = commit_prepared_upload_batch(
                     service=self._upload_service,
                     batching_repository=self._batching_repository,
-                    batch=self._batching_repository.begin_batch(normalized_ticker),
+                    batch=publication_batch,
                     prepared=prepared_upload,
                     cancellation=cancellation_checker,
                 )
@@ -935,6 +949,7 @@ class CnPipeline:
                 payload={"result": final_result},
             )
         except Exception as exc:
+            failure_reason = fins_upload_failure_from_exception(exc)
             failed_result = self._build_upload_result(
                 action="upload_filing",
                 ticker=normalized_ticker,
@@ -953,13 +968,14 @@ class CnPipeline:
                 overwrite=overwrite,
                 document_id=document_id,
                 status="failed",
-                message=str(exc),
+                message=failure_reason.message,
+                failure=failure_reason.to_json(),
             )
             yield UploadFilingEvent(
                 event_type=UploadFilingEventType.UPLOAD_FAILED,
                 ticker=normalized_ticker,
                 document_id=document_id,
-                payload={"error": str(exc), "result": failed_result},
+                payload={"error": failure_reason.message, "result": failed_result},
             )
 
     def upload_material(
@@ -1204,6 +1220,7 @@ class CnPipeline:
                 payload={"result": final_result},
             )
         except Exception as exc:
+            failure_reason = fins_upload_failure_from_exception(exc)
             failed_result = self._build_upload_result(
                 action="upload_material",
                 ticker=normalized_ticker,
@@ -1223,13 +1240,14 @@ class CnPipeline:
                 company_name=company_name,
                 overwrite=overwrite,
                 status="failed",
-                message=str(exc),
+                message=failure_reason.message,
+                failure=failure_reason.to_json(),
             )
             yield UploadMaterialEvent(
                 event_type=UploadMaterialEventType.UPLOAD_FAILED,
                 ticker=normalized_ticker,
                 document_id=resolved_document_id,
-                payload={"error": str(exc), "result": failed_result},
+                payload={"error": failure_reason.message, "result": failed_result},
             )
 
     def _safe_get_upload_document_meta(

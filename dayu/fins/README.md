@@ -112,6 +112,10 @@ source repository 以 typed integrity contract 分类 published 或 staged sourc
 
 download / upload overwrite 是单目标替换语义，不是 ticker 级清空语义。下载路径不得在发现本轮有效目标 document_id 之前清空 ticker 的全部 filings；空结果、失败或取消不得删除非目标旧文档。上传覆盖路径先完成文件校验、Docling 转换和取消检查，再由顶层 caller 开启短 batch，在其中 reset 目标文档、blob-first 写入文件并发布一次完整 source；commit 前失败或取消只 rollback 一次并保留旧文档，commit 开始后 caller 不再二次 rollback。
 
+filing 上传的参数与 published-state 判定由统一 typed validator 持有。CLI 在 Service factory 前完成首次校验，非 CLI runtime 入口也在 producer、observation 或 job 创建前复用同一 validator；production workflow 提交前会重新读取 published state 并丢弃旧的 action/company 派生值。`FilingUploadStateRepositoryProtocol` 只提供 upload admissibility 所需的 company/source 同版轻量快照，不替代包含文件、provenance 与 revision 的完整 `read_source_snapshot`。fresh workspace 的只读校验不创建 identity、ticker、lock 或 job 目录，实际写入 owner 在首次 mutation 时惰性建立基础设施。
+
+filing 的 company meta 与 source/blob 共享一个 caller-owned publication batch：转换失败或 terminal skip 不开启 batch；company stage 与 source stage 任一失败只 rollback 该 batch，成功时一次 commit 同时可见。上传失败通过 `dayu.fins.upload_failure` 的 closed kind/code 与固定安全文案贯穿 pipeline result、runtime summary、direct RESULT 详情和 durable failure summary；原始异常只进入 operator log，不进入用户事件或持久化 public summary。
+
 `FilingMaintenanceRepositoryProtocol` 持有 SEC 下载拒绝注册表。注册表条目使用 `DownloadRejectionEntry` typed contract，包含 document id、拒绝原因、分类、SEC form、filing date 和下载版本；文件系统仓储读取非法 registry 时失败关闭，保存时只通过 typed entry 序列化，SEC 下载、SC13 过滤和下载诊断只消费该 typed registry。
 
 文件系统仓储只接受 `dayu.fins.ticker_normalization` 已产生的 canonical ticker，并把 ticker 物理目录固定为 `portfolio/<canonical ticker>`；storage 不在读写边界静默归一化 ticker。document ID 仍作为 exact opaque identity 保存，并由 storage-private mapping key 隔离路径语义。ticker 与 document 目录都持有 identity descriptor，lookup、枚举、staging、publication、backup 与 recovery 必须双向校验 descriptor；损坏或非 canonical ticker 失败关闭，不由下游工具补偿。filename、SEC `primaryDocument` 投影后的文件名、manifest entry、object key 与 local URI 保持单路径组件、containment 与 symlink fail-closed 边界。

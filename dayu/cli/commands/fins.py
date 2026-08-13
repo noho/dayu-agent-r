@@ -55,6 +55,11 @@ from dayu.fins.direct_events import (
 from dayu.fins.direct_events import ValidatedFinsEventStream
 from dayu.fins.download_contract import FinsDownloadRequest, FinsDownloadUsageError
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.ingestion_runtime import (
+    FinsUploadFilingRequest,
+    FinsUploadUsageError,
+    ValidatedFinsUploadFilingRequest,
+)
 from dayu.fins.domain.filing_semantics import FiscalPeriod
 from dayu.fins.resolver import FmpCompanyInfoResolver
 from dayu.fins.ticker_normalization import normalize_ticker
@@ -73,6 +78,7 @@ from dayu.service.fins_direct import (
     FinsDirectCommandService,
     build_direct_download_request,
 )
+from dayu.fins.service_runtime import prevalidate_fins_upload_filing_request_for_workspace
 
 _BASE_OPTION: Final[str] = "--base"
 _TICKER_OPTION: Final[str] = "--ticker"
@@ -195,6 +201,9 @@ def run_fins_direct_command(args: ParsedCliArgs) -> int:
     except FinsDownloadUsageError as exc:
         render_cli_error(f"dayu-cli {args.command_name}: {exc}")
         return EXIT_USAGE_ERROR
+    except FinsUploadUsageError as exc:
+        render_cli_error(f"dayu-cli upload_filing: {exc.failure.message}")
+        return EXIT_USAGE_ERROR
     except FinsDirectStreamProtocolError as exc:
         render_cli_error(f"dayu-cli {args.command_name}: {exc.message}")
         return EXIT_FAILURE
@@ -223,6 +232,10 @@ async def _run_fins_direct_command_async(args: ParsedCliArgs) -> int:
         return _run_upload_filings_from(args)
     download_request = _prevalidate_download_request(args)
     workspace_root = _resolve_workspace_root(args.workspace_root)
+    upload_filing_request = _prevalidate_upload_filing_request(
+        args,
+        workspace_root=workspace_root,
+    )
     service = FINS_DIRECT_SERVICE_FACTORY(workspace_root)
     cancellation_token = _CliFinsCancellationToken()
     stream = _open_direct_stream(
@@ -230,6 +243,7 @@ async def _run_fins_direct_command_async(args: ParsedCliArgs) -> int:
         service=service,
         cancellation_token=cancellation_token,
         download_request=download_request,
+        upload_filing_request=upload_filing_request,
     )
     try:
         runtime_log.log_verbose(
@@ -511,6 +525,7 @@ def _open_direct_stream(
     service: FinsDirectCommandService,
     cancellation_token: _CliFinsCancellationToken,
     download_request: FinsDownloadRequest | None,
+    upload_filing_request: ValidatedFinsUploadFilingRequest | None,
 ) -> ValidatedFinsEventStream:
     """按命令名打开 direct event stream。
 
@@ -518,6 +533,7 @@ def _open_direct_stream(
     :param service: Fins direct Service helper。
     :param cancellation_token: 当前 operation 的取消 token。
     :param download_request: download 命令预先校验完成的请求；其它命令为 ``None``。
+    :param upload_filing_request: filing 命令预先校验完成的请求；其它命令为 ``None``。
     :returns: Fins owner 已验证的 direct 事件流。
     :raises CliFinsUsageError: 命令或用户输入非法时抛出。
     :raises Exception: Service 打开 stream 失败时向上抛出。
@@ -532,8 +548,10 @@ def _open_direct_stream(
             cancellation_token=cancellation_token,
         )
     if args.command_name == COMMAND_UPLOAD_FILING:
+        if upload_filing_request is None:
+            raise AssertionError("upload_filing command 缺少预校验请求")
         return _upload_filing_stream(
-            args=args,
+            request=upload_filing_request,
             service=service,
             cancellation_token=cancellation_token,
         )
@@ -610,33 +628,68 @@ def _prevalidate_download_request(args: ParsedCliArgs) -> FinsDownloadRequest | 
 
 def _upload_filing_stream(
     *,
-    args: ParsedCliArgs,
+    request: ValidatedFinsUploadFilingRequest,
     service: FinsDirectCommandService,
     cancellation_token: _CliFinsCancellationToken,
 ) -> ValidatedFinsEventStream:
     """打开 upload_filing direct stream。
 
-    :param args: argparse 已解析的 upload_filing 参数。
+    :param request: Fins owner 已验证的 upload_filing request。
     :param service: Fins direct Service helper。
     :param cancellation_token: 当前 operation 的取消 token。
     :returns: Fins owner 已验证的 direct 事件流。
     :raises CliFinsUsageError: ticker 或文件路径非法时抛出。
     """
 
-    ticker = _parse_ticker_csv(args.ticker)
     return service.upload_filing(
-        ticker=ticker.canonical,
+        request,
+        cancellation_token=cancellation_token,
+    )
+
+
+def _prevalidate_upload_filing_request(
+    args: ParsedCliArgs,
+    *,
+    workspace_root: Path,
+) -> ValidatedFinsUploadFilingRequest | None:
+    """在 Service factory 前构造并验证 filing upload request。
+
+    Args:
+        args: argparse 已解析的 direct command 参数。
+        workspace_root: 已解析但尚未 bootstrap 的 workspace root。
+
+    Returns:
+        upload_filing 命令返回 validated request；其它命令返回 ``None``。
+
+    Raises:
+        FinsUploadUsageError: Fins owner 判定请求违反 usage contract 时抛出。
+        OSError: published state 读取失败时抛出。
+        ValueError: published storage state 损坏时抛出。
+    """
+
+    if args.command_name != COMMAND_UPLOAD_FILING:
+        return None
+    ticker_parts = tuple(part.strip() for part in (args.ticker or "").split(","))
+    raw_ticker = ticker_parts[0] if ticker_parts else ""
+    request = FinsUploadFilingRequest(
+        ticker=raw_ticker,
         action=args.action,
-        files=_validated_upload_files(args.files),
+        files=tuple(
+            Path(raw_file).expanduser().resolve(strict=False)
+            for raw_file in (args.files or ())
+        ),
         fiscal_year=args.fiscal_year,
         fiscal_period=_optional_stripped_text(args.fiscal_period),
         amended=args.amended,
         filing_date=_optional_stripped_text(args.filing_date),
         report_date=_optional_stripped_text(args.report_date),
         company_name=_optional_stripped_text(args.company_name),
-        ticker_aliases=ticker.aliases,
+        ticker_aliases=ticker_parts[1:],
         overwrite=args.overwrite,
-        cancellation_token=cancellation_token,
+    )
+    return prevalidate_fins_upload_filing_request_for_workspace(
+        request,
+        workspace_root=workspace_root,
     )
 
 

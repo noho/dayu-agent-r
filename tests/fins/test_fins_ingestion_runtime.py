@@ -87,6 +87,7 @@ from dayu.fins.ingestion_runtime import (
     FinsIngestionExecutor,
     FinsIngestionOperationKind,
     FinsIngestionJobStatus,
+    FinsIngestionJobRecord,
     FinsPreprocessRequest,
     FinsPreprocessResultSummary,
     FinsPreprocessResultStatus,
@@ -95,17 +96,31 @@ from dayu.fins.ingestion_runtime import (
     FinsSourceDownloadAdapterRequest,
     FinsSourceDownloadAdapterResult,
     FinsUploadFilingRequest,
+    FinsUploadUsageCode,
+    FinsUploadUsageError,
+    ValidatedFinsUploadFilingRequest,
     FinsUploadMaterialRequest,
     FinsUploadPipelineResult,
     FinsUploadRequest,
     FinsUploadResultSummary,
     FinsUploadRunner,
     FinsUploadTerminalDisposition,
+    fins_upload_usage_failure,
+    validate_fins_upload_filing_request,
+)
+from dayu.fins.upload_failure import (
+    FinsUploadFailureCode,
+    FinsUploadFailureKind,
+    FinsUploadFailureReason,
+    fins_upload_failure_from_exception,
 )
 from dayu.fins.pipelines.cn_pipeline import CnDownloadAdapter, CnPipeline
 from dayu.fins.pipelines.docling_process_converter import (
     DoclingConversionConfig,
+    DoclingConversionError,
+    DoclingConversionFailureKind,
     DoclingConversionResult,
+    ProcessDoclingConverter,
 )
 from dayu.fins.pipelines.sec_pipeline import SecDownloadAdapter, SecPipeline
 from dayu.fins.service_runtime import DefaultFinsRuntime, ProductionFinsUploadRunner
@@ -118,6 +133,7 @@ from dayu.fins.storage import (
     FsFilingMaintenanceRepository,
     FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
+    FilingUploadPublishedState,
     SourceDocumentRepositoryProtocol,
 )
 from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
@@ -125,6 +141,459 @@ from dayu.fins.storage.repository_protocols import SourceSnapshotProtocol
 from dayu.fins.ticker_normalization import NormalizedTicker
 from dayu.fins.tools.read_runtime import FinsReadRuntime
 import dayu.runtime.log as runtime_log
+
+
+def test_failed_pipeline_result_requires_closed_typed_failure_reason() -> None:
+    """failed pipeline JSON 必须携带 closed typed failure，非 failed 禁止携带。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: parser 接受缺失、未知、越界或错状态 failure 时抛出。
+    """
+
+    with pytest.raises(ValueError):
+        FinsUploadPipelineResult.from_pipeline_json({"status": "failed"})
+    with pytest.raises(ValueError):
+        FinsUploadPipelineResult.from_pipeline_json(
+            {
+                "status": "ok",
+                "failure": {
+                    "kind": "runtime",
+                    "code": "unexpected_runtime",
+                    "message": "上传执行失败，请检查运行日志后重试",
+                    "retry_hint": None,
+                },
+            }
+        )
+    result = FinsUploadPipelineResult.from_pipeline_json(
+        {
+            "status": "failed",
+            "failure": {
+                "kind": "content",
+                "code": "docling_converter_execution",
+                "message": "文件无法解析或已损坏，请检查文件后重试",
+                "retry_hint": "请确认文件可正常打开并重新上传",
+            },
+        }
+    )
+    assert result.failure_reason is not None
+    assert result.failure_reason.kind is FinsUploadFailureKind.CONTENT
+    assert result.failure_reason.code is FinsUploadFailureCode.DOCLING_CONVERTER_EXECUTION
+
+
+@pytest.mark.parametrize(
+    ("kind", "safe_message", "expected_code"),
+    (
+        (
+            DoclingConversionFailureKind.CONVERTER_CONSTRUCTION,
+            "Docling converter construction failed",
+            FinsUploadFailureCode.DOCLING_CONVERTER_CONSTRUCTION,
+        ),
+        (
+            DoclingConversionFailureKind.CONVERTER_EXECUTION,
+            "Docling conversion execution failed",
+            FinsUploadFailureCode.DOCLING_CONVERTER_EXECUTION,
+        ),
+        (
+            DoclingConversionFailureKind.RESULT_SERIALIZATION,
+            "Docling conversion result serialization failed",
+            FinsUploadFailureCode.DOCLING_RESULT_SERIALIZATION,
+        ),
+        (
+            DoclingConversionFailureKind.IPC_PROTOCOL,
+            "Docling conversion IPC protocol failed",
+            FinsUploadFailureCode.DOCLING_IPC_PROTOCOL,
+        ),
+        (
+            DoclingConversionFailureKind.CHILD_CRASH,
+            "Docling conversion child crashed",
+            FinsUploadFailureCode.DOCLING_CHILD_CRASH,
+        ),
+        (
+            DoclingConversionFailureKind.CLEANUP,
+            "Docling conversion cleanup failed",
+            FinsUploadFailureCode.DOCLING_CLEANUP,
+        ),
+    ),
+)
+def test_upload_failure_mapper_exhaustively_maps_docling_kinds(
+    kind: DoclingConversionFailureKind,
+    safe_message: str,
+    expected_code: FinsUploadFailureCode,
+) -> None:
+    """每个 Docling failure kind 必须映射到唯一 content code。
+
+    Args:
+        kind: Docling closed failure kind。
+        safe_message: converter owner 的固定安全文案。
+        expected_code: upload failure owner 的目标 code。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: kind、code 或 public 文案映射漂移时抛出。
+    """
+
+    reason = fins_upload_failure_from_exception(DoclingConversionError(kind, safe_message, None))
+
+    assert reason.kind is FinsUploadFailureKind.CONTENT
+    assert reason.code is expected_code
+    assert reason.message == "文件无法解析或已损坏，请检查文件后重试"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (
+        {
+            "kind": "runtime",
+            "code": "unexpected_runtime",
+            "message": "上传执行失败，请检查运行日志后重试",
+            "retry_hint": None,
+            "unknown": "forbidden",
+        },
+        {
+            "kind": "unknown",
+            "code": "unexpected_runtime",
+            "message": "上传执行失败，请检查运行日志后重试",
+            "retry_hint": None,
+        },
+        {
+            "kind": "runtime",
+            "code": "unknown",
+            "message": "上传执行失败，请检查运行日志后重试",
+            "retry_hint": None,
+        },
+        {
+            "kind": "runtime",
+            "code": "unexpected_runtime",
+            "message": "workspace/private/report.pdf",
+            "retry_hint": None,
+        },
+        {
+            "kind": "runtime",
+            "code": "unexpected_runtime",
+            "message": "x\nsecret",
+            "retry_hint": None,
+        },
+        {
+            "kind": "runtime",
+            "code": "unexpected_runtime",
+            "message": "x" * 241,
+            "retry_hint": None,
+        },
+    ),
+)
+def test_failed_pipeline_result_rejects_unsafe_or_open_failure_json(
+    failure: dict[str, JsonValue],
+) -> None:
+    """failed parser 必须拒绝 open、未知、pathful、control 与过长 failure。
+
+    Args:
+        failure: 非法 failure JSON fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: parser 未 fail closed 时抛出。
+    """
+
+    with pytest.raises(ValueError):
+        FinsUploadPipelineResult.from_pipeline_json({"status": "failed", "failure": failure})
+
+
+def _valid_runtime_filing_request(*, ticker: str = "AAPL") -> FinsUploadFilingRequest:
+    """构造不依赖本地文件的合法 filing delete 请求。
+
+    Args:
+        ticker: 测试请求 ticker。
+
+    Returns:
+        满足统一 validation contract 的 filing request。
+
+    Raises:
+        无。
+    """
+
+    return FinsUploadFilingRequest(
+        ticker=ticker,
+        action="delete",
+        fiscal_year=2024,
+        fiscal_period="FY",
+    )
+
+
+def _runtime_failure_for_status(status: str) -> FinsUploadFailureReason | None:
+    """为参数化 status 构造严格 runtime failure。
+
+    Args:
+        status: upload terminal status。
+
+    Returns:
+        failed 对应的 closed failure；其它状态返回 ``None``。
+
+    Raises:
+        无。
+    """
+
+    if status != "failed":
+        return None
+    return fins_upload_failure_from_exception(RuntimeError())
+
+
+def test_fins_upload_usage_failure_mapping_is_closed_bounded_and_path_free() -> None:
+    """usage code 到可行动文案的 mapping 必须穷尽、短小且不泄漏路径。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: code 集合、精确文案或安全边界漂移时抛出。
+    """
+
+    expected_codes = {
+        "empty_ticker",
+        "invalid_ticker",
+        "invalid_ticker_alias",
+        "invalid_source_kind",
+        "invalid_action",
+        "too_many_files",
+        "missing_fiscal_year",
+        "invalid_fiscal_year",
+        "missing_fiscal_period",
+        "fiscal_period_too_long",
+        "unsupported_cn_fiscal_period",
+        "filing_date_too_long",
+        "report_date_too_long",
+        "company_name_too_long",
+        "too_many_ticker_aliases",
+        "missing_files",
+        "file_not_found",
+        "file_not_regular",
+        "file_suffix_not_allowed",
+        "converter_suffix_unsupported",
+        "company_name_required",
+        "create_target_exists",
+        "update_target_missing",
+    }
+    assert {code.value for code in FinsUploadUsageCode} == expected_codes
+    exact_messages = {
+        FinsUploadUsageCode.EMPTY_TICKER: "--ticker 不能为空，请提供公司代码",
+        FinsUploadUsageCode.INVALID_TICKER: "--ticker 无法识别，请提供有效公司代码",
+        FinsUploadUsageCode.MISSING_FISCAL_YEAR: "--fiscal-year 不能为空",
+        FinsUploadUsageCode.MISSING_FISCAL_PERIOD: "--fiscal-period 不能为空",
+        FinsUploadUsageCode.MISSING_FILES: "create/update 上传必须提供 --files",
+        FinsUploadUsageCode.COMPANY_NAME_REQUIRED: "当前公司缺少有效元数据；create/update 必须提供 --company-name",
+        FinsUploadUsageCode.INVALID_FISCAL_YEAR: "--fiscal-year 必须是非负整数",
+        FinsUploadUsageCode.FISCAL_PERIOD_TOO_LONG: "--fiscal-period 长度不能超过 240 个字符",
+        FinsUploadUsageCode.UNSUPPORTED_CN_FISCAL_PERIOD: "CN/HK --fiscal-period 仅支持 Q1、Q2、Q3、Q4、H1、FY",
+    }
+    for code in FinsUploadUsageCode:
+        if code in {
+            FinsUploadUsageCode.FILE_NOT_FOUND,
+            FinsUploadUsageCode.FILE_NOT_REGULAR,
+            FinsUploadUsageCode.FILE_SUFFIX_NOT_ALLOWED,
+            FinsUploadUsageCode.CONVERTER_SUFFIX_UNSUPPORTED,
+        }:
+            failure = fins_upload_usage_failure(code, file_name="report.pdf")
+        else:
+            failure = fins_upload_usage_failure(code)
+        assert failure.code is code
+        assert 0 < len(failure.message) <= 240
+        assert "/Users/" not in failure.message
+        assert "\\" not in failure.message
+        if code in exact_messages:
+            assert failure.message == exact_messages[code]
+
+    assert fins_upload_usage_failure(
+        FinsUploadUsageCode.FILE_NOT_FOUND,
+        file_name="report.pdf",
+    ).message == "上传文件不存在：report.pdf"
+    assert fins_upload_usage_failure(
+        FinsUploadUsageCode.FILE_NOT_REGULAR,
+        file_name="report.pdf",
+    ).message == "上传路径不是普通文件：report.pdf"
+    assert fins_upload_usage_failure(
+        FinsUploadUsageCode.FILE_SUFFIX_NOT_ALLOWED,
+        file_name="report.exe",
+    ).message == "上传文件后缀不在命令允许范围：report.exe"
+    assert fins_upload_usage_failure(
+        FinsUploadUsageCode.CONVERTER_SUFFIX_UNSUPPORTED,
+        file_name="report.doc",
+    ).message == "当前上传转换器不支持该文件后缀：report.doc"
+
+
+def test_validate_fins_upload_filing_request_resolves_state_aware_contract(
+    tmp_path: Path,
+) -> None:
+    """validator 必须统一解析 identity、action、company decision 与 year 0 合法域。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: owner contract 未按 published state 解析时抛出。
+    """
+
+    upload_file = tmp_path / "report.pdf"
+    upload_file.write_bytes(b"pdf")
+    absent = FilingUploadPublishedState(company_meta=None, source_meta=None)
+    request = FinsUploadFilingRequest(
+        ticker="aapl.us",
+        files=(upload_file,),
+        fiscal_year=0,
+        fiscal_period=" fy ",
+        company_name="Apple Inc.",
+    )
+
+    validated = validate_fins_upload_filing_request(request, published_state=absent)
+
+    assert validated.request is request
+    assert validated.normalized_ticker.canonical == "AAPL"
+    assert validated.normalized_fiscal_period == "FY"
+    assert validated.resolved_action == "create"
+    assert validated.published_state is absent
+    assert validated.company_meta_decision.disposition == "stage"
+
+    present = FilingUploadPublishedState(
+        company_meta=validated.company_meta_decision.company_meta,
+        source_meta={"source_fingerprint": "old"},
+    )
+    updated = validate_fins_upload_filing_request(
+        replace(request, company_name=None),
+        published_state=present,
+    )
+    assert updated.resolved_action == "update"
+    assert updated.company_meta_decision.disposition == "keep"
+
+
+@pytest.mark.parametrize(
+    ("upload_request", "expected_code"),
+    (
+        (FinsUploadFilingRequest(ticker=""), FinsUploadUsageCode.EMPTY_TICKER),
+        (FinsUploadFilingRequest(ticker="../../etc/passwd"), FinsUploadUsageCode.INVALID_TICKER),
+        (
+            FinsUploadFilingRequest(ticker="AAPL", fiscal_period="FY"),
+            FinsUploadUsageCode.MISSING_FISCAL_YEAR,
+        ),
+        (
+            FinsUploadFilingRequest(ticker="AAPL", fiscal_year=-1, fiscal_period="FY"),
+            FinsUploadUsageCode.INVALID_FISCAL_YEAR,
+        ),
+        (
+            FinsUploadFilingRequest(ticker="AAPL", fiscal_year=2024),
+            FinsUploadUsageCode.MISSING_FISCAL_PERIOD,
+        ),
+        (
+            FinsUploadFilingRequest(ticker="AAPL", fiscal_year=2024, fiscal_period="FY"),
+            FinsUploadUsageCode.MISSING_FILES,
+        ),
+    ),
+)
+def test_validate_fins_upload_filing_request_preserves_validation_priority(
+    upload_request: FinsUploadFilingRequest,
+    expected_code: FinsUploadUsageCode,
+) -> None:
+    """冲突输入必须按 ticker→year→period→files 的 owner 顺序失败。
+
+    Args:
+        upload_request: 当前非法请求。
+        expected_code: 预期首个 usage code。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: validator 返回错误优先级时抛出。
+    """
+
+    with pytest.raises(FinsUploadUsageError) as exc_info:
+        validate_fins_upload_filing_request(
+            upload_request,
+            published_state=FilingUploadPublishedState(company_meta=None, source_meta=None),
+        )
+    assert exc_info.value.failure.code is expected_code
+
+
+def test_default_runtime_create_and_ingestion_assembly_are_lazy(tmp_path: Path) -> None:
+    """默认 runtime 构造与 ingestion 装配不得提前创建 workspace skeleton。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 任一装配步骤提前创建目录时抛出。
+    """
+
+    workspace_root = tmp_path / "lazy-workspace"
+
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    assert not workspace_root.exists()
+
+    runtime.get_ingestion_runtime()
+    assert not workspace_root.exists()
+
+
+def test_job_store_first_write_creates_root_but_missing_read_and_save_do_not(
+    tmp_path: Path,
+) -> None:
+    """job store 仅由 create_job 首写创建目录，missing read/save 保持纯失败。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: missing 操作创建目录或 create_job 未创建目录时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    store = ingestion_runtime.FsFinsIngestionJobStore.from_workspace_root(workspace_root)
+    record = FinsIngestionJobRecord(
+        job_id="finsjob_00000000000000000000000000000001",
+        operation_kind=FinsIngestionOperationKind.DOWNLOAD,
+        normalized_ticker="AAPL",
+        market="US",
+        exchange=None,
+        source="sec",
+        source_kind=None,
+        status=FinsIngestionJobStatus.QUEUED,
+        created_at="2026-08-13T00:00:00+00:00",
+        updated_at="2026-08-13T00:00:00+00:00",
+        started_at=None,
+        finished_at=None,
+        request_summary={},
+        result_summary={},
+        failure_summary={},
+        cancellation_requested=False,
+    )
+
+    with pytest.raises(FileNotFoundError):
+        store.read_job(record.job_id)
+    assert not workspace_root.exists()
+    with pytest.raises(FileNotFoundError):
+        store.save_job(record)
+    assert not workspace_root.exists()
+
+    assert store.create_job(record) == record
+    assert store.root_dir.is_dir()
 
 
 def _typed_download_summary(
@@ -950,13 +1419,13 @@ class _FakeUploadRunner(FinsUploadRunner):
         """
 
         self.result_summary = result_summary
-        self.requests: list[FinsUploadRequest] = []
+        self.requests: list[ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest] = []
         self.cancellation_checks: list[bool] = []
         self.cancellation_tokens: list[FinsJobCancellationChecker] = []
 
     def run_upload(
         self,
-        request: FinsUploadRequest,
+        request: ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest,
         *,
         cancellation_checker: FinsJobCancellationChecker,
     ) -> FinsUploadResultSummary:
@@ -1009,7 +1478,7 @@ class _BarrierUploadRunner(FinsUploadRunner):
 
     def run_upload(
         self,
-        request: FinsUploadRequest,
+        request: ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest,
         *,
         cancellation_checker: FinsJobCancellationChecker,
     ) -> FinsUploadResultSummary:
@@ -1030,8 +1499,9 @@ class _BarrierUploadRunner(FinsUploadRunner):
         if not self.release_summary.wait(timeout=1.0):
             raise TimeoutError("upload summary barrier 未释放")
         if self.observe_cancel_before_summary and cancellation_checker():
+            raw_request = request.request if isinstance(request, ValidatedFinsUploadFilingRequest) else request
             return FinsUploadResultSummary(
-                source_kind=request.source_kind,
+                source_kind=raw_request.source_kind,
                 status="cancelled",
             )
         return self.accepted_summary
@@ -1067,11 +1537,11 @@ class _BlockingArtifactUploadRunner(FinsUploadRunner):
         self.artifact_written = Event()
         self.allow_finish = Event()
         self.cancellation_checks: tuple[bool, ...] = ()
-        self.requests: tuple[FinsUploadRequest, ...] = ()
+        self.requests: tuple[ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest, ...] = ()
 
     def run_upload(
         self,
-        request: FinsUploadRequest,
+        request: ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest,
         *,
         cancellation_checker: FinsJobCancellationChecker,
     ) -> FinsUploadResultSummary:
@@ -1090,12 +1560,13 @@ class _BlockingArtifactUploadRunner(FinsUploadRunner):
         """
 
         self.requests = self.requests + (request,)
-        batch = self.batching_repository.begin_batch(request.ticker)
+        raw_request = request.request if isinstance(request, ValidatedFinsUploadFilingRequest) else request
+        batch = self.batching_repository.begin_batch(raw_request.ticker)
         try:
             filename = f"{self.document_id}.md"
             file_meta = self.blob_repository.store_file(
                 SourceHandle(
-                    ticker=request.ticker,
+                    ticker=raw_request.ticker,
                     document_id=self.document_id,
                     source_kind=SourceKind.FILING.value,
                 ),
@@ -1106,7 +1577,7 @@ class _BlockingArtifactUploadRunner(FinsUploadRunner):
             )
             self.source_repository.create_source_document(
                 SourceDocumentUpsertRequest(
-                    ticker=request.ticker,
+                    ticker=raw_request.ticker,
                     document_id=self.document_id,
                     internal_document_id=self.document_id,
                     form_type="10-K",
@@ -1201,6 +1672,7 @@ def _inject_upload_runtime_converter(
             processed_repository=default_runtime.processed_repository,
             blob_repository=default_runtime.blob_repository,
             filing_maintenance_repository=default_runtime.filing_maintenance_repository,
+            filing_upload_state_repository=default_runtime.filing_upload_state_repository,
             docling_converter=converter,
         ),
         cn_pipeline=CnPipeline(
@@ -1211,9 +1683,46 @@ def _inject_upload_runtime_converter(
             processed_repository=default_runtime.processed_repository,
             blob_repository=default_runtime.blob_repository,
             filing_maintenance_repository=default_runtime.filing_maintenance_repository,
+            filing_upload_state_repository=default_runtime.filing_upload_state_repository,
             docling_converter=converter,
         ),
+        filing_upload_state_repository=default_runtime.filing_upload_state_repository,
     )
+
+
+def test_default_runtime_composition_shares_upload_state_and_docling_converter(tmp_path: Path) -> None:
+    """production composition 必须共享 state repository 与 interruptible converter。
+
+    Args:
+        tmp_path: pytest 临时目录夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: runtime 缓存、repository 或 converter identity 漂移时抛出。
+    """
+
+    default_runtime = DefaultFinsRuntime.create(workspace_root=tmp_path / "fins-workspace")
+    ingestion = default_runtime.get_ingestion_runtime()
+    repeated = default_runtime.get_ingestion_runtime()
+    runner = ingestion.upload_runner
+
+    assert repeated is ingestion
+    assert isinstance(runner, ProductionFinsUploadRunner)
+    assert runner.filing_upload_state_repository is default_runtime.filing_upload_state_repository
+    assert runner.sec_pipeline._filing_upload_state_repository is default_runtime.filing_upload_state_repository
+    assert runner.cn_pipeline._filing_upload_state_repository is default_runtime.filing_upload_state_repository
+
+    converter = runner.cn_pipeline._docling_converter
+    assert isinstance(converter, ProcessDoclingConverter)
+    assert runner.sec_pipeline._upload_service._docling_converter is converter
+    cn_adapter = ingestion.download_adapters[("cninfo", "CN")]
+    hk_adapter = ingestion.download_adapters[("hkexnews", "HK")]
+    assert isinstance(cn_adapter, CnDownloadAdapter)
+    assert isinstance(hk_adapter, CnDownloadAdapter)
+    assert cn_adapter._pipeline._docling_converter is converter
+    assert hk_adapter._pipeline._docling_converter is converter
 
 
 class _CancelOnSecondCheckToken(CancellationToken):
@@ -2040,6 +2549,7 @@ def test_store_downloaded_document_commit_failure_does_not_caller_rollback(tmp_p
             workspace_root,
             repository_set=repository_set,
         ),
+        filing_upload_state_repository=default_runtime.filing_upload_state_repository,
         processed_repository=FsProcessedDocumentRepository(
             workspace_root,
             repository_set=repository_set,
@@ -2785,7 +3295,7 @@ async def test_direct_upload_projection_failure_before_claim_emits_single_failur
         upload_runner=_FakeUploadRunner(summary),
     )
 
-    events = await _collect_direct_events(runtime.upload(FinsUploadFilingRequest(ticker="AAPL")))
+    events = await _collect_direct_events(runtime.upload(_valid_runtime_filing_request()))
     progress_stages = tuple(event.progress.stage for event in events if event.progress is not None)
     results = tuple(event.result for event in events if event.result is not None)
 
@@ -2824,7 +3334,7 @@ async def test_direct_upload_cancel_before_final_checkpoint_returns_only_cancell
         executor=_HoldingExecutor(),
         upload_runner=runner,
     )
-    collection = asyncio.create_task(_collect_direct_events(runtime.upload(FinsUploadFilingRequest(ticker="AAPL"))))
+    collection = asyncio.create_task(_collect_direct_events(runtime.upload(_valid_runtime_filing_request())))
     assert await asyncio.to_thread(runner.boundary_reached.wait, 1.0)
     assert len(states) == 1
     assert states[0].request_cancel()
@@ -2868,7 +3378,7 @@ async def test_direct_upload_cancel_after_commit_before_summary_keeps_completed(
         executor=_HoldingExecutor(),
         upload_runner=runner,
     )
-    collection = asyncio.create_task(_collect_direct_events(runtime.upload(FinsUploadFilingRequest(ticker="AAPL"))))
+    collection = asyncio.create_task(_collect_direct_events(runtime.upload(_valid_runtime_filing_request())))
     assert await asyncio.to_thread(runner.boundary_reached.wait, 1.0)
     assert len(states) == 1
     assert states[0].request_cancel()
@@ -2956,9 +3466,15 @@ async def test_direct_upload_cancel_around_summary_claim_keeps_progress_result_a
     runtime = _build_ingestion_runtime(
         tmp_path / "fins-workspace",
         executor=_HoldingExecutor(),
-        upload_runner=_FakeUploadRunner(FinsUploadResultSummary(source_kind=SourceKind.FILING, status=status)),
+        upload_runner=_FakeUploadRunner(
+            FinsUploadResultSummary(
+                source_kind=SourceKind.FILING,
+                status=status,
+                failure_reason=_runtime_failure_for_status(status),
+            )
+        ),
     )
-    collection = asyncio.create_task(_collect_direct_events(runtime.upload(FinsUploadFilingRequest(ticker="AAPL"))))
+    collection = asyncio.create_task(_collect_direct_events(runtime.upload(_valid_runtime_filing_request())))
     assert await asyncio.to_thread(claim_boundary.wait, 1.0)
     assert len(states) == 1
     cancel_accepted = states[0].request_cancel()
@@ -3716,11 +4232,13 @@ def test_start_upload_persists_queued_record_and_uses_public_ticker_normalizatio
 
     monkeypatch.setattr(ticker_normalization, "normalize_ticker", normalize_upload_ticker)
 
+    upload_file = tmp_path / "aapl-10k.pdf"
+    upload_file.write_bytes(b"filing")
     start = runtime.start_upload(
         FinsUploadFilingRequest(
             ticker="aapl.us",
             action="CREATE",
-            files=(tmp_path / "aapl-10k.pdf",),
+            files=(upload_file,),
             fiscal_year=2024,
             fiscal_period="FY",
             amended=True,
@@ -3733,7 +4251,8 @@ def test_start_upload_persists_queued_record_and_uses_public_ticker_normalizatio
     record = runtime.read_job(start.job_id)
     payload_text = _job_file(workspace_root, start.job_id).read_text(encoding="utf-8")
 
-    assert calls == ["aapl.us"]
+    assert calls[0] == "aapl.us"
+    assert "APPLE" in calls
     assert start.status is FinsIngestionJobStatus.QUEUED
     assert record.operation_kind is FinsIngestionOperationKind.UPLOAD
     assert record.normalized_ticker == "AAPL"
@@ -3762,7 +4281,7 @@ def test_upload_start_cancel_between_create_and_submit_marks_job_cancelled_and_d
     runtime = _build_ingestion_runtime(workspace_root, executor=executor)
     token = _CancelOnSecondCheckToken()
 
-    start = runtime.start_upload(FinsUploadFilingRequest(ticker="AAPL"), cancellation_token=token)
+    start = runtime.start_upload(_valid_runtime_filing_request(), cancellation_token=token)
     record = runtime.read_job(start.job_id)
 
     assert start.status is FinsIngestionJobStatus.CANCELLED
@@ -3885,7 +4404,15 @@ async def test_direct_upload_stream_omits_paths_job_ids_and_raw_payload_text(tmp
     upload_file.write_text("Annual recurring revenue increased raw provider payload", encoding="utf-8")
 
     events = await _collect_direct_events(
-        ingestion.upload(FinsUploadFilingRequest(ticker="AAPL", files=(upload_file,)))
+        ingestion.upload(
+            FinsUploadFilingRequest(
+                ticker="AAPL",
+                files=(upload_file,),
+                fiscal_year=2024,
+                fiscal_period="FY",
+                company_name="Apple Inc.",
+            )
+        )
     )
     event_text = repr(events)
 
@@ -3909,6 +4436,7 @@ def test_start_upload_failed_status_emits_completed_with_failures_progress(tmp_p
             document_id="aapl-investor-day",
             internal_document_id="aapl-investor-day-internal",
             status="failed",
+            failure_reason=fins_upload_failure_from_exception(RuntimeError()),
             uploaded_files=(),
             primary_document=None,
             deleted=False,
@@ -3936,7 +4464,12 @@ def test_start_upload_failed_status_emits_completed_with_failures_progress(tmp_p
 
     assert record.status is FinsIngestionJobStatus.FAILED
     assert record.result_summary["status"] == "failed"
-    assert record.failure_summary == {"message": direct_upload_failed_status_message()}
+    assert record.failure_summary == {
+        "kind": "runtime",
+        "code": "unexpected_runtime",
+        "message": "上传执行失败，请检查运行日志后重试",
+        "retry_hint": None,
+    }
     assert [event.source_event_type for event in progress_events] == [
         "upload.started",
         "upload.completed_with_failures",
@@ -3980,9 +4513,15 @@ def test_durable_upload_projection_failure_preserves_accepted_terminal(
     runtime = _build_ingestion_runtime(
         tmp_path / "fins-workspace",
         executor=executor,
-        upload_runner=_FakeUploadRunner(FinsUploadResultSummary(source_kind=SourceKind.FILING, status=status)),
+        upload_runner=_FakeUploadRunner(
+            FinsUploadResultSummary(
+                source_kind=SourceKind.FILING,
+                status=status,
+                failure_reason=_runtime_failure_for_status(status),
+            )
+        ),
     )
-    start = runtime.start_upload(FinsUploadFilingRequest(ticker="AAPL"))
+    start = runtime.start_upload(_valid_runtime_filing_request())
     original_save = ingestion_runtime.FsFinsIngestionJobStore.save_accepted_upload_terminal_if_active
     original_read = ingestion_runtime.FsFinsIngestionJobStore.read_job
     accepted_records: list[ingestion_runtime.FinsIngestionJobRecord] = []
@@ -4113,7 +4652,7 @@ def test_durable_upload_cancel_before_final_checkpoint_saves_only_cancelled(
         executor=executor,
         upload_runner=runner,
     )
-    start = runtime.start_upload(FinsUploadFilingRequest(ticker="AAPL"))
+    start = runtime.start_upload(_valid_runtime_filing_request())
     operation_thread = Thread(target=executor.run_all)
     operation_thread.start()
     assert runner.boundary_reached.wait(timeout=1.0)
@@ -4168,7 +4707,7 @@ def test_durable_upload_cancel_after_commit_before_summary_keeps_completed(
         executor=executor,
         upload_runner=runner,
     )
-    start = runtime.start_upload(FinsUploadFilingRequest(ticker="AAPL"))
+    start = runtime.start_upload(_valid_runtime_filing_request())
     operation_thread = Thread(target=executor.run_all)
     operation_thread.start()
     assert runner.boundary_reached.wait(timeout=1.0)
@@ -4284,9 +4823,15 @@ def test_durable_upload_cancel_before_atomic_save_keeps_accepted_summary(
     runtime = _build_ingestion_runtime(
         tmp_path / "fins-workspace",
         executor=executor,
-        upload_runner=_FakeUploadRunner(FinsUploadResultSummary(source_kind=SourceKind.FILING, status=status)),
+        upload_runner=_FakeUploadRunner(
+            FinsUploadResultSummary(
+                source_kind=SourceKind.FILING,
+                status=status,
+                failure_reason=_runtime_failure_for_status(status),
+            )
+        ),
     )
-    start = runtime.start_upload(FinsUploadFilingRequest(ticker="AAPL"))
+    start = runtime.start_upload(_valid_runtime_filing_request())
     operation_thread = Thread(target=executor.run_all)
     operation_thread.start()
     assert save_entered.wait(timeout=1.0)
@@ -4392,9 +4937,15 @@ def test_durable_upload_cancel_after_atomic_save_keeps_single_terminal(
     runtime = _build_ingestion_runtime(
         tmp_path / "fins-workspace",
         executor=executor,
-        upload_runner=_FakeUploadRunner(FinsUploadResultSummary(source_kind=SourceKind.FILING, status=status)),
+        upload_runner=_FakeUploadRunner(
+            FinsUploadResultSummary(
+                source_kind=SourceKind.FILING,
+                status=status,
+                failure_reason=_runtime_failure_for_status(status),
+            )
+        ),
     )
-    start = runtime.start_upload(FinsUploadFilingRequest(ticker="AAPL"))
+    start = runtime.start_upload(_valid_runtime_filing_request())
     operation_thread = Thread(target=executor.run_all)
     operation_thread.start()
     assert save_completed.wait(timeout=1.0)
@@ -4444,7 +4995,7 @@ def test_accepted_upload_terminal_store_rejects_mismatch_and_preserves_existing_
 
     executor = _HoldingExecutor()
     runtime = _build_ingestion_runtime(tmp_path / "fins-workspace", executor=executor)
-    start = runtime.start_upload(FinsUploadFilingRequest(ticker="AAPL"))
+    start = runtime.start_upload(_valid_runtime_filing_request())
     store = runtime.job_store
     completed_summary = FinsUploadResultSummary(
         source_kind=SourceKind.FILING,
@@ -4453,6 +5004,7 @@ def test_accepted_upload_terminal_store_rejects_mismatch_and_preserves_existing_
     failed_summary = FinsUploadResultSummary(
         source_kind=SourceKind.FILING,
         status="failed",
+        failure_reason=fins_upload_failure_from_exception(RuntimeError()),
     ).to_json_summary()
     finished_at = datetime.now(timezone.utc).isoformat()
 
@@ -4619,8 +5171,9 @@ def test_upload_request_and_result_summaries_enforce_bounds(tmp_path: Path) -> N
     too_many_aliases = tuple(f"alias-{index}" for index in range(ingestion_runtime._MAX_TUPLE_ITEMS + 1))
     too_many_files = tuple(f"file-{index}.pdf" for index in range(ingestion_runtime._MAX_TUPLE_ITEMS + 1))
 
-    with pytest.raises(ValueError, match="ticker_aliases 元素数量超出上限"):
+    with pytest.raises(FinsUploadUsageError) as aliases_exc:
         runtime.start_upload(FinsUploadFilingRequest(ticker="AAPL", ticker_aliases=too_many_aliases))
+    assert aliases_exc.value.failure.code is FinsUploadUsageCode.TOO_MANY_TICKER_ALIASES
     with pytest.raises(ValueError, match="uploaded_files 元素数量超出上限"):
         FinsUploadResultSummary(
             source_kind=SourceKind.FILING,
@@ -4637,8 +5190,9 @@ def test_upload_requests_use_source_kind_for_filing_material_discrimination(tmp_
     executor = _HoldingExecutor()
     runtime = _build_ingestion_runtime(workspace_root, executor=executor)
 
-    with pytest.raises(ValueError, match="filing 上传请求必须使用 source_kind=filing"):
+    with pytest.raises(FinsUploadUsageError) as source_kind_exc:
         runtime.start_upload(FinsUploadFilingRequest(ticker="AAPL", source_kind=SourceKind.MATERIAL))
+    assert source_kind_exc.value.failure.code is FinsUploadUsageCode.INVALID_SOURCE_KIND
     with pytest.raises(ValueError, match="material 上传请求必须使用 source_kind=material"):
         runtime.start_upload(FinsUploadMaterialRequest(ticker="AAPL", source_kind=SourceKind.FILING))
 
@@ -4754,8 +5308,20 @@ def test_upload_status_owner_maps_only_exact_production_statuses(
         AssertionError: 两个 owner boundary 的映射不一致时抛出。
     """
 
-    pipeline_result = FinsUploadPipelineResult.from_pipeline_json({"status": status})
-    summary = FinsUploadResultSummary(source_kind=SourceKind.FILING, status=status)
+    pipeline_json: dict[str, JsonValue] = {"status": status}
+    if status == "failed":
+        pipeline_json["failure"] = {
+            "kind": "runtime",
+            "code": "unexpected_runtime",
+            "message": "上传执行失败，请检查运行日志后重试",
+            "retry_hint": None,
+        }
+    pipeline_result = FinsUploadPipelineResult.from_pipeline_json(pipeline_json)
+    summary = FinsUploadResultSummary(
+        source_kind=SourceKind.FILING,
+        status=status,
+        failure_reason=_runtime_failure_for_status(status),
+    )
 
     assert pipeline_result.status == status
     assert summary.terminal_disposition() is expected
@@ -4800,7 +5366,7 @@ def test_prepare_observed_operations_do_not_submit_until_activation(tmp_path: Pa
         cancellation_token=_NeverCancelledToken(),
     )
     upload = runtime.prepare_observed_upload(
-        FinsUploadFilingRequest(ticker="AAPL"),
+        _valid_runtime_filing_request(),
         cancellation_token=_NeverCancelledToken(),
     )
 
@@ -4943,6 +5509,7 @@ def test_abandon_submitted_observation_cancels_and_keeps_storage_artifacts(
         source_repository=default_runtime.source_repository,
         blob_repository=default_runtime.blob_repository,
         filing_maintenance_repository=default_runtime.filing_maintenance_repository,
+        filing_upload_state_repository=default_runtime.filing_upload_state_repository,
         processed_repository=default_runtime.processed_repository,
         processor_registry=default_runtime.processor_registry,
         job_store=default_runtime.ingestion_job_store,
@@ -4950,7 +5517,7 @@ def test_abandon_submitted_observation_cancels_and_keeps_storage_artifacts(
         upload_runner=runner,
     )
     handle = runtime.prepare_observed_upload(
-        FinsUploadFilingRequest(ticker="AAPL"),
+        _valid_runtime_filing_request(),
         cancellation_token=_NeverCancelledToken(),
     )
 
@@ -4984,7 +5551,7 @@ def test_cancel_and_activate_share_observation_lock_without_timing_sleep(
     executor = _HoldingExecutor()
     runtime = _build_ingestion_runtime(workspace_root, executor=executor)
     handle = runtime.prepare_observed_upload(
-        FinsUploadFilingRequest(ticker="AAPL"),
+        _valid_runtime_filing_request(),
         cancellation_token=_NeverCancelledToken(),
     )
     hooked_lock = _HookedObservationLock()
@@ -5062,7 +5629,7 @@ def test_unexpected_activation_exception_terminalizes_prepared_observation(
         executor=_FailingSubmitExecutor(ValueError("unexpected activation error")),
     )
     handle = runtime.prepare_observed_upload(
-        FinsUploadFilingRequest(ticker="AAPL"),
+        _valid_runtime_filing_request(),
         cancellation_token=_NeverCancelledToken(),
     )
 
@@ -5138,7 +5705,7 @@ def test_job_serialization_validates_upload_operation_shape(tmp_path: Path) -> N
     workspace_root = tmp_path / "fins-workspace"
     executor = _HoldingExecutor()
     runtime = _build_ingestion_runtime(workspace_root, executor=executor)
-    start = runtime.start_upload(FinsUploadFilingRequest(ticker="AAPL"))
+    start = runtime.start_upload(_valid_runtime_filing_request())
     job_file = _job_file(workspace_root, start.job_id)
     payload_value = cast(JsonValue, json.loads(job_file.read_text(encoding="utf-8")))
 
@@ -5252,7 +5819,15 @@ def test_job_event_sidecar_omits_paths_payload_bodies_and_raw_provider_payloads(
     upload_file.parent.mkdir(parents=True)
     upload_file.write_text("Annual recurring revenue increased raw provider payload", encoding="utf-8")
 
-    start = ingestion.start_upload(FinsUploadFilingRequest(ticker="AAPL", files=(upload_file,)))
+    start = ingestion.start_upload(
+        FinsUploadFilingRequest(
+            ticker="AAPL",
+            files=(upload_file,),
+            fiscal_year=2024,
+            fiscal_period="FY",
+            company_name="Apple Inc.",
+        )
+    )
     executor.run_all()
     event_text = _job_event_file(workspace_root, start.job_id).read_text(encoding="utf-8")
 
@@ -5564,7 +6139,7 @@ def test_progress_event_append_failure_warns_and_job_still_succeeds(
         executor=executor,
         upload_runner=runner,
     )
-    start = ingestion.start_upload(FinsUploadFilingRequest(ticker="AAPL"))
+    start = ingestion.start_upload(_valid_runtime_filing_request())
     original_append = ingestion_runtime.FsFinsIngestionJobStore.append_job_event
 
     def raise_for_progress_event(
@@ -6079,6 +6654,7 @@ def test_claim_running_preserves_cancel_between_read_and_running_write(
         source_repository=default_runtime.source_repository,
         blob_repository=default_runtime.blob_repository,
         filing_maintenance_repository=default_runtime.filing_maintenance_repository,
+        filing_upload_state_repository=default_runtime.filing_upload_state_repository,
         processed_repository=default_runtime.processed_repository,
         processor_registry=default_runtime.processor_registry,
         job_store=job_store,
@@ -6311,6 +6887,7 @@ def test_start_preprocess_unsupported_document_records_not_supported_summary(tmp
         source_repository=default_runtime.source_repository,
         blob_repository=default_runtime.blob_repository,
         filing_maintenance_repository=default_runtime.filing_maintenance_repository,
+        filing_upload_state_repository=default_runtime.filing_upload_state_repository,
         processed_repository=default_runtime.processed_repository,
         processor_registry=ProcessorRegistry(),
         job_store=default_runtime.ingestion_job_store,
@@ -6505,6 +7082,7 @@ def _build_ingestion_runtime(
         source_repository=default_runtime.source_repository,
         blob_repository=default_runtime.blob_repository,
         filing_maintenance_repository=default_runtime.filing_maintenance_repository,
+        filing_upload_state_repository=default_runtime.filing_upload_state_repository,
         processed_repository=default_runtime.processed_repository,
         processor_registry=default_runtime.processor_registry,
         job_store=default_runtime.ingestion_job_store,
@@ -6549,6 +7127,7 @@ def _build_ingestion_runtime_with_repository_set(
             workspace_root,
             repository_set=repository_set,
         ),
+        filing_upload_state_repository=default_runtime.filing_upload_state_repository,
         processed_repository=FsProcessedDocumentRepository(
             workspace_root,
             repository_set=repository_set,

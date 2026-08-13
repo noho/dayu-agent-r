@@ -42,7 +42,12 @@ from dayu.fins.ingestion_runtime import (
     FinsUploadFilingRequest,
     FinsUploadMaterialRequest,
     FinsUploadRequest,
+    ValidatedFinsUploadFilingRequest,
+    validate_fins_upload_filing_request,
 )
+from dayu.fins.domain.document_models import CompanyMeta
+from dayu.fins.pipelines.upload_company_meta import RESOLVER_VERSION
+from dayu.fins.storage import FilingUploadPublishedState
 from dayu.service.fins_direct import (
     FINS_DIRECT_EXIT_FAILURE,
     FINS_DIRECT_EXIT_KEYBOARD_INTERRUPT,
@@ -59,7 +64,7 @@ class _FakeIngestionRuntime:
 
     download_requests: list[FinsDownloadRequest]
     preprocess_requests: list[FinsPreprocessRequest]
-    upload_requests: list[FinsUploadRequest]
+    upload_requests: list[ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest]
     cancellation_tokens: list[CancellationToken | None]
     events: tuple[FinsEvent, ...]
     stream_error: Exception | None
@@ -135,7 +140,7 @@ class _FakeIngestionRuntime:
 
     def upload(
         self,
-        request: FinsUploadRequest,
+        request: ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest,
         *,
         cancellation_token: CancellationToken | None = None,
     ) -> ValidatedFinsEventStream:
@@ -709,24 +714,38 @@ async def test_upload_methods_build_union_requests(tmp_path: Path) -> None:
 
     filing_file = tmp_path / "filing.pdf"
     material_file = tmp_path / "material.pdf"
+    filing_file.write_bytes(b"filing")
     runtime = _FakeIngestionRuntime((_result_event(operation_kind=FinsOperationKind.UPLOAD_FILING),))
     service = FinsDirectCommandService(runtime)
 
-    await _collect_events(
-        service.upload_filing(
-            ticker="AAPL",
-            action="update",
-            files=(filing_file,),
-            fiscal_year=2024,
-            fiscal_period="FY",
-            amended=True,
-            filing_date="2025-01-30",
-            report_date="2024-12-31",
-            company_name="Apple Inc.",
-            ticker_aliases=("Apple",),
-            overwrite=True,
-        )
+    raw_filing_request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        action="update",
+        files=(filing_file,),
+        fiscal_year=2024,
+        fiscal_period="FY",
+        amended=True,
+        filing_date="2025-01-30",
+        report_date="2024-12-31",
+        company_name="Apple Inc.",
+        ticker_aliases=("Apple",),
+        overwrite=True,
     )
+    validated_filing_request = validate_fins_upload_filing_request(
+        raw_filing_request,
+        published_state=FilingUploadPublishedState(
+            company_meta=CompanyMeta(
+                company_id="company-aapl",
+                company_name="Apple Inc.",
+                ticker="AAPL",
+                market="US",
+                resolver_version=RESOLVER_VERSION,
+                updated_at="2026-08-13T00:00:00+00:00",
+            ),
+            source_meta={"source_fingerprint": "old"},
+        ),
+    )
+    await _collect_events(service.upload_filing(validated_filing_request))
     await _collect_events(
         service.upload_material(
             ticker="MSFT",
@@ -746,21 +765,7 @@ async def test_upload_methods_build_union_requests(tmp_path: Path) -> None:
         )
     )
 
-    assert isinstance(runtime.upload_requests[0], FinsUploadFilingRequest)
-    assert runtime.upload_requests[0] == FinsUploadFilingRequest(
-        ticker="AAPL",
-        source_kind=SourceKind.FILING,
-        action="update",
-        files=(filing_file,),
-        fiscal_year=2024,
-        fiscal_period="FY",
-        amended=True,
-        filing_date="2025-01-30",
-        report_date="2024-12-31",
-        company_name="Apple Inc.",
-        ticker_aliases=("Apple",),
-        overwrite=True,
-    )
+    assert runtime.upload_requests[0] is validated_filing_request
     assert isinstance(runtime.upload_requests[1], FinsUploadMaterialRequest)
     assert runtime.upload_requests[1] == FinsUploadMaterialRequest(
         ticker="MSFT",

@@ -5,6 +5,7 @@ from .fs_batching_repository import FsBatchingRepository
 from .fs_company_meta_repository import FsCompanyMetaRepository
 from .fs_document_blob_repository import FsDocumentBlobRepository
 from .fs_filing_maintenance_repository import FsFilingMaintenanceRepository
+from .fs_filing_upload_state_repository import FsFilingUploadStateRepository
 from .fs_processed_document_repository import FsProcessedDocumentRepository
 from .fs_source_document_repository import FsSourceDocumentRepository
 from .local_file_store import LocalFileStore
@@ -13,6 +14,8 @@ from .repository_protocols import (
     CompanyMetaRepositoryProtocol,
     DocumentBlobRepositoryProtocol,
     FilingMaintenanceRepositoryProtocol,
+    FilingUploadPublishedState,
+    FilingUploadStateRepositoryProtocol,
     ProcessedDocumentRepositoryProtocol,
     SourceDocumentRepositoryProtocol,
 )
@@ -37,12 +40,15 @@ __all__ = [
     "ProcessedDocumentRepositoryProtocol",
     "DocumentBlobRepositoryProtocol",
     "FilingMaintenanceRepositoryProtocol",
+    "FilingUploadPublishedState",
+    "FilingUploadStateRepositoryProtocol",
     "FsBatchingRepository",
     "FsCompanyMetaRepository",
     "FsSourceDocumentRepository",
     "FsProcessedDocumentRepository",
     "FsDocumentBlobRepository",
     "FsFilingMaintenanceRepository",
+    "FsFilingUploadStateRepository",
     "FileStore",
     "LocalFileStore",
     "NoSourceRepairRequired",

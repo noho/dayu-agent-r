@@ -450,7 +450,13 @@ async def test_upload_filing_stream_stale_company_meta_requires_company_name(tmp
     failed_result = events[-1].payload["result"]
     assert isinstance(failed_result, dict)
     assert failed_result["status"] == "failed"
-    assert "--company-name" in str(failed_result["message"])
+    assert failed_result["message"] == "上传执行失败，请检查运行日志后重试"
+    assert failed_result["failure"] == {
+        "kind": "runtime",
+        "code": "unexpected_runtime",
+        "message": "上传执行失败，请检查运行日志后重试",
+        "retry_hint": None,
+    }
     company_meta = pipeline._company_repository.get_company_meta("AAPL")
     assert company_meta.company_name == "Stale Apple"
     assert company_meta.resolver_version == "market_resolver_v0.9.0"

@@ -33,6 +33,7 @@ from dayu.fins.ingestion_runtime import (
     FinsUploadFilingRequest,
     FinsUploadMaterialRequest,
     FinsUploadRequest,
+    ValidatedFinsUploadFilingRequest,
 )
 from dayu.fins.service_runtime import DefaultFinsRuntime
 
@@ -80,7 +81,7 @@ class FinsDirectIngestionRuntime(Protocol):
 
     def upload(
         self,
-        request: FinsUploadRequest,
+        request: ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest,
         *,
         cancellation_token: CancellationToken | None = None,
     ) -> ValidatedFinsEventStream:
@@ -278,52 +279,18 @@ class FinsDirectCommandService:
 
     def upload_filing(
         self,
+        request: ValidatedFinsUploadFilingRequest,
         *,
-        ticker: str,
-        action: str,
-        files: tuple[Path, ...],
-        fiscal_year: int | None = None,
-        fiscal_period: str | None = None,
-        amended: bool = False,
-        filing_date: str | None = None,
-        report_date: str | None = None,
-        company_name: str | None = None,
-        ticker_aliases: tuple[str, ...] = (),
-        overwrite: bool = False,
         cancellation_token: CancellationToken | None = None,
     ) -> ValidatedFinsEventStream:
         """执行 filing 上传 direct stream。
 
-        :param ticker: canonical ticker 文本。
-        :param action: 上传动作。
-        :param files: 用户提供且已通过入口前置校验的文件路径。
-        :param fiscal_year: 可选会计年度。
-        :param fiscal_period: 可选会计期间。
-        :param amended: 是否为修订 filing。
-        :param filing_date: 可选披露日期。
-        :param report_date: 可选报告期日期。
-        :param company_name: 可选公司名称。
-        :param ticker_aliases: ticker 别名，仅传给支持该字段的 upload request。
-        :param overwrite: 是否允许覆盖已有文档。
+        :param request: Fins owner 已验证且必须原样传递的 filing request。
         :param cancellation_token: 可选 operation-scoped 取消 token。
         :returns: runtime 返回的同一个 Fins owner 已验证事件流。
         :raises Exception: request 构造或 runtime 执行失败时由底层抛出。
         """
 
-        request = FinsUploadFilingRequest(
-            ticker=ticker,
-            source_kind=SourceKind.FILING,
-            action=action,
-            files=files,
-            fiscal_year=fiscal_year,
-            fiscal_period=fiscal_period,
-            amended=amended,
-            filing_date=filing_date,
-            report_date=report_date,
-            company_name=company_name,
-            ticker_aliases=ticker_aliases,
-            overwrite=overwrite,
-        )
         return self._runtime.upload(
             request,
             cancellation_token=cancellation_token,

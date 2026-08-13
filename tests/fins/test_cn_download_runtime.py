@@ -56,6 +56,7 @@ from dayu.fins.storage import (
     FsCompanyMetaRepository,
     FsDocumentBlobRepository,
     FsFilingMaintenanceRepository,
+    FsFilingUploadStateRepository,
     FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
 )
@@ -488,6 +489,7 @@ class _RuntimeRepositorySet:
     processed_repository: FsProcessedDocumentRepository
     blob_repository: FsDocumentBlobRepository
     filing_maintenance_repository: FsFilingMaintenanceRepository
+    filing_upload_state_repository: FsFilingUploadStateRepository
 
 
 def test_start_download_cninfo_persists_summary_and_source_document(tmp_path: Path) -> None:
@@ -1172,6 +1174,7 @@ def _build_runtime_with_cn_hk_adapters(
         processed_repository=repositories.processed_repository,
         blob_repository=repositories.blob_repository,
         filing_maintenance_repository=repositories.filing_maintenance_repository,
+        filing_upload_state_repository=repositories.filing_upload_state_repository,
         cn_discovery_client=cn_discovery,
         hk_discovery_client=hk_discovery,
         docling_converter=runner,
@@ -1181,6 +1184,7 @@ def _build_runtime_with_cn_hk_adapters(
         source_repository=repositories.source_repository,
         blob_repository=repositories.blob_repository,
         filing_maintenance_repository=repositories.filing_maintenance_repository,
+        filing_upload_state_repository=repositories.filing_upload_state_repository,
         processed_repository=repositories.processed_repository,
         processor_registry=ProcessorRegistry(),
         job_store=FsFinsIngestionJobStore.from_workspace_root(repositories.workspace_root),
@@ -1234,6 +1238,10 @@ def _build_runtime_repositories(tmp_path: Path) -> _RuntimeRepositorySet:
         processed_repository=FsProcessedDocumentRepository(workspace_root, repository_set=repository_set),
         blob_repository=FsDocumentBlobRepository(workspace_root, repository_set=repository_set),
         filing_maintenance_repository=FsFilingMaintenanceRepository(
+            workspace_root,
+            repository_set=repository_set,
+        ),
+        filing_upload_state_repository=FsFilingUploadStateRepository(
             workspace_root,
             repository_set=repository_set,
         ),

@@ -311,6 +311,8 @@ dayu-cli upload_filing --help
 dayu-cli upload_material --help
 ```
 
+`upload_filing` 会在启动运行时前完成参数、文件与当前目标状态校验。可由用户修正的输入错误会输出一行具体原因并退出 `2`，不会创建上传任务或发布财报；文件解析、存储或执行失败会输出脱敏的可操作原因并退出 `1`。filing 的公司信息与文档内容只会一起发布，失败时不会留下只发布一半的结果。
+
 三个上传命令的 `--action` 默认都是 `auto`。单份上传还可显式使用
 `create`、`update` 或 `delete`；批量脚本只会生成 `auto`、`create` 或 `update`。
 

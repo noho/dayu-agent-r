@@ -145,10 +145,12 @@ from dayu.fins.storage import (
     CompanyMetaRepositoryProtocol,
     DocumentBlobRepositoryProtocol,
     FilingMaintenanceRepositoryProtocol,
+    FilingUploadStateRepositoryProtocol,
     FsBatchingRepository,
     FsCompanyMetaRepository,
     FsDocumentBlobRepository,
     FsFilingMaintenanceRepository,
+    FsFilingUploadStateRepository,
     FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
     ProcessedDocumentRepositoryProtocol,
@@ -485,6 +487,7 @@ class SecPipeline:
         processed_repository: ProcessedDocumentRepositoryProtocol | None = None,
         blob_repository: DocumentBlobRepositoryProtocol | None = None,
         filing_maintenance_repository: FilingMaintenanceRepositoryProtocol | None = None,
+        filing_upload_state_repository: FilingUploadStateRepositoryProtocol | None = None,
         batching_repository: BatchingRepositoryProtocol | None = None,
         docling_converter: DoclingConverter | None = None,
         user_agent: Optional[str] = None,
@@ -502,6 +505,7 @@ class SecPipeline:
             processed_repository: 可选 processed 文档仓储。
             blob_repository: 可选文件对象仓储。
             filing_maintenance_repository: 可选 filing 维护仓储。
+            filing_upload_state_repository: 可选 filing 上传 published-state 只读仓储。
             batching_repository: 可选 batch lifecycle 仓储。
             docling_converter: 可选共享 Docling converter；未提供时构造 production 实现。
             user_agent: SEC User-Agent。
@@ -523,7 +527,10 @@ class SecPipeline:
             workspace_root=self._workspace_root,
             user_agent=user_agent,
         )
-        repository_set = build_fs_repository_set(workspace_root=self._workspace_root)
+        repository_set = build_fs_repository_set(
+            workspace_root=self._workspace_root,
+            create_directories=False,
+        )
         self._batching_repository = batching_repository or FsBatchingRepository(
             self._workspace_root,
             repository_set=repository_set,
@@ -547,6 +554,13 @@ class SecPipeline:
         self._filing_maintenance_repository = filing_maintenance_repository or FsFilingMaintenanceRepository(
             self._workspace_root,
             repository_set=repository_set,
+        )
+        self._filing_upload_state_repository = (
+            filing_upload_state_repository
+            or FsFilingUploadStateRepository(
+                self._workspace_root,
+                repository_set=repository_set,
+            )
         )
         self._processor_registry = processor_registry
         self._user_agent = user_agent

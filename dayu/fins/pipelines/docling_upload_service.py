@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Final, Literal, TypeAlias
+from enum import Enum
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
@@ -149,6 +150,43 @@ PreparedDoclingUpload: TypeAlias = UploadOperationResult | _PreparedDeleteMutati
 """Docling 转换完成后交给 top-level publication owner 的 typed plan。"""
 
 
+class UploadOverwritePrecondition(str, Enum):
+    """上传动作与 published source 状态的 closed 前置条件结果。"""
+
+    ALLOWED = "allowed"
+    CREATE_TARGET_EXISTS = "create_target_exists"
+    UPDATE_TARGET_MISSING = "update_target_missing"
+
+
+def evaluate_upload_overwrite_precondition(
+    *,
+    action: str,
+    previous_meta: Mapping[str, JsonValue] | None,
+    overwrite: bool,
+) -> UploadOverwritePrecondition:
+    """评估 create/update 对当前 source state 的既有 overwrite 前置条件。
+
+    Args:
+        action: 已解析为 create、update 或 delete 的动作。
+        previous_meta: 当前 published source meta；不存在时为 ``None``。
+        overwrite: 是否允许既有覆盖语义。
+
+    Returns:
+        closed 前置条件 disposition。
+
+    Raises:
+        ValueError: action 不在 workflow closed set 时抛出。
+    """
+
+    if action not in UPLOAD_ACTIONS:
+        raise ValueError("上传动作必须是 create、update 或 delete")
+    if action == "create" and previous_meta is not None and not overwrite:
+        return UploadOverwritePrecondition.CREATE_TARGET_EXISTS
+    if action == "update" and previous_meta is None and not overwrite:
+        return UploadOverwritePrecondition.UPDATE_TARGET_MISSING
+    return UploadOverwritePrecondition.ALLOWED
+
+
 class DoclingUploadService:
     """Docling 上传服务。"""
 
@@ -247,7 +285,17 @@ class DoclingUploadService:
 
         validated_files = _validate_source_files(files)
         previous_meta = self._safe_get_document_meta(normalized_ticker, document_id, source_kind)
-        if normalized_action == "update" and previous_meta is None and not overwrite:
+        precondition = evaluate_upload_overwrite_precondition(
+            action=normalized_action,
+            previous_meta=previous_meta,
+            overwrite=overwrite,
+        )
+        if (
+            precondition is UploadOverwritePrecondition.CREATE_TARGET_EXISTS
+            and source_kind is SourceKind.FILING
+        ):
+            raise FileExistsError(f"Document already exists for create: {document_id}")
+        if precondition is UploadOverwritePrecondition.UPDATE_TARGET_MISSING:
             raise FileNotFoundError(f"Document not found for update: {document_id}")
         if _is_cancelled(cancellation):
             return _build_cancelled_result(document_id=document_id, internal_document_id=internal_document_id)

@@ -22,6 +22,9 @@ from dayu.fins.ingestion_runtime import (
     FinsUploadResultSummary,
     FinsUploadRunner,
     FsFinsIngestionJobStore,
+    ValidatedFinsUploadFilingRequest,
+    _filing_upload_request_identity,
+    validate_fins_upload_filing_request,
 )
 from dayu.fins.processors.registry import build_fins_processor_registry
 from dayu.fins.storage import (
@@ -29,10 +32,12 @@ from dayu.fins.storage import (
     CompanyMetaRepositoryProtocol,
     DocumentBlobRepositoryProtocol,
     FilingMaintenanceRepositoryProtocol,
+    FilingUploadStateRepositoryProtocol,
     FsBatchingRepository,
     FsCompanyMetaRepository,
     FsDocumentBlobRepository,
     FsFilingMaintenanceRepository,
+    FsFilingUploadStateRepository,
     FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
     ProcessedDocumentRepositoryProtocol,
@@ -47,6 +52,39 @@ if TYPE_CHECKING:
     from dayu.fins.tools.read_runtime import FinsReadRuntime
 
 
+def prevalidate_fins_upload_filing_request_for_workspace(
+    request: FinsUploadFilingRequest,
+    *,
+    workspace_root: Path,
+) -> ValidatedFinsUploadFilingRequest:
+    """在 production runtime bootstrap 前验证 filing upload request。
+
+    Args:
+        request: CLI 或其它入口构造的 raw filing request。
+        workspace_root: Fins 工作区根目录。
+
+    Returns:
+        同一 storage snapshot 与 pure validator 产生的 validated request。
+
+    Raises:
+        FinsUploadUsageError: 请求违反调用方可修正契约时抛出。
+        ValueError: published identity 或元数据损坏时抛出。
+        RuntimeFileLockError: publication guard 获取或释放失败时抛出。
+        OSError: published state 读取失败时抛出。
+    """
+
+    ticker, document_id = _filing_upload_request_identity(request)
+    repository = FsFilingUploadStateRepository(
+        workspace_root,
+        create_directories=False,
+    )
+    published_state = repository.read_filing_upload_state(ticker, document_id)
+    return validate_fins_upload_filing_request(
+        request,
+        published_state=published_state,
+    )
+
+
 @dataclass(frozen=True)
 class ProductionFinsUploadRunner(FinsUploadRunner):
     """production Fins upload runner。
@@ -57,10 +95,11 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
 
     sec_pipeline: "SecPipeline"
     cn_pipeline: "CnPipeline"
+    filing_upload_state_repository: FilingUploadStateRepositoryProtocol
 
     def run_upload(
         self,
-        request: FinsUploadRequest,
+        request: ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest,
         *,
         cancellation_checker: FinsJobCancellationChecker,
     ) -> FinsUploadResultSummary:
@@ -79,21 +118,22 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
             OSError: 仓储读写失败时抛出。
         """
 
+        raw_request = request.request if isinstance(request, ValidatedFinsUploadFilingRequest) else request
         if cancellation_checker():
             return FinsUploadResultSummary(
-                source_kind=request.source_kind,
+                source_kind=raw_request.source_kind,
                 status="cancelled",
                 skip_reason="cancelled",
             )
-        normalized = normalize_ticker(request.ticker)
-        if isinstance(request, FinsUploadFilingRequest):
+        normalized = normalize_ticker(raw_request.ticker)
+        if isinstance(request, ValidatedFinsUploadFilingRequest):
             result = self._run_filing_upload(
                 request=request,
                 ticker=normalized.canonical,
                 market=normalized.market,
                 cancellation_checker=cancellation_checker,
             )
-            return _upload_summary_from_result(request=request, result=result)
+            return _upload_summary_from_result(request=raw_request, result=result)
         if isinstance(request, FinsUploadMaterialRequest):
             result = self._run_material_upload(
                 request=request,
@@ -107,7 +147,7 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
     def _run_filing_upload(
         self,
         *,
-        request: FinsUploadFilingRequest,
+        request: ValidatedFinsUploadFilingRequest,
         ticker: str,
         market: str,
         cancellation_checker: FinsJobCancellationChecker,
@@ -129,25 +169,32 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
             OSError: 仓储读写失败时抛出。
         """
 
-        if request.fiscal_year is None:
-            raise ValueError("filing 上传必须提供 fiscal_year")
-        if request.fiscal_period is None:
-            raise ValueError("filing 上传必须提供 fiscal_period")
-        action = _pipeline_upload_action(request.action)
+        raw_request = request.request
+        if raw_request.fiscal_year is None:
+            raise AssertionError("validated filing request 缺少 fiscal_year")
+        fresh_state = self.filing_upload_state_repository.read_filing_upload_state(
+            request.normalized_ticker.canonical,
+            request.document_id,
+        )
+        fresh_request = validate_fins_upload_filing_request(
+            raw_request,
+            published_state=fresh_state,
+        )
+        action = fresh_request.resolved_action
         if market == "US":
             return FinsUploadPipelineResult.from_pipeline_json(
                 self.sec_pipeline.upload_filing(
                     ticker=ticker,
                     action=action,
-                    files=list(request.files),
-                    fiscal_year=request.fiscal_year,
-                    fiscal_period=request.fiscal_period,
-                    amended=request.amended,
-                    filing_date=request.filing_date,
-                    report_date=request.report_date,
-                    company_name=request.company_name,
-                    ticker_aliases=list(request.ticker_aliases),
-                    overwrite=request.overwrite,
+                    files=list(raw_request.files),
+                    fiscal_year=raw_request.fiscal_year,
+                    fiscal_period=fresh_request.normalized_fiscal_period,
+                    amended=raw_request.amended,
+                    filing_date=raw_request.filing_date,
+                    report_date=raw_request.report_date,
+                    company_name=raw_request.company_name,
+                    ticker_aliases=list(raw_request.ticker_aliases),
+                    overwrite=raw_request.overwrite,
                     cancellation_checker=cancellation_checker,
                 )
             )
@@ -156,15 +203,15 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
                 self.cn_pipeline.upload_filing(
                     ticker=ticker,
                     action=action,
-                    files=list(request.files),
-                    fiscal_year=request.fiscal_year,
-                    fiscal_period=request.fiscal_period,
-                    amended=request.amended,
-                    filing_date=request.filing_date,
-                    report_date=request.report_date,
-                    company_name=request.company_name,
-                    ticker_aliases=list(request.ticker_aliases),
-                    overwrite=request.overwrite,
+                    files=list(raw_request.files),
+                    fiscal_year=raw_request.fiscal_year,
+                    fiscal_period=fresh_request.normalized_fiscal_period,
+                    amended=raw_request.amended,
+                    filing_date=raw_request.filing_date,
+                    report_date=raw_request.report_date,
+                    company_name=raw_request.company_name,
+                    ticker_aliases=list(raw_request.ticker_aliases),
+                    overwrite=raw_request.overwrite,
                     cancellation_checker=cancellation_checker,
                 )
             )
@@ -291,6 +338,7 @@ def _upload_summary_from_result(
         skip_reason=result.skip_reason,
         document_version=result.document_version,
         source_fingerprint=result.source_fingerprint,
+        failure_reason=result.failure_reason,
     )
 
 
@@ -309,6 +357,7 @@ class DefaultFinsRuntime:
     source_repository: SourceDocumentRepositoryProtocol
     blob_repository: DocumentBlobRepositoryProtocol
     filing_maintenance_repository: FilingMaintenanceRepositoryProtocol
+    filing_upload_state_repository: FilingUploadStateRepositoryProtocol
     processed_repository: ProcessedDocumentRepositoryProtocol
     processor_registry: ProcessorRegistry
     ingestion_job_store: FsFinsIngestionJobStore
@@ -348,7 +397,10 @@ class DefaultFinsRuntime:
             OSError: 仓储根目录创建或读取失败时抛出。
         """
 
-        repository_set = build_fs_repository_set(workspace_root=workspace_root)
+        repository_set = build_fs_repository_set(
+            workspace_root=workspace_root,
+            create_directories=False,
+        )
         return cls(
             workspace_root=workspace_root,
             batching_repository=FsBatchingRepository(
@@ -368,6 +420,10 @@ class DefaultFinsRuntime:
                 repository_set=repository_set,
             ),
             filing_maintenance_repository=FsFilingMaintenanceRepository(
+                workspace_root,
+                repository_set=repository_set,
+            ),
+            filing_upload_state_repository=FsFilingUploadStateRepository(
                 workspace_root,
                 repository_set=repository_set,
             ),
@@ -520,6 +576,7 @@ class DefaultFinsRuntime:
                 processed_repository=self.processed_repository,
                 blob_repository=self.blob_repository,
                 filing_maintenance_repository=self.filing_maintenance_repository,
+                filing_upload_state_repository=self.filing_upload_state_repository,
                 docling_converter=docling_converter,
             )
             cn_upload_pipeline = CnPipeline(
@@ -530,17 +587,20 @@ class DefaultFinsRuntime:
                 processed_repository=self.processed_repository,
                 blob_repository=self.blob_repository,
                 filing_maintenance_repository=self.filing_maintenance_repository,
+                filing_upload_state_repository=self.filing_upload_state_repository,
                 docling_converter=docling_converter,
             )
             upload_runner = ProductionFinsUploadRunner(
                 sec_pipeline=sec_upload_pipeline,
                 cn_pipeline=cn_upload_pipeline,
+                filing_upload_state_repository=self.filing_upload_state_repository,
             )
             runtime = FinsIngestionRuntime.create(
                 batching_repository=self.batching_repository,
                 source_repository=self.source_repository,
                 blob_repository=self.blob_repository,
                 filing_maintenance_repository=self.filing_maintenance_repository,
+                filing_upload_state_repository=self.filing_upload_state_repository,
                 processed_repository=self.processed_repository,
                 processor_registry=self.processor_registry,
                 job_store=self.ingestion_job_store,

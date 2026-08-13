@@ -6,7 +6,8 @@
 
 from __future__ import annotations
 
-from typing import Final
+from dataclasses import dataclass
+from typing import Final, Literal
 
 from dayu.fins._log import Log
 from dayu.fins.domain.document_models import BatchToken, CompanyMeta, now_iso8601
@@ -16,6 +17,99 @@ from dayu.fins.ticker_normalization import normalize_ticker, ticker_to_company_i
 UPLOAD_ACTIONS_REQUIRING_COMPANY_META: Final[frozenset[str]] = frozenset({"create", "update"})
 RESOLVER_VERSION: Final[str] = "market_resolver_v1.0.0"
 MODULE: Final[str] = "FINS.UPLOAD_COMPANY_META"
+
+
+@dataclass(frozen=True, slots=True)
+class UploadCompanyMetaDecision:
+    """upload workflow 的纯 company meta 决策。
+
+    Attributes:
+        disposition: 保留既有 meta、不处理或在 batch 中 stage 新 meta。
+        company_meta: stage 时的完整 company meta；其它 disposition 为 ``None``。
+    """
+
+    disposition: Literal["keep", "skip", "stage"]
+    company_meta: CompanyMeta | None
+
+
+def resolve_upload_company_meta_decision(
+    *,
+    existing_meta: CompanyMeta | None,
+    ticker: str,
+    action: str,
+    company_name: str | None,
+    ticker_aliases: tuple[str, ...],
+) -> UploadCompanyMetaDecision:
+    """按 upload resolver freshness 产生不含 I/O 的 company meta 决策。
+
+    Args:
+        existing_meta: published company meta；不存在时为 ``None``。
+        ticker: canonical ticker。
+        action: 已解析上传动作。
+        company_name: 可选公司名称。
+        ticker_aliases: 用户提供的 ticker aliases。
+
+    Returns:
+        供 validation 与 workflow 共用的纯决策。
+
+    Raises:
+        ValueError: create/update 需要 stage 但缺少公司名称，或 ticker/alias 非法时抛出。
+    """
+
+    if action not in UPLOAD_ACTIONS_REQUIRING_COMPANY_META:
+        return UploadCompanyMetaDecision(disposition="skip", company_meta=None)
+    if existing_meta is not None and _existing_company_meta_is_fresh(
+        existing_meta=existing_meta,
+        resolver_version=RESOLVER_VERSION,
+    ):
+        return UploadCompanyMetaDecision(disposition="keep", company_meta=None)
+    profile = normalize_ticker(ticker)
+    return UploadCompanyMetaDecision(
+        disposition="stage",
+        company_meta=CompanyMeta(
+            company_id=ticker_to_company_id(profile),
+            company_name=_require_company_meta_field(
+                value=company_name,
+                option_name="--company-name",
+            ),
+            ticker=profile.canonical,
+            market=profile.market,
+            resolver_version=RESOLVER_VERSION,
+            updated_at=now_iso8601(),
+            ticker_aliases=_normalize_ticker_aliases(
+                canonical_ticker=profile.canonical,
+                ticker_aliases=list(ticker_aliases),
+            ),
+        ),
+    )
+
+
+def stage_upload_company_meta_decision(
+    *,
+    repository: CompanyMetaRepositoryProtocol,
+    decision: UploadCompanyMetaDecision,
+    batch: BatchToken,
+) -> None:
+    """在 caller-owned batch 中 stage 已裁决的 company meta。
+
+    Args:
+        repository: company meta 仓储 owner。
+        decision: pure resolver 决策。
+        batch: caller 持有的 publication capability。
+
+    Returns:
+        无。
+
+    Raises:
+        ValueError: stage 决策缺少 company meta 时抛出。
+        OSError: company meta staging 失败时抛出。
+    """
+
+    if decision.disposition != "stage":
+        return
+    if decision.company_meta is None:
+        raise ValueError("stage company meta decision 缺少 company_meta")
+    repository.upsert_company_meta(decision.company_meta, batch=batch)
 
 
 def upsert_company_meta_for_upload(

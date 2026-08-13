@@ -250,51 +250,32 @@ class _FakeFinsDirectService:
 
     def upload_filing(
         self,
+        request: fins_command.ValidatedFinsUploadFilingRequest,
         *,
-        ticker: str,
-        action: str,
-        files: tuple[Path, ...],
-        fiscal_year: int | None = None,
-        fiscal_period: str | None = None,
-        amended: bool = False,
-        filing_date: str | None = None,
-        report_date: str | None = None,
-        company_name: str | None = None,
-        ticker_aliases: tuple[str, ...] = (),
-        overwrite: bool = False,
         cancellation_token: fins_command._CliFinsCancellationToken | None = None,
     ) -> ValidatedFinsEventStream:
         """记录 upload_filing 参数并返回 fake stream。
 
-        :param ticker: canonical ticker。
-        :param action: 上传动作。
-        :param files: 上传文件路径。
-        :param fiscal_year: 可选会计年度。
-        :param fiscal_period: 可选会计期间。
-        :param amended: 是否为修订 filing。
-        :param filing_date: 可选披露日期。
-        :param report_date: 可选报告期日期。
-        :param company_name: 可选公司名称。
-        :param ticker_aliases: ticker aliases。
-        :param overwrite: 是否覆盖已有文档。
+        :param request: Fins owner 已验证的 filing request。
         :param cancellation_token: CLI operation 取消 token。
         :returns: Fins direct event stream。
         :raises Exception: 不主动抛出异常。
         """
 
+        raw_request = request.request
         self.upload_filing_requests.append(
             _UploadFilingCall(
-                ticker=ticker,
-                action=action,
-                files=files,
-                fiscal_year=fiscal_year,
-                fiscal_period=fiscal_period,
-                amended=amended,
-                filing_date=filing_date,
-                report_date=report_date,
-                company_name=company_name,
-                ticker_aliases=ticker_aliases,
-                overwrite=overwrite,
+                ticker=request.normalized_ticker.canonical,
+                action=raw_request.action,
+                files=raw_request.files,
+                fiscal_year=raw_request.fiscal_year,
+                fiscal_period=request.normalized_fiscal_period,
+                amended=raw_request.amended,
+                filing_date=raw_request.filing_date,
+                report_date=raw_request.report_date,
+                company_name=raw_request.company_name,
+                ticker_aliases=raw_request.ticker_aliases,
+                overwrite=raw_request.overwrite,
             )
         )
         return self._stream(
@@ -930,6 +911,66 @@ def test_download_static_usage_error_precedes_workspace_and_service_factory(
     assert not workspace_root.exists()
 
 
+def test_upload_filing_usage_error_precedes_service_factory_and_workspace_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """filing 静态 usage failure 必须在 Service factory 前 exact 映射为 exit 2。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: factory 替换夹具。
+        capsys: 标准流捕获夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: factory 被调用、workspace 变化或标准流不精确时抛出。
+    """
+
+    workspace_root = tmp_path / "must-not-exist"
+    factory_calls: list[Path] = []
+
+    def forbidden_factory(path: Path) -> fins_command.FinsDirectCommandService:
+        """记录不应发生的 Service factory 调用。
+
+        Args:
+            path: CLI 传入的 workspace root。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: factory 一旦被调用即抛出。
+        """
+
+        factory_calls.append(path)
+        raise AssertionError("usage error 不得构造 Service")
+
+    monkeypatch.setattr(fins_command, "FINS_DIRECT_SERVICE_FACTORY", forbidden_factory)
+
+    exit_code = cli_main.main(
+        (
+            "upload_filing",
+            "--base",
+            str(workspace_root),
+            "--ticker",
+            "AAPL",
+            "--fiscal-period",
+            "FY",
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_USAGE_ERROR
+    assert captured.out == ""
+    assert captured.err == "dayu-cli upload_filing: --fiscal-year 不能为空\n"
+    assert factory_calls == []
+    assert not workspace_root.exists()
+
+
 @pytest.mark.parametrize(
     "mutation_flags",
     (
@@ -1038,7 +1079,10 @@ def test_download_path_does_not_reuse_upload_ticker_csv_parser() -> None:
 
     assert "_parse_ticker_csv" not in calls_by_function["_prevalidate_download_request"]
     assert "_parse_ticker_csv" not in calls_by_function["_download_stream"]
-    assert "_parse_ticker_csv" in calls_by_function["_upload_filing_stream"]
+    assert "_parse_ticker_csv" not in calls_by_function["_upload_filing_stream"]
+    assert "prevalidate_fins_upload_filing_request_for_workspace" in calls_by_function[
+        "_prevalidate_upload_filing_request"
+    ]
     assert "_parse_ticker_csv" in calls_by_function["_run_upload_filings_from"]
 
 
@@ -1989,7 +2033,19 @@ def _live_command_argv(command_name: str, tmp_path: Path) -> tuple[str, ...]:
     if command_name == "upload_filing":
         upload_file = tmp_path / "filing.pdf"
         upload_file.write_text("filing", encoding="utf-8")
-        return ("upload_filing", "--ticker", "AAPL", "--files", str(upload_file))
+        return (
+            "upload_filing",
+            "--ticker",
+            "AAPL",
+            "--files",
+            str(upload_file),
+            "--fiscal-year",
+            "2024",
+            "--fiscal-period",
+            "FY",
+            "--company-name",
+            "Apple Inc.",
+        )
     if command_name == "upload_material":
         upload_file = tmp_path / "material.pdf"
         upload_file.write_text("material", encoding="utf-8")

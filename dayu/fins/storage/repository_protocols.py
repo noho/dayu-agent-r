@@ -48,6 +48,45 @@ from .source_integrity import SourceIntegrityClassification
 
 
 @dataclass(frozen=True, slots=True)
+class FilingUploadPublishedState:
+    """filing 上传校验所需的同版 published state。
+
+    Attributes:
+        company_meta: 当前已发布公司元数据；不存在时为 ``None``。
+        source_meta: 当前已发布 filing source 元数据；不存在时为 ``None``。
+    """
+
+    company_meta: CompanyMeta | None
+    source_meta: Mapping[str, JsonValue] | None
+
+
+class FilingUploadStateRepositoryProtocol(Protocol):
+    """filing 上传校验使用的最小只读仓储协议。"""
+
+    def read_filing_upload_state(
+        self,
+        ticker: str,
+        document_id: str,
+    ) -> FilingUploadPublishedState:
+        """读取同一 publication guard 下的公司与 filing source 状态。
+
+        Args:
+            ticker: 待校验的公司代码。
+            document_id: 待校验的 filing 文档 ID。
+
+        Returns:
+            同版 published state；独立缺失的成员分别为 ``None``。
+
+        Raises:
+            ValueError: ticker、identity descriptor 或元数据不合法时抛出。
+            RuntimeFileLockError: publication guard 获取或释放失败时抛出。
+            OSError: published state 读取失败时抛出。
+        """
+
+        ...
+
+
+@dataclass(frozen=True, slots=True)
 class SourceSnapshotFileDescriptor:
     """source snapshot 内单个业务文件的无路径描述符。
 
@@ -1306,6 +1345,8 @@ class FilingMaintenanceRepositoryProtocol(Protocol):
 __all__ = [
     "BatchingRepositoryProtocol",
     "CompanyMetaRepositoryProtocol",
+    "FilingUploadPublishedState",
+    "FilingUploadStateRepositoryProtocol",
     "SourceSnapshotConsistencyError",
     "SourceSnapshotFileDescriptor",
     "SourceSnapshotProtocol",
