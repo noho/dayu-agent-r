@@ -53,10 +53,7 @@ from dayu.service.fins_direct import (
 )
 
 _NOW: datetime = datetime(2026, 6, 16, tzinfo=timezone.utc)
-_CALIBRATION_CORRUPT_PDF = Path(
-    "/Users/leo/workspace/.dayu-cli-ci/"
-    "upload-filing-calibration-20260811-tF6OnN/inputs/corrupt.pdf"
-)
+_UNPARSABLE_PDF_BYTES = b"not a PDF"
 _TYPED_CONTENT_FAILURE_REASON = "文件无法解析或已损坏，请检查文件后重试"
 _MAX_PUBLIC_CONTENT_FAILURE_STDERR_CHARS = 1024
 
@@ -1393,11 +1390,12 @@ def test_real_cli_corrupt_pdf_has_bounded_stderr_and_zero_fresh_workspace_mutati
         无。
 
     Raises:
-        AssertionError: calibration 输入缺失、CLI contract 漂移、stderr 泄漏或 workspace 变化时抛出。
+        AssertionError: CLI contract 漂移、stderr 泄漏或 workspace 变化时抛出。
         subprocess.TimeoutExpired: 真实 conversion 未在期限内结束时抛出。
     """
 
-    assert _CALIBRATION_CORRUPT_PDF.is_file()
+    corrupt_pdf = tmp_path / "corrupt.pdf"
+    corrupt_pdf.write_bytes(_UNPARSABLE_PDF_BYTES)
     workspace_root = tmp_path / "fresh-workspace"
     cli_executable = Path(sys.executable).with_name("dayu-cli")
     repository_root = Path(__file__).resolve().parents[2]
@@ -1411,7 +1409,7 @@ def test_real_cli_corrupt_pdf_has_bounded_stderr_and_zero_fresh_workspace_mutati
             "--ticker",
             "ICPD",
             "--files",
-            str(_CALIBRATION_CORRUPT_PDF),
+            str(corrupt_pdf),
             "--fiscal-year",
             "2024",
             "--fiscal-period",
@@ -1432,7 +1430,7 @@ def test_real_cli_corrupt_pdf_has_bounded_stderr_and_zero_fresh_workspace_mutati
     assert len(completed.stderr) <= _MAX_PUBLIC_CONTENT_FAILURE_STDERR_CHARS
     assert "Traceback" not in completed.stderr
     assert str(repository_root) not in completed.stderr
-    assert str(_CALIBRATION_CORRUPT_PDF) not in completed.stderr
+    assert str(corrupt_pdf) not in completed.stderr
     assert not workspace_root.exists()
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import logging
 import os
@@ -14,7 +15,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import ClassVar, Literal, Protocol, cast
+from typing import ClassVar, Literal, Protocol, TextIO, cast
 
 import pytest
 
@@ -42,6 +43,9 @@ _PROCESS_EXIT_DEADLINE_SECONDS = 5.0
 _PROCESS_POLL_SECONDS = 0.02
 _TEST_TERMINATE_GRACE_SECONDS = 0.05
 _TEST_KILL_GRACE_SECONDS = 1.0
+_EXIT_FLUSH_CALL_NUMBER = 2
+_LAST_RESORT_CONTROL_MARKER = "owner-test-last-resort-control"
+_RESTORED_STDERR_MARKER = b"owner-test-restored-stderr\n"
 _NESTED_PROCESS_SCRIPT = """
 import os
 import signal
@@ -53,6 +57,42 @@ with open(sys.argv[1], "w", encoding="utf-8") as marker_file:
     marker_file.flush()
 signal.pause()
 """
+
+
+class _ExitFlushFailureStderr:
+    """仅在隔离区退出 flush 时失败的 stderr 观察器。"""
+
+    def __init__(self, delegate: TextIO) -> None:
+        """初始化 stderr 观察器。
+
+        :param delegate: 提供真实 FD2 的当前 stderr。
+        :returns: ``None``。
+        :raises Exception: 本构造函数不抛出异常。
+        """
+
+        self._delegate = delegate
+        self.flush_calls = 0
+
+    def flush(self) -> None:
+        """入口 flush 正常，退出 flush 抛出次生异常。
+
+        :returns: ``None``。
+        :raises OSError: 隔离区退出 flush 时抛出。
+        """
+
+        self.flush_calls += 1
+        if self.flush_calls == _EXIT_FLUSH_CALL_NUMBER:
+            raise OSError("owner-test exit flush failure")
+        self._delegate.flush()
+
+    def fileno(self) -> int:
+        """返回真实 stderr 文件描述符。
+
+        :returns: delegate 拥有的 FD2。
+        :raises OSError: delegate 无有效 descriptor 时抛出。
+        """
+
+        return self._delegate.fileno()
 
 
 class _CleanupLogRecord(Protocol):
@@ -765,9 +805,12 @@ def test_child_target_isolates_inherited_stderr_while_preserving_failure_descrip
 
     target = _target_in_temp(tmp_path)
     leaking_logger = logging.getLogger("third_party.docling.stderr_owner_test")
+    root_logger = logging.getLogger()
     original_handlers = tuple(leaking_logger.handlers)
     original_level = leaking_logger.level
     original_propagate = leaking_logger.propagate
+    original_disabled = leaking_logger.disabled
+    original_root_handlers = tuple(root_logger.handlers)
 
     def failing_convert(
         raw_bytes: bytes,
@@ -804,18 +847,25 @@ def test_child_target_isolates_inherited_stderr_while_preserving_failure_descrip
 
     leaking_logger.handlers.clear()
     leaking_logger.setLevel(logging.WARNING)
-    leaking_logger.propagate = False
+    leaking_logger.propagate = True
+    leaking_logger.disabled = False
+    root_logger.handlers.clear()
     monkeypatch.setattr(
         docling_process_converter,
         "convert_pdf_bytes_with_docling",
         failing_convert,
     )
     try:
+        assert logging.lastResort is not None
+        leaking_logger.warning(_LAST_RESORT_CONTROL_MARKER)
+        assert capfd.readouterr().err == f"{_LAST_RESORT_CONTROL_MARKER}\n"
         descriptor = target()
     finally:
         leaking_logger.handlers[:] = original_handlers
         leaking_logger.setLevel(original_level)
         leaking_logger.propagate = original_propagate
+        leaking_logger.disabled = original_disabled
+        root_logger.handlers[:] = original_root_handlers
 
     captured = capfd.readouterr()
     assert captured.err == ""
@@ -825,6 +875,109 @@ def test_child_target_isolates_inherited_stderr_while_preserving_failure_descrip
         "failure_kind": "converter_execution",
         "message": "Docling conversion execution failed",
     }
+
+
+def test_child_target_preserves_primary_exception_when_exit_flush_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """exit flush 次生异常不得遮蔽主异常，且必须恢复并关闭 FD。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest 属性替换工具。
+    :param capfd: OS 文件描述符级标准流捕获夹具。
+    :returns: ``None``。
+    :raises Exception: 原始分类、FD2 恢复或复制 FD 关闭契约失败时抛出。
+    """
+
+    target = _target_in_temp(tmp_path)
+    stderr_observer = _ExitFlushFailureStderr(sys.stderr)
+    duplicated_descriptors: list[int] = []
+    closed_descriptors: list[int] = []
+    original_dup = os.dup
+    original_close = os.close
+
+    def recording_dup(file_descriptor: int) -> int:
+        """复制并记录 inherited stderr descriptor。
+
+        :param file_descriptor: 待复制的 FD2。
+        :returns: 真实复制 descriptor。
+        :raises OSError: 系统 descriptor 复制失败时抛出。
+        """
+
+        duplicated_descriptor = original_dup(file_descriptor)
+        duplicated_descriptors.append(duplicated_descriptor)
+        return duplicated_descriptor
+
+    def recording_close(file_descriptor: int) -> None:
+        """关闭并记录 inherited stderr 复制 descriptor。
+
+        :param file_descriptor: 待关闭的 descriptor。
+        :returns: ``None``。
+        :raises OSError: 系统 descriptor 关闭失败时抛出。
+        """
+
+        closed_descriptors.append(file_descriptor)
+        original_close(file_descriptor)
+
+    def construction_failure_convert(
+        raw_bytes: bytes,
+        *,
+        stream_name: str,
+        do_ocr: bool,
+        do_table_structure: bool,
+        table_mode: str,
+        do_cell_matching: bool,
+    ) -> _FakeConversion:
+        """模拟隔离区主体的 converter construction 失败。
+
+        :param raw_bytes: 输入字节。
+        :param stream_name: 输入名。
+        :param do_ocr: OCR 配置。
+        :param do_table_structure: 表格结构配置。
+        :param table_mode: 表格模式。
+        :param do_cell_matching: 单元格匹配配置。
+        :returns: 永不返回。
+        :raises DoclingRuntimeInitializationError: 始终抛出主异常。
+        """
+
+        _ = (
+            raw_bytes,
+            stream_name,
+            do_ocr,
+            do_table_structure,
+            table_mode,
+            do_cell_matching,
+        )
+        raise DoclingRuntimeInitializationError("owner-test primary construction failure")
+
+    with monkeypatch.context() as patch_context:
+        patch_context.setattr(docling_process_converter.sys, "stderr", stderr_observer)
+        patch_context.setattr(docling_process_converter.os, "dup", recording_dup)
+        patch_context.setattr(docling_process_converter.os, "close", recording_close)
+        patch_context.setattr(
+            docling_process_converter,
+            "convert_pdf_bytes_with_docling",
+            construction_failure_convert,
+        )
+        descriptor = target()
+
+    assert descriptor == {
+        "schema_version": 1,
+        "status": "failure",
+        "failure_kind": "converter_construction",
+        "message": "Docling converter construction failed",
+    }
+    assert stderr_observer.flush_calls == _EXIT_FLUSH_CALL_NUMBER
+    assert len(duplicated_descriptors) == 1
+    assert closed_descriptors == duplicated_descriptors
+    with pytest.raises(OSError) as closed_error:
+        os.fstat(duplicated_descriptors[0])
+    assert closed_error.value.errno == errno.EBADF
+
+    os.write(sys.stderr.fileno(), _RESTORED_STDERR_MARKER)
+    assert capfd.readouterr().err == _RESTORED_STDERR_MARKER.decode("utf-8")
 
 
 def test_child_target_maps_export_failure_to_exact_serialization_descriptor(

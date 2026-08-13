@@ -68,6 +68,7 @@ def _isolated_inherited_stderr() -> Iterator[None]:
 
     :returns: 进入隔离范围的 context manager。
     :raises OSError: descriptor 复制、重定向或恢复失败时抛出。
+    :raises Exception: 隔离区主体异常原样传播；无主体异常时 flush 异常传播。
     """
 
     stderr_stream = sys.stderr
@@ -80,8 +81,14 @@ def _isolated_inherited_stderr() -> Iterator[None]:
             try:
                 yield
             finally:
+                active_error = sys.exception()
                 try:
-                    stderr_stream.flush()
+                    try:
+                        stderr_stream.flush()
+                    except Exception:
+                        # flush 是退出清理；已有主体异常时不得改写其分类语义。
+                        if active_error is None:
+                            raise
                 finally:
                     os.dup2(inherited_stderr_copy, stderr_file_descriptor)
     finally:
