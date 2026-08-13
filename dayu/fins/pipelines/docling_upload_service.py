@@ -40,6 +40,7 @@ from dayu.fins.storage import (
     BatchingRepositoryProtocol,
     DocumentBlobRepositoryProtocol,
     SourceDocumentRepositoryProtocol,
+    require_source_meta_is_deleted,
 )
 from dayu.fins.ticker_normalization import try_normalize_ticker
 
@@ -164,12 +165,12 @@ def evaluate_upload_overwrite_precondition(
     previous_meta: Mapping[str, JsonValue] | None,
     overwrite: bool,
 ) -> UploadOverwritePrecondition:
-    """评估 create/update 对当前 source state 的既有 overwrite 前置条件。
+    """评估 create/update 对当前 source state 的 closed admission 前置条件。
 
     Args:
         action: 已解析为 create、update 或 delete 的动作。
         previous_meta: 当前 published source meta；不存在时为 ``None``。
-        overwrite: 是否允许既有覆盖语义。
+        overwrite: 是否允许 create 覆盖既有目标；不提供 update upsert 权限。
 
     Returns:
         closed 前置条件 disposition。
@@ -182,7 +183,7 @@ def evaluate_upload_overwrite_precondition(
         raise ValueError("上传动作必须是 create、update 或 delete")
     if action == "create" and previous_meta is not None and not overwrite:
         return UploadOverwritePrecondition.CREATE_TARGET_EXISTS
-    if action == "update" and previous_meta is None and not overwrite:
+    if action == "update" and previous_meta is None:
         return UploadOverwritePrecondition.UPDATE_TARGET_MISSING
     return UploadOverwritePrecondition.ALLOWED
 
@@ -257,7 +258,8 @@ class DoclingUploadService:
             无需写入时返回最终结果；否则返回等待 caller 短事务发布的 typed plan。
 
         Raises:
-            ValueError: 参数非法时抛出。
+            KeyError: 既有 source meta 缺少 canonical ``is_deleted`` 时抛出。
+            ValueError: 参数非法，或既有 source meta 的 ``is_deleted`` 非布尔值时抛出。
             FileNotFoundError: 需要的文件或文档不存在时抛出。
             FileExistsError: create 目标已存在且不可覆盖时抛出。
             RuntimeError: 上传失败时抛出。
@@ -992,10 +994,13 @@ def _can_skip_upload(
         满足跳过条件时返回 ``True``。
 
     Raises:
-        无。
+        KeyError: 既有 source meta 缺少 ``is_deleted`` 时抛出。
+        ValueError: 既有 source meta 的 ``is_deleted`` 不是布尔值时抛出。
     """
 
     if overwrite or previous_meta is None:
+        return False
+    if require_source_meta_is_deleted(previous_meta):
         return False
     previous_fingerprint = _text_meta(previous_meta, "source_fingerprint")
     return bool(previous_fingerprint) and previous_fingerprint == source_fingerprint

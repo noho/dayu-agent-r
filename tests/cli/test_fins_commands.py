@@ -5,6 +5,8 @@ from __future__ import annotations
 import ast
 import asyncio
 import errno
+import hashlib
+import io
 import subprocess
 import sys
 from collections.abc import AsyncGenerator
@@ -45,7 +47,15 @@ from dayu.fins.download_contract import (
     build_fins_download_request,
 )
 from dayu.fins.domain.enums import SourceKind
-from dayu.fins.storage import FsFilingUploadStateRepository
+from dayu.fins.domain.document_models import SourceDocumentUpsertRequest, SourceHandle
+from dayu.fins.pipelines.docling_upload_service import build_sec_filing_ids
+from dayu.fins.storage import (
+    FsBatchingRepository,
+    FsDocumentBlobRepository,
+    FsFilingUploadStateRepository,
+    FsSourceDocumentRepository,
+)
+from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
 from dayu.service.fins_direct import (
     FINS_DIRECT_EXIT_FAILURE,
     FINS_DIRECT_EXIT_KEYBOARD_INTERRUPT,
@@ -511,6 +521,84 @@ def _recording_direct_service_factory(
 
     factory_calls.append(workspace_root)
     return cast(fins_command.FinsDirectCommandService, service)
+
+
+def _snapshot_cli_workspace_tree(workspace_root: Path) -> tuple[tuple[str, str], ...]:
+    """读取 CLI workspace 的相对业务树与文件内容摘要。
+
+    Args:
+        workspace_root: 待观测 workspace 根目录。
+
+    Returns:
+        按相对路径排序的目录标记或文件 SHA-256 元组。
+
+    Raises:
+        OSError: 遍历或读取 workspace 失败时抛出。
+    """
+
+    if not workspace_root.exists():
+        return ()
+    entries: list[tuple[str, str]] = []
+    for path in sorted(workspace_root.rglob("*")):
+        relative_path = path.relative_to(workspace_root).as_posix()
+        if path.is_dir():
+            entries.append((relative_path, "directory"))
+        elif path.is_file():
+            entries.append((relative_path, hashlib.sha256(path.read_bytes()).hexdigest()))
+    return tuple(entries)
+
+
+def _seed_cli_filing_source(workspace_root: Path) -> None:
+    """通过真实 storage owner 发布 CLI create-existing 测试目标。
+
+    Args:
+        workspace_root: 待发布 filing 的 workspace 根目录。
+
+    Returns:
+        无。
+
+    Raises:
+        OSError: batch、blob 或 source publication 失败时抛出。
+        ValueError: storage owner 拒绝测试 filing 元数据时抛出。
+    """
+
+    document_id, internal_document_id = build_sec_filing_ids(
+        ticker="AAPL",
+        fiscal_year=2024,
+        fiscal_period="FY",
+        amended=False,
+    )
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    batch = batching_repository.begin_batch("AAPL")
+    handle = SourceHandle(
+        ticker="AAPL",
+        document_id=document_id,
+        source_kind=SourceKind.FILING.value,
+    )
+    file_meta = blob_repository.store_file(
+        handle,
+        "published.txt",
+        io.BytesIO(b"published"),
+        batch=batch,
+        content_type="text/plain",
+    )
+    source_repository.create_source_document(
+        SourceDocumentUpsertRequest(
+            ticker="AAPL",
+            document_id=document_id,
+            internal_document_id=internal_document_id,
+            form_type="10-K",
+            primary_document="published.txt",
+            meta={"ingest_method": "upload", "source_provider": "user_upload"},
+            files=[file_meta],
+        ),
+        SourceKind.FILING,
+        batch=batch,
+    )
+    batching_repository.commit_batch(batch)
 
 
 @pytest.mark.parametrize(
@@ -1112,6 +1200,186 @@ def test_upload_filing_usage_matrix_precedes_service_factory_and_workspace_mutat
     assert not workspace_root.exists()
 
 
+@pytest.mark.parametrize(
+    ("case_id", "action", "overwrite", "seed_existing", "expected_reason"),
+    (
+        (
+            "update-missing",
+            "update",
+            False,
+            False,
+            "update 目标不存在；请改用 create",
+        ),
+        (
+            "update-missing-overwrite",
+            "update",
+            True,
+            False,
+            "update 目标不存在；请改用 create",
+        ),
+        (
+            "create-existing",
+            "create",
+            False,
+            True,
+            "create 目标已存在；请改用 update 或允许覆盖",
+        ),
+    ),
+)
+def test_upload_filing_state_conflict_exits_before_service_factory_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    case_id: str,
+    action: str,
+    overwrite: bool,
+    seed_existing: bool,
+    expected_reason: str,
+) -> None:
+    """真实 published state 冲突必须在 Service factory 前精确失败且零 mutation。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: factory 替换夹具。
+        capsys: 标准流捕获夹具。
+        case_id: 当前 admission 场景标识。
+        action: 显式上传动作。
+        overwrite: 是否传入 ``--overwrite``。
+        seed_existing: 是否先通过真实 storage 发布目标。
+        expected_reason: 精确单行 stderr 原因。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: exit、标准流、factory 或 workspace contract 漂移时抛出。
+    """
+
+    workspace_root = tmp_path / f"workspace-{case_id}"
+    if seed_existing:
+        _seed_cli_filing_source(workspace_root)
+    before_tree = _snapshot_cli_workspace_tree(workspace_root)
+    input_file = tmp_path / f"{case_id}.txt"
+    input_file.write_text("input", encoding="utf-8")
+    service = _FakeFinsDirectService()
+    factory_calls: list[Path] = []
+    recording_factory = partial(
+        _recording_direct_service_factory,
+        service=service,
+        factory_calls=factory_calls,
+    )
+    monkeypatch.setattr(fins_command, "FINS_DIRECT_SERVICE_FACTORY", recording_factory)
+    overwrite_args = ("--overwrite",) if overwrite else ()
+
+    exit_code = cli_main.main(
+        (
+            "upload_filing",
+            "--base",
+            str(workspace_root),
+            "--ticker",
+            "AAPL",
+            "--action",
+            action,
+            "--files",
+            str(input_file),
+            "--fiscal-year",
+            "2024",
+            "--fiscal-period",
+            "FY",
+            "--company-name",
+            "Apple Inc.",
+            *overwrite_args,
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_USAGE_ERROR
+    assert captured.out == ""
+    assert captured.err == f"dayu-cli upload_filing: {expected_reason}\n"
+    assert captured.err.count("\n") == 1
+    assert len(captured.err) <= _MAX_PUBLIC_CONTENT_FAILURE_STDERR_CHARS
+    assert factory_calls == []
+    assert service.upload_filing_requests == []
+    assert service.stream_calls == []
+    assert _snapshot_cli_workspace_tree(workspace_root) == before_tree
+    assert workspace_root.exists() is seed_existing
+
+
+@pytest.mark.parametrize("overwrite", (False, True))
+def test_upload_filing_existing_update_projects_typed_request_to_service(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    overwrite: bool,
+) -> None:
+    """existing filing 的 update 必须把 action/overwrite 精确投影给 Service。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: factory 替换夹具。
+        overwrite: 是否传入 ``--overwrite``。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: CLI admission 或 typed Service handoff 漂移时抛出。
+    """
+
+    workspace_root = tmp_path / f"workspace-update-{overwrite}"
+    _seed_cli_filing_source(workspace_root)
+    input_file = tmp_path / f"update-{overwrite}.txt"
+    input_file.write_text("updated input", encoding="utf-8")
+    service = _FakeFinsDirectService()
+    factory_calls: list[Path] = []
+    recording_factory = partial(
+        _recording_direct_service_factory,
+        service=service,
+        factory_calls=factory_calls,
+    )
+    monkeypatch.setattr(fins_command, "FINS_DIRECT_SERVICE_FACTORY", recording_factory)
+    overwrite_args = ("--overwrite",) if overwrite else ()
+
+    exit_code = cli_main.main(
+        (
+            "upload_filing",
+            "--base",
+            str(workspace_root),
+            "--ticker",
+            "AAPL",
+            "--action",
+            "update",
+            "--files",
+            str(input_file),
+            "--fiscal-year",
+            "2024",
+            "--fiscal-period",
+            "FY",
+            "--company-name",
+            "Apple Inc.",
+            *overwrite_args,
+        )
+    )
+
+    assert exit_code == EXIT_SUCCESS
+    assert factory_calls == [workspace_root]
+    assert service.upload_filing_requests == [
+        _UploadFilingCall(
+            ticker="AAPL",
+            action="update",
+            files=(input_file.resolve(),),
+            fiscal_year=2024,
+            fiscal_period="FY",
+            amended=False,
+            filing_date=None,
+            report_date=None,
+            company_name="Apple Inc.",
+            ticker_aliases=(),
+            overwrite=overwrite,
+        )
+    ]
+    assert service.stream_calls == [FinsOperationKind.UPLOAD_FILING]
+
+
 def test_upload_filing_prevalidation_io_failure_is_typed_bounded_and_path_free(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1495,7 +1763,18 @@ def test_upload_commands_map_args_and_validate_files(
     tmp_path: Path,
     fake_service: _FakeFinsDirectService,
 ) -> None:
-    """upload_filing/material CLI 必须调用 Service direct stream 方法。"""
+    """upload_filing/material CLI 必须调用 Service direct stream 方法。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        fake_service: 记录 CLI 参数投影的 direct Service 替身。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 参数校验、动作映射或 Service 调用漂移时抛出。
+    """
 
     filing_file = tmp_path / "filing.pdf"
     material_file = tmp_path / "material.html"
@@ -1509,7 +1788,7 @@ def test_upload_commands_map_args_and_validate_files(
                 "--ticker",
                 "AAPL,MSFT",
                 "--action",
-                "update",
+                "create",
                 "--files",
                 str(filing_file),
                 "--fiscal-year",
@@ -1552,7 +1831,7 @@ def test_upload_commands_map_args_and_validate_files(
     assert fake_service.upload_filing_requests == [
         _UploadFilingCall(
             ticker="AAPL",
-            action="update",
+            action="create",
             files=(filing_file.resolve(),),
             fiscal_year=2024,
             fiscal_period="FY",

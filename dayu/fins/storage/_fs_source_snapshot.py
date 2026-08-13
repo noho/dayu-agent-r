@@ -51,6 +51,7 @@ from .repository_protocols import (
     SourceSnapshotFileDescriptor,
     SourceSnapshotProtocol,
 )
+from .source_meta_contract import require_source_meta_is_deleted
 
 if TYPE_CHECKING:
     from ._fs_source_document_core import _FsSourceDocumentMixin
@@ -761,7 +762,7 @@ def _acquire_snapshot_attempt_unguarded(
     )
     if not provenance.ingest_complete:
         raise ValueError("source snapshot 只读取完成态 source")
-    is_deleted = _require_deleted_flag(persisted_meta)
+    is_deleted = require_source_meta_is_deleted(persisted_meta)
     if is_deleted:
         raise FileNotFoundError(
             f"document_id={document_id} 的 {resolved_source_kind.value} source 已删除"
@@ -990,28 +991,6 @@ def _parse_snapshot_files(
     return tuple(descriptors), primary_filename
 
 
-def _require_deleted_flag(meta: Mapping[str, JsonValue]) -> bool:
-    """读取 source deleted 状态并拒绝 loose truthiness。
-
-    Args:
-        meta: persisted source meta。
-
-    Returns:
-        typed deletion flag。
-
-    Raises:
-        KeyError: meta 缺少 ``is_deleted`` 时抛出。
-        ValueError: ``is_deleted`` 不是布尔值时抛出。
-    """
-
-    if "is_deleted" not in meta:
-        raise KeyError("source meta 缺少 is_deleted")
-    value = meta["is_deleted"]
-    if not isinstance(value, bool):
-        raise ValueError("source meta is_deleted 必须为布尔值")
-    return value
-
-
 def _build_published_marker(
     core: _FsSourceDocumentMixin,
     ticker: str,
@@ -1107,7 +1086,7 @@ def _read_published_marker(
                 document_id,
                 source_kind,
                 revision,
-                _require_deleted_flag(persisted_meta),
+                require_source_meta_is_deleted(persisted_meta),
             )
     except BaseException as exc:
         marker_error = exc

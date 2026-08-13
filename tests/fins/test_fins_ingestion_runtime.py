@@ -490,6 +490,145 @@ def test_validate_fins_upload_filing_request_resolves_state_aware_contract(
     assert updated.company_meta_decision.disposition == "keep"
 
 
+@pytest.mark.parametrize("overwrite", (False, True))
+def test_validate_fins_upload_filing_request_rejects_missing_explicit_update(
+    tmp_path: Path,
+    overwrite: bool,
+) -> None:
+    """显式 update 在目标缺失时不得由 overwrite 获得 upsert 权限。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        overwrite: 是否请求覆盖既有目标。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: owner 未返回精确 typed usage failure 时抛出。
+    """
+
+    upload_file = tmp_path / "report.txt"
+    upload_file.write_text("report", encoding="utf-8")
+    request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        action="update",
+        files=(upload_file,),
+        fiscal_year=2024,
+        fiscal_period="FY",
+        company_name="Apple Inc.",
+        overwrite=overwrite,
+    )
+
+    with pytest.raises(FinsUploadUsageError) as exc_info:
+        validate_fins_upload_filing_request(
+            request,
+            published_state=FilingUploadPublishedState(company_meta=None, source_meta=None),
+        )
+
+    assert exc_info.value.failure.code is FinsUploadUsageCode.UPDATE_TARGET_MISSING
+    assert exc_info.value.failure.message == "update 目标不存在；请改用 create"
+
+
+@pytest.mark.parametrize(
+    ("overwrite", "expected_code"),
+    (
+        (False, FinsUploadUsageCode.CREATE_TARGET_EXISTS),
+        (True, None),
+    ),
+)
+def test_validate_fins_upload_filing_request_limits_create_overwrite_to_existing_target(
+    tmp_path: Path,
+    overwrite: bool,
+    expected_code: FinsUploadUsageCode | None,
+) -> None:
+    """create-existing 仅在显式 overwrite 时允许继续。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        overwrite: 是否请求覆盖既有目标。
+        expected_code: 预期 typed failure code；允许时为 ``None``。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: create admission matrix 漂移时抛出。
+    """
+
+    upload_file = tmp_path / "report.txt"
+    upload_file.write_text("report", encoding="utf-8")
+    request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        action="create",
+        files=(upload_file,),
+        fiscal_year=2024,
+        fiscal_period="FY",
+        company_name="Apple Inc.",
+        overwrite=overwrite,
+    )
+    published_state = FilingUploadPublishedState(
+        company_meta=None,
+        source_meta={"is_deleted": False, "source_fingerprint": "published"},
+    )
+
+    if expected_code is not None:
+        with pytest.raises(FinsUploadUsageError) as exc_info:
+            validate_fins_upload_filing_request(request, published_state=published_state)
+        assert exc_info.value.failure.code is expected_code
+        return
+
+    validated = validate_fins_upload_filing_request(request, published_state=published_state)
+    assert validated.resolved_action == "create"
+
+
+def test_validate_fins_upload_filing_request_keeps_deleted_auto_identity_filename_independent(
+    tmp_path: Path,
+) -> None:
+    """logical-deleted auto 必须解析 update，且 filing identity 不依赖文件名。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: action 或稳定 identity owner 漂移时抛出。
+    """
+
+    original_file = tmp_path / "report.txt"
+    renamed_file = tmp_path / "renamed-report.txt"
+    original_file.write_text("same filing", encoding="utf-8")
+    renamed_file.write_text("same filing", encoding="utf-8")
+    original_request = FinsUploadFilingRequest(
+        ticker="aapl.us",
+        files=(original_file,),
+        fiscal_year=2024,
+        fiscal_period=" fy ",
+        company_name="Apple Inc.",
+    )
+    renamed_request = replace(original_request, files=(renamed_file,))
+    deleted_state = FilingUploadPublishedState(
+        company_meta=None,
+        source_meta={"is_deleted": True, "source_fingerprint": "published"},
+    )
+
+    original = validate_fins_upload_filing_request(
+        original_request,
+        published_state=deleted_state,
+    )
+    renamed = validate_fins_upload_filing_request(
+        renamed_request,
+        published_state=deleted_state,
+    )
+
+    assert original.resolved_action == "update"
+    assert renamed.resolved_action == "update"
+    assert renamed.document_id == original.document_id
+    assert renamed.internal_document_id == original.internal_document_id
+
+
 @pytest.mark.parametrize(
     ("upload_request", "expected_code"),
     (

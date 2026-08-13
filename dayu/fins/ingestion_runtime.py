@@ -750,7 +750,7 @@ _USAGE_MESSAGES: Final[Mapping[FinsUploadUsageCode, str]] = {
     FinsUploadUsageCode.CONVERTER_SUFFIX_UNSUPPORTED: "当前上传转换器不支持该文件后缀：{file_name}",
     FinsUploadUsageCode.COMPANY_NAME_REQUIRED: "当前公司缺少有效元数据；create/update 必须提供 --company-name",
     FinsUploadUsageCode.CREATE_TARGET_EXISTS: "create 目标已存在；请改用 update 或允许覆盖",
-    FinsUploadUsageCode.UPDATE_TARGET_MISSING: "update 目标不存在；请改用 create 或允许覆盖",
+    FinsUploadUsageCode.UPDATE_TARGET_MISSING: "update 目标不存在；请改用 create",
 }
 
 

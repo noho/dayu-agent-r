@@ -1069,6 +1069,255 @@ def test_execute_upload_create_final_failure_leaves_document_absent(tmp_path: Pa
     assert blob_repository.list_entries(handle) == []
 
 
+@pytest.mark.parametrize("source_kind", (SourceKind.FILING, SourceKind.MATERIAL))
+@pytest.mark.parametrize("overwrite", (False, True))
+def test_prepare_upload_rejects_missing_update_before_shared_conversion(
+    tmp_path: Path,
+    source_kind: SourceKind,
+    overwrite: bool,
+) -> None:
+    """filing/material update-missing 均须在 shared converter 前失败。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        source_kind: 当前 shared owner 的 source 类型。
+        overwrite: 是否请求覆盖。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: overwrite 获得 upsert 权限或 converter 被调用时抛出。
+    """
+
+    calls: list[str] = []
+    context = _build_service_context(tmp_path)
+    service = DoclingUploadService(
+        source_repository=context.source_repository,
+        blob_repository=context.blob_repository,
+        docling_converter=_FakeDoclingConverter(calls),
+    )
+    sample_file = tmp_path / "missing.txt"
+    sample_file.write_text("missing target", encoding="utf-8")
+
+    with pytest.raises(FileNotFoundError, match="Document not found for update"):
+        asyncio.run(
+            service.prepare_upload(
+                ticker="AAPL",
+                source_kind=source_kind,
+                action="update",
+                document_id="missing_document",
+                internal_document_id="missing_document",
+                form_type="10-K" if source_kind is SourceKind.FILING else "MATERIAL_OTHER",
+                files=[sample_file],
+                overwrite=overwrite,
+                previous_meta=None,
+                meta={"ingest_method": "upload"},
+                cancellation=None,
+            )
+        )
+
+    assert calls == []
+
+
+def test_prepare_upload_rejects_existing_filing_create_before_conversion(tmp_path: Path) -> None:
+    """filing create-existing 且未 overwrite 时必须在 converter 前失败。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: precondition 晚于 converter 或未拒绝时抛出。
+    """
+
+    calls: list[str] = []
+    context = _build_service_context(tmp_path)
+    service = DoclingUploadService(
+        source_repository=context.source_repository,
+        blob_repository=context.blob_repository,
+        docling_converter=_FakeDoclingConverter(calls),
+    )
+    sample_file = tmp_path / "report.txt"
+    sample_file.write_text("published", encoding="utf-8")
+    _execute_upload(
+        service=service,
+        batching_repository=context.batching_repository,
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        action="create",
+        document_id="filing_existing",
+        internal_document_id="filing_existing",
+        form_type="10-K",
+        files=[sample_file],
+        overwrite=False,
+        meta={"ingest_method": "upload"},
+    )
+    calls.clear()
+    previous_meta = context.source_repository.get_source_meta(
+        "AAPL",
+        "filing_existing",
+        SourceKind.FILING,
+    )
+
+    with pytest.raises(FileExistsError, match="Document already exists for create"):
+        asyncio.run(
+            service.prepare_upload(
+                ticker="AAPL",
+                source_kind=SourceKind.FILING,
+                action="create",
+                document_id="filing_existing",
+                internal_document_id="filing_existing",
+                form_type="10-K",
+                files=[sample_file],
+                overwrite=False,
+                previous_meta=previous_meta,
+                meta={"ingest_method": "upload"},
+                cancellation=None,
+            )
+        )
+
+    assert calls == []
+
+
+@pytest.mark.parametrize("deleted_value", (None, "false"))
+def test_prepare_upload_requires_canonical_boolean_deleted_state(
+    tmp_path: Path,
+    deleted_value: str | None,
+) -> None:
+    """skip owner 必须直接校验 canonical source_meta 的确定 bool。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        deleted_value: ``None`` 表示字段缺失，否则为非法非布尔值。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: owner 使用默认值或 loose truthiness 时抛出。
+    """
+
+    calls: list[str] = []
+    context = _build_service_context(tmp_path)
+    service = DoclingUploadService(
+        source_repository=context.source_repository,
+        blob_repository=context.blob_repository,
+        docling_converter=_FakeDoclingConverter(calls),
+    )
+    sample_file = tmp_path / "report.txt"
+    raw = b"same input"
+    sample_file.write_bytes(raw)
+    fingerprint = _build_upload_source_fingerprint(
+        [
+            _PendingFileAsset(
+                name=sample_file.name,
+                data=raw,
+                content_type="text/plain",
+                sha256=hashlib.sha256(raw).hexdigest(),
+                size=len(raw),
+                source="original",
+            )
+        ]
+    )
+    previous_meta: dict[str, JsonValue] = {"source_fingerprint": fingerprint}
+    expected_error: type[KeyError] | type[ValueError]
+    if deleted_value is None:
+        expected_error = KeyError
+    else:
+        previous_meta["is_deleted"] = deleted_value
+        expected_error = ValueError
+
+    with pytest.raises(expected_error):
+        asyncio.run(
+            service.prepare_upload(
+                ticker="AAPL",
+                source_kind=SourceKind.FILING,
+                action="update",
+                document_id="filing_corrupt_meta",
+                internal_document_id="filing_corrupt_meta",
+                form_type="10-K",
+                files=[sample_file],
+                overwrite=False,
+                previous_meta=previous_meta,
+                meta={"ingest_method": "upload"},
+                cancellation=None,
+            )
+        )
+
+    assert calls == []
+
+
+def test_execute_upload_deleted_equal_fingerprint_enters_conversion(tmp_path: Path) -> None:
+    """logical-deleted source 即使指纹相同也不得 skip。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: deleted source 被误判为 no-op 时抛出。
+    """
+
+    calls: list[str] = []
+    context = _build_service_context(tmp_path)
+    service = DoclingUploadService(
+        source_repository=context.source_repository,
+        blob_repository=context.blob_repository,
+        docling_converter=_FakeDoclingConverter(calls),
+    )
+    sample_file = tmp_path / "report.txt"
+    sample_file.write_text("same input", encoding="utf-8")
+    created = _execute_upload(
+        service=service,
+        batching_repository=context.batching_repository,
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        action="create",
+        document_id="filing_deleted",
+        internal_document_id="filing_deleted",
+        form_type="10-K",
+        files=[sample_file],
+        overwrite=False,
+        meta={"ingest_method": "upload"},
+    )
+    deleted = _execute_upload(
+        service=service,
+        batching_repository=context.batching_repository,
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        action="delete",
+        document_id="filing_deleted",
+        internal_document_id="filing_deleted",
+        form_type="10-K",
+        files=[],
+        overwrite=False,
+        meta={},
+    )
+    restored = _execute_upload(
+        service=service,
+        batching_repository=context.batching_repository,
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        action="update",
+        document_id="filing_deleted",
+        internal_document_id="filing_deleted",
+        form_type="10-K",
+        files=[sample_file],
+        overwrite=False,
+        meta={"ingest_method": "upload"},
+    )
+
+    assert created.status == "uploaded"
+    assert deleted.status == "deleted"
+    assert restored.status == "uploaded"
+    assert calls == ["report.txt", "report.txt"]
+
+
 def test_execute_upload_skips_when_source_fingerprint_matches(tmp_path: Path) -> None:
     """相同源文件重复上传时应在转换前跳过。
 

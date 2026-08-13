@@ -93,8 +93,11 @@ Fins 与其它层的稳定边界如下：
 - `BatchingRepositoryProtocol`
 - 对应 `Fs*Repository` 文件系统实现
 - `FileStore` / `LocalFileStore`
+- `require_source_meta_is_deleted(...)` canonical source-meta 严格读取契约
 
 source document meta 中的 `source_provider` 是来源提供方真源，当前支持 SEC EDGAR、巨潮资讯、港交所披露易与用户上传。storage snapshot 负责把同版 source meta 投影为 typed provenance；read runtime 的 citation 只消费当前 processor borrow 所持 snapshot 的 provenance 来生成 LLM-facing `source_type` 与 `source_provider`，不重新读取仓储或猜测来源。
+
+source document meta 中的 `is_deleted` 由 storage publication owner 产生；storage snapshot 与上传 skip 判定统一通过 `require_source_meta_is_deleted(...)` 读取精确布尔值。字段缺失或非布尔值均视为损坏并 fail closed，不使用默认值或 loose truthiness。
 
 source published revision 由 complete-source mutation owner 在每次 source create、update、replace、delete 或 restore 的最终 meta 中自动生成并持久化，随同一个 batch commit 与 source 内容原子发布。`SourceDocumentRevision.token` 只承诺非空字符串的 exact opaque equality，不承诺 prefix、长度、字符集、hash 算法或其它 grammar；producer 不能传入 token，processed / company / maintenance-only batch 与 rollback 不改变已发布 token。consumer 只通过 storage snapshot 取得同版 opaque revision，不按 meta、文件字段、时间或内容 hash 重建它。
 
