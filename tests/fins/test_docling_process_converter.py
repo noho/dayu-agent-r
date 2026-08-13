@@ -749,6 +749,84 @@ def test_child_target_maps_construction_and_execution_to_exact_failure_descripto
     }
 
 
+def test_child_target_isolates_inherited_stderr_while_preserving_failure_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """第三方 conversion 的 stderr 与 logger 输出不得越过 child adapter。
+
+    :param tmp_path: pytest 临时目录。
+    :param monkeypatch: pytest 属性替换工具。
+    :param capfd: OS 文件描述符级标准流捕获夹具。
+    :returns: ``None``。
+    :raises Exception: stderr 泄漏或 descriptor contract 漂移时抛出。
+    """
+
+    target = _target_in_temp(tmp_path)
+    leaking_logger = logging.getLogger("third_party.docling.stderr_owner_test")
+    original_handlers = tuple(leaking_logger.handlers)
+    original_level = leaking_logger.level
+    original_propagate = leaking_logger.propagate
+
+    def failing_convert(
+        raw_bytes: bytes,
+        *,
+        stream_name: str,
+        do_ocr: bool,
+        do_table_structure: bool,
+        table_mode: str,
+        do_cell_matching: bool,
+    ) -> _FakeConversion:
+        """模拟第三方 callback 与 lastResort logger 泄漏后失败。
+
+        :param raw_bytes: 输入字节。
+        :param stream_name: 输入名。
+        :param do_ocr: OCR 配置。
+        :param do_table_structure: 表格结构配置。
+        :param table_mode: 表格模式。
+        :param do_cell_matching: 单元格匹配配置。
+        :returns: 永不返回。
+        :raises RuntimeError: 始终在写入敏感 stderr 后抛出。
+        """
+
+        _ = (
+            raw_bytes,
+            stream_name,
+            do_ocr,
+            do_table_structure,
+            table_mode,
+            do_cell_matching,
+        )
+        sys.stderr.write(f"Traceback: sensitive input path {tmp_path / 'corrupt.pdf'}\n")
+        leaking_logger.warning("third-party logger leaked repo path /private/dayu-agent-r")
+        raise RuntimeError("sensitive conversion failure")
+
+    leaking_logger.handlers.clear()
+    leaking_logger.setLevel(logging.WARNING)
+    leaking_logger.propagate = False
+    monkeypatch.setattr(
+        docling_process_converter,
+        "convert_pdf_bytes_with_docling",
+        failing_convert,
+    )
+    try:
+        descriptor = target()
+    finally:
+        leaking_logger.handlers[:] = original_handlers
+        leaking_logger.setLevel(original_level)
+        leaking_logger.propagate = original_propagate
+
+    captured = capfd.readouterr()
+    assert captured.err == ""
+    assert descriptor == {
+        "schema_version": 1,
+        "status": "failure",
+        "failure_kind": "converter_execution",
+        "message": "Docling conversion execution failed",
+    }
+
+
 def test_child_target_maps_export_failure_to_exact_serialization_descriptor(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -5,6 +5,8 @@ from __future__ import annotations
 import ast
 import asyncio
 import errno
+import subprocess
+import sys
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -51,6 +53,12 @@ from dayu.service.fins_direct import (
 )
 
 _NOW: datetime = datetime(2026, 6, 16, tzinfo=timezone.utc)
+_CALIBRATION_CORRUPT_PDF = Path(
+    "/Users/leo/workspace/.dayu-cli-ci/"
+    "upload-filing-calibration-20260811-tF6OnN/inputs/corrupt.pdf"
+)
+_TYPED_CONTENT_FAILURE_REASON = "文件无法解析或已损坏，请检查文件后重试"
+_MAX_PUBLIC_CONTENT_FAILURE_STDERR_CHARS = 1024
 
 
 def _raise_cli_consumer_error(
@@ -1370,6 +1378,61 @@ def test_download_mutation_mode_conflict_precedes_all_side_effects(
     assert factory_calls == []
     assert service.download_requests == []
     assert service.stream_calls == []
+    assert not workspace_root.exists()
+
+
+def test_real_cli_corrupt_pdf_has_bounded_stderr_and_zero_fresh_workspace_mutation(
+    tmp_path: Path,
+) -> None:
+    """真实 CLI/Docling content failure 必须安全投影且不创建 fresh workspace。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: calibration 输入缺失、CLI contract 漂移、stderr 泄漏或 workspace 变化时抛出。
+        subprocess.TimeoutExpired: 真实 conversion 未在期限内结束时抛出。
+    """
+
+    assert _CALIBRATION_CORRUPT_PDF.is_file()
+    workspace_root = tmp_path / "fresh-workspace"
+    cli_executable = Path(sys.executable).with_name("dayu-cli")
+    repository_root = Path(__file__).resolve().parents[2]
+
+    completed = subprocess.run(
+        (
+            str(cli_executable),
+            "upload_filing",
+            "--base",
+            str(workspace_root),
+            "--ticker",
+            "ICPD",
+            "--files",
+            str(_CALIBRATION_CORRUPT_PDF),
+            "--fiscal-year",
+            "2024",
+            "--fiscal-period",
+            "FY",
+            "--company-name",
+            "ICPD Corp.",
+        ),
+        cwd=repository_root,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60.0,
+    )
+
+    assert completed.returncode == EXIT_FAILURE
+    assert _TYPED_CONTENT_FAILURE_REASON in completed.stderr
+    assert 'failure_kind="content"' in completed.stderr
+    assert len(completed.stderr) <= _MAX_PUBLIC_CONTENT_FAILURE_STDERR_CHARS
+    assert "Traceback" not in completed.stderr
+    assert str(repository_root) not in completed.stderr
+    assert str(_CALIBRATION_CORRUPT_PDF) not in completed.stderr
     assert not workspace_root.exists()
 
 

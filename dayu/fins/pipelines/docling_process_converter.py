@@ -11,10 +11,13 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import shutil
+import sys
 import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -53,6 +56,36 @@ _MESSAGE_KEY: Final[str] = "message"
 _SHA256_HEX_LENGTH: Final[int] = 64
 _LOWERCASE_HEX_DIGITS: Final[frozenset[str]] = frozenset("0123456789abcdef")
 _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
+
+
+@contextmanager
+def _isolated_inherited_stderr() -> Iterator[None]:
+    """在当前 child conversion 动态范围内隔离继承的公开 stderr。
+
+    这里操作底层文件描述符而不是只替换 ``sys.stderr``，确保第三方 logger、
+    native dependency 与第三方创建的后代进程都不能绕过 child adapter 写入
+    调用方公开 stderr。退出动态范围时恢复原 descriptor，不改变父进程日志边界。
+
+    :returns: 进入隔离范围的 context manager。
+    :raises OSError: descriptor 复制、重定向或恢复失败时抛出。
+    """
+
+    stderr_stream = sys.stderr
+    stderr_stream.flush()
+    stderr_file_descriptor = stderr_stream.fileno()
+    inherited_stderr_copy = os.dup(stderr_file_descriptor)
+    try:
+        with open(os.devnull, "w", encoding="utf-8") as isolated_stderr:
+            os.dup2(isolated_stderr.fileno(), stderr_file_descriptor)
+            try:
+                yield
+            finally:
+                try:
+                    stderr_stream.flush()
+                finally:
+                    os.dup2(inherited_stderr_copy, stderr_file_descriptor)
+    finally:
+        os.close(inherited_stderr_copy)
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,14 +269,15 @@ class _DoclingProcessTarget:
 
         try:
             input_bytes = Path(self.input_path).read_bytes()
-            conversion = convert_pdf_bytes_with_docling(
-                input_bytes,
-                stream_name=self.stream_name,
-                do_ocr=self.config.do_ocr,
-                do_table_structure=self.config.do_table_structure,
-                table_mode=self.config.table_mode,
-                do_cell_matching=self.config.do_cell_matching,
-            )
+            with _isolated_inherited_stderr():
+                conversion = convert_pdf_bytes_with_docling(
+                    input_bytes,
+                    stream_name=self.stream_name,
+                    do_ocr=self.config.do_ocr,
+                    do_table_structure=self.config.do_table_structure,
+                    table_mode=self.config.table_mode,
+                    do_cell_matching=self.config.do_cell_matching,
+                )
         except DoclingRuntimeInitializationError:
             return _failure_descriptor(DoclingConversionFailureKind.CONVERTER_CONSTRUCTION)
         except Exception:

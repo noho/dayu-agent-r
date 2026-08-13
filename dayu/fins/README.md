@@ -803,7 +803,7 @@ Runtime producer 在进入 download / preprocess / upload 业务执行前检查�
 
 Upload 取消以 workflow publication 与 terminal summary 的 first-committer 为准：publication 前观察到取消时返回 cancelled，publication/no-op 或 failed summary 已接受后到达的取消只保留为请求事实，不回滚产物，也不改写 terminal。CLI 与其它消费者只展示 runtime 产出的 canonical progress/result，不删除或替换迟到事件。
 
-CN/HK Docling convert 在独立子进程中执行；父进程持续观察 operation cancellation，取消时按 terminate、必要时 kill、close 的顺序回收子进程，并清理系统临时目录。正常结果在进入 storage batch 前完成输出存在性、大小与 SHA-256 校验；转换失败、取消或输出损坏都不会发布半成品 source。
+CN/HK Docling convert 在独立子进程中执行；child adapter 只在第三方 conversion 调用期间隔离继承的公开 stderr，第三方 logger、traceback 与本地路径不会绕过 closed failure descriptor 直接进入 CLI stderr。父进程持续观察 operation cancellation，取消时按 terminate、必要时 kill、close 的顺序回收子进程，并清理系统临时目录。正常结果在进入 storage batch 前完成输出存在性、大小与 SHA-256 校验；转换失败、取消或输出损坏都不会发布半成品 source。
 
 ### Service wait adapter 与 Host resume
 
