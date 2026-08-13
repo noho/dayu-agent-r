@@ -860,6 +860,107 @@ def _constructor_keyword_sets(source_path: Path, constructor_name: str) -> list[
     ]
 
 
+def _direct_exception_handler_names(
+    source_path: Path,
+    *,
+    function_name: str,
+    class_name: str | None,
+) -> tuple[str, ...]:
+    """读取 workflow 外层 try 的直接异常 handler 名称。
+
+    Args:
+        source_path: 待审计 production Python 文件。
+        function_name: workflow 函数或异步方法名称。
+        class_name: 方法所属类名；顶层函数传入 ``None``。
+
+    Returns:
+        workflow 外层 try 按声明顺序排列的异常类型名称。
+
+    Raises:
+        AssertionError: workflow、外层 try 或直接名称类型的 handler 不唯一时抛出。
+        OSError: production 文件读取失败时抛出。
+        SyntaxError: production 文件无法解析时抛出。
+    """
+
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    owner_body = tree.body
+    if class_name is not None:
+        owner_classes = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == class_name
+        ]
+        assert len(owner_classes) == 1
+        owner_body = owner_classes[0].body
+    workflow_functions = [
+        node
+        for node in owner_body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == function_name
+    ]
+    assert len(workflow_functions) == 1
+    outer_tries = [node for node in workflow_functions[0].body if isinstance(node, ast.Try)]
+    assert len(outer_tries) == 1
+    handler_types = [handler.type for handler in outer_tries[0].handlers]
+    assert all(isinstance(handler_type, ast.Name) for handler_type in handler_types)
+    return tuple(
+        handler_type.id
+        for handler_type in handler_types
+        if isinstance(handler_type, ast.Name)
+    )
+
+
+def test_filing_workflows_consume_only_typed_admission_failure_before_generic_handlers() -> None:
+    """filing 必须消费唯一 typed failure，material 则保持既有 generic 边界。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: SEC/CN filing 直接捕获 Docling、typed handler 顺序漂移，或 material
+            既有异常边界改变时抛出。
+        OSError: production 文件读取失败时抛出。
+        SyntaxError: production 文件无法解析时抛出。
+    """
+
+    pipelines_root = Path(ingestion_runtime.__file__).parent / "pipelines"
+    workflow_contracts = (
+        (
+            pipelines_root / "sec_upload_workflow.py",
+            None,
+            "run_upload_filing_stream",
+            ("FinsUploadFailureError", "OSError", "Exception"),
+        ),
+        (
+            pipelines_root / "cn_pipeline.py",
+            "CnPipeline",
+            "upload_filing_stream",
+            ("FinsUploadFailureError", "OSError", "Exception"),
+        ),
+        (
+            pipelines_root / "sec_upload_workflow.py",
+            None,
+            "run_upload_material_stream",
+            ("Exception",),
+        ),
+        (
+            pipelines_root / "cn_pipeline.py",
+            "CnPipeline",
+            "upload_material_stream",
+            ("Exception",),
+        ),
+    )
+
+    for source_path, class_name, function_name, expected_handlers in workflow_contracts:
+        assert _direct_exception_handler_names(
+            source_path,
+            function_name=function_name,
+            class_name=class_name,
+        ) == expected_handlers
+
+
 def test_production_upload_count_constructors_are_explicit_and_complete() -> None:
     """production constructor inventory 必须与 S1 review 裁决后的清单完全一致。
 

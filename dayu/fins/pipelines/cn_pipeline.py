@@ -66,7 +66,6 @@ from dayu.fins.pipelines.docling_upload_service import (
     validate_material_upload_ids,
 )
 from dayu.fins.pipelines.docling_process_converter import (
-    DoclingConversionError,
     DoclingConverter,
     ProcessDoclingConverter,
 )
@@ -914,15 +913,6 @@ class CnPipeline:
                 request=authoritative_request,
                 requested_action=requested_action,
                 failure_reason=exc.failure,
-            )
-        except DoclingConversionError as exc:
-            _LOGGER.exception("CN/HK filing upload Docling conversion failed")
-            failure_reason = fins_upload_failure_from_exception(exc, file_label=None)
-            yield _build_cn_filing_failure_event(
-                pipeline=self,
-                request=authoritative_request,
-                requested_action=requested_action,
-                failure_reason=failure_reason,
             )
         except OSError as exc:
             _LOGGER.exception("CN/HK filing upload storage operation failed")

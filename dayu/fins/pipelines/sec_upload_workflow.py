@@ -20,9 +20,6 @@ from dayu.fins.ingestion_runtime import (
     ValidatedFinsUploadFilingRequest,
     validate_fins_upload_filing_request,
 )
-from dayu.fins.pipelines.docling_process_converter import (
-    DoclingConversionError,
-)
 from dayu.fins.pipelines.docling_upload_service import (
     DoclingUploadService,
     UploadOperationResult,
@@ -294,15 +291,6 @@ async def run_upload_filing_stream(
             request=authoritative_request,
             requested_action=requested_action,
             failure_reason=exc.failure,
-        )
-    except DoclingConversionError as exc:
-        _LOGGER.exception("SEC filing upload Docling conversion failed")
-        failure_reason = fins_upload_failure_from_exception(exc, file_label=None)
-        yield _build_sec_filing_failure_event(
-            host=host,
-            request=authoritative_request,
-            requested_action=requested_action,
-            failure_reason=failure_reason,
         )
     except OSError as exc:
         _LOGGER.exception("SEC filing upload storage operation failed")
