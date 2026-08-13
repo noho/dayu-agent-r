@@ -131,6 +131,8 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
             return FinsUploadResultSummary(
                 source_kind=raw_request.source_kind,
                 status="cancelled",
+                requested_file_count=len(raw_request.files),
+                stored_file_count=0,
                 skip_reason="cancelled",
             )
         normalized = normalize_ticker(raw_request.ticker)
@@ -303,9 +305,10 @@ def _upload_summary_from_result(
     return FinsUploadResultSummary(
         source_kind=request.source_kind,
         status=result.status,
+        requested_file_count=len(request.files),
+        stored_file_count=result.stored_file_count,
         document_id=result.document_id,
         internal_document_id=result.internal_document_id,
-        uploaded_files=tuple(path.name for path in request.files),
         primary_document=result.primary_document,
         deleted=result.deleted,
         skip_reason=result.skip_reason,

@@ -99,6 +99,7 @@ async def test_upload_material_stream_uploads_docling_files(tmp_path: Path) -> N
     assert result_value["action"] == "upload_material"
     assert result_value["ticker"] == "AAPL"
     assert result_value["status"] == "ok"
+    assert result_value["stored_file_count"] == 1
     assert str(result_value["document_id"]).startswith("mat_")
     company_meta = pipeline._company_repository.get_company_meta("AAPL")
     assert company_meta.company_id == "AAPL_US"
@@ -167,6 +168,7 @@ async def test_upload_material_stream_auto_action_and_overwrite_reset(tmp_path: 
     overwrite_result = overwrite_events[-1].payload["result"]
     assert isinstance(overwrite_result, dict)
     assert overwrite_result["status"] == "ok"
+    assert overwrite_result["stored_file_count"] == 1
     assert overwrite_result["material_action"] == "update"
     assert overwrite_result["document_id"] == create_result["document_id"]
 
@@ -217,6 +219,7 @@ async def test_upload_material_failure_preserves_existing_user_visible_semantics
     result = events[-1].payload["result"]
     assert isinstance(result, dict)
     assert result["status"] == "failed"
+    assert result["stored_file_count"] == 0
     assert result["message"] == "create/update 时必须提供 --company-name"
     assert "failure" not in result
     assert events[-1].payload["error"] == "create/update 时必须提供 --company-name"

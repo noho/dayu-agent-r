@@ -806,6 +806,7 @@ def test_execute_upload_create_material_success(tmp_path: Path) -> None:
     )
 
     assert result.status == "uploaded"
+    assert result.stored_file_count == 1
     assert result.document_id == "mat_demo"
     assert len(result.file_events) == 3
     assert result.file_events[0].event_type == "conversion_started"
@@ -857,6 +858,7 @@ def test_prepare_maps_shared_converter_cancel_without_starting_publication(tmp_p
 
     assert isinstance(prepared, UploadOperationResult)
     assert prepared.status == "cancelled"
+    assert prepared.stored_file_count == 0
     assert batching_repository.begin_calls == 0
     with pytest.raises(FileNotFoundError):
         source_repository.get_source_meta("AAPL", "mat_cancelled", SourceKind.MATERIAL)
@@ -894,6 +896,7 @@ def test_execute_upload_writes_blobs_before_single_complete_source(tmp_path: Pat
     meta = source_repository.get_source_meta("AAPL", "mat_staged", SourceKind.MATERIAL)
 
     assert result.status == "uploaded"
+    assert result.stored_file_count == 1
     assert events == ["store:deck.pdf", "store:deck_docling.json"]
     assert blob_repository.observed_source_absent == [True, True]
     assert meta["ingest_complete"] is True
@@ -941,6 +944,7 @@ def test_execute_upload_uses_one_caller_batch_for_blobs_and_final_meta(tmp_path:
     batch_ids = {batch_id for _, batch_id in batching_repository.phase_batch_ids}
     phases = [phase for phase, _ in batching_repository.phase_batch_ids]
     assert result.status == "uploaded"
+    assert result.stored_file_count == 1
     assert batch_ids and len(batch_ids) == 1
     assert phases == [
         "begin",
@@ -1431,6 +1435,9 @@ def test_execute_upload_deleted_input_republishes_complete_source(
     assert created.status == "uploaded"
     assert deleted.status == "deleted"
     assert restored.status == "uploaded"
+    assert created.stored_file_count == 1
+    assert deleted.stored_file_count == 0
+    assert restored.stored_file_count == 1
     assert calls == [sample_file.name, sample_file.name]
     assert restored_meta["is_deleted"] is False
     assert restored_meta["deleted_at"] is None
@@ -1528,6 +1535,7 @@ def test_execute_upload_existing_full_input_replaces_exact_complete_set(
     integrity = context.source_repository.classify_source_integrity("AAPL", document_id, source_kind)
 
     assert result.status == "uploaded"
+    assert result.stored_file_count == 1
     assert published_names == expected_names
     assert context.blob_repository.read_file_bytes(handle, new_name) == b"new bytes"
     assert final_meta["document_version"] == "v2"
@@ -1593,6 +1601,8 @@ def test_execute_upload_skips_when_source_fingerprint_matches(tmp_path: Path) ->
 
     assert first.status == "uploaded"
     assert second.status == "skipped"
+    assert first.stored_file_count == 1
+    assert second.stored_file_count == 0
     assert calls == ["deck.pdf"]
     assert all(event.event_type == "file_skipped" for event in second.file_events)
 
@@ -1663,6 +1673,7 @@ def test_existing_replacement_cancellation_keeps_entire_published_tree(
     )
 
     assert result.status == "cancelled"
+    assert result.stored_file_count == 0
     assert published_tree_sha256(tmp_path, "AAPL") == old_tree
     assert context.source_repository.get_source_meta("AAPL", "mat_demo", SourceKind.MATERIAL) == old_meta
     assert {entry.name for entry in context.blob_repository.list_entries(handle)} == old_entries
@@ -1853,6 +1864,7 @@ def test_execute_upload_delete_material(tmp_path: Path) -> None:
 
     meta = context.source_repository.get_source_meta("AAPL", "mat_demo", SourceKind.MATERIAL)
     assert result.status == "deleted"
+    assert result.stored_file_count == 0
     assert meta["is_deleted"] is True
 
 
@@ -1937,4 +1949,49 @@ def test_upload_source_fingerprint_is_stable() -> None:
         _PendingFileAsset("b.pdf", b"b", "application/pdf", "sha-b", 1, "original"),
     ]
 
-    assert _build_upload_source_fingerprint(first) == _build_upload_source_fingerprint(second)
+    expected_digest = "099dc9636e306c75f1d5d64dd0210123956ba73888e968088c7279baab1d7fdd"
+
+    assert _build_upload_source_fingerprint(first) == expected_digest
+    assert _build_upload_source_fingerprint(second) == expected_digest
+
+
+def test_execute_upload_counts_only_successful_original_stores(tmp_path: Path) -> None:
+    """多个 original 与 derived 资产落盘时只累计 original publication count。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: count 使用总资产数或 payload 保留旧字段时抛出。
+    """
+
+    context = _build_service_context(tmp_path)
+    first_file = tmp_path / "first.pdf"
+    second_file = tmp_path / "second.pdf"
+    first_file.write_text("first", encoding="utf-8")
+    second_file.write_text("second", encoding="utf-8")
+
+    result = _execute_upload(
+        service=context.service,
+        batching_repository=context.batching_repository,
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        action="create",
+        document_id="filing_two_originals",
+        internal_document_id="filing_two_originals",
+        form_type="10-K",
+        files=[first_file, second_file],
+        overwrite=False,
+        meta={"ingest_method": "upload"},
+    )
+    meta = context.source_repository.get_source_meta(
+        "AAPL",
+        "filing_two_originals",
+        SourceKind.FILING,
+    )
+
+    assert len(meta["files"]) == 4
+    assert result.stored_file_count == 2

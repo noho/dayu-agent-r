@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import io
 import asyncio
 import hashlib
@@ -156,11 +157,14 @@ def test_failed_pipeline_result_requires_closed_typed_failure_reason() -> None:
     """
 
     with pytest.raises(ValueError):
-        FinsUploadPipelineResult.from_pipeline_json({"status": "failed"})
+        FinsUploadPipelineResult.from_pipeline_json(
+            {"status": "failed", "stored_file_count": 0}
+        )
     with pytest.raises(ValueError):
         FinsUploadPipelineResult.from_pipeline_json(
             {
                 "status": "ok",
+                "stored_file_count": 1,
                 "failure": {
                     "kind": "runtime",
                     "code": "unexpected_runtime",
@@ -172,6 +176,7 @@ def test_failed_pipeline_result_requires_closed_typed_failure_reason() -> None:
     result = FinsUploadPipelineResult.from_pipeline_json(
         {
             "status": "failed",
+            "stored_file_count": 0,
             "failure": {
                 "kind": "content",
                 "code": "docling_converter_execution",
@@ -304,7 +309,352 @@ def test_failed_pipeline_result_rejects_unsafe_or_open_failure_json(
     """
 
     with pytest.raises(ValueError):
-        FinsUploadPipelineResult.from_pipeline_json({"status": "failed", "failure": failure})
+        FinsUploadPipelineResult.from_pipeline_json(
+            {"status": "failed", "stored_file_count": 0, "failure": failure}
+        )
+
+
+@pytest.mark.parametrize(
+    ("status", "stored_file_count"),
+    (
+        ("ok", 1),
+        ("skipped", 0),
+        ("deleted", 0),
+        ("failed", 0),
+        ("cancelled", 0),
+    ),
+)
+def test_upload_pipeline_count_owner_accepts_complete_status_matrix(
+    status: str,
+    stored_file_count: int,
+) -> None:
+    """pipeline constructor 与 JSON parser 必须接受完整合法计数矩阵。
+
+    Args:
+        status: pipeline 终态。
+        stored_file_count: 与终态匹配的已发布 original 数。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: direct constructor 或 parser 拒绝合法矩阵时抛出。
+    """
+
+    failure_reason = _runtime_failure_for_status(status)
+    direct = FinsUploadPipelineResult(
+        status=status,
+        stored_file_count=stored_file_count,
+        failure_reason=failure_reason,
+    )
+    payload: dict[str, JsonValue] = {
+        "status": status,
+        "stored_file_count": stored_file_count,
+    }
+    if failure_reason is not None:
+        payload["failure"] = failure_reason.to_json()
+    parsed = FinsUploadPipelineResult.from_pipeline_json(payload)
+
+    assert direct.stored_file_count == stored_file_count
+    assert parsed.stored_file_count == stored_file_count
+
+
+@pytest.mark.parametrize(
+    ("status", "stored_file_count"),
+    (
+        ("ok", 0),
+        ("skipped", 1),
+        ("deleted", 1),
+        ("failed", 1),
+        ("cancelled", 1),
+    ),
+)
+def test_upload_pipeline_count_owner_rejects_invalid_status_matrix(
+    status: str,
+    stored_file_count: int,
+) -> None:
+    """pipeline constructor 与 JSON parser 必须共同拒绝非法计数矩阵。
+
+    Args:
+        status: pipeline 终态。
+        stored_file_count: 与终态冲突的已发布 original 数。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 任一入口接受非法矩阵时抛出。
+    """
+
+    failure_reason = _runtime_failure_for_status(status)
+    with pytest.raises(ValueError, match="stored_file_count"):
+        FinsUploadPipelineResult(
+            status=status,
+            stored_file_count=stored_file_count,
+            failure_reason=failure_reason,
+        )
+    payload: dict[str, JsonValue] = {
+        "status": status,
+        "stored_file_count": stored_file_count,
+    }
+    if failure_reason is not None:
+        payload["failure"] = failure_reason.to_json()
+    with pytest.raises(ValueError, match="stored_file_count"):
+        FinsUploadPipelineResult.from_pipeline_json(payload)
+
+
+@pytest.mark.parametrize("stored_file_count", (True, -1, 1.5, "1", None))
+def test_upload_pipeline_count_owner_rejects_missing_bool_negative_and_non_int(
+    stored_file_count: JsonValue,
+) -> None:
+    """pipeline parser 必须拒绝缺失、bool、负数和非整数 count。
+
+    Args:
+        stored_file_count: 非法 count fixture；``None`` 表示缺失字段。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: parser 接受非法 count 时抛出。
+    """
+
+    payload: dict[str, JsonValue] = {"status": "ok"}
+    if stored_file_count is not None:
+        payload["stored_file_count"] = stored_file_count
+    with pytest.raises(ValueError, match="stored_file_count"):
+        FinsUploadPipelineResult.from_pipeline_json(payload)
+
+
+@pytest.mark.parametrize("stored_file_count", (True, -1))
+def test_upload_pipeline_constructor_rejects_bool_and_negative_count(
+    stored_file_count: int,
+) -> None:
+    """pipeline direct constructor 必须拒绝 bool 与负数 count。
+
+    Args:
+        stored_file_count: 非法 typed count fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: constructor 接受非法 count 时抛出。
+    """
+
+    with pytest.raises(ValueError, match="stored_file_count"):
+        FinsUploadPipelineResult(
+            status="cancelled",
+            stored_file_count=stored_file_count,
+        )
+
+
+@pytest.mark.parametrize(
+    ("status", "requested_file_count", "stored_file_count"),
+    (
+        ("ok", 2, 2),
+        ("skipped", 2, 0),
+        ("deleted", 0, 0),
+        ("cancelled", 0, 0),
+        ("failed", 0, 0),
+    ),
+)
+def test_upload_summary_count_owner_accepts_complete_status_matrix(
+    status: str,
+    requested_file_count: int,
+    stored_file_count: int,
+) -> None:
+    """runtime summary owner 必须接受完整合法 requested/stored 矩阵。
+
+    Args:
+        status: runtime 上传终态。
+        requested_file_count: validated request 文件数。
+        stored_file_count: commit 后发布的 original 数。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 合法矩阵未被接受或 JSON 投影漂移时抛出。
+    """
+
+    summary = FinsUploadResultSummary(
+        source_kind=SourceKind.FILING,
+        status=status,
+        requested_file_count=requested_file_count,
+        stored_file_count=stored_file_count,
+        failure_reason=_runtime_failure_for_status(status),
+    )
+
+    assert summary.to_json_summary()["requested_file_count"] == requested_file_count
+    assert summary.to_json_summary()["stored_file_count"] == stored_file_count
+
+
+@pytest.mark.parametrize(
+    ("status", "requested_file_count", "stored_file_count"),
+    (
+        ("ok", 0, 0),
+        ("ok", 2, 1),
+        ("ok", 1, 2),
+        ("skipped", 0, 0),
+        ("skipped", 1, 1),
+        ("deleted", 0, 1),
+        ("cancelled", 0, 1),
+        ("failed", 0, 1),
+    ),
+)
+def test_upload_summary_count_owner_rejects_invalid_status_matrix(
+    status: str,
+    requested_file_count: int,
+    stored_file_count: int,
+) -> None:
+    """runtime summary owner 必须拒绝不一致或非零 non-ok stored count。
+
+    Args:
+        status: runtime 上传终态。
+        requested_file_count: validated request 文件数。
+        stored_file_count: 非法 publication count fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: constructor 接受非法矩阵时抛出。
+    """
+
+    with pytest.raises(ValueError, match="file_count"):
+        FinsUploadResultSummary(
+            source_kind=SourceKind.FILING,
+            status=status,
+            requested_file_count=requested_file_count,
+            stored_file_count=stored_file_count,
+            failure_reason=_runtime_failure_for_status(status),
+        )
+
+
+@pytest.mark.parametrize(
+    ("requested_file_count", "stored_file_count"),
+    ((True, 0), (0, True), (-1, 0), (0, -1)),
+)
+def test_upload_summary_count_owner_rejects_bool_and_negative_counts(
+    requested_file_count: int,
+    stored_file_count: int,
+) -> None:
+    """runtime summary count owner 必须拒绝 bool 与负数。
+
+    Args:
+        requested_file_count: 非法 requested count fixture。
+        stored_file_count: 非法 stored count fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: constructor 接受非法整数语义时抛出。
+    """
+
+    with pytest.raises(ValueError, match="file_count"):
+        FinsUploadResultSummary(
+            source_kind=SourceKind.FILING,
+            status="cancelled",
+            requested_file_count=requested_file_count,
+            stored_file_count=stored_file_count,
+        )
+
+
+def _constructor_keyword_sets(source_path: Path, constructor_name: str) -> list[frozenset[str]]:
+    """读取 production AST 并返回指定 constructor 的显式关键字集合。
+
+    Args:
+        source_path: 待审计 production Python 文件。
+        constructor_name: constructor 符号名。
+
+    Returns:
+        每个 constructor call 的显式关键字名称集合。
+
+    Raises:
+        OSError: production 文件读取失败时抛出。
+        SyntaxError: production 文件无法解析时抛出。
+    """
+
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    return [
+        frozenset(keyword.arg for keyword in node.keywords if keyword.arg is not None)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == constructor_name
+    ]
+
+
+def test_production_upload_count_constructors_are_explicit_and_complete() -> None:
+    """production constructor inventory 必须与 S1 review 裁决后的清单完全一致。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: constructor 数量或 required count 关键字缺失时抛出。
+        OSError: production 文件读取失败时抛出。
+        SyntaxError: production 文件无法解析时抛出。
+    """
+
+    fins_root = Path(ingestion_runtime.__file__).parent
+    summary_calls = _constructor_keyword_sets(
+        fins_root / "ingestion_runtime.py",
+        "FinsUploadResultSummary",
+    ) + _constructor_keyword_sets(
+        fins_root / "service_runtime.py",
+        "FinsUploadResultSummary",
+    )
+    operation_calls: list[frozenset[str]] = []
+    for source_path in (
+        fins_root / "pipelines" / "docling_upload_service.py",
+        fins_root / "pipelines" / "sec_upload_workflow.py",
+        fins_root / "pipelines" / "cn_pipeline.py",
+    ):
+        operation_calls.extend(_constructor_keyword_sets(source_path, "UploadOperationResult"))
+    ingestion_tree = ast.parse(
+        (fins_root / "ingestion_runtime.py").read_text(encoding="utf-8"),
+        filename=str(fins_root / "ingestion_runtime.py"),
+    )
+    pipeline_class = next(
+        node
+        for node in ingestion_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "FinsUploadPipelineResult"
+    )
+    parser_method = next(
+        node
+        for node in pipeline_class.body
+        if isinstance(node, ast.FunctionDef) and node.name == "from_pipeline_json"
+    )
+    pipeline_calls = [
+        frozenset(keyword.arg for keyword in node.keywords if keyword.arg is not None)
+        for node in ast.walk(parser_method)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "cls"
+    ]
+
+    assert len(summary_calls) == 4
+    assert all({"requested_file_count", "stored_file_count"} <= keywords for keywords in summary_calls)
+    assert len(operation_calls) == 4
+    assert all("stored_file_count" in keywords for keywords in operation_calls)
+    assert pipeline_calls == [frozenset({
+        "status",
+        "stored_file_count",
+        "document_id",
+        "internal_document_id",
+        "primary_document",
+        "deleted",
+        "skip_reason",
+        "document_version",
+        "source_fingerprint",
+        "failure_reason",
+    })]
 
 
 def _valid_runtime_filing_request(*, ticker: str = "AAPL") -> FinsUploadFilingRequest:
@@ -1653,6 +2003,8 @@ class _BarrierUploadRunner(FinsUploadRunner):
             return FinsUploadResultSummary(
                 source_kind=raw_request.source_kind,
                 status="cancelled",
+                requested_file_count=len(raw_request.files),
+                stored_file_count=0,
             )
         return self.accepted_summary
 
@@ -1758,7 +2110,8 @@ class _BlockingArtifactUploadRunner(FinsUploadRunner):
             document_id=self.document_id,
             internal_document_id=self.document_id,
             status="ok",
-            uploaded_files=(f"{self.document_id}.md",),
+            requested_file_count=1,
+            stored_file_count=1,
             primary_document=f"{self.document_id}.md",
         )
 
@@ -3435,6 +3788,8 @@ async def test_direct_upload_projection_failure_before_claim_emits_single_failur
         source_kind=SourceKind.FILING,
         document_id=oversized_direct_label,
         status="ok",
+        requested_file_count=1,
+        stored_file_count=1,
     )
     assert summary.to_json_summary()["document_id"] == oversized_direct_label
     runtime = _build_ingestion_runtime(
@@ -3474,7 +3829,12 @@ async def test_direct_upload_cancel_before_final_checkpoint_returns_only_cancell
 
     states = _record_direct_cancellation_states(monkeypatch)
     runner = _BarrierUploadRunner(
-        accepted_summary=FinsUploadResultSummary(source_kind=SourceKind.FILING, status="ok"),
+        accepted_summary=FinsUploadResultSummary(
+            source_kind=SourceKind.FILING,
+            status="ok",
+            requested_file_count=1,
+            stored_file_count=1,
+        ),
         observe_cancel_before_summary=True,
     )
     runtime = _build_ingestion_runtime(
@@ -3518,7 +3878,12 @@ async def test_direct_upload_cancel_after_commit_before_summary_keeps_completed(
 
     states = _record_direct_cancellation_states(monkeypatch)
     runner = _BarrierUploadRunner(
-        accepted_summary=FinsUploadResultSummary(source_kind=SourceKind.FILING, status="ok"),
+        accepted_summary=FinsUploadResultSummary(
+            source_kind=SourceKind.FILING,
+            status="ok",
+            requested_file_count=1,
+            stored_file_count=1,
+        ),
         observe_cancel_before_summary=False,
     )
     runtime = _build_ingestion_runtime(
@@ -3618,6 +3983,8 @@ async def test_direct_upload_cancel_around_summary_claim_keeps_progress_result_a
             FinsUploadResultSummary(
                 source_kind=SourceKind.FILING,
                 status=status,
+                requested_file_count=1 if status == "ok" else 0,
+                stored_file_count=1 if status == "ok" else 0,
                 failure_reason=_runtime_failure_for_status(status),
             )
         ),
@@ -4356,6 +4723,8 @@ def test_start_upload_persists_queued_record_and_uses_public_ticker_normalizatio
             source_kind=SourceKind.FILING,
             document_id="aapl-2024-10k",
             status="ok",
+            requested_file_count=1,
+            stored_file_count=1,
         )
     )
     runtime = _build_ingestion_runtime(workspace_root, executor=executor, upload_runner=runner)
@@ -4462,7 +4831,8 @@ def test_start_upload_without_runner_writes_failed_terminal_record(tmp_path: Pat
     assert record.source_kind is SourceKind.MATERIAL
     assert record.result_summary["source_kind"] == "material"
     assert record.result_summary["status"] == "failed"
-    assert record.result_summary["uploaded_files"] == []
+    assert record.result_summary["requested_file_count"] == 0
+    assert record.result_summary["stored_file_count"] == 0
     assert "unsupported upload runtime" in str(record.failure_summary["message"])
     assert "production upload runner" in str(record.failure_summary["message"])
 
@@ -4478,7 +4848,8 @@ def test_start_upload_with_runner_writes_bounded_result_summary(tmp_path: Path) 
             document_id="aapl-investor-day",
             internal_document_id="aapl-investor-day-internal",
             status="ok",
-            uploaded_files=("primary.pdf",),
+            requested_file_count=1,
+            stored_file_count=1,
             primary_document="primary.pdf",
             deleted=False,
             skip_reason=None,
@@ -4508,7 +4879,8 @@ def test_start_upload_with_runner_writes_bounded_result_summary(tmp_path: Path) 
     assert record.result_summary["document_id"] == "aapl-investor-day"
     assert record.result_summary["internal_document_id"] == "aapl-investor-day-internal"
     assert record.result_summary["status"] == "ok"
-    assert record.result_summary["uploaded_files"] == ["primary.pdf"]
+    assert record.result_summary["requested_file_count"] == 1
+    assert record.result_summary["stored_file_count"] == 1
     assert record.result_summary["primary_document"] == "primary.pdf"
     assert record.result_summary["deleted"] is False
     assert record.result_summary["document_version"] == "v2"
@@ -4524,8 +4896,13 @@ def test_start_upload_with_runner_writes_bounded_result_summary(tmp_path: Path) 
     assert progress_events[0].document_id == "aapl-investor-day"
     assert progress_events[0].payload["source_kind"] == "material"
     assert progress_events[0].payload["file_count"] == 1
+    assert "requested_file_count" not in progress_events[0].payload
+    assert "stored_file_count" not in progress_events[0].payload
     assert progress_events[1].document_id == "aapl-investor-day"
     assert progress_events[1].payload["upload_status"] == "ok"
+    assert progress_events[1].payload["file_count"] == 1
+    assert "requested_file_count" not in progress_events[1].payload
+    assert "stored_file_count" not in progress_events[1].payload
 
 
 @pytest.mark.asyncio
@@ -4538,7 +4915,8 @@ async def test_direct_upload_stream_omits_paths_job_ids_and_raw_payload_text(tmp
             source_kind=SourceKind.FILING,
             document_id="aapl-2024-10k",
             status="ok",
-            uploaded_files=("primary.pdf",),
+            requested_file_count=1,
+            stored_file_count=1,
             primary_document="primary.pdf",
         )
     )
@@ -4566,11 +4944,53 @@ async def test_direct_upload_stream_omits_paths_job_ids_and_raw_payload_text(tmp
 
     assert events[-1].result is not None
     assert events[-1].result.status is FinsResultStatus.SUCCESS
+    details = {detail.label: detail.value for detail in events[-1].result.details}
+    assert details["requested files"] == "1"
+    assert details["stored files"] == "1"
+    assert "uploaded files" not in details
     assert str(tmp_path) not in event_text
     assert "aapl-10k.pdf" not in event_text
     assert "finsjob_" not in event_text
     assert "raw provider payload" not in event_text
     assert "Annual recurring revenue increased" not in event_text
+
+
+@pytest.mark.asyncio
+async def test_direct_upload_without_runner_reports_requested_and_zero_stored_counts(
+    tmp_path: Path,
+) -> None:
+    """direct runner 未装配时必须从请求投影 requested，并保持 stored 为零。
+
+    Args:
+        tmp_path: pytest 临时目录夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: failure 文案或 requested/stored count 语义漂移时抛出。
+    """
+
+    ingestion = _build_ingestion_runtime(
+        tmp_path / "fins-workspace",
+        executor=_HoldingExecutor(),
+    )
+    events = await _collect_direct_events(
+        ingestion.upload(
+            FinsUploadMaterialRequest(
+                ticker="AAPL",
+                files=(Path("first.pdf"), Path("second.pdf")),
+            )
+        )
+    )
+
+    result = events[-1].result
+    assert result is not None
+    assert result.status is FinsResultStatus.FAILURE
+    assert result.error_message == direct_upload_runtime_unavailable_message()
+    details = {detail.label: detail.value for detail in result.details}
+    assert details["requested files"] == "2"
+    assert details["stored files"] == "0"
 
 
 def test_start_upload_failed_status_emits_completed_with_failures_progress(tmp_path: Path) -> None:
@@ -4584,8 +5004,9 @@ def test_start_upload_failed_status_emits_completed_with_failures_progress(tmp_p
             document_id="aapl-investor-day",
             internal_document_id="aapl-investor-day-internal",
             status="failed",
+            requested_file_count=1,
+            stored_file_count=0,
             failure_reason=fins_upload_failure_from_exception(RuntimeError()),
-            uploaded_files=(),
             primary_document=None,
             deleted=False,
             skip_reason="fixture failure",
@@ -4665,6 +5086,8 @@ def test_durable_upload_projection_failure_preserves_accepted_terminal(
             FinsUploadResultSummary(
                 source_kind=SourceKind.FILING,
                 status=status,
+                requested_file_count=1 if status == "ok" else 0,
+                stored_file_count=1 if status == "ok" else 0,
                 failure_reason=_runtime_failure_for_status(status),
             )
         ),
@@ -4792,7 +5215,12 @@ def test_durable_upload_cancel_before_final_checkpoint_saves_only_cancelled(
 
     executor = _HoldingExecutor()
     runner = _BarrierUploadRunner(
-        accepted_summary=FinsUploadResultSummary(source_kind=SourceKind.FILING, status="ok"),
+        accepted_summary=FinsUploadResultSummary(
+            source_kind=SourceKind.FILING,
+            status="ok",
+            requested_file_count=1,
+            stored_file_count=1,
+        ),
         observe_cancel_before_summary=True,
     )
     runtime = _build_ingestion_runtime(
@@ -4847,7 +5275,12 @@ def test_durable_upload_cancel_after_commit_before_summary_keeps_completed(
 
     executor = _HoldingExecutor()
     runner = _BarrierUploadRunner(
-        accepted_summary=FinsUploadResultSummary(source_kind=SourceKind.FILING, status="ok"),
+        accepted_summary=FinsUploadResultSummary(
+            source_kind=SourceKind.FILING,
+            status="ok",
+            requested_file_count=1,
+            stored_file_count=1,
+        ),
         observe_cancel_before_summary=False,
     )
     runtime = _build_ingestion_runtime(
@@ -4975,6 +5408,8 @@ def test_durable_upload_cancel_before_atomic_save_keeps_accepted_summary(
             FinsUploadResultSummary(
                 source_kind=SourceKind.FILING,
                 status=status,
+                requested_file_count=1 if status == "ok" else 0,
+                stored_file_count=1 if status == "ok" else 0,
                 failure_reason=_runtime_failure_for_status(status),
             )
         ),
@@ -5089,6 +5524,8 @@ def test_durable_upload_cancel_after_atomic_save_keeps_single_terminal(
             FinsUploadResultSummary(
                 source_kind=SourceKind.FILING,
                 status=status,
+                requested_file_count=1 if status == "ok" else 0,
+                stored_file_count=1 if status == "ok" else 0,
                 failure_reason=_runtime_failure_for_status(status),
             )
         ),
@@ -5148,10 +5585,14 @@ def test_accepted_upload_terminal_store_rejects_mismatch_and_preserves_existing_
     completed_summary = FinsUploadResultSummary(
         source_kind=SourceKind.FILING,
         status="ok",
+        requested_file_count=1,
+        stored_file_count=1,
     ).to_json_summary()
     failed_summary = FinsUploadResultSummary(
         source_kind=SourceKind.FILING,
         status="failed",
+        requested_file_count=0,
+        stored_file_count=0,
         failure_reason=fins_upload_failure_from_exception(RuntimeError()),
     ).to_json_summary()
     finished_at = datetime.now(timezone.utc).isoformat()
@@ -5317,17 +5758,17 @@ def test_upload_request_and_result_summaries_enforce_bounds(tmp_path: Path) -> N
     executor = _HoldingExecutor()
     runtime = _build_ingestion_runtime(workspace_root, executor=executor)
     too_many_aliases = tuple(f"alias-{index}" for index in range(ingestion_runtime._MAX_TUPLE_ITEMS + 1))
-    too_many_files = tuple(f"file-{index}.pdf" for index in range(ingestion_runtime._MAX_TUPLE_ITEMS + 1))
 
     with pytest.raises(FinsUploadUsageError) as aliases_exc:
         runtime.start_upload(FinsUploadFilingRequest(ticker="AAPL", ticker_aliases=too_many_aliases))
     assert aliases_exc.value.failure.code is FinsUploadUsageCode.TOO_MANY_TICKER_ALIASES
-    with pytest.raises(ValueError, match="uploaded_files 元素数量超出上限"):
+    with pytest.raises(ValueError, match="requested_file_count"):
         FinsUploadResultSummary(
             source_kind=SourceKind.FILING,
             status="ok",
-            uploaded_files=too_many_files,
-        ).to_json_summary()
+            requested_file_count=-1,
+            stored_file_count=0,
+        )
     assert executor.operations == []
 
 
@@ -5371,6 +5812,8 @@ def test_result_summaries_allow_slash_in_document_ids() -> None:
     upload_summary = FinsUploadResultSummary(
         source_kind=SourceKind.FILING,
         status="ok",
+        requested_file_count=1,
+        stored_file_count=1,
         document_id="sec/aapl-2024-10ka",
         internal_document_id="sec/aapl-2024-10ka-internal",
     )
@@ -5456,7 +5899,12 @@ def test_upload_status_owner_maps_only_exact_production_statuses(
         AssertionError: 两个 owner boundary 的映射不一致时抛出。
     """
 
-    pipeline_json: dict[str, JsonValue] = {"status": status}
+    stored_file_count = 1 if status == "ok" else 0
+    requested_file_count = 1 if status in {"ok", "skipped"} else 0
+    pipeline_json: dict[str, JsonValue] = {
+        "status": status,
+        "stored_file_count": stored_file_count,
+    }
     if status == "failed":
         pipeline_json["failure"] = {
             "kind": "runtime",
@@ -5468,6 +5916,8 @@ def test_upload_status_owner_maps_only_exact_production_statuses(
     summary = FinsUploadResultSummary(
         source_kind=SourceKind.FILING,
         status=status,
+        requested_file_count=requested_file_count,
+        stored_file_count=stored_file_count,
         failure_reason=_runtime_failure_for_status(status),
     )
 
@@ -5493,9 +5943,16 @@ def test_upload_status_owner_rejects_unknown_case_and_whitespace_variants(status
     """
 
     with pytest.raises(ValueError, match="upload status"):
-        FinsUploadPipelineResult.from_pipeline_json({"status": status})
+        FinsUploadPipelineResult.from_pipeline_json(
+            {"status": status, "stored_file_count": 0}
+        )
     with pytest.raises(ValueError, match="upload status"):
-        FinsUploadResultSummary(source_kind=SourceKind.FILING, status=status)
+        FinsUploadResultSummary(
+            source_kind=SourceKind.FILING,
+            status=status,
+            requested_file_count=0,
+            stored_file_count=0,
+        )
 
 
 def test_prepare_observed_operations_do_not_submit_until_activation(tmp_path: Path) -> None:
@@ -5960,6 +6417,8 @@ def test_job_event_sidecar_omits_paths_payload_bodies_and_raw_provider_payloads(
             source_kind=SourceKind.FILING,
             document_id="aapl-2024-10k",
             status="ok",
+            requested_file_count=1,
+            stored_file_count=1,
         )
     )
     ingestion = _build_ingestion_runtime(workspace_root, executor=executor, upload_runner=runner)
@@ -6280,6 +6739,8 @@ def test_progress_event_append_failure_warns_and_job_still_succeeds(
             source_kind=SourceKind.FILING,
             document_id="aapl-2024-10k",
             status="ok",
+            requested_file_count=1,
+            stored_file_count=1,
         )
     )
     ingestion = _build_ingestion_runtime(

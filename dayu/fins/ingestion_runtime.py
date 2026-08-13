@@ -174,6 +174,8 @@ _KEY_SEQUENCE: Final[str] = "sequence"
 _KEY_EVENT_TYPE: Final[str] = "event_type"
 _KEY_SOURCE_EVENT_TYPE: Final[str] = "source_event_type"
 _KEY_DOCUMENT_ID: Final[str] = "document_id"
+_KEY_REQUESTED_FILE_COUNT: Final[str] = "requested_file_count"
+_KEY_STORED_FILE_COUNT: Final[str] = "stored_file_count"
 _KEY_MESSAGE: Final[str] = "message"
 _KEY_PAYLOAD: Final[str] = "payload"
 _KEY_EMITTED_AT: Final[str] = "emitted_at"
@@ -323,6 +325,26 @@ def _upload_terminal_disposition_from_status(status: str) -> FinsUploadTerminalD
     if disposition is None:
         raise ValueError(f"未知 upload status: {status!r}")
     return disposition
+
+
+def _validate_required_non_negative_count(value: int, field_name: str) -> None:
+    """校验 required count 是非 bool 的非负整数。
+
+    Args:
+        value: 待校验计数。
+        field_name: 对外 contract 字段名。
+
+    Returns:
+        无。
+
+    Raises:
+        ValueError: 值为 bool、非整数或负数时抛出。
+    """
+
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"{field_name} 必须是整数")
+    if value < 0:
+        raise ValueError(f"{field_name} 不能为负数")
 
 
 def _direct_upload_result_status(
@@ -1147,6 +1169,7 @@ class FinsUploadPipelineResult:
 
     Attributes:
         status: 上传业务状态，pipeline 必须显式提供。
+        stored_file_count: commit 成功后发布的用户输入 original 数。
         document_id: 可选业务文档 ID。
         internal_document_id: 可选来源内部文档 ID。
         primary_document: 可选主文件名。
@@ -1157,6 +1180,7 @@ class FinsUploadPipelineResult:
     """
 
     status: str
+    stored_file_count: int
     document_id: str | None = None
     internal_document_id: str | None = None
     primary_document: str | None = None
@@ -1165,6 +1189,34 @@ class FinsUploadPipelineResult:
     document_version: str | None = None
     source_fingerprint: str | None = None
     failure_reason: FinsUploadFailureReason | None = None
+
+    def __post_init__(self) -> None:
+        """校验 pipeline terminal count 与 failure 的完整状态矩阵。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: status、stored count 或 failure 组合不符合闭集契约时抛出。
+        """
+
+        _upload_terminal_disposition_from_status(self.status)
+        _validate_required_non_negative_count(
+            self.stored_file_count,
+            _KEY_STORED_FILE_COUNT,
+        )
+        if self.status == _UPLOAD_RESULT_STATUS_OK:
+            if self.stored_file_count < 1:
+                raise ValueError("ok upload pipeline result 的 stored_file_count 必须大于等于 1")
+        elif self.stored_file_count != 0:
+            raise ValueError("非 ok upload pipeline result 的 stored_file_count 必须为 0")
+        if self.status == _UPLOAD_RESULT_STATUS_FAILED and self.failure_reason is None:
+            raise ValueError("failed upload pipeline result 必须包含 failure")
+        if self.status != _UPLOAD_RESULT_STATUS_FAILED and self.failure_reason is not None:
+            raise ValueError("非 failed upload pipeline result 禁止包含 failure")
 
     @classmethod
     def from_pipeline_json(cls, result: Mapping[str, JsonValue]) -> "FinsUploadPipelineResult":
@@ -1181,15 +1233,11 @@ class FinsUploadPipelineResult:
         """
 
         status = _required_upload_result_status(result)
-        _upload_terminal_disposition_from_status(status)
         raw_failure = result.get("failure")
         failure_reason = upload_failure_reason_from_json(raw_failure)
-        if status == _UPLOAD_RESULT_STATUS_FAILED and failure_reason is None:
-            raise ValueError("failed upload pipeline result 必须包含 failure")
-        if status != _UPLOAD_RESULT_STATUS_FAILED and failure_reason is not None:
-            raise ValueError("非 failed upload pipeline result 禁止包含 failure")
         return cls(
             status=status,
+            stored_file_count=_required_upload_result_int(result, _KEY_STORED_FILE_COUNT),
             document_id=_optional_upload_result_text(result, "document_id"),
             internal_document_id=_optional_upload_result_text(result, "internal_document_id"),
             primary_document=_optional_upload_result_text(result, "primary_document"),
@@ -1210,7 +1258,8 @@ class FinsUploadResultSummary:
         document_id: 可选业务文档 ID。
         internal_document_id: 可选来源内部文档 ID。
         status: 上传业务状态摘要。
-        uploaded_files: 已写入或处理的文件名摘要；不得包含路径。
+        requested_file_count: validated request 中的用户输入文件数。
+        stored_file_count: commit 成功后发布的用户输入 original 数。
         primary_document: 可选主文件名。
         deleted: 是否执行了删除动作；``None`` 表示 pipeline 未声明。
         skip_reason: 可选跳过原因。
@@ -1220,9 +1269,10 @@ class FinsUploadResultSummary:
 
     source_kind: SourceKind
     status: str
+    requested_file_count: int
+    stored_file_count: int
     document_id: str | None = None
     internal_document_id: str | None = None
-    uploaded_files: tuple[str, ...] = ()
     primary_document: str | None = None
     deleted: bool | None = None
     skip_reason: str | None = None
@@ -1244,6 +1294,26 @@ class FinsUploadResultSummary:
         """
 
         disposition = _upload_terminal_disposition_from_status(self.status)
+        _validate_required_non_negative_count(
+            self.requested_file_count,
+            _KEY_REQUESTED_FILE_COUNT,
+        )
+        _validate_required_non_negative_count(
+            self.stored_file_count,
+            _KEY_STORED_FILE_COUNT,
+        )
+        if self.status == _UPLOAD_RESULT_STATUS_OK:
+            if self.requested_file_count < 1:
+                raise ValueError("ok upload summary 的 requested_file_count 必须大于等于 1")
+            if self.stored_file_count != self.requested_file_count:
+                raise ValueError("ok upload summary 的 stored_file_count 必须等于 requested_file_count")
+        elif self.status == _UPLOAD_RESULT_STATUS_SKIPPED:
+            if self.requested_file_count < 1:
+                raise ValueError("skipped upload summary 的 requested_file_count 必须大于等于 1")
+            if self.stored_file_count != 0:
+                raise ValueError("非 ok upload summary 的 stored_file_count 必须为 0")
+        elif self.stored_file_count != 0:
+            raise ValueError("非 ok upload summary 的 stored_file_count 必须为 0")
         if disposition is FinsUploadTerminalDisposition.FAILED and self.failure_reason is None:
             raise ValueError("failed upload summary 必须包含 failure_reason")
         if disposition is not FinsUploadTerminalDisposition.FAILED and self.failure_reason is not None:
@@ -1290,7 +1360,8 @@ class FinsUploadResultSummary:
                 reject_path_separators=False,
             ),
             "status": _bounded_text(self.status, "upload_status", reject_path_separators=False),
-            "uploaded_files": list(_bounded_text_tuple(self.uploaded_files, "uploaded_files")),
+            _KEY_REQUESTED_FILE_COUNT: self.requested_file_count,
+            _KEY_STORED_FILE_COUNT: self.stored_file_count,
             "primary_document": _optional_bounded_text(self.primary_document, "primary_document"),
             "deleted": self.deleted,
             "skip_reason": _optional_bounded_text(
@@ -3874,6 +3945,8 @@ class FinsIngestionRuntime:
                     FinsUploadResultSummary(
                         source_kind=_raw_upload_request(request).source_kind,
                         status=_UPLOAD_RESULT_STATUS_FAILED,
+                        requested_file_count=len(_raw_upload_request(request).files),
+                        stored_file_count=0,
                         failure_reason=fins_upload_failure_from_exception(RuntimeError()),
                     )
                 ),
@@ -4350,6 +4423,8 @@ class FinsIngestionRuntime:
                     result_summary=FinsUploadResultSummary(
                         source_kind=_raw_upload_request(request).source_kind,
                         status=_UPLOAD_RESULT_STATUS_FAILED,
+                        requested_file_count=len(_raw_upload_request(request).files),
+                        stored_file_count=0,
                         failure_reason=fins_upload_failure_from_exception(RuntimeError()),
                     ).to_json_summary(),
                 )
@@ -6272,9 +6347,12 @@ def _upload_result_details(summary: FinsUploadResultSummary) -> tuple[FinsEventD
     document_id = json_summary.get("document_id")
     if isinstance(document_id, str) and document_id:
         details.append(FinsEventDetail("document", document_id))
-    uploaded_files = json_summary.get("uploaded_files")
-    if isinstance(uploaded_files, list):
-        details.append(FinsEventDetail("uploaded files", str(len(uploaded_files))))
+    details.extend(
+        (
+            FinsEventDetail("requested files", str(summary.requested_file_count)),
+            FinsEventDetail("stored files", str(summary.stored_file_count)),
+        )
+    )
     if summary.failure_reason is not None:
         details.extend(
             (
@@ -6323,6 +6401,26 @@ def _required_upload_result_status(result: Mapping[str, JsonValue]) -> str:
     if not isinstance(status, str):
         raise ValueError("upload pipeline result 缺少必填文本字段: status")
     return status
+
+
+def _required_upload_result_int(result: Mapping[str, JsonValue], key: str) -> int:
+    """从 upload pipeline result 精确读取必填整数字段。
+
+    Args:
+        result: pipeline 上传结果。
+        key: 字段名。
+
+    Returns:
+        非 bool 的整数原值；状态矩阵由 typed result constructor 校验。
+
+    Raises:
+        ValueError: 字段缺失、为 bool 或不是整数时抛出。
+    """
+
+    value = result.get(key)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"upload pipeline result 字段必须是整数: {key}")
+    return value
 
 
 def _optional_upload_result_text(result: Mapping[str, JsonValue], key: str) -> str | None:

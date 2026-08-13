@@ -471,6 +471,7 @@ async def test_upload_filing_stream_uploads_docling_files(tmp_path: Path) -> Non
     assert result_value["action"] == "upload_filing"
     assert result_value["ticker"] == "AAPL"
     assert result_value["status"] == "ok"
+    assert result_value["stored_file_count"] == 1
     assert str(result_value["document_id"]).startswith("fil_sec_")
     assert result_value["filing_action"] == "create"
     company_meta = pipeline._company_repository.get_company_meta("AAPL")
@@ -689,6 +690,7 @@ async def test_upload_filing_stream_renamed_update_without_overwrite_replaces_co
     skip_result = skip_events[-1].payload["result"]
     assert isinstance(skip_result, dict)
     assert skip_result["status"] == "skipped"
+    assert skip_result["stored_file_count"] == 0
     assert skip_result["filing_action"] == "update"
     sibling_events = [
         event
@@ -981,6 +983,7 @@ async def test_upload_filing_fresh_recheck_discards_stale_action_and_company_dec
     assert isinstance(stale_result, dict)
     assert stale_result["filing_action"] == "update"
     assert stale_result["status"] == "skipped"
+    assert stale_result["stored_file_count"] == 0
     assert pipeline._company_repository.get_company_meta("AAPL").company_name == ("Published Company Name")
     assert batching.begin_tokens == []
     assert company.stage_tokens == []
@@ -1023,6 +1026,7 @@ async def test_upload_filing_rollback_failure_logs_primary_and_recovery_evidence
 
     failed_result = events[-1].payload["result"]
     assert isinstance(failed_result, dict)
+    assert failed_result["stored_file_count"] == 0
     assert failed_result["message"] == "上传执行失败，请检查运行日志后重试"
     assert "injected company stage primary failure" not in str(failed_result)
     assert "injected rollback evidence failure" not in str(failed_result)
@@ -1102,6 +1106,7 @@ async def test_upload_filing_observably_classifies_cancelled_docling_storage_and
     result = events[-1].payload["result"]
     assert isinstance(result, dict)
     assert result["status"] == expected_status
+    assert result["stored_file_count"] == 0
     if expected_code is None:
         assert events[-1].event_type is UploadFilingEventType.UPLOAD_COMPLETED
         assert "failure" not in result
@@ -1116,6 +1121,79 @@ async def test_upload_filing_observably_classifies_cancelled_docling_storage_and
         assert operator_marker in caplog.text
         assert str(error) in caplog.text
         assert str(error) not in str(result)
+
+
+@pytest.mark.parametrize(
+    ("commit_error", "expected_kind", "expected_code"),
+    (
+        (OSError("commit storage failure"), "storage", "storage_io"),
+        (RuntimeError("commit runtime failure"), "runtime", "unexpected_runtime"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_upload_filing_commit_failure_never_publishes_staged_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    commit_error: Exception,
+    expected_kind: str,
+    expected_code: str,
+) -> None:
+    """commit 失败时 staged original count 不得成为 terminal stored fact。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: commit failure 注入夹具。
+        commit_error: ``commit_batch`` 应抛出的异常。
+        expected_kind: 既有 failure kind。
+        expected_code: 既有 failure code。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: terminal count、分类或 published tree 漂移时抛出。
+    """
+
+    pipeline, batching, _company, _source = _tracking_sec_pipeline(tmp_path)
+    filing_file = tmp_path / "filing.pdf"
+    filing_file.write_text("demo filing", encoding="utf-8")
+    request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action="create",
+        company_name="Apple Inc.",
+    )
+    before_tree = published_tree_sha256(tmp_path, "AAPL")
+
+    def fail_commit(batch: BatchToken) -> None:
+        """在 storage commit owner 入口注入指定异常。
+
+        Args:
+            batch: 当前 publication batch。
+
+        Returns:
+            不返回。
+
+        Raises:
+            Exception: 始终抛出测试参数提供的 commit 异常。
+        """
+
+        del batch
+        raise commit_error
+
+    monkeypatch.setattr(batching, "commit_batch", fail_commit)
+    events = [event async for event in pipeline.upload_filing_stream(request)]
+
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    failure = result["failure"]
+    assert isinstance(failure, dict)
+    assert events[-1].event_type is UploadFilingEventType.UPLOAD_FAILED
+    assert result["stored_file_count"] == 0
+    assert failure["kind"] == expected_kind
+    assert failure["code"] == expected_code
+    assert published_tree_sha256(tmp_path, "AAPL") == before_tree == {}
+    assert batching.rollback_tokens == []
 
 
 @pytest.mark.asyncio

@@ -63,6 +63,9 @@ SUPPORTED_UPLOAD_SUFFIXES: Final[frozenset[str]] = frozenset(
 )
 UPLOAD_ACTIONS: Final[frozenset[str]] = frozenset({"create", "update", "delete"})
 DOCLING_FILE_SUFFIX: Final[str] = "_docling.json"
+_AssetSource: TypeAlias = Literal["original", "docling"]
+_ASSET_SOURCE_ORIGINAL: Final[_AssetSource] = "original"
+_ASSET_SOURCE_DOCLING: Final[_AssetSource] = "docling"
 
 UploadFileEventType = Literal[
     "conversion_started",
@@ -95,6 +98,7 @@ class UploadOperationResult:
         status: 上传状态。
         document_id: 可选业务文档 ID。
         internal_document_id: 可选内部文档 ID。
+        stored_file_count: 成功写入 staging 的用户输入 original 数；仅在 commit 成功后对外消费。
         file_events: 文件级事件。
         payload: 结果负载。
     """
@@ -102,6 +106,7 @@ class UploadOperationResult:
     status: str
     document_id: str | None
     internal_document_id: str | None
+    stored_file_count: int
     file_events: list[UploadFileEventPayload]
     payload: JsonObject
 
@@ -115,7 +120,7 @@ class _PendingFileAsset:
     content_type: str | None
     sha256: str
     size: int
-    source: str
+    source: _AssetSource
 
 
 @dataclass(frozen=True)
@@ -313,6 +318,7 @@ class DoclingUploadService:
                 status="skipped",
                 document_id=document_id,
                 internal_document_id=internal_document_id,
+                stored_file_count=0,
                 file_events=skipped_events,
                 payload={
                     "document_id": document_id,
@@ -393,6 +399,7 @@ class DoclingUploadService:
                 status="deleted",
                 document_id=prepared.document_id,
                 internal_document_id=prepared.internal_document_id,
+                stored_file_count=0,
                 file_events=[],
                 payload={
                     "document_id": prepared.document_id,
@@ -422,7 +429,7 @@ class DoclingUploadService:
                 (
                     f"Docling 转换与源文档落盘完成: ticker={prepared.ticker} "
                     f"document_id={prepared.document_id} "
-                    f"files={result.payload.get('uploaded_files')}"
+                    f"original_files={result.stored_file_count}"
                 ),
                 module=self.MODULE,
             )
@@ -488,6 +495,7 @@ class DoclingUploadService:
             )
 
         stored_entries: list[JsonObject] = []
+        stored_original_count = 0
         file_events: list[UploadFileEventPayload] = list(conversion_events)
         handle = SourceHandle(
             ticker=ticker,
@@ -507,6 +515,8 @@ class DoclingUploadService:
                 batch=batch,
                 content_type=asset.content_type,
             )
+            if asset.source == _ASSET_SOURCE_ORIGINAL:
+                stored_original_count += 1
             stored_entries.append(_build_stored_file_entry(asset=asset, file_meta=file_meta))
             file_events.append(
                 UploadFileEventPayload(
@@ -548,12 +558,12 @@ class DoclingUploadService:
             status="uploaded",
             document_id=document_id,
             internal_document_id=internal_document_id,
+            stored_file_count=stored_original_count,
             file_events=file_events,
             payload={
                 "document_id": document_id,
                 "internal_document_id": internal_document_id,
                 "primary_document": primary_document,
-                "uploaded_files": len(stored_entries),
                 "source_fingerprint": source_fingerprint,
                 "document_version": document_version,
             },
@@ -680,7 +690,7 @@ class DoclingUploadService:
                     content_type=raw_content_type,
                     sha256=raw_sha256,
                     size=len(raw_data),
-                    source="original",
+                    source=_ASSET_SOURCE_ORIGINAL,
                 )
             )
         return assets
@@ -741,7 +751,7 @@ class DoclingUploadService:
                     content_type="application/json",
                     sha256=docling_sha256,
                     size=len(docling_data),
-                    source="docling",
+                    source=_ASSET_SOURCE_DOCLING,
                 )
             )
         return assets, conversion_events
@@ -1410,6 +1420,7 @@ def _build_cancelled_result(*, document_id: str, internal_document_id: str) -> U
         status="cancelled",
         document_id=document_id,
         internal_document_id=internal_document_id,
+        stored_file_count=0,
         file_events=[],
         payload={
             "document_id": document_id,

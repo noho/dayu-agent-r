@@ -31,6 +31,7 @@ from dayu.fins.pipelines.cn_download_models import (
 )
 from dayu.fins.pipelines.cn_pipeline import CnPipeline, collect_cn_download_result_from_events
 from dayu.fins.pipelines.docling_process_converter import (
+    DoclingConversionCancelledError,
     DoclingConversionConfig,
     DoclingConversionResult,
 )
@@ -838,6 +839,7 @@ async def test_upload_filing_stream_uploads_files_with_docling(tmp_path: Path) -
     assert result_value["pipeline"] == "cn"
     assert result_value["action"] == "upload_filing"
     assert result_value["status"] == "ok"
+    assert result_value["stored_file_count"] == 1
     assert str(result_value["document_id"]).startswith("fil_cn_")
     assert result_value["filing_action"] == "create"
     meta = pipeline._source_repository.get_source_meta(
@@ -999,6 +1001,7 @@ async def test_upload_material_failure_preserves_existing_user_visible_semantics
     result = events[-1].payload["result"]
     assert isinstance(result, dict)
     assert result["status"] == "failed"
+    assert result["stored_file_count"] == 0
     assert result["message"] == "create/update 时必须提供 --company-name"
     assert "failure" not in result
     assert events[-1].payload["error"] == "create/update 时必须提供 --company-name"
@@ -1070,9 +1073,11 @@ async def test_upload_filing_stream_auto_resolves_create_update_skip(tmp_path: P
     assert create_result["filing_action"] == "create"
     assert update_result["filing_action"] == "update"
     assert update_result["status"] == "ok"
+    assert update_result["stored_file_count"] == 1
     assert update_result["document_id"] == create_result["document_id"]
     assert skip_result["filing_action"] == "update"
     assert skip_result["status"] == "skipped"
+    assert skip_result["stored_file_count"] == 0
     handle = pipeline._source_repository.get_source_handle(
         "600519",
         str(create_result["document_id"]),
@@ -1317,10 +1322,48 @@ async def test_upload_filing_storage_and_generic_failures_use_distinct_typed_cat
     assert isinstance(result, dict)
     failure = result["failure"]
     assert isinstance(failure, dict)
+    assert result["stored_file_count"] == 0
     assert failure["code"] == expected_code
     assert operator_marker in caplog.text
     assert str(error) in caplog.text
     assert str(error) not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_upload_filing_conversion_cancelled_has_zero_stored_count(tmp_path: Path) -> None:
+    """CN/HK conversion cancelled producer 必须显式投影 stored zero。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: cancelled terminal、count 或 publication 边界漂移时抛出。
+    """
+
+    pipeline = CnPipeline(
+        workspace_root=tmp_path,
+        docling_converter=_FailingCnUploadConverter(DoclingConversionCancelledError()),
+    )
+    filing_file = tmp_path / "annual.pdf"
+    filing_file.write_text("demo cn filing", encoding="utf-8")
+    request = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action="create",
+        company_name="贵州茅台",
+    )
+
+    events = [event async for event in pipeline.upload_filing_stream(request)]
+
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    assert events[-1].event_type is UploadFilingEventType.UPLOAD_COMPLETED
+    assert result["status"] == "cancelled"
+    assert result["stored_file_count"] == 0
+    assert published_tree_sha256(tmp_path, "600519") == {}
 
 
 @pytest.mark.asyncio
@@ -1427,6 +1470,7 @@ async def test_hk_upload_filing_facade_consumes_typed_request_and_fresh_snapshot
     assert isinstance(result, dict)
     assert result["pipeline"] == "hk"
     assert result["status"] == "ok"
+    assert result["stored_file_count"] == 1
     assert (
         pipeline._filing_upload_state_repository.read_filing_upload_state(
             request.normalized_ticker.canonical,
@@ -1487,6 +1531,7 @@ async def test_upload_material_stream_overwrite_resets_single_document(tmp_path:
     assert isinstance(create_result, dict)
     assert isinstance(overwrite_result, dict)
     assert overwrite_result["status"] == "ok"
+    assert overwrite_result["stored_file_count"] == 1
     assert overwrite_result["material_action"] == "update"
     assert overwrite_result["document_id"] == create_result["document_id"]
 

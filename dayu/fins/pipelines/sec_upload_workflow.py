@@ -21,7 +21,6 @@ from dayu.fins.ingestion_runtime import (
     validate_fins_upload_filing_request,
 )
 from dayu.fins.pipelines.docling_process_converter import (
-    DoclingConversionCancelledError,
     DoclingConversionError,
 )
 from dayu.fins.pipelines.docling_upload_service import (
@@ -275,43 +274,7 @@ async def run_upload_filing_stream(
             ticker_aliases=_json_text_list(list(raw_request.ticker_aliases)),
             overwrite=raw_request.overwrite,
             **upload_result.payload,
-            status=_resolve_upload_status(upload_result.status),
-        )
-        yield UploadFilingEvent(
-            event_type=UploadFilingEventType.UPLOAD_COMPLETED,
-            ticker=normalized_ticker,
-            document_id=document_id,
-            payload={"result": result},
-        )
-    except DoclingConversionCancelledError:
-        upload_result = UploadOperationResult(
-            status="cancelled",
-            document_id=document_id,
-            internal_document_id=internal_document_id,
-            file_events=[],
-            payload={
-                "document_id": document_id,
-                "internal_document_id": internal_document_id,
-                "skip_reason": "cancelled",
-            },
-        )
-        result = host._build_result(
-            action="upload_filing",
-            ticker=normalized_ticker,
-            filing_action=normalized_action,
-            requested_action=requested_action,
-            resolved_action=normalized_action,
-            files=_json_text_list([str(path) for path in raw_request.files]),
-            fiscal_year=raw_request.fiscal_year,
-            fiscal_period=normalized_period,
-            amended=raw_request.amended,
-            filing_date=raw_request.filing_date,
-            report_date=raw_request.report_date,
-            company_id=normalized_company_id,
-            company_name=raw_request.company_name,
-            ticker_aliases=_json_text_list(list(raw_request.ticker_aliases)),
-            overwrite=raw_request.overwrite,
-            **upload_result.payload,
+            stored_file_count=upload_result.stored_file_count,
             status=_resolve_upload_status(upload_result.status),
         )
         yield UploadFilingEvent(
@@ -415,6 +378,7 @@ def _build_sec_filing_failure_event(
         company_name=raw_request.company_name,
         ticker_aliases=_json_text_list(list(raw_request.ticker_aliases)),
         overwrite=raw_request.overwrite,
+        stored_file_count=0,
         status="failed",
         message=failure_reason.message,
         failure=failure_reason.to_json(),
@@ -595,6 +559,7 @@ async def run_upload_material_stream(
             company_name=company_name,
             overwrite=overwrite,
             **upload_result.payload,
+            stored_file_count=upload_result.stored_file_count,
             status=_resolve_upload_status(upload_result.status),
         )
         yield UploadMaterialEvent(
@@ -622,6 +587,7 @@ async def run_upload_material_stream(
             company_id=normalized_company_id,
             company_name=company_name,
             overwrite=overwrite,
+            stored_file_count=0,
             status="failed",
             message=str(exc),
         )
