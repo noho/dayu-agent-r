@@ -370,10 +370,13 @@ class FilingUploadStateRepositoryProtocol(Protocol):
     ) -> FilingUploadPublishedState: ...
 ```
 
-- FS 实现必须按唯一顺序执行：先规范 external ticker，再调用 storage owner 已有 canonical ticker-root
-  read helper `_ticker_dir_for_read(external_ticker)` 判定 published root。只有该 helper 抛出的 exact
-  `FileNotFoundError` 可短路为 `(None, None)`；此分支不得调用 `_acquire_publication_guard`，不得创建
-  `.dayu`、`portfolio`、lock。
+- FS 实现必须按唯一顺序执行：先规范 external ticker，再调用 storage owner 新增的 private tri-state helper
+  `_ticker_dir_if_present_for_read(external_ticker) -> Path | None`。它复用 `_fs_identity.py` 新增的
+  `_identity_directory_if_present_for_read(...) -> Path | None` 及既有 descriptor 校验规则：namespace/identity
+  directory absent 返回 `None`，existing valid 返回 canonical locator，symlink/descriptor mismatch/corruption
+  fail closed。只有 `None` 可短路为 `(None, None)`；此分支不得调用 `_acquire_publication_guard`，不得创建
+  `.dayu`、`portfolio`、lock。既有 `_ticker_dir_for_read` 的真实契约是 absent 时仍返回确定性 locator，
+  不得把它误当 absent predicate，也不得修改其既有 contract。
 - canonical root existing 时才 `_acquire_publication_guard(external_ticker)` **一次**，在同一个 guard 内依次调用
   `_get_company_meta_unguarded(external_ticker)` 与
   `_get_source_meta_unguarded(external_ticker, document_id, SourceKind.FILING)`，分别只把 exact
@@ -398,6 +401,10 @@ class FilingUploadStateRepositoryProtocol(Protocol):
   不新增 wrapper/overload。
 - `FsFinsIngestionJobStore.__post_init__` 不创建目录；`create_job` 在获取 job lock 前调用私有
   `_ensure_root_for_write()`。read/save missing 不为不存在的 job store 创目录。
+- `SecPipeline`、`CnPipeline` 及 SEC/CN/HK download adapter builder 的内部 fallback repository set 必须使用
+  `build_fs_repository_set(..., create_directories=False)`，并让默认具体 repositories 共享该 lazy set。
+  即使 caller 已注入全部具体 repositories，也不得先构造一个未使用的 eager set。首次真实写仍只由
+  `begin_batch`/repository write owner 创建目录；不新增 repository-set public 参数或兼容 wrapper。
 - direct upload 不创建 legacy job；合法内容失败若 publication batch 尚未开始，fresh workspace 保持空。
 - 该变化只消除 eager side effect，不改变 batch recovery、download/preprocess 写路径或 durable legacy job schema。
 
@@ -522,6 +529,11 @@ class FinsUploadFailureReason:
   - `FsFinsIngestionJobStore.__post_init__` / `create_job` / `_ensure_root_for_write`
 - `dayu/fins/storage/repository_protocols.py`
   - `FilingUploadPublishedState`、`FilingUploadStateRepositoryProtocol`
+- `dayu/fins/storage/_fs_identity.py`
+  - 新增 private `_identity_directory_if_present_for_read`，复用既有 identity/descriptor validation，
+    以 `Path | None` 精确表达 valid/absent，corruption fail closed；不修改 `_identity_directory_for_read` 契约
+- `dayu/fins/storage/_fs_storage_infra.py`
+  - 新增 private `_ticker_dir_if_present_for_read`，只委托 identity owner 的 tri-state helper，不 mkdir/lock
 - `dayu/fins/storage/_fs_storage_core.py`
   - 组合 `_FsFilingUploadStateMixin`
 - `dayu/fins/storage/__init__.py`
@@ -542,6 +554,7 @@ class FinsUploadFailureReason:
   - `prepare_upload(..., previous_meta=...)` 不再自行读取 state
   - `commit_prepared_upload_batch` 生命周期不改，只扩展 docstring/断言同 batch 使用
 - `dayu/fins/pipelines/sec_pipeline.py`
+  - constructor 与 `build_sec_download_adapter` 的 fallback repository set 使用 `create_directories=False`
   - `SecPipeline.__init__(..., filing_upload_state_repository: FilingUploadStateRepositoryProtocol, ...)`
   - `SecPipeline.upload_filing` / `upload_filing_stream` 改收 typed validated request，并把同一 repository identity
     与 request 透传给 workflow
@@ -551,6 +564,8 @@ class FinsUploadFailureReason:
     单 publication unit + typed failure
   - `run_upload_material_stream` 仅做 failure projection 回归所需的共用 helper 迁移；material 原子业务不扩 scope
 - `dayu/fins/pipelines/cn_pipeline.py`
+  - constructor、`build_cn_download_adapter`、`build_hk_download_adapter` 的 fallback repository set 使用
+    `create_directories=False`
   - `CnPipeline.__init__(..., filing_upload_state_repository: FilingUploadStateRepositoryProtocol, ...)` 注入与 SEC
     相同 repository instance
   - `upload_filing` / `upload_filing_stream` 改收 typed validated request；CN/HK 共用同一 snapshot/recheck，
@@ -575,8 +590,9 @@ class FinsUploadFailureReason:
 
 ### S1 — Pure published-state read + lazy bootstrap
 
-**实现文件**：storage 新文件、`repository_protocols.py`、`_fs_storage_core.py`、`storage/__init__.py`、
-`ingestion_runtime.py` job store、`service_runtime.py` runtime create。
+**实现文件**：storage 新文件、`repository_protocols.py`、`_fs_identity.py`、`_fs_storage_infra.py`、
+`_fs_storage_core.py`、`storage/__init__.py`、`ingestion_runtime.py` job store、`service_runtime.py` runtime create、
+`sec_pipeline.py` / `cn_pipeline.py` lazy fallback composition。
 
 **owner tests**：`tests/fins/test_fins_storage_atomicity.py`、`tests/fins/test_fins_storage_provider.py`、
 `tests/fins/test_fins_ingestion_runtime.py`。
@@ -589,8 +605,12 @@ Exact assertions：
   fail closed，guard/reader error 不降级为 absent。
 - existing ticker 在一个 publication guard 内返回 company/source 同版 snapshot；guard acquire/release 各一次，
   两个 unguarded reader 在该 guard 内各调用一次。
-- company missing/source present、company present/source missing 都分别精确返回；corrupt meta 不降级为 absent。
+- company missing/source present、company present/source missing 都分别精确返回；source fixture 必须发布至少一个
+  真实业务文件并通过 complete-source commit validation，不得用空 `files` 假造 durable source；corrupt meta 不降级为 absent。
 - `DefaultFinsRuntime.create` + `get_ingestion_runtime` 在 fresh root 不创建任何 entry。
+- owner test 分别覆盖 `SecPipeline`、`CnPipeline` 与 SEC/CN/HK adapter builder 的默认 fallback composition：
+  constructor 本身零目录，首次 begin/write 后才创建 infrastructure；全部具体 repositories 已注入时不构造
+  未使用的 eager repository set。
 - `begin_batch` 后 batch/recovery/lock 目录仍按现行协议创建；legacy `create_job` 首写才创建 jobs root。
 - **direct download**：`FinsIngestionRuntime.download` 在 fresh root 通过真实 repository/batch 首写 source，成功后有
   source durable tree、无 `.dayu/fins_ingestion/jobs`。
