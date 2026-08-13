@@ -91,3 +91,38 @@ coverage supplement 运行 SEC material/download 与 CN/HK download owner suites
 - 未运行全仓 pytest；裁决明确不要求，本 fix 已运行计划完整受影响 suite、coverage supplement 与完整 pyright。
 - 无已知未分类 correctness/owner/public protocol/architecture risk。
 - 下一 gate：MiMo 与 DS 对本地 fix commit 做双路 implementation fix re-review；本 gate 不创建 PR 或 push。
+
+## 7. R1/R2 implementation delta fix
+
+### Gate 与 scope
+
+- target HEAD：`0391b589de075f47a2c13f8e173e48e3ae0f1c5e`
+- adjudication：`docs/gateflow/uf-fix01-validation-atomic-boundary-implementation-fix-rereview-adjudication-20260813.md`
+- gate：implementation fix delta
+- completion status：R1/R2 implementation delta **PASS**，等待两路独立 re-review
+- artifact path：`docs/gateflow/uf-fix01-validation-atomic-boundary-implementation-fix-20260813.md`
+- scope：严格只修 R1/R2；未运行 UF-PF01，未修改 owner/non-goals、date/year、suffix、material、converter、frozen registry/evidence
+
+### Owner decision 与 changed files
+
+- `dayu/fins/service_runtime.py`：`prevalidate_fins_upload_filing_request_for_workspace` 继续作为 concrete workspace prevalidation owner；将 `FsFilingUploadStateRepository` 构造与 state read 放入同一个既有 typed `try`，构造/resolve/read 的 `OSError`、lock failure 与 corruption 分别复用既有 I/O/corruption mapping。未新增 CLI fallback、异常字符串分类或兼容分支。
+- `dayu/cli/commands/fins.py`：只修正 `_prevalidate_upload_filing_request` docstring，异常契约改为 `FinsUploadUsageError` / `FinsUploadPrevalidationError`，不改变 CLI 运行语义。
+- `tests/fins/test_fins_service_runtime.py`：新增 service-runtime owner test，注入 repository 构造期 workspace `resolve()` 的 `PermissionError`，断言 exact typed reason、完整 path-free cause chain 与 fresh workspace 零 mutation。
+- `tests/cli/test_fins_commands.py`：新增真实 `cli_main` boundary test，断言构造期 resolve failure 为 exit `1`、stdout empty、exact path-free stderr、operator log 保留底层 `PermissionError` cause、fresh workspace 零 mutation。
+
+### Validation
+
+- tests-first 红灯：修复前两个新增定点测试均失败；owner 直接收到 `PermissionError`，CLI generic branch 输出 storage 内部诊断，证实 R1 与代码根因同源。
+- 定点转绿：`2 passed, 3 warnings`。
+- 完整直接影响 suite：`pytest -q tests/fins/test_fins_service_runtime.py tests/cli/test_fins_commands.py` → `79 passed, 3 warnings in 1.54s`。warning 均为既有第三方 `edgar` deprecation。
+- 完整类型检查：`python -m pyright dayu/ tests/ utils/` → `0 errors, 0 warnings, 0 informations`。
+- 静态验证：受影响文件 Ruff check、Ruff format check、`git diff --check` 均通过。
+- diff/static audit：production delta 只有一个 owner-boundary try 移动与一个 docstring contract 修正；无新增 `hasattr/getattr`、`str(exc)` 分类、generic CLI fallback、compatibility shim、lazy import、字符串错误分类或 non-goal 文件 diff。
+
+### README decision 与 residual risk
+
+- `dayu/fins/README.md` 已准确承诺 prevalidation storage I/O 通过 closed path-free typed reason 投影且 operator log 保留 cause；构造阶段纳入同一边界未改变稳定架构或 public contract，因此不重复修改。
+- `tests/README.md` 已记录 prevalidation storage I/O 的 typed exit `1`、operator cause 与 fresh workspace owner coverage；新增测试未改变测试分层或维护命令，因此不重复修改。
+- 根 README 的 exit `1` / 脱敏 operational failure 用户契约未变化；分层、Host/Engine、schema、config、prompt 均未变化，不触发其它 README。
+- 未运行全仓 pytest；本 delta 只改变已由完整 CLI 文件与 owner 定点测试覆盖的 prevalidation try boundary。
+- 无已知未分类 residual risk。下一 gate 仍是 MiMo、DS 对本地 delta commit 做第二轮独立 `$deepreview`；两路 PASS 后才可进入 UF-PF01，本轮不得运行 UF-PF01、push 或创建 PR。

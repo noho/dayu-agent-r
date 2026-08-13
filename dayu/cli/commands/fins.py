@@ -668,8 +668,7 @@ def _prevalidate_upload_filing_request(
 
     Raises:
         FinsUploadUsageError: Fins owner 判定请求违反 usage contract 时抛出。
-        OSError: published state 读取失败时抛出。
-        ValueError: published storage state 损坏时抛出。
+        FinsUploadPrevalidationError: Fins owner 判定 storage operational failure 时抛出。
     """
 
     if args.command_name != COMMAND_UPLOAD_FILING:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import errno
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -1178,6 +1179,88 @@ def test_upload_filing_prevalidation_io_failure_is_typed_bounded_and_path_free(
     assert str(tmp_path) not in captured.err
     assert "Traceback" not in captured.err
     assert "PermissionError" not in captured.err
+
+
+def test_upload_filing_repository_resolve_failure_preserves_cli_boundary_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """构造期 resolve failure 必须 exit 1、stderr 脱敏、日志留因且零 mutation。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: 第二次 workspace resolve failure 注入夹具。
+        capsys: 标准流捕获夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: CLI public/operator boundary 或零 mutation contract 漂移时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    input_file = tmp_path / "filing.pdf"
+    input_file.write_text("filing", encoding="utf-8")
+    operator_log = tmp_path / "operator.log"
+    real_resolve = Path.resolve
+    workspace_resolve_count = 0
+
+    def fail_repository_workspace_resolve(path: Path, strict: bool = False) -> Path:
+        """允许 CLI 解析 workspace，但在 repository 再次 resolve 时注入失败。
+
+        Args:
+            path: 当前待解析路径。
+            strict: 是否要求路径已经存在。
+
+        Returns:
+            CLI 首次 workspace resolve 与其它路径的真实解析结果。
+
+        Raises:
+            PermissionError: repository 构造期再次解析 workspace 时抛出。
+        """
+
+        nonlocal workspace_resolve_count
+        if path == workspace_root:
+            workspace_resolve_count += 1
+            if workspace_resolve_count == 2:
+                raise PermissionError(errno.EACCES, "resolve denied", str(workspace_root))
+        return real_resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", fail_repository_workspace_resolve)
+
+    exit_code = cli_main.main(
+        (
+            "upload_filing",
+            "--base",
+            str(workspace_root),
+            "--log-file",
+            str(operator_log),
+            "--ticker",
+            "AAPL",
+            "--files",
+            str(input_file),
+            "--fiscal-year",
+            "2024",
+            "--fiscal-period",
+            "FY",
+            "--company-name",
+            "Apple Inc.",
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_FAILURE
+    assert captured.out == ""
+    assert captured.err == "dayu-cli upload_filing: 上传状态读取失败，请检查工作区存储状态\n"
+    assert str(tmp_path) not in captured.err
+    operator_diagnostic = operator_log.read_text(encoding="utf-8")
+    assert "upload_filing prevalidation operational failure" in operator_diagnostic
+    assert "PermissionError" in operator_diagnostic
+    assert "解析 storage workspace底层文件系统失败" in operator_diagnostic
+    assert workspace_resolve_count == 2
+    assert not workspace_root.exists()
 
 
 def test_upload_filing_prevalidation_descriptor_corruption_is_typed_and_path_free(

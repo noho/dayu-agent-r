@@ -78,11 +78,11 @@ def prevalidate_fins_upload_filing_request_for_workspace(
     """
 
     ticker, document_id = _filing_upload_request_identity(request)
-    repository = FsFilingUploadStateRepository(
-        workspace_root,
-        create_directories=False,
-    )
     try:
+        repository = FsFilingUploadStateRepository(
+            workspace_root,
+            create_directories=False,
+        )
         published_state = repository.read_filing_upload_state(ticker, document_id)
     except (OSError, RuntimeFileLockError) as exc:
         raise FinsUploadPrevalidationError(fins_upload_prevalidation_io_failure()) from exc
