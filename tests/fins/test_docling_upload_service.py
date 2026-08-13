@@ -624,6 +624,14 @@ def _execute_upload(
         BaseException: prepare、publication、rollback 或 commit 失败时传播。
     """
 
+    try:
+        previous_meta = service._source_repository.get_source_meta(
+            ticker,
+            document_id,
+            source_kind,
+        )
+    except FileNotFoundError:
+        previous_meta = None
     prepared = asyncio.run(
         service.prepare_upload(
             ticker=ticker,
@@ -634,6 +642,7 @@ def _execute_upload(
             form_type=form_type,
             files=files,
             overwrite=overwrite,
+            previous_meta=previous_meta,
             meta=meta,
             cancellation=cancellation_checker,
         )
@@ -752,6 +761,7 @@ def test_prepare_maps_shared_converter_cancel_without_starting_publication(tmp_p
             form_type="MATERIAL_OTHER",
             files=[sample_file],
             overwrite=False,
+            previous_meta=None,
             meta={"material_name": "Deck", "ingest_method": "upload"},
             cancellation=None,
         )
@@ -931,6 +941,7 @@ def test_commit_winner_ignores_cancel_after_ownership_transfer(tmp_path: Path) -
             form_type="MATERIAL_OTHER",
             files=[sample_file],
             overwrite=False,
+            previous_meta=None,
             meta={"material_name": "Deck", "ingest_method": "upload"},
             cancellation=token,
         )

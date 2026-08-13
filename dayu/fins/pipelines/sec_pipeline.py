@@ -47,6 +47,7 @@ from dayu.fins.ingestion_runtime import (
     FinsSourceDownloadAdapter,
     FinsSourceDownloadAdapterRequest,
     FinsSourceDownloadAdapterResult,
+    ValidatedFinsUploadFilingRequest,
 )
 from dayu.fins.pipelines.docling_process_converter import DoclingConverter, ProcessDoclingConverter
 from dayu.fins.pipelines.docling_upload_service import DoclingUploadService
@@ -555,12 +556,9 @@ class SecPipeline:
             self._workspace_root,
             repository_set=repository_set,
         )
-        self._filing_upload_state_repository = (
-            filing_upload_state_repository
-            or FsFilingUploadStateRepository(
-                self._workspace_root,
-                repository_set=repository_set,
-            )
+        self._filing_upload_state_repository = filing_upload_state_repository or FsFilingUploadStateRepository(
+            self._workspace_root,
+            repository_set=repository_set,
         )
         self._processor_registry = processor_registry
         self._user_agent = user_agent
@@ -744,36 +742,14 @@ class SecPipeline:
 
     def upload_filing(
         self,
-        ticker: str,
-        action: Optional[str],
-        files: list[Path],
-        fiscal_year: int,
-        fiscal_period: str,
-        amended: bool = False,
-        filing_date: Optional[str] = None,
-        report_date: Optional[str] = None,
-        company_id: Optional[str] = None,
-        company_name: Optional[str] = None,
-        ticker_aliases: Optional[list[str]] = None,
-        overwrite: bool = False,
+        request: ValidatedFinsUploadFilingRequest,
         *,
         cancellation_checker: CancellationToken | None = None,
     ) -> SecPipelineUploadResult:
         """执行 SEC 财报上传并同步返回聚合结果。
 
         Args:
-            ticker: 股票代码。
-            action: 可选动作类型。
-            files: 上传文件列表。
-            fiscal_year: 财年。
-            fiscal_period: 财期。
-            amended: 是否修订版。
-            filing_date: 可选 filing 日期。
-            report_date: 可选 report 日期。
-            company_id: 可选兼容字段。
-            company_name: 公司名称。
-            ticker_aliases: 可选 ticker alias。
-            overwrite: 是否覆盖。
+            request: 已完成 preflight 的 typed filing 请求。
             cancellation_checker: 可选协作式取消检查器。
 
         Returns:
@@ -786,18 +762,7 @@ class SecPipeline:
         return _run_async_upload_sync(
             _collect_upload_result_from_events(
                 self.upload_filing_stream(
-                    ticker=ticker,
-                    action=action,
-                    files=files,
-                    fiscal_year=fiscal_year,
-                    fiscal_period=fiscal_period,
-                    amended=amended,
-                    filing_date=filing_date,
-                    report_date=report_date,
-                    company_id=company_id,
-                    company_name=company_name,
-                    ticker_aliases=ticker_aliases,
-                    overwrite=overwrite,
+                    request,
                     cancellation_checker=cancellation_checker,
                 ),
                 stream_name="upload_filing_stream",
@@ -806,36 +771,14 @@ class SecPipeline:
 
     async def upload_filing_stream(
         self,
-        ticker: str,
-        action: Optional[str],
-        files: list[Path],
-        fiscal_year: int,
-        fiscal_period: str,
-        amended: bool = False,
-        filing_date: Optional[str] = None,
-        report_date: Optional[str] = None,
-        company_id: Optional[str] = None,
-        company_name: Optional[str] = None,
-        ticker_aliases: Optional[list[str]] = None,
-        overwrite: bool = False,
+        request: ValidatedFinsUploadFilingRequest,
         *,
         cancellation_checker: CancellationToken | None = None,
     ) -> AsyncIterator["UploadFilingEvent"]:
         """执行流式 SEC 财报上传。
 
         Args:
-            ticker: 股票代码。
-            action: 可选动作类型。
-            files: 上传文件列表。
-            fiscal_year: 财年。
-            fiscal_period: 财期。
-            amended: 是否修订版。
-            filing_date: 可选 filing 日期。
-            report_date: 可选 report 日期。
-            company_id: 可选兼容字段。
-            company_name: 公司名称。
-            ticker_aliases: 可选 ticker alias。
-            overwrite: 是否覆盖。
+            request: 已完成 preflight 的 typed filing 请求。
             cancellation_checker: 可选协作式取消检查器。
 
         Yields:
@@ -847,18 +790,7 @@ class SecPipeline:
 
         async for event in _run_upload_filing_stream(
             self,
-            ticker=ticker,
-            action=action,
-            files=files,
-            fiscal_year=fiscal_year,
-            fiscal_period=fiscal_period,
-            amended=amended,
-            filing_date=filing_date,
-            report_date=report_date,
-            company_id=company_id,
-            company_name=company_name,
-            ticker_aliases=ticker_aliases,
-            overwrite=overwrite,
+            request=request,
             cancellation_checker=cancellation_checker,
         ):
             yield event

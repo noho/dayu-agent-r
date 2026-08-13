@@ -60,6 +60,7 @@ from dayu.fins.ingestion_runtime import (
     FinsUploadUsageError,
     ValidatedFinsUploadFilingRequest,
 )
+from dayu.fins.upload_failure import FinsUploadPrevalidationError
 from dayu.fins.domain.filing_semantics import FiscalPeriod
 from dayu.fins.resolver import FmpCompanyInfoResolver
 from dayu.fins.ticker_normalization import normalize_ticker
@@ -204,6 +205,10 @@ def run_fins_direct_command(args: ParsedCliArgs) -> int:
     except FinsUploadUsageError as exc:
         render_cli_error(f"dayu-cli upload_filing: {exc.failure.message}")
         return EXIT_USAGE_ERROR
+    except FinsUploadPrevalidationError as exc:
+        _LOGGER.exception("upload_filing prevalidation operational failure")
+        render_cli_error(f"dayu-cli upload_filing: {exc.failure.message}")
+        return EXIT_FAILURE
     except FinsDirectStreamProtocolError as exc:
         render_cli_error(f"dayu-cli {args.command_name}: {exc.message}")
         return EXIT_FAILURE
@@ -638,7 +643,7 @@ def _upload_filing_stream(
     :param service: Fins direct Service helper。
     :param cancellation_token: 当前 operation 的取消 token。
     :returns: Fins owner 已验证的 direct 事件流。
-    :raises CliFinsUsageError: ticker 或文件路径非法时抛出。
+    :raises Exception: Service/runtime stream 打开失败时原样透传。
     """
 
     return service.upload_filing(
@@ -674,10 +679,7 @@ def _prevalidate_upload_filing_request(
     request = FinsUploadFilingRequest(
         ticker=raw_ticker,
         action=args.action,
-        files=tuple(
-            Path(raw_file).expanduser().resolve(strict=False)
-            for raw_file in (args.files or ())
-        ),
+        files=tuple(Path(raw_file).expanduser().resolve(strict=False) for raw_file in (args.files or ())),
         fiscal_year=args.fiscal_year,
         fiscal_period=_optional_stripped_text(args.fiscal_period),
         amended=args.amended,

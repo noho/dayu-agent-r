@@ -234,6 +234,7 @@ class DoclingUploadService:
         form_type: str,
         files: list[Path],
         overwrite: bool,
+        previous_meta: Mapping[str, JsonValue] | None,
         meta: Mapping[str, JsonValue],
         cancellation: CancellationToken | None,
     ) -> PreparedDoclingUpload:
@@ -248,6 +249,7 @@ class DoclingUploadService:
             form_type: 文档 form type。
             files: 上传文件列表。
             overwrite: 是否强制覆盖。
+            previous_meta: caller 从当前 state owner 取得的 source meta。
             meta: 业务元数据字段。
             cancellation: 公共取消观察 token；``None`` 表示无取消源。
 
@@ -283,17 +285,14 @@ class DoclingUploadService:
                 internal_document_id=internal_document_id,
             )
 
+        normalized_previous_meta = dict(previous_meta) if previous_meta is not None else None
         validated_files = _validate_source_files(files)
-        previous_meta = self._safe_get_document_meta(normalized_ticker, document_id, source_kind)
         precondition = evaluate_upload_overwrite_precondition(
             action=normalized_action,
-            previous_meta=previous_meta,
+            previous_meta=normalized_previous_meta,
             overwrite=overwrite,
         )
-        if (
-            precondition is UploadOverwritePrecondition.CREATE_TARGET_EXISTS
-            and source_kind is SourceKind.FILING
-        ):
+        if precondition is UploadOverwritePrecondition.CREATE_TARGET_EXISTS and source_kind is SourceKind.FILING:
             raise FileExistsError(f"Document already exists for create: {document_id}")
         if precondition is UploadOverwritePrecondition.UPDATE_TARGET_MISSING:
             raise FileNotFoundError(f"Document not found for update: {document_id}")
@@ -302,7 +301,7 @@ class DoclingUploadService:
 
         original_assets = self._build_original_assets(validated_files)
         source_fingerprint = _build_upload_source_fingerprint(original_assets)
-        if _can_skip_upload(previous_meta, source_fingerprint, overwrite):
+        if _can_skip_upload(normalized_previous_meta, source_fingerprint, overwrite):
             Log.info(
                 f"文档已存在且未变更，跳过上传: ticker={normalized_ticker} document_id={document_id}",
                 module=self.MODULE,
@@ -333,9 +332,9 @@ class DoclingUploadService:
             )
         if _is_cancelled(cancellation):
             return _build_cancelled_result(document_id=document_id, internal_document_id=internal_document_id)
-        current_version = _resolve_document_version(previous_meta, source_fingerprint)
+        current_version = _resolve_document_version(normalized_previous_meta, source_fingerprint)
         staging_meta = self._build_upsert_meta(
-            previous_meta=previous_meta,
+            previous_meta=normalized_previous_meta,
             source_fingerprint=source_fingerprint,
             document_version=current_version,
             base_meta=meta,
@@ -350,7 +349,7 @@ class DoclingUploadService:
             overwrite=overwrite,
             pending_assets=tuple(pending_assets),
             conversion_events=tuple(conversion_events),
-            previous_meta=previous_meta,
+            previous_meta=normalized_previous_meta,
             meta=staging_meta,
             source_fingerprint=source_fingerprint,
             document_version=current_version,
@@ -893,20 +892,20 @@ def commit_prepared_upload_batch(
         return result
     finally:
         if not batch_terminal_started:
-            _rollback_precommit_upload_batch(
+            rollback_prepared_upload_batch(
                 batching_repository=batching_repository,
                 batch=batch,
                 operation_error=sys.exception(),
             )
 
 
-def _rollback_precommit_upload_batch(
+def rollback_prepared_upload_batch(
     *,
     batching_repository: BatchingRepositoryProtocol,
     batch: BatchToken,
     operation_error: BaseException | None,
 ) -> None:
-    """恰好一次回滚尚由 caller 持有的上传 batch。
+    """恰好一次回滚尚由 caller 持有的上传 batch，并保留主异常证据。
 
     Args:
         batching_repository: batch 生命周期仓储。
@@ -1508,5 +1507,6 @@ __all__ = [
     "derive_report_kind",
     "normalize_cn_fiscal_period",
     "resolve_upload_action",
+    "rollback_prepared_upload_batch",
     "validate_material_upload_ids",
 ]

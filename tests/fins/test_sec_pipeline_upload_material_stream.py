@@ -177,3 +177,46 @@ async def test_upload_material_stream_auto_action_and_overwrite_reset(tmp_path: 
     )
     file_names = sorted(meta.uri.split("/")[-1] for meta in pipeline._blob_repository.list_files(handle))
     assert file_names == ["deck_new.pdf", "deck_new_docling.json"]
+
+
+@pytest.mark.asyncio
+async def test_upload_material_failure_preserves_existing_user_visible_semantics(tmp_path: Path) -> None:
+    """Filing typed failure 收束不得改变 SEC material 的既有错误文案 contract。
+
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: material 被改为 filing typed failure projection 时抛出。
+    """
+
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        processor_registry=build_fins_processor_registry(),
+        docling_converter=_FakeDoclingConverter(),
+    )
+    material_file = tmp_path / "material.pdf"
+    material_file.write_text("demo material", encoding="utf-8")
+
+    events = [
+        event
+        async for event in pipeline.upload_material_stream(
+            ticker="AAPL",
+            action="create",
+            form_type="MATERIAL_OTHER",
+            material_name="Deck",
+            files=[material_file],
+            company_name=None,
+            overwrite=False,
+        )
+    ]
+
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    assert result["status"] == "failed"
+    assert result["message"] == "create/update 时必须提供 --company-name"
+    assert "failure" not in result
+    assert events[-1].payload["error"] == "create/update 时必须提供 --company-name"

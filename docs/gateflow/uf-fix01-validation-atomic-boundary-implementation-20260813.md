@@ -24,8 +24,9 @@
 
 ### S3 — authoritative recheck 与单 batch publication
 
-- production runner 在提交前 fresh 读取 published state，并用同一 validator 丢弃旧 action/company 派生值。
-- `DefaultFinsRuntime` 向 SEC/CN facade 与 runner 注入同一个 `FilingUploadStateRepositoryProtocol` instance。
+- Service 与 production runner 将同一个 `ValidatedFinsUploadFilingRequest` 原样交给 SEC/CN/HK facade，不还原散参。
+- `DefaultFinsRuntime` 向 SEC/CN facade 注入同一个 `FilingUploadStateRepositoryProtocol` instance；workflow 在 prepare 前读取 fresh state、调用同一 validator 并校验 deterministic identity，丢弃旧 action/company 派生值。
+- filing prepare 只消费 authoritative `published_state.source_meta`，company stage 只消费 authoritative `company_meta_decision`；`prepare_upload` 不再自行读取 state。
 - SEC/CN/HK filing 先完成转换；terminal skip/cancel 不开启 batch。非 terminal 路径以同一 `BatchToken` stage company 与 source/blob，成功一次 commit；stage 或 precommit failure 只 rollback 一次，无补偿 delete、第二 batch 或 late rollback。
 - composition owner test 固定 ingestion runtime 缓存、state repository identity，以及 SEC upload、CN upload、CN download、HK download 共用同一 `ProcessDoclingConverter`。
 
@@ -34,7 +35,7 @@
 - 新增层内唯一 owner `dayu.fins.upload_failure`；pipeline 与 orchestration runtime 直接依赖该模块，不存在 pipeline → ingestion runtime 反向依赖、lazy import 或 compatibility re-export。
 - exhaustive 映射全部 `DoclingConversionFailureKind`，并为 storage/runtime 提供各自 closed code 与固定安全文案。
 - failed pipeline JSON 缺 failure、未知 key/kind/code、kind/code 不一致、pathful/control/过长文本均 fail closed；非 failed 带 failure 同样拒绝。
-- pipeline result、runtime summary、direct RESULT details/error message 与 durable failure summary 从同一 typed reason 投影；public 内容不使用 `str(exc)`，operator cause 不进入 public event 或 durable summary。
+- filing pipeline result、runtime summary、direct RESULT details/error message 与 durable failure summary 从同一 typed reason 投影；filing public 内容不使用 `str(exc)`，operator cause 不进入 public event 或 durable summary。material 保留既有 state owner 与用户可见失败语义。
 
 ### S5 — documentation
 
@@ -94,3 +95,12 @@ README trigger audit 与 accepted plan 一致：root、Fins、Service、tests �
 - UF-PF01 focused-real bundle 按 Controller 明确要求保留到双路 implementation deepreview 通过后，本 implementation gate 未提供该真实 CLI/tree/durable/SHA-256 证据。
 - 未执行仓库全量 pytest；执行了 accepted plan 指定的完整受影响测试集与为逐文件覆盖率补充的 SEC/CN/HK owner suites。
 - 测试仅出现第三方 `edgar` deprecation warning；无本次实现 warning、测试失败或 pyright error。
+
+## 6. Implementation review fix addendum
+
+implementation commit `3caca6fa0091a738c5c78cc5165a49fed82c6458` 的双路 review 经 Controller 裁决为
+`BLOCKED → implementation fix`。A1–A5/C1–C3 已按冻结 owner boundary 修复；完整变更、失败先行证据、
+最终验证与 residual risk 记录在
+`docs/gateflow/uf-fix01-validation-atomic-boundary-implementation-fix-20260813.md`。本 addendum 取代本 artifact
+中与 runner-owned recheck、material failure projection 有关的旧描述；UF-PF01 仍未运行，下一 gate 为 MiMo/DS 双路
+implementation fix re-review。

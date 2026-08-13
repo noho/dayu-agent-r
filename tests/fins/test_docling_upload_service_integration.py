@@ -66,6 +66,7 @@ async def test_real_docling_upload_service_conversion_when_enabled(tmp_path: Pat
         form_type="MATERIAL_OTHER",
         files=[sample_file],
         overwrite=False,
+        previous_meta=None,
         meta={"material_name": "Docling Fixture", "ingest_method": "upload"},
         cancellation=None,
     )

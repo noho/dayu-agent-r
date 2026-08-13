@@ -45,6 +45,12 @@ from dayu.fins.storage import (
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
 from dayu.fins.ticker_normalization import normalize_ticker
+from dayu.fins.upload_failure import (
+    FinsUploadPrevalidationError,
+    fins_upload_prevalidation_corruption_failure,
+    fins_upload_prevalidation_io_failure,
+)
+from dayu.runtime.filelock import RuntimeFileLockError
 
 if TYPE_CHECKING:
     from dayu.fins.pipelines.cn_pipeline import CnPipeline
@@ -68,9 +74,7 @@ def prevalidate_fins_upload_filing_request_for_workspace(
 
     Raises:
         FinsUploadUsageError: 请求违反调用方可修正契约时抛出。
-        ValueError: published identity 或元数据损坏时抛出。
-        RuntimeFileLockError: publication guard 获取或释放失败时抛出。
-        OSError: published state 读取失败时抛出。
+        FinsUploadPrevalidationError: published state 损坏或读取失败时抛出。
     """
 
     ticker, document_id = _filing_upload_request_identity(request)
@@ -78,7 +82,12 @@ def prevalidate_fins_upload_filing_request_for_workspace(
         workspace_root,
         create_directories=False,
     )
-    published_state = repository.read_filing_upload_state(ticker, document_id)
+    try:
+        published_state = repository.read_filing_upload_state(ticker, document_id)
+    except (OSError, RuntimeFileLockError) as exc:
+        raise FinsUploadPrevalidationError(fins_upload_prevalidation_io_failure()) from exc
+    except ValueError as exc:
+        raise FinsUploadPrevalidationError(fins_upload_prevalidation_corruption_failure()) from exc
     return validate_fins_upload_filing_request(
         request,
         published_state=published_state,
@@ -95,7 +104,6 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
 
     sec_pipeline: "SecPipeline"
     cn_pipeline: "CnPipeline"
-    filing_upload_state_repository: FilingUploadStateRepositoryProtocol
 
     def run_upload(
         self,
@@ -129,7 +137,6 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
         if isinstance(request, ValidatedFinsUploadFilingRequest):
             result = self._run_filing_upload(
                 request=request,
-                ticker=normalized.canonical,
                 market=normalized.market,
                 cancellation_checker=cancellation_checker,
             )
@@ -148,7 +155,6 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
         self,
         *,
         request: ValidatedFinsUploadFilingRequest,
-        ticker: str,
         market: str,
         cancellation_checker: FinsJobCancellationChecker,
     ) -> FinsUploadPipelineResult:
@@ -156,7 +162,6 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
 
         Args:
             request: filing 上传请求。
-            ticker: canonical ticker。
             market: 归一化市场。
             cancellation_checker: 协作式取消检查器。
 
@@ -169,49 +174,17 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
             OSError: 仓储读写失败时抛出。
         """
 
-        raw_request = request.request
-        if raw_request.fiscal_year is None:
-            raise AssertionError("validated filing request 缺少 fiscal_year")
-        fresh_state = self.filing_upload_state_repository.read_filing_upload_state(
-            request.normalized_ticker.canonical,
-            request.document_id,
-        )
-        fresh_request = validate_fins_upload_filing_request(
-            raw_request,
-            published_state=fresh_state,
-        )
-        action = fresh_request.resolved_action
         if market == "US":
             return FinsUploadPipelineResult.from_pipeline_json(
                 self.sec_pipeline.upload_filing(
-                    ticker=ticker,
-                    action=action,
-                    files=list(raw_request.files),
-                    fiscal_year=raw_request.fiscal_year,
-                    fiscal_period=fresh_request.normalized_fiscal_period,
-                    amended=raw_request.amended,
-                    filing_date=raw_request.filing_date,
-                    report_date=raw_request.report_date,
-                    company_name=raw_request.company_name,
-                    ticker_aliases=list(raw_request.ticker_aliases),
-                    overwrite=raw_request.overwrite,
+                    request,
                     cancellation_checker=cancellation_checker,
                 )
             )
         if market in {"CN", "HK"}:
             return FinsUploadPipelineResult.from_pipeline_json(
                 self.cn_pipeline.upload_filing(
-                    ticker=ticker,
-                    action=action,
-                    files=list(raw_request.files),
-                    fiscal_year=raw_request.fiscal_year,
-                    fiscal_period=fresh_request.normalized_fiscal_period,
-                    amended=raw_request.amended,
-                    filing_date=raw_request.filing_date,
-                    report_date=raw_request.report_date,
-                    company_name=raw_request.company_name,
-                    ticker_aliases=list(raw_request.ticker_aliases),
-                    overwrite=raw_request.overwrite,
+                    request,
                     cancellation_checker=cancellation_checker,
                 )
             )
@@ -593,7 +566,6 @@ class DefaultFinsRuntime:
             upload_runner = ProductionFinsUploadRunner(
                 sec_pipeline=sec_upload_pipeline,
                 cn_pipeline=cn_upload_pipeline,
-                filing_upload_state_repository=self.filing_upload_state_repository,
             )
             runtime = FinsIngestionRuntime.create(
                 batching_repository=self.batching_repository,

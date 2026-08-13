@@ -42,6 +42,7 @@ from dayu.fins.download_contract import (
     build_fins_download_request,
 )
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.storage import FsFilingUploadStateRepository
 from dayu.service.fins_direct import (
     FINS_DIRECT_EXIT_FAILURE,
     FINS_DIRECT_EXIT_KEYBOARD_INTERRUPT,
@@ -911,45 +912,246 @@ def test_download_static_usage_error_precedes_workspace_and_service_factory(
     assert not workspace_root.exists()
 
 
-def test_upload_filing_usage_error_precedes_service_factory_and_workspace_mutation(
+@pytest.mark.parametrize(
+    ("case_id", "argv_suffix", "expected_reason"),
+    (
+        ("UF-003", ("--ticker", ""), "--ticker 不能为空，请提供公司代码"),
+        ("UF-004", ("--ticker", "../../etc/passwd"), "--ticker 无法识别，请提供有效公司代码"),
+        ("UF-005", ("--ticker", "ABCDEFGHI"), "--ticker 无法识别，请提供有效公司代码"),
+        ("UF-006", ("--ticker", "AAPL,"), "--ticker 不能为空，请提供公司代码"),
+        ("UF-015", ("--ticker", "AAPL", "--fiscal-period", "FY"), "--fiscal-year 不能为空"),
+        ("UF-016", ("--ticker", "AAPL", "--fiscal-year", "2024"), "--fiscal-period 不能为空"),
+        (
+            "UF-017",
+            (
+                "--ticker",
+                "AAPL",
+                "--fiscal-year",
+                "2024",
+                "--fiscal-period",
+                "FY",
+                "--company-name",
+                "Apple Inc.",
+            ),
+            "create/update 上传必须提供 --files",
+        ),
+        (
+            "UF-018",
+            (
+                "--ticker",
+                "AAPL",
+                "--files",
+                "{input}/probe.txt",
+                "--fiscal-year",
+                "2024",
+                "--fiscal-period",
+                "FY",
+            ),
+            "当前公司缺少有效元数据；create/update 必须提供 --company-name",
+        ),
+        (
+            "UF-019",
+            (
+                "--ticker",
+                "AAPL",
+                "--fiscal-year",
+                "2024",
+                "--fiscal-period",
+                "FY",
+                "--company-name",
+                "",
+            ),
+            "create/update 上传必须提供 --files",
+        ),
+        (
+            "UF-021",
+            ("--ticker", "AAPL", "--fiscal-year", "-1", "--fiscal-period", "FY"),
+            "--fiscal-year 必须是非负整数",
+        ),
+        (
+            "UF-022",
+            ("--ticker", "AAPL", "--fiscal-year", "2024", "--fiscal-period", ""),
+            "--fiscal-period 不能为空",
+        ),
+        (
+            "UF-023",
+            ("--ticker", "AAPL", "--fiscal-year", "2024", "--fiscal-period", "X" * 300),
+            "--fiscal-period 长度不能超过 240 个字符",
+        ),
+        (
+            "UF-024",
+            ("--ticker", "600519", "--fiscal-year", "2024", "--fiscal-period", "9M"),
+            "CN/HK --fiscal-period 仅支持 Q1、Q2、Q3、Q4、H1、FY",
+        ),
+        (
+            "UF-026",
+            (
+                "--ticker",
+                "AAPL",
+                "--fiscal-year",
+                "2024",
+                "--fiscal-period",
+                "FY",
+                "--company-name",
+                "Apple Inc.",
+                "--files",
+                "{input}/missing.pdf",
+            ),
+            "上传文件不存在：missing.pdf",
+        ),
+        (
+            "UF-027",
+            (
+                "--ticker",
+                "AAPL",
+                "--fiscal-year",
+                "2024",
+                "--fiscal-period",
+                "FY",
+                "--company-name",
+                "Apple Inc.",
+                "--files",
+                "{input}",
+            ),
+            "上传路径不是普通文件：input",
+        ),
+        *tuple(
+            (
+                case_id,
+                (
+                    "--ticker",
+                    "AAPL",
+                    "--fiscal-year",
+                    "2024",
+                    "--fiscal-period",
+                    "FY",
+                    "--company-name",
+                    "Apple Inc.",
+                    "--files",
+                    f"{{input}}/probe.{suffix}",
+                ),
+                expected_reason,
+            )
+            for case_id, suffix, expected_reason in (
+                ("UF-028", "bin", "上传文件后缀不在命令允许范围：probe.bin"),
+                ("UF-030", "doc", "上传文件后缀不在命令允许范围：probe.doc"),
+                ("UF-031", "ppt", "上传文件后缀不在命令允许范围：probe.ppt"),
+                ("UF-032", "pptx", "上传文件后缀不在命令允许范围：probe.pptx"),
+                ("UF-033", "csv", "当前上传转换器不支持该文件后缀：probe.csv"),
+                ("UF-034", "json", "当前上传转换器不支持该文件后缀：probe.json"),
+                ("UF-035", "xbrl", "当前上传转换器不支持该文件后缀：probe.xbrl"),
+                ("UF-036", "xhtml", "当前上传转换器不支持该文件后缀：probe.xhtml"),
+                ("UF-037", "xml", "当前上传转换器不支持该文件后缀：probe.xml"),
+                ("UF-038", "zip", "当前上传转换器不支持该文件后缀：probe.zip"),
+            )
+        ),
+    ),
+)
+def test_upload_filing_usage_matrix_precedes_service_factory_and_workspace_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    case_id: str,
+    argv_suffix: tuple[str, ...],
+    expected_reason: str,
 ) -> None:
-    """filing 静态 usage failure 必须在 Service factory 前 exact 映射为 exit 2。
+    """冻结 filing usage case 必须在 Service factory 前 exact 映射为 exit 2。
 
     Args:
         tmp_path: pytest 临时目录。
         monkeypatch: factory 替换夹具。
+        capsys: 标准流捕获夹具。
+        case_id: frozen usage case 标识。
+        argv_suffix: ``upload_filing --base`` 后的冻结参数。
+        expected_reason: usage owner 的精确可行动文案。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: factory/service 被调用、workspace 变化或标准流不精确时抛出。
+    """
+
+    workspace_root = tmp_path / f"workspace-{case_id}"
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    for suffix in ("txt", "bin", "doc", "ppt", "pptx", "csv", "json", "xbrl", "xhtml", "xml", "zip"):
+        (input_root / f"probe.{suffix}").write_text("fixture", encoding="utf-8")
+    resolved_argv = tuple(token.format(input=str(input_root)) for token in argv_suffix)
+    service = _FakeFinsDirectService()
+    factory_calls: list[Path] = []
+    recording_factory = partial(
+        _recording_direct_service_factory,
+        service=service,
+        factory_calls=factory_calls,
+    )
+    monkeypatch.setattr(fins_command, "FINS_DIRECT_SERVICE_FACTORY", recording_factory)
+
+    exit_code = cli_main.main(
+        (
+            "upload_filing",
+            "--base",
+            str(workspace_root),
+            *resolved_argv,
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_USAGE_ERROR
+    assert captured.out == ""
+    assert captured.err == f"dayu-cli upload_filing: {expected_reason}\n"
+    assert factory_calls == []
+    assert service.upload_filing_requests == []
+    assert service.stream_calls == []
+    assert not workspace_root.exists()
+
+
+def test_upload_filing_prevalidation_io_failure_is_typed_bounded_and_path_free(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """prevalidation I/O failure 必须 exit 1 且 public stderr 不泄漏路径。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: storage read failure 注入夹具。
         capsys: 标准流捕获夹具。
 
     Returns:
         无。
 
     Raises:
-        AssertionError: factory 被调用、workspace 变化或标准流不精确时抛出。
+        AssertionError: failure 未经 typed owner 投影或泄漏内部路径时抛出。
     """
 
-    workspace_root = tmp_path / "must-not-exist"
-    factory_calls: list[Path] = []
+    workspace_root = tmp_path / "workspace"
+    input_file = tmp_path / "filing.pdf"
+    input_file.write_text("filing", encoding="utf-8")
 
-    def forbidden_factory(path: Path) -> fins_command.FinsDirectCommandService:
-        """记录不应发生的 Service factory 调用。
+    def fail_read(
+        _repository: FsFilingUploadStateRepository,
+        ticker: str,
+        document_id: str,
+    ) -> NoReturn:
+        """注入包含绝对路径的 permission failure。
 
         Args:
-            path: CLI 传入的 workspace root。
+            _repository: production state repository。
+            ticker: canonical ticker。
+            document_id: filing document identity。
 
         Returns:
             不返回。
 
         Raises:
-            AssertionError: factory 一旦被调用即抛出。
+            PermissionError: 始终抛出包含内部路径的异常。
         """
 
-        factory_calls.append(path)
-        raise AssertionError("usage error 不得构造 Service")
+        del ticker, document_id
+        raise PermissionError(f"permission denied: {workspace_root / 'portfolio' / 'AAPL'}")
 
-    monkeypatch.setattr(fins_command, "FINS_DIRECT_SERVICE_FACTORY", forbidden_factory)
+    monkeypatch.setattr(FsFilingUploadStateRepository, "read_filing_upload_state", fail_read)
 
     exit_code = cli_main.main(
         (
@@ -958,17 +1160,75 @@ def test_upload_filing_usage_error_precedes_service_factory_and_workspace_mutati
             str(workspace_root),
             "--ticker",
             "AAPL",
+            "--files",
+            str(input_file),
+            "--fiscal-year",
+            "2024",
             "--fiscal-period",
             "FY",
+            "--company-name",
+            "Apple Inc.",
         )
     )
 
     captured = capsys.readouterr()
-    assert exit_code == EXIT_USAGE_ERROR
+    assert exit_code == EXIT_FAILURE
     assert captured.out == ""
-    assert captured.err == "dayu-cli upload_filing: --fiscal-year 不能为空\n"
-    assert factory_calls == []
-    assert not workspace_root.exists()
+    assert captured.err == ("dayu-cli upload_filing: 上传状态读取失败，请检查工作区存储状态\n")
+    assert str(tmp_path) not in captured.err
+    assert "Traceback" not in captured.err
+    assert "PermissionError" not in captured.err
+
+
+def test_upload_filing_prevalidation_descriptor_corruption_is_typed_and_path_free(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """descriptor corruption 必须 exit 1 且只输出 closed bounded reason。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        capsys: 标准流捕获夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: corruption 被当 usage/generic pathful failure 时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    ticker_root = workspace_root / "portfolio" / "AAPL"
+    ticker_root.mkdir(parents=True)
+    (ticker_root / ".identity.json").write_text("{}", encoding="utf-8")
+    input_file = tmp_path / "filing.pdf"
+    input_file.write_text("filing", encoding="utf-8")
+
+    exit_code = cli_main.main(
+        (
+            "upload_filing",
+            "--base",
+            str(workspace_root),
+            "--ticker",
+            "AAPL",
+            "--files",
+            str(input_file),
+            "--fiscal-year",
+            "2024",
+            "--fiscal-period",
+            "FY",
+            "--company-name",
+            "Apple Inc.",
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_FAILURE
+    assert captured.out == ""
+    assert captured.err == ("dayu-cli upload_filing: 上传状态已损坏，请检查工作区存储状态\n")
+    assert str(tmp_path) not in captured.err
+    assert "Traceback" not in captured.err
+    assert "ValueError" not in captured.err
 
 
 @pytest.mark.parametrize(
@@ -1080,9 +1340,10 @@ def test_download_path_does_not_reuse_upload_ticker_csv_parser() -> None:
     assert "_parse_ticker_csv" not in calls_by_function["_prevalidate_download_request"]
     assert "_parse_ticker_csv" not in calls_by_function["_download_stream"]
     assert "_parse_ticker_csv" not in calls_by_function["_upload_filing_stream"]
-    assert "prevalidate_fins_upload_filing_request_for_workspace" in calls_by_function[
-        "_prevalidate_upload_filing_request"
-    ]
+    assert (
+        "prevalidate_fins_upload_filing_request_for_workspace"
+        in calls_by_function["_prevalidate_upload_filing_request"]
+    )
     assert "_parse_ticker_csv" in calls_by_function["_run_upload_filings_from"]
 
 

@@ -101,7 +101,6 @@ from dayu.fins.ingestion_runtime import (
     ValidatedFinsUploadFilingRequest,
     FinsUploadMaterialRequest,
     FinsUploadPipelineResult,
-    FinsUploadRequest,
     FinsUploadResultSummary,
     FinsUploadRunner,
     FinsUploadTerminalDisposition,
@@ -414,22 +413,34 @@ def test_fins_upload_usage_failure_mapping_is_closed_bounded_and_path_free() -> 
         if code in exact_messages:
             assert failure.message == exact_messages[code]
 
-    assert fins_upload_usage_failure(
-        FinsUploadUsageCode.FILE_NOT_FOUND,
-        file_name="report.pdf",
-    ).message == "上传文件不存在：report.pdf"
-    assert fins_upload_usage_failure(
-        FinsUploadUsageCode.FILE_NOT_REGULAR,
-        file_name="report.pdf",
-    ).message == "上传路径不是普通文件：report.pdf"
-    assert fins_upload_usage_failure(
-        FinsUploadUsageCode.FILE_SUFFIX_NOT_ALLOWED,
-        file_name="report.exe",
-    ).message == "上传文件后缀不在命令允许范围：report.exe"
-    assert fins_upload_usage_failure(
-        FinsUploadUsageCode.CONVERTER_SUFFIX_UNSUPPORTED,
-        file_name="report.doc",
-    ).message == "当前上传转换器不支持该文件后缀：report.doc"
+    assert (
+        fins_upload_usage_failure(
+            FinsUploadUsageCode.FILE_NOT_FOUND,
+            file_name="report.pdf",
+        ).message
+        == "上传文件不存在：report.pdf"
+    )
+    assert (
+        fins_upload_usage_failure(
+            FinsUploadUsageCode.FILE_NOT_REGULAR,
+            file_name="report.pdf",
+        ).message
+        == "上传路径不是普通文件：report.pdf"
+    )
+    assert (
+        fins_upload_usage_failure(
+            FinsUploadUsageCode.FILE_SUFFIX_NOT_ALLOWED,
+            file_name="report.exe",
+        ).message
+        == "上传文件后缀不在命令允许范围：report.exe"
+    )
+    assert (
+        fins_upload_usage_failure(
+            FinsUploadUsageCode.CONVERTER_SUFFIX_UNSUPPORTED,
+            file_name="report.doc",
+        ).message
+        == "当前上传转换器不支持该文件后缀：report.doc"
+    )
 
 
 def test_validate_fins_upload_filing_request_resolves_state_aware_contract(
@@ -1686,7 +1697,6 @@ def _inject_upload_runtime_converter(
             filing_upload_state_repository=default_runtime.filing_upload_state_repository,
             docling_converter=converter,
         ),
-        filing_upload_state_repository=default_runtime.filing_upload_state_repository,
     )
 
 
@@ -1710,7 +1720,6 @@ def test_default_runtime_composition_shares_upload_state_and_docling_converter(t
 
     assert repeated is ingestion
     assert isinstance(runner, ProductionFinsUploadRunner)
-    assert runner.filing_upload_state_repository is default_runtime.filing_upload_state_repository
     assert runner.sec_pipeline._filing_upload_state_repository is default_runtime.filing_upload_state_repository
     assert runner.cn_pipeline._filing_upload_state_repository is default_runtime.filing_upload_state_repository
 

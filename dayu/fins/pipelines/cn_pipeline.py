@@ -9,6 +9,7 @@ Host、tool/provider 装配不在本 Slice 内。
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
 from pathlib import Path
 from typing import Final, Optional, TypeAlias, cast
@@ -40,6 +41,8 @@ from dayu.fins.ingestion_runtime import (
     FinsSourceDownloadAdapter,
     FinsSourceDownloadAdapterRequest,
     FinsSourceDownloadAdapterResult,
+    ValidatedFinsUploadFilingRequest,
+    validate_fins_upload_filing_request,
 )
 from dayu.fins.domain.document_models import FinsIngestMethod
 from dayu.fins.domain.enums import SourceKind
@@ -55,20 +58,25 @@ from dayu.fins.pipelines.cn_download_workflow import run_cn_download_stream_impl
 from dayu.fins.pipelines.docling_upload_service import (
     DoclingUploadService,
     UploadOperationResult,
-    build_cn_filing_ids,
     build_material_ids,
     commit_prepared_upload_batch,
     derive_report_kind,
-    normalize_cn_fiscal_period,
     resolve_upload_action,
+    rollback_prepared_upload_batch,
     validate_material_upload_ids,
 )
 from dayu.fins.pipelines.docling_process_converter import (
+    DoclingConversionCancelledError,
+    DoclingConversionError,
     DoclingConverter,
     ProcessDoclingConverter,
 )
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
-from dayu.fins.pipelines.upload_company_meta import build_upload_company_id, upsert_company_meta_for_upload
+from dayu.fins.pipelines.upload_company_meta import (
+    build_upload_company_id,
+    stage_upload_company_meta_decision,
+    upsert_company_meta_for_upload,
+)
 from dayu.fins.pipelines.upload_filing_events import UploadFilingEvent, UploadFilingEventType
 from dayu.fins.pipelines.upload_material_events import UploadMaterialEvent, UploadMaterialEventType
 from dayu.fins.pipelines.upload_progress_helpers import (
@@ -93,7 +101,7 @@ from dayu.fins.storage import (
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
 from dayu.fins.ticker_normalization import normalize_ticker, try_normalize_ticker
-from dayu.fins.upload_failure import fins_upload_failure_from_exception
+from dayu.fins.upload_failure import FinsUploadFailureReason, fins_upload_failure_from_exception
 
 CN_DOWNLOAD_SOURCE: Final[str] = "cninfo"
 HK_DOWNLOAD_SOURCE: Final[str] = "hkexnews"
@@ -111,6 +119,7 @@ _ADAPTER_PROGRESS_FILE_SKIPPED: Final[str] = "download.file_skipped"
 _ADAPTER_PROGRESS_FILE_FAILED: Final[str] = "download.file_failed"
 _ADAPTER_PROGRESS_CONVERSION_STARTED: Final[str] = "download.conversion_started"
 _ADAPTER_PROGRESS_CONVERSION_COMPLETED: Final[str] = "download.conversion_completed"
+_LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
 
 CnPipelineDownloadResult: TypeAlias = dict[str, JsonValue]
@@ -393,12 +402,9 @@ class CnPipeline:
             self._workspace_root,
             repository_set=repository_set,
         )
-        self._filing_upload_state_repository = (
-            filing_upload_state_repository
-            or FsFilingUploadStateRepository(
-                self._workspace_root,
-                repository_set=repository_set,
-            )
+        self._filing_upload_state_repository = filing_upload_state_repository or FsFilingUploadStateRepository(
+            self._workspace_root,
+            repository_set=repository_set,
         )
         self._user_agent = user_agent
         self._sleep_seconds = sleep_seconds
@@ -731,36 +737,14 @@ class CnPipeline:
 
     def upload_filing(
         self,
-        ticker: str,
-        action: Optional[str],
-        files: list[Path],
-        fiscal_year: int,
-        fiscal_period: str,
-        amended: bool = False,
-        filing_date: Optional[str] = None,
-        report_date: Optional[str] = None,
-        company_id: Optional[str] = None,
-        company_name: Optional[str] = None,
-        ticker_aliases: Optional[list[str]] = None,
-        overwrite: bool = False,
+        request: ValidatedFinsUploadFilingRequest,
         *,
         cancellation_checker: CancellationToken | None = None,
     ) -> CnPipelineUploadResult:
         """执行 CN/HK 财报上传并同步返回聚合结果。
 
         Args:
-            ticker: 股票代码。
-            action: 可选动作类型。
-            files: 上传文件列表。
-            fiscal_year: 财年。
-            fiscal_period: 财期。
-            amended: 是否修订版。
-            filing_date: 可选披露日期。
-            report_date: 可选报告日期。
-            company_id: 可选兼容字段。
-            company_name: 公司名称。
-            ticker_aliases: 可选 ticker alias。
-            overwrite: 是否强制覆盖。
+            request: 已完成 preflight 的 typed filing 请求。
             cancellation_checker: 可选协作式取消检查器。
 
         Returns:
@@ -773,18 +757,7 @@ class CnPipeline:
         return _run_async_upload_sync(
             collect_cn_upload_result_from_events(
                 self.upload_filing_stream(
-                    ticker=ticker,
-                    action=action,
-                    files=files,
-                    fiscal_year=fiscal_year,
-                    fiscal_period=fiscal_period,
-                    amended=amended,
-                    filing_date=filing_date,
-                    report_date=report_date,
-                    company_id=company_id,
-                    company_name=company_name,
-                    ticker_aliases=ticker_aliases,
-                    overwrite=overwrite,
+                    request,
                     cancellation_checker=cancellation_checker,
                 ),
                 stream_name="upload_filing_stream",
@@ -793,36 +766,14 @@ class CnPipeline:
 
     async def upload_filing_stream(
         self,
-        ticker: str,
-        action: Optional[str],
-        files: list[Path],
-        fiscal_year: int,
-        fiscal_period: str,
-        amended: bool = False,
-        filing_date: Optional[str] = None,
-        report_date: Optional[str] = None,
-        company_id: Optional[str] = None,
-        company_name: Optional[str] = None,
-        ticker_aliases: Optional[list[str]] = None,
-        overwrite: bool = False,
+        request: ValidatedFinsUploadFilingRequest,
         *,
         cancellation_checker: CancellationToken | None = None,
     ) -> AsyncIterator[UploadFilingEvent]:
         """执行流式 CN/HK 财报上传。
 
         Args:
-            ticker: 股票代码。
-            action: 可选动作类型。
-            files: 上传文件列表。
-            fiscal_year: 财年。
-            fiscal_period: 财期。
-            amended: 是否修订版。
-            filing_date: 可选披露日期。
-            report_date: 可选报告日期。
-            company_id: 可选兼容字段。
-            company_name: 公司名称。
-            ticker_aliases: 可选 ticker alias。
-            overwrite: 是否强制覆盖。
+            request: 已完成 preflight 的 typed filing 请求。
             cancellation_checker: 可选协作式取消检查器。
 
         Yields:
@@ -832,24 +783,27 @@ class CnPipeline:
             RuntimeError: 上传执行失败时抛出。
         """
 
-        normalized_ticker = _normalize_upload_ticker(ticker)
+        raw_request = request.request
+        fresh_state = self._filing_upload_state_repository.read_filing_upload_state(
+            request.normalized_ticker.canonical,
+            request.document_id,
+        )
+        authoritative_request = validate_fins_upload_filing_request(
+            raw_request,
+            published_state=fresh_state,
+        )
+        _assert_authoritative_filing_identity(request, authoritative_request)
+        if raw_request.fiscal_year is None:
+            raise AssertionError("validated filing request 缺少 fiscal_year")
+        normalized_ticker = authoritative_request.normalized_ticker.canonical
         normalized_company_id = build_upload_company_id(normalized_ticker)
-        normalized_period = normalize_cn_fiscal_period(fiscal_period)
+        normalized_period = authoritative_request.normalized_fiscal_period
         form_type = normalized_period
-        requested_action = str(action or "").strip().lower() or None
-        document_id, internal_document_id = build_cn_filing_ids(
-            ticker=normalized_ticker,
-            form_type=form_type,
-            fiscal_year=fiscal_year,
-            fiscal_period=normalized_period,
-            amended=amended,
-        )
-        previous_meta = self._safe_get_upload_document_meta(
-            normalized_ticker,
-            document_id,
-            SourceKind.FILING,
-        )
-        resolved_action = resolve_upload_action(action, previous_meta)
+        requested_action = raw_request.action.strip().lower()
+        document_id = authoritative_request.document_id
+        internal_document_id = authoritative_request.internal_document_id
+        previous_meta = authoritative_request.published_state.source_meta
+        resolved_action = authoritative_request.resolved_action
         yield UploadFilingEvent(
             event_type=UploadFilingEventType.UPLOAD_STARTED,
             ticker=normalized_ticker,
@@ -858,16 +812,16 @@ class CnPipeline:
                 "action": resolved_action,
                 "requested_action": requested_action,
                 "resolved_action": resolved_action,
-                "fiscal_year": fiscal_year,
+                "fiscal_year": raw_request.fiscal_year,
                 "fiscal_period": normalized_period,
-                "amended": amended,
-                "filing_date": filing_date,
-                "report_date": report_date,
+                "amended": raw_request.amended,
+                "filing_date": raw_request.filing_date,
+                "report_date": raw_request.report_date,
                 "company_id": normalized_company_id,
-                "company_name": company_name,
-                "ticker_aliases": _json_text_list(ticker_aliases),
-                "overwrite": overwrite,
-                "file_count": len(files),
+                "company_name": raw_request.company_name,
+                "ticker_aliases": _json_text_list(list(raw_request.ticker_aliases)),
+                "overwrite": raw_request.overwrite,
+                "file_count": len(raw_request.files),
             },
         )
         try:
@@ -878,18 +832,19 @@ class CnPipeline:
                 document_id=document_id,
                 internal_document_id=internal_document_id,
                 form_type=form_type,
-                files=files,
-                overwrite=overwrite,
+                files=list(raw_request.files),
+                overwrite=raw_request.overwrite,
+                previous_meta=previous_meta,
                 cancellation=cancellation_checker,
                 meta={
                     "company_id": normalized_company_id,
                     "ingest_method": FinsIngestMethod.UPLOAD.to_storage_value(),
-                    "fiscal_year": fiscal_year,
+                    "fiscal_year": raw_request.fiscal_year,
                     "fiscal_period": normalized_period,
                     "report_kind": derive_report_kind(normalized_period),
-                    "filing_date": filing_date,
-                    "report_date": report_date,
-                    "amended": amended,
+                    "filing_date": raw_request.filing_date,
+                    "report_date": raw_request.report_date,
+                    "amended": raw_request.amended,
                 },
             )
             if isinstance(prepared_upload, UploadOperationResult):
@@ -897,17 +852,17 @@ class CnPipeline:
             else:
                 publication_batch = self._batching_repository.begin_batch(normalized_ticker)
                 try:
-                    upsert_company_meta_for_upload(
+                    stage_upload_company_meta_decision(
                         repository=self._company_repository,
-                        ticker=normalized_ticker,
-                        action=resolved_action,
-                        company_id=company_id,
-                        company_name=company_name,
-                        ticker_aliases=ticker_aliases,
+                        decision=authoritative_request.company_meta_decision,
                         batch=publication_batch,
                     )
-                except BaseException:
-                    self._batching_repository.rollback_batch(publication_batch)
+                except BaseException as operation_error:
+                    rollback_prepared_upload_batch(
+                        batching_repository=self._batching_repository,
+                        batch=publication_batch,
+                        operation_error=operation_error,
+                    )
                     raise
                 upload_result = commit_prepared_upload_batch(
                     service=self._upload_service,
@@ -929,16 +884,16 @@ class CnPipeline:
                 filing_action=resolved_action,
                 requested_action=requested_action,
                 resolved_action=resolved_action,
-                files=_json_text_list([str(path) for path in files]),
-                fiscal_year=fiscal_year,
+                files=_json_text_list([str(path) for path in raw_request.files]),
+                fiscal_year=raw_request.fiscal_year,
                 fiscal_period=normalized_period,
-                amended=amended,
-                filing_date=filing_date,
-                report_date=report_date,
+                amended=raw_request.amended,
+                filing_date=raw_request.filing_date,
+                report_date=raw_request.report_date,
                 company_id=normalized_company_id,
-                company_name=company_name,
-                ticker_aliases=_json_text_list(ticker_aliases),
-                overwrite=overwrite,
+                company_name=raw_request.company_name,
+                ticker_aliases=_json_text_list(list(raw_request.ticker_aliases)),
+                overwrite=raw_request.overwrite,
                 **upload_result.payload,
                 status=_resolve_upload_status(upload_result.status),
             )
@@ -948,34 +903,69 @@ class CnPipeline:
                 document_id=document_id,
                 payload={"result": final_result},
             )
-        except Exception as exc:
-            failure_reason = fins_upload_failure_from_exception(exc)
-            failed_result = self._build_upload_result(
+        except DoclingConversionCancelledError:
+            cancelled_result = UploadOperationResult(
+                status="cancelled",
+                document_id=document_id,
+                internal_document_id=internal_document_id,
+                file_events=[],
+                payload={
+                    "document_id": document_id,
+                    "internal_document_id": internal_document_id,
+                    "skip_reason": "cancelled",
+                },
+            )
+            final_result = self._build_upload_result(
                 action="upload_filing",
                 ticker=normalized_ticker,
                 filing_action=resolved_action,
                 requested_action=requested_action,
                 resolved_action=resolved_action,
-                files=_json_text_list([str(path) for path in files]),
-                fiscal_year=fiscal_year,
+                files=_json_text_list([str(path) for path in raw_request.files]),
+                fiscal_year=raw_request.fiscal_year,
                 fiscal_period=normalized_period,
-                amended=amended,
-                filing_date=filing_date,
-                report_date=report_date,
+                amended=raw_request.amended,
+                filing_date=raw_request.filing_date,
+                report_date=raw_request.report_date,
                 company_id=normalized_company_id,
-                company_name=company_name,
-                ticker_aliases=_json_text_list(ticker_aliases),
-                overwrite=overwrite,
-                document_id=document_id,
-                status="failed",
-                message=failure_reason.message,
-                failure=failure_reason.to_json(),
+                company_name=raw_request.company_name,
+                ticker_aliases=_json_text_list(list(raw_request.ticker_aliases)),
+                overwrite=raw_request.overwrite,
+                **cancelled_result.payload,
+                status=_resolve_upload_status(cancelled_result.status),
             )
             yield UploadFilingEvent(
-                event_type=UploadFilingEventType.UPLOAD_FAILED,
+                event_type=UploadFilingEventType.UPLOAD_COMPLETED,
                 ticker=normalized_ticker,
                 document_id=document_id,
-                payload={"error": failure_reason.message, "result": failed_result},
+                payload={"result": final_result},
+            )
+        except DoclingConversionError as exc:
+            _LOGGER.exception("CN/HK filing upload Docling conversion failed")
+            failure_reason = fins_upload_failure_from_exception(exc)
+            yield _build_cn_filing_failure_event(
+                pipeline=self,
+                request=authoritative_request,
+                requested_action=requested_action,
+                failure_reason=failure_reason,
+            )
+        except OSError as exc:
+            _LOGGER.exception("CN/HK filing upload storage operation failed")
+            failure_reason = fins_upload_failure_from_exception(exc)
+            yield _build_cn_filing_failure_event(
+                pipeline=self,
+                request=authoritative_request,
+                requested_action=requested_action,
+                failure_reason=failure_reason,
+            )
+        except Exception as exc:
+            _LOGGER.exception("CN/HK filing upload runtime operation failed")
+            failure_reason = fins_upload_failure_from_exception(exc)
+            yield _build_cn_filing_failure_event(
+                pipeline=self,
+                request=authoritative_request,
+                requested_action=requested_action,
+                failure_reason=failure_reason,
             )
 
     def upload_material(
@@ -1166,6 +1156,7 @@ class CnPipeline:
                 form_type=form_type,
                 files=file_list,
                 overwrite=overwrite,
+                previous_meta=previous_meta,
                 cancellation=cancellation_checker,
                 meta={
                     "company_id": normalized_company_id,
@@ -1220,7 +1211,6 @@ class CnPipeline:
                 payload={"result": final_result},
             )
         except Exception as exc:
-            failure_reason = fins_upload_failure_from_exception(exc)
             failed_result = self._build_upload_result(
                 action="upload_material",
                 ticker=normalized_ticker,
@@ -1240,14 +1230,13 @@ class CnPipeline:
                 company_name=company_name,
                 overwrite=overwrite,
                 status="failed",
-                message=failure_reason.message,
-                failure=failure_reason.to_json(),
+                message=str(exc),
             )
             yield UploadMaterialEvent(
                 event_type=UploadMaterialEventType.UPLOAD_FAILED,
                 ticker=normalized_ticker,
                 document_id=resolved_document_id,
-                payload={"error": failure_reason.message, "result": failed_result},
+                payload={"error": str(exc), "result": failed_result},
             )
 
     def _safe_get_upload_document_meta(
@@ -1802,6 +1791,85 @@ def _pipeline_name_for_ticker(ticker: str) -> str:
     if normalized is not None and normalized.market == "HK":
         return HK_PIPELINE_NAME
     return CN_PIPELINE_NAME
+
+
+def _assert_authoritative_filing_identity(
+    preflight: ValidatedFinsUploadFilingRequest,
+    authoritative: ValidatedFinsUploadFilingRequest,
+) -> None:
+    """断言 fresh validator 未改变 CN/HK filing deterministic identity。
+
+    Args:
+        preflight: 入口 preflight validated request。
+        authoritative: workflow fresh snapshot 产生的 validated request。
+
+    Returns:
+        无。
+
+    Raises:
+        RuntimeError: canonical ticker 或 filing identity 不一致时抛出。
+    """
+
+    if (
+        authoritative.normalized_ticker.canonical != preflight.normalized_ticker.canonical
+        or authoritative.document_id != preflight.document_id
+        or authoritative.internal_document_id != preflight.internal_document_id
+    ):
+        raise RuntimeError("filing authoritative identity mismatch")
+
+
+def _build_cn_filing_failure_event(
+    *,
+    pipeline: CnPipeline,
+    request: ValidatedFinsUploadFilingRequest,
+    requested_action: str,
+    failure_reason: FinsUploadFailureReason,
+) -> UploadFilingEvent:
+    """从 authoritative request 与 typed reason 构造 CN/HK filing 失败事件。
+
+    Args:
+        pipeline: CN/HK pipeline facade。
+        request: authoritative validated request。
+        requested_action: 用户请求动作。
+        failure_reason: closed public failure reason。
+
+    Returns:
+        单个 typed upload failed 事件。
+
+    Raises:
+        无。
+    """
+
+    raw_request = request.request
+    normalized_ticker = request.normalized_ticker.canonical
+    normalized_company_id = build_upload_company_id(normalized_ticker)
+    failed_result = pipeline._build_upload_result(
+        action="upload_filing",
+        ticker=normalized_ticker,
+        filing_action=request.resolved_action,
+        requested_action=requested_action,
+        resolved_action=request.resolved_action,
+        files=_json_text_list([str(path) for path in raw_request.files]),
+        fiscal_year=raw_request.fiscal_year,
+        fiscal_period=request.normalized_fiscal_period,
+        amended=raw_request.amended,
+        filing_date=raw_request.filing_date,
+        report_date=raw_request.report_date,
+        company_id=normalized_company_id,
+        company_name=raw_request.company_name,
+        ticker_aliases=_json_text_list(list(raw_request.ticker_aliases)),
+        overwrite=raw_request.overwrite,
+        document_id=request.document_id,
+        status="failed",
+        message=failure_reason.message,
+        failure=failure_reason.to_json(),
+    )
+    return UploadFilingEvent(
+        event_type=UploadFilingEventType.UPLOAD_FAILED,
+        ticker=normalized_ticker,
+        document_id=request.document_id,
+        payload={"error": failure_reason.message, "result": failed_result},
+    )
 
 
 def _normalize_upload_ticker(ticker: str) -> str:

@@ -38,6 +38,28 @@ class FinsUploadFailureCode(str, Enum):
     UNEXPECTED_RUNTIME = "unexpected_runtime"
 
 
+class FinsUploadPrevalidationError(RuntimeError):
+    """filing prevalidation 期间的 typed bounded operational failure。"""
+
+    failure: FinsUploadFailureReason
+
+    def __init__(self, failure: FinsUploadFailureReason) -> None:
+        """初始化 prevalidation operational error。
+
+        Args:
+            failure: 已由 failure owner 产生的 path-free reason。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.failure = failure
+        super().__init__(failure.message)
+
+
 @dataclass(frozen=True, slots=True)
 class FinsUploadFailureReason:
     """上传失败的有界、安全且可行动 public reason。
@@ -100,9 +122,7 @@ _DOCLING_FAILURE_CODES: Final[Mapping[DoclingConversionFailureKind, FinsUploadFa
     DoclingConversionFailureKind.CHILD_CRASH: FinsUploadFailureCode.DOCLING_CHILD_CRASH,
     DoclingConversionFailureKind.CLEANUP: FinsUploadFailureCode.DOCLING_CLEANUP,
 }
-_CONTENT_FAILURE_CODES: Final[frozenset[FinsUploadFailureCode]] = frozenset(
-    _DOCLING_FAILURE_CODES.values()
-)
+_CONTENT_FAILURE_CODES: Final[frozenset[FinsUploadFailureCode]] = frozenset(_DOCLING_FAILURE_CODES.values())
 
 
 def fins_upload_failure_from_exception(error: Exception) -> FinsUploadFailureReason:
@@ -140,6 +160,48 @@ def fins_upload_failure_from_exception(error: Exception) -> FinsUploadFailureRea
     )
 
 
+def fins_upload_prevalidation_io_failure() -> FinsUploadFailureReason:
+    """构造 filing published-state I/O 的 bounded public reason。
+
+    Args:
+        无。
+
+    Returns:
+        不含路径或原始异常文本的 storage failure reason。
+
+    Raises:
+        无。
+    """
+
+    return FinsUploadFailureReason(
+        kind=FinsUploadFailureKind.STORAGE,
+        code=FinsUploadFailureCode.STORAGE_IO,
+        message="上传状态读取失败，请检查工作区存储状态",
+        retry_hint="修复工作区存储后重试",
+    )
+
+
+def fins_upload_prevalidation_corruption_failure() -> FinsUploadFailureReason:
+    """构造 filing published-state corruption 的 bounded public reason。
+
+    Args:
+        无。
+
+    Returns:
+        不含路径或原始异常文本的 storage failure reason。
+
+    Raises:
+        无。
+    """
+
+    return FinsUploadFailureReason(
+        kind=FinsUploadFailureKind.STORAGE,
+        code=FinsUploadFailureCode.STORAGE_IO,
+        message="上传状态已损坏，请检查工作区存储状态",
+        retry_hint="修复工作区存储后重试",
+    )
+
+
 def upload_failure_reason_from_json(value: JsonValue | None) -> FinsUploadFailureReason | None:
     """从 pipeline JSON exact-key object 恢复 typed failure reason。
 
@@ -164,9 +226,9 @@ def upload_failure_reason_from_json(value: JsonValue | None) -> FinsUploadFailur
     expected_kind = (
         FinsUploadFailureKind.CONTENT
         if code in _CONTENT_FAILURE_CODES
-        else FinsUploadFailureKind.STORAGE
-        if code is FinsUploadFailureCode.STORAGE_IO
-        else FinsUploadFailureKind.RUNTIME
+        else (
+            FinsUploadFailureKind.STORAGE if code is FinsUploadFailureCode.STORAGE_IO else FinsUploadFailureKind.RUNTIME
+        )
     )
     if kind is not expected_kind:
         raise ValueError("upload failure kind 与 code 不一致")

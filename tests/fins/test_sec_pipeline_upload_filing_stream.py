@@ -3,16 +3,27 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+import dayu.fins.pipelines.sec_upload_workflow as sec_upload_workflow
 from dayu.contracts.cancellation import CancellationToken
 from dayu.fins.domain.document_models import BatchToken, CompanyMeta, CompanyMetaInventoryEntry, now_iso8601
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.ingestion_runtime import (
+    FinsUploadFilingRequest,
+    FinsUploadUsageCode,
+    FinsUploadUsageError,
+    ValidatedFinsUploadFilingRequest,
+)
 from dayu.fins.pipelines.sec_pipeline import SecPipeline
 from dayu.fins.pipelines.docling_process_converter import (
     DoclingConversionConfig,
+    DoclingConversionCancelledError,
+    DoclingConversionError,
+    DoclingConversionFailureKind,
     DoclingConversionResult,
 )
 from dayu.fins.pipelines.upload_filing_events import UploadFilingEventType
@@ -22,6 +33,20 @@ from dayu.fins.pipelines.upload_company_meta import (
     upsert_company_meta_for_upload,
 )
 from dayu.fins.processors.registry import build_fins_processor_registry
+from dayu.fins.service_runtime import prevalidate_fins_upload_filing_request_for_workspace
+from dayu.fins.storage import (
+    FilingUploadPublishedState,
+    FsDocumentBlobRepository,
+    FsFilingUploadStateRepository,
+)
+from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
+
+from .upload_filing_test_support import (
+    TrackingBatchingRepository,
+    TrackingCompanyMetaRepository,
+    TrackingSourceDocumentRepository,
+    published_tree_sha256,
+)
 
 
 class _SpyCompanyMetaRepository:
@@ -134,6 +159,147 @@ class _FakeDoclingConverter:
         del input_bytes, config, cancellation
         data = ('{"name": "' + stream_name + '", "format": "docling"}').encode()
         return DoclingConversionResult(data, len(data), hashlib.sha256(data).hexdigest())
+
+
+class _FailingDoclingConverter:
+    """抛出指定 typed/runtime exception 的 converter 测试替身。"""
+
+    def __init__(self, error: Exception) -> None:
+        """初始化 failure converter。
+
+        Args:
+            error: conversion 调用应抛出的异常。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.error = error
+
+    async def convert_to_json_bytes(
+        self,
+        input_bytes: bytes,
+        stream_name: str,
+        *,
+        config: DoclingConversionConfig,
+        cancellation: CancellationToken | None,
+    ) -> DoclingConversionResult:
+        """抛出预设异常以验证 workflow typed catch 顺序。
+
+        Args:
+            input_bytes: 输入字节。
+            stream_name: 输入名称。
+            config: 闭合转换配置。
+            cancellation: canonical cancellation token。
+
+        Returns:
+            不返回。
+
+        Raises:
+            Exception: 始终抛出构造时传入的异常。
+        """
+
+        del input_bytes, stream_name, config, cancellation
+        raise self.error
+
+
+def _validated_sec_filing_request(
+    *,
+    pipeline: SecPipeline,
+    filing_file: Path,
+    action: str | None,
+    company_name: str | None,
+    overwrite: bool = False,
+    ticker_aliases: tuple[str, ...] = (),
+    fiscal_year: int = 2025,
+    fiscal_period: str = "Q1",
+    filing_date: str | None = None,
+    report_date: str | None = None,
+) -> ValidatedFinsUploadFilingRequest:
+    """使用 production validator 构造 SEC filing 测试请求。
+
+    Args:
+        pipeline: 持有当前 published state 的 SEC pipeline。
+        filing_file: 上传文件。
+        action: 请求动作；``None`` 表示 auto。
+        company_name: 可选公司名称。
+        overwrite: 是否覆盖既有 filing。
+        ticker_aliases: 可选 ticker aliases。
+        fiscal_year: 财年。
+        fiscal_period: 财期。
+        filing_date: 可选披露日期。
+        report_date: 可选报告日期。
+
+    Returns:
+        由 production storage/validator owner 产生的 validated request。
+
+    Raises:
+        FinsUploadUsageError: 请求不满足 filing usage contract 时抛出。
+        OSError: published state 读取失败时抛出。
+        ValueError: published state 损坏时抛出。
+    """
+
+    return prevalidate_fins_upload_filing_request_for_workspace(
+        FinsUploadFilingRequest(
+            ticker="AAPL",
+            action=action or "auto",
+            files=(filing_file,),
+            fiscal_year=fiscal_year,
+            fiscal_period=fiscal_period,
+            filing_date=filing_date,
+            report_date=report_date,
+            company_name=company_name,
+            ticker_aliases=ticker_aliases,
+            overwrite=overwrite,
+        ),
+        workspace_root=pipeline._workspace_root,
+    )
+
+
+def _tracking_sec_pipeline(
+    workspace_root: Path,
+) -> tuple[
+    SecPipeline,
+    TrackingBatchingRepository,
+    TrackingCompanyMetaRepository,
+    TrackingSourceDocumentRepository,
+]:
+    """构造共享同一 FS core 的 SEC upload tracking composition。
+
+    Args:
+        workspace_root: 测试工作区根目录。
+
+    Returns:
+        pipeline、batch、company 与 source tracking repositories。
+
+    Raises:
+        OSError: storage composition 初始化失败时抛出。
+    """
+
+    repository_set = build_fs_repository_set(
+        workspace_root=workspace_root,
+        create_directories=False,
+    )
+    batching = TrackingBatchingRepository(workspace_root, repository_set=repository_set)
+    company = TrackingCompanyMetaRepository(workspace_root, repository_set=repository_set)
+    source = TrackingSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    pipeline = SecPipeline(
+        workspace_root=workspace_root,
+        processor_registry=build_fins_processor_registry(),
+        batching_repository=batching,
+        company_repository=company,
+        source_repository=source,
+        blob_repository=FsDocumentBlobRepository(workspace_root, repository_set=repository_set),
+        filing_upload_state_repository=FsFilingUploadStateRepository(
+            workspace_root,
+            repository_set=repository_set,
+        ),
+        docling_converter=_FakeDoclingConverter(),
+    )
+    return pipeline, batching, company, source
 
 
 def _seed_sec_upload_company_meta(
@@ -253,28 +419,23 @@ async def test_upload_filing_stream_uploads_docling_files(tmp_path: Path) -> Non
         AssertionError: 断言失败时抛出。
     """
 
-    pipeline = SecPipeline(
-        workspace_root=tmp_path,
-        processor_registry=build_fins_processor_registry(),
-        docling_converter=_FakeDoclingConverter(),
-    )
+    pipeline, batching, company, source = _tracking_sec_pipeline(tmp_path)
     filing_file = tmp_path / "filing.pdf"
     filing_file.write_text("demo filing", encoding="utf-8")
+    before_tree = published_tree_sha256(tmp_path, "AAPL")
 
     events = [
         event
         async for event in pipeline.upload_filing_stream(
-            ticker="AAPL",
-            action="create",
-            files=[filing_file],
-            fiscal_year=2025,
-            fiscal_period="Q1",
-            amended=False,
-            filing_date="2025-05-01",
-            report_date="2025-03-31",
-            company_name="Apple Inc.",
-            ticker_aliases=["AAPL", "APC"],
-            overwrite=False,
+            _validated_sec_filing_request(
+                pipeline=pipeline,
+                filing_file=filing_file,
+                action="create",
+                company_name="Apple Inc.",
+                ticker_aliases=("AAPL", "APC"),
+                filing_date="2025-05-01",
+                report_date="2025-03-31",
+            )
         )
     ]
 
@@ -301,6 +462,14 @@ async def test_upload_filing_stream_uploads_docling_files(tmp_path: Path) -> Non
     )
     assert str(meta["primary_document"]).endswith("_docling.json")
     assert str(meta["form_type"]) == "Q1"
+    after_tree = published_tree_sha256(tmp_path, "AAPL")
+    assert before_tree == {}
+    assert after_tree
+    assert len(batching.begin_tokens) == 1
+    assert batching.commit_tokens == batching.begin_tokens
+    assert batching.rollback_tokens == []
+    assert company.stage_tokens == batching.begin_tokens
+    assert source.stage_tokens == batching.begin_tokens
 
 
 @pytest.mark.asyncio
@@ -334,14 +503,13 @@ async def test_upload_filing_stream_preserves_same_version_company_meta(tmp_path
     events = [
         event
         async for event in pipeline.upload_filing_stream(
-            ticker="AAPL",
-            action="create",
-            files=[filing_file],
-            fiscal_year=2025,
-            fiscal_period="Q1",
-            company_name="Ignored Apple",
-            ticker_aliases=["AAPL", "NEW"],
-            overwrite=False,
+            _validated_sec_filing_request(
+                pipeline=pipeline,
+                filing_file=filing_file,
+                action="create",
+                company_name="Ignored Apple",
+                ticker_aliases=("AAPL", "NEW"),
+            )
         )
     ]
 
@@ -383,14 +551,13 @@ async def test_upload_filing_stream_refreshes_stale_company_meta(tmp_path: Path)
     events = [
         event
         async for event in pipeline.upload_filing_stream(
-            ticker="AAPL",
-            action="create",
-            files=[filing_file],
-            fiscal_year=2025,
-            fiscal_period="Q1",
-            company_name="Apple Refreshed",
-            ticker_aliases=["AAPL", "APC"],
-            overwrite=False,
+            _validated_sec_filing_request(
+                pipeline=pipeline,
+                filing_file=filing_file,
+                action="create",
+                company_name="Apple Refreshed",
+                ticker_aliases=("AAPL", "APC"),
+            )
         )
     ]
 
@@ -430,33 +597,16 @@ async def test_upload_filing_stream_stale_company_meta_requires_company_name(tmp
     filing_file = tmp_path / "filing.pdf"
     filing_file.write_text("demo filing", encoding="utf-8")
 
-    events = [
-        event
-        async for event in pipeline.upload_filing_stream(
-            ticker="AAPL",
+    with pytest.raises(FinsUploadUsageError) as exc_info:
+        _validated_sec_filing_request(
+            pipeline=pipeline,
+            filing_file=filing_file,
             action="create",
-            files=[filing_file],
-            fiscal_year=2025,
-            fiscal_period="Q1",
             company_name=None,
-            overwrite=False,
         )
-    ]
 
-    assert [event.event_type for event in events] == [
-        UploadFilingEventType.UPLOAD_STARTED,
-        UploadFilingEventType.UPLOAD_FAILED,
-    ]
-    failed_result = events[-1].payload["result"]
-    assert isinstance(failed_result, dict)
-    assert failed_result["status"] == "failed"
-    assert failed_result["message"] == "上传执行失败，请检查运行日志后重试"
-    assert failed_result["failure"] == {
-        "kind": "runtime",
-        "code": "unexpected_runtime",
-        "message": "上传执行失败，请检查运行日志后重试",
-        "retry_hint": None,
-    }
+    assert exc_info.value.failure.code is FinsUploadUsageCode.COMPANY_NAME_REQUIRED
+    assert exc_info.value.failure.message == ("当前公司缺少有效元数据；create/update 必须提供 --company-name")
     company_meta = pipeline._company_repository.get_company_meta("AAPL")
     assert company_meta.company_name == "Stale Apple"
     assert company_meta.resolver_version == "market_resolver_v0.9.0"
@@ -489,13 +639,12 @@ async def test_upload_filing_stream_auto_action_and_overwrite_reset(tmp_path: Pa
     create_events = [
         event
         async for event in pipeline.upload_filing_stream(
-            ticker="AAPL",
-            action=None,
-            files=[old_file],
-            fiscal_year=2025,
-            fiscal_period="Q1",
-            company_name="Apple Inc.",
-            overwrite=False,
+            _validated_sec_filing_request(
+                pipeline=pipeline,
+                filing_file=old_file,
+                action=None,
+                company_name="Apple Inc.",
+            )
         )
     ]
     create_result = create_events[-1].payload["result"]
@@ -505,13 +654,12 @@ async def test_upload_filing_stream_auto_action_and_overwrite_reset(tmp_path: Pa
     skip_events = [
         event
         async for event in pipeline.upload_filing_stream(
-            ticker="AAPL",
-            action=None,
-            files=[old_file],
-            fiscal_year=2025,
-            fiscal_period="Q1",
-            company_name="Apple Inc.",
-            overwrite=False,
+            _validated_sec_filing_request(
+                pipeline=pipeline,
+                filing_file=old_file,
+                action=None,
+                company_name="Apple Inc.",
+            )
         )
     ]
     skip_result = skip_events[-1].payload["result"]
@@ -522,13 +670,13 @@ async def test_upload_filing_stream_auto_action_and_overwrite_reset(tmp_path: Pa
     overwrite_events = [
         event
         async for event in pipeline.upload_filing_stream(
-            ticker="AAPL",
-            action=None,
-            files=[new_file],
-            fiscal_year=2025,
-            fiscal_period="Q1",
-            company_name="Apple Inc.",
-            overwrite=True,
+            _validated_sec_filing_request(
+                pipeline=pipeline,
+                filing_file=new_file,
+                action=None,
+                company_name="Apple Inc.",
+                overwrite=True,
+            )
         )
     ]
     overwrite_result = overwrite_events[-1].payload["result"]
@@ -544,3 +692,297 @@ async def test_upload_filing_stream_auto_action_and_overwrite_reset(tmp_path: Pa
     )
     file_names = sorted(meta.uri.split("/")[-1] for meta in pipeline._blob_repository.list_files(handle))
     assert file_names == ["q1_new.pdf", "q1_new_docling.json"]
+
+
+@pytest.mark.parametrize("failure_point", ("company", "source"))
+@pytest.mark.asyncio
+async def test_upload_filing_stage_failure_rolls_back_one_batch_and_preserves_published_tree(
+    tmp_path: Path,
+    failure_point: str,
+) -> None:
+    """SEC company/source stage failure 必须回滚同一 batch 且 published SHA 不变。
+
+    Args:
+        tmp_path: 临时目录。
+        failure_point: 注入 company 或 source stage failure。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: batch 计数、token identity 或 published tree 漂移时抛出。
+    """
+
+    pipeline, batching, company, source = _tracking_sec_pipeline(tmp_path)
+    filing_file = tmp_path / "filing.pdf"
+    filing_file.write_text("demo filing", encoding="utf-8")
+    request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action="create",
+        company_name="Apple Inc.",
+    )
+    company.fail_after_stage = failure_point == "company"
+    source.fail_after_stage = failure_point == "source"
+    before_tree = published_tree_sha256(tmp_path, "AAPL")
+
+    events = [event async for event in pipeline.upload_filing_stream(request)]
+
+    assert events[-1].event_type is UploadFilingEventType.UPLOAD_FAILED
+    assert published_tree_sha256(tmp_path, "AAPL") == before_tree == {}
+    assert len(batching.begin_tokens) == 1
+    assert batching.commit_tokens == []
+    assert batching.rollback_tokens == batching.begin_tokens
+    assert company.stage_tokens == batching.begin_tokens
+    if failure_point == "source":
+        assert source.stage_tokens == batching.begin_tokens
+    else:
+        assert source.stage_tokens == []
+
+
+@pytest.mark.asyncio
+async def test_upload_filing_fresh_recheck_discards_stale_action_and_company_decision(
+    tmp_path: Path,
+) -> None:
+    """SEC workflow 必须丢弃 preflight 后失效的 action/company decision。
+
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: fresh recheck 未成为唯一 prepare/stage authority 时抛出。
+    """
+
+    pipeline, batching, company, source = _tracking_sec_pipeline(tmp_path)
+    filing_file = tmp_path / "filing.pdf"
+    filing_file.write_text("demo filing", encoding="utf-8")
+    stale_preflight = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action=None,
+        company_name="Stale Decision Name",
+    )
+    assert stale_preflight.resolved_action == "create"
+    assert stale_preflight.company_meta_decision.disposition == "stage"
+    published_request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action=None,
+        company_name="Published Company Name",
+    )
+    published_events = [event async for event in pipeline.upload_filing_stream(published_request)]
+    assert published_events[-1].event_type is UploadFilingEventType.UPLOAD_COMPLETED
+    batching.begin_tokens.clear()
+    batching.commit_tokens.clear()
+    batching.rollback_tokens.clear()
+    company.stage_tokens.clear()
+    source.stage_tokens.clear()
+    published_tree = published_tree_sha256(tmp_path, "AAPL")
+
+    stale_events = [event async for event in pipeline.upload_filing_stream(stale_preflight)]
+
+    stale_result = stale_events[-1].payload["result"]
+    assert isinstance(stale_result, dict)
+    assert stale_result["filing_action"] == "update"
+    assert stale_result["status"] == "skipped"
+    assert pipeline._company_repository.get_company_meta("AAPL").company_name == ("Published Company Name")
+    assert batching.begin_tokens == []
+    assert company.stage_tokens == []
+    assert source.stage_tokens == []
+    assert published_tree_sha256(tmp_path, "AAPL") == published_tree
+
+
+@pytest.mark.asyncio
+async def test_upload_filing_rollback_failure_logs_primary_and_recovery_evidence(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """SEC rollback failure 必须保留 stage 主因与 recovery evidence 给 operator。
+
+    Args:
+        tmp_path: 临时目录。
+        caplog: operator log 捕获夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 主因被 rollback failure 覆盖或 public reason 泄漏时抛出。
+    """
+
+    pipeline, batching, company, _source = _tracking_sec_pipeline(tmp_path)
+    filing_file = tmp_path / "filing.pdf"
+    filing_file.write_text("demo filing", encoding="utf-8")
+    request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action="create",
+        company_name="Apple Inc.",
+    )
+    company.fail_after_stage = True
+    batching.fail_rollback = True
+
+    with caplog.at_level("ERROR"):
+        events = [event async for event in pipeline.upload_filing_stream(request)]
+
+    failed_result = events[-1].payload["result"]
+    assert isinstance(failed_result, dict)
+    assert failed_result["message"] == "上传执行失败，请检查运行日志后重试"
+    assert "injected company stage primary failure" not in str(failed_result)
+    assert "injected rollback evidence failure" not in str(failed_result)
+    assert "injected company stage primary failure" in caplog.text
+    assert "injected rollback evidence failure" in caplog.text
+    assert batching.commit_tokens == []
+    assert batching.rollback_tokens == batching.begin_tokens
+    assert published_tree_sha256(tmp_path, "AAPL") == {}
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status", "expected_code", "operator_marker"),
+    (
+        (DoclingConversionCancelledError(), "cancelled", None, None),
+        (
+            DoclingConversionError(
+                DoclingConversionFailureKind.CONVERTER_EXECUTION,
+                "Docling conversion execution failed",
+                7,
+            ),
+            "failed",
+            "docling_converter_execution",
+            "Docling conversion failed",
+        ),
+        (OSError("private storage cause"), "failed", "storage_io", "storage operation failed"),
+        (
+            RuntimeError("private runtime cause"),
+            "failed",
+            "unexpected_runtime",
+            "runtime operation failed",
+        ),
+    ),
+)
+@pytest.mark.asyncio
+async def test_upload_filing_observably_classifies_cancelled_docling_storage_and_generic(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    error: Exception,
+    expected_status: str,
+    expected_code: str | None,
+    operator_marker: str | None,
+) -> None:
+    """SEC filing failure path 必须按 frozen typed priority 分类并保留 operator cause。
+
+    Args:
+        tmp_path: 临时目录。
+        caplog: operator log 捕获夹具。
+        error: converter 注入异常。
+        expected_status: pipeline 预期终态。
+        expected_code: failed 终态的 closed code；取消时为空。
+        operator_marker: 对应 typed catch 的 operator marker；取消时为空。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: typed failure 落入错误分类或 public/internal cause 边界漂移时抛出。
+    """
+
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        processor_registry=build_fins_processor_registry(),
+        docling_converter=_FailingDoclingConverter(error),
+    )
+    filing_file = tmp_path / "filing.pdf"
+    filing_file.write_text("demo filing", encoding="utf-8")
+    request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action="create",
+        company_name="Apple Inc.",
+    )
+
+    with caplog.at_level("ERROR"):
+        events = [event async for event in pipeline.upload_filing_stream(request)]
+
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    assert result["status"] == expected_status
+    if expected_code is None:
+        assert events[-1].event_type is UploadFilingEventType.UPLOAD_COMPLETED
+        assert "failure" not in result
+        assert operator_marker is None
+        assert caplog.text == ""
+    else:
+        assert events[-1].event_type is UploadFilingEventType.UPLOAD_FAILED
+        failure = result["failure"]
+        assert isinstance(failure, dict)
+        assert failure["code"] == expected_code
+        assert operator_marker is not None
+        assert operator_marker in caplog.text
+        assert str(error) in caplog.text
+        assert str(error) not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_upload_filing_authoritative_identity_mismatch_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SEC fresh validator identity 漂移必须在 prepare/mutation 前失败关闭。
+
+    Args:
+        tmp_path: 临时目录。
+        monkeypatch: authoritative validator 输出注入夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: identity mismatch 未失败关闭或产生 published mutation 时抛出。
+    """
+
+    pipeline, batching, _company, _source = _tracking_sec_pipeline(tmp_path)
+    filing_file = tmp_path / "filing.pdf"
+    filing_file.write_text("demo filing", encoding="utf-8")
+    request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action="create",
+        company_name="Apple Inc.",
+    )
+    owner_validator = sec_upload_workflow.validate_fins_upload_filing_request
+
+    def mismatched_validator(
+        raw_request: FinsUploadFilingRequest,
+        *,
+        published_state: FilingUploadPublishedState,
+    ) -> ValidatedFinsUploadFilingRequest:
+        """返回仅 document identity 漂移的 validator 结果。
+
+        Args:
+            raw_request: immutable raw filing request。
+            published_state: workflow fresh snapshot。
+
+        Returns:
+            document ID 被注入漂移的 validated request。
+
+        Raises:
+            FinsUploadUsageError: owner validator 拒绝请求时抛出。
+        """
+
+        validated = owner_validator(raw_request, published_state=published_state)
+        return replace(validated, document_id=f"{validated.document_id}-mismatch")
+
+    monkeypatch.setattr(
+        sec_upload_workflow,
+        "validate_fins_upload_filing_request",
+        mismatched_validator,
+    )
+
+    with pytest.raises(RuntimeError, match="filing authoritative identity mismatch"):
+        _ = [event async for event in pipeline.upload_filing_stream(request)]
+
+    assert batching.begin_tokens == []
+    assert published_tree_sha256(tmp_path, "AAPL") == {}
