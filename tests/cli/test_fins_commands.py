@@ -7,6 +7,7 @@ import asyncio
 import errno
 import hashlib
 import io
+import logging
 import subprocess
 import sys
 from collections.abc import AsyncGenerator
@@ -21,6 +22,7 @@ import pytest
 import dayu.cli.commands.fins as fins_command
 import dayu.cli.main as cli_main
 import dayu.cli.output as cli_output
+import dayu.fins.ingestion_runtime as ingestion_runtime
 from dayu.cli.agent_entrypoint import CliSigintMonitor
 from dayu.cli.arg_parsing import parse_cli_args
 from dayu.cli.exit_codes import (
@@ -48,14 +50,23 @@ from dayu.fins.download_contract import (
 )
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.domain.document_models import SourceDocumentUpsertRequest, SourceHandle
+from dayu.fins.ingestion_runtime import (
+    FinsJobCancellationChecker,
+    FinsIngestionOperationKind,
+    FinsUploadFilingRequest,
+    FinsUploadResultSummary,
+    validate_fins_upload_filing_request,
+)
 from dayu.fins.pipelines.docling_upload_service import build_sec_filing_ids
 from dayu.fins.storage import (
+    FilingUploadPublishedState,
     FsBatchingRepository,
     FsDocumentBlobRepository,
     FsFilingUploadStateRepository,
     FsSourceDocumentRepository,
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
+from dayu.fins.upload_failure import fins_upload_failure_from_exception
 from dayu.service.fins_direct import (
     FINS_DIRECT_EXIT_FAILURE,
     FINS_DIRECT_EXIT_KEYBOARD_INTERRUPT,
@@ -64,8 +75,80 @@ from dayu.service.fins_direct import (
 
 _NOW: datetime = datetime(2026, 6, 16, tzinfo=timezone.utc)
 _UNPARSABLE_PDF_BYTES = b"not a PDF"
+_UNPARSABLE_DOCX_BYTES = b"not a DOCX"
 _TYPED_CONTENT_FAILURE_REASON = "文件无法解析或已损坏，请检查文件后重试"
 _MAX_PUBLIC_CONTENT_FAILURE_STDERR_CHARS = 1024
+_UNKNOWN_DIRECT_FAILURE_MARKER = "private /absolute/path traceback marker"
+_UNKNOWN_DIRECT_FAILURE_STDERR = (
+    "dayu-cli download: 命令执行失败，请使用 --log-file PATH 重试并查看日志\n"
+)
+
+
+class _NeverCancelledJobChecker(FinsJobCancellationChecker):
+    """CLI terminal projection 测试用未取消 checker。"""
+
+    def __call__(self) -> bool:
+        """返回未取消状态。
+
+        Args:
+            无。
+
+        Returns:
+            恒为 ``False``。
+
+        Raises:
+            无。
+        """
+
+        return False
+
+    def is_cancelled(self) -> bool:
+        """返回未取消状态。
+
+        Args:
+            无。
+
+        Returns:
+            恒为 ``False``。
+
+        Raises:
+            无。
+        """
+
+        return False
+
+    def cancel_reason(self) -> str | None:
+        """返回取消原因。
+
+        Args:
+            无。
+
+        Returns:
+            未取消，恒为 ``None``。
+
+        Raises:
+            无。
+        """
+
+        return None
+
+    def requested_at(self) -> datetime | None:
+        """返回取消请求时间。
+
+        Args:
+            无。
+
+        Returns:
+            未取消，恒为 ``None``。
+
+        Raises:
+            无。
+        """
+
+        return None
+
+
+_NEVER_CANCELLED_JOB_CHECKER = _NeverCancelledJobChecker()
 
 
 def _raise_cli_consumer_error(
@@ -82,6 +165,22 @@ def _raise_cli_consumer_error(
     """
 
     raise error
+
+
+async def _raise_unknown_fins_direct_error(_args: fins_command.ParsedCliArgs) -> int:
+    """注入携带内部路径 marker 的未知 direct 异常。
+
+    Args:
+        _args: 已解析命令参数。
+
+    Returns:
+        不返回。
+
+    Raises:
+        RuntimeError: 始终抛出包含内部 marker 的异常。
+    """
+
+    raise RuntimeError(_UNKNOWN_DIRECT_FAILURE_MARKER)
 
 
 class _FakeFinsDirectService:
@@ -1646,13 +1745,39 @@ def test_download_mutation_mode_conflict_precedes_all_side_effects(
     assert not workspace_root.exists()
 
 
-def test_real_cli_corrupt_pdf_has_bounded_stderr_and_zero_fresh_workspace_mutation(
+@pytest.mark.parametrize(
+    ("file_name", "payload", "expected_reason", "expected_failure_code"),
+    (
+        ("empty.pdf", b"", "文件为空，无法上传", "empty_input_file"),
+        (
+            "corrupt.pdf",
+            _UNPARSABLE_PDF_BYTES,
+            _TYPED_CONTENT_FAILURE_REASON,
+            "docling_converter_execution",
+        ),
+        (
+            "corrupt.docx",
+            _UNPARSABLE_DOCX_BYTES,
+            _TYPED_CONTENT_FAILURE_REASON,
+            "docling_converter_execution",
+        ),
+    ),
+)
+def test_real_cli_content_failure_has_bounded_stderr_and_zero_fresh_workspace_mutation(
     tmp_path: Path,
+    file_name: str,
+    payload: bytes,
+    expected_reason: str,
+    expected_failure_code: str,
 ) -> None:
-    """真实 CLI/Docling content failure 必须安全投影且不创建 fresh workspace。
+    """真实 CLI empty/corrupt PDF/DOCX failure 必须安全投影且零 mutation。
 
     Args:
         tmp_path: pytest 临时目录。
+        file_name: 当前失败输入的安全 basename。
+        payload: 当前失败输入 bytes。
+        expected_reason: 当前 closed content reason。
+        expected_failure_code: 当前 closed content failure code。
 
     Returns:
         无。
@@ -1662,8 +1787,8 @@ def test_real_cli_corrupt_pdf_has_bounded_stderr_and_zero_fresh_workspace_mutati
         subprocess.TimeoutExpired: 真实 conversion 未在期限内结束时抛出。
     """
 
-    corrupt_pdf = tmp_path / "corrupt.pdf"
-    corrupt_pdf.write_bytes(_UNPARSABLE_PDF_BYTES)
+    corrupt_file = tmp_path / file_name
+    corrupt_file.write_bytes(payload)
     workspace_root = tmp_path / "fresh-workspace"
     cli_executable = Path(sys.executable).with_name("dayu-cli")
     repository_root = Path(__file__).resolve().parents[2]
@@ -1677,7 +1802,7 @@ def test_real_cli_corrupt_pdf_has_bounded_stderr_and_zero_fresh_workspace_mutati
             "--ticker",
             "ICPD",
             "--files",
-            str(corrupt_pdf),
+            str(corrupt_file),
             "--fiscal-year",
             "2024",
             "--fiscal-period",
@@ -1693,12 +1818,16 @@ def test_real_cli_corrupt_pdf_has_bounded_stderr_and_zero_fresh_workspace_mutati
     )
 
     assert completed.returncode == EXIT_FAILURE
-    assert _TYPED_CONTENT_FAILURE_REASON in completed.stderr
+    assert expected_reason in completed.stderr
     assert 'failure_kind="content"' in completed.stderr
+    assert f'failure_code="{expected_failure_code}"' in completed.stderr
+    assert 'requested_files="1"' in completed.stderr
+    assert 'stored_files="0"' in completed.stderr
+    assert f'file="{file_name}"' in completed.stderr
     assert len(completed.stderr) <= _MAX_PUBLIC_CONTENT_FAILURE_STDERR_CHARS
     assert "Traceback" not in completed.stderr
     assert str(repository_root) not in completed.stderr
-    assert str(corrupt_pdf) not in completed.stderr
+    assert str(corrupt_file) not in completed.stderr
     assert not workspace_root.exists()
 
 
@@ -2167,9 +2296,170 @@ def test_stream_failure_propagates_to_cli_error(
     assert cli_main.main(("download", "--ticker", "AAPL")) == EXIT_FAILURE
 
     captured = capsys.readouterr()
-    assert "stream boom" in captured.err
+    assert captured.err == _UNKNOWN_DIRECT_FAILURE_STDERR
+    assert "stream boom" not in captured.err
     assert "job_id" not in captured.err
     assert service.closed_streams == 1
+
+
+def test_unknown_fins_direct_failure_logs_traceback_and_hides_exception_from_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """未知 direct 异常只进入 operator traceback，普通 stderr 使用固定文案。
+
+    Args:
+        monkeypatch: direct async 主流程异常注入夹具。
+        caplog: operator 日志捕获夹具。
+        capsys: 标准流捕获夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: stderr 泄漏异常或 operator 日志缺少 traceback 时抛出。
+    """
+
+    monkeypatch.setattr(
+        fins_command,
+        "_run_fins_direct_command_async",
+        _raise_unknown_fins_direct_error,
+    )
+    caplog.set_level(logging.ERROR, logger=fins_command.__name__)
+
+    exit_code = fins_command.run_fins_direct_command(parse_cli_args(("download", "--ticker", "AAPL")))
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_FAILURE
+    assert captured.out == ""
+    assert captured.err == _UNKNOWN_DIRECT_FAILURE_STDERR
+    assert _UNKNOWN_DIRECT_FAILURE_MARKER not in captured.err
+    assert "/absolute/path" not in captured.err
+    assert "Traceback" not in captured.err
+    assert "RuntimeError" not in captured.err
+    assert "Fins direct command failed; command=download" in caplog.text
+    assert _UNKNOWN_DIRECT_FAILURE_MARKER in caplog.text
+    assert "Traceback" in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("summary", "expected_stream"),
+    (
+        (
+            FinsUploadResultSummary(
+                source_kind=SourceKind.FILING,
+                status="ok",
+                requested_file_count=2,
+                stored_file_count=2,
+            ),
+            "stdout",
+        ),
+        (
+            FinsUploadResultSummary(
+                source_kind=SourceKind.FILING,
+                status="deleted",
+                requested_file_count=0,
+                stored_file_count=0,
+            ),
+            "stdout",
+        ),
+        (
+            FinsUploadResultSummary(
+                source_kind=SourceKind.FILING,
+                status="skipped",
+                requested_file_count=2,
+                stored_file_count=0,
+            ),
+            "stdout",
+        ),
+        (
+            FinsUploadResultSummary(
+                source_kind=SourceKind.FILING,
+                status="failed",
+                requested_file_count=2,
+                stored_file_count=0,
+                failure_reason=fins_upload_failure_from_exception(
+                    RuntimeError(),
+                    file_label=None,
+                ),
+            ),
+            "stderr",
+        ),
+    ),
+)
+def test_upload_terminal_summary_renderer_uses_typed_requested_and_stored_counts(
+    summary: FinsUploadResultSummary,
+    expected_stream: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """CLI renderer 必须展示 typed upload summary 的 requested/stored 真源。
+
+    Args:
+        summary: production upload summary owner 构造的当前终态。
+        expected_stream: 当前终态应写入的标准流名称。
+        tmp_path: filing validator 使用的临时输入目录。
+        capsys: 标准流捕获夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: typed RESULT 到 CLI 摘要的计数或字段名投影漂移时抛出。
+    """
+
+    input_files = tuple(
+        tmp_path / f"input-{index}.pdf"
+        for index in range(summary.requested_file_count)
+    )
+    for input_file in input_files:
+        input_file.write_bytes(b"typed filing input")
+    raw_request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        action="delete" if summary.status == "deleted" else "create",
+        files=input_files,
+        fiscal_year=2024,
+        fiscal_period="FY",
+        company_name=None if summary.status == "deleted" else "Apple Inc.",
+    )
+    published_state = FilingUploadPublishedState(company_meta=None, source_meta=None)
+    request = validate_fins_upload_filing_request(
+        raw_request,
+        published_state=published_state,
+    )
+    context = ingestion_runtime._FinsIngestionExecutionContext(
+        operation_kind=FinsIngestionOperationKind.UPLOAD,
+        direct_operation_kind=FinsOperationKind.UPLOAD_FILING,
+        normalized_ticker=request.normalized_ticker.canonical,
+        market=request.normalized_ticker.market,
+        exchange=request.normalized_ticker.exchange,
+        source=None,
+        source_kind=request.request.source_kind,
+        download_request=None,
+        cancellation_checker=_NEVER_CANCELLED_JOB_CHECKER,
+        job_record=None,
+        direct_queue=None,
+        cancellation_state=None,
+    )
+    _progress_event_value, result_event = ingestion_runtime._direct_upload_terminal_events(
+        context=context,
+        request=request,
+        summary=summary,
+        disposition=summary.terminal_disposition(),
+        emitted_at=_NOW,
+    )
+
+    cli_output.render_fins_direct_event(result_event)
+
+    captured = capsys.readouterr()
+    rendered = captured.out if expected_stream == "stdout" else captured.err
+    other_stream = captured.err if expected_stream == "stdout" else captured.out
+    assert f'requested_files="{summary.requested_file_count}"' in rendered
+    assert f'stored_files="{summary.stored_file_count}"' in rendered
+    assert "uploaded_files" not in rendered
+    assert other_stream == ""
 
 
 @pytest.mark.parametrize(

@@ -942,6 +942,9 @@ def test_service_public_direct_api_does_not_export_job_handle() -> None:
     assert "FinsDirectJobEvent" not in dir(fins_direct_module)
     assert "FinsDirectTerminalResult" not in dir(fins_direct_module)
     assert "stream_job_events_until_terminal" not in dir(FinsDirectCommandService)
+    assert "start_upload" not in dir(FinsDirectCommandService)
+    assert "read_job" not in dir(FinsDirectCommandService)
+    assert "read_job_events" not in dir(FinsDirectCommandService)
     assert "wait_for_terminal" not in dir(FinsDirectCommandService)
     assert "request_cancel" not in dir(FinsDirectCommandService)
 

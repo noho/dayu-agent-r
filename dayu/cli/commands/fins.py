@@ -96,6 +96,9 @@ _FINS_DIAGNOSTIC_TEXT_MAX_CHARS: Final[int] = 120
 _FINS_DIAGNOSTIC_DETAIL_MAX_ITEMS: Final[int] = 4
 _FINS_DIAGNOSTIC_TRUNCATED_SUFFIX: Final[str] = "..."
 _FINS_DIRECT_DEBUG_BASE_PART_COUNT: Final[int] = 2
+_FINS_DIRECT_UNKNOWN_FAILURE_MESSAGE: Final[str] = (
+    "命令执行失败，请使用 --log-file PATH 重试并查看日志"
+)
 _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
 
@@ -214,8 +217,14 @@ def run_fins_direct_command(args: ParsedCliArgs) -> int:
         return EXIT_FAILURE
     except KeyboardInterrupt:
         return EXIT_KEYBOARD_INTERRUPT
-    except Exception as exc:
-        render_cli_error(f"dayu-cli {args.command_name}: {exc}")
+    except Exception:
+        _LOGGER.exception(
+            "Fins direct command failed; command=%s",
+            args.command_name,
+        )
+        render_cli_error(
+            f"dayu-cli {args.command_name}: {_FINS_DIRECT_UNKNOWN_FAILURE_MESSAGE}"
+        )
         return EXIT_FAILURE
 
 

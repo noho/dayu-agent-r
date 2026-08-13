@@ -6372,28 +6372,26 @@ def _upload_result_details(summary: FinsUploadResultSummary) -> tuple[FinsEventD
     details = [
         FinsEventDetail("source kind", str(json_summary["source_kind"])),
         FinsEventDetail("status", str(json_summary["status"])),
+        FinsEventDetail("requested files", str(summary.requested_file_count)),
+        FinsEventDetail("stored files", str(summary.stored_file_count)),
     ]
-    document_id = json_summary.get("document_id")
-    if isinstance(document_id, str) and document_id:
-        details.append(FinsEventDetail("document", document_id))
-    details.extend(
-        (
-            FinsEventDetail("requested files", str(summary.requested_file_count)),
-            FinsEventDetail("stored files", str(summary.stored_file_count)),
-        )
-    )
     if summary.failure_reason is not None:
         details.extend(
             (
                 FinsEventDetail("failure kind", summary.failure_reason.kind.value),
                 FinsEventDetail("failure code", summary.failure_reason.code.value),
-                FinsEventDetail("failure message", summary.failure_reason.message),
             )
         )
-        if summary.failure_reason.retry_hint is not None:
-            details.append(FinsEventDetail("retry hint", summary.failure_reason.retry_hint))
+        # 失败前缀优先保留 closed code、canonical 文件名与 bounded 原因；
+        # 有界终端消费者即使截断辅助信息，也能同时展示 counts 与可行动失败事实。
         if summary.failure_reason.file_label is not None:
             details.append(FinsEventDetail("file", summary.failure_reason.file_label))
+        details.append(FinsEventDetail("failure message", summary.failure_reason.message))
+        if summary.failure_reason.retry_hint is not None:
+            details.append(FinsEventDetail("retry hint", summary.failure_reason.retry_hint))
+    document_id = json_summary.get("document_id")
+    if isinstance(document_id, str) and document_id:
+        details.append(FinsEventDetail("document", document_id))
     return tuple(details)
 
 

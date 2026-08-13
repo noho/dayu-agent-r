@@ -120,11 +120,13 @@ from dayu.fins.upload_failure import (
 from dayu.fins.pipelines.cn_pipeline import CnDownloadAdapter, CnPipeline
 from dayu.fins.pipelines.docling_process_converter import (
     DoclingConversionConfig,
+    DoclingConverter,
     DoclingConversionError,
     DoclingConversionFailureKind,
     DoclingConversionResult,
     ProcessDoclingConverter,
 )
+from dayu.fins.pipelines.docling_upload_service import build_sec_filing_ids
 from dayu.fins.pipelines.sec_pipeline import SecDownloadAdapter, SecPipeline
 from dayu.fins.service_runtime import DefaultFinsRuntime, ProductionFinsUploadRunner
 from dayu.fins.storage import (
@@ -144,6 +146,7 @@ from dayu.fins.storage.repository_protocols import SourceSnapshotProtocol
 from dayu.fins.ticker_normalization import NormalizedTicker
 from dayu.fins.tools.read_runtime import FinsReadRuntime
 import dayu.runtime.log as runtime_log
+from dayu.runtime.workspace_paths import WorkspacePaths
 
 
 def test_failed_pipeline_result_requires_closed_typed_failure_reason() -> None:
@@ -468,14 +471,35 @@ def test_upload_direct_details_consume_typed_failure_label_and_retry_hint() -> N
         status="failed",
         requested_file_count=1,
         stored_file_count=0,
+        document_id="AAPL-2024-FY",
         failure_reason=reason,
     )
 
-    details = {
-        detail.label: detail.value
-        for detail in ingestion_runtime._upload_result_details(summary)
-    }
+    projected_details = ingestion_runtime._upload_result_details(summary)
+    details = {detail.label: detail.value for detail in projected_details}
 
+    assert tuple(detail.label for detail in projected_details) == (
+        "source kind",
+        "status",
+        "requested files",
+        "stored files",
+        "failure kind",
+        "failure code",
+        "file",
+        "failure message",
+        "retry hint",
+        "document",
+    )
+    assert tuple(detail.label for detail in projected_details[:8]) == (
+        "source kind",
+        "status",
+        "requested files",
+        "stored files",
+        "failure kind",
+        "failure code",
+        "file",
+        "failure message",
+    )
     assert details["failure kind"] == "content"
     assert details["failure code"] == "empty_input_file"
     assert details["failure message"] == "文件为空，无法上传"
@@ -2487,6 +2511,25 @@ class _BlockingArtifactUploadRunner(FinsUploadRunner):
 class _UploadRuntimeConverter:
     """runtime production upload 测试用 typed Docling converter。"""
 
+    calls: list[str]
+    _failing_stream_names: frozenset[str]
+
+    def __init__(self, *, failing_stream_names: frozenset[str] = frozenset()) -> None:
+        """初始化可选择失败文件的确定性 converter。
+
+        Args:
+            failing_stream_names: 需要抛出 closed conversion failure 的文件名集合。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.calls = []
+        self._failing_stream_names = failing_stream_names
+
     async def convert_to_json_bytes(
         self,
         input_bytes: bytes,
@@ -2507,10 +2550,17 @@ class _UploadRuntimeConverter:
             typed conversion result。
 
         Raises:
-            无。
+            DoclingConversionError: 当前文件名被配置为确定性失败时抛出。
         """
 
         del input_bytes, config, cancellation
+        self.calls.append(stream_name)
+        if stream_name in self._failing_stream_names:
+            raise DoclingConversionError(
+                DoclingConversionFailureKind.CONVERTER_EXECUTION,
+                "Docling conversion execution failed",
+                None,
+            ) from RuntimeError("private deterministic converter failure")
         data = ('{"name": "' + stream_name + '", "format": "docling"}').encode()
         return DoclingConversionResult(data, len(data), hashlib.sha256(data).hexdigest())
 
@@ -2518,12 +2568,15 @@ class _UploadRuntimeConverter:
 def _inject_upload_runtime_converter(
     default_runtime: DefaultFinsRuntime,
     runtime: ingestion_runtime.FinsIngestionRuntime,
+    *,
+    converter: DoclingConverter | None = None,
 ) -> None:
     """通过 public constructor injection 替换测试 upload runner。
 
     Args:
         default_runtime: 持有共享 repositories 的默认运行时。
         runtime: 待装配 production runner 的 ingestion runtime。
+        converter: 可选确定性 converter；省略时创建默认成功 converter。
 
     Returns:
         无。
@@ -2532,7 +2585,7 @@ def _inject_upload_runtime_converter(
         OSError: pipeline 初始化失败时抛出。
     """
 
-    converter = _UploadRuntimeConverter()
+    effective_converter = _UploadRuntimeConverter() if converter is None else converter
     runtime.upload_runner = ProductionFinsUploadRunner(
         sec_pipeline=SecPipeline(
             workspace_root=default_runtime.workspace_root,
@@ -2544,7 +2597,7 @@ def _inject_upload_runtime_converter(
             blob_repository=default_runtime.blob_repository,
             filing_maintenance_repository=default_runtime.filing_maintenance_repository,
             filing_upload_state_repository=default_runtime.filing_upload_state_repository,
-            docling_converter=converter,
+            docling_converter=effective_converter,
         ),
         cn_pipeline=CnPipeline(
             workspace_root=default_runtime.workspace_root,
@@ -2555,9 +2608,67 @@ def _inject_upload_runtime_converter(
             blob_repository=default_runtime.blob_repository,
             filing_maintenance_repository=default_runtime.filing_maintenance_repository,
             filing_upload_state_repository=default_runtime.filing_upload_state_repository,
-            docling_converter=converter,
+            docling_converter=effective_converter,
         ),
     )
+
+
+def _build_direct_upload_test_runtime(
+    *,
+    workspace_root: Path,
+    converter: DoclingConverter,
+) -> tuple[DefaultFinsRuntime, ingestion_runtime.FinsIngestionRuntime, _HoldingExecutor]:
+    """构造共享 Fins 仓储的 production direct upload 测试边界。
+
+    Args:
+        workspace_root: 当前测试的 Fins workspace root。
+        converter: 通过 production pipeline constructor 注入的确定性 converter。
+
+    Returns:
+        默认运行时、direct ingestion runtime 与 holding executor。
+
+    Raises:
+        OSError: 仓储或 pipeline 初始化失败时抛出。
+    """
+
+    default_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    executor = _HoldingExecutor()
+    ingestion = _build_ingestion_runtime(workspace_root, executor=executor)
+    _inject_upload_runtime_converter(
+        default_runtime,
+        ingestion,
+        converter=converter,
+    )
+    return default_runtime, ingestion, executor
+
+
+def _assert_direct_test_filing_was_not_published(default_runtime: DefaultFinsRuntime) -> None:
+    """断言固定 direct test filing 未形成 company/source publication。
+
+    Args:
+        default_runtime: 持有待检查 Fins repositories 的默认运行时。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: company 或 source 已发布时抛出。
+    """
+
+    document_id, _internal_document_id = build_sec_filing_ids(
+        ticker="AAPL",
+        fiscal_year=2024,
+        fiscal_period="FY",
+        amended=False,
+    )
+    with pytest.raises(FileNotFoundError):
+        default_runtime.source_repository.get_source_meta(
+            "AAPL",
+            document_id,
+            SourceKind.FILING,
+        )
+    with pytest.raises(FileNotFoundError):
+        default_runtime.company_repository.get_company_meta("AAPL")
 
 
 def test_default_runtime_composition_shares_upload_state_and_docling_converter(tmp_path: Path) -> None:
@@ -5271,6 +5382,239 @@ def test_start_upload_with_runner_writes_bounded_result_summary(tmp_path: Path) 
     assert progress_events[1].payload["file_count"] == 1
     assert "requested_file_count" not in progress_events[1].payload
     assert "stored_file_count" not in progress_events[1].payload
+
+
+@pytest.mark.asyncio
+async def test_direct_upload_filing_success_publishes_fins_assets_without_host_or_legacy_artifacts(
+    tmp_path: Path,
+) -> None:
+    """direct upload_filing 成功正控只发布 Fins 资产，不创建 Host 或 legacy job 事实。
+
+    Args:
+        tmp_path: pytest 临时目录夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: direct publication、summary 或 no-artifact 边界漂移时抛出。
+    """
+
+    workspace_root = tmp_path / "fins-workspace"
+    converter = _UploadRuntimeConverter()
+    default_runtime, ingestion, executor = _build_direct_upload_test_runtime(
+        workspace_root=workspace_root,
+        converter=converter,
+    )
+    upload_file = tmp_path / "report.pdf"
+    original_bytes = b"deterministic filing bytes"
+    upload_file.write_bytes(original_bytes)
+
+    events = await _collect_direct_events(
+        ingestion.upload(
+            FinsUploadFilingRequest(
+                ticker="AAPL",
+                action="create",
+                files=(upload_file,),
+                fiscal_year=2024,
+                fiscal_period="FY",
+                company_name="Apple Inc.",
+            )
+        )
+    )
+
+    result = events[-1].result
+    assert result is not None
+    assert result.status is FinsResultStatus.SUCCESS
+    details = {detail.label: detail.value for detail in result.details}
+    assert details["requested files"] == "1"
+    assert details["stored files"] == "1"
+    assert "uploaded files" not in details
+    assert converter.calls == ["report.pdf"]
+
+    document_id, _internal_document_id = build_sec_filing_ids(
+        ticker="AAPL",
+        fiscal_year=2024,
+        fiscal_period="FY",
+        amended=False,
+    )
+    source_meta = default_runtime.source_repository.get_source_meta(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+    )
+    source_handle = default_runtime.source_repository.get_source_handle(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+    )
+    published_names = sorted(
+        item.uri.rsplit("/", maxsplit=1)[-1]
+        for item in default_runtime.blob_repository.list_files(source_handle)
+    )
+    assert source_meta["ingest_method"] == "upload"
+    assert source_meta["primary_document"] == "report_docling.json"
+    assert published_names == ["report.pdf", "report_docling.json"]
+    assert default_runtime.blob_repository.read_file_bytes(source_handle, "report.pdf") == original_bytes
+    assert default_runtime.blob_repository.read_file_bytes(
+        source_handle,
+        "report_docling.json",
+    ) == b'{"name": "report.pdf", "format": "docling"}'
+    assert default_runtime.company_repository.get_company_meta("AAPL").company_name == "Apple Inc."
+
+    job_store = ingestion.job_store
+    assert isinstance(job_store, ingestion_runtime.FsFinsIngestionJobStore)
+    jobs_dir = job_store.root_dir
+    paths = WorkspacePaths(workspace_root=workspace_root)
+    assert executor.operations == []
+    assert tuple(jobs_dir.glob("*.json")) == ()
+    assert tuple(jobs_dir.glob("*.jsonl")) == ()
+    assert not paths.host_dir.exists()
+    assert not paths.host_sqlite_path.exists()
+    assert not paths.artifact_root.exists()
+    assert not paths.runtime_lanes_db_path.exists()
+
+
+@pytest.mark.parametrize(
+    (
+        "file_name",
+        "payload",
+        "failing_stream_names",
+        "expected_failure_code",
+        "expected_converter_calls",
+    ),
+    (
+        ("empty.pdf", b"", frozenset(), "empty_input_file", ()),
+        (
+            "corrupt.pdf",
+            b"corrupt PDF",
+            frozenset({"corrupt.pdf"}),
+            "docling_converter_execution",
+            ("corrupt.pdf",),
+        ),
+        (
+            "corrupt.docx",
+            b"corrupt DOCX",
+            frozenset({"corrupt.docx"}),
+            "docling_converter_execution",
+            ("corrupt.docx",),
+        ),
+    ),
+)
+@pytest.mark.asyncio
+async def test_direct_upload_filing_content_failure_is_typed_and_has_zero_publication(
+    tmp_path: Path,
+    file_name: str,
+    payload: bytes,
+    failing_stream_names: frozenset[str],
+    expected_failure_code: str,
+    expected_converter_calls: tuple[str, ...],
+) -> None:
+    """direct empty/corrupt filing 必须 typed fail 且不发布 company/source/blob。
+
+    Args:
+        tmp_path: pytest 临时目录夹具。
+        file_name: 当前输入文件名。
+        payload: 当前输入 bytes。
+        failing_stream_names: converter 需要确定性拒绝的文件名集合。
+        expected_failure_code: direct detail 中的 closed failure code。
+        expected_converter_calls: 预期 converter 调用顺序。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: failure projection、count 或零发布边界漂移时抛出。
+    """
+
+    workspace_root = tmp_path / "fins-workspace"
+    converter = _UploadRuntimeConverter(failing_stream_names=failing_stream_names)
+    default_runtime, ingestion, executor = _build_direct_upload_test_runtime(
+        workspace_root=workspace_root,
+        converter=converter,
+    )
+    upload_file = tmp_path / file_name
+    upload_file.write_bytes(payload)
+
+    events = await _collect_direct_events(
+        ingestion.upload(
+            FinsUploadFilingRequest(
+                ticker="AAPL",
+                action="create",
+                files=(upload_file,),
+                fiscal_year=2024,
+                fiscal_period="FY",
+                company_name="Apple Inc.",
+            )
+        )
+    )
+
+    result = events[-1].result
+    assert result is not None
+    assert result.status is FinsResultStatus.FAILURE
+    details = {detail.label: detail.value for detail in result.details}
+    assert details["requested files"] == "1"
+    assert details["stored files"] == "0"
+    assert details["failure kind"] == "content"
+    assert details["failure code"] == expected_failure_code
+    assert details["file"] == file_name
+    assert "private deterministic converter failure" not in repr(result)
+    assert converter.calls == list(expected_converter_calls)
+    assert executor.operations == []
+    _assert_direct_test_filing_was_not_published(default_runtime)
+
+
+@pytest.mark.asyncio
+async def test_direct_upload_filing_mixed_input_fails_fast_without_partial_publication(
+    tmp_path: Path,
+) -> None:
+    """direct mixed filing 在首个损坏文件失败，先转换成功的文件不得形成 stored fact。
+
+    Args:
+        tmp_path: pytest 临时目录夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: fail-fast 顺序、count 或原子 publication 边界漂移时抛出。
+    """
+
+    workspace_root = tmp_path / "fins-workspace"
+    converter = _UploadRuntimeConverter(failing_stream_names=frozenset({"corrupt.docx"}))
+    default_runtime, ingestion, executor = _build_direct_upload_test_runtime(
+        workspace_root=workspace_root,
+        converter=converter,
+    )
+    valid_file = tmp_path / "valid.pdf"
+    corrupt_file = tmp_path / "corrupt.docx"
+    valid_file.write_bytes(b"valid filing")
+    corrupt_file.write_bytes(b"corrupt filing")
+
+    events = await _collect_direct_events(
+        ingestion.upload(
+            FinsUploadFilingRequest(
+                ticker="AAPL",
+                action="create",
+                files=(valid_file, corrupt_file),
+                fiscal_year=2024,
+                fiscal_period="FY",
+                company_name="Apple Inc.",
+            )
+        )
+    )
+
+    result = events[-1].result
+    assert result is not None
+    assert result.status is FinsResultStatus.FAILURE
+    details = {detail.label: detail.value for detail in result.details}
+    assert details["requested files"] == "2"
+    assert details["stored files"] == "0"
+    assert details["failure code"] == "docling_converter_execution"
+    assert details["file"] == "corrupt.docx"
+    assert converter.calls == ["valid.pdf", "corrupt.docx"]
+    assert executor.operations == []
+    _assert_direct_test_filing_was_not_published(default_runtime)
 
 
 @pytest.mark.asyncio

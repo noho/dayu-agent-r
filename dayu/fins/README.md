@@ -558,6 +558,10 @@ Download terminal 由同一个 typed `FinsResultSummary` 收口：成功、失�
 
 当前 `DefaultFinsRuntime` 内置 production upload runner：US filing/material 上传走 SEC upload workflow，CN/HK filing/material 上传走 CN/HK upload facade，通用文件校验、Docling 转换、source document create/update/delete/skip/overwrite 与 blob 写入由 `DoclingUploadService` 通过仓储协议完成。production upload runner 把 pipeline JSON result 收敛为 Fins-local typed upload result，`status` 必须由 pipeline 显式提供，且只接受 exact lowercase `ok`、`skipped`、`deleted`、`failed`、`cancelled`；前三者映射 completed，后两者分别映射 failed 与 cancelled，大小写、空白变体和未知值都失败关闭。direct stream 与 legacy upload job 共用这一 typed terminal disposition 真源，不从 UI、日志或取消时间重建上传终态。直接调用 `FinsIngestionRuntime.create(...)` 且不装配 `FinsUploadRunner` 时，upload job 仍会进入明确的 failed 终态，不执行真实上传、文件读取或仓储写入。
 
+上传结果中的 `requested_file_count` 来自已校验请求，`stored_file_count` 只统计成功 commit 的 original 文件；Docling 派生资产不增加 stored count。`skipped`、`deleted`、`failed` 与 `cancelled` 的 stored count 固定为 `0`，direct RESULT 与 legacy durable summary 都只消费同一个 `FinsUploadResultSummary`，不从目录、basename 或派生资产数量重算。
+
+filing original 会在 publication batch 开始前完成读取与顺序转换。空文件或 Docling closed conversion failure 由 upload failure owner 产生带 canonical public file label 的 typed content reason；typed terminal detail 投影先排列 requested/stored、closed kind/code、canonical file label 与 bounded message，再排列 retry hint、document 等辅助信息，使有界前缀消费者仍从同一个 reason/count 真源取得可行动失败事实。mixed input 在首个失败处 fail-fast，先转换成功的内存产物不形成 company/source/blob publication。第三方异常文本、异常链和本地绝对路径只保留在 operator 日志，不进入 direct event 或 durable summary；material 仍保留自己的既有 generic failure 与 company publication 语义。
+
 production upload 的 existing full-input update 与 create-overwrite 完整替换由 `DoclingUploadService` 在同一个 storage batch 内执行；filing/material 共用该 publication owner。SEC/CN/HK upload facade 只解析动作、写 company meta 并调用 upload service；它们不得在 Docling 转换、取消检查或新材料构建前删除旧 source document。
 
 ### Awaiting observation 与 Service wait adapter
