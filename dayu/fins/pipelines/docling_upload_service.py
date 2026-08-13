@@ -474,20 +474,18 @@ class DoclingUploadService:
             OSError: 仓储写入失败时抛出。
         """
 
-        replace_existing = overwrite and previous_meta is not None and action in {"create", "update"}
-        upsert_mode = _resolve_upsert_mode(
-            action=action,
-            previous_meta=previous_meta,
-            overwrite=overwrite,
+        replace_existing = previous_meta is not None and (
+            action == "update" or (action == "create" and overwrite)
         )
         if replace_existing:
+            # 完整输入的既有目标先在同一 staging batch 删除，再由下方 blob-first + create
+            # 一次性重建；reset 前持有的 previous_meta 仍是版本与首次创建时间真源。
             self._source_repository.reset_source_document(
                 ticker=ticker,
                 document_id=document_id,
                 source_kind=source_kind,
                 batch=batch,
             )
-            upsert_mode = "create"
 
         stored_entries: list[JsonObject] = []
         file_events: list[UploadFileEventPayload] = list(conversion_events)
@@ -530,8 +528,7 @@ class DoclingUploadService:
                 document_id=document_id,
                 internal_document_id=internal_document_id,
             )
-        self._upsert_source_document(
-            upsert_mode=upsert_mode,
+        self._create_source_document(
             source_kind=source_kind,
             ticker=ticker,
             document_id=document_id,
@@ -776,9 +773,11 @@ class DoclingUploadService:
         previous_first_ingested_at = (
             _text_meta(previous_meta, "first_ingested_at") if previous_meta is not None else None
         )
+        previous_created_at = _text_meta(previous_meta, "created_at") if previous_meta is not None else None
         merged = dict(base_meta)
         merged["updated_at"] = now
         merged["first_ingested_at"] = previous_first_ingested_at or now
+        merged["created_at"] = previous_created_at or now
         merged["document_version"] = document_version
         merged["source_fingerprint"] = source_fingerprint
         merged["ingest_complete"] = True
@@ -787,10 +786,9 @@ class DoclingUploadService:
         merged["deleted_at"] = None
         return merged
 
-    def _upsert_source_document(
+    def _create_source_document(
         self,
         *,
-        upsert_mode: str,
         source_kind: SourceKind,
         ticker: str,
         document_id: str,
@@ -801,10 +799,9 @@ class DoclingUploadService:
         meta: JsonObject,
         batch: BatchToken,
     ) -> None:
-        """执行仓储 upsert。
+        """在 blob 完整落盘后创建唯一 final source meta。
 
         Args:
-            upsert_mode: 写入模式。
             source_kind: 来源类型。
             ticker: 股票代码。
             document_id: 文档 ID。
@@ -819,7 +816,8 @@ class DoclingUploadService:
             无。
 
         Raises:
-            RuntimeError: upsert 失败时抛出。
+            FileExistsError: staging source 未先按 owner contract 清空时抛出。
+            OSError: final source meta 或 manifest 写入失败时抛出。
         """
 
         request = SourceDocumentUpsertRequest(
@@ -831,14 +829,7 @@ class DoclingUploadService:
             file_entries=file_entries,
             meta=meta,
         )
-        if upsert_mode == "create":
-            self._source_repository.create_source_document(
-                request,
-                source_kind=source_kind,
-                batch=batch,
-            )
-            return
-        self._source_repository.update_source_document(
+        self._source_repository.create_source_document(
             request,
             source_kind=source_kind,
             batch=batch,
@@ -1053,39 +1044,6 @@ def _resolve_document_version(previous_meta: Mapping[str, JsonValue] | None, sou
     if previous_fingerprint and previous_fingerprint != source_fingerprint:
         return _increment_document_version(previous_version)
     return previous_version
-
-
-def _resolve_upsert_mode(
-    action: str,
-    previous_meta: Mapping[str, JsonValue] | None,
-    overwrite: bool,
-) -> str:
-    """解析写入模式。
-
-    Args:
-        action: 上传动作。
-        previous_meta: 旧元数据；不存在时为 ``None``。
-        overwrite: 是否启用覆盖。
-
-    Returns:
-        ``"create"`` 或 ``"update"``。
-
-    Raises:
-        FileNotFoundError: update 目标不存在且未启用覆盖时抛出。
-        FileExistsError: create 目标已存在且未启用覆盖时抛出。
-    """
-
-    if action == "update":
-        if previous_meta is None:
-            if overwrite:
-                return "create"
-            raise FileNotFoundError("更新目标不存在")
-        return "update"
-    if previous_meta is None:
-        return "create"
-    if overwrite:
-        return "update"
-    raise FileExistsError("创建目标已存在")
 
 
 def _build_skipped_file_events(files: list[Path]) -> list[UploadFileEventPayload]:

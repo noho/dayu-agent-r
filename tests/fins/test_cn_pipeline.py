@@ -18,6 +18,8 @@ from dayu.fins.domain.enums import SourceKind
 from dayu.fins.ingestion_runtime import (
     FinsDownloadProgressEvent,
     FinsUploadFilingRequest,
+    FinsUploadUsageCode,
+    FinsUploadUsageError,
     ValidatedFinsUploadFilingRequest,
 )
 from dayu.fins.pipelines.cn_download_models import (
@@ -159,6 +161,8 @@ def _validated_cn_filing_request(
 
 def _tracking_cn_pipeline(
     workspace_root: Path,
+    *,
+    converter: _PipelineDownloadFakeConversionRunner | None = None,
 ) -> tuple[
     CnPipeline,
     TrackingBatchingRepository,
@@ -169,6 +173,7 @@ def _tracking_cn_pipeline(
 
     Args:
         workspace_root: 测试工作区根目录。
+        converter: 可选 typed Docling converter recorder。
 
     Returns:
         pipeline、batch、company 与 source tracking repositories。
@@ -194,7 +199,7 @@ def _tracking_cn_pipeline(
             workspace_root,
             repository_set=repository_set,
         ),
-        docling_converter=_PipelineDownloadFakeConversionRunner(),
+        docling_converter=converter or _PipelineDownloadFakeConversionRunner(),
     )
     return pipeline, batching, company, source
 
@@ -1001,7 +1006,7 @@ async def test_upload_material_failure_preserves_existing_user_visible_semantics
 
 @pytest.mark.asyncio
 async def test_upload_filing_stream_auto_resolves_create_update_skip(tmp_path: Path) -> None:
-    """CN filing upload stream 应自动 create/update 并跳过相同源文件。
+    """CN/HK shared facade 应完整替换 changed update 并跳过其相同重放。
 
     Args:
         tmp_path: 临时目录。
@@ -1018,7 +1023,9 @@ async def test_upload_filing_stream_auto_resolves_create_update_skip(tmp_path: P
         docling_converter=_PipelineDownloadFakeConversionRunner(),
     )
     filing_file = tmp_path / "annual.pdf"
+    renamed_file = tmp_path / "renamed-annual.pdf"
     filing_file.write_text("demo cn filing", encoding="utf-8")
+    renamed_file.write_text("changed cn filing", encoding="utf-8")
 
     create_events = [
         event
@@ -1031,7 +1038,82 @@ async def test_upload_filing_stream_auto_resolves_create_update_skip(tmp_path: P
             )
         )
     ]
+    update_events = [
+        event
+        async for event in pipeline.upload_filing_stream(
+            _validated_cn_filing_request(
+                pipeline=pipeline,
+                filing_file=renamed_file,
+                action=None,
+                company_name="贵州茅台",
+            )
+        )
+    ]
     skip_events = [
+        event
+        async for event in pipeline.upload_filing_stream(
+            _validated_cn_filing_request(
+                pipeline=pipeline,
+                filing_file=renamed_file,
+                action=None,
+                company_name="贵州茅台",
+            )
+        )
+    ]
+    create_result = create_events[-1].payload["result"]
+    update_result = update_events[-1].payload["result"]
+    skip_result = skip_events[-1].payload["result"]
+
+    assert isinstance(create_result, dict)
+    assert isinstance(update_result, dict)
+    assert isinstance(skip_result, dict)
+    assert create_result["filing_action"] == "create"
+    assert update_result["filing_action"] == "update"
+    assert update_result["status"] == "ok"
+    assert update_result["document_id"] == create_result["document_id"]
+    assert skip_result["filing_action"] == "update"
+    assert skip_result["status"] == "skipped"
+    handle = pipeline._source_repository.get_source_handle(
+        "600519",
+        str(create_result["document_id"]),
+        SourceKind.FILING,
+    )
+    file_names = sorted(meta.uri.split("/")[-1] for meta in pipeline._blob_repository.list_files(handle))
+    assert file_names == ["renamed-annual.pdf", "renamed-annual_docling.json"]
+    assert [event.event_type for event in skip_events] == [
+        UploadFilingEventType.UPLOAD_STARTED,
+        UploadFilingEventType.FILE_SKIPPED,
+        UploadFilingEventType.UPLOAD_COMPLETED,
+    ]
+
+
+@pytest.mark.parametrize("overwrite", (False, True))
+@pytest.mark.asyncio
+async def test_upload_filing_fresh_missing_update_fails_before_conversion(
+    tmp_path: Path,
+    overwrite: bool,
+) -> None:
+    """CN/HK fresh owner 必须拒绝 stale update-missing，overwrite 不得授予 upsert。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        overwrite: stale update 请求的覆盖标志。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: fresh missing 未 typed fail、发生转换/batch 或 tree 漂移时抛出。
+    """
+
+    converter = _PipelineDownloadFakeConversionRunner()
+    pipeline, batching, company, source = _tracking_cn_pipeline(
+        tmp_path,
+        converter=converter,
+    )
+    filing_file = tmp_path / "annual.pdf"
+    filing_file.write_text("demo cn filing", encoding="utf-8")
+    create_events = [
         event
         async for event in pipeline.upload_filing_stream(
             _validated_cn_filing_request(
@@ -1043,18 +1125,40 @@ async def test_upload_filing_stream_auto_resolves_create_update_skip(tmp_path: P
         )
     ]
     create_result = create_events[-1].payload["result"]
-    skip_result = skip_events[-1].payload["result"]
-
     assert isinstance(create_result, dict)
-    assert isinstance(skip_result, dict)
-    assert create_result["filing_action"] == "create"
-    assert skip_result["filing_action"] == "update"
-    assert skip_result["status"] == "skipped"
-    assert [event.event_type for event in skip_events] == [
-        UploadFilingEventType.UPLOAD_STARTED,
-        UploadFilingEventType.FILE_SKIPPED,
-        UploadFilingEventType.UPLOAD_COMPLETED,
-    ]
+    stale_update = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action="update",
+        company_name="贵州茅台",
+        overwrite=overwrite,
+    )
+    reset_batch = pipeline._batching_repository.begin_batch("600519")
+    pipeline._source_repository.reset_source_document(
+        "600519",
+        stale_update.document_id,
+        SourceKind.FILING,
+        batch=reset_batch,
+    )
+    pipeline._batching_repository.commit_batch(reset_batch)
+    converter.calls = 0
+    converter.cancellations.clear()
+    batching.begin_tokens.clear()
+    batching.commit_tokens.clear()
+    batching.rollback_tokens.clear()
+    company.stage_tokens.clear()
+    source.stage_tokens.clear()
+    published_tree = published_tree_sha256(tmp_path, "600519")
+
+    with pytest.raises(FinsUploadUsageError) as exc_info:
+        _ = [event async for event in pipeline.upload_filing_stream(stale_update)]
+
+    assert exc_info.value.failure.code is FinsUploadUsageCode.UPDATE_TARGET_MISSING
+    assert converter.calls == 0
+    assert batching.begin_tokens == []
+    assert company.stage_tokens == []
+    assert source.stage_tokens == []
+    assert published_tree_sha256(tmp_path, "600519") == published_tree
 
 
 @pytest.mark.parametrize("failure_point", ("company", "source"))

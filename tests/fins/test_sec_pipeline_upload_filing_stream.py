@@ -133,6 +133,21 @@ class _SpyCompanyMetaRepository:
 class _FakeDoclingConverter:
     """SEC filing 测试用 typed converter。"""
 
+    def __init__(self, calls: list[str] | None = None) -> None:
+        """初始化 converter。
+
+        Args:
+            calls: 可选转换调用记录。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self._calls = calls
+
     async def convert_to_json_bytes(
         self,
         input_bytes: bytes,
@@ -157,6 +172,8 @@ class _FakeDoclingConverter:
         """
 
         del input_bytes, config, cancellation
+        if self._calls is not None:
+            self._calls.append(stream_name)
         data = ('{"name": "' + stream_name + '", "format": "docling"}').encode()
         return DoclingConversionResult(data, len(data), hashlib.sha256(data).hexdigest())
 
@@ -261,6 +278,8 @@ def _validated_sec_filing_request(
 
 def _tracking_sec_pipeline(
     workspace_root: Path,
+    *,
+    converter_calls: list[str] | None = None,
 ) -> tuple[
     SecPipeline,
     TrackingBatchingRepository,
@@ -271,6 +290,7 @@ def _tracking_sec_pipeline(
 
     Args:
         workspace_root: 测试工作区根目录。
+        converter_calls: 可选转换调用记录。
 
     Returns:
         pipeline、batch、company 与 source tracking repositories。
@@ -297,7 +317,7 @@ def _tracking_sec_pipeline(
             workspace_root,
             repository_set=repository_set,
         ),
-        docling_converter=_FakeDoclingConverter(),
+        docling_converter=_FakeDoclingConverter(converter_calls),
     )
     return pipeline, batching, company, source
 
@@ -613,8 +633,10 @@ async def test_upload_filing_stream_stale_company_meta_requires_company_name(tmp
 
 
 @pytest.mark.asyncio
-async def test_upload_filing_stream_auto_action_and_overwrite_reset(tmp_path: Path) -> None:
-    """SEC filing upload stream 应自动解析动作并在 overwrite 时重置单文档。
+async def test_upload_filing_stream_renamed_update_without_overwrite_replaces_complete_set(
+    tmp_path: Path,
+) -> None:
+    """SEC renamed update 不依赖 overwrite，并只发布新完整文件集合。
 
     Args:
         tmp_path: 临时目录。
@@ -632,9 +654,11 @@ async def test_upload_filing_stream_auto_action_and_overwrite_reset(tmp_path: Pa
         docling_converter=_FakeDoclingConverter(),
     )
     old_file = tmp_path / "q1_old.pdf"
-    new_file = tmp_path / "q1_new.pdf"
+    new_file = tmp_path / "q1_renamed.pdf"
+    sibling_file = tmp_path / "q2_sibling.pdf"
     old_file.write_text("old filing", encoding="utf-8")
     new_file.write_text("new filing", encoding="utf-8")
+    sibling_file.write_text("sibling filing", encoding="utf-8")
 
     create_events = [
         event
@@ -666,8 +690,35 @@ async def test_upload_filing_stream_auto_action_and_overwrite_reset(tmp_path: Pa
     assert isinstance(skip_result, dict)
     assert skip_result["status"] == "skipped"
     assert skip_result["filing_action"] == "update"
+    sibling_events = [
+        event
+        async for event in pipeline.upload_filing_stream(
+            _validated_sec_filing_request(
+                pipeline=pipeline,
+                filing_file=sibling_file,
+                action=None,
+                company_name="Apple Inc.",
+                fiscal_period="Q2",
+            )
+        )
+    ]
+    sibling_result = sibling_events[-1].payload["result"]
+    assert isinstance(sibling_result, dict)
+    sibling_document_id = str(sibling_result["document_id"])
+    sibling_meta = pipeline._source_repository.get_source_meta(
+        "AAPL",
+        sibling_document_id,
+        SourceKind.FILING,
+    )
+    sibling_handle = pipeline._source_repository.get_source_handle(
+        "AAPL",
+        sibling_document_id,
+        SourceKind.FILING,
+    )
+    sibling_files = pipeline._blob_repository.list_files(sibling_handle)
+    company_meta = pipeline._company_repository.get_company_meta("AAPL")
 
-    overwrite_events = [
+    update_events = [
         event
         async for event in pipeline.upload_filing_stream(
             _validated_sec_filing_request(
@@ -675,23 +726,165 @@ async def test_upload_filing_stream_auto_action_and_overwrite_reset(tmp_path: Pa
                 filing_file=new_file,
                 action=None,
                 company_name="Apple Inc.",
-                overwrite=True,
             )
         )
     ]
-    overwrite_result = overwrite_events[-1].payload["result"]
-    assert isinstance(overwrite_result, dict)
-    assert overwrite_result["status"] == "ok"
-    assert overwrite_result["filing_action"] == "update"
-    assert overwrite_result["document_id"] == create_result["document_id"]
+    update_result = update_events[-1].payload["result"]
+    assert isinstance(update_result, dict)
+    assert update_result["status"] == "ok"
+    assert update_result["filing_action"] == "update"
+    assert update_result["document_id"] == create_result["document_id"]
 
     handle = pipeline._source_repository.get_source_handle(
         "AAPL",
-        str(overwrite_result["document_id"]),
+        str(update_result["document_id"]),
         SourceKind.FILING,
     )
     file_names = sorted(meta.uri.split("/")[-1] for meta in pipeline._blob_repository.list_files(handle))
-    assert file_names == ["q1_new.pdf", "q1_new_docling.json"]
+    assert file_names == ["q1_renamed.pdf", "q1_renamed_docling.json"]
+    assert pipeline._company_repository.get_company_meta("AAPL") == company_meta
+    assert (
+        pipeline._source_repository.get_source_meta(
+            "AAPL",
+            sibling_document_id,
+            SourceKind.FILING,
+        )
+        == sibling_meta
+    )
+    assert pipeline._blob_repository.list_files(sibling_handle) == sibling_files
+
+
+@pytest.mark.asyncio
+async def test_upload_filing_fresh_create_existing_fails_before_conversion_and_batch(
+    tmp_path: Path,
+) -> None:
+    """SEC fresh recheck 必须让 stale create-existing 在 conversion 前 typed fail。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: stale action 被消费、converter/batch 被调用或 tree 漂移时抛出。
+    """
+
+    calls: list[str] = []
+    pipeline, batching, company, source = _tracking_sec_pipeline(
+        tmp_path,
+        converter_calls=calls,
+    )
+    filing_file = tmp_path / "filing.pdf"
+    filing_file.write_text("published filing", encoding="utf-8")
+    stale_create = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action="create",
+        company_name="Apple Inc.",
+    )
+    published_events = [
+        event
+        async for event in pipeline.upload_filing_stream(
+            _validated_sec_filing_request(
+                pipeline=pipeline,
+                filing_file=filing_file,
+                action=None,
+                company_name="Apple Inc.",
+            )
+        )
+    ]
+    assert published_events[-1].event_type is UploadFilingEventType.UPLOAD_COMPLETED
+    calls.clear()
+    batching.begin_tokens.clear()
+    batching.commit_tokens.clear()
+    batching.rollback_tokens.clear()
+    company.stage_tokens.clear()
+    source.stage_tokens.clear()
+    published_tree = published_tree_sha256(tmp_path, "AAPL")
+
+    with pytest.raises(FinsUploadUsageError) as exc_info:
+        _ = [event async for event in pipeline.upload_filing_stream(stale_create)]
+
+    assert exc_info.value.failure.code is FinsUploadUsageCode.CREATE_TARGET_EXISTS
+    assert calls == []
+    assert batching.begin_tokens == []
+    assert company.stage_tokens == []
+    assert source.stage_tokens == []
+    assert published_tree_sha256(tmp_path, "AAPL") == published_tree
+
+
+@pytest.mark.parametrize("changed_input", (False, True))
+@pytest.mark.asyncio
+async def test_upload_filing_auto_after_delete_republishes_active_source(
+    tmp_path: Path,
+    changed_input: bool,
+) -> None:
+    """SEC delete 后 equal/changed 完整输入 auto 必须发布 uploaded/update active source。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        changed_input: logical delete 后是否改变完整输入内容。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: restore 被 skip 或 source 仍处于 logical deleted 时抛出。
+    """
+
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        processor_registry=build_fins_processor_registry(),
+        docling_converter=_FakeDoclingConverter(),
+    )
+    filing_file = tmp_path / "restore.pdf"
+    filing_file.write_text("same filing", encoding="utf-8")
+    create_request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action=None,
+        company_name="Apple Inc.",
+    )
+    create_events = [event async for event in pipeline.upload_filing_stream(create_request)]
+    create_result = create_events[-1].payload["result"]
+    assert isinstance(create_result, dict)
+    document_id = str(create_result["document_id"])
+    delete_events = [
+        event
+        async for event in pipeline.upload_filing_stream(
+            _validated_sec_filing_request(
+                pipeline=pipeline,
+                filing_file=filing_file,
+                action="delete",
+                company_name="Apple Inc.",
+            )
+        )
+    ]
+    assert delete_events[-1].event_type is UploadFilingEventType.UPLOAD_COMPLETED
+    if changed_input:
+        filing_file.write_text("changed filing", encoding="utf-8")
+
+    restore_events = [
+        event
+        async for event in pipeline.upload_filing_stream(
+            _validated_sec_filing_request(
+                pipeline=pipeline,
+                filing_file=filing_file,
+                action=None,
+                company_name="Apple Inc.",
+            )
+        )
+    ]
+    restore_result = restore_events[-1].payload["result"]
+    state = pipeline._filing_upload_state_repository.read_filing_upload_state("AAPL", document_id)
+
+    assert isinstance(restore_result, dict)
+    assert restore_result["status"] == "ok"
+    assert restore_result["filing_action"] == "update"
+    assert state.source_meta is not None
+    assert state.source_meta["is_deleted"] is False
+    assert state.source_meta["deleted_at"] is None
 
 
 @pytest.mark.parametrize("failure_point", ("company", "source"))

@@ -31,7 +31,6 @@ from dayu.fins.pipelines.docling_upload_service import (
     _build_upload_source_fingerprint,
     _increment_document_version,
     _resolve_document_version,
-    _resolve_upsert_mode,
     build_cn_filing_ids,
     build_material_ids,
     build_sec_filing_ids,
@@ -49,8 +48,39 @@ from dayu.fins.storage import (
     FsBatchingRepository,
     FsDocumentBlobRepository,
     FsSourceDocumentRepository,
+    SourceIntegrityStatus,
 )
 from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
+
+from .upload_filing_test_support import published_tree_sha256
+
+
+_INITIAL_CREATED_AT = "2020-01-01T00:00:00+00:00"
+_REPLACEMENT_CREATED_AT = "2020-01-02T00:00:00+00:00"
+
+
+def _set_upload_clock(monkeypatch: pytest.MonkeyPatch, timestamp: str) -> None:
+    """为上传 owner 与真实 FS 仓储设置同一个确定时钟。
+
+    Args:
+        monkeypatch: pytest 属性替换器。
+        timestamp: 当前阶段应返回的 ISO8601 时间。
+
+    Returns:
+        无。
+
+    Raises:
+        AttributeError: 目标模块不再暴露时钟依赖时抛出。
+    """
+
+    monkeypatch.setattr(
+        "dayu.fins.pipelines.docling_upload_service.now_iso8601",
+        lambda: timestamp,
+    )
+    monkeypatch.setattr(
+        "dayu.fins.storage._fs_source_document_core.now_iso8601",
+        lambda: timestamp,
+    )
 
 
 @dataclass(frozen=True)
@@ -87,19 +117,6 @@ class _FailingFinalUploadSourceRepository(_SpyUploadSourceRepository):
 
         del req, source_kind, batch
         self._events.append("create_failed")
-        raise RuntimeError("forced final upsert failure")
-
-    def update_source_document(
-        self,
-        req: SourceDocumentUpsertRequest,
-        source_kind: SourceKind,
-        *,
-        batch: BatchToken,
-    ) -> DocumentHandle:
-        """模拟 staging 后 final source update 失败。"""
-
-        del req, source_kind, batch
-        self._events.append("update_failed")
         raise RuntimeError("forced final upsert failure")
 
 
@@ -396,6 +413,77 @@ class _BlobFirstUploadBlobRepository(FsDocumentBlobRepository):
             else:
                 self.observed_source_absent.append(False)
         self._events.append(f"store:{filename}")
+        return super().store_file(
+            handle,
+            filename,
+            data,
+            batch=batch,
+            content_type=content_type,
+            metadata=metadata,
+        )
+
+
+class _FailingNthUploadBlobRepository(FsDocumentBlobRepository):
+    """在指定次序的 staging blob 写入处注入失败。"""
+
+    def __init__(
+        self,
+        workspace_root: Path,
+        repository_set: _FsRepositorySet,
+        *,
+        fail_at: int,
+    ) -> None:
+        """初始化 blob failure injector。
+
+        Args:
+            workspace_root: 测试工作区。
+            repository_set: 与 source/batch 共用的真实 FS core。
+            fail_at: 从一开始计数的失败写入次序。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: ``fail_at`` 不是正整数时抛出。
+        """
+
+        if fail_at <= 0:
+            raise ValueError("fail_at 必须为正整数")
+        super().__init__(workspace_root, repository_set=repository_set)
+        self._fail_at = fail_at
+        self._store_calls = 0
+
+    def store_file(
+        self,
+        handle: SourceHandle | ProcessedHandle,
+        filename: str,
+        data: BinaryIO,
+        *,
+        batch: BatchToken,
+        content_type: Optional[str] = None,
+        metadata: Optional[dict[str, str]] = None,
+    ) -> FileObjectMeta:
+        """在目标写入次序抛出异常，否则转发真实 staging 写入。
+
+        Args:
+            handle: source 或 processed handle。
+            filename: 待写文件名。
+            data: 文件字节流。
+            batch: caller-owned batch capability。
+            content_type: 可选 MIME 类型。
+            metadata: 可选文件元数据。
+
+        Returns:
+            成功写入的文件对象元数据。
+
+        Raises:
+            RuntimeError: 命中目标写入次序时抛出。
+            OSError: 真实 staging 写入失败时抛出。
+        """
+
+        self._store_calls += 1
+        if self._store_calls == self._fail_at:
+            raise RuntimeError("forced replacement blob failure")
         return super().store_file(
             handle,
             filename,
@@ -1250,17 +1338,33 @@ def test_prepare_upload_requires_canonical_boolean_deleted_state(
     assert calls == []
 
 
-def test_execute_upload_deleted_equal_fingerprint_enters_conversion(tmp_path: Path) -> None:
-    """logical-deleted source 即使指纹相同也不得 skip。
+@pytest.mark.parametrize(
+    ("source_kind", "changed_input"),
+    (
+        (SourceKind.FILING, False),
+        (SourceKind.FILING, True),
+        (SourceKind.MATERIAL, False),
+    ),
+)
+def test_execute_upload_deleted_input_republishes_complete_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_kind: SourceKind,
+    changed_input: bool,
+) -> None:
+    """shared owner 必须把 deleted equal/changed input 重新发布为完整 active source。
 
     Args:
         tmp_path: pytest 临时目录。
+        monkeypatch: pytest 属性替换器。
+        source_kind: 当前验证的 shared source 类型。
+        changed_input: logical delete 后是否改变完整输入内容。
 
     Returns:
         无。
 
     Raises:
-        AssertionError: deleted source 被误判为 no-op 时抛出。
+        AssertionError: deleted source 被 skip、版本/首次创建事实漂移或未恢复完整性时抛出。
     """
 
     calls: list[str] = []
@@ -1270,52 +1374,167 @@ def test_execute_upload_deleted_equal_fingerprint_enters_conversion(tmp_path: Pa
         blob_repository=context.blob_repository,
         docling_converter=_FakeDoclingConverter(calls),
     )
-    sample_file = tmp_path / "report.txt"
+    sample_file = tmp_path / ("report.txt" if source_kind is SourceKind.FILING else "deck.txt")
     sample_file.write_text("same input", encoding="utf-8")
+    form_type = "10-K" if source_kind is SourceKind.FILING else "MATERIAL_OTHER"
+    document_id = "filing_deleted" if source_kind is SourceKind.FILING else "material_deleted"
+    base_meta: dict[str, JsonValue] = {"ingest_method": "upload"}
+    if source_kind is SourceKind.MATERIAL:
+        base_meta["material_name"] = "Deck"
+    _set_upload_clock(monkeypatch, _INITIAL_CREATED_AT)
     created = _execute_upload(
         service=service,
         batching_repository=context.batching_repository,
         ticker="AAPL",
-        source_kind=SourceKind.FILING,
+        source_kind=source_kind,
         action="create",
-        document_id="filing_deleted",
-        internal_document_id="filing_deleted",
-        form_type="10-K",
+        document_id=document_id,
+        internal_document_id=document_id,
+        form_type=form_type,
         files=[sample_file],
         overwrite=False,
-        meta={"ingest_method": "upload"},
+        meta=base_meta,
     )
+    created_meta = context.source_repository.get_source_meta("AAPL", document_id, source_kind)
+    _set_upload_clock(monkeypatch, _REPLACEMENT_CREATED_AT)
     deleted = _execute_upload(
         service=service,
         batching_repository=context.batching_repository,
         ticker="AAPL",
-        source_kind=SourceKind.FILING,
+        source_kind=source_kind,
         action="delete",
-        document_id="filing_deleted",
-        internal_document_id="filing_deleted",
-        form_type="10-K",
+        document_id=document_id,
+        internal_document_id=document_id,
+        form_type=form_type,
         files=[],
         overwrite=False,
         meta={},
     )
+    if changed_input:
+        sample_file.write_text("changed input", encoding="utf-8")
     restored = _execute_upload(
         service=service,
         batching_repository=context.batching_repository,
         ticker="AAPL",
-        source_kind=SourceKind.FILING,
+        source_kind=source_kind,
         action="update",
-        document_id="filing_deleted",
-        internal_document_id="filing_deleted",
-        form_type="10-K",
+        document_id=document_id,
+        internal_document_id=document_id,
+        form_type=form_type,
         files=[sample_file],
         overwrite=False,
-        meta={"ingest_method": "upload"},
+        meta=base_meta,
     )
+    restored_meta = context.source_repository.get_source_meta("AAPL", document_id, source_kind)
+    integrity = context.source_repository.classify_source_integrity("AAPL", document_id, source_kind)
 
     assert created.status == "uploaded"
     assert deleted.status == "deleted"
     assert restored.status == "uploaded"
-    assert calls == ["report.txt", "report.txt"]
+    assert calls == [sample_file.name, sample_file.name]
+    assert restored_meta["is_deleted"] is False
+    assert restored_meta["deleted_at"] is None
+    expected_version = "v2" if changed_input else created_meta["document_version"]
+    assert restored_meta["document_version"] == expected_version
+    assert restored_meta["first_ingested_at"] == created_meta["first_ingested_at"]
+    assert restored_meta["created_at"] == created_meta["created_at"]
+    assert integrity.status is SourceIntegrityStatus.COMPLETE
+
+
+@pytest.mark.parametrize(
+    ("source_kind", "action", "overwrite", "old_name", "new_name"),
+    (
+        (SourceKind.FILING, "update", False, "report.txt", "report.txt"),
+        (SourceKind.FILING, "update", False, "old-report.txt", "renamed-report.txt"),
+        (SourceKind.MATERIAL, "create", True, "old-deck.txt", "new-deck.txt"),
+    ),
+)
+def test_execute_upload_existing_full_input_replaces_exact_complete_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_kind: SourceKind,
+    action: str,
+    overwrite: bool,
+    old_name: str,
+    new_name: str,
+) -> None:
+    """existing update/create-overwrite 必须以 reset 前 meta 派生完整新集合。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest 属性替换器。
+        source_kind: filing 或 material shared owner 输入。
+        action: 第二次完整输入动作。
+        overwrite: 第二次动作的覆盖标志。
+        old_name: 初次发布的文件名。
+        new_name: 替换发布的文件名。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 旧文件残留、版本/首次创建事实漂移或完整性异常时抛出。
+    """
+
+    context = _build_service_context(tmp_path)
+    old_dir = tmp_path / "old-input"
+    new_dir = tmp_path / "new-input"
+    old_dir.mkdir()
+    new_dir.mkdir()
+    old_file = old_dir / old_name
+    new_file = new_dir / new_name
+    old_file.write_text("old bytes", encoding="utf-8")
+    new_file.write_text("new bytes", encoding="utf-8")
+    form_type = "10-K" if source_kind is SourceKind.FILING else "MATERIAL_OTHER"
+    document_id = "filing_replace" if source_kind is SourceKind.FILING else "material_replace"
+    base_meta: dict[str, JsonValue] = {"ingest_method": "upload"}
+    if source_kind is SourceKind.MATERIAL:
+        base_meta["material_name"] = "Deck"
+    _set_upload_clock(monkeypatch, _INITIAL_CREATED_AT)
+    _execute_upload(
+        service=context.service,
+        batching_repository=context.batching_repository,
+        ticker="AAPL",
+        source_kind=source_kind,
+        action="create",
+        document_id=document_id,
+        internal_document_id=document_id,
+        form_type=form_type,
+        files=[old_file],
+        overwrite=False,
+        meta=base_meta,
+    )
+    initial_meta = context.source_repository.get_source_meta("AAPL", document_id, source_kind)
+
+    _set_upload_clock(monkeypatch, _REPLACEMENT_CREATED_AT)
+    result = _execute_upload(
+        service=context.service,
+        batching_repository=context.batching_repository,
+        ticker="AAPL",
+        source_kind=source_kind,
+        action=action,
+        document_id=document_id,
+        internal_document_id=document_id,
+        form_type=form_type,
+        files=[new_file],
+        overwrite=overwrite,
+        meta=base_meta,
+    )
+
+    final_meta = context.source_repository.get_source_meta("AAPL", document_id, source_kind)
+    handle = SourceHandle(ticker="AAPL", document_id=document_id, source_kind=source_kind.value)
+    published_names = sorted(item.uri.rsplit("/", maxsplit=1)[-1] for item in context.blob_repository.list_files(handle))
+    expected_names = sorted((new_name, f"{Path(new_name).stem}_docling.json"))
+    integrity = context.source_repository.classify_source_integrity("AAPL", document_id, source_kind)
+
+    assert result.status == "uploaded"
+    assert published_names == expected_names
+    assert context.blob_repository.read_file_bytes(handle, new_name) == b"new bytes"
+    assert final_meta["document_version"] == "v2"
+    assert final_meta["first_ingested_at"] == initial_meta["first_ingested_at"]
+    assert final_meta["created_at"] == initial_meta["created_at"]
+    assert final_meta["is_deleted"] is False
+    assert integrity.status is SourceIntegrityStatus.COMPLETE
 
 
 def test_execute_upload_skips_when_source_fingerprint_matches(tmp_path: Path) -> None:
@@ -1378,8 +1597,23 @@ def test_execute_upload_skips_when_source_fingerprint_matches(tmp_path: Path) ->
     assert all(event.event_type == "file_skipped" for event in second.file_events)
 
 
-def test_execute_upload_overwrite_cancel_after_conversion_keeps_previous_document(tmp_path: Path) -> None:
-    """overwrite 在转换后取消时应保留旧 source document。"""
+@pytest.mark.parametrize("cancel_at", (2, 4, 5))
+def test_existing_replacement_cancellation_keeps_entire_published_tree(
+    tmp_path: Path,
+    cancel_at: int,
+) -> None:
+    """reset 后 blob/final/precommit checkpoint 取消必须回滚整棵 ticker tree。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        cancel_at: publication 内命中的取消检查次序。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 取消未回滚或 published tree 发生任何漂移时抛出。
+    """
 
     context = _build_service_context(tmp_path)
     old_file = tmp_path / "deck.pdf"
@@ -1402,26 +1636,109 @@ def test_execute_upload_overwrite_cancel_after_conversion_keeps_previous_documen
     old_entries = {entry.name for entry in context.blob_repository.list_entries(handle)}
     new_file = tmp_path / "deck-new.pdf"
     new_file.write_text("new", encoding="utf-8")
-    cancellation_checker = _CancelOnNthCheck(cancel_at=5)
+    prepared = asyncio.run(
+        context.service.prepare_upload(
+            ticker="AAPL",
+            source_kind=SourceKind.MATERIAL,
+            action="update",
+            document_id="mat_demo",
+            internal_document_id="mat_demo",
+            form_type="MATERIAL_OTHER",
+            files=[new_file],
+            overwrite=False,
+            previous_meta=old_meta,
+            meta={"material_name": "Deck", "ingest_method": "upload"},
+            cancellation=None,
+        )
+    )
+    assert not isinstance(prepared, UploadOperationResult)
+    old_tree = published_tree_sha256(tmp_path, "AAPL")
 
-    result = _execute_upload(
+    result = _publish_prepared_upload(
         service=context.service,
         batching_repository=context.batching_repository,
         ticker="AAPL",
-        source_kind=SourceKind.MATERIAL,
-        action="update",
-        document_id="mat_demo",
-        internal_document_id="mat_demo",
-        form_type="MATERIAL_OTHER",
-        files=[new_file],
-        overwrite=True,
-        cancellation_checker=cancellation_checker,
-        meta={"material_name": "Deck", "ingest_method": "upload"},
+        prepared=prepared,
+        cancellation=_CancelOnNthCheck(cancel_at=cancel_at),
     )
 
     assert result.status == "cancelled"
+    assert published_tree_sha256(tmp_path, "AAPL") == old_tree
     assert context.source_repository.get_source_meta("AAPL", "mat_demo", SourceKind.MATERIAL) == old_meta
     assert {entry.name for entry in context.blob_repository.list_entries(handle)} == old_entries
+
+
+@pytest.mark.parametrize("fail_at", (1, 2))
+def test_existing_replacement_blob_failure_keeps_entire_published_tree(
+    tmp_path: Path,
+    fail_at: int,
+) -> None:
+    """reset 后任一 blob 写入失败必须丢弃 staging 并保留旧发布树。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        fail_at: 失败的 blob 写入次序。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 失败未传播或 published tree 漂移时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching_repository = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    source_repository = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    seed_blob_repository = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    seed_service = DoclingUploadService(
+        source_repository=source_repository,
+        blob_repository=seed_blob_repository,
+        docling_converter=_FakeDoclingConverter(),
+    )
+    old_file = tmp_path / "old.txt"
+    new_file = tmp_path / "renamed.txt"
+    old_file.write_text("old", encoding="utf-8")
+    new_file.write_text("new", encoding="utf-8")
+    _execute_upload(
+        service=seed_service,
+        batching_repository=batching_repository,
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        action="create",
+        document_id="filing_blob_failure",
+        internal_document_id="filing_blob_failure",
+        form_type="10-K",
+        files=[old_file],
+        overwrite=False,
+        meta={"ingest_method": "upload"},
+    )
+    old_tree = published_tree_sha256(tmp_path, "AAPL")
+    failing_service = DoclingUploadService(
+        source_repository=source_repository,
+        blob_repository=_FailingNthUploadBlobRepository(
+            tmp_path,
+            repository_set,
+            fail_at=fail_at,
+        ),
+        docling_converter=_FakeDoclingConverter(),
+    )
+
+    with pytest.raises(RuntimeError, match="forced replacement blob failure"):
+        _execute_upload(
+            service=failing_service,
+            batching_repository=batching_repository,
+            ticker="AAPL",
+            source_kind=SourceKind.FILING,
+            action="update",
+            document_id="filing_blob_failure",
+            internal_document_id="filing_blob_failure",
+            form_type="10-K",
+            files=[new_file],
+            overwrite=False,
+            meta={"ingest_method": "upload"},
+        )
+
+    assert published_tree_sha256(tmp_path, "AAPL") == old_tree
 
 
 @pytest.mark.parametrize("overwrite", [False, True])
@@ -1458,6 +1775,7 @@ def test_execute_upload_update_failure_keeps_previous_document(
     old_meta = seed_source_repository.get_source_meta("AAPL", "mat_demo", SourceKind.MATERIAL)
     handle = SourceHandle(ticker="AAPL", document_id="mat_demo", source_kind=SourceKind.MATERIAL.value)
     old_entries = {entry.name for entry in seed_blob_repository.list_entries(handle)}
+    old_tree = published_tree_sha256(tmp_path, "AAPL")
     events: list[str] = []
     failing_source_repository = _FailingFinalUploadSourceRepository(tmp_path, repository_set, events)
     failing_service = DoclingUploadService(
@@ -1485,6 +1803,8 @@ def test_execute_upload_update_failure_keeps_previous_document(
 
     assert failing_source_repository.get_source_meta("AAPL", "mat_demo", SourceKind.MATERIAL) == old_meta
     assert {entry.name for entry in seed_blob_repository.list_entries(handle)} == old_entries
+    assert published_tree_sha256(tmp_path, "AAPL") == old_tree
+    assert events[-1] == "create_failed"
 
 
 def test_execute_upload_delete_material(tmp_path: Path) -> None:
@@ -1580,7 +1900,6 @@ def test_upload_helper_id_and_version_rules() -> None:
     assert _increment_document_version("v2") == "v3"
     assert _resolve_document_version(None, "fp") == "v1"
     assert _resolve_document_version({"document_version": "v1", "source_fingerprint": "old"}, "new") == "v2"
-    assert _resolve_upsert_mode("update", None, True) == "create"
     assert validate_material_upload_ids(
         stable_document_id="mat_a",
         stable_internal_document_id="mat_a",
