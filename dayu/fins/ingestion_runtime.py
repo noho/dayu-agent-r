@@ -46,6 +46,7 @@ from dayu.fins.direct_events import (
     FinsPublicFailureKind,
     FinsResultStatus,
     FinsResultSummary,
+    canonicalize_fins_public_file_label,
 )
 from dayu.fins.direct_events import ValidatedFinsEventStream
 from dayu.fins.download_contract import (
@@ -662,6 +663,7 @@ class FinsUploadUsageCode(str, Enum):
     COMPANY_NAME_TOO_LONG = "company_name_too_long"
     TOO_MANY_TICKER_ALIASES = "too_many_ticker_aliases"
     MISSING_FILES = "missing_files"
+    INVALID_FILE_BASENAME = "invalid_file_basename"
     FILE_NOT_FOUND = "file_not_found"
     FILE_NOT_REGULAR = "file_not_regular"
     FILE_SUFFIX_NOT_ALLOWED = "file_suffix_not_allowed"
@@ -766,6 +768,7 @@ _USAGE_MESSAGES: Final[Mapping[FinsUploadUsageCode, str]] = {
     FinsUploadUsageCode.COMPANY_NAME_TOO_LONG: "--company-name 长度不能超过 240 个字符",
     FinsUploadUsageCode.TOO_MANY_TICKER_ALIASES: "--ticker 别名数量不能超过 100 个",
     FinsUploadUsageCode.MISSING_FILES: "create/update 上传必须提供 --files",
+    FinsUploadUsageCode.INVALID_FILE_BASENAME: "上传文件名无效；请提供单个非空文件名",
     FinsUploadUsageCode.FILE_NOT_FOUND: "上传文件不存在：{file_name}",
     FinsUploadUsageCode.FILE_NOT_REGULAR: "上传路径不是普通文件：{file_name}",
     FinsUploadUsageCode.FILE_SUFFIX_NOT_ALLOWED: "上传文件后缀不在命令允许范围：{file_name}",
@@ -829,6 +832,25 @@ def _raise_upload_usage(
     raise FinsUploadUsageError(fins_upload_usage_failure(code, file_name=file_name))
 
 
+def _admit_fins_upload_file_basename(basename: str) -> None:
+    """复用 public label owner 完成 filing 文件名 shape admission。
+
+    Args:
+        basename: ``Path.name`` 产生的原始文件名。
+
+    Returns:
+        文件名满足 canonicalizer 的 basename shape contract 时不返回业务值。
+
+    Raises:
+        FinsUploadUsageError: 文件名不是单个非空 basename 时抛出。
+    """
+
+    try:
+        canonicalize_fins_public_file_label(basename)
+    except ValueError:
+        _raise_upload_usage(FinsUploadUsageCode.INVALID_FILE_BASENAME)
+
+
 def _validate_fins_upload_filing_static(
     request: FinsUploadFilingRequest,
 ) -> _StaticFinsUploadFilingValidation:
@@ -890,6 +912,7 @@ def _validate_fins_upload_filing_static(
         _raise_upload_usage(FinsUploadUsageCode.MISSING_FILES)
     for file_path in request.files:
         basename = file_path.name
+        _admit_fins_upload_file_basename(basename)
         if not file_path.exists():
             _raise_upload_usage(FinsUploadUsageCode.FILE_NOT_FOUND, file_name=basename)
         if not file_path.is_file():
@@ -3947,7 +3970,10 @@ class FinsIngestionRuntime:
                         status=_UPLOAD_RESULT_STATUS_FAILED,
                         requested_file_count=len(_raw_upload_request(request).files),
                         stored_file_count=0,
-                        failure_reason=fins_upload_failure_from_exception(RuntimeError()),
+                        failure_reason=fins_upload_failure_from_exception(
+                            RuntimeError(),
+                            file_label=None,
+                        ),
                     )
                 ),
                 error_kind=FinsErrorKind.EXECUTION,
@@ -4425,7 +4451,10 @@ class FinsIngestionRuntime:
                         status=_UPLOAD_RESULT_STATUS_FAILED,
                         requested_file_count=len(_raw_upload_request(request).files),
                         stored_file_count=0,
-                        failure_reason=fins_upload_failure_from_exception(RuntimeError()),
+                        failure_reason=fins_upload_failure_from_exception(
+                            RuntimeError(),
+                            file_label=None,
+                        ),
                     ).to_json_summary(),
                 )
                 return
@@ -6361,6 +6390,10 @@ def _upload_result_details(summary: FinsUploadResultSummary) -> tuple[FinsEventD
                 FinsEventDetail("failure message", summary.failure_reason.message),
             )
         )
+        if summary.failure_reason.retry_hint is not None:
+            details.append(FinsEventDetail("retry hint", summary.failure_reason.retry_hint))
+        if summary.failure_reason.file_label is not None:
+            details.append(FinsEventDetail("file", summary.failure_reason.file_label))
     return tuple(details)
 
 

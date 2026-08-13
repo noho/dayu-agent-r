@@ -181,11 +181,19 @@ class _FakeDoclingConverter:
 class _FailingDoclingConverter:
     """抛出指定 typed/runtime exception 的 converter 测试替身。"""
 
-    def __init__(self, error: Exception) -> None:
+    def __init__(
+        self,
+        error: Exception,
+        *,
+        failing_name: str | None = None,
+        calls: list[str] | None = None,
+    ) -> None:
         """初始化 failure converter。
 
         Args:
             error: conversion 调用应抛出的异常。
+            failing_name: 仅该 basename 抛错；``None`` 表示每次都抛错。
+            calls: 可选 converter 调用顺序记录。
 
         Returns:
             无。
@@ -195,6 +203,8 @@ class _FailingDoclingConverter:
         """
 
         self.error = error
+        self._failing_name = failing_name
+        self._calls = calls
 
     async def convert_to_json_bytes(
         self,
@@ -219,8 +229,13 @@ class _FailingDoclingConverter:
             Exception: 始终抛出构造时传入的异常。
         """
 
-        del input_bytes, stream_name, config, cancellation
-        raise self.error
+        del input_bytes, config, cancellation
+        if self._calls is not None:
+            self._calls.append(stream_name)
+        if self._failing_name is None or stream_name == self._failing_name:
+            raise self.error
+        data = ('{"name": "' + stream_name + '", "format": "docling"}').encode()
+        return DoclingConversionResult(data, len(data), hashlib.sha256(data).hexdigest())
 
 
 def _validated_sec_filing_request(
@@ -1049,7 +1064,7 @@ async def test_upload_filing_rollback_failure_logs_primary_and_recovery_evidence
             ),
             "failed",
             "docling_converter_execution",
-            "Docling conversion failed",
+            "typed content admission failed",
         ),
         (OSError("private storage cause"), "failed", "storage_io", "storage operation failed"),
         (
@@ -1121,6 +1136,158 @@ async def test_upload_filing_observably_classifies_cancelled_docling_storage_and
         assert operator_marker in caplog.text
         assert str(error) in caplog.text
         assert str(error) not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_upload_filing_empty_fails_before_batch_with_typed_label(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """SEC empty filing 必须在 converter/batch/company/source publication 前失败。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        caplog: operator log 捕获夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: typed reason 或 zero-publication 原子性漂移时抛出。
+    """
+
+    calls: list[str] = []
+    pipeline, batching, company, source = _tracking_sec_pipeline(tmp_path, converter_calls=calls)
+    filing_file = tmp_path / "empty.pdf"
+    filing_file.write_bytes(b"")
+    request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action="create",
+        company_name="Apple Inc.",
+    )
+
+    with caplog.at_level("ERROR"):
+        events = [event async for event in pipeline.upload_filing_stream(request)]
+
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    failure = result["failure"]
+    assert isinstance(failure, dict)
+    assert result["status"] == "failed"
+    assert result["stored_file_count"] == 0
+    assert failure == {
+        "kind": "content",
+        "code": "empty_input_file",
+        "message": "文件为空，无法上传",
+        "retry_hint": "请提供非空文件后重试",
+        "file_label": "empty.pdf",
+    }
+    assert "typed content admission failed" in caplog.text
+    assert calls == []
+    assert batching.begin_tokens == []
+    assert batching.commit_tokens == []
+    assert batching.rollback_tokens == []
+    assert company.stage_tokens == []
+    assert source.stage_tokens == []
+    assert published_tree_sha256(tmp_path, "AAPL") == {}
+
+
+@pytest.mark.asyncio
+async def test_upload_filing_valid_and_corrupt_mixed_batch_fails_atomically(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SEC valid+corrupt mixed filing 必须 fail-fast 且整批不开始 publication。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        caplog: operator log 捕获夹具。
+        monkeypatch: workflow generic mapper 禁用夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: conversion 顺序、typed label 或原子 publication 漂移时抛出。
+    """
+
+    pipeline, batching, company, source = _tracking_sec_pipeline(tmp_path)
+
+    def reject_workflow_reclassification(
+        error: Exception,
+        *,
+        file_label: str | None,
+    ) -> None:
+        """若 typed exception 被 workflow 重新分类则立即失败。
+
+        Args:
+            error: 意外进入 generic mapper 的异常。
+            file_label: 意外进入 generic mapper 的 label。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 始终抛出。
+        """
+
+        del error, file_label
+        raise AssertionError("typed filing failure 禁止 workflow 字符串重分类")
+
+    monkeypatch.setattr(
+        sec_upload_workflow,
+        "fins_upload_failure_from_exception",
+        reject_workflow_reclassification,
+    )
+    valid_file = tmp_path / "valid.pdf"
+    corrupt_file = tmp_path / "corrupt.docx"
+    later_file = tmp_path / "later.pdf"
+    for file_path in (valid_file, corrupt_file, later_file):
+        file_path.write_bytes(b"filing input")
+    calls: list[str] = []
+    cause = DoclingConversionError(
+        DoclingConversionFailureKind.CONVERTER_EXECUTION,
+        "Docling conversion execution failed",
+        23,
+    )
+    pipeline._upload_service._docling_converter = _FailingDoclingConverter(
+        cause,
+        failing_name=corrupt_file.name,
+        calls=calls,
+    )
+    first_request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=valid_file,
+        action="create",
+        company_name="Apple Inc.",
+    )
+    request = replace(
+        first_request,
+        request=replace(first_request.request, files=(valid_file, corrupt_file, later_file)),
+    )
+
+    with caplog.at_level("ERROR"):
+        events = [event async for event in pipeline.upload_filing_stream(request)]
+
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    failure = result["failure"]
+    assert isinstance(failure, dict)
+    assert result["stored_file_count"] == 0
+    assert failure["code"] == "docling_converter_execution"
+    assert failure["file_label"] == "corrupt.docx"
+    assert calls == ["valid.pdf", "corrupt.docx"]
+    assert "typed content admission failed" in caplog.text
+    assert str(cause) in caplog.text
+    assert str(cause) not in str(result)
+    assert batching.begin_tokens == []
+    assert batching.commit_tokens == []
+    assert batching.rollback_tokens == []
+    assert company.stage_tokens == []
+    assert source.stage_tokens == []
+    assert published_tree_sha256(tmp_path, "AAPL") == {}
 
 
 @pytest.mark.parametrize(

@@ -30,12 +30,14 @@ from dayu.fins.downloaders.sec_downloader import SEC_USER_AGENT_ENV
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins import ingestion_runtime
 from dayu.fins.direct_events import (
+    canonicalize_fins_public_file_label,
     FinsErrorKind,
     FinsEvent,
     FinsEventType,
     FinsOperationKind,
     FinsPublicFailureKind,
     FinsResultStatus,
+    validate_fins_public_file_label,
 )
 from dayu.fins.direct_event_text import (
     direct_download_no_source_documents_message,
@@ -113,6 +115,7 @@ from dayu.fins.upload_failure import (
     FinsUploadFailureKind,
     FinsUploadFailureReason,
     fins_upload_failure_from_exception,
+    upload_failure_reason_from_json,
 )
 from dayu.fins.pipelines.cn_pipeline import CnDownloadAdapter, CnPipeline
 from dayu.fins.pipelines.docling_process_converter import (
@@ -170,6 +173,7 @@ def test_failed_pipeline_result_requires_closed_typed_failure_reason() -> None:
                     "code": "unexpected_runtime",
                     "message": "上传执行失败，请检查运行日志后重试",
                     "retry_hint": None,
+                    "file_label": None,
                 },
             }
         )
@@ -182,6 +186,7 @@ def test_failed_pipeline_result_requires_closed_typed_failure_reason() -> None:
                 "code": "docling_converter_execution",
                 "message": "文件无法解析或已损坏，请检查文件后重试",
                 "retry_hint": "请确认文件可正常打开并重新上传",
+                "file_label": "report.pdf",
             },
         }
     )
@@ -244,7 +249,10 @@ def test_upload_failure_mapper_exhaustively_maps_docling_kinds(
         AssertionError: kind、code 或 public 文案映射漂移时抛出。
     """
 
-    reason = fins_upload_failure_from_exception(DoclingConversionError(kind, safe_message, None))
+    reason = fins_upload_failure_from_exception(
+        DoclingConversionError(kind, safe_message, None),
+        file_label="report.pdf",
+    )
 
     assert reason.kind is FinsUploadFailureKind.CONTENT
     assert reason.code is expected_code
@@ -259,6 +267,7 @@ def test_upload_failure_mapper_exhaustively_maps_docling_kinds(
             "code": "unexpected_runtime",
             "message": "上传执行失败，请检查运行日志后重试",
             "retry_hint": None,
+            "file_label": None,
             "unknown": "forbidden",
         },
         {
@@ -266,30 +275,35 @@ def test_upload_failure_mapper_exhaustively_maps_docling_kinds(
             "code": "unexpected_runtime",
             "message": "上传执行失败，请检查运行日志后重试",
             "retry_hint": None,
+            "file_label": None,
         },
         {
             "kind": "runtime",
             "code": "unknown",
             "message": "上传执行失败，请检查运行日志后重试",
             "retry_hint": None,
+            "file_label": None,
         },
         {
             "kind": "runtime",
             "code": "unexpected_runtime",
             "message": "workspace/private/report.pdf",
             "retry_hint": None,
+            "file_label": None,
         },
         {
             "kind": "runtime",
             "code": "unexpected_runtime",
             "message": "x\nsecret",
             "retry_hint": None,
+            "file_label": None,
         },
         {
             "kind": "runtime",
             "code": "unexpected_runtime",
             "message": "x" * 241,
             "retry_hint": None,
+            "file_label": None,
         },
     ),
 )
@@ -312,6 +326,241 @@ def test_failed_pipeline_result_rejects_unsafe_or_open_failure_json(
         FinsUploadPipelineResult.from_pipeline_json(
             {"status": "failed", "stored_file_count": 0, "failure": failure}
         )
+
+
+@pytest.mark.parametrize(
+    ("raw_basename", "expected_label"),
+    (
+        ("report.pdf", "report.pdf"),
+        ("job_id_notes.pdf", "输入文件（文件名已隐藏）"),
+        ("财报正文.pdf", "输入文件（文件名已隐藏）"),
+        ("line\nbreak.pdf", "输入文件（文件名已隐藏）"),
+        ("report\u202ename.pdf", "输入文件（文件名已隐藏）"),
+        (f"{'a' * 241}.pdf", "输入文件（文件名已隐藏）"),
+    ),
+)
+def test_public_file_label_owner_canonicalizes_unsafe_legal_basenames(
+    raw_basename: str,
+    expected_label: str,
+) -> None:
+    """唯一 label owner 应原样保留安全名称并隐藏无法安全公开的合法 basename。
+
+    Args:
+        raw_basename: producer 从 ``Path.name`` 取得的原始 basename。
+        expected_label: 唯一 owner 应返回的 canonical public label。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: canonical label 或 validator 接受集漂移时抛出。
+    """
+
+    canonical = canonicalize_fins_public_file_label(raw_basename)
+
+    assert canonical == expected_label
+    validate_fins_public_file_label(canonical)
+
+
+@pytest.mark.parametrize("pathful", ("folder/report.pdf", "folder\\report.pdf", ".", "..", ""))
+def test_public_file_label_owner_rejects_non_basename_input(pathful: str) -> None:
+    """canonicalizer 必须拒绝 pathful、空或 dot-segment 输入。
+
+    Args:
+        pathful: 非法 basename fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非 basename 输入未 fail closed 时抛出。
+    """
+
+    with pytest.raises(ValueError):
+        canonicalize_fins_public_file_label(pathful)
+
+
+@pytest.mark.parametrize(
+    "file_label",
+    (
+        "job_id_notes.pdf",
+        "财报正文.pdf",
+        "line\nbreak.pdf",
+        "report\u202ename.pdf",
+        f"{'a' * 241}.pdf",
+        "folder/report.pdf",
+    ),
+)
+def test_upload_failure_reason_constructor_owns_canonical_label_invariant(
+    file_label: str,
+) -> None:
+    """reason constructor 必须调用唯一 validator 并拒绝未 canonicalize label。
+
+    Args:
+        file_label: 绕过 producer 直接注入的非法 public label。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: reason constructor 接受非法 label 时抛出。
+    """
+
+    with pytest.raises(ValueError):
+        FinsUploadFailureReason(
+            kind=FinsUploadFailureKind.RUNTIME,
+            code=FinsUploadFailureCode.UNEXPECTED_RUNTIME,
+            message="上传执行失败，请检查运行日志后重试",
+            retry_hint=None,
+            file_label=file_label,
+        )
+
+
+@pytest.mark.parametrize("file_label", (None, "report.pdf", "输入文件（文件名已隐藏）"))
+def test_upload_failure_reason_constructor_accepts_only_canonical_labels(
+    file_label: str | None,
+) -> None:
+    """reason constructor 应接受 null、普通 canonical label 与固定隐藏标签。
+
+    Args:
+        file_label: 合法 canonical label 或 ``None``。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 合法 owner 值被拒绝时抛出。
+    """
+
+    reason = FinsUploadFailureReason(
+        kind=FinsUploadFailureKind.RUNTIME,
+        code=FinsUploadFailureCode.UNEXPECTED_RUNTIME,
+        message="上传执行失败，请检查运行日志后重试",
+        retry_hint=None,
+        file_label=file_label,
+    )
+
+    assert reason.file_label == file_label
+
+
+def test_upload_direct_details_consume_typed_failure_label_and_retry_hint() -> None:
+    """direct projection 只应消费 reason 中同一个 canonical label 与 retry hint。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: direct details 丢失或重分类 typed failure 字段时抛出。
+    """
+
+    reason = FinsUploadFailureReason(
+        kind=FinsUploadFailureKind.CONTENT,
+        code=FinsUploadFailureCode.EMPTY_INPUT_FILE,
+        message="文件为空，无法上传",
+        retry_hint="请提供非空文件后重试",
+        file_label="输入文件（文件名已隐藏）",
+    )
+    summary = FinsUploadResultSummary(
+        source_kind=SourceKind.FILING,
+        status="failed",
+        requested_file_count=1,
+        stored_file_count=0,
+        failure_reason=reason,
+    )
+
+    details = {
+        detail.label: detail.value
+        for detail in ingestion_runtime._upload_result_details(summary)
+    }
+
+    assert details["failure kind"] == "content"
+    assert details["failure code"] == "empty_input_file"
+    assert details["failure message"] == "文件为空，无法上传"
+    assert details["retry hint"] == "请提供非空文件后重试"
+    assert details["file"] == "输入文件（文件名已隐藏）"
+
+
+def test_upload_failure_parser_requires_five_fields_and_delegates_label_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """parser 只应 exact-read 五字段并把 label 原样交给 reason constructor。
+
+    Args:
+        monkeypatch: constructor 入口替换夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: parser 兼容旧 schema 或复制 label 规则时抛出。
+    """
+
+    old_shape: dict[str, JsonValue] = {
+        "kind": "runtime",
+        "code": "unexpected_runtime",
+        "message": "上传执行失败，请检查运行日志后重试",
+        "retry_hint": None,
+    }
+    with pytest.raises(ValueError, match="exact-key"):
+        upload_failure_reason_from_json(old_shape)
+
+    captured: list[tuple[FinsUploadFailureKind, FinsUploadFailureCode, str, str | None, str | None]] = []
+    sentinel = FinsUploadFailureReason(
+        kind=FinsUploadFailureKind.RUNTIME,
+        code=FinsUploadFailureCode.UNEXPECTED_RUNTIME,
+        message="上传执行失败，请检查运行日志后重试",
+        retry_hint=None,
+        file_label=None,
+    )
+
+    def capture_reason(
+        *,
+        kind: FinsUploadFailureKind,
+        code: FinsUploadFailureCode,
+        message: str,
+        retry_hint: str | None,
+        file_label: str | None,
+    ) -> FinsUploadFailureReason:
+        """记录 parser 传入 constructor 的 exact five-field 值。
+
+        Args:
+            kind: typed failure kind。
+            code: typed failure code。
+            message: public bounded message。
+            retry_hint: 可选重试建议。
+            file_label: parser 原样读取的可选 label。
+
+        Returns:
+            预先构造的合法 reason sentinel。
+
+        Raises:
+            无。
+        """
+
+        captured.append((kind, code, message, retry_hint, file_label))
+        return sentinel
+
+    monkeypatch.setattr("dayu.fins.upload_failure.FinsUploadFailureReason", capture_reason)
+    parsed = upload_failure_reason_from_json(
+        {
+            **old_shape,
+            "file_label": "job_id_notes.pdf",
+        }
+    )
+
+    assert parsed is sentinel
+    assert captured == [
+        (
+            FinsUploadFailureKind.RUNTIME,
+            FinsUploadFailureCode.UNEXPECTED_RUNTIME,
+            "上传执行失败，请检查运行日志后重试",
+            None,
+            "job_id_notes.pdf",
+        )
+    ]
 
 
 @pytest.mark.parametrize(
@@ -693,7 +942,40 @@ def _runtime_failure_for_status(status: str) -> FinsUploadFailureReason | None:
 
     if status != "failed":
         return None
-    return fins_upload_failure_from_exception(RuntimeError())
+    return fins_upload_failure_from_exception(RuntimeError(), file_label=None)
+
+
+def _pathful_basename_for_static_admission(file_path: Path) -> str:
+    """为不能创建反斜杠文件名的平台提供等价 ``Path.name`` owner fixture。
+
+    Args:
+        file_path: static validator 接收的占位路径。
+
+    Returns:
+        canonicalizer 必须拒绝的 pathful basename。
+
+    Raises:
+        无。
+    """
+
+    del file_path
+    return "a\\b.pdf"
+
+
+def _fail_if_static_admission_probes_path(file_path: Path) -> bool:
+    """证明 basename shape rejection 发生在任一 filesystem probe 前。
+
+    Args:
+        file_path: 不应被访问的文件路径。
+
+    Returns:
+        不返回。
+
+    Raises:
+        AssertionError: static validator 在 basename admission 前探测路径时始终抛出。
+    """
+
+    raise AssertionError(f"basename admission 前禁止探测文件系统：{file_path!s}")
 
 
 def test_fins_upload_usage_failure_mapping_is_closed_bounded_and_path_free() -> None:
@@ -726,6 +1008,7 @@ def test_fins_upload_usage_failure_mapping_is_closed_bounded_and_path_free() -> 
         "company_name_too_long",
         "too_many_ticker_aliases",
         "missing_files",
+        "invalid_file_basename",
         "file_not_found",
         "file_not_regular",
         "file_suffix_not_allowed",
@@ -741,6 +1024,7 @@ def test_fins_upload_usage_failure_mapping_is_closed_bounded_and_path_free() -> 
         FinsUploadUsageCode.MISSING_FISCAL_YEAR: "--fiscal-year 不能为空",
         FinsUploadUsageCode.MISSING_FISCAL_PERIOD: "--fiscal-period 不能为空",
         FinsUploadUsageCode.MISSING_FILES: "create/update 上传必须提供 --files",
+        FinsUploadUsageCode.INVALID_FILE_BASENAME: "上传文件名无效；请提供单个非空文件名",
         FinsUploadUsageCode.COMPANY_NAME_REQUIRED: "当前公司缺少有效元数据；create/update 必须提供 --company-name",
         FinsUploadUsageCode.INVALID_FISCAL_YEAR: "--fiscal-year 必须是非负整数",
         FinsUploadUsageCode.FISCAL_PERIOD_TOO_LONG: "--fiscal-period 长度不能超过 240 个字符",
@@ -791,6 +1075,90 @@ def test_fins_upload_usage_failure_mapping_is_closed_bounded_and_path_free() -> 
         ).message
         == "当前上传转换器不支持该文件后缀：report.doc"
     )
+
+
+def test_filing_static_admission_rejects_pathful_basename_before_filesystem_probes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """pathful basename 必须在任一文件探测或 workspace read 前 typed 拒绝。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: Windows 等平台的等价 basename 与 probe guard 夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: code/message、跨平台 owner contract 或校验顺序漂移时抛出。
+    """
+
+    raw_basename = "a\\b.pdf"
+    if os.name == "nt":
+        upload_file = tmp_path / "placeholder.pdf"
+        upload_file.write_bytes(b"filing")
+        monkeypatch.setattr(Path, "name", property(_pathful_basename_for_static_admission))
+    else:
+        upload_file = tmp_path / raw_basename
+        upload_file.write_bytes(b"filing")
+        assert upload_file.is_file()
+
+    monkeypatch.setattr(Path, "exists", _fail_if_static_admission_probes_path)
+    monkeypatch.setattr(Path, "is_file", _fail_if_static_admission_probes_path)
+    request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        files=(upload_file,),
+        fiscal_year=2024,
+        fiscal_period="FY",
+        company_name="Apple Inc.",
+    )
+
+    with pytest.raises(FinsUploadUsageError) as exc_info:
+        ingestion_runtime._filing_upload_request_identity(request)
+
+    failure = exc_info.value.failure
+    assert failure.code is FinsUploadUsageCode.INVALID_FILE_BASENAME
+    assert failure.message == "上传文件名无效；请提供单个非空文件名"
+    assert raw_basename not in failure.message
+    with pytest.raises(ValueError, match="非文件 usage failure 不接受 file_name"):
+        fins_upload_usage_failure(
+            FinsUploadUsageCode.INVALID_FILE_BASENAME,
+            file_name="report.pdf",
+        )
+
+
+@pytest.mark.parametrize(
+    ("raw_basename", "expected_label"),
+    (
+        ("report.pdf", "report.pdf"),
+        ("审计报告.pdf", "审计报告.pdf"),
+        ("job_id_notes.pdf", "输入文件（文件名已隐藏）"),
+        ("line\nbreak.pdf", "输入文件（文件名已隐藏）"),
+        ("report\u202ename.pdf", "输入文件（文件名已隐藏）"),
+        (f"{'a' * 241}.pdf", "输入文件（文件名已隐藏）"),
+    ),
+)
+def test_filing_static_admission_accepts_every_canonicalizable_basename(
+    raw_basename: str,
+    expected_label: str,
+) -> None:
+    """static admission 不得把应由 failure label owner 隐藏的合法 basename 拒绝。
+
+    Args:
+        raw_basename: 普通、Unicode、fragment、Cc/Cf 或合法超长 basename。
+        expected_label: 既有 failure label owner 必须保持的投影。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: static 接受集收紧或既有 failure label contract 漂移时抛出。
+    """
+
+    ingestion_runtime._admit_fins_upload_file_basename(raw_basename)
+
+    assert canonicalize_fins_public_file_label(raw_basename) == expected_label
 
 
 def test_validate_fins_upload_filing_request_resolves_state_aware_contract(
@@ -4956,6 +5324,115 @@ async def test_direct_upload_stream_omits_paths_job_ids_and_raw_payload_text(tmp
 
 
 @pytest.mark.asyncio
+async def test_direct_upload_typed_failure_projection_bypasses_string_classifiers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """direct upload 应机械消费 typed reason，不进入异常字符串分类或安全化分支。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: generic string classifier 禁用夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: typed reason 未直达 direct RESULT 时抛出。
+    """
+
+    def fail_classify(
+        exc: Exception,
+        *,
+        operation_kind: FinsOperationKind,
+    ) -> FinsErrorKind:
+        """若 typed upload 误入 generic classifier 则立即失败。
+
+        Args:
+            exc: 意外传入的异常。
+            operation_kind: 意外传入的 direct operation。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 始终抛出。
+        """
+
+        del exc, operation_kind
+        raise AssertionError("typed upload failure 禁止字符串分类")
+
+    def fail_safe_message(
+        exc: Exception,
+        *,
+        error_kind: FinsErrorKind,
+    ) -> str:
+        """若 typed upload 误入 generic message sanitizer 则立即失败。
+
+        Args:
+            exc: 意外传入的异常。
+            error_kind: 意外传入的 generic 分类。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 始终抛出。
+        """
+
+        del exc, error_kind
+        raise AssertionError("typed upload failure 禁止字符串安全化")
+
+    monkeypatch.setattr(ingestion_runtime, "_classify_direct_error", fail_classify)
+    monkeypatch.setattr(ingestion_runtime, "_safe_direct_error_message", fail_safe_message)
+    reason = FinsUploadFailureReason(
+        kind=FinsUploadFailureKind.CONTENT,
+        code=FinsUploadFailureCode.EMPTY_INPUT_FILE,
+        message="文件为空，无法上传",
+        retry_hint="请提供非空文件后重试",
+        file_label="输入文件（文件名已隐藏）",
+    )
+    runner = _FakeUploadRunner(
+        FinsUploadResultSummary(
+            source_kind=SourceKind.FILING,
+            status="failed",
+            requested_file_count=1,
+            stored_file_count=0,
+            failure_reason=reason,
+        )
+    )
+    ingestion = _build_ingestion_runtime(
+        tmp_path / "fins-workspace",
+        executor=_HoldingExecutor(),
+        upload_runner=runner,
+    )
+    upload_file = tmp_path / "private-job_id-notes.pdf"
+    upload_file.write_bytes(b"filing")
+
+    events = await _collect_direct_events(
+        ingestion.upload(
+            FinsUploadFilingRequest(
+                ticker="AAPL",
+                files=(upload_file,),
+                fiscal_year=2024,
+                fiscal_period="FY",
+                company_name="Apple Inc.",
+            )
+        )
+    )
+
+    result = events[-1].result
+    assert result is not None
+    assert result.status is FinsResultStatus.FAILURE
+    assert result.error_message == "文件为空，无法上传"
+    details = {detail.label: detail.value for detail in result.details}
+    assert details["failure code"] == "empty_input_file"
+    assert details["retry hint"] == "请提供非空文件后重试"
+    assert details["file"] == "输入文件（文件名已隐藏）"
+    assert upload_file.name not in repr(result)
+
+
+@pytest.mark.asyncio
 async def test_direct_upload_without_runner_reports_requested_and_zero_stored_counts(
     tmp_path: Path,
 ) -> None:
@@ -5006,7 +5483,7 @@ def test_start_upload_failed_status_emits_completed_with_failures_progress(tmp_p
             status="failed",
             requested_file_count=1,
             stored_file_count=0,
-            failure_reason=fins_upload_failure_from_exception(RuntimeError()),
+            failure_reason=fins_upload_failure_from_exception(RuntimeError(), file_label=None),
             primary_document=None,
             deleted=False,
             skip_reason="fixture failure",
@@ -5038,6 +5515,7 @@ def test_start_upload_failed_status_emits_completed_with_failures_progress(tmp_p
         "code": "unexpected_runtime",
         "message": "上传执行失败，请检查运行日志后重试",
         "retry_hint": None,
+        "file_label": None,
     }
     assert [event.source_event_type for event in progress_events] == [
         "upload.started",
@@ -5593,7 +6071,7 @@ def test_accepted_upload_terminal_store_rejects_mismatch_and_preserves_existing_
         status="failed",
         requested_file_count=0,
         stored_file_count=0,
-        failure_reason=fins_upload_failure_from_exception(RuntimeError()),
+        failure_reason=fins_upload_failure_from_exception(RuntimeError(), file_label=None),
     ).to_json_summary()
     finished_at = datetime.now(timezone.utc).isoformat()
 
@@ -5911,6 +6389,7 @@ def test_upload_status_owner_maps_only_exact_production_statuses(
             "code": "unexpected_runtime",
             "message": "上传执行失败，请检查运行日志后重试",
             "retry_hint": None,
+            "file_label": None,
         }
     pipeline_result = FinsUploadPipelineResult.from_pipeline_json(pipeline_json)
     summary = FinsUploadResultSummary(

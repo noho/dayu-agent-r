@@ -42,6 +42,8 @@ from dayu.fins.pipelines.docling_upload_service import (
 from dayu.fins.pipelines.docling_process_converter import (
     DoclingConversionCancelledError,
     DoclingConversionConfig,
+    DoclingConversionError,
+    DoclingConversionFailureKind,
     DoclingConversionResult,
 )
 from dayu.fins.storage import (
@@ -51,6 +53,11 @@ from dayu.fins.storage import (
     SourceIntegrityStatus,
 )
 from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
+from dayu.fins.upload_failure import (
+    FinsUploadFailureCode,
+    FinsUploadFailureError,
+    FinsUploadFailureKind,
+)
 
 from .upload_filing_test_support import published_tree_sha256
 
@@ -640,6 +647,69 @@ class _CancelledDoclingConverter:
         raise DoclingConversionCancelledError()
 
 
+class _SelectiveFailingDoclingConverter:
+    """按唯一文件名注入 typed Docling failure，并记录 fail-fast 顺序。"""
+
+    def __init__(
+        self,
+        *,
+        failing_name: str,
+        error: DoclingConversionError,
+        calls: list[str],
+    ) -> None:
+        """初始化逐文件 failure converter。
+
+        Args:
+            failing_name: 应抛出异常的 basename。
+            error: 需要保留为 ``__cause__`` 的 typed Docling 异常。
+            calls: 转换调用顺序记录。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self._failing_name = failing_name
+        self._error = error
+        self._calls = calls
+
+    async def convert_to_json_bytes(
+        self,
+        input_bytes: bytes,
+        stream_name: str,
+        *,
+        config: DoclingConversionConfig,
+        cancellation: CancellationToken | None,
+    ) -> DoclingConversionResult:
+        """记录调用，在目标文件抛错，其余文件返回合法结果。
+
+        Args:
+            input_bytes: 原始文件字节。
+            stream_name: 当前 basename。
+            config: closed conversion config。
+            cancellation: canonical cancellation token。
+
+        Returns:
+            非目标文件的合法 Docling JSON 结果。
+
+        Raises:
+            DoclingConversionError: 当前文件命中 failure fixture 时抛出。
+        """
+
+        del input_bytes, config, cancellation
+        self._calls.append(stream_name)
+        if stream_name == self._failing_name:
+            raise self._error
+        data = ('{"name": "' + stream_name + '"}').encode()
+        return DoclingConversionResult(
+            json_bytes=data,
+            size=len(data),
+            sha256=hashlib.sha256(data).hexdigest(),
+        )
+
+
 def _publish_prepared_upload(
     *,
     service: DoclingUploadService,
@@ -772,6 +842,201 @@ def _build_service_context(tmp_path: Path) -> _UploadServiceContext:
         blob_repository=blob_repository,
         service=service,
     )
+
+
+def _prepare_filing_for_admission_test(
+    *,
+    service: DoclingUploadService,
+    files: list[Path],
+) -> PreparedDoclingUpload:
+    """调用 filing prepare owner，不进入 publication batch。
+
+    Args:
+        service: 使用目标 converter 的上传服务。
+        files: 按用户请求顺序排列的 filing 文件。
+
+    Returns:
+        prepare 成功时返回 typed publication plan。
+
+    Raises:
+        FinsUploadFailureError: empty/corrupt filing 被内容 admission 拒绝时抛出。
+        OSError: 文件读取失败时抛出。
+        ValueError: 测试输入不符合 upload contract 时抛出。
+    """
+
+    return asyncio.run(
+        service.prepare_upload(
+            ticker="AAPL",
+            source_kind=SourceKind.FILING,
+            action="create",
+            document_id="filing_admission",
+            internal_document_id="filing_admission",
+            form_type="Q1",
+            files=files,
+            overwrite=False,
+            previous_meta=None,
+            meta={"ingest_method": "upload"},
+            cancellation=None,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("file_name", "expected_label"),
+    (
+        ("empty.pdf", "empty.pdf"),
+        ("empty.docx", "empty.docx"),
+        ("job_id_notes.pdf", "输入文件（文件名已隐藏）"),
+        ("财报正文.pdf", "输入文件（文件名已隐藏）"),
+        ("line\nbreak.pdf", "输入文件（文件名已隐藏）"),
+        ("report\u202ename.pdf", "输入文件（文件名已隐藏）"),
+        (f"{'a' * 241}.pdf", "输入文件（文件名已隐藏）"),
+    ),
+)
+def test_empty_filing_is_rejected_before_converter_and_publication(
+    tmp_path: Path,
+    file_name: str,
+    expected_label: str,
+) -> None:
+    """zero-byte filing 必须在 converter 与 publication 之前形成 typed failure。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        file_name: 覆盖普通与无法原样公开的合法 basename。
+        expected_label: reason 应携带的 canonical public label。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: empty contract、调用顺序或 published tree 漂移时抛出。
+    """
+
+    calls: list[str] = []
+    context = _build_service_context(tmp_path)
+    context.service._docling_converter = _FakeDoclingConverter(calls)
+    empty_file = tmp_path / file_name
+    empty_file.write_bytes(b"")
+
+    with pytest.raises(FinsUploadFailureError) as exc_info:
+        _prepare_filing_for_admission_test(service=context.service, files=[empty_file])
+
+    failure = exc_info.value.failure
+    assert failure.kind is FinsUploadFailureKind.CONTENT
+    assert failure.code is FinsUploadFailureCode.EMPTY_INPUT_FILE
+    assert failure.message == "文件为空，无法上传"
+    assert failure.retry_hint == "请提供非空文件后重试"
+    assert failure.file_label == expected_label
+    assert calls == []
+    assert published_tree_sha256(tmp_path, "AAPL") == {}
+
+
+@pytest.mark.parametrize(
+    ("suffix", "kind", "safe_message"),
+    (
+        (".pdf", DoclingConversionFailureKind.CONVERTER_CONSTRUCTION, "Docling converter construction failed"),
+        (".docx", DoclingConversionFailureKind.CONVERTER_EXECUTION, "Docling conversion execution failed"),
+        (".pdf", DoclingConversionFailureKind.RESULT_SERIALIZATION, "Docling conversion result serialization failed"),
+        (".docx", DoclingConversionFailureKind.IPC_PROTOCOL, "Docling conversion IPC protocol failed"),
+        (".pdf", DoclingConversionFailureKind.CHILD_CRASH, "Docling conversion child crashed"),
+        (".docx", DoclingConversionFailureKind.CLEANUP, "Docling conversion cleanup failed"),
+    ),
+)
+def test_corrupt_filing_wraps_each_closed_docling_failure_with_label_and_cause(
+    tmp_path: Path,
+    suffix: str,
+    kind: DoclingConversionFailureKind,
+    safe_message: str,
+) -> None:
+    """逐文件 conversion owner 必须稳定映射 code、label 并保留原 cause。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        suffix: PDF/DOCX 代表性后缀。
+        kind: Docling closed failure kind。
+        safe_message: converter owner 对该 kind 的固定文案。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: typed projection、cause 或 publication 边界漂移时抛出。
+    """
+
+    context = _build_service_context(tmp_path)
+    filing_file = tmp_path / f"corrupt{suffix}"
+    filing_file.write_bytes(b"corrupt input")
+    cause = DoclingConversionError(kind, safe_message, 17)
+    calls: list[str] = []
+    context.service._docling_converter = _SelectiveFailingDoclingConverter(
+        failing_name=filing_file.name,
+        error=cause,
+        calls=calls,
+    )
+
+    with pytest.raises(FinsUploadFailureError) as exc_info:
+        _prepare_filing_for_admission_test(service=context.service, files=[filing_file])
+
+    failure = exc_info.value.failure
+    assert failure.kind is FinsUploadFailureKind.CONTENT
+    assert failure.file_label == filing_file.name
+    assert failure.message == "文件无法解析或已损坏，请检查文件后重试"
+    assert safe_message not in str(failure)
+    assert str(filing_file) not in str(failure)
+    assert exc_info.value.__cause__ is cause
+    assert calls == [filing_file.name]
+    assert published_tree_sha256(tmp_path, "AAPL") == {}
+
+
+@pytest.mark.parametrize(
+    ("names", "failing_name", "expected_calls"),
+    (
+        (("bad.pdf", "later.docx"), "bad.pdf", ("bad.pdf",)),
+        (("valid.pdf", "bad.docx", "later.pdf"), "bad.docx", ("valid.pdf", "bad.docx")),
+    ),
+)
+def test_corrupt_mixed_filing_fails_fast_without_publication(
+    tmp_path: Path,
+    names: tuple[str, ...],
+    failing_name: str,
+    expected_calls: tuple[str, ...],
+) -> None:
+    """mixed filing 必须在首个损坏文件 fail-fast 且不产生 partial publication。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        names: 用户输入顺序。
+        failing_name: 首个损坏文件 basename。
+        expected_calls: 截止首个损坏文件的 converter 调用顺序。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: fail-fast 或 zero-publication 不变量漂移时抛出。
+    """
+
+    context = _build_service_context(tmp_path)
+    files = [tmp_path / name for name in names]
+    for file_path in files:
+        file_path.write_bytes(b"filing input")
+    cause = DoclingConversionError(
+        DoclingConversionFailureKind.CONVERTER_EXECUTION,
+        "Docling conversion execution failed",
+        None,
+    )
+    calls: list[str] = []
+    context.service._docling_converter = _SelectiveFailingDoclingConverter(
+        failing_name=failing_name,
+        error=cause,
+        calls=calls,
+    )
+
+    with pytest.raises(FinsUploadFailureError):
+        _prepare_filing_for_admission_test(service=context.service, files=files)
+
+    assert calls == list(expected_calls)
+    assert published_tree_sha256(tmp_path, "AAPL") == {}
 
 
 def test_execute_upload_create_material_success(tmp_path: Path) -> None:

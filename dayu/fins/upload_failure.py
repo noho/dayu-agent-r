@@ -8,13 +8,16 @@ from enum import Enum
 from typing import Final
 
 from dayu.contracts.json_value import JsonValue
+from dayu.fins.direct_events import validate_fins_public_file_label
 from dayu.fins.pipelines.docling_process_converter import (
     DoclingConversionError,
     DoclingConversionFailureKind,
 )
 
 _MAX_FAILURE_TEXT_CHARS: Final[int] = 240
-_FAILURE_KEYS: Final[frozenset[str]] = frozenset({"kind", "code", "message", "retry_hint"})
+_FAILURE_KEYS: Final[frozenset[str]] = frozenset(
+    {"kind", "code", "message", "retry_hint", "file_label"}
+)
 
 
 class FinsUploadFailureKind(str, Enum):
@@ -34,6 +37,7 @@ class FinsUploadFailureCode(str, Enum):
     DOCLING_IPC_PROTOCOL = "docling_ipc_protocol"
     DOCLING_CHILD_CRASH = "docling_child_crash"
     DOCLING_CLEANUP = "docling_cleanup"
+    EMPTY_INPUT_FILE = "empty_input_file"
     STORAGE_IO = "storage_io"
     UNEXPECTED_RUNTIME = "unexpected_runtime"
 
@@ -69,12 +73,14 @@ class FinsUploadFailureReason:
         code: closed failure code。
         message: 不含路径或异常 repr 的安全文案。
         retry_hint: 可选安全重试建议。
+        file_label: 可选且已 canonicalize 的 public basename 标签。
     """
 
     kind: FinsUploadFailureKind
     code: FinsUploadFailureCode
     message: str
     retry_hint: str | None
+    file_label: str | None
 
     def __post_init__(self) -> None:
         """校验 failure reason 的长度与 path-free 边界。
@@ -86,12 +92,14 @@ class FinsUploadFailureReason:
             无。
 
         Raises:
-            ValueError: 文本为空、超长、含控制字符或路径分隔符时抛出。
+            ValueError: 文本或 file label 不符合 public contract 时抛出。
         """
 
         _validate_failure_reason_text(self.message, "failure.message")
         if self.retry_hint is not None:
             _validate_failure_reason_text(self.retry_hint, "failure.retry_hint")
+        if self.file_label is not None:
+            validate_fins_public_file_label(self.file_label)
 
     def to_json(self) -> dict[str, JsonValue]:
         """投影为 pipeline/runtime 共用 JSON object。
@@ -111,7 +119,30 @@ class FinsUploadFailureReason:
             "code": self.code.value,
             "message": self.message,
             "retry_hint": self.retry_hint,
+            "file_label": self.file_label,
         }
+
+
+class FinsUploadFailureError(RuntimeError):
+    """携带唯一 owner 已校验 failure reason 的 typed 上传异常。"""
+
+    failure: FinsUploadFailureReason
+
+    def __init__(self, failure: FinsUploadFailureReason) -> None:
+        """初始化 typed upload failure。
+
+        Args:
+            failure: 已由 upload failure owner 构造并校验的 public reason。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.failure = failure
+        super().__init__(failure.message)
 
 
 _DOCLING_FAILURE_CODES: Final[Mapping[DoclingConversionFailureKind, FinsUploadFailureCode]] = {
@@ -122,20 +153,27 @@ _DOCLING_FAILURE_CODES: Final[Mapping[DoclingConversionFailureKind, FinsUploadFa
     DoclingConversionFailureKind.CHILD_CRASH: FinsUploadFailureCode.DOCLING_CHILD_CRASH,
     DoclingConversionFailureKind.CLEANUP: FinsUploadFailureCode.DOCLING_CLEANUP,
 }
-_CONTENT_FAILURE_CODES: Final[frozenset[FinsUploadFailureCode]] = frozenset(_DOCLING_FAILURE_CODES.values())
+_CONTENT_FAILURE_CODES: Final[frozenset[FinsUploadFailureCode]] = frozenset(
+    (*_DOCLING_FAILURE_CODES.values(), FinsUploadFailureCode.EMPTY_INPUT_FILE)
+)
 
 
-def fins_upload_failure_from_exception(error: Exception) -> FinsUploadFailureReason:
+def fins_upload_failure_from_exception(
+    error: Exception,
+    *,
+    file_label: str | None,
+) -> FinsUploadFailureReason:
     """按 typed exception 类别产生安全 public failure reason。
 
     Args:
         error: workflow 捕获的原始异常，仅用于类型分类。
+        file_label: 当前 original 的 canonical public label；无法归属文件时为 ``None``。
 
     Returns:
         不包含原始异常文本的 closed failure reason。
 
     Raises:
-        无。
+        ValueError: ``file_label`` 未经过唯一 canonicalizer 时抛出。
     """
 
     if isinstance(error, DoclingConversionError):
@@ -144,6 +182,7 @@ def fins_upload_failure_from_exception(error: Exception) -> FinsUploadFailureRea
             code=_DOCLING_FAILURE_CODES[error.kind],
             message="文件无法解析或已损坏，请检查文件后重试",
             retry_hint="请确认文件可正常打开并重新上传",
+            file_label=file_label,
         )
     if isinstance(error, OSError):
         return FinsUploadFailureReason(
@@ -151,12 +190,36 @@ def fins_upload_failure_from_exception(error: Exception) -> FinsUploadFailureRea
             code=FinsUploadFailureCode.STORAGE_IO,
             message="上传产物读写失败，请稍后重试",
             retry_hint="若持续失败，请检查工作区存储状态",
+            file_label=file_label,
         )
     return FinsUploadFailureReason(
         kind=FinsUploadFailureKind.RUNTIME,
         code=FinsUploadFailureCode.UNEXPECTED_RUNTIME,
         message="上传执行失败，请检查运行日志后重试",
         retry_hint=None,
+        file_label=file_label,
+    )
+
+
+def fins_upload_empty_input_failure(file_label: str) -> FinsUploadFailureReason:
+    """构造 filing 空文件的 closed bounded public reason。
+
+    Args:
+        file_label: 当前 original 的 canonical public file label。
+
+    Returns:
+        固定 content kind/code/message/retry hint 的 failure reason。
+
+    Raises:
+        ValueError: ``file_label`` 未经过唯一 canonicalizer 时抛出。
+    """
+
+    return FinsUploadFailureReason(
+        kind=FinsUploadFailureKind.CONTENT,
+        code=FinsUploadFailureCode.EMPTY_INPUT_FILE,
+        message="文件为空，无法上传",
+        retry_hint="请提供非空文件后重试",
+        file_label=file_label,
     )
 
 
@@ -178,6 +241,7 @@ def fins_upload_prevalidation_io_failure() -> FinsUploadFailureReason:
         code=FinsUploadFailureCode.STORAGE_IO,
         message="上传状态读取失败，请检查工作区存储状态",
         retry_hint="修复工作区存储后重试",
+        file_label=None,
     )
 
 
@@ -199,6 +263,7 @@ def fins_upload_prevalidation_corruption_failure() -> FinsUploadFailureReason:
         code=FinsUploadFailureCode.STORAGE_IO,
         message="上传状态已损坏，请检查工作区存储状态",
         retry_hint="修复工作区存储后重试",
+        file_label=None,
     )
 
 
@@ -223,6 +288,7 @@ def upload_failure_reason_from_json(value: JsonValue | None) -> FinsUploadFailur
     code = FinsUploadFailureCode(_required_failure_text(value, "code"))
     message = _required_failure_text(value, "message")
     retry_hint = _optional_failure_text(value, "retry_hint")
+    file_label = _optional_failure_text(value, "file_label")
     expected_kind = (
         FinsUploadFailureKind.CONTENT
         if code in _CONTENT_FAILURE_CODES
@@ -232,7 +298,13 @@ def upload_failure_reason_from_json(value: JsonValue | None) -> FinsUploadFailur
     )
     if kind is not expected_kind:
         raise ValueError("upload failure kind 与 code 不一致")
-    return FinsUploadFailureReason(kind=kind, code=code, message=message, retry_hint=retry_hint)
+    return FinsUploadFailureReason(
+        kind=kind,
+        code=code,
+        message=message,
+        retry_hint=retry_hint,
+        file_label=file_label,
+    )
 
 
 def _required_failure_text(value: Mapping[str, JsonValue], key: str) -> str:

@@ -51,7 +51,11 @@ from dayu.fins.storage import (
     SourceDocumentRepositoryProtocol,
 )
 from dayu.fins.ticker_normalization import normalize_ticker
-from dayu.fins.upload_failure import FinsUploadFailureReason, fins_upload_failure_from_exception
+from dayu.fins.upload_failure import (
+    FinsUploadFailureError,
+    FinsUploadFailureReason,
+    fins_upload_failure_from_exception,
+)
 
 JsonObject: TypeAlias = dict[str, JsonValue]
 _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
@@ -283,9 +287,17 @@ async def run_upload_filing_stream(
             document_id=document_id,
             payload={"result": result},
         )
+    except FinsUploadFailureError as exc:
+        _LOGGER.exception("SEC filing upload typed content admission failed")
+        yield _build_sec_filing_failure_event(
+            host=host,
+            request=authoritative_request,
+            requested_action=requested_action,
+            failure_reason=exc.failure,
+        )
     except DoclingConversionError as exc:
         _LOGGER.exception("SEC filing upload Docling conversion failed")
-        failure_reason = fins_upload_failure_from_exception(exc)
+        failure_reason = fins_upload_failure_from_exception(exc, file_label=None)
         yield _build_sec_filing_failure_event(
             host=host,
             request=authoritative_request,
@@ -294,7 +306,7 @@ async def run_upload_filing_stream(
         )
     except OSError as exc:
         _LOGGER.exception("SEC filing upload storage operation failed")
-        failure_reason = fins_upload_failure_from_exception(exc)
+        failure_reason = fins_upload_failure_from_exception(exc, file_label=None)
         yield _build_sec_filing_failure_event(
             host=host,
             request=authoritative_request,
@@ -303,7 +315,7 @@ async def run_upload_filing_stream(
         )
     except Exception as exc:
         _LOGGER.exception("SEC filing upload runtime operation failed")
-        failure_reason = fins_upload_failure_from_exception(exc)
+        failure_reason = fins_upload_failure_from_exception(exc, file_label=None)
         yield _build_sec_filing_failure_event(
             host=host,
             request=authoritative_request,

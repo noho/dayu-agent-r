@@ -33,6 +33,8 @@ from dayu.fins.pipelines.cn_pipeline import CnPipeline, collect_cn_download_resu
 from dayu.fins.pipelines.docling_process_converter import (
     DoclingConversionCancelledError,
     DoclingConversionConfig,
+    DoclingConversionError,
+    DoclingConversionFailureKind,
     DoclingConversionResult,
 )
 from dayu.fins.pipelines.download_events import DownloadEventType
@@ -437,11 +439,19 @@ class _PipelineDownloadFakeConversionRunner:
 class _FailingCnUploadConverter:
     """CN/HK filing failure classification 测试 converter。"""
 
-    def __init__(self, error: Exception) -> None:
+    def __init__(
+        self,
+        error: Exception,
+        *,
+        failing_name: str | None = None,
+        calls: list[str] | None = None,
+    ) -> None:
         """初始化 failure converter。
 
         Args:
             error: conversion 调用应抛出的异常。
+            failing_name: 仅该 basename 抛错；``None`` 表示每次都抛错。
+            calls: 可选 converter 调用顺序记录。
 
         Returns:
             无。
@@ -451,6 +461,8 @@ class _FailingCnUploadConverter:
         """
 
         self.error = error
+        self._failing_name = failing_name
+        self._calls = calls
 
     async def convert_to_json_bytes(
         self,
@@ -475,8 +487,13 @@ class _FailingCnUploadConverter:
             Exception: 始终抛出构造时传入的异常。
         """
 
-        del input_bytes, stream_name, config, cancellation
-        raise self.error
+        del input_bytes, config, cancellation
+        if self._calls is not None:
+            self._calls.append(stream_name)
+        if self._failing_name is None or stream_name == self._failing_name:
+            raise self.error
+        data = ('{"name": "' + stream_name + '"}').encode()
+        return DoclingConversionResult(data, len(data), hashlib.sha256(data).hexdigest())
 
 
 def _seed_cn_upload_company_meta(
@@ -1327,6 +1344,104 @@ async def test_upload_filing_storage_and_generic_failures_use_distinct_typed_cat
     assert operator_marker in caplog.text
     assert str(error) in caplog.text
     assert str(error) not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_upload_filing_valid_and_corrupt_mixed_batch_fails_atomically(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CN/HK valid+corrupt mixed filing 必须在首个损坏文件整批 typed fail。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        caplog: operator log 捕获夹具。
+        monkeypatch: workflow generic mapper 禁用夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: fail-fast、typed label 或 zero-publication 原子性漂移时抛出。
+    """
+
+    pipeline, batching, company, source = _tracking_cn_pipeline(tmp_path)
+
+    def reject_workflow_reclassification(
+        error: Exception,
+        *,
+        file_label: str | None,
+    ) -> None:
+        """若 typed exception 被 CN/HK workflow 重分类则立即失败。
+
+        Args:
+            error: 意外进入 generic mapper 的异常。
+            file_label: 意外进入 generic mapper 的 label。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 始终抛出。
+        """
+
+        del error, file_label
+        raise AssertionError("typed filing failure 禁止 workflow 字符串重分类")
+
+    monkeypatch.setattr(
+        cn_pipeline_module,
+        "fins_upload_failure_from_exception",
+        reject_workflow_reclassification,
+    )
+    valid_file = tmp_path / "valid.pdf"
+    corrupt_file = tmp_path / "corrupt.docx"
+    later_file = tmp_path / "later.pdf"
+    for file_path in (valid_file, corrupt_file, later_file):
+        file_path.write_bytes(b"filing input")
+    calls: list[str] = []
+    cause = DoclingConversionError(
+        DoclingConversionFailureKind.CONVERTER_EXECUTION,
+        "Docling conversion execution failed",
+        29,
+    )
+    pipeline._upload_service._docling_converter = _FailingCnUploadConverter(
+        cause,
+        failing_name=corrupt_file.name,
+        calls=calls,
+    )
+    first_request = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=valid_file,
+        action="create",
+        company_name="贵州茅台",
+    )
+    request = replace(
+        first_request,
+        request=replace(first_request.request, files=(valid_file, corrupt_file, later_file)),
+    )
+
+    with caplog.at_level("ERROR"):
+        events = [event async for event in pipeline.upload_filing_stream(request)]
+
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    failure = result["failure"]
+    assert isinstance(failure, dict)
+    assert result["stored_file_count"] == 0
+    assert failure["kind"] == "content"
+    assert failure["code"] == "docling_converter_execution"
+    assert failure["file_label"] == "corrupt.docx"
+    assert calls == ["valid.pdf", "corrupt.docx"]
+    assert "typed content admission failed" in caplog.text
+    assert str(cause) in caplog.text
+    assert str(cause) not in str(result)
+    assert batching.begin_tokens == []
+    assert batching.commit_tokens == []
+    assert batching.rollback_tokens == []
+    assert company.stage_tokens == []
+    assert source.stage_tokens == []
+    assert published_tree_sha256(tmp_path, "600519") == {}
 
 
 @pytest.mark.asyncio

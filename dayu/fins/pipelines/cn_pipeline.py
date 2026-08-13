@@ -100,7 +100,11 @@ from dayu.fins.storage import (
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
 from dayu.fins.ticker_normalization import normalize_ticker, try_normalize_ticker
-from dayu.fins.upload_failure import FinsUploadFailureReason, fins_upload_failure_from_exception
+from dayu.fins.upload_failure import (
+    FinsUploadFailureError,
+    FinsUploadFailureReason,
+    fins_upload_failure_from_exception,
+)
 
 CN_DOWNLOAD_SOURCE: Final[str] = "cninfo"
 HK_DOWNLOAD_SOURCE: Final[str] = "hkexnews"
@@ -903,9 +907,17 @@ class CnPipeline:
                 document_id=document_id,
                 payload={"result": final_result},
             )
+        except FinsUploadFailureError as exc:
+            _LOGGER.exception("CN/HK filing upload typed content admission failed")
+            yield _build_cn_filing_failure_event(
+                pipeline=self,
+                request=authoritative_request,
+                requested_action=requested_action,
+                failure_reason=exc.failure,
+            )
         except DoclingConversionError as exc:
             _LOGGER.exception("CN/HK filing upload Docling conversion failed")
-            failure_reason = fins_upload_failure_from_exception(exc)
+            failure_reason = fins_upload_failure_from_exception(exc, file_label=None)
             yield _build_cn_filing_failure_event(
                 pipeline=self,
                 request=authoritative_request,
@@ -914,7 +926,7 @@ class CnPipeline:
             )
         except OSError as exc:
             _LOGGER.exception("CN/HK filing upload storage operation failed")
-            failure_reason = fins_upload_failure_from_exception(exc)
+            failure_reason = fins_upload_failure_from_exception(exc, file_label=None)
             yield _build_cn_filing_failure_event(
                 pipeline=self,
                 request=authoritative_request,
@@ -923,7 +935,7 @@ class CnPipeline:
             )
         except Exception as exc:
             _LOGGER.exception("CN/HK filing upload runtime operation failed")
-            failure_reason = fins_upload_failure_from_exception(exc)
+            failure_reason = fins_upload_failure_from_exception(exc, file_label=None)
             yield _build_cn_filing_failure_event(
                 pipeline=self,
                 request=authoritative_request,

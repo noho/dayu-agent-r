@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import mimetypes
 import sys
 from collections.abc import Mapping
@@ -21,6 +22,7 @@ from enum import Enum
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.fins._log import Log
+from dayu.fins.direct_events import canonicalize_fins_public_file_label
 from dayu.fins.domain.document_models import (
     BatchToken,
     FinsSourceProvider,
@@ -34,6 +36,7 @@ from dayu.fins.domain.enums import SourceKind
 from dayu.fins.pipelines.docling_process_converter import (
     DEFAULT_FINS_DOCLING_CONVERSION_CONFIG,
     DoclingConversionCancelledError,
+    DoclingConversionError,
     DoclingConverter,
 )
 from dayu.fins.storage import (
@@ -43,6 +46,11 @@ from dayu.fins.storage import (
     require_source_meta_is_deleted,
 )
 from dayu.fins.ticker_normalization import try_normalize_ticker
+from dayu.fins.upload_failure import (
+    FinsUploadFailureError,
+    fins_upload_empty_input_failure,
+    fins_upload_failure_from_exception,
+)
 
 JsonObject: TypeAlias = dict[str, JsonValue]
 
@@ -66,6 +74,7 @@ DOCLING_FILE_SUFFIX: Final[str] = "_docling.json"
 _AssetSource: TypeAlias = Literal["original", "docling"]
 _ASSET_SOURCE_ORIGINAL: Final[_AssetSource] = "original"
 _ASSET_SOURCE_DOCLING: Final[_AssetSource] = "docling"
+_LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
 UploadFileEventType = Literal[
     "conversion_started",
@@ -267,6 +276,7 @@ class DoclingUploadService:
             ValueError: 参数非法，或既有 source meta 的 ``is_deleted`` 非布尔值时抛出。
             FileNotFoundError: 需要的文件或文档不存在时抛出。
             FileExistsError: create 目标已存在且不可覆盖时抛出。
+            FinsUploadFailureError: filing 为空或无法转换时抛出 typed content failure。
             RuntimeError: 上传失败时抛出。
             OSError: 仓储读写失败时抛出。
         """
@@ -306,7 +316,10 @@ class DoclingUploadService:
         if _is_cancelled(cancellation):
             return _build_cancelled_result(document_id=document_id, internal_document_id=internal_document_id)
 
-        original_assets = self._build_original_assets(validated_files)
+        original_assets = self._build_original_assets(
+            validated_files,
+            source_kind=source_kind,
+        )
         source_fingerprint = _build_upload_source_fingerprint(original_assets)
         if _can_skip_upload(normalized_previous_meta, source_fingerprint, overwrite):
             Log.info(
@@ -331,6 +344,7 @@ class DoclingUploadService:
             pending_assets, conversion_events = await self._build_pending_assets(
                 validated_files,
                 original_assets,
+                source_kind=source_kind,
                 cancellation=cancellation,
             )
         except DoclingConversionCancelledError:
@@ -664,23 +678,40 @@ class DoclingUploadService:
             batch=batch,
         )
 
-    def _build_original_assets(self, files: list[Path]) -> list[_PendingFileAsset]:
+    def _build_original_assets(
+        self,
+        files: list[Path],
+        *,
+        source_kind: SourceKind,
+    ) -> list[_PendingFileAsset]:
         """构建原始上传文件资产列表。
 
         Args:
             files: 源文件列表。
+            source_kind: filing 或 material 文档类型。
 
         Returns:
             仅包含原始上传文件的资产列表。
 
         Raises:
             FileNotFoundError: 源文件不存在时抛出。
+            FinsUploadFailureError: filing 文件为空时抛出。
             OSError: 源文件读取失败时抛出。
         """
 
         assets: list[_PendingFileAsset] = []
         for file_path in files:
             raw_data = file_path.read_bytes()
+            if source_kind is SourceKind.FILING and raw_data == b"":
+                raw_basename = file_path.name
+                _LOGGER.error(
+                    "Filing upload empty input rejected before publication; raw_basename=%r",
+                    raw_basename,
+                )
+                file_label = canonicalize_fins_public_file_label(raw_basename)
+                raise FinsUploadFailureError(
+                    fins_upload_empty_input_failure(file_label)
+                )
             raw_sha256 = hashlib.sha256(raw_data).hexdigest()
             raw_content_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
             assets.append(
@@ -700,6 +731,7 @@ class DoclingUploadService:
         files: list[Path],
         original_assets: list[_PendingFileAsset],
         *,
+        source_kind: SourceKind,
         cancellation: CancellationToken | None,
     ) -> tuple[list[_PendingFileAsset], list[UploadFileEventPayload]]:
         """构建待上传资产列表与转换阶段事件。
@@ -707,13 +739,15 @@ class DoclingUploadService:
         Args:
             files: 源文件列表。
             original_assets: 已读取完成的原始文件资产列表。
+            source_kind: filing 或 material 文档类型。
             cancellation: 公共取消观察 token；``None`` 表示无取消源。
 
         Returns:
             待上传资产列表与转换阶段事件列表。
 
         Raises:
-            RuntimeError: Docling 转换失败时抛出。
+            FinsUploadFailureError: filing Docling 转换失败时抛出。
+            RuntimeError: material Docling 转换失败时抛出。
             ValueError: ``files`` 与 ``original_assets`` 长度不一致时抛出。
         """
 
@@ -735,12 +769,27 @@ class DoclingUploadService:
                     },
                 )
             )
-            conversion = await self._docling_converter.convert_to_json_bytes(
-                original_asset.data,
-                file_path.name,
-                config=DEFAULT_FINS_DOCLING_CONVERSION_CONFIG,
-                cancellation=cancellation,
-            )
+            try:
+                conversion = await self._docling_converter.convert_to_json_bytes(
+                    original_asset.data,
+                    file_path.name,
+                    config=DEFAULT_FINS_DOCLING_CONVERSION_CONFIG,
+                    cancellation=cancellation,
+                )
+            except DoclingConversionError as exc:
+                if source_kind is not SourceKind.FILING:
+                    raise
+                raw_basename = file_path.name
+                _LOGGER.exception(
+                    "Filing upload conversion rejected before publication; raw_basename=%r",
+                    raw_basename,
+                )
+                file_label = canonicalize_fins_public_file_label(raw_basename)
+                failure = fins_upload_failure_from_exception(
+                    exc,
+                    file_label=file_label,
+                )
+                raise FinsUploadFailureError(failure) from exc
             docling_data = conversion.json_bytes
             docling_name = f"{file_path.stem}{DOCLING_FILE_SUFFIX}"
             docling_sha256 = conversion.sha256
