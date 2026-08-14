@@ -27,6 +27,7 @@ from dayu.cli.exit_codes import (
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.resolver import FmpCompanyInfo, FmpCompanyInfoResolver
 from dayu.fins.storage import FsCompanyMetaRepository, FsSourceDocumentRepository
+from dayu.fins.ticker_normalization import build_company_ticker_identity
 from dayu.fins.upload_batch import (
     UploadBatchPlan,
     UploadBatchPlanRequest,
@@ -129,9 +130,11 @@ class _FakeFmpResolver:
 
         self.calls.append(canonical_ticker)
         return FmpCompanyInfo(
-            canonical_ticker=canonical_ticker,
+            ticker_identity=build_company_ticker_identity(
+                canonical_ticker,
+                ("MSFT",),
+            ),
             company_name="Apple Inc.",
-            ticker_aliases=(canonical_ticker, "MSFT"),
         )
 
 
@@ -952,7 +955,7 @@ def test_windows_generated_script_runs_real_cli_into_temp_storage(tmp_path: Path
 
     assert execution.returncode == 0, execution.stderr
     company_meta = FsCompanyMetaRepository(storage).get_company_meta("AAPL")
-    assert company_meta.ticker == "AAPL"
+    assert company_meta.ticker_identity.canonical_ticker == "AAPL"
     assert company_meta.company_name == _WINDOWS_REAL_SMOKE_COMPANY_NAME
     source_repository = FsSourceDocumentRepository(storage)
     document_ids = source_repository.list_source_document_ids(

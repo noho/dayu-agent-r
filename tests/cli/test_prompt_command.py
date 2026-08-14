@@ -103,6 +103,7 @@ from dayu.service.entrypoint_runtime import (
     EntrypointThinking,
 )
 from dayu.fins.resolver import FmpCompanyInfo
+from dayu.fins.ticker_normalization import build_company_ticker_identity
 
 _REMOVED_PROMPT_DEBUG_OPTIONS: tuple[tuple[str, ...], ...] = (
     ("--debug-sse",),
@@ -216,9 +217,8 @@ class _FakePromptFmpResolver:
         """
 
         return FmpCompanyInfo(
-            canonical_ticker=canonical_ticker,
+            ticker_identity=build_company_ticker_identity(canonical_ticker, ()),
             company_name="Visa Inc.",
-            ticker_aliases=(canonical_ticker,),
         )
 
 

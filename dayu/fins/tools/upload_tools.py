@@ -207,7 +207,10 @@ def _upload_parameters_schema() -> ToolParametersSchema:
     properties: dict[str, JsonValue] = {
         "ticker": {
             "type": "string",
-            "description": "要归属上传文件的股票代码，可包含交易所后缀。",
+            "description": (
+                "公司财报归档的 canonical ticker，只填写一个股票代码，不要填写 CSV；"
+                "可包含系统支持的市场或交易所前后缀。"
+            ),
         },
         "upload_kind": {
             "type": "string",
@@ -268,7 +271,11 @@ def _upload_parameters_schema() -> ToolParametersSchema:
         },
         "ticker_aliases": {
             "type": "array",
-            "description": "可选股票代码别名列表。",
+            "description": (
+                "可选的同公司 ticker 别名数组，filing 与 material 上传都适用。每项都是用户明确声明的"
+                "同公司查询代码；系统信任声明且不联网核验。公司元数据成功保存后，canonical ticker 与"
+                "这些别名查询同一财报归档；不要重复填写 canonical 的等价写法。"
+            ),
             "items": string_items_schema,
         },
         "overwrite": {

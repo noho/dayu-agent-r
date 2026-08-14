@@ -32,8 +32,8 @@ from dayu.fins.pipelines.docling_upload_service import (
 )
 from dayu.fins.pipelines.upload_company_meta import (
     build_upload_company_id,
+    stage_company_meta_for_upload,
     stage_upload_company_meta_decision,
-    upsert_company_meta_for_upload,
 )
 from dayu.fins.pipelines.upload_filing_events import UploadFilingEvent, UploadFilingEventType
 from dayu.fins.pipelines.upload_material_events import UploadMaterialEvent, UploadMaterialEventType
@@ -491,11 +491,10 @@ async def run_upload_material_stream(
     try:
         company_batch = host._batching_repository.begin_batch(normalized_ticker)
         try:
-            upsert_company_meta_for_upload(
+            stage_company_meta_for_upload(
                 repository=host._company_repository,
                 ticker=normalized_ticker,
                 action=normalized_action,
-                company_id=company_id,
                 company_name=company_name,
                 ticker_aliases=ticker_aliases,
                 batch=company_batch,

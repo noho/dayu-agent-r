@@ -1,10 +1,12 @@
 """Ticker 归一化唯一真源。
 
-该模块提供港/沪/深/美股 ticker 各种常见变形到 canonical 形态的统一归一化逻辑。
+该模块提供港/沪/深/美股 ticker 各种常见变形到 canonical 形态的统一归一化逻辑，
+并拥有公司 canonical ticker、accepted aliases 与查询投影的结构化 identity contract。
 
 设计要点：
-- 仅暴露 ``NormalizedTicker`` 与 ``normalize_ticker`` / ``try_normalize_ticker``
-  / ``ticker_to_company_id`` 作为公共 API；其它均为模块级私有辅助。
+- 公共 API 包含 ``NormalizedTicker``、``CompanyTickerIdentity``、
+  ``build_company_ticker_identity``、``normalize_ticker`` / ``try_normalize_ticker``
+  与 ``ticker_to_company_id``；其它均为模块级私有辅助。
 - Canonical 形态：港股 4 位补零（``0700``）或保留原 5 位（``89988``），沪股 6 位
   （``600519``），深股 6 位（``000333`` / ``300750``），美股保留字母并把类股
   分隔符统一为横杠（``AAPL``、``BRK-B``）。
@@ -19,6 +21,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Final, Literal, Optional
 
@@ -45,6 +48,39 @@ class NormalizedTicker:
     raw: str
 
 
+@dataclass(frozen=True, slots=True)
+class CompanyTickerIdentity:
+    """公司的规范 ticker 与可接受查询别名。
+
+    Attributes:
+        canonical_ticker: 公司财报 corpus 的规范 ticker。
+        market: canonical ticker 所属市场。
+        exchange: canonical ticker 的交易所；无法从 ticker 唯一判定时为 ``None``。
+        accepted_aliases: 用户或 resolver 明确声明且与 canonical 不等价的规范别名，
+            按首次出现顺序稳定去重。
+    """
+
+    canonical_ticker: str
+    market: Market
+    exchange: Optional[Exchange]
+    accepted_aliases: tuple[str, ...]
+
+    def lookup_tickers(self) -> tuple[str, ...]:
+        """投影该公司全部可查询 ticker。
+
+        Args:
+            无。
+
+        Returns:
+            canonical ticker 在前、accepted aliases 按声明顺序在后的不可变 tuple。
+
+        Raises:
+            无。
+        """
+
+        return (self.canonical_ticker, *self.accepted_aliases)
+
+
 # ---- 市场前后缀识别常量（仅在本模块内使用） ----
 # 前缀形如 ``HK.00700`` / ``SH:600519`` / ``NASDAQ-AAPL``；分隔符可选。
 # 单字符交易所后缀（``N``/``O``）不纳入前缀，避免把诸如 ``OPEN`` 误拆分为 ``O`` + ``PEN``。
@@ -65,7 +101,7 @@ _SUFFIX_WITH_SEP_PATTERN: Final[re.Pattern[str]] = re.compile(
 _SUFFIX_NO_SEP_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"^(.+?)(HKEX|HK|SSE|SH|SS|SZSE|SZ|NASDAQ|NYSE|OQ|PK|US)$"
 )
-_US_SYMBOL_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[A-Z]+(?:-[A-Z0-9]+|[.][A-Z])?$")
+_US_SYMBOL_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[A-Z]+(?:[.-][A-Z0-9]+)?$")
 # 美股 ticker 字面长度上限。
 #
 # 设计意图：防御性输入白名单，**不是**对合法 ticker 的业务约束。
@@ -145,6 +181,42 @@ def try_normalize_ticker(raw: str) -> Optional[NormalizedTicker]:
         return normalize_ticker(raw)
     except (TypeError, ValueError):
         return None
+
+
+def build_company_ticker_identity(
+    canonical_ticker: str,
+    declared_aliases: Sequence[str],
+) -> CompanyTickerIdentity:
+    """构造公司的唯一 ticker identity。
+
+    Args:
+        canonical_ticker: 公司财报 corpus 的主 ticker。
+        declared_aliases: 用户或 resolver 明确声明的同公司 ticker aliases。
+
+    Returns:
+        canonical 与 aliases 均已规范化、且 aliases 稳定去重的不可变 identity。
+
+    Raises:
+        ValueError: canonical ticker 或任一 alias 为空或不符合 ticker grammar 时抛出。
+        TypeError: 输入不是字符串时由 ticker normalizer 抛出。
+    """
+
+    canonical_profile = normalize_ticker(canonical_ticker)
+    accepted_aliases: list[str] = []
+    seen_lookup_tickers = {canonical_profile.canonical}
+    for declared_alias in declared_aliases:
+        alias_profile = normalize_ticker(declared_alias)
+        normalized_alias = alias_profile.canonical
+        if normalized_alias in seen_lookup_tickers:
+            continue
+        seen_lookup_tickers.add(normalized_alias)
+        accepted_aliases.append(normalized_alias)
+    return CompanyTickerIdentity(
+        canonical_ticker=canonical_profile.canonical,
+        market=canonical_profile.market,
+        exchange=canonical_profile.exchange,
+        accepted_aliases=tuple(accepted_aliases),
+    )
 
 
 def ticker_to_company_id(ticker: NormalizedTicker) -> str:
@@ -345,8 +417,9 @@ def _build_us(body: str, raw: str) -> Optional[NormalizedTicker]:
     """构造美股 ``NormalizedTicker``。
 
     规则：首字符字母、仅含 ``A-Z`` 以及可选类股分节（如 ``BRK.B`` /
-    ``BRK-B``），长度不超过 ``_MAX_US_SYMBOL_LENGTH``；点号分节只接受单字符
-    类股，避免把 ``AAPL.SW`` 这类外部交易所 alias 误识别为美股类股。
+    ``BRK-B``），长度不超过 ``_MAX_US_SYMBOL_LENGTH``；单个点号或横杠分节
+    接受一个或多个字母/数字，使 ``V.BA``、``AAPL.SW`` 等 resolver alias
+    与 canonical ticker 共享同一 grammar。
 
     Args:
         body: ticker 主体。

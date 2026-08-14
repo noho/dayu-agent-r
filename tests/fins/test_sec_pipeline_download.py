@@ -35,6 +35,7 @@ from dayu.fins.downloaders.sec_downloader import (
 )
 from dayu.fins.domain.document_models import (
     BatchToken,
+    CompanyMeta,
     DownloadRejectionEntry,
     FileObjectMeta,
     FilingUpdateRequest,
@@ -80,6 +81,7 @@ from dayu.fins.pipelines.sec_pipeline import (
 from dayu.fins.pipelines.sec_sc13_filtering import SC13_FORMS as _SC13_FORMS, SC13_RETRY_MAX as _SC13_RETRY_MAX
 from dayu.fins.storage import (
     FsBatchingRepository,
+    FsCompanyMetaRepository,
     FsDocumentBlobRepository,
     FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
@@ -88,10 +90,11 @@ from dayu.fins.storage import (
 )
 from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
 from dayu.fins.storage.repository_protocols import (
+    ProcessedDocumentRepositoryProtocol,
     SourceDocumentRepositoryProtocol,
     SourceSnapshotProtocol,
 )
-from dayu.fins.ticker_normalization import normalize_ticker
+from dayu.fins.ticker_normalization import build_company_ticker_identity, normalize_ticker
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 
 
@@ -2256,7 +2259,7 @@ def test_sec_pipeline_download_writes_meta_and_manifest(tmp_path: Path) -> None:
     company_meta = json.loads(company_meta_path.read_text(encoding="utf-8"))
     assert company_meta["ticker"] == "AAPL"
     assert company_meta["market"] == "US"
-    assert company_meta["ticker_aliases"] == ["AAPL", "APC"]
+    assert company_meta["ticker_aliases"] == ["APC"]
 
 
 def test_sec_pipeline_download_merges_cli_aliases_with_sec_aliases(tmp_path: Path) -> None:
@@ -2292,7 +2295,7 @@ def test_sec_pipeline_download_merges_cli_aliases_with_sec_aliases(tmp_path: Pat
 
     company_meta_path = _company_meta_path(tmp_path, "AAPL")
     company_meta = json.loads(company_meta_path.read_text(encoding="utf-8"))
-    assert company_meta["ticker_aliases"] == ["AAPL", "APC", "AAPL.SW"]
+    assert company_meta["ticker_aliases"] == ["APC", "AAPL-SW"]
 
 
 def test_sec_pipeline_rebuild_local_meta_manifest_without_redownload(tmp_path: Path) -> None:
@@ -4225,6 +4228,27 @@ def test_standalone_6k_reconcile_publishes_source_and_processed_together(
         ticker=ticker,
         document_id=document_id,
     )
+    discovery_repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    discovery_batching = FsBatchingRepository(
+        tmp_path,
+        repository_set=discovery_repository_set,
+    )
+    discovery_company = FsCompanyMetaRepository(
+        tmp_path,
+        repository_set=discovery_repository_set,
+    )
+    discovery_batch = discovery_batching.begin_batch(ticker)
+    discovery_company.upsert_company_meta(
+        CompanyMeta(
+            company_id="0000000000",
+            company_name="Test Company",
+            ticker_identity=build_company_ticker_identity(ticker, ()),
+            resolver_version="test",
+            updated_at="2026-08-14T00:00:00+00:00",
+        ),
+        batch=discovery_batch,
+    )
+    discovery_batching.commit_batch(discovery_batch)
     assessments = {
         "form6-k.htm": _sec_6k_primary_repair.SixKPrimaryCandidateAssessment(
             filename="form6-k.htm",
@@ -4259,7 +4283,7 @@ def test_standalone_6k_reconcile_publishes_source_and_processed_together(
 
     report = _sec_6k_primary_repair.reconcile_active_6k_primary_documents(
         workspace_root=tmp_path,
-        target_tickers=[ticker, ticker.lower()],
+        target_tickers=None,
         target_document_ids=[document_id],
     )
 
@@ -4272,6 +4296,172 @@ def test_standalone_6k_reconcile_publishes_source_and_processed_together(
     assert report.updated[0].selected_primary_document == "ex99-1.htm"
     assert published_meta["primary_document"] == "ex99-1.htm"
     assert processed_meta["reprocess_required"] is True
+
+
+def test_prepared_6k_reconcile_handles_non_candidates_and_invalid_files() -> None:
+    """publication 前 6-K owner 应跳过非候选并拒绝非法 files contract。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: public owner 的早退或校验边界漂移时抛出。
+    """
+
+    assert (
+        _sec_6k_primary_repair.select_prepared_6k_primary_document(
+            ticker="TCOM",
+            document_id="fil-non-6k",
+            meta={"form_type": "20-F", "primary_document": "form.htm", "files": []},
+            candidate_payloads={},
+        )
+        is None
+    )
+    assert (
+        _sec_6k_primary_repair.select_prepared_6k_primary_document(
+            ticker="TCOM",
+            document_id="fil-no-html",
+            meta={
+                "form_type": "6-K",
+                "primary_document": "form.htm",
+                "files": [None, {}, {"name": "notes.txt"}],
+            },
+            candidate_payloads={},
+        )
+        is None
+    )
+    assert (
+        _sec_6k_primary_repair.select_prepared_6k_primary_document(
+            ticker="TCOM",
+            document_id="fil-missing-payload",
+            meta={
+                "form_type": "6-K",
+                "primary_document": "form.htm",
+                "files": [{"name": "missing.htm"}],
+            },
+            candidate_payloads={},
+        )
+        is None
+    )
+    with pytest.raises(ValueError, match="meta.files 必须为 list"):
+        _sec_6k_primary_repair.select_prepared_6k_primary_document(
+            ticker="TCOM",
+            document_id="fil-invalid-files",
+            meta={"form_type": "6-K", "primary_document": "form.htm"},
+            candidate_payloads={},
+        )
+
+
+def test_standalone_6k_reconcile_normalizes_public_filters(tmp_path: Path) -> None:
+    """standalone public path 应稳定去重 ticker 并拒绝清洗后的空过滤器。
+
+    Args:
+        tmp_path: pytest 临时工作区。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: public filter owner 的规范化或空值合同漂移时抛出。
+    """
+
+    report = _sec_6k_primary_repair.reconcile_active_6k_primary_documents(
+        workspace_root=tmp_path,
+        target_tickers=[" aapl ", "AAPL", "", " msft "],
+        target_document_ids=None,
+    )
+
+    assert report.updated == ()
+    with pytest.raises(ValueError, match="target_tickers 不能为空"):
+        _sec_6k_primary_repair.reconcile_active_6k_primary_documents(
+            workspace_root=tmp_path,
+            target_tickers=[" ", ""],
+        )
+    with pytest.raises(ValueError, match="target_document_ids 不能为空"):
+        _sec_6k_primary_repair.reconcile_active_6k_primary_documents(
+            workspace_root=tmp_path,
+            target_tickers=["AAPL"],
+            target_document_ids=[" ", ""],
+        )
+
+
+def test_standalone_6k_reconcile_rolls_back_failed_document(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """单文档 reconcile 异常时 public owner 必须 rollback 且保留 published meta。
+
+    Args:
+        tmp_path: pytest 临时工作区。
+        monkeypatch: pytest monkeypatch。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: rollback 后 published state 发生变化时抛出。
+    """
+
+    ticker = "TCOM"
+    document_id = "fil_0000000000-25-000101"
+    _seed_complete_6k_source_and_processed(
+        workspace_root=tmp_path,
+        ticker=ticker,
+        document_id=document_id,
+    )
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    source_repository = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    before_meta = source_repository.get_source_meta(ticker, document_id, SourceKind.FILING)
+
+    def _raise_reconcile_failure(
+        *,
+        source_repository: SourceDocumentRepositoryProtocol,
+        processed_repository: ProcessedDocumentRepositoryProtocol,
+        ticker: str,
+        document_id: str,
+        batch: BatchToken,
+    ) -> _sec_6k_primary_repair.SixKPrimaryReconcileOutcome | None:
+        """模拟单文档 owner 在 batch 内失败。
+
+        Args:
+            source_repository: source 仓储协议。
+            processed_repository: processed 仓储协议。
+            ticker: 当前 ticker。
+            document_id: 当前文档 ID。
+            batch: caller-owned batch。
+
+        Returns:
+            不返回。
+
+        Raises:
+            RuntimeError: 始终抛出以验证 rollback。
+        """
+
+        del source_repository, processed_repository, ticker, document_id, batch
+        raise RuntimeError("forced 6-K reconcile failure")
+
+    monkeypatch.setattr(
+        _sec_6k_primary_repair,
+        "reconcile_active_6k_primary_document",
+        _raise_reconcile_failure,
+    )
+
+    with pytest.raises(RuntimeError, match="forced 6-K reconcile failure"):
+        _sec_6k_primary_repair.reconcile_active_6k_primary_documents(
+            workspace_root=tmp_path,
+            target_tickers=[ticker],
+            target_document_ids=[document_id],
+        )
+
+    after_repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    after_repository = FsSourceDocumentRepository(
+        tmp_path,
+        repository_set=after_repository_set,
+    )
+    assert after_repository.get_source_meta(ticker, document_id, SourceKind.FILING) == before_meta
 
 
 def test_active_6k_candidate_assessment_consumes_one_storage_snapshot(

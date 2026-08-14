@@ -21,6 +21,7 @@ from dayu.documents.processors.base import (
 )
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.documents.processors.source import Source
+from dayu.fins.ticker_normalization import build_company_ticker_identity
 from dayu.fins.domain.document_models import (
     BatchToken,
     CompanyMeta,
@@ -2087,11 +2088,9 @@ def _build_runtime_with_source_documents(
         CompanyMeta(
             company_id="0000320193",
             company_name="Apple Inc.",
-            ticker="AAPL",
-            market="US",
+            ticker_identity=build_company_ticker_identity("AAPL", ()),
             resolver_version="test",
             updated_at=now_iso8601(),
-            ticker_aliases=[],
         ),
         batch=batch,
     )

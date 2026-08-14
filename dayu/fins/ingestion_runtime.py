@@ -117,6 +117,7 @@ from dayu.fins.pipelines.docling_upload_service import (
     resolve_upload_action,
 )
 from dayu.fins.pipelines.upload_company_meta import (
+    UploadCompanyNameRequiredError,
     UploadCompanyMetaDecision,
     resolve_upload_company_meta_decision,
 )
@@ -1056,7 +1057,7 @@ def validate_fins_upload_filing_request(
             company_name=request.company_name,
             ticker_aliases=request.ticker_aliases,
         )
-    except ValueError:
+    except UploadCompanyNameRequiredError:
         _raise_upload_usage(FinsUploadUsageCode.COMPANY_NAME_REQUIRED)
     return ValidatedFinsUploadFilingRequest(
         request=request,

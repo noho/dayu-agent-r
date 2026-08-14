@@ -102,6 +102,7 @@ from dayu.service.scene_context import (
 )
 import dayu.service.scene_context as scene_context
 from dayu.fins.resolver import FmpCompanyInfo, FmpCompanyInfoResolutionError
+from dayu.fins.ticker_normalization import build_company_ticker_identity
 
 _PACKAGE_CONFIG_ROOT = Path(__file__).resolve().parents[2] / "dayu" / "config"
 _NOW = datetime(2026, 6, 14, 8, 0, 0, tzinfo=UTC)
@@ -150,9 +151,8 @@ class _FakeSceneContextFmpResolver:
         """
 
         return FmpCompanyInfo(
-            canonical_ticker=canonical_ticker,
+            ticker_identity=build_company_ticker_identity(canonical_ticker, ()),
             company_name="Visa Inc.",
-            ticker_aliases=(canonical_ticker,),
         )
 
 

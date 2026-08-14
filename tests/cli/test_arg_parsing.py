@@ -68,6 +68,7 @@ COMMAND_HELP_EXPECTATIONS: dict[str, tuple[str, ...]] = {
     ),
     "upload_filing": (
         "--ticker",
+        "第一项是该公司财报归档的 canonical ticker",
         "--action",
         "--files",
         "--fiscal-year",
@@ -77,6 +78,7 @@ COMMAND_HELP_EXPECTATIONS: dict[str, tuple[str, ...]] = {
     ),
     "upload_material": (
         "--ticker",
+        "成功保存公司元数据后均查询同一归档",
         "--action",
         "--forms",
         "--material-name",
@@ -86,6 +88,7 @@ COMMAND_HELP_EXPECTATIONS: dict[str, tuple[str, ...]] = {
     ),
     "upload_filings_from": (
         "--ticker",
+        "系统信任声明且不联网核验",
         "--from",
         "--action",
         "--output",

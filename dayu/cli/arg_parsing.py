@@ -915,7 +915,7 @@ def _register_upload_filing_command(
         command_name=COMMAND_UPLOAD_FILING,
         help_text="上传或管理单个财报 filing 文档。",
     )
-    _add_required_ticker_argument(parser)
+    _add_upload_ticker_argument(parser)
     _add_upload_action_argument(parser, choices=FILING_ACTION_CHOICES)
     parser.add_argument("--files", nargs="+", help="待上传文件路径。")
     _add_filing_metadata_arguments(parser)
@@ -940,7 +940,7 @@ def _register_upload_material_command(
         command_name=COMMAND_UPLOAD_MATERIAL,
         help_text="上传或管理补充材料文档。",
     )
-    _add_required_ticker_argument(parser)
+    _add_upload_ticker_argument(parser)
     _add_upload_action_argument(parser, choices=FILING_ACTION_CHOICES)
     parser.add_argument("--forms", nargs="+", help="关联的报表类型。")
     parser.add_argument("--material-name", help="材料名称。")
@@ -969,7 +969,7 @@ def _register_upload_filings_from_command(
         command_name=COMMAND_UPLOAD_FILINGS_FROM,
         help_text="从目录生成可执行的批量上传脚本。",
     )
-    _add_required_ticker_argument(parser)
+    _add_upload_ticker_argument(parser)
     parser.add_argument("--from", dest="source_dir", required=True, help="待扫描目录。")
     _add_upload_action_argument(parser, choices=BATCH_UPLOAD_ACTION_CHOICES)
     parser.add_argument(
@@ -1075,6 +1075,29 @@ def _add_required_ticker_argument(parser: argparse.ArgumentParser) -> None:
     """
 
     parser.add_argument("--ticker", required=True, help="公司代码或财报主体。")
+
+
+def _add_upload_ticker_argument(parser: argparse.ArgumentParser) -> None:
+    """追加上传命令使用的必填 ticker CSV 参数。
+
+    Args:
+        parser: 目标上传命令 parser。
+
+    Returns:
+        无。
+
+    Raises:
+        ValueError: argparse 参数注册失败时透传底层异常。
+    """
+
+    parser.add_argument(
+        "--ticker",
+        required=True,
+        help=(
+            "公司 ticker CSV：第一项是该公司财报归档的 canonical ticker，后续项是用户明确声明的"
+            "同公司查询别名；系统信任声明且不联网核验，成功保存公司元数据后均查询同一归档。"
+        ),
+    )
 
 
 def _add_upload_action_argument(parser: argparse.ArgumentParser, *, choices: tuple[str, ...]) -> None:

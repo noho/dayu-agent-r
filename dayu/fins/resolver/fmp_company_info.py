@@ -17,7 +17,12 @@ from dataclasses import dataclass
 from typing import Final, Protocol, cast
 
 from dayu.contracts import JsonValue
-from dayu.fins.ticker_normalization import try_normalize_ticker
+from dayu.fins.ticker_normalization import (
+    CompanyTickerIdentity,
+    build_company_ticker_identity,
+    normalize_ticker,
+    try_normalize_ticker,
+)
 
 _FMP_BASE_URL: Final[str] = "https://financialmodelingprep.com/stable"
 _SEARCH_SYMBOL_ENDPOINT: Final[str] = "search-symbol"
@@ -34,15 +39,12 @@ _NAME_FIELD: Final[str] = "name"
 class FmpCompanyInfo:
     """FMP 公司信息解析结果。
 
-    :param canonical_ticker: resolver 使用的规范 ticker，始终为 alias 首项。
+    :param ticker_identity: resolver 接受的 canonical ticker 与严格同名 aliases。
     :param company_name: FMP 返回的严格公司名称。
-    :param ticker_aliases: 严格同名证券 alias。使用 tuple 是为了让 public
-        result 不可变，避免调用方修改 resolver 已返回的业务事实。
     """
 
-    canonical_ticker: str
+    ticker_identity: CompanyTickerIdentity
     company_name: str
-    ticker_aliases: tuple[str, ...]
 
 
 class FmpCompanyInfoResolutionError(RuntimeError):
@@ -99,8 +101,8 @@ class FmpCompanyInfoResolver:
     """FMP 公司信息 resolver。
 
     resolver 执行两跳算法：先通过 ``search-symbol`` 精确定位 canonical
-    ticker 对应公司名，再通过 ``search-name`` 搜索严格同名证券，并保证
-    canonical ticker 在 alias tuple 首位。无精确 symbol 命中时不得注入公司身份。
+    ticker 对应公司名，再通过 ``search-name`` 搜索严格同名证券，并通过唯一
+    identity builder 产生 accepted aliases。无精确 symbol 命中时不得注入公司身份。
     """
 
     _api_key: str
@@ -140,9 +142,10 @@ class FmpCompanyInfoResolver:
         :raises FmpCompanyInfoResolutionError: 输入、请求、JSON 或业务结果非法时抛出。
         """
 
-        normalized_ticker = _normalize_ticker_token(canonical_ticker)
-        if normalized_ticker == "":
-            raise FmpCompanyInfoResolutionError("canonical ticker 不能为空")
+        try:
+            normalized_ticker = normalize_ticker(canonical_ticker).canonical
+        except (TypeError, ValueError) as exc:
+            raise FmpCompanyInfoResolutionError("canonical ticker 不符合 ticker grammar") from exc
 
         symbol_results = self._fetch_search_results(
             endpoint=_SEARCH_SYMBOL_ENDPOINT,
@@ -169,20 +172,18 @@ class FmpCompanyInfoResolver:
             results=name_results,
             normalized_company_name=normalized_company_name,
         )
-        ticker_aliases = _dedupe_ticker_aliases(
-            canonical_ticker=normalized_ticker,
-            raw_aliases=tuple(
-                result.symbol
-                for result in (
+        ticker_identity = build_company_ticker_identity(
+            normalized_ticker,
+            _valid_fmp_symbols(
+                (
                     *same_name_symbol_results,
                     *same_name_name_results,
                 )
             ),
         )
         return FmpCompanyInfo(
-            canonical_ticker=normalized_ticker,
+            ticker_identity=ticker_identity,
             company_name=company_name,
-            ticker_aliases=ticker_aliases,
         )
 
     def _fetch_search_results(
@@ -291,8 +292,8 @@ def _select_symbol_result(
             f"FMP search-symbol 未返回结果: ticker={canonical_ticker}"
         )
     for item in results:
-        normalized_symbol = _normalize_ticker_token(item.symbol)
-        if normalized_symbol == canonical_ticker:
+        normalized_symbol = try_normalize_ticker(item.symbol)
+        if normalized_symbol is not None and normalized_symbol.canonical == canonical_ticker:
             return item
     raise FmpCompanyInfoResolutionError(
         f"FMP search-symbol 未返回精确 ticker 命中: ticker={canonical_ticker}"
@@ -332,43 +333,24 @@ def _normalize_company_name(company_name: str) -> str:
     return normalized.upper()
 
 
-def _normalize_ticker_token(raw_token: str) -> str:
-    """规范化 ticker token。
+def _valid_fmp_symbols(results: Sequence[_FmpSearchResult]) -> tuple[str, ...]:
+    """筛选 FMP 外部响应中符合公共 ticker grammar 的 symbol。
 
-    :param raw_token: 原始 ticker token。
-    :returns: canonical ticker 或大写去空白 token；空输入返回空字符串。
-    :raises Exception: 不主动抛出异常。
+    Args:
+        results: 严格同名的 FMP 搜索结果。
+
+    Returns:
+        保留原始顺序的合法 symbol tuple；canonicalization 与去重由 identity builder 完成。
+
+    Raises:
+        无。
     """
 
-    normalized_source = try_normalize_ticker(raw_token)
-    if normalized_source is not None:
-        return normalized_source.canonical
-    compact_token = "".join(raw_token.strip().split())
-    return compact_token.upper()
-
-
-def _dedupe_ticker_aliases(
-    *,
-    canonical_ticker: str,
-    raw_aliases: Sequence[str],
-) -> tuple[str, ...]:
-    """对 alias 列表做规范化与去重。
-
-    :param canonical_ticker: 规范 ticker。
-    :param raw_aliases: 原始 alias 列表。
-    :returns: 首项恒为 canonical ticker 的不可变去重 alias tuple。
-    :raises Exception: 不主动抛出异常。
-    """
-
-    deduped_aliases: list[str] = []
-    seen_aliases: set[str] = set()
-    for raw_alias in (canonical_ticker, *raw_aliases):
-        normalized_alias = _normalize_ticker_token(raw_alias)
-        if normalized_alias == "" or normalized_alias in seen_aliases:
-            continue
-        seen_aliases.add(normalized_alias)
-        deduped_aliases.append(normalized_alias)
-    return tuple(deduped_aliases)
+    return tuple(
+        result.symbol
+        for result in results
+        if try_normalize_ticker(result.symbol) is not None
+    )
 
 
 def _string_field(item: Mapping[str, JsonValue], field_name: str) -> str:

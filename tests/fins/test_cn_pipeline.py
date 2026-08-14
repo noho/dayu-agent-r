@@ -14,6 +14,7 @@ import dayu.fins.pipelines.cn_pipeline as cn_pipeline_module
 from dayu.contracts.cancellation import CancellationToken
 from dayu.fins.downloaders.hkexnews_downloader import HkexnewsDiscoveryClient
 from dayu.fins.domain.document_models import CompanyMeta, now_iso8601
+from dayu.fins.ticker_normalization import build_company_ticker_identity
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.ingestion_runtime import (
     FinsDownloadProgressEvent,
@@ -523,11 +524,9 @@ def _seed_cn_upload_company_meta(
         CompanyMeta(
             company_id="600519_CN",
             company_name=company_name,
-            ticker="600519",
-            market="CN",
+            ticker_identity=build_company_ticker_identity("600519", ticker_aliases),
             resolver_version=resolver_version,
             updated_at=now_iso8601(),
-            ticker_aliases=ticker_aliases,
         ),
         batch=batch,
     )
@@ -923,7 +922,7 @@ async def test_upload_filing_stream_refreshes_stale_company_meta(tmp_path: Path)
     assert company_meta.company_id == "600519_SSE"
     assert company_meta.company_name == "贵州茅台"
     assert company_meta.resolver_version == RESOLVER_VERSION
-    assert company_meta.ticker_aliases == ["600519"]
+    assert company_meta.ticker_identity.accepted_aliases == ("OLD",)
 
 
 @pytest.mark.asyncio
@@ -956,6 +955,7 @@ async def test_upload_material_stream_uploads_files_with_docling(tmp_path: Path)
             material_name="Roadshow Deck",
             files=[material_file],
             company_name="贵州茅台",
+            ticker_aliases=["600519.SH", "MSFT", "V.BA"],
             overwrite=False,
         )
     ]
@@ -973,6 +973,10 @@ async def test_upload_material_stream_uploads_files_with_docling(tmp_path: Path)
     assert result_value["action"] == "upload_material"
     assert result_value["status"] == "ok"
     assert str(result_value["document_id"]).startswith("mat_")
+    company_meta = pipeline._company_repository.get_company_meta("600519")
+    assert company_meta.ticker_identity.accepted_aliases == ("MSFT", "V-BA")
+    assert pipeline._company_repository.resolve_existing_ticker(["MSFT"]) == "600519"
+    assert pipeline._company_repository.resolve_existing_ticker(["V.BA"]) == "600519"
     meta = pipeline._source_repository.get_source_meta(
         "600519",
         str(result_value["document_id"]),
@@ -1627,6 +1631,7 @@ async def test_upload_material_stream_overwrite_resets_single_document(tmp_path:
             material_name="Deck",
             files=[old_file],
             company_name="贵州茅台",
+            ticker_aliases=["OLD"],
         )
     ]
     overwrite_events = [
@@ -1637,7 +1642,8 @@ async def test_upload_material_stream_overwrite_resets_single_document(tmp_path:
             form_type="MATERIAL_OTHER",
             material_name="Deck",
             files=[new_file],
-            company_name="贵州茅台",
+            company_name="本次名称不应覆盖 fresh meta",
+            ticker_aliases=["NEW"],
             overwrite=True,
         )
     ]
@@ -1649,6 +1655,10 @@ async def test_upload_material_stream_overwrite_resets_single_document(tmp_path:
     assert overwrite_result["stored_file_count"] == 1
     assert overwrite_result["material_action"] == "update"
     assert overwrite_result["document_id"] == create_result["document_id"]
+
+    company_meta = pipeline._company_repository.get_company_meta("600519")
+    assert company_meta.company_name == "贵州茅台"
+    assert company_meta.ticker_identity.accepted_aliases == ("OLD", "NEW")
 
     handle = pipeline._source_repository.get_source_handle(
         "600519",

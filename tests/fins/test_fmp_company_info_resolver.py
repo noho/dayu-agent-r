@@ -90,6 +90,7 @@ def test_resolve_company_info_uses_two_hop_same_name_aliases() -> None:
                         {"symbol": "V", "name": "Visa Inc."},
                         {"symbol": "V.BA", "name": "Visa Inc."},
                         {"symbol": "V.BA", "name": "Visa Inc."},
+                        {"symbol": "NOT VALID", "name": "Visa Inc."},
                         {"symbol": "VISA", "name": "Visa Inc. Class A"},
                     ]
                 ),
@@ -104,10 +105,11 @@ def test_resolve_company_info_uses_two_hop_same_name_aliases() -> None:
 
     result = resolver.resolve_company_info(" v ")
 
-    assert result.canonical_ticker == "V"
+    assert result.ticker_identity.canonical_ticker == "V"
     assert result.company_name == "Visa Inc."
-    assert result.ticker_aliases == ("V", "V.BA")
-    assert isinstance(result.ticker_aliases, tuple)
+    assert result.ticker_identity.accepted_aliases == ("V-BA",)
+    assert result.ticker_identity.lookup_tickers() == ("V", "V-BA")
+    assert isinstance(result.ticker_identity.accepted_aliases, tuple)
     assert len(client.calls) == 2
     assert all(call[1] == 3.5 for call in client.calls)
     assert "query=V" in client.calls[0][0]

@@ -24,6 +24,7 @@ import dayu.fins.storage._fs_storage_infra as storage_infra_module
 import dayu.fins.storage._fs_source_snapshot as source_snapshot_module
 import dayu.fins.storage._fs_storage_utils as storage_utils_module
 import dayu.fins.storage.local_file_store as local_file_store_module
+from dayu.fins.ticker_normalization import build_company_ticker_identity
 from dayu.fins.domain.document_models import (
     BatchToken,
     CompanyMeta,
@@ -68,7 +69,6 @@ from dayu.fins.storage._fs_storage_infra import (
 )
 from dayu.fins.storage.repository_protocols import SourceSnapshotConsistencyError
 from dayu.fins.storage._fs_storage_utils import (
-    _canonicalize_ticker_alias,
     _local_path_from_uri,
     _normalize_entry_name,
     _normalize_filename,
@@ -180,8 +180,7 @@ def test_filing_upload_state_reads_company_and_source_from_one_published_version
         CompanyMeta(
             company_id="company-aapl",
             company_name="Apple Inc.",
-            ticker="AAPL",
-            market="US",
+            ticker_identity=build_company_ticker_identity("AAPL", ()),
             resolver_version="test",
             updated_at=now_iso8601(),
         ),
@@ -974,19 +973,17 @@ def test_company_owner_reads_only_published_meta_inventory_and_aliases(tmp_path:
     batches = {ticker: batching.begin_batch(ticker) for ticker in ("AAPL", "MSFT", "DUP-A", "DUP-B")}
     for ticker, aliases in (
         ("AAPL", ["APPLE"]),
-        ("MSFT", ["MICROSOFT"]),
-        ("DUP-A", ["DUPLICATE"]),
-        ("DUP-B", ["DUPLICATE"]),
+        ("MSFT", ["MSFT-A"]),
+        ("DUP-A", ["DUP-C"]),
+        ("DUP-B", ["DUP-C"]),
     ):
         company.upsert_company_meta(
             CompanyMeta(
                 company_id=f"company-{ticker}",
                 company_name=f"{ticker} Inc.",
-                ticker=ticker,
-                market="US",
+                ticker_identity=build_company_ticker_identity(ticker, aliases),
                 resolver_version="test",
                 updated_at=now_iso8601(),
-                ticker_aliases=aliases,
             ),
             batch=batches[ticker],
         )
@@ -1001,7 +998,7 @@ def test_company_owner_reads_only_published_meta_inventory_and_aliases(tmp_path:
     assert company.resolve_existing_ticker(["apple"]) == "AAPL"
     assert company.resolve_existing_ticker(["not-listed"]) is None
     with pytest.raises(ValueError, match="命中多个公司目录"):
-        company.resolve_existing_ticker(["duplicate"])
+        company.resolve_existing_ticker(["dup.c"])
     with pytest.raises(FileNotFoundError):
         company.get_company_meta("NONE")
 
@@ -1944,8 +1941,6 @@ def test_valid_dot_hyphen_identity_and_object_key_round_trip(tmp_path: Path) -> 
         AssertionError: 合法 identity 被过窄规则拒绝或内容不一致时由 pytest 抛出。
     """
 
-    assert _canonicalize_ticker_alias("brk.b") == "BRK-B"
-    assert _canonicalize_ticker_alias("test-1") == "TEST-1"
     key = "BRK.B/filings/annual-report/report-2024.md"
     store = LocalFileStore(tmp_path / "objects")
 

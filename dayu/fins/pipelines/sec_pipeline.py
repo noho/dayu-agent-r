@@ -14,7 +14,7 @@ from dayu.contracts.json_value import JsonValue
 import asyncio
 import datetime as dt
 from pathlib import Path
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import AsyncIterator, Callable, Coroutine, Final, Optional, TypeAlias, TypedDict, cast
 
 from dayu.documents.processors.processor_registry import ProcessorRegistry
@@ -1702,7 +1702,7 @@ class SecPipeline:
         ticker: str,
         company_id: str,
         company_name: str,
-        ticker_aliases: Optional[list[str]] = None,
+        ticker_aliases: Optional[Sequence[str]] = None,
         *,
         batch: BatchToken,
     ) -> None:

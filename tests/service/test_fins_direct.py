@@ -46,6 +46,7 @@ from dayu.fins.ingestion_runtime import (
     validate_fins_upload_filing_request,
 )
 from dayu.fins.domain.document_models import CompanyMeta
+from dayu.fins.ticker_normalization import build_company_ticker_identity
 from dayu.fins.pipelines.upload_company_meta import RESOLVER_VERSION
 from dayu.fins.storage import FilingUploadPublishedState
 from dayu.service.fins_direct import (
@@ -737,8 +738,7 @@ async def test_upload_methods_build_union_requests(tmp_path: Path) -> None:
             company_meta=CompanyMeta(
                 company_id="company-aapl",
                 company_name="Apple Inc.",
-                ticker="AAPL",
-                market="US",
+                ticker_identity=build_company_ticker_identity("AAPL", ()),
                 resolver_version=RESOLVER_VERSION,
                 updated_at="2026-08-13T00:00:00+00:00",
             ),

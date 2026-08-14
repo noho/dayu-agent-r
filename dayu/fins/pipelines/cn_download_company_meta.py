@@ -10,7 +10,11 @@ from __future__ import annotations
 from dayu.fins.domain.document_models import BatchToken, CompanyMeta, now_iso8601
 from dayu.fins.pipelines.cn_download_models import CnCompanyProfile
 from dayu.fins.storage import CompanyMetaRepositoryProtocol
-from dayu.fins.ticker_normalization import normalize_ticker, ticker_to_company_id
+from dayu.fins.ticker_normalization import (
+    build_company_ticker_identity,
+    normalize_ticker,
+    ticker_to_company_id,
+)
 
 _RESOLVER_VERSION = "cn_download_v1"
 
@@ -44,47 +48,20 @@ def upsert_company_meta_for_cn_download(
     ticker = normalized_ticker.strip()
     if not ticker:
         raise ValueError("normalized_ticker 不能为空")
-    normalized = normalize_ticker(ticker)
-    company_id = ticker_to_company_id(normalized)
+    ticker_identity = build_company_ticker_identity(ticker, ticker_aliases or ())
+    company_id = ticker_to_company_id(normalize_ticker(ticker_identity.canonical_ticker))
     company_name = profile.company_name.strip()
     if not company_name:
         raise ValueError("profile.company_name 不能为空")
 
-    aliases = _merge_aliases(primary_ticker=ticker, aliases=ticker_aliases)
-    market = "HK" if profile.provider == "hkexnews" else "CN"
     meta = CompanyMeta(
         company_id=company_id,
         company_name=company_name,
-        ticker=ticker,
-        market=market,
+        ticker_identity=ticker_identity,
         resolver_version=_RESOLVER_VERSION,
         updated_at=now_iso8601(),
-        ticker_aliases=aliases,
     )
     repository.upsert_company_meta(meta, batch=batch)
     return meta
-
-
-def _merge_aliases(*, primary_ticker: str, aliases: list[str] | None) -> list[str]:
-    """合并 ticker alias，保持稳定顺序并去重。
-
-    Args:
-        primary_ticker: 主 ticker。
-        aliases: 可选 alias 列表。
-
-    Returns:
-        去重后的 alias 列表，包含主 ticker。
-
-    Raises:
-        无。
-    """
-
-    result: list[str] = []
-    for raw in [primary_ticker, *(aliases or [])]:
-        item = raw.strip()
-        if item and item not in result:
-            result.append(item)
-    return result
-
 
 __all__ = ["upsert_company_meta_for_cn_download"]

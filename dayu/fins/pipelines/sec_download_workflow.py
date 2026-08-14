@@ -7,6 +7,7 @@ from dayu.contracts.json_value import JsonValue
 import datetime as dt
 import inspect
 import time
+from collections.abc import Sequence
 from typing import AsyncIterator, Awaitable, Callable, Final, Optional, Protocol, TypeVar, cast
 
 from dayu.fins.domain.document_models import BatchToken, DownloadRejectionRegistry
@@ -178,7 +179,7 @@ class SecDownloadWorkflowHost(Protocol):
         ticker: str,
         company_id: str,
         company_name: str,
-        ticker_aliases: Optional[list[str]],
+        ticker_aliases: Optional[Sequence[str]],
         *,
         batch: BatchToken,
     ) -> None:
@@ -309,8 +310,8 @@ async def run_download_stream_impl(
     start_is_explicit: bool,
     cancel_checker: Optional[Callable[[], bool]] = None,
     parse_date: Callable[[str, bool], dt.date],
-    extract_sec_ticker_aliases: Callable[..., list[str]],
-    merge_ticker_aliases: Callable[..., list[str]],
+    extract_sec_ticker_aliases: Callable[..., tuple[str, ...]],
+    merge_ticker_aliases: Callable[..., tuple[str, ...]],
     load_rejection_registry: Callable[
         [FilingMaintenanceRepositoryProtocol, str],
         DownloadRejectionRegistry,
@@ -776,7 +777,7 @@ async def _publish_sec_post_repair_mutations(
     ticker: str,
     cik: str,
     company_name: str,
-    ticker_aliases: list[str],
+    ticker_aliases: Sequence[str],
     rejection_decisions: tuple[Sc13RejectedDirectionDecision, ...],
     rejection_registry: DownloadRejectionRegistry,
     overwrite: bool,

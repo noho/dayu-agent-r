@@ -13,7 +13,6 @@ import logging
 import os
 import shlex
 from collections.abc import Callable
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Final, NoReturn, cast
@@ -63,7 +62,10 @@ from dayu.fins.ingestion_runtime import (
 from dayu.fins.upload_failure import FinsUploadPrevalidationError
 from dayu.fins.domain.filing_semantics import FiscalPeriod
 from dayu.fins.resolver import FmpCompanyInfoResolver
-from dayu.fins.ticker_normalization import normalize_ticker
+from dayu.fins.ticker_normalization import (
+    CompanyTickerIdentity,
+    build_company_ticker_identity,
+)
 from dayu.fins.upload_batch import (
     FINS_UPLOAD_FILE_SUFFIXES,
     BatchUploadAction,
@@ -104,19 +106,6 @@ _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
 class CliFinsUsageError(ValueError):
     """Fins direct CLI 用法错误。"""
-
-
-@dataclass(frozen=True, slots=True)
-class CliTickerInput:
-    """CLI ticker CSV 解析结果。
-
-    Attributes:
-        canonical: 当前请求使用的 canonical ticker 文本。
-        aliases: 用户传入的 ticker 别名。
-    """
-
-    canonical: str
-    aliases: tuple[str, ...]
 
 
 class _CliFinsCancellationToken:
@@ -316,19 +305,23 @@ def _run_upload_filings_from(args: ParsedCliArgs) -> int:
         raise CliFinsUsageError("--from must not be empty")
     ticker = _parse_ticker_csv(args.ticker)
     explicit_company_name = _optional_stripped_text(args.company_name)
-    aliases = ticker.aliases
+    resolved_identity = ticker
     company_name = explicit_company_name
     if args.infer:
         api_key = os.environ.get(_FMP_API_KEY_ENV)
         if api_key is None or api_key.strip() == "":
             raise CliFinsUsageError("--infer requires non-empty FMP_API_KEY")
-        resolved_info = FmpCompanyInfoResolver(api_key=api_key).resolve_company_info(ticker.canonical)
-        if resolved_info.canonical_ticker != ticker.canonical:
+        resolved_info = FmpCompanyInfoResolver(api_key=api_key).resolve_company_info(
+            ticker.canonical_ticker
+        )
+        if resolved_info.ticker_identity.canonical_ticker != ticker.canonical_ticker:
             raise RuntimeError("FMP resolved canonical ticker does not match the requested ticker")
-        aliases = _merge_ticker_aliases(
-            canonical=ticker.canonical,
-            explicit_aliases=ticker.aliases,
-            resolved_aliases=resolved_info.ticker_aliases,
+        resolved_identity = build_company_ticker_identity(
+            ticker.canonical_ticker,
+            (
+                *ticker.accepted_aliases,
+                *resolved_info.ticker_identity.accepted_aliases,
+            ),
         )
         if company_name is None:
             company_name = resolved_info.company_name
@@ -337,8 +330,8 @@ def _run_upload_filings_from(args: ParsedCliArgs) -> int:
     source_dir = Path(args.source_dir)
     plan = generate_upload_batch_plan(
         UploadBatchPlanRequest(
-            ticker=ticker.canonical,
-            aliases=aliases,
+            ticker=resolved_identity.canonical_ticker,
+            aliases=resolved_identity.accepted_aliases,
             source_dir=source_dir,
             action=cast(BatchUploadAction, args.action),
             recursive=args.recursive,
@@ -374,7 +367,7 @@ def _run_upload_filings_from(args: ParsedCliArgs) -> int:
     script_path = publish_upload_script(
         workspace_root=workspace_root,
         output=Path(args.output) if args.output is not None else None,
-        canonical_ticker=ticker.canonical,
+        canonical_ticker=ticker.canonical_ticker,
         platform=platform,
         content=content,
     )
@@ -452,7 +445,7 @@ def _append_optional_entry_metadata(
 def _upload_batch_regeneration_argv(
     *,
     args: ParsedCliArgs,
-    ticker: CliTickerInput,
+    ticker: CompanyTickerIdentity,
     source_dir: Path,
     explicit_company_name: str | None,
     material_form: str | None,
@@ -476,7 +469,7 @@ def _upload_batch_regeneration_argv(
         _BASE_OPTION,
         args.workspace_root,
         "--ticker",
-        ",".join((ticker.canonical, *ticker.aliases)),
+        ",".join(ticker.lookup_tickers()),
         "--from",
         str(source_dir),
     ]
@@ -721,7 +714,7 @@ def _upload_material_stream(
     ticker = _parse_ticker_csv(args.ticker)
     form_type = _single_optional_form(args.forms)
     return service.upload_material(
-        ticker=ticker.canonical,
+        ticker=ticker.canonical_ticker,
         action=args.action,
         files=_validated_upload_files(args.files),
         form_type=form_type,
@@ -734,7 +727,7 @@ def _upload_material_stream(
         filing_date=_optional_stripped_text(args.filing_date),
         report_date=_optional_stripped_text(args.report_date),
         company_name=_optional_stripped_text(args.company_name),
-        ticker_aliases=ticker.aliases,
+        ticker_aliases=ticker.accepted_aliases,
         overwrite=args.overwrite,
         cancellation_token=cancellation_token,
     )
@@ -757,7 +750,7 @@ def _process_stream(
 
     ticker = _parse_ticker_csv(args.ticker)
     return service.process(
-        ticker=ticker.canonical,
+        ticker=ticker.canonical_ticker,
         source_kind=SourceKind.FILING,
         document_ids=_document_ids_from_arg(args.document_id),
         rebuild_processed=args.overwrite,
@@ -783,7 +776,7 @@ def _process_filing_stream(
     ticker = _parse_ticker_csv(args.ticker)
     document_id = _required_single_document_id(args.document_id)
     return service.process_filing(
-        ticker=ticker.canonical,
+        ticker=ticker.canonical_ticker,
         document_ids=(document_id,),
         rebuild_processed=args.overwrite,
         cancellation_token=cancellation_token,
@@ -808,7 +801,7 @@ def _process_material_stream(
     ticker = _parse_ticker_csv(args.ticker)
     document_id = _required_single_document_id(args.document_id)
     return service.process_material(
-        ticker=ticker.canonical,
+        ticker=ticker.canonical_ticker,
         document_ids=(document_id,),
         rebuild_processed=args.overwrite,
         cancellation_token=cancellation_token,
@@ -1104,7 +1097,7 @@ def _resolve_workspace_root(raw_value: str) -> Path:
     return Path(raw_value).expanduser().resolve(strict=False)
 
 
-def _parse_ticker_csv(raw_value: str | None) -> CliTickerInput:
+def _parse_ticker_csv(raw_value: str | None) -> CompanyTickerIdentity:
     """解析 ticker CSV 为 canonical ticker 与 aliases。
 
     :param raw_value: ``--ticker`` 原始值。
@@ -1118,44 +1111,9 @@ def _parse_ticker_csv(raw_value: str | None) -> CliTickerInput:
     if not parts or any(part == "" for part in parts):
         raise CliFinsUsageError(_EMPTY_TICKER_MESSAGE)
     try:
-        canonical = normalize_ticker(parts[0]).canonical
-        normalized_aliases = tuple(normalize_ticker(alias).canonical for alias in parts[1:])
+        return build_company_ticker_identity(parts[0], parts[1:])
     except ValueError as exc:
         raise CliFinsUsageError(str(exc)) from exc
-    aliases = _merge_ticker_aliases(
-        canonical=canonical,
-        explicit_aliases=normalized_aliases,
-        resolved_aliases=(),
-    )
-    return CliTickerInput(canonical=canonical, aliases=aliases)
-
-
-def _merge_ticker_aliases(
-    *,
-    canonical: str,
-    explicit_aliases: tuple[str, ...],
-    resolved_aliases: tuple[str, ...],
-) -> tuple[str, ...]:
-    """按显式优先顺序合并已由各自 owner 规范化的 ticker aliases。
-
-    :param canonical: 用户 canonical ticker。
-    :param explicit_aliases: CLI strict normalizer 产生的显式 aliases。
-    :param resolved_aliases: FMP resolver public contract 产生的 aliases。
-    :returns: 排除 canonical 后的稳定去重 aliases。
-    :raises RuntimeError: resolver 返回空 alias 时抛出。
-    """
-
-    aliases: list[str] = []
-    seen = {canonical}
-    for raw_alias in (*explicit_aliases, *resolved_aliases):
-        alias = raw_alias.strip()
-        if alias == "":
-            raise RuntimeError("FMP resolver returned an empty ticker alias")
-        if alias in seen:
-            continue
-        seen.add(alias)
-        aliases.append(alias)
-    return tuple(aliases)
 
 
 def _validated_upload_files(raw_files: list[str] | None) -> tuple[Path, ...]:

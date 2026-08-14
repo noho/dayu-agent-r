@@ -33,6 +33,7 @@ from dayu.contracts.tool_outcome import (
 from dayu.contracts.tool_result import ToolResultMeta, ToolResultSuccess
 from dayu.contracts.tool_schema import ToolTruncateSpec
 from dayu.contracts.tool_source import ToolBundleSourceRef
+from dayu.fins.ticker_normalization import build_company_ticker_identity
 from dayu.fins.domain.document_models import (
     CompanyMeta,
     FinsSourceProvider,
@@ -899,11 +900,9 @@ def _build_fins_workspace(tmp_path: Path) -> Path:
         CompanyMeta(
             company_id="0000320193",
             company_name="Apple Inc.",
-            ticker="AAPL",
-            market="US",
+            ticker_identity=build_company_ticker_identity("AAPL", ("APPLE",)),
             resolver_version="combined-test",
             updated_at=now_iso8601(),
-            ticker_aliases=["APPLE"],
         ),
         batch=company_batch,
     )

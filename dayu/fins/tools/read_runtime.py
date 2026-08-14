@@ -2750,7 +2750,7 @@ class FinsReadRuntime:
             company_meta = self._company_repository.get_company_meta(ticker)
         except FileNotFoundError:
             return ticker, "unknown"
-        return company_meta.company_name, company_meta.market
+        return company_meta.company_name, company_meta.ticker_identity.market
 
     def _read_capability_flags(
         self,

@@ -6,17 +6,24 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Final, Literal
 
-from dayu.fins._log import Log
 from dayu.fins.domain.document_models import BatchToken, CompanyMeta, now_iso8601
 from dayu.fins.storage import CompanyMetaRepositoryProtocol
-from dayu.fins.ticker_normalization import normalize_ticker, ticker_to_company_id, try_normalize_ticker
+from dayu.fins.ticker_normalization import (
+    build_company_ticker_identity,
+    normalize_ticker,
+    ticker_to_company_id,
+)
 
 UPLOAD_ACTIONS_REQUIRING_COMPANY_META: Final[frozenset[str]] = frozenset({"create", "update"})
 RESOLVER_VERSION: Final[str] = "market_resolver_v1.0.0"
-MODULE: Final[str] = "FINS.UPLOAD_COMPANY_META"
+
+
+class UploadCompanyNameRequiredError(ValueError):
+    """upload company meta 缺少必填公司名称。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,33 +60,53 @@ def resolve_upload_company_meta_decision(
         供 validation 与 workflow 共用的纯决策。
 
     Raises:
-        ValueError: create/update 需要 stage 但缺少公司名称，或 ticker/alias 非法时抛出。
+        UploadCompanyNameRequiredError: create/update 需要 stage 但缺少公司名称时抛出。
+        ValueError: ticker/alias 非法或既有 identity 与请求不一致时抛出。
     """
 
     if action not in UPLOAD_ACTIONS_REQUIRING_COMPANY_META:
         return UploadCompanyMetaDecision(disposition="skip", company_meta=None)
-    if existing_meta is not None and _existing_company_meta_is_fresh(
-        existing_meta=existing_meta,
-        resolver_version=RESOLVER_VERSION,
-    ):
-        return UploadCompanyMetaDecision(disposition="keep", company_meta=None)
-    profile = normalize_ticker(ticker)
+    proposed_identity = build_company_ticker_identity(ticker, ticker_aliases)
+    merged_identity = proposed_identity
+    if existing_meta is not None:
+        existing_identity = existing_meta.ticker_identity
+        if (
+            existing_identity.canonical_ticker != proposed_identity.canonical_ticker
+            or existing_identity.market != proposed_identity.market
+            or existing_identity.exchange != proposed_identity.exchange
+        ):
+            raise ValueError("既有 CompanyMeta 与本次 canonical ticker identity 不一致")
+        merged_identity = build_company_ticker_identity(
+            proposed_identity.canonical_ticker,
+            (
+                *existing_identity.accepted_aliases,
+                *proposed_identity.accepted_aliases,
+            ),
+        )
+        if _existing_company_meta_is_fresh(
+            existing_meta=existing_meta,
+            resolver_version=RESOLVER_VERSION,
+        ):
+            if merged_identity == existing_identity:
+                return UploadCompanyMetaDecision(disposition="keep", company_meta=None)
+            return UploadCompanyMetaDecision(
+                disposition="stage",
+                company_meta=CompanyMeta(
+                    company_id=existing_meta.company_id,
+                    company_name=existing_meta.company_name,
+                    ticker_identity=merged_identity,
+                    resolver_version=existing_meta.resolver_version,
+                    updated_at=now_iso8601(),
+                ),
+            )
     return UploadCompanyMetaDecision(
         disposition="stage",
         company_meta=CompanyMeta(
-            company_id=ticker_to_company_id(profile),
-            company_name=_require_company_meta_field(
-                value=company_name,
-                option_name="--company-name",
-            ),
-            ticker=profile.canonical,
-            market=profile.market,
+            company_id=ticker_to_company_id(normalize_ticker(proposed_identity.canonical_ticker)),
+            company_name=_require_upload_company_name(company_name),
+            ticker_identity=merged_identity,
             resolver_version=RESOLVER_VERSION,
             updated_at=now_iso8601(),
-            ticker_aliases=_normalize_ticker_aliases(
-                canonical_ticker=profile.canonical,
-                ticker_aliases=list(ticker_aliases),
-            ),
         ),
     )
 
@@ -112,23 +139,21 @@ def stage_upload_company_meta_decision(
     repository.upsert_company_meta(decision.company_meta, batch=batch)
 
 
-def upsert_company_meta_for_upload(
+def stage_company_meta_for_upload(
     *,
     repository: CompanyMetaRepositoryProtocol,
     ticker: str,
     action: str,
-    company_id: str | None,
     company_name: str | None,
-    ticker_aliases: list[str] | None = None,
+    ticker_aliases: Sequence[str] | None = None,
     batch: BatchToken,
 ) -> None:
-    """在上传链路中按规则写入公司级元数据。
+    """在 caller-owned batch 中读取、裁决并 stage 公司元数据。
 
     Args:
         repository: 公司元数据仓储实现。
         ticker: 股票代码。
         action: 上传动作。
-        company_id: 兼容既有调用方的可选字段；上传链路不会把它作为身份真源。
         company_name: 公司名称。
         ticker_aliases: 可选 ticker alias 列表。
         batch: caller 显式传入的 batch capability。
@@ -137,46 +162,22 @@ def upsert_company_meta_for_upload(
         无。
 
     Raises:
-        ValueError: create/update 场景在缺少公司名称时抛出。
+        UploadCompanyNameRequiredError: create/update 场景在缺少公司名称时抛出。
+        ValueError: ticker/alias 非法或既有 identity 与请求不一致时抛出。
         OSError: 仓储写入失败时抛出。
     """
 
-    normalized_action = action.strip().lower()
-    if normalized_action not in UPLOAD_ACTIONS_REQUIRING_COMPANY_META:
-        return
-
     existing_meta = _load_existing_company_meta(repository=repository, ticker=ticker)
-    if existing_meta is not None and _existing_company_meta_is_fresh(
+    decision = resolve_upload_company_meta_decision(
         existing_meta=existing_meta,
-        resolver_version=RESOLVER_VERSION,
-    ):
-        _warn_ignored_company_meta_args(
-            ticker=existing_meta.ticker,
-            company_id=company_id,
-            company_name=company_name,
-        )
-        return
-
-    profile = normalize_ticker(ticker)
-    normalized_company_id = ticker_to_company_id(profile)
-    normalized_company_name = _require_company_meta_field(
-        value=company_name,
-        option_name="--company-name",
+        ticker=ticker,
+        action=action.strip().lower(),
+        company_name=company_name,
+        ticker_aliases=tuple(ticker_aliases or ()),
     )
-    normalized_ticker_aliases = _normalize_ticker_aliases(
-        canonical_ticker=profile.canonical,
-        ticker_aliases=ticker_aliases,
-    )
-    repository.upsert_company_meta(
-        CompanyMeta(
-            company_id=normalized_company_id,
-            company_name=normalized_company_name,
-            ticker=profile.canonical,
-            market=profile.market,
-            resolver_version=RESOLVER_VERSION,
-            updated_at=now_iso8601(),
-            ticker_aliases=normalized_ticker_aliases,
-        ),
+    stage_upload_company_meta_decision(
+        repository=repository,
+        decision=decision,
         batch=batch,
     )
 
@@ -197,23 +198,22 @@ def build_upload_company_id(ticker: str) -> str:
     return ticker_to_company_id(normalize_ticker(ticker))
 
 
-def _require_company_meta_field(*, value: str | None, option_name: str) -> str:
-    """校验并返回 company meta 字段值。
+def _require_upload_company_name(value: str | None) -> str:
+    """校验并返回 upload company meta 的公司名称。
 
     Args:
-        value: 原始字段值。
-        option_name: 参数名，用于构造错误信息。
+        value: 原始公司名称。
 
     Returns:
         去除首尾空白后的字段值。
 
     Raises:
-        ValueError: 字段为空时抛出。
+        UploadCompanyNameRequiredError: 公司名称为空时抛出。
     """
 
     normalized_value = str(value or "").strip()
     if not normalized_value:
-        raise ValueError(f"create/update 时必须提供 {option_name}")
+        raise UploadCompanyNameRequiredError("create/update 时必须提供 --company-name")
     return normalized_value
 
 
@@ -242,43 +242,6 @@ def _load_existing_company_meta(
         return None
 
 
-def _normalize_ticker_aliases(
-    *,
-    canonical_ticker: str,
-    ticker_aliases: list[str] | None,
-) -> list[str]:
-    """标准化公司级 ticker alias 列表。
-
-    Args:
-        canonical_ticker: 规范 ticker。
-        ticker_aliases: 原始 alias 列表。
-
-    Returns:
-        去重后的 canonical ticker 列表，且首项始终为规范 ticker。
-
-    Raises:
-        ValueError: canonical ticker 或任一非空 alias 无法识别时抛出。
-    """
-
-    canonical_profile = try_normalize_ticker(canonical_ticker)
-    if canonical_profile is None:
-        raise ValueError(f"无法识别 canonical ticker: {canonical_ticker!r}")
-    normalized_canonical = canonical_profile.canonical
-    normalized_aliases: list[str] = []
-    for raw_alias in [normalized_canonical, *(ticker_aliases or [])]:
-        alias_text = raw_alias.strip()
-        if not alias_text:
-            continue
-        alias_profile = try_normalize_ticker(alias_text)
-        if alias_profile is None:
-            raise ValueError(f"无法识别 ticker alias: {raw_alias!r}")
-        normalized_alias = alias_profile.canonical
-        if normalized_alias in normalized_aliases:
-            continue
-        normalized_aliases.append(normalized_alias)
-    return normalized_aliases
-
-
 def _existing_company_meta_is_fresh(*, existing_meta: CompanyMeta, resolver_version: str) -> bool:
     """判断既有 upload company meta 是否由当前 resolver 语义产生。
 
@@ -296,42 +259,13 @@ def _existing_company_meta_is_fresh(*, existing_meta: CompanyMeta, resolver_vers
     return existing_meta.resolver_version == resolver_version
 
 
-def _warn_ignored_company_meta_args(
-    *,
-    ticker: str,
-    company_id: str | None,
-    company_name: str | None,
-) -> None:
-    """在现有 meta 已存在时记录 company meta 参数忽略告警。
-
-    Args:
-        ticker: 股票代码。
-        company_id: 传入的公司 ID。
-        company_name: 传入的公司名称。
-
-    Returns:
-        无。
-
-    Raises:
-        无。
-    """
-
-    normalized_company_id = str(company_id or "").strip()
-    normalized_company_name = str(company_name or "").strip()
-    if not normalized_company_id and not normalized_company_name:
-        return
-    Log.warn(
-        (
-            f"ticker={ticker} 已存在公司元数据，"
-            "将忽略本次上传传入的 company_id/company_name，继续使用现有 meta.json"
-        ),
-        module=MODULE,
-    )
-
-
 __all__ = [
     "RESOLVER_VERSION",
     "UPLOAD_ACTIONS_REQUIRING_COMPANY_META",
+    "UploadCompanyNameRequiredError",
+    "UploadCompanyMetaDecision",
     "build_upload_company_id",
-    "upsert_company_meta_for_upload",
+    "resolve_upload_company_meta_decision",
+    "stage_company_meta_for_upload",
+    "stage_upload_company_meta_decision",
 ]

@@ -82,7 +82,7 @@ async def test_upload_material_stream_uploads_docling_files(tmp_path: Path) -> N
             filing_date="2025-05-01",
             report_date="2025-03-31",
             company_name="Apple Inc.",
-            ticker_aliases=["AAPL", "APC"],
+            ticker_aliases=["AAPL", "APC", "V.BA"],
             overwrite=False,
         )
     ]
@@ -104,7 +104,9 @@ async def test_upload_material_stream_uploads_docling_files(tmp_path: Path) -> N
     company_meta = pipeline._company_repository.get_company_meta("AAPL")
     assert company_meta.company_id == "AAPL_US"
     assert company_meta.company_name == "Apple Inc."
-    assert company_meta.ticker_aliases == ["AAPL", "APC"]
+    assert company_meta.ticker_identity.accepted_aliases == ("APC", "V-BA")
+    assert pipeline._company_repository.resolve_existing_ticker(["APC"]) == "AAPL"
+    assert pipeline._company_repository.resolve_existing_ticker(["V.BA"]) == "AAPL"
     meta = pipeline._source_repository.get_source_meta(
         "AAPL",
         str(result_value["document_id"]),
@@ -146,6 +148,7 @@ async def test_upload_material_stream_auto_action_and_overwrite_reset(tmp_path: 
             material_name="Deck",
             files=[old_file],
             company_name="Apple Inc.",
+            ticker_aliases=["OLD"],
             overwrite=False,
         )
     ]
@@ -161,7 +164,8 @@ async def test_upload_material_stream_auto_action_and_overwrite_reset(tmp_path: 
             form_type="MATERIAL_OTHER",
             material_name="Deck",
             files=[new_file],
-            company_name="Apple Inc.",
+            company_name="Ignored Apple Name",
+            ticker_aliases=["NEW"],
             overwrite=True,
         )
     ]
@@ -171,6 +175,10 @@ async def test_upload_material_stream_auto_action_and_overwrite_reset(tmp_path: 
     assert overwrite_result["stored_file_count"] == 1
     assert overwrite_result["material_action"] == "update"
     assert overwrite_result["document_id"] == create_result["document_id"]
+
+    company_meta = pipeline._company_repository.get_company_meta("AAPL")
+    assert company_meta.company_name == "Apple Inc."
+    assert company_meta.ticker_identity.accepted_aliases == ("OLD", "NEW")
 
     handle = pipeline._source_repository.get_source_handle(
         "AAPL",

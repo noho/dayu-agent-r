@@ -1246,10 +1246,19 @@ def test_upload_tool_calendar_year_schema_and_usage_messages_are_business_neutra
     fiscal_year_schema = properties["fiscal_year"]
     filing_date_schema = properties["filing_date"]
     report_date_schema = properties["report_date"]
+    ticker_schema = properties["ticker"]
+    aliases_schema = properties["ticker_aliases"]
 
     assert isinstance(fiscal_year_schema, dict)
     assert isinstance(filing_date_schema, dict)
     assert isinstance(report_date_schema, dict)
+    assert isinstance(ticker_schema, dict)
+    assert isinstance(aliases_schema, dict)
+    assert "canonical ticker" in str(ticker_schema["description"])
+    assert "不要填写 CSV" in str(ticker_schema["description"])
+    assert "filing 与 material 上传都适用" in str(aliases_schema["description"])
+    assert "系统信任声明且不联网核验" in str(aliases_schema["description"])
+    assert "查询同一财报归档" in str(aliases_schema["description"])
     assert fiscal_year_schema["description"] == (
         "财年。上传 filing 时必填，且只接受 1000..9999 的整数；上传 material 时可选。"
     )
@@ -1445,6 +1454,7 @@ def test_upload_tool_accepts_local_file_outside_workspace_without_source_side_ef
                     "files": [str(outside_file)],
                     "fiscal_year": 2024,
                     "fiscal_period": "FY",
+                    "company_name": "Apple Inc.",
                 },
             ),
             _context(),

@@ -2288,7 +2288,7 @@ def test_upload_commands_map_args_and_validate_files(
             (
                 "upload_material",
                 "--ticker",
-                "MSFT,GOOG",
+                "DELTA,MSFT",
                 "--forms",
                 "8-K",
                 "--material-name",
@@ -2321,7 +2321,7 @@ def test_upload_commands_map_args_and_validate_files(
     ]
     assert fake_service.upload_material_requests == [
         _UploadMaterialCall(
-            ticker="MSFT",
+            ticker="DELTA",
             action="auto",
             files=(material_file.resolve(),),
             form_type="8-K",
@@ -2334,7 +2334,7 @@ def test_upload_commands_map_args_and_validate_files(
             filing_date=None,
             report_date=None,
             company_name=None,
-            ticker_aliases=("GOOG",),
+            ticker_aliases=("MSFT",),
             overwrite=False,
         )
     ]

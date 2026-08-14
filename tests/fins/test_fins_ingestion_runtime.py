@@ -127,6 +127,11 @@ from dayu.fins.pipelines.docling_process_converter import (
     ProcessDoclingConverter,
 )
 from dayu.fins.pipelines.docling_upload_service import build_sec_filing_ids
+from dayu.fins.pipelines.upload_company_meta import (
+    RESOLVER_VERSION,
+    UploadCompanyNameRequiredError,
+    resolve_upload_company_meta_decision,
+)
 from dayu.fins.pipelines.sec_pipeline import SecDownloadAdapter, SecPipeline
 from dayu.fins.service_runtime import (
     DefaultFinsRuntime,
@@ -148,7 +153,7 @@ from dayu.fins.storage import (
 )
 from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
 from dayu.fins.storage.repository_protocols import SourceSnapshotProtocol
-from dayu.fins.ticker_normalization import NormalizedTicker
+from dayu.fins.ticker_normalization import NormalizedTicker, build_company_ticker_identity
 from dayu.fins.tools.read_runtime import FinsReadRuntime
 import dayu.runtime.log as runtime_log
 from dayu.runtime.workspace_paths import WorkspacePaths
@@ -1075,6 +1080,38 @@ def _runtime_failure_for_status(status: str) -> FinsUploadFailureReason | None:
     return fins_upload_failure_from_exception(RuntimeError(), file_label=None)
 
 
+def test_upload_validator_accepts_v_dot_ba_alias_from_identity_grammar() -> None:
+    """upload static validator 应接受 resolver 可产生的 ``V.BA`` alias。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: producer grammar 与 upload consumer 再次断裂时抛出。
+    """
+
+    request = FinsUploadFilingRequest(
+        ticker="V",
+        action="delete",
+        fiscal_year=2024,
+        fiscal_period="FY",
+        ticker_aliases=("V.BA",),
+    )
+    validated = validate_fins_upload_filing_request(
+        request,
+        published_state=FilingUploadPublishedState(
+            company_meta=None,
+            source_meta={"source_fingerprint": "published"},
+        ),
+    )
+
+    assert validated.normalized_ticker.canonical == "V"
+    assert validated.request.ticker_aliases == ("V.BA",)
+
+
 def _pathful_basename_for_static_admission(file_path: Path) -> str:
     """为不能创建反斜杠文件名的平台提供等价 ``Path.name`` owner fixture。
 
@@ -1344,6 +1381,98 @@ def test_validate_fins_upload_filing_request_resolves_state_aware_contract(
     )
     assert updated.resolved_action == "update"
     assert updated.company_meta_decision.disposition == "keep"
+
+
+@pytest.mark.parametrize(
+    "existing_meta",
+    (
+        None,
+        CompanyMeta(
+            company_id="AAPL_US",
+            company_name="Stale Apple",
+            ticker_identity=build_company_ticker_identity("AAPL", ()),
+            resolver_version="market_resolver_v0.9.0",
+            updated_at="2026-08-14T00:00:00+00:00",
+        ),
+    ),
+)
+def test_upload_company_meta_missing_name_uses_typed_owner(
+    existing_meta: CompanyMeta | None,
+) -> None:
+    """只有 new/stale company meta 缺少公司名时才抛专用异常。
+
+    Args:
+        existing_meta: 不存在或 resolver 版本过期的 company meta。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 缺公司名未由 typed owner 表达时抛出。
+    """
+
+    with pytest.raises(UploadCompanyNameRequiredError):
+        resolve_upload_company_meta_decision(
+            existing_meta=existing_meta,
+            ticker="AAPL",
+            action="create",
+            company_name=None,
+            ticker_aliases=(),
+        )
+
+    with pytest.raises(ValueError) as exc_info:
+        resolve_upload_company_meta_decision(
+            existing_meta=existing_meta,
+            ticker="AAPL",
+            action="create",
+            company_name="Apple Inc.",
+            ticker_aliases=("NOT VALID",),
+        )
+    assert not isinstance(exc_info.value, UploadCompanyNameRequiredError)
+
+
+def test_upload_validator_does_not_project_identity_mismatch_as_company_name_required(
+    tmp_path: Path,
+) -> None:
+    """strict-valid published identity mismatch 不得伪装成缺少公司名。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: runtime 错误投影重新漂移时抛出。
+    """
+
+    upload_file = tmp_path / "report.pdf"
+    upload_file.write_bytes(b"pdf")
+    request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        files=(upload_file,),
+        fiscal_year=2024,
+        fiscal_period="FY",
+        company_name="Apple Inc.",
+    )
+    mismatched_meta = CompanyMeta(
+        company_id="MSFT_US",
+        company_name="Microsoft Corporation",
+        ticker_identity=build_company_ticker_identity("MSFT", ()),
+        resolver_version=RESOLVER_VERSION,
+        updated_at="2026-08-14T00:00:00+00:00",
+    )
+
+    with pytest.raises(ValueError, match="canonical ticker identity") as exc_info:
+        validate_fins_upload_filing_request(
+            request,
+            published_state=FilingUploadPublishedState(
+                company_meta=mismatched_meta,
+                source_meta=None,
+            ),
+        )
+
+    assert not isinstance(exc_info.value, FinsUploadUsageError)
 
 
 @pytest.mark.parametrize("overwrite", (False, True))
@@ -9320,11 +9449,9 @@ def _build_fins_workspace(
         CompanyMeta(
             company_id="0000320193",
             company_name="Apple Inc.",
-            ticker="AAPL",
-            market="US",
+            ticker_identity=build_company_ticker_identity("AAPL", ("APPLE",)),
             resolver_version="test",
             updated_at=now_iso8601(),
-            ticker_aliases=["APPLE"],
         ),
         batch=company_batch,
     )

@@ -63,6 +63,7 @@ from dayu.documents.processors.base import (
 )
 from dayu.runtime.filelock import RuntimeFileLockToken
 from dayu.documents.processors.source import Source
+from dayu.fins.ticker_normalization import build_company_ticker_identity
 from dayu.fins.domain.document_models import (
     BatchToken,
     CompanyMeta,
@@ -1093,8 +1094,7 @@ def test_rollback_and_non_source_batch_preserve_published_revision(tmp_path: Pat
         CompanyMeta(
             company_id="0000320193",
             company_name="Apple Inc.",
-            ticker="AAPL",
-            market="US",
+            ticker_identity=build_company_ticker_identity("AAPL", ()),
             resolver_version="snapshot-test",
             updated_at=now_iso8601(),
         ),
@@ -2270,8 +2270,7 @@ def test_identity_mapping_detects_collision_corruption_and_business_meta_mismatc
         CompanyMeta(
             company_id="company-aapl",
             company_name="Apple Inc.",
-            ticker="AAPL",
-            market="US",
+            ticker_identity=build_company_ticker_identity("AAPL", ()),
             resolver_version="test",
             updated_at=now_iso8601(),
         ),
@@ -2387,8 +2386,7 @@ def test_public_storage_errors_never_expose_internal_locator_or_workspace_path(
         CompanyMeta(
             company_id="opaque-company",
             company_name="Opaque Company",
-            ticker=ticker,
-            market="US",
+            ticker_identity=build_company_ticker_identity(ticker, ()),
             resolver_version="test",
             updated_at=now_iso8601(),
         ),
@@ -2479,8 +2477,7 @@ def test_public_storage_os_errors_are_path_free_across_read_and_inventory_bounda
         CompanyMeta(
             company_id="permission-company",
             company_name="Permission Company",
-            ticker=ticker,
-            market="US",
+            ticker_identity=build_company_ticker_identity(ticker, ()),
             resolver_version="test",
             updated_at=now_iso8601(),
         ),
@@ -2946,11 +2943,9 @@ def test_read_runtime_citation_reuses_same_snapshot_provenance(tmp_path: Path) -
         CompanyMeta(
             company_id="0000320193",
             company_name="Apple Inc.",
-            ticker="AAPL",
-            market="US",
+            ticker_identity=build_company_ticker_identity("AAPL", ()),
             resolver_version="test",
             updated_at=now_iso8601(),
-            ticker_aliases=[],
         ),
         batch=batch,
     )
@@ -4867,11 +4862,9 @@ def _build_fins_workspace(tmp_path: Path) -> Path:
             CompanyMeta(
                 company_id="0000320193",
                 company_name="Apple Inc.",
-                ticker="AAPL",
-                market="US",
+                ticker_identity=build_company_ticker_identity("AAPL", ("APPLE",)),
                 resolver_version="test",
                 updated_at=now_iso8601(),
-                ticker_aliases=["APPLE"],
             ),
             batch=token,
         )
@@ -5246,11 +5239,9 @@ def _build_read_runtime_with_provenance_documents(tmp_path: Path) -> FinsReadRun
             CompanyMeta(
                 company_id=company_id,
                 company_name=f"{ticker} Test Company",
-                ticker=ticker,
-                market=market,
+                ticker_identity=build_company_ticker_identity(ticker, ()),
                 resolver_version="test",
                 updated_at=now_iso8601(),
-                ticker_aliases=[],
             ),
             batch=batches[ticker],
         )
@@ -5345,11 +5336,9 @@ def _build_fins_financial_html_workspace(tmp_path: Path) -> Path:
             CompanyMeta(
                 company_id="0000320193",
                 company_name="Apple Inc.",
-                ticker="AAPL",
-                market="US",
+                ticker_identity=build_company_ticker_identity("AAPL", ()),
                 resolver_version="test",
                 updated_at=now_iso8601(),
-                ticker_aliases=[],
             ),
             batch=token,
         )
@@ -5431,11 +5420,9 @@ def _build_fins_aapl_xbrl_workspace(
             CompanyMeta(
                 company_id="0000320193",
                 company_name="Apple Inc.",
-                ticker="AAPL",
-                market="US",
+                ticker_identity=build_company_ticker_identity("AAPL", ("APPLE",)),
                 resolver_version="test",
                 updated_at=now_iso8601(),
-                ticker_aliases=["APPLE"],
             ),
             batch=token,
         )

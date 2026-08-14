@@ -22,9 +22,7 @@ from ._fs_storage_infra import (
 from ._fs_identity import _require_external_identity
 from ._fs_storage_utils import (
     _SOURCE_META_FILENAME,
-    _canonicalize_ticker_alias,
     _list_directory,
-    _normalize_company_ticker_aliases,
     _read_json_object,
     _write_json,
 )
@@ -78,7 +76,7 @@ class _FsCompanyMetaMixin(_FsStorageInfra):
             raise FileNotFoundError(f"公司元数据不存在: ticker={external_ticker}")
         data = _read_json_object(company_meta_path)
         company_meta = CompanyMeta.from_dict(data)
-        if company_meta.ticker != external_ticker:
+        if company_meta.ticker_identity.canonical_ticker != external_ticker:
             raise ValueError("公司元数据 ticker 与 identity descriptor 不一致")
         return company_meta
 
@@ -159,7 +157,7 @@ class _FsCompanyMetaMixin(_FsStorageInfra):
                     continue
                 try:
                     company_meta = CompanyMeta.from_dict(_read_json_object(meta_path))
-                    if company_meta.ticker != external_ticker:
+                    if company_meta.ticker_identity.canonical_ticker != external_ticker:
                         raise ValueError("公司元数据 ticker 与 identity descriptor 不一致")
                 except (KeyError, TypeError, ValueError) as exc:
                     inventory.append(
@@ -203,7 +201,10 @@ class _FsCompanyMetaMixin(_FsStorageInfra):
             OSError: 写入失败时抛出。
         """
 
-        state = self._resolve_active_batch(batch, meta.ticker)
+        state = self._resolve_active_batch(
+            batch,
+            meta.ticker_identity.canonical_ticker,
+        )
         self._upsert_company_meta_impl(meta, state)
 
     def _upsert_company_meta_impl(self, meta: CompanyMeta, state: _ActiveBatchState) -> None:
@@ -221,19 +222,17 @@ class _FsCompanyMetaMixin(_FsStorageInfra):
             OSError: 写入失败时抛出。
         """
 
-        ticker = _require_external_identity(meta.ticker, field_name="ticker")
+        ticker = _require_external_identity(
+            meta.ticker_identity.canonical_ticker,
+            field_name="ticker",
+        )
         ticker_dir = self._ticker_dir_for_write(ticker, state)
         normalized_meta = CompanyMeta(
             company_id=meta.company_id,
             company_name=meta.company_name,
-            ticker=ticker,
-            market=meta.market,
+            ticker_identity=meta.ticker_identity,
             resolver_version=meta.resolver_version,
             updated_at=meta.updated_at or now_iso8601(),
-            ticker_aliases=_normalize_company_ticker_aliases(
-                canonical_ticker=ticker,
-                ticker_aliases=meta.ticker_aliases,
-            ),
         )
         _write_json(ticker_dir / _SOURCE_META_FILENAME, normalized_meta.to_dict())
 
@@ -285,10 +284,10 @@ class _FsCompanyMetaMixin(_FsStorageInfra):
 
         normalized_candidates: list[str] = []
         for candidate in candidates:
-            try:
-                normalized_candidate = _canonicalize_ticker_alias(candidate)
-            except ValueError:
+            normalized = try_normalize_ticker(candidate)
+            if normalized is None:
                 continue
+            normalized_candidate = normalized.canonical
             if normalized_candidate not in normalized_candidates:
                 normalized_candidates.append(normalized_candidate)
         if not normalized_candidates:
@@ -343,7 +342,7 @@ class _FsCompanyMetaMixin(_FsStorageInfra):
         """
 
         return {
-            entry.company_meta.ticker: entry.company_meta
+            entry.company_meta.ticker_identity.canonical_ticker: entry.company_meta
             for entry in self.scan_company_meta_inventory()
             if entry.status == "available" and entry.company_meta is not None
         }
@@ -367,11 +366,9 @@ class _FsCompanyMetaMixin(_FsStorageInfra):
         alias_index: dict[str, list[str]] = {}
         for external_ticker in sorted(company_meta_by_ticker):
             company_meta = company_meta_by_ticker[external_ticker]
-            normalized_aliases = _normalize_company_ticker_aliases(
-                canonical_ticker=external_ticker,
-                ticker_aliases=company_meta.ticker_aliases,
-            )
-            for alias in normalized_aliases:
+            if company_meta.ticker_identity.canonical_ticker != external_ticker:
+                raise ValueError("公司元数据 ticker 与索引 owner 不一致")
+            for alias in company_meta.ticker_identity.lookup_tickers():
                 alias_index.setdefault(alias, [])
                 if external_ticker not in alias_index[alias]:
                     alias_index[alias].append(external_ticker)

@@ -11,6 +11,7 @@ import pytest
 import dayu.fins.pipelines.sec_upload_workflow as sec_upload_workflow
 from dayu.contracts.cancellation import CancellationToken
 from dayu.fins.domain.document_models import BatchToken, CompanyMeta, CompanyMetaInventoryEntry, now_iso8601
+from dayu.fins.ticker_normalization import build_company_ticker_identity
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.ingestion_runtime import (
     FinsUploadFilingRequest,
@@ -29,8 +30,7 @@ from dayu.fins.pipelines.docling_process_converter import (
 from dayu.fins.pipelines.upload_filing_events import UploadFilingEventType
 from dayu.fins.pipelines.upload_company_meta import (
     RESOLVER_VERSION,
-    _normalize_ticker_aliases,
-    upsert_company_meta_for_upload,
+    stage_company_meta_for_upload,
 )
 from dayu.fins.processors.registry import build_fins_processor_registry
 from dayu.fins.service_runtime import prevalidate_fins_upload_filing_request_for_workspace
@@ -364,51 +364,13 @@ def _seed_sec_upload_company_meta(
         CompanyMeta(
             company_id="AAPL_US",
             company_name=company_name,
-            ticker="AAPL",
-            market="US",
+            ticker_identity=build_company_ticker_identity("AAPL", ticker_aliases),
             resolver_version=resolver_version,
             updated_at=now_iso8601(),
-            ticker_aliases=ticker_aliases,
         ),
         batch=batch,
     )
     pipeline._batching_repository.commit_batch(batch)
-
-
-@pytest.mark.parametrize(
-    ("canonical_ticker", "raw_aliases", "expected"),
-    [
-        ("0700", ["700.HK", "HK.0700", "0700.hk"], ["0700"]),
-        ("BRK-B", ["BRK.B", "brk-b.us"], ["BRK-B"]),
-        ("AAPL", ["aapl", "AAPL.US", "us.aapl"], ["AAPL"]),
-    ],
-)
-def test_upload_company_meta_ticker_aliases_use_canonical_owner(
-    canonical_ticker: str,
-    raw_aliases: list[str],
-    expected: list[str],
-) -> None:
-    """upload ticker aliases 应 canonical 化、稳定去重并保持主 ticker 首项。
-
-    Args:
-        canonical_ticker: 主 ticker。
-        raw_aliases: 含大小写、市场后缀或类股分隔符变体的 aliases。
-        expected: 期望 canonical alias 列表。
-
-    Returns:
-        无。
-
-    Raises:
-        AssertionError: alias owner 未被消费或去重顺序漂移时抛出。
-    """
-
-    assert (
-        _normalize_ticker_aliases(
-            canonical_ticker=canonical_ticker,
-            ticker_aliases=raw_aliases,
-        )
-        == expected
-    )
 
 
 def test_upload_company_meta_invalid_ticker_alias_fails_before_repository_write() -> None:
@@ -426,12 +388,11 @@ def test_upload_company_meta_invalid_ticker_alias_fails_before_repository_write(
 
     repository = _SpyCompanyMetaRepository()
 
-    with pytest.raises(ValueError, match="无法识别 ticker alias"):
-        upsert_company_meta_for_upload(
+    with pytest.raises(ValueError, match="无法识别的 ticker"):
+        stage_company_meta_for_upload(
             repository=repository,
             ticker="AAPL",
             action="create",
-            company_id=None,
             company_name="Apple Inc.",
             ticker_aliases=["AAPL", "Apple Inc."],
             batch=BatchToken(transaction_id="invalid-alias", ticker="AAPL"),
@@ -490,7 +451,7 @@ async def test_upload_filing_stream_uploads_docling_files(tmp_path: Path) -> Non
     assert str(result_value["document_id"]).startswith("fil_sec_")
     assert result_value["filing_action"] == "create"
     company_meta = pipeline._company_repository.get_company_meta("AAPL")
-    assert company_meta.ticker_aliases == ["AAPL", "APC"]
+    assert company_meta.ticker_identity.accepted_aliases == ("APC",)
     meta = pipeline._source_repository.get_source_meta(
         "AAPL",
         str(result_value["document_id"]),
@@ -553,7 +514,7 @@ async def test_upload_filing_stream_preserves_same_version_company_meta(tmp_path
     company_meta = pipeline._company_repository.get_company_meta("AAPL")
     assert company_meta.company_name == "Existing Apple"
     assert company_meta.resolver_version == RESOLVER_VERSION
-    assert company_meta.ticker_aliases == ["AAPL", "OLD"]
+    assert company_meta.ticker_identity.accepted_aliases == ("OLD", "NEW")
 
 
 @pytest.mark.asyncio
@@ -602,7 +563,7 @@ async def test_upload_filing_stream_refreshes_stale_company_meta(tmp_path: Path)
     assert company_meta.company_id == "AAPL_US"
     assert company_meta.company_name == "Apple Refreshed"
     assert company_meta.resolver_version == RESOLVER_VERSION
-    assert company_meta.ticker_aliases == ["AAPL", "APC"]
+    assert company_meta.ticker_identity.accepted_aliases == ("STALE", "APC")
 
 
 @pytest.mark.asyncio
