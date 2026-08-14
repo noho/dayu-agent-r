@@ -954,6 +954,45 @@ def test_parse_source_document_meta_preserves_bool_and_defaults() -> None:
     assert meta["ingest_complete"] is True
 
 
+@pytest.mark.parametrize("value", [1000, 2025, 9999])
+def test_parse_source_document_meta_preserves_valid_four_digit_fiscal_year(value: int) -> None:
+    """read runtime 应保留 owner 已验证的合法四位财年。
+
+    Args:
+        value: 合法四位 fiscal year。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: read runtime 未原样保留合法年份时抛出。
+    """
+
+    meta = _parse_source_document_meta({"fiscal_year": value})
+
+    assert meta["fiscal_year"] == value
+
+
+@pytest.mark.parametrize("value", [999, 10000, True, False, "2025"])
+def test_parse_source_document_meta_fails_closed_for_invalid_historical_fiscal_year(
+    value: JsonValue,
+) -> None:
+    """read runtime 对历史非法财年必须按 domain owner 失败关闭。
+
+    Args:
+        value: 仓储中非法的历史 fiscal year 值。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法历史值被忽略、默认化或未触发 ``ValueError`` 时抛出。
+    """
+
+    with pytest.raises(ValueError, match=r"fiscal_year 必须是 1000\.\.9999 的整数"):
+        _parse_source_document_meta({"fiscal_year": value})
+
+
 @pytest.mark.parametrize(
     ("field_name", "value"),
     [
