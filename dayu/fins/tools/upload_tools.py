@@ -227,7 +227,7 @@ def _upload_parameters_schema() -> ToolParametersSchema:
         },
         "fiscal_year": {
             "type": "integer",
-            "description": "财年。上传 filing 时必填；上传 material 时可选。",
+            "description": "财年。上传 filing 时必填，且只接受 1000..9999 的整数；上传 material 时可选。",
         },
         "fiscal_period": {
             "type": "string",
@@ -256,11 +256,11 @@ def _upload_parameters_schema() -> ToolParametersSchema:
         },
         "filing_date": {
             "type": "string",
-            "description": "可选披露日期，格式 YYYY-MM-DD。",
+            "description": "可选披露日期。上传 filing 时若填写，必须是实际存在的 YYYY-MM-DD 日期；文本不会自动去除空白，空串、纯空白或首尾空白均非法。",
         },
         "report_date": {
             "type": "string",
-            "description": "可选报告期日期，格式 YYYY-MM-DD。",
+            "description": "可选报告期日期。上传 filing 时若填写，必须是实际存在的 YYYY-MM-DD 日期；文本不会自动去除空白，空串、纯空白或首尾空白均非法。",
         },
         "company_name": {
             "type": "string",
@@ -309,8 +309,8 @@ def _upload_request_from_arguments(arguments: Mapping[str, JsonValue]) -> FinsUp
             fiscal_year=_required_int(arguments, "fiscal_year"),
             fiscal_period=_required_text(arguments, "fiscal_period"),
             amended=_optional_bool(arguments, "amended", default=False),
-            filing_date=_optional_nullable_text(arguments, "filing_date"),
-            report_date=_optional_nullable_text(arguments, "report_date"),
+            filing_date=_optional_raw_nullable_text(arguments, "filing_date"),
+            report_date=_optional_raw_nullable_text(arguments, "report_date"),
             company_name=_optional_nullable_text(arguments, "company_name"),
             ticker_aliases=_optional_text_tuple(arguments, "ticker_aliases"),
             overwrite=_optional_bool(arguments, "overwrite", default=False),
@@ -332,6 +332,31 @@ def _upload_request_from_arguments(arguments: Mapping[str, JsonValue]) -> FinsUp
         ticker_aliases=_optional_text_tuple(arguments, "ticker_aliases"),
         overwrite=_optional_bool(arguments, "overwrite", default=False),
     )
+
+
+def _optional_raw_nullable_text(
+    arguments: Mapping[str, JsonValue],
+    key: str,
+) -> str | None:
+    """读取 filing 分支需保留原始形态的可选文本。
+
+    Args:
+        arguments: 工具参数。
+        key: 待读取的参数名。
+
+    Returns:
+        参数缺失或为 ``null`` 时返回 ``None``；字符串按原样返回。
+
+    Raises:
+        ValueError: 参数存在且不是字符串时抛出。
+    """
+
+    value = arguments.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{key} must be a string or null")
+    return value
 
 
 def _required_upload_kind(arguments: Mapping[str, JsonValue]) -> UploadKind:

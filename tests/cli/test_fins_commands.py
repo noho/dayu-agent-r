@@ -1159,7 +1159,85 @@ def test_download_static_usage_error_precedes_workspace_and_service_factory(
         (
             "UF-021",
             ("--ticker", "AAPL", "--fiscal-year", "-1", "--fiscal-period", "FY"),
-            "--fiscal-year 必须是非负整数",
+            "财年（fiscal_year）必须是 1000..9999 的整数",
+        ),
+        *tuple(
+            (
+                f"UF-S2-year-{raw_year}",
+                ("--ticker", "AAPL", "--fiscal-year", raw_year, "--fiscal-period", "FY"),
+                "财年（fiscal_year）必须是 1000..9999 的整数",
+            )
+            for raw_year in ("0", "999", "10000")
+        ),
+        *tuple(
+            (
+                f"UF-S2-filing-date-{case_id}",
+                (
+                    "--ticker",
+                    "AAPL",
+                    "--action",
+                    "delete",
+                    "--fiscal-year",
+                    "2024",
+                    "--fiscal-period",
+                    "FY",
+                    "--filing-date",
+                    raw_date,
+                ),
+                "披露日期（filing_date）必须是实际存在的 YYYY-MM-DD 日期",
+            )
+            for case_id, raw_date in (
+                ("empty", ""),
+                ("blank", " "),
+                ("padded", " 2024-02-29 "),
+                ("non-padded", "2024-2-29"),
+                ("non-leap", "2023-02-29"),
+                ("month", "2024-13-01"),
+                ("separator", "2024/02/29"),
+            )
+        ),
+        *tuple(
+            (
+                f"UF-S2-report-date-{case_id}",
+                (
+                    "--ticker",
+                    "AAPL",
+                    "--action",
+                    "delete",
+                    "--fiscal-year",
+                    "2024",
+                    "--fiscal-period",
+                    "FY",
+                    "--report-date",
+                    raw_date,
+                ),
+                "报告期日期（report_date）必须是实际存在的 YYYY-MM-DD 日期",
+            )
+            for case_id, raw_date in (
+                ("empty", ""),
+                ("blank", "\t"),
+                ("padded", "2024-02-29 "),
+                ("non-padded", "2024-2-29"),
+                ("non-leap", "2023-02-29"),
+                ("month", "2024-00-01"),
+                ("separator", "2024.02.29"),
+            )
+        ),
+        (
+            "UF-S2-seeded-invalid-report-date",
+            (
+                "--ticker",
+                "AAPL",
+                "--action",
+                "delete",
+                "--fiscal-year",
+                "2024",
+                "--fiscal-period",
+                "FY",
+                "--report-date",
+                "2024-04-31",
+            ),
+            "报告期日期（report_date）必须是实际存在的 YYYY-MM-DD 日期",
         ),
         (
             "UF-022",
@@ -1266,6 +1344,11 @@ def test_upload_filing_usage_matrix_precedes_service_factory_and_workspace_mutat
     """
 
     workspace_root = tmp_path / f"workspace-{case_id}"
+    seed_workspace = case_id == "UF-S2-seeded-invalid-report-date"
+    if seed_workspace:
+        workspace_root.mkdir(parents=True)
+        (workspace_root / "sentinel.txt").write_text("unchanged", encoding="utf-8")
+    before_tree = _snapshot_cli_workspace_tree(workspace_root)
     input_root = tmp_path / "input"
     input_root.mkdir()
     for suffix in ("txt", "bin", "doc", "ppt", "pptx", "csv", "json", "xbrl", "xhtml", "xml", "zip"):
@@ -1296,7 +1379,8 @@ def test_upload_filing_usage_matrix_precedes_service_factory_and_workspace_mutat
     assert factory_calls == []
     assert service.upload_filing_requests == []
     assert service.stream_calls == []
-    assert not workspace_root.exists()
+    assert _snapshot_cli_workspace_tree(workspace_root) == before_tree
+    assert workspace_root.exists() is seed_workspace
 
 
 @pytest.mark.parametrize(

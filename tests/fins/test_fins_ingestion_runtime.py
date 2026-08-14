@@ -13,7 +13,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path, PurePosixPath
 from threading import Event, Lock as ThreadingLock, Thread, current_thread, enumerate as enumerate_threads
 from typing import cast
@@ -128,7 +128,11 @@ from dayu.fins.pipelines.docling_process_converter import (
 )
 from dayu.fins.pipelines.docling_upload_service import build_sec_filing_ids
 from dayu.fins.pipelines.sec_pipeline import SecDownloadAdapter, SecPipeline
-from dayu.fins.service_runtime import DefaultFinsRuntime, ProductionFinsUploadRunner
+from dayu.fins.service_runtime import (
+    DefaultFinsRuntime,
+    ProductionFinsUploadRunner,
+    prevalidate_fins_upload_filing_request_for_workspace,
+)
 from dayu.fins.storage import (
     BatchingRepositoryProtocol,
     DocumentBlobRepositoryProtocol,
@@ -139,6 +143,7 @@ from dayu.fins.storage import (
     FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
     FilingUploadPublishedState,
+    FilingUploadStateRepositoryProtocol,
     SourceDocumentRepositoryProtocol,
 )
 from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
@@ -1128,8 +1133,8 @@ def test_fins_upload_usage_failure_mapping_is_closed_bounded_and_path_free() -> 
         "missing_fiscal_period",
         "fiscal_period_too_long",
         "unsupported_cn_fiscal_period",
-        "filing_date_too_long",
-        "report_date_too_long",
+        "invalid_filing_date",
+        "invalid_report_date",
         "company_name_too_long",
         "too_many_ticker_aliases",
         "missing_files",
@@ -1151,7 +1156,9 @@ def test_fins_upload_usage_failure_mapping_is_closed_bounded_and_path_free() -> 
         FinsUploadUsageCode.MISSING_FILES: "create/update 上传必须提供 --files",
         FinsUploadUsageCode.INVALID_FILE_BASENAME: "上传文件名无效；请提供单个非空文件名",
         FinsUploadUsageCode.COMPANY_NAME_REQUIRED: "当前公司缺少有效元数据；create/update 必须提供 --company-name",
-        FinsUploadUsageCode.INVALID_FISCAL_YEAR: "--fiscal-year 必须是非负整数",
+        FinsUploadUsageCode.INVALID_FISCAL_YEAR: "财年（fiscal_year）必须是 1000..9999 的整数",
+        FinsUploadUsageCode.INVALID_FILING_DATE: "披露日期（filing_date）必须是实际存在的 YYYY-MM-DD 日期",
+        FinsUploadUsageCode.INVALID_REPORT_DATE: "报告期日期（report_date）必须是实际存在的 YYYY-MM-DD 日期",
         FinsUploadUsageCode.FISCAL_PERIOD_TOO_LONG: "--fiscal-period 长度不能超过 240 个字符",
         FinsUploadUsageCode.UNSUPPORTED_CN_FISCAL_PERIOD: "CN/HK --fiscal-period 仅支持 Q1、Q2、Q3、Q4、H1、FY",
     }
@@ -1171,6 +1178,12 @@ def test_fins_upload_usage_failure_mapping_is_closed_bounded_and_path_free() -> 
         assert "\\" not in failure.message
         if code in exact_messages:
             assert failure.message == exact_messages[code]
+    for code in (
+        FinsUploadUsageCode.INVALID_FISCAL_YEAR,
+        FinsUploadUsageCode.INVALID_FILING_DATE,
+        FinsUploadUsageCode.INVALID_REPORT_DATE,
+    ):
+        assert "--" not in fins_upload_usage_failure(code).message
 
     assert (
         fins_upload_usage_failure(
@@ -1289,7 +1302,7 @@ def test_filing_static_admission_accepts_every_canonicalizable_basename(
 def test_validate_fins_upload_filing_request_resolves_state_aware_contract(
     tmp_path: Path,
 ) -> None:
-    """validator 必须统一解析 identity、action、company decision 与 year 0 合法域。
+    """validator 必须统一解析 identity、action 与 company decision。
 
     Args:
         tmp_path: pytest 临时目录。
@@ -1307,7 +1320,7 @@ def test_validate_fins_upload_filing_request_resolves_state_aware_contract(
     request = FinsUploadFilingRequest(
         ticker="aapl.us",
         files=(upload_file,),
-        fiscal_year=0,
+        fiscal_year=2024,
         fiscal_period=" fy ",
         company_name="Apple Inc.",
     )
@@ -1490,18 +1503,40 @@ def test_validate_fins_upload_filing_request_keeps_deleted_auto_identity_filenam
             FinsUploadUsageCode.MISSING_FISCAL_PERIOD,
         ),
         (
+            FinsUploadFilingRequest(
+                ticker="AAPL",
+                fiscal_year=2024,
+                fiscal_period="FY",
+                filing_date="2024-13-01",
+                files=(Path("missing.pdf"),),
+            ),
+            FinsUploadUsageCode.INVALID_FILING_DATE,
+        ),
+        (
+            FinsUploadFilingRequest(
+                ticker="AAPL",
+                fiscal_year=2024,
+                fiscal_period="FY",
+                report_date="2024-13-01",
+                files=(Path("missing.pdf"),),
+            ),
+            FinsUploadUsageCode.INVALID_REPORT_DATE,
+        ),
+        (
             FinsUploadFilingRequest(ticker="AAPL", fiscal_year=2024, fiscal_period="FY"),
             FinsUploadUsageCode.MISSING_FILES,
         ),
     ),
 )
 def test_validate_fins_upload_filing_request_preserves_validation_priority(
+    tmp_path: Path,
     upload_request: FinsUploadFilingRequest,
     expected_code: FinsUploadUsageCode,
 ) -> None:
-    """冲突输入必须按 ticker→year→period→files 的 owner 顺序失败。
+    """冲突输入必须按 ticker→year→period→dates→files 的 owner 顺序失败。
 
     Args:
+        tmp_path: pytest 临时目录，用于提供确定不存在的文件路径。
         upload_request: 当前非法请求。
         expected_code: 预期首个 usage code。
 
@@ -1512,12 +1547,228 @@ def test_validate_fins_upload_filing_request_preserves_validation_priority(
         AssertionError: validator 返回错误优先级时抛出。
     """
 
+    if upload_request.files:
+        missing_file = tmp_path / upload_request.files[0].name
+        assert not missing_file.exists()
+        upload_request = replace(upload_request, files=(missing_file,))
+
     with pytest.raises(FinsUploadUsageError) as exc_info:
         validate_fins_upload_filing_request(
             upload_request,
             published_state=FilingUploadPublishedState(company_meta=None, source_meta=None),
         )
     assert exc_info.value.failure.code is expected_code
+
+
+@pytest.mark.parametrize(
+    ("upload_request", "expected_code", "expected_message"),
+    (
+        (
+            FinsUploadFilingRequest(ticker="AAPL", action="delete", fiscal_year=False, fiscal_period="FY"),
+            FinsUploadUsageCode.INVALID_FISCAL_YEAR,
+            "财年（fiscal_year）必须是 1000..9999 的整数",
+        ),
+        *tuple(
+            (
+                FinsUploadFilingRequest(
+                    ticker="AAPL",
+                    action="delete",
+                    fiscal_year=raw_year,
+                    fiscal_period="FY",
+                ),
+                FinsUploadUsageCode.INVALID_FISCAL_YEAR,
+                "财年（fiscal_year）必须是 1000..9999 的整数",
+            )
+            for raw_year in (0, -1, 999, 10000)
+        ),
+        *tuple(
+            (
+                FinsUploadFilingRequest(
+                    ticker="AAPL",
+                    action="delete",
+                    fiscal_year=2024,
+                    fiscal_period="FY",
+                    filing_date=raw_date,
+                ),
+                FinsUploadUsageCode.INVALID_FILING_DATE,
+                "披露日期（filing_date）必须是实际存在的 YYYY-MM-DD 日期",
+            )
+            for raw_date in (
+                "",
+                " ",
+                " 2024-02-29 ",
+                "2024-2-29",
+                "2023-02-29",
+                "2024-13-01",
+                "2024/02/29",
+            )
+        ),
+        *tuple(
+            (
+                FinsUploadFilingRequest(
+                    ticker="AAPL",
+                    action="delete",
+                    fiscal_year=2024,
+                    fiscal_period="FY",
+                    report_date=raw_date,
+                ),
+                FinsUploadUsageCode.INVALID_REPORT_DATE,
+                "报告期日期（report_date）必须是实际存在的 YYYY-MM-DD 日期",
+            )
+            for raw_date in (
+                "",
+                "\t",
+                "2024-02-29 ",
+                "2024-2-29",
+                "2023-02-29",
+                "2024-00-01",
+                "2024.02.29",
+            )
+        ),
+    ),
+)
+def test_filing_calendar_year_static_admission_precedes_all_side_effects(
+    tmp_path: Path,
+    upload_request: FinsUploadFilingRequest,
+    expected_code: FinsUploadUsageCode,
+    expected_message: str,
+) -> None:
+    """非法 calendar/year 必须在 state、operation、runner 与 durable mutation 前失败。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        upload_request: 当前非法 filing upload request。
+        expected_code: 当前字段对应的 typed usage code。
+        expected_message: 当前字段的精确业务中立文案。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 失败投影、校验顺序或零副作用边界漂移时抛出。
+    """
+
+    preflight_workspace = tmp_path / "preflight-workspace"
+    before_preflight = _snapshot_runtime_workspace_tree(preflight_workspace)
+    with pytest.raises(FinsUploadUsageError) as preflight_exc:
+        prevalidate_fins_upload_filing_request_for_workspace(
+            upload_request,
+            workspace_root=preflight_workspace,
+        )
+    assert preflight_exc.value.failure.code is expected_code
+    assert preflight_exc.value.failure.message == expected_message
+    assert _snapshot_runtime_workspace_tree(preflight_workspace) == before_preflight
+
+    runtime_workspace = tmp_path / "runtime-workspace"
+    runtime, executor, state_repository, runner = _build_static_admission_guarded_runtime(
+        runtime_workspace
+    )
+    before_runtime = _snapshot_runtime_workspace_tree(runtime_workspace)
+
+    with pytest.raises(FinsUploadUsageError) as start_exc:
+        runtime.start_upload(upload_request)
+    assert start_exc.value.failure.code is expected_code
+    assert start_exc.value.failure.message == expected_message
+
+    with pytest.raises(FinsUploadUsageError) as observation_exc:
+        runtime.prepare_observed_upload(
+            upload_request,
+            cancellation_token=_MutableCancellationToken(),
+        )
+    assert observation_exc.value.failure.code is expected_code
+    assert observation_exc.value.failure.message == expected_message
+    assert state_repository.calls == []
+    assert executor.operations == []
+    assert runner.requests == []
+    assert runtime._observations == {}
+    assert _snapshot_runtime_workspace_tree(runtime_workspace) == before_runtime
+    assert not (runtime_workspace / ".dayu" / "fins_ingestion" / "jobs").exists()
+    assert not (runtime_workspace / "portfolio").exists()
+
+
+@pytest.mark.parametrize("fiscal_year", (1000, 9999))
+def test_filing_calendar_year_static_admission_accepts_boundaries_and_delegates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fiscal_year: int,
+) -> None:
+    """合法边界年与闰日必须委托共享 owner 并进入 state-aware path。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: shared owner 委托监视夹具。
+        fiscal_year: 待验证的四位边界年。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 合法值被拒绝、identity 不稳定或 owner 委托漂移时抛出。
+    """
+
+    original_year_parser = ingestion_runtime.parse_calendar_year
+    original_date_parser = ingestion_runtime.parse_iso_calendar_date
+    year_calls: list[int] = []
+    date_calls: list[str] = []
+
+    def record_year(value: int) -> int:
+        """记录年份 owner 委托并返回其结果。
+
+        Args:
+            value: upload static admission 传入的原始年份。
+
+        Returns:
+            shared owner 返回的合法四位年份。
+
+        Raises:
+            ValueError: shared owner 判定年份非法时抛出。
+        """
+
+        year_calls.append(value)
+        return original_year_parser(value)
+
+    def record_date(value: str) -> date:
+        """记录日期 owner 委托并返回其结果。
+
+        Args:
+            value: upload static admission 传入的原始日期文本。
+
+        Returns:
+            shared owner 返回的公历日期。
+
+        Raises:
+            ValueError: shared owner 判定日期非法时抛出。
+        """
+
+        date_calls.append(value)
+        return original_date_parser(value)
+
+    monkeypatch.setattr(ingestion_runtime, "parse_calendar_year", record_year)
+    monkeypatch.setattr(ingestion_runtime, "parse_iso_calendar_date", record_date)
+    request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        action="delete",
+        fiscal_year=fiscal_year,
+        fiscal_period="FY",
+        filing_date="2024-02-29",
+        report_date="2024-02-29",
+    )
+
+    first = prevalidate_fins_upload_filing_request_for_workspace(
+        request,
+        workspace_root=tmp_path / "first",
+    )
+    second = prevalidate_fins_upload_filing_request_for_workspace(
+        request,
+        workspace_root=tmp_path / "second",
+    )
+
+    assert first.document_id == second.document_id
+    assert first.internal_document_id == second.internal_document_id
+    assert first.resolved_action == "delete"
+    assert first.request is request
+    assert year_calls == [fiscal_year, fiscal_year, fiscal_year, fiscal_year]
+    assert date_calls == ["2024-02-29"] * 8
 
 
 def test_default_runtime_create_and_ingestion_assembly_are_lazy(tmp_path: Path) -> None:
@@ -8585,6 +8836,155 @@ def _job_event_file(workspace_root: Path, job_id: str) -> Path:
     """
 
     return workspace_root / ".dayu" / "fins_ingestion" / "jobs" / f"{job_id}.events.jsonl"
+
+
+class _ForbiddenFilingUploadStateRepository:
+    """静态 admission 测试中禁止读取的 filing state 仓储。"""
+
+    def __init__(self) -> None:
+        """初始化读取记录。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.calls: list[tuple[str, str]] = []
+
+    def read_filing_upload_state(
+        self,
+        ticker: str,
+        document_id: str,
+    ) -> FilingUploadPublishedState:
+        """记录越界读取并立即失败。
+
+        Args:
+            ticker: 待读取的 canonical ticker。
+            document_id: 待读取的 filing 文档 ID。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 方法被调用时始终抛出。
+        """
+
+        self.calls.append((ticker, document_id))
+        raise AssertionError("calendar/year static admission 前禁止读取 filing state")
+
+
+class _ForbiddenUploadRunner(FinsUploadRunner):
+    """静态 admission 测试中禁止调用的 upload runner。"""
+
+    def __init__(self) -> None:
+        """初始化 runner 请求记录。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.requests: list[ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest] = []
+
+    def run_upload(
+        self,
+        request: ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest,
+        *,
+        cancellation_checker: FinsJobCancellationChecker,
+    ) -> FinsUploadResultSummary:
+        """记录越界 runner 调用并立即失败。
+
+        Args:
+            request: runtime 传入的已验证请求。
+            cancellation_checker: runtime 传入的取消检查器。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 方法被调用时始终抛出。
+        """
+
+        del cancellation_checker
+        self.requests.append(request)
+        raise AssertionError("calendar/year static admission 前禁止调用 upload runner")
+
+
+def _snapshot_runtime_workspace_tree(workspace_root: Path) -> tuple[tuple[str, str], ...]:
+    """读取 runtime workspace 树的稳定目录/内容快照。
+
+    Args:
+        workspace_root: 待观测的 workspace 根目录。
+
+    Returns:
+        按相对路径排序的目录标记或文件 SHA-256 元组。
+
+    Raises:
+        OSError: workspace 遍历或文件读取失败时抛出。
+    """
+
+    if not workspace_root.exists():
+        return ()
+    entries: list[tuple[str, str]] = []
+    for path in sorted(workspace_root.rglob("*")):
+        relative_path = path.relative_to(workspace_root).as_posix()
+        if path.is_dir():
+            entries.append((relative_path, "directory"))
+        elif path.is_file():
+            entries.append((relative_path, hashlib.sha256(path.read_bytes()).hexdigest()))
+    return tuple(entries)
+
+
+def _build_static_admission_guarded_runtime(
+    workspace_root: Path,
+) -> tuple[
+    ingestion_runtime.FinsIngestionRuntime,
+    _HoldingExecutor,
+    _ForbiddenFilingUploadStateRepository,
+    _ForbiddenUploadRunner,
+]:
+    """构造对 state、operation 与 runner 越界调用立即失败的 runtime。
+
+    Args:
+        workspace_root: Fins workspace 根目录。
+
+    Returns:
+        runtime、延迟执行器、禁止 state 仓储与禁止 runner。
+
+    Raises:
+        OSError: 默认 runtime 仓储装配失败时抛出。
+    """
+
+    default_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    executor = _HoldingExecutor()
+    state_repository = _ForbiddenFilingUploadStateRepository()
+    runner = _ForbiddenUploadRunner()
+    runtime = ingestion_runtime.FinsIngestionRuntime.create(
+        batching_repository=default_runtime.batching_repository,
+        source_repository=default_runtime.source_repository,
+        blob_repository=default_runtime.blob_repository,
+        filing_maintenance_repository=default_runtime.filing_maintenance_repository,
+        filing_upload_state_repository=cast(
+            FilingUploadStateRepositoryProtocol,
+            state_repository,
+        ),
+        processed_repository=default_runtime.processed_repository,
+        processor_registry=default_runtime.processor_registry,
+        job_store=default_runtime.ingestion_job_store,
+        executor=executor,
+        upload_runner=runner,
+    )
+    return runtime, executor, state_repository, runner
 
 
 def _build_ingestion_runtime(

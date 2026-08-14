@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import hashlib
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -30,6 +31,9 @@ from dayu.fins.ingestion_runtime import (
     FinsIngestionRuntime,
     FinsPreprocessRequest,
     FinsUploadRequest,
+    FinsUploadUsageCode,
+    FinsUploadMaterialRequest,
+    fins_upload_usage_failure,
 )
 from dayu.fins.ingestion import (
     FINS_OBSERVATION_HANDLE_ID_PREFIX,
@@ -60,11 +64,16 @@ from dayu.fins.direct_events import (
     FinsResultSummary,
 )
 from dayu.fins.service_runtime import DefaultFinsRuntime
+from dayu.fins.storage import FilingUploadPublishedState
 from dayu.fins.tools import download_provider, preprocess_provider, provider as read_provider
 from dayu.fins.tools.download_tools import DOWNLOAD_TOOL_NAME, FinsDownloadToolCallable
 from dayu.fins.tools.preprocess_tools import PREPROCESS_TOOL_NAME, FinsPreprocessToolCallable
-from dayu.fins.tools import upload_provider
-from dayu.fins.tools.upload_tools import UPLOAD_TOOL_NAME, FinsUploadToolCallable
+from dayu.fins.tools import upload_provider, upload_tools
+from dayu.fins.tools.upload_tools import (
+    UPLOAD_TOOL_NAME,
+    FinsUploadToolCallable,
+    build_fins_upload_tool,
+)
 from dayu.runtime.config_loader import ConfigLoader, RuntimeConfig
 from dayu.runtime.tools_discovery import (
     PythonImportPathProvider,
@@ -741,6 +750,46 @@ class _NoOpExecutor:
         self.submitted_job_ids = self.submitted_job_ids + (job_id,)
 
 
+class _ForbiddenFilingUploadStateRepository:
+    """tool static admission 测试中禁止读取的 filing state 仓储。"""
+
+    def __init__(self) -> None:
+        """初始化读取记录。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.calls: list[tuple[str, str]] = []
+
+    def read_filing_upload_state(
+        self,
+        ticker: str,
+        document_id: str,
+    ) -> FilingUploadPublishedState:
+        """记录越界 state read 并立即失败。
+
+        Args:
+            ticker: 待读取的 canonical ticker。
+            document_id: 待读取的 filing 文档 ID。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 方法被调用时始终抛出。
+        """
+
+        self.calls.append((ticker, document_id))
+        raise AssertionError("tool calendar/year admission 前禁止读取 filing state")
+
+
 def test_tools_discovery_discovers_read_download_preprocess_and_upload_independently(
     tmp_path: Path,
 ) -> None:
@@ -1038,6 +1087,203 @@ def test_upload_tool_returns_external_job_awaiting_outcome(tmp_path: Path) -> No
     _assert_resume_token_is_opaque(outcome.await_spec.resume_token)
     assert outcome.snapshot is not None
     assert "finsjob_" not in outcome.snapshot.snapshot_id
+
+
+@pytest.mark.parametrize(
+    ("argument_overrides", "expected_message"),
+    (
+        ({"fiscal_year": 999}, "财年（fiscal_year）必须是 1000..9999 的整数"),
+        ({"fiscal_year": 10000}, "财年（fiscal_year）必须是 1000..9999 的整数"),
+        *tuple(
+            (
+                {"filing_date": raw_date},
+                "披露日期（filing_date）必须是实际存在的 YYYY-MM-DD 日期",
+            )
+            for raw_date in ("", " ", " 2024-02-29 ", "2024-2-29", "2023-02-29", "2024-13-01", "2024/02/29")
+        ),
+        *tuple(
+            (
+                {"report_date": raw_date},
+                "报告期日期（report_date）必须是实际存在的 YYYY-MM-DD 日期",
+            )
+            for raw_date in ("", "\t", "2024-02-29 ", "2024-2-29", "2023-02-29", "2024-00-01", "2024.02.29")
+        ),
+    ),
+)
+def test_upload_tool_filing_calendar_year_invalid_input_has_zero_side_effects(
+    tmp_path: Path,
+    argument_overrides: Mapping[str, JsonValue],
+    expected_message: str,
+) -> None:
+    """filing calendar/year 非法参数必须精确失败且不产生任何副作用。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        argument_overrides: 覆盖合法基础请求的当前非法参数。
+        expected_message: typed usage owner 产生的精确业务文案。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: outcome、state/observation/job 边界或 workspace 快照漂移时抛出。
+    """
+
+    workspace_root = _build_workspace(tmp_path)
+    (workspace_root / "sentinel.txt").write_text("unchanged", encoding="utf-8")
+    runtime, executor, state_repository = _runtime_with_static_admission_guard(
+        workspace_root=workspace_root
+    )
+    before_tree = _snapshot_tool_workspace_tree(workspace_root)
+    arguments: dict[str, JsonValue] = {
+        "ticker": "AAPL",
+        "upload_kind": "filing",
+        "action": "delete",
+        "fiscal_year": 2024,
+        "fiscal_period": "FY",
+    }
+    arguments.update(argument_overrides)
+
+    outcome = asyncio.run(
+        FinsUploadToolCallable(runtime=runtime)(
+            _call(UPLOAD_TOOL_NAME, arguments),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "invalid_argument"
+    assert outcome.result.message == expected_message
+    assert "--" not in outcome.result.message
+    assert state_repository.calls == []
+    assert executor.submitted_job_ids == ()
+    assert runtime._observations == {}
+    assert not tuple(_job_store_root(workspace_root).glob("*.json"))
+    assert _snapshot_tool_workspace_tree(workspace_root) == before_tree
+
+
+@pytest.mark.parametrize(
+    ("field_name", "raw_value", "expected_message"),
+    (
+        ("filing_date", "", "披露日期（filing_date）必须是实际存在的 YYYY-MM-DD 日期"),
+        ("filing_date", " ", "披露日期（filing_date）必须是实际存在的 YYYY-MM-DD 日期"),
+        ("filing_date", " 2024-02-29 ", "披露日期（filing_date）必须是实际存在的 YYYY-MM-DD 日期"),
+        ("report_date", "", "报告期日期（report_date）必须是实际存在的 YYYY-MM-DD 日期"),
+        ("report_date", "\t", "报告期日期（report_date）必须是实际存在的 YYYY-MM-DD 日期"),
+        ("report_date", "2024-02-29 ", "报告期日期（report_date）必须是实际存在的 YYYY-MM-DD 日期"),
+        ("filing_date", 0, "filing_date must be a string or null"),
+        ("report_date", False, "report_date must be a string or null"),
+    ),
+)
+def test_upload_tool_filing_dates_preserve_raw_text_until_domain_admission(
+    tmp_path: Path,
+    field_name: str,
+    raw_value: JsonValue,
+    expected_message: str,
+) -> None:
+    """filing date adapter 必须保留原文，且只在类型错误时自身拒绝。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        field_name: 当前 filing 日期字段名。
+        raw_value: 未经 strip 或 blank folding 的原始 JSON 值。
+        expected_message: admission 边界的精确失败文案。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: adapter 改写原文或非法参数越过 observation 边界时抛出。
+    """
+
+    workspace_root = _build_workspace(tmp_path)
+    runtime, executor, state_repository = _runtime_with_static_admission_guard(
+        workspace_root=workspace_root
+    )
+    arguments: dict[str, JsonValue] = {
+        "ticker": "AAPL",
+        "upload_kind": "filing",
+        "action": "delete",
+        "fiscal_year": 2024,
+        "fiscal_period": "FY",
+        field_name: raw_value,
+    }
+
+    outcome = asyncio.run(
+        FinsUploadToolCallable(runtime=runtime)(
+            _call(UPLOAD_TOOL_NAME, arguments),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "invalid_argument"
+    assert outcome.result.message == expected_message
+    assert state_repository.calls == []
+    assert executor.submitted_job_ids == ()
+    assert runtime._observations == {}
+
+
+def test_upload_tool_calendar_year_schema_and_usage_messages_are_business_neutral(
+    tmp_path: Path,
+) -> None:
+    """filing schema 必须自足说明 strict contract，三个 usage message 必须业务中立。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: schema 扩大 material contract 或 usage 文案出现 channel 语法时抛出。
+    """
+
+    runtime = DefaultFinsRuntime.create(
+        workspace_root=_build_workspace(tmp_path)
+    ).get_ingestion_runtime()
+    properties = build_fins_upload_tool(runtime).schema.function.parameters.properties
+    fiscal_year_schema = properties["fiscal_year"]
+    filing_date_schema = properties["filing_date"]
+    report_date_schema = properties["report_date"]
+
+    assert isinstance(fiscal_year_schema, dict)
+    assert isinstance(filing_date_schema, dict)
+    assert isinstance(report_date_schema, dict)
+    assert fiscal_year_schema["description"] == (
+        "财年。上传 filing 时必填，且只接受 1000..9999 的整数；上传 material 时可选。"
+    )
+    assert filing_date_schema["description"] == (
+        "可选披露日期。上传 filing 时若填写，必须是实际存在的 YYYY-MM-DD 日期；"
+        "文本不会自动去除空白，空串、纯空白或首尾空白均非法。"
+    )
+    assert report_date_schema["description"] == (
+        "可选报告期日期。上传 filing 时若填写，必须是实际存在的 YYYY-MM-DD 日期；"
+        "文本不会自动去除空白，空串、纯空白或首尾空白均非法。"
+    )
+    exact_messages = {
+        FinsUploadUsageCode.INVALID_FISCAL_YEAR: "财年（fiscal_year）必须是 1000..9999 的整数",
+        FinsUploadUsageCode.INVALID_FILING_DATE: "披露日期（filing_date）必须是实际存在的 YYYY-MM-DD 日期",
+        FinsUploadUsageCode.INVALID_REPORT_DATE: "报告期日期（report_date）必须是实际存在的 YYYY-MM-DD 日期",
+    }
+    for code, expected_message in exact_messages.items():
+        message = fins_upload_usage_failure(code).message
+        assert message == expected_message
+        assert "--" not in message
+
+    material_request = upload_tools._upload_request_from_arguments(
+        {
+            "ticker": "AAPL",
+            "upload_kind": "material",
+            "action": "delete",
+            "form_type": "MATERIAL_OTHER",
+            "material_name": "Deck",
+            "filing_date": " 2024-02-29 ",
+        }
+    )
+    assert isinstance(material_request, FinsUploadMaterialRequest)
+    assert material_request.filing_date == "2024-02-29"
+    assert material_request.report_date is None
 
 
 def test_awaiting_tool_callables_prepare_without_executor_submit(tmp_path: Path) -> None:
@@ -1634,6 +1880,62 @@ def _job_store_root(workspace_root: Path) -> Path:
     """
 
     return workspace_root / ".dayu" / "fins_ingestion" / "jobs"
+
+
+def _snapshot_tool_workspace_tree(workspace_root: Path) -> tuple[tuple[str, str], ...]:
+    """读取 tool workspace 的稳定目录/内容快照。
+
+    Args:
+        workspace_root: 待观测的 workspace 根目录。
+
+    Returns:
+        按相对路径排序的目录标记或文件 SHA-256 元组。
+
+    Raises:
+        OSError: workspace 遍历或文件读取失败时抛出。
+    """
+
+    entries: list[tuple[str, str]] = []
+    for path in sorted(workspace_root.rglob("*")):
+        relative_path = path.relative_to(workspace_root).as_posix()
+        if path.is_dir():
+            entries.append((relative_path, "directory"))
+        elif path.is_file():
+            entries.append((relative_path, hashlib.sha256(path.read_bytes()).hexdigest()))
+    return tuple(entries)
+
+
+def _runtime_with_static_admission_guard(
+    *,
+    workspace_root: Path,
+) -> tuple[FinsIngestionRuntime, _NoOpExecutor, _ForbiddenFilingUploadStateRepository]:
+    """构造禁止 state read 且记录 executor submit 的 tool runtime。
+
+    Args:
+        workspace_root: Fins workspace 根目录。
+
+    Returns:
+        ingestion runtime、记录执行器与禁止 state 仓储。
+
+    Raises:
+        OSError: 默认 runtime 仓储装配失败时抛出。
+    """
+
+    base_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    executor = _NoOpExecutor()
+    state_repository = _ForbiddenFilingUploadStateRepository()
+    runtime = FinsIngestionRuntime.create(
+        batching_repository=base_runtime.batching_repository,
+        source_repository=base_runtime.source_repository,
+        blob_repository=base_runtime.blob_repository,
+        filing_maintenance_repository=base_runtime.filing_maintenance_repository,
+        filing_upload_state_repository=state_repository,
+        processed_repository=base_runtime.processed_repository,
+        processor_registry=base_runtime.processor_registry,
+        job_store=base_runtime.ingestion_job_store,
+        executor=executor,
+    )
+    return runtime, executor, state_repository
 
 
 def _runtime_with_executor(

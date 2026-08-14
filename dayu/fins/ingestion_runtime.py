@@ -85,6 +85,7 @@ from dayu.fins.domain.document_models import (
     SourceHandle,
 )
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.domain.filing_semantics import parse_calendar_year, parse_iso_calendar_date
 from dayu.fins.ingestion_events import (
     FinsIngestionJobEventAppend,
     FinsIngestionJobEventRecord,
@@ -658,8 +659,8 @@ class FinsUploadUsageCode(str, Enum):
     MISSING_FISCAL_PERIOD = "missing_fiscal_period"
     FISCAL_PERIOD_TOO_LONG = "fiscal_period_too_long"
     UNSUPPORTED_CN_FISCAL_PERIOD = "unsupported_cn_fiscal_period"
-    FILING_DATE_TOO_LONG = "filing_date_too_long"
-    REPORT_DATE_TOO_LONG = "report_date_too_long"
+    INVALID_FILING_DATE = "invalid_filing_date"
+    INVALID_REPORT_DATE = "invalid_report_date"
     COMPANY_NAME_TOO_LONG = "company_name_too_long"
     TOO_MANY_TICKER_ALIASES = "too_many_ticker_aliases"
     MISSING_FILES = "missing_files"
@@ -759,12 +760,12 @@ _USAGE_MESSAGES: Final[Mapping[FinsUploadUsageCode, str]] = {
     FinsUploadUsageCode.INVALID_ACTION: "--action 仅支持 auto、create、update、delete",
     FinsUploadUsageCode.TOO_MANY_FILES: "--files 数量不能超过 100 个",
     FinsUploadUsageCode.MISSING_FISCAL_YEAR: "--fiscal-year 不能为空",
-    FinsUploadUsageCode.INVALID_FISCAL_YEAR: "--fiscal-year 必须是非负整数",
+    FinsUploadUsageCode.INVALID_FISCAL_YEAR: "财年（fiscal_year）必须是 1000..9999 的整数",
     FinsUploadUsageCode.MISSING_FISCAL_PERIOD: "--fiscal-period 不能为空",
     FinsUploadUsageCode.FISCAL_PERIOD_TOO_LONG: "--fiscal-period 长度不能超过 240 个字符",
     FinsUploadUsageCode.UNSUPPORTED_CN_FISCAL_PERIOD: "CN/HK --fiscal-period 仅支持 Q1、Q2、Q3、Q4、H1、FY",
-    FinsUploadUsageCode.FILING_DATE_TOO_LONG: "--filing-date 长度不能超过 240 个字符",
-    FinsUploadUsageCode.REPORT_DATE_TOO_LONG: "--report-date 长度不能超过 240 个字符",
+    FinsUploadUsageCode.INVALID_FILING_DATE: "披露日期（filing_date）必须是实际存在的 YYYY-MM-DD 日期",
+    FinsUploadUsageCode.INVALID_REPORT_DATE: "报告期日期（report_date）必须是实际存在的 YYYY-MM-DD 日期",
     FinsUploadUsageCode.COMPANY_NAME_TOO_LONG: "--company-name 长度不能超过 240 个字符",
     FinsUploadUsageCode.TOO_MANY_TICKER_ALIASES: "--ticker 别名数量不能超过 100 个",
     FinsUploadUsageCode.MISSING_FILES: "create/update 上传必须提供 --files",
@@ -891,7 +892,9 @@ def _validate_fins_upload_filing_static(
             _raise_upload_usage(FinsUploadUsageCode.INVALID_TICKER_ALIAS)
     if request.fiscal_year is None:
         _raise_upload_usage(FinsUploadUsageCode.MISSING_FISCAL_YEAR)
-    if isinstance(request.fiscal_year, bool) or not isinstance(request.fiscal_year, int) or request.fiscal_year < 0:
+    try:
+        parse_calendar_year(request.fiscal_year)
+    except ValueError:
         _raise_upload_usage(FinsUploadUsageCode.INVALID_FISCAL_YEAR)
     if request.fiscal_period is None or request.fiscal_period.strip() == "":
         _raise_upload_usage(FinsUploadUsageCode.MISSING_FISCAL_PERIOD)
@@ -905,8 +908,8 @@ def _validate_fins_upload_filing_static(
             _raise_upload_usage(FinsUploadUsageCode.UNSUPPORTED_CN_FISCAL_PERIOD)
     else:
         normalized_period = period_text
-    _validate_optional_upload_text(request.filing_date, FinsUploadUsageCode.FILING_DATE_TOO_LONG)
-    _validate_optional_upload_text(request.report_date, FinsUploadUsageCode.REPORT_DATE_TOO_LONG)
+    _validate_optional_upload_iso_date(request.filing_date, FinsUploadUsageCode.INVALID_FILING_DATE)
+    _validate_optional_upload_iso_date(request.report_date, FinsUploadUsageCode.INVALID_REPORT_DATE)
     _validate_optional_upload_text(request.company_name, FinsUploadUsageCode.COMPANY_NAME_TOO_LONG)
     if action != _UPLOAD_ACTION_DELETE and not request.files:
         _raise_upload_usage(FinsUploadUsageCode.MISSING_FILES)
@@ -962,6 +965,31 @@ def _validate_optional_upload_text(
     """
 
     if value is not None and len(value.strip()) > _MAX_TEXT_CHARS:
+        _raise_upload_usage(code)
+
+
+def _validate_optional_upload_iso_date(
+    value: str | None,
+    code: FinsUploadUsageCode,
+) -> None:
+    """通过共享日期 owner 验证可选 upload 日期。
+
+    Args:
+        value: 可选原始日期文本。
+        code: 当前字段对应的 typed usage code。
+
+    Returns:
+        无。
+
+    Raises:
+        FinsUploadUsageError: 日期不是实际存在的 strict ISO full date 时抛出。
+    """
+
+    if value is None:
+        return
+    try:
+        parse_iso_calendar_date(value)
+    except ValueError:
         _raise_upload_usage(code)
 
 
