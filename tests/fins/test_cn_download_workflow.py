@@ -17,9 +17,9 @@ import pytest
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
+from dayu.fins.domain.company_meta_contract import CompanyMetaCommitIntent
 from dayu.fins.domain.document_models import (
     BatchToken,
-    CompanyMeta,
     DocumentHandle,
     DocumentMeta,
     FileObjectMeta,
@@ -350,10 +350,15 @@ class _BatchIdentityCnProcessedRepository(FsProcessedDocumentRepository):
 class _FailingCnCompanyMetaRepository(FsCompanyMetaRepository):
     """在 company publication mutation 处失败的真实仓储 spy。"""
 
-    def upsert_company_meta(self, meta: CompanyMeta, *, batch: BatchToken) -> None:
+    def stage_company_meta_intent(
+        self,
+        intent: CompanyMetaCommitIntent,
+        *,
+        batch: BatchToken,
+    ) -> None:
         """拒绝 company mutation，以验证 top-level rollback owner。"""
 
-        del meta, batch
+        del intent, batch
         raise OSError("forced company publication failure")
 
 

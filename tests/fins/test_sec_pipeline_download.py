@@ -18,6 +18,8 @@ from typing import Literal, Optional, cast
 
 import pytest
 
+from tests.fins.company_meta_test_support import stage_company_meta_fixture
+
 from dayu.fins.downloaders.sec_downloader import (
     BrowseEdgarFiling,
     DownloaderEvent,
@@ -4238,7 +4240,8 @@ def test_standalone_6k_reconcile_publishes_source_and_processed_together(
         repository_set=discovery_repository_set,
     )
     discovery_batch = discovery_batching.begin_batch(ticker)
-    discovery_company.upsert_company_meta(
+    stage_company_meta_fixture(
+        discovery_company,
         CompanyMeta(
             company_id="0000000000",
             company_name="Test Company",

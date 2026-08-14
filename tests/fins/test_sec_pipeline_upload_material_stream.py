@@ -105,8 +105,8 @@ async def test_upload_material_stream_uploads_docling_files(tmp_path: Path) -> N
     assert company_meta.company_id == "AAPL_US"
     assert company_meta.company_name == "Apple Inc."
     assert company_meta.ticker_identity.accepted_aliases == ("APC", "V-BA")
-    assert pipeline._company_repository.resolve_existing_ticker(["APC"]) == "AAPL"
-    assert pipeline._company_repository.resolve_existing_ticker(["V.BA"]) == "AAPL"
+    assert pipeline._company_repository.resolve_company_ticker("APC") == "AAPL"
+    assert pipeline._company_repository.resolve_company_ticker("V.BA") == "AAPL"
     meta = pipeline._source_repository.get_source_meta(
         "AAPL",
         str(result_value["document_id"]),
@@ -190,8 +190,8 @@ async def test_upload_material_stream_auto_action_and_overwrite_reset(tmp_path: 
 
 
 @pytest.mark.asyncio
-async def test_upload_material_failure_preserves_existing_user_visible_semantics(tmp_path: Path) -> None:
-    """Filing typed failure 收束不得改变 SEC material 的既有错误文案 contract。
+async def test_upload_material_failure_uses_shared_typed_failure_owner(tmp_path: Path) -> None:
+    """SEC material terminal catch 必须复用共享 typed failure owner。
 
     Args:
         tmp_path: 临时目录。
@@ -200,7 +200,7 @@ async def test_upload_material_failure_preserves_existing_user_visible_semantics
         无。
 
     Raises:
-        AssertionError: material 被改为 filing typed failure projection 时抛出。
+        AssertionError: material 未使用 bounded typed failure projection 时抛出。
     """
 
     pipeline = SecPipeline(
@@ -228,6 +228,67 @@ async def test_upload_material_failure_preserves_existing_user_visible_semantics
     assert isinstance(result, dict)
     assert result["status"] == "failed"
     assert result["stored_file_count"] == 0
-    assert result["message"] == "create/update 时必须提供 --company-name"
-    assert "failure" not in result
-    assert events[-1].payload["error"] == "create/update 时必须提供 --company-name"
+    assert result["message"] == "上传执行失败，请检查运行日志后重试"
+    assert result["failure"] == {
+        "kind": "runtime",
+        "code": "unexpected_runtime",
+        "message": "上传执行失败，请检查运行日志后重试",
+        "retry_hint": None,
+        "file_label": None,
+    }
+    assert events[-1].payload["error"] == "上传执行失败，请检查运行日志后重试"
+
+
+@pytest.mark.asyncio
+async def test_upload_material_alias_conflict_projects_exact_typed_terminal(tmp_path: Path) -> None:
+    """SEC material alias conflict 必须从 storage typed error 投影 exact failure JSON。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: conflict 未原子拒绝或 terminal JSON 漂移时抛出。
+    """
+
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        processor_registry=build_fins_processor_registry(),
+        docling_converter=_FakeDoclingConverter(),
+    )
+    existing = pipeline._batching_repository.begin_batch("MSFT")
+    pipeline._batching_repository.commit_batch(existing)
+    material_file = tmp_path / "material.pdf"
+    material_file.write_text("demo material", encoding="utf-8")
+
+    events = [
+        event
+        async for event in pipeline.upload_material_stream(
+            ticker="AAPL",
+            action="create",
+            form_type="MATERIAL_OTHER",
+            material_name="Deck",
+            files=[material_file],
+            company_name="Apple Inc.",
+            ticker_aliases=["MSFT"],
+            overwrite=False,
+        )
+    ]
+
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    expected_failure = {
+        "kind": "storage",
+        "code": "ticker_alias_conflict",
+        "message": "股票代码别名已属于当前工作区中的其他公司，请移除冲突别名后重试",
+        "retry_hint": "请确认公司的主代码与别名声明后重新上传",
+        "file_label": None,
+    }
+    assert events[-1].event_type is UploadMaterialEventType.UPLOAD_FAILED
+    assert result["status"] == "failed"
+    assert result["stored_file_count"] == 0
+    assert result["failure"] == expected_failure
+    assert events[-1].payload["error"] == expected_failure["message"]
+    assert not (tmp_path / "portfolio" / "AAPL").exists()

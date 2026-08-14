@@ -19,6 +19,7 @@ from typing import BinaryIO, Literal, Optional, Protocol
 
 from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.source import Source
+from dayu.fins.domain.company_meta_contract import CompanyMetaCommitIntent
 from dayu.fins.domain.document_models import (
     BatchToken,
     CompanyMeta,
@@ -43,8 +44,96 @@ from dayu.fins.domain.document_models import (
     SourceHandle,
 )
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.ticker_normalization import normalize_ticker
 
 from .source_integrity import SourceIntegrityClassification
+
+
+CompanyTickerIdentityCorruptionKind = Literal[
+    "invalid_descriptor",
+    "invalid_meta",
+    "identity_mismatch",
+    "duplicate_owner",
+]
+"""Published company ticker identity corruption 的 closed kind。"""
+
+
+class CompanyTickerAliasConflictError(ValueError):
+    """本次 lookup ticker 已被另一 canonical corpus 占用。"""
+
+    alias: str
+    existing_canonical_ticker: str
+    incoming_canonical_ticker: str
+
+    def __init__(
+        self,
+        *,
+        alias: str,
+        existing_canonical_ticker: str,
+        incoming_canonical_ticker: str,
+    ) -> None:
+        """构造 incoming identity conflict。
+
+        Args:
+            alias: 发生冲突的 normalized lookup ticker。
+            existing_canonical_ticker: 当前 published owner。
+            incoming_canonical_ticker: 本次提交的 canonical corpus。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: 任一业务 identity 为空时抛出。
+        """
+
+        for field_name, ticker in (
+            ("alias", alias),
+            ("existing_canonical_ticker", existing_canonical_ticker),
+            ("incoming_canonical_ticker", incoming_canonical_ticker),
+        ):
+            if not ticker or normalize_ticker(ticker).canonical != ticker:
+                raise ValueError(f"{field_name} 必须是 normalized ticker")
+        self.alias = alias
+        self.existing_canonical_ticker = existing_canonical_ticker
+        self.incoming_canonical_ticker = incoming_canonical_ticker
+        super().__init__("股票代码别名已属于其他 canonical corpus")
+
+
+class CompanyTickerIdentityCorruptionError(ValueError):
+    """Published company ticker identity durable state 已损坏。"""
+
+    kind: CompanyTickerIdentityCorruptionKind
+    lookup_ticker: str | None
+
+    def __init__(
+        self,
+        *,
+        kind: CompanyTickerIdentityCorruptionKind,
+        lookup_ticker: str | None = None,
+    ) -> None:
+        """构造不携带 filesystem locator 的 durable corruption fact。
+
+        Args:
+            kind: closed corruption kind。
+            lookup_ticker: 可选 normalized lookup ticker，仅供结构化 owner 处理。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: kind 不属于 closed contract 或 lookup ticker 为空字符串时抛出。
+        """
+
+        allowed_kinds: frozenset[str] = frozenset(
+            {"invalid_descriptor", "invalid_meta", "identity_mismatch", "duplicate_owner"}
+        )
+        if kind not in allowed_kinds:
+            raise ValueError("未知 company ticker identity corruption kind")
+        if lookup_ticker is not None and normalize_ticker(lookup_ticker).canonical != lookup_ticker:
+            raise ValueError("lookup_ticker 必须是 normalized ticker")
+        self.kind = kind
+        self.lookup_ticker = lookup_ticker
+        super().__init__("工作区公司代码身份数据损坏")
 
 
 @dataclass(frozen=True, slots=True)
@@ -371,34 +460,38 @@ class CompanyMetaRepositoryProtocol(Protocol):
         """
         ...
 
-    def upsert_company_meta(self, meta: CompanyMeta, *, batch: BatchToken) -> None:
-        """在显式 transaction staging 中写入公司级元数据。
+    def stage_company_meta_intent(
+        self,
+        intent: CompanyMetaCommitIntent,
+        *,
+        batch: BatchToken,
+    ) -> None:
+        """在显式 transaction state 中记录公司元数据提交意图。
 
         Args:
-            meta: 待写入的公司级元数据。
+            intent: 待在 commit-time 与 authoritative published state 合并的意图。
             batch: 同一 storage core、ticker 且仍为 open 的显式 capability。
 
         Returns:
             无。
 
         Raises:
-            ValueError: capability、ticker 或元数据路径字段非法时抛出。
-            OSError: staging 写入失败时抛出。
+            ValueError: capability、ticker、意图不匹配或重复 stage 时抛出。
         """
         ...
 
-    def resolve_existing_ticker(self, ticker_candidates: list[str]) -> Optional[str]:
-        """只基于 published 公司目录与 alias 解析首个既有 ticker。
+    def resolve_company_ticker(self, ticker: str) -> str | None:
+        """按唯一 published identity index 解析 canonical corpus ticker。
 
         Args:
-            ticker_candidates: 按优先级排列的候选 ticker。
+            ticker: 单个 canonical 或 accepted alias 查询值。
 
         Returns:
-            首个命中的规范 ticker；没有命中时返回 ``None``。
+            唯一 canonical corpus ticker；输入非法或未命中时返回 ``None``。
 
         Raises:
-            ValueError: ticker 非法或一个 alias 对应多个 published 公司时抛出。
-            RuntimeFileLockError: publication guard 获取或释放失败时抛出。
+            CompanyTickerIdentityCorruptionError: descriptor、meta、identity 或唯一性损坏时抛出。
+            RuntimeFileLockError: identity/publication guard 获取或释放失败时抛出。
             OSError: published I/O 失败时抛出。
         """
         ...

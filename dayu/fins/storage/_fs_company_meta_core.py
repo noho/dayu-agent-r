@@ -2,20 +2,18 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 from dayu.fins.ticker_normalization import try_normalize_ticker
+
+from dayu.fins.domain.company_meta_contract import CompanyMetaCommitIntent
 
 from dayu.fins.domain.document_models import (
     BatchToken,
     CompanyMeta,
     CompanyMetaInventoryEntry,
-    now_iso8601,
 )
 
 from ._fs_storage_infra import (
     _RECOVERY_LOCK_FILENAME,
-    _ActiveBatchState,
     _FsStorageInfra,
     _parse_backup_directory_name,
 )
@@ -24,7 +22,6 @@ from ._fs_storage_utils import (
     _SOURCE_META_FILENAME,
     _list_directory,
     _read_json_object,
-    _write_json,
 )
 
 
@@ -186,193 +183,68 @@ class _FsCompanyMetaMixin(_FsStorageInfra):
             ),
         )
 
-    def upsert_company_meta(self, meta: CompanyMeta, *, batch: BatchToken) -> None:
-        """写入公司级元数据。
+    def stage_company_meta_intent(
+        self,
+        intent: CompanyMetaCommitIntent,
+        *,
+        batch: BatchToken,
+    ) -> None:
+        """在 transaction state 中记录唯一 CompanyMeta 提交意图。
 
         Args:
-            meta: 公司级元数据对象。
+            intent: commit-time authoritative merge 使用的提交意图。
             batch: 显式 transaction capability。
 
         Returns:
             无。
 
         Raises:
-            ValueError: capability、ticker 或元数据路径字段非法时抛出。
-            OSError: 写入失败时抛出。
+            ValueError: capability、ticker、intent 不匹配或重复 stage 时抛出。
         """
 
         state = self._resolve_active_batch(
             batch,
-            meta.ticker_identity.canonical_ticker,
+            intent.proposed_identity.canonical_ticker,
         )
-        self._upsert_company_meta_impl(meta, state)
+        if state.company_meta_intent is not None:
+            raise ValueError("同一 batch 只能 stage 一次 CompanyMeta intent")
+        state.company_meta_intent = intent
 
-    def _upsert_company_meta_impl(self, meta: CompanyMeta, state: _ActiveBatchState) -> None:
-        """执行公司元数据写入（内部实现）。
+    def resolve_company_ticker(self, ticker: str) -> str | None:
+        """按唯一 published identity index 解析 canonical corpus ticker。
 
         Args:
-            meta: 公司级元数据对象。
-            state: 已解析的内部 transaction state。
+            ticker: 单个 canonical 或 accepted alias 查询值。
 
         Returns:
-            无。
+            命中时返回 descriptor-owned canonical；非法或未命中时返回 ``None``。
 
         Raises:
-            ValueError: ticker、alias、capability 或 descriptor 不合法时抛出。
-            OSError: 写入失败时抛出。
+            CompanyTickerIdentityCorruptionError: published identity durable state 损坏时抛出。
+            RuntimeFileLockError: identity/publication guard 获取或释放失败时抛出。
+            OSError: workspace 扫描失败时抛出。
         """
 
-        ticker = _require_external_identity(
-            meta.ticker_identity.canonical_ticker,
-            field_name="ticker",
-        )
-        ticker_dir = self._ticker_dir_for_write(ticker, state)
-        normalized_meta = CompanyMeta(
-            company_id=meta.company_id,
-            company_name=meta.company_name,
-            ticker_identity=meta.ticker_identity,
-            resolver_version=meta.resolver_version,
-            updated_at=meta.updated_at or now_iso8601(),
-        )
-        _write_json(ticker_dir / _SOURCE_META_FILENAME, normalized_meta.to_dict())
-
-    def resolve_existing_ticker(self, candidates: list[str]) -> Optional[str]:
-        """按候选顺序从 published 公司目录解析已存在的 ticker。
-
-        Args:
-            candidates: 候选 ticker 列表，顺序即优先级。
-
-        Returns:
-            首个命中的仓储 ticker；若均不存在则返回 `None`。
-
-        Raises:
-            OSError: 文件系统访问失败时抛出。
-            ValueError: 同一 alias 命中多个公司目录时抛出。
-            RuntimeFileLockError: publication guard 获取或释放失败时抛出。
-        """
-
-        for candidate in candidates:
-            normalized_candidate = try_normalize_ticker(candidate)
-            if normalized_candidate is None:
-                continue
-            canonical_ticker = normalized_candidate.canonical
-            guard_token = self._acquire_publication_guard(canonical_ticker)
-            try:
-                ticker_dir = self._target_ticker_dir(canonical_ticker)
-                if ticker_dir.exists():
-                    self._ticker_dir_for_read(canonical_ticker)
-                    return canonical_ticker
-            finally:
-                self._release_lock_token(guard_token)
-        return self._resolve_existing_ticker_by_company_alias(candidates)
+        normalized = try_normalize_ticker(ticker)
+        if normalized is None:
+            return None
+        identity_token = self._acquire_company_identity_guard()
+        primary_error: Exception | None = None
+        try:
+            identities = self._scan_actual_published_company_identities()
+            index = self._build_unique_company_identity_index(identities)
+            return index.get(normalized.canonical)
+        except Exception as exc:
+            primary_error = exc
+            raise
+        finally:
+            self._release_lock_after_operation(
+                identity_token,
+                primary_error=primary_error,
+                action="company identity guard release",
+            )
 
     # ---------- 内部实现 ----------
-
-    def _resolve_existing_ticker_by_company_alias(self, candidates: list[str]) -> Optional[str]:
-        """通过公司级 `meta.json` 的 alias 解析已存在 ticker。
-
-        Args:
-            candidates: 候选 ticker 列表，顺序即优先级。
-
-        Returns:
-            首个命中的规范 ticker；若均不存在则返回 `None`。
-
-        Raises:
-            OSError: 文件系统访问失败时抛出。
-            ValueError: 同一 alias 命中多个公司目录时抛出。
-        """
-
-        normalized_candidates: list[str] = []
-        for candidate in candidates:
-            normalized = try_normalize_ticker(candidate)
-            if normalized is None:
-                continue
-            normalized_candidate = normalized.canonical
-            if normalized_candidate not in normalized_candidates:
-                normalized_candidates.append(normalized_candidate)
-        if not normalized_candidates:
-            return None
-        alias_to_tickers = self._build_company_alias_index()
-        for candidate in normalized_candidates:
-            matched_tickers = alias_to_tickers.get(candidate, [])
-            if len(matched_tickers) > 1:
-                raise ValueError(
-                    f"ticker alias={candidate} 命中多个公司目录: {matched_tickers}"
-                )
-            if len(matched_tickers) == 1:
-                return matched_tickers[0]
-        return None
-
-    def _build_company_alias_index(self) -> dict[str, list[str]]:
-        """扫描公司级 `meta.json` 并构建 alias 索引。
-
-        Args:
-            无。
-
-        Returns:
-            `alias -> [ticker]` 映射。
-
-        Raises:
-            OSError: 文件系统访问失败时抛出。
-            ValueError: 公司级元数据格式非法时抛出。
-        """
-
-        company_meta_by_ticker = self._scan_company_meta_by_ticker()
-        alias_index = self._build_company_alias_index_from_meta(company_meta_by_ticker)
-        return {
-            alias: tickers.copy()
-            for alias, tickers in alias_index.items()
-        }
-
-    def _scan_company_meta_by_ticker(self) -> dict[str, CompanyMeta]:
-        """扫描 published 可读视图中的公司级元数据。
-
-        当前可读视图只包含已提交到 `portfolio/*` 的公司目录。
-
-        Args:
-            无。
-
-        Returns:
-            `ticker -> CompanyMeta` 映射。
-
-        Raises:
-            OSError: 文件系统访问失败时抛出。
-            ValueError: 公司级元数据格式非法时抛出。
-            RuntimeFileLockError: publication guard 获取或释放失败时抛出。
-        """
-
-        return {
-            entry.company_meta.ticker_identity.canonical_ticker: entry.company_meta
-            for entry in self.scan_company_meta_inventory()
-            if entry.status == "available" and entry.company_meta is not None
-        }
-
-    def _build_company_alias_index_from_meta(
-        self,
-        company_meta_by_ticker: dict[str, CompanyMeta],
-    ) -> dict[str, list[str]]:
-        """根据公司级元数据构建 alias 索引。
-
-        Args:
-            company_meta_by_ticker: `ticker -> CompanyMeta` 映射。
-
-        Returns:
-            `alias -> [ticker]` 映射。
-
-        Raises:
-            ValueError: 公司级元数据中的 ticker 非法时抛出。
-        """
-
-        alias_index: dict[str, list[str]] = {}
-        for external_ticker in sorted(company_meta_by_ticker):
-            company_meta = company_meta_by_ticker[external_ticker]
-            if company_meta.ticker_identity.canonical_ticker != external_ticker:
-                raise ValueError("公司元数据 ticker 与索引 owner 不一致")
-            for alias in company_meta.ticker_identity.lookup_tickers():
-                alias_index.setdefault(alias, [])
-                if external_ticker not in alias_index[alias]:
-                    alias_index[alias].append(external_ticker)
-        return alias_index
 
     def _published_ticker_candidate_keys(self) -> list[str]:
         """收集 published、backup 与 lock locator 的 ticker candidates。

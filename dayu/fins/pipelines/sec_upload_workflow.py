@@ -568,6 +568,7 @@ async def run_upload_material_stream(
             payload={"result": final_result},
         )
     except Exception as exc:
+        failure_reason = fins_upload_failure_from_exception(exc, file_label=None)
         failed_result = host._build_result(
             action="upload_material",
             ticker=normalized_ticker,
@@ -588,13 +589,14 @@ async def run_upload_material_stream(
             overwrite=overwrite,
             stored_file_count=0,
             status="failed",
-            message=str(exc),
+            message=failure_reason.message,
+            failure=failure_reason.to_json(),
         )
         yield UploadMaterialEvent(
             event_type=UploadMaterialEventType.UPLOAD_FAILED,
             ticker=normalized_ticker,
             document_id=resolved_document_id,
-            payload={"error": str(exc), "result": failed_result},
+            payload={"error": failure_reason.message, "result": failed_result},
         )
 
 

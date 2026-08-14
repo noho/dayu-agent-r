@@ -64,7 +64,10 @@ from dayu.fins.direct_events import (
     FinsResultSummary,
 )
 from dayu.fins.service_runtime import DefaultFinsRuntime
-from dayu.fins.storage import FilingUploadPublishedState
+from dayu.fins.storage import (
+    CompanyTickerIdentityCorruptionError,
+    FilingUploadPublishedState,
+)
 from dayu.fins.tools import download_provider, preprocess_provider, provider as read_provider
 from dayu.fins.tools.download_tools import DOWNLOAD_TOOL_NAME, FinsDownloadToolCallable
 from dayu.fins.tools.preprocess_tools import PREPROCESS_TOOL_NAME, FinsPreprocessToolCallable
@@ -1089,6 +1092,72 @@ def test_upload_tool_returns_external_job_awaiting_outcome(tmp_path: Path) -> No
     assert "finsjob_" not in outcome.snapshot.snapshot_id
 
 
+def test_upload_tool_does_not_swallow_typed_corruption_as_invalid_argument(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """typed workspace corruption 必须先于宽泛 ValueError 投影。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest monkeypatch fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: corruption 被 except ValueError 误投影为用户参数错误时抛出。
+    """
+
+    runtime = DefaultFinsRuntime.create(workspace_root=_build_workspace(tmp_path)).get_ingestion_runtime()
+    monkeypatch.setattr(
+        runtime,
+        "prepare_observed_upload",
+        _raise_identity_corruption_on_prepare,
+    )
+    outcome = asyncio.run(
+        FinsUploadToolCallable(runtime=runtime)(
+            _call(
+                UPLOAD_TOOL_NAME,
+                {
+                    "ticker": "AAPL",
+                    "upload_kind": "filing",
+                    "action": "delete",
+                    "fiscal_year": 2024,
+                    "fiscal_period": "FY",
+                },
+            ),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "fins_upload_start_failed"
+    assert outcome.result.message == "工作区公司代码身份数据损坏，上传任务未启动。"
+    assert outcome.result.hint == "请修复工作区公司元数据后重试。"
+
+
+def _raise_identity_corruption_on_prepare(
+    request: FinsUploadRequest,
+    cancellation_token: CancellationToken,
+) -> FinsObservationHandle:
+    """为 upload tool catch-order 测试注入 typed corruption。
+
+    Args:
+        request: 上传请求。
+        cancellation_token: operation-scoped 取消 token。
+
+    Returns:
+        不返回。
+
+    Raises:
+        CompanyTickerIdentityCorruptionError: 始终抛出。
+    """
+
+    del request, cancellation_token
+    raise CompanyTickerIdentityCorruptionError(kind="invalid_descriptor")
+
+
 @pytest.mark.parametrize(
     ("argument_overrides", "expected_message"),
     (
@@ -1131,9 +1200,7 @@ def test_upload_tool_filing_calendar_year_invalid_input_has_zero_side_effects(
 
     workspace_root = _build_workspace(tmp_path)
     (workspace_root / "sentinel.txt").write_text("unchanged", encoding="utf-8")
-    runtime, executor, state_repository = _runtime_with_static_admission_guard(
-        workspace_root=workspace_root
-    )
+    runtime, executor, state_repository = _runtime_with_static_admission_guard(workspace_root=workspace_root)
     before_tree = _snapshot_tool_workspace_tree(workspace_root)
     arguments: dict[str, JsonValue] = {
         "ticker": "AAPL",
@@ -1197,9 +1264,7 @@ def test_upload_tool_filing_dates_preserve_raw_text_until_domain_admission(
     """
 
     workspace_root = _build_workspace(tmp_path)
-    runtime, executor, state_repository = _runtime_with_static_admission_guard(
-        workspace_root=workspace_root
-    )
+    runtime, executor, state_repository = _runtime_with_static_admission_guard(workspace_root=workspace_root)
     arguments: dict[str, JsonValue] = {
         "ticker": "AAPL",
         "upload_kind": "filing",
@@ -1239,9 +1304,7 @@ def test_upload_tool_calendar_year_schema_and_usage_messages_are_business_neutra
         AssertionError: schema 扩大 material contract 或 usage 文案出现 channel 语法时抛出。
     """
 
-    runtime = DefaultFinsRuntime.create(
-        workspace_root=_build_workspace(tmp_path)
-    ).get_ingestion_runtime()
+    runtime = DefaultFinsRuntime.create(workspace_root=_build_workspace(tmp_path)).get_ingestion_runtime()
     properties = build_fins_upload_tool(runtime).schema.function.parameters.properties
     fiscal_year_schema = properties["fiscal_year"]
     filing_date_schema = properties["filing_date"]

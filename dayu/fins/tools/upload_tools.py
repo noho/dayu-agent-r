@@ -30,6 +30,7 @@ from dayu.fins.ingestion_runtime import (
     FinsUploadMaterialRequest,
     FinsUploadRequest,
 )
+from dayu.fins.storage import CompanyTickerIdentityCorruptionError
 from dayu.fins.tools._ingestion_tool_helpers import (
     _awaiting_outcome_from_observation_handle,
     _failed_outcome,
@@ -101,6 +102,14 @@ class FinsUploadToolCallable:
             )
         except FinsIngestionStartCancelledError:
             return _cancelled_outcome(started_at)
+        except CompanyTickerIdentityCorruptionError:
+            return _failed_outcome(
+                tool_name=UPLOAD_TOOL_NAME,
+                started_at=started_at,
+                error=_ERROR_JOB_START_FAILED,
+                message="工作区公司代码身份数据损坏，上传任务未启动。",
+                hint="请修复工作区公司元数据后重试。",
+            )
         except ValueError as exc:
             return _failed_outcome(
                 tool_name=UPLOAD_TOOL_NAME,

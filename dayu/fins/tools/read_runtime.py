@@ -48,9 +48,11 @@ from dayu.fins.domain.enums import SourceKind
 from dayu.fins.domain.tool_models import Citation, SourceType
 from dayu.fins.storage import (
     CompanyMetaRepositoryProtocol,
+    CompanyTickerIdentityCorruptionError,
     ProcessedDocumentRepositoryProtocol,
     SourceDocumentRepositoryProtocol,
 )
+from dayu.runtime.filelock import RuntimeFileLockError
 from dayu.fins.storage.repository_protocols import (
     SourceSnapshotConsistencyError,
     SourceSnapshotProtocol,
@@ -93,7 +95,6 @@ from .result_types import (
     project_financial_statement_result,
 )
 from dayu.fins._converters import normalize_optional_text, require_non_empty_text
-from dayu.fins.ticker_normalization import try_normalize_ticker
 from .read_runtime_helpers import (
     FinsReadArgumentError,
     FinsReadBusinessError,
@@ -167,6 +168,7 @@ _RECOMMENDED_DOCUMENT_KEYS: Final[tuple[str, ...]] = (
 )
 """list_documents 推荐槽位键集合。"""
 
+
 class _SourceDocumentMeta(TypedDict):
     """read runtime 使用的 source meta 投影。
 
@@ -238,10 +240,7 @@ class _CachedProcessor:
         with self._lock:
             if self._retired or self._closed:
                 return False
-            return (
-                self.snapshot.source_kind is snapshot.source_kind
-                and self.snapshot.revision == snapshot.revision
-            )
+            return self.snapshot.source_kind is snapshot.source_kind and self.snapshot.revision == snapshot.revision
 
     def try_acquire_borrow(self) -> bool:
         """尝试为 live 条目增加一个 active borrow。
@@ -362,12 +361,7 @@ class _CachedProcessor:
             无。
         """
 
-        if (
-            not self._retired
-            or self._active_borrows != 0
-            or self._closed
-            or self._closing
-        ):
+        if not self._retired or self._active_borrows != 0 or self._closed or self._closing:
             return False
         self._closing = True
         return True
@@ -2305,16 +2299,7 @@ class FinsReadRuntime:
         tool_name: str,
         cancellation_token: CancellationToken | None = None,
     ) -> str:
-        """将外部 ticker 归一化为可用 ticker。
-
-        解析顺序：
-        1. ``require_non_empty_text`` 拒绝空输入。
-        2. 走 ``try_normalize_ticker`` 真源把 ``0700.HK`` / ``600519.SH`` 等
-           常见变形归一化为 canonical；作为唯一查询候选。
-        3. 若真源识别失败（例如用户传了 ``"Apple Inc."`` 这种公司名），回退到
-           ``strip().upper()`` 作为候选；保留"公司名可当 ticker 传"的既有行为。
-        4. 仓储 ``resolve_existing_ticker`` 在 canonical 未命中时会走公司级
-           ``ticker_aliases`` 索引反查；alias 已全部归一化，无需再构造变体。
+        """通过 storage 唯一 identity route 解析 canonical corpus ticker。
 
         Args:
             ticker: 原始 ticker。
@@ -2339,13 +2324,21 @@ class FinsReadRuntime:
                 "Argument must not be empty",
             ),
         )
-        normalized_source = try_normalize_ticker(normalized_ticker)
-        if normalized_source is not None:
-            probe_ticker = normalized_source.canonical
-        else:
-            probe_ticker = normalized_ticker.strip().upper()
         _raise_if_fins_cancelled(cancellation_token)
-        resolved_ticker = self._company_repository.resolve_existing_ticker([probe_ticker])
+        try:
+            resolved_ticker = self._company_repository.resolve_company_ticker(normalized_ticker)
+        except CompanyTickerIdentityCorruptionError as exc:
+            raise FinsReadBusinessError(
+                code=ErrorCode.WORKSPACE_IDENTITY_CORRUPTED,
+                message="工作区中的公司代码身份数据不一致，当前无法安全解析该公司",
+                hint="请修复该工作区的公司元数据后重试",
+            ) from exc
+        except (RuntimeFileLockError, OSError) as exc:
+            raise FinsReadBusinessError(
+                code=ErrorCode.STORAGE_UNAVAILABLE,
+                message="财报存储当前无法建立一致读取视图",
+                hint="请稍后重试；若持续失败，请检查工作区存储权限与锁服务",
+            ) from exc
         _raise_if_fins_cancelled(cancellation_token)
         if resolved_ticker is None:
             raise FinsReadBusinessError(
@@ -2355,8 +2348,7 @@ class FinsReadRuntime:
             )
         if resolved_ticker != normalized_ticker:
             Log.debug(
-                f"ticker 已归一化: tool={tool_name} raw={normalized_ticker!r} "
-                f"probe={probe_ticker!r} canonical={resolved_ticker!r}",
+                f"ticker 已归一化: tool={tool_name} raw={normalized_ticker!r} canonical={resolved_ticker!r}",
                 module=self.MODULE,
             )
         return resolved_ticker
@@ -2609,8 +2601,7 @@ class FinsReadRuntime:
         provenance = snapshot.provenance
         if not provenance.ingest_complete:
             raise FileNotFoundError(
-                f"source document 尚未完成入库: ticker={snapshot.ticker}, "
-                f"document_id={snapshot.document_id}"
+                f"source document 尚未完成入库: ticker={snapshot.ticker}, document_id={snapshot.document_id}"
             )
         if snapshot.source_kind is SourceKind.MATERIAL:
             source_type = SourceType.SUPPLEMENTARY.value
@@ -2940,11 +2931,7 @@ class FinsReadRuntime:
         cached = self._processor_cache.get(cache_key)
         acquired_cached = False
         try:
-            acquired_cached = (
-                cached is not None
-                and cached.matches(light_snapshot)
-                and cached.try_acquire_borrow()
-            )
+            acquired_cached = cached is not None and cached.matches(light_snapshot) and cached.try_acquire_borrow()
         except BaseException as compare_error:
             self._close_unowned_snapshot(light_snapshot, active_error=compare_error)
             if cached is not None:
@@ -2981,11 +2968,7 @@ class FinsReadRuntime:
                 self._ensure_open()
                 _raise_if_fins_cancelled(cancellation_token)
                 competing = self._processor_cache.get(cache_key)
-                if (
-                    competing is not None
-                    and competing.matches(full_snapshot)
-                    and competing.try_acquire_borrow()
-                ):
+                if competing is not None and competing.matches(full_snapshot) and competing.try_acquire_borrow():
                     try:
                         self._close_unowned_snapshot(full_snapshot, active_error=None)
                     except BaseException as close_error:
@@ -3061,8 +3044,7 @@ class FinsReadRuntime:
         parsed_source_meta = _parse_source_document_meta(source_meta)
         if parsed_source_meta["is_deleted"] or not parsed_source_meta["ingest_complete"]:
             raise FileNotFoundError(
-                f"source document 当前不可读取: ticker={snapshot.ticker}, "
-                f"document_id={snapshot.document_id}"
+                f"source document 当前不可读取: ticker={snapshot.ticker}, document_id={snapshot.document_id}"
             )
         form_type = normalize_optional_text(parsed_source_meta["form_type"])
         _raise_if_fins_cancelled(cancellation_token)
@@ -3207,9 +3189,7 @@ class FinsReadRuntime:
                 if first_error is None:
                     first_error = close_error
                 else:
-                    first_error.add_note(
-                        f"另一个 processor snapshot cleanup 失败: type={type(close_error).__name__}"
-                    )
+                    first_error.add_note(f"另一个 processor snapshot cleanup 失败: type={type(close_error).__name__}")
         if first_error is not None:
             raise first_error
 
@@ -3418,10 +3398,7 @@ class FinsReadRuntime:
         errno_text = ""
         if isinstance(close_error, OSError) and close_error.errno is not None:
             errno_text = f" errno={close_error.errno}"
-        primary_error.add_note(
-            "processor snapshot cleanup 失败: "
-            f"type={type(close_error).__name__}{errno_text}"
-        )
+        primary_error.add_note(f"processor snapshot cleanup 失败: type={type(close_error).__name__}{errno_text}")
 
     @staticmethod
     def _raise_source_changed_during_read(*, cause: Exception | None = None) -> NoReturn:

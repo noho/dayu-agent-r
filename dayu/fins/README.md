@@ -107,9 +107,11 @@ read runtime 的每个 processor cache entry 独占一份 full snapshot，并从
 
 storage mutation authority 由显式 `BatchToken(transaction_id, ticker)` 承载。只有 `BatchingRepositoryProtocol` 提供 `begin_batch(...)`、`commit_batch(...)` 与 `rollback_batch(...)` lifecycle；source、blob、processed、company 与 filing maintenance 的所有 mutation 都要求 keyword-only `batch=`，并由 shared repository set 的同一 storage core 校验 token 仍开放且 ticker 匹配。异步 task、线程或 callback 不从上下文推断 authority；需要回调写文件时，每次 invocation 都显式接收并传递同一个 token。
 
+Company ticker identity 的 durable owner 分为两项：每个 published corpus 的 identity descriptor 持有 exact canonical ticker；存在且严格合法的 `CompanyMeta` 只额外持有 accepted aliases。descriptor 合法但 `meta.json` 缺失是 canonical-only 的合法状态，不是 corruption，也不允许从文档、请求或目录名反推 alias。`CompanyMetaRepositoryProtocol.resolve_company_ticker(...)` 是 canonical/alias 到 canonical corpus 的唯一公开路由：在 workspace identity guard 内扫描 descriptor 与可选 CompanyMeta，构造单值唯一 index；canonical 与任一 accepted alias 因而路由同一 corpus。descriptor/meta 损坏、二者 identity mismatch 或 durable duplicate owner 产生 closed typed corruption；incoming canonical/alias 被另一 corpus 占用则产生独立 typed conflict。
+
 source publication 使用 blob-first、complete-source commit：producer 可以先在 caller-owned batch 中按 identity handle 写入全部 blob，published read 在 commit 前仍看不到该 source；随后 producer 只执行一次 final source mutation，完整提供 meta、files、primary、provenance 与 manifest 所需事实。完整输入替换既有 source 时，shared Docling owner 先在同一 batch reset exact identity，再以 create 发布唯一 final source meta；reset 前读取的 source meta 继续作为 version、`first_ingested_at` 与 `created_at` 真源。commit validator 是完整 source 的资格 owner，拒绝缺失、悬空、重复、false completion、非法 provenance、symlink 或 containment escape；不存在 acknowledgement、半完成 source 或 stable re-entry 契约。
 
-文件系统实现对同 ticker writer 使用覆盖整个 transaction 的 reservation：同进程调用方通过 per-ticker condition 等待，跨进程调用方通过 blocking writer lock 串行化，不使用 timeout 猜测写者完成。commit 与 recovery 的物理目录切换另由短时 publication guard 保护，published read 不读取 staging，也不被长 staging / validator 阶段阻塞；published meta、manifest、blob、processed 与 `LocalFileSource.open()` 在在线 rename 窗口只能观察完整 old 或完整 new。所有 writer 退出路径统一释放 reservation 并通知等待者；recovery 只做 nonblocking try-lock，活动 writer 存在时立即跳过。journal 只保存可校验的最小相对事实；进程崩溃后 fresh repository 会在相同锁序下恢复到完整 old/new，并清理未提交 staging。
+文件系统实现对同 ticker writer 使用覆盖整个 transaction 的 reservation：同进程调用方通过 per-ticker condition 等待，跨进程调用方通过 blocking writer lock 串行化，不使用 timeout 猜测写者完成。普通既有 corpus 的 document-only commit 保持 ticker writer 到 publication guard 的局部路径；带 CompanyMeta intent 或首次发布 descriptor 的 commit 固定使用 `writer -> recovery -> workspace identity -> publication`，在 backup/swap 前重读 authoritative CompanyMeta、合并 aliases、严格扫描全部 published identities 并验证唯一性。recovery 的物理恢复同样在 nonblocking ticker writer 后取得 workspace identity 与 publication guards，避免 crash 恢复与新 identity publication 交错。published read 不读取 staging，也不被长 staging / validator 阶段阻塞；published meta、manifest、blob、processed 与 `LocalFileSource.open()` 在在线 rename 窗口只能观察完整 old 或完整 new。所有 writer 退出路径统一释放 reservation并通知等待者；journal 只保存可校验的最小相对事实；进程崩溃后 fresh repository 会在相同锁序下恢复到完整 old/new，并清理未提交 staging。
 
 source repository 以 typed integrity contract 分类 published 或 staged source：`MISSING` 表示目标不存在，`COMPLETE` 表示完整树通过结构、文件大小与 SHA-256 校验，`REPAIR_REQUIRED` 表示已发布目标缺文件、大小不符或 digest 不符；malformed SHA-256 属于结构损坏并直接失败，不降级为可修复状态。下载 workflow 在任何 company、maintenance 或 rejected artifact publication 前执行 whole-tree preflight；恰有一个本轮已选中的损坏目标时先完成 repair 并重新校验完整树，多处损坏或未选中目标损坏则在业务副作用前 fail closed。repair transport 始终重新取得目标内容，Phase B 仍按原请求的 overwrite policy 与同版 identity 决定 publication；provider、PDF 与 Docling I/O 均不在 writer reservation 内执行。
 
@@ -127,7 +129,7 @@ financial statement result contract 由 `dayu.fins.domain.financial_result_contr
 
 XBRL facts processor result contract 由 `dayu.fins.domain.xbrl_result_contract` 持有：`query_xbrl_facts` 必须包含扁平 `query_params`、`facts` 与 `data_quality`，可选过滤条件只在实际提供时出现；`reason` 仅在 `partial` 时出现。正常执行但零命中是 `xbrl` 结果；部分 concept 失败是带 reason 的 `partial`；全部 concept 失败抛 typed execution error。read runtime 先校验并独立复制输入，再规范化和稳定去重而不修改 producer 数据；唯一公共 projection 输出最终 `facts`，并只用 `fact_count=len(facts)` 表达同一结果实际返回的事实数量。
 
-上传链路的 company meta freshness 由 `dayu.fins.pipelines.upload_company_meta` 持有：只有既有 meta 的 `resolver_version` 等于当前 upload resolver 版本时才可保留；版本不一致时必须用本次上传字段重新校验并写入。`updated_at` 仅是审计时间，不是 freshness TTL。SEC/CN/HK 下载链路仍由各自 producer 写入公司元数据，不经上传 freshness 逻辑；read runtime 只读取仓储中的 company meta，不刷新或推断 freshness。
+上传链路的 company meta freshness 与 intent construction 由 `dayu.fins.pipelines.upload_company_meta` 持有：只有既有 meta 的 `resolver_version` 等于当前 upload resolver 版本时才可保留；版本不一致时必须用本次上传字段重新校验。producer 只 stage `CompanyMetaCommitIntent`，storage 在 commit 锁内重读 authoritative CompanyMeta，并通过 `dayu.fins.domain.company_meta_contract` 的唯一 pure merge contract 选择非身份字段、stable-union aliases 与 `updated_at`；prevalidation snapshot 不可覆盖并发更新。SEC/CN/HK 下载 producer 也提交同一 intent contract。read runtime 只消费 storage 的唯一 ticker route 与已发布 company meta，不刷新或推断 freshness。
 
 ### Resolver
 
@@ -135,7 +137,7 @@ XBRL facts processor result contract 由 `dayu.fins.domain.xbrl_result_contract`
 
 当前已实现 FMP 公司信息 resolver：
 
-- `FmpCompanyInfo(canonical_ticker, company_name, ticker_aliases)`：不可变解析结果，`ticker_aliases` 是 tuple，首项恒为 canonical ticker。
+- `FmpCompanyInfo(ticker_identity, company_name)`：不可变解析结果；`ticker_identity` 同时携带 canonical ticker、市场信息与严格同名搜索得到的 accepted aliases，aliases 不重复 canonical-equivalent 写法。
 - `FmpCompanyInfoResolver(api_key=..., http_client=..., timeout_seconds=...)`：显式接收 FMP API key 和 timeout，不读取环境变量。
 - `resolve_company_info(canonical_ticker)`：先用 `search-symbol` 精确匹配 canonical ticker 后定位公司名，再用 `search-name` 搜索严格同名证券，alias 去重后返回；HTTP、JSON、空结果、无精确 ticker 命中、非法 payload 或第二跳失败都会收口为 `FmpCompanyInfoResolutionError`。
 
@@ -822,7 +824,7 @@ Fins awaiting tools 不直接恢复 Host Run。Service assembly 根据 active ty
 
 ### Ticker normalization
 
-Fins read 与 ingestion 都通过 `ticker_normalization.normalize_ticker(...)` 收口 ticker 输入，生成 canonical ticker、market 和 exchange。工具 schema 允许模型传自然 ticker 写法；业务路由以 canonical ticker 为准。upload company meta 的每个非空 `ticker_aliases` 输入都通过 `try_normalize_ticker(...)` 生成 canonical alias，主 ticker 始终位于首项且相同 canonical 只保存一次；无法识别的 alias 在仓储写入前失败关闭。
+Fins ticker grammar、canonicalization 与 stable dedupe 统一由 `CompanyTickerIdentity` builder 持有，并生成 canonical ticker、market、exchange 与 accepted aliases。upload company meta 的每个非空 alias 都必须通过同一 builder；canonical-equivalent 写法只形成 canonical，不进入 aliases，distinct aliases 保持首次出现顺序，无法识别的 alias 在仓储写入前失败关闭。Read runtime 不再构造候选、转大写或 loose fallback，只把原始单个查询 token 交给 storage 的 `resolve_company_ticker(...)`；storage 机械消费 descriptor canonical + valid CompanyMeta aliases 的唯一 index。
 
 ## 扩展点
 

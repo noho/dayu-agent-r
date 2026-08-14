@@ -5,9 +5,9 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+from dayu.fins.domain.company_meta_contract import CompanyMetaCommitIntent
 from dayu.fins.domain.document_models import (
     BatchToken,
-    CompanyMeta,
     DocumentHandle,
     SourceDocumentStateChangeRequest,
     SourceDocumentUpsertRequest,
@@ -121,11 +121,16 @@ class TrackingCompanyMetaRepository(FsCompanyMetaRepository):
         self.stage_tokens: list[BatchToken] = []
         self.fail_after_stage = False
 
-    def upsert_company_meta(self, meta: CompanyMeta, *, batch: BatchToken) -> None:
+    def stage_company_meta_intent(
+        self,
+        intent: CompanyMetaCommitIntent,
+        *,
+        batch: BatchToken,
+    ) -> None:
         """记录 token、执行真实 stage，并按需注入主异常。
 
         Args:
-            meta: authoritative decision 携带的 company meta。
+            intent: authoritative merge 使用的 company meta intent。
             batch: caller-owned batch capability。
 
         Returns:
@@ -138,7 +143,7 @@ class TrackingCompanyMetaRepository(FsCompanyMetaRepository):
         """
 
         self.stage_tokens.append(batch)
-        super().upsert_company_meta(meta, batch=batch)
+        super().stage_company_meta_intent(intent, batch=batch)
         if self.fail_after_stage:
             raise RuntimeError("injected company stage primary failure")
 

@@ -20,6 +20,8 @@ from typing import cast
 
 import pytest
 
+from tests.fins.company_meta_test_support import stage_company_meta_fixture
+
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.source import Source
@@ -140,6 +142,7 @@ from dayu.fins.service_runtime import (
 )
 from dayu.fins.storage import (
     BatchingRepositoryProtocol,
+    CompanyTickerAliasConflictError,
     DocumentBlobRepositoryProtocol,
     FsBatchingRepository,
     FsCompanyMetaRepository,
@@ -173,9 +176,7 @@ def test_failed_pipeline_result_requires_closed_typed_failure_reason() -> None:
     """
 
     with pytest.raises(ValueError):
-        FinsUploadPipelineResult.from_pipeline_json(
-            {"status": "failed", "stored_file_count": 0}
-        )
+        FinsUploadPipelineResult.from_pipeline_json({"status": "failed", "stored_file_count": 0})
     with pytest.raises(ValueError):
         FinsUploadPipelineResult.from_pipeline_json(
             {
@@ -336,9 +337,7 @@ def test_failed_pipeline_result_rejects_unsafe_or_open_failure_json(
     """
 
     with pytest.raises(ValueError):
-        FinsUploadPipelineResult.from_pipeline_json(
-            {"status": "failed", "stored_file_count": 0, "failure": failure}
-        )
+        FinsUploadPipelineResult.from_pipeline_json({"status": "failed", "stored_file_count": 0, "failure": failure})
 
 
 @pytest.mark.parametrize(
@@ -864,9 +863,7 @@ def _constructor_keyword_sets(source_path: Path, constructor_name: str) -> list[
     return [
         frozenset(keyword.arg for keyword in node.keywords if keyword.arg is not None)
         for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == constructor_name
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == constructor_name
     ]
 
 
@@ -895,28 +892,18 @@ def _direct_exception_handler_names(
     tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
     owner_body = tree.body
     if class_name is not None:
-        owner_classes = [
-            node
-            for node in tree.body
-            if isinstance(node, ast.ClassDef) and node.name == class_name
-        ]
+        owner_classes = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name]
         assert len(owner_classes) == 1
         owner_body = owner_classes[0].body
     workflow_functions = [
-        node
-        for node in owner_body
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == function_name
+        node for node in owner_body if isinstance(node, ast.AsyncFunctionDef) and node.name == function_name
     ]
     assert len(workflow_functions) == 1
     outer_tries = [node for node in workflow_functions[0].body if isinstance(node, ast.Try)]
     assert len(outer_tries) == 1
     handler_types = [handler.type for handler in outer_tries[0].handlers]
     assert all(isinstance(handler_type, ast.Name) for handler_type in handler_types)
-    return tuple(
-        handler_type.id
-        for handler_type in handler_types
-        if isinstance(handler_type, ast.Name)
-    )
+    return tuple(handler_type.id for handler_type in handler_types if isinstance(handler_type, ast.Name))
 
 
 def test_filing_workflows_consume_only_typed_admission_failure_before_generic_handlers() -> None:
@@ -964,11 +951,14 @@ def test_filing_workflows_consume_only_typed_admission_failure_before_generic_ha
     )
 
     for source_path, class_name, function_name, expected_handlers in workflow_contracts:
-        assert _direct_exception_handler_names(
-            source_path,
-            function_name=function_name,
-            class_name=class_name,
-        ) == expected_handlers
+        assert (
+            _direct_exception_handler_names(
+                source_path,
+                function_name=function_name,
+                class_name=class_name,
+            )
+            == expected_handlers
+        )
 
 
 def test_production_upload_count_constructors_are_explicit_and_complete() -> None:
@@ -1011,34 +1001,34 @@ def test_production_upload_count_constructors_are_explicit_and_complete() -> Non
         if isinstance(node, ast.ClassDef) and node.name == "FinsUploadPipelineResult"
     )
     parser_method = next(
-        node
-        for node in pipeline_class.body
-        if isinstance(node, ast.FunctionDef) and node.name == "from_pipeline_json"
+        node for node in pipeline_class.body if isinstance(node, ast.FunctionDef) and node.name == "from_pipeline_json"
     )
     pipeline_calls = [
         frozenset(keyword.arg for keyword in node.keywords if keyword.arg is not None)
         for node in ast.walk(parser_method)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "cls"
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "cls"
     ]
 
     assert len(summary_calls) == 4
     assert all({"requested_file_count", "stored_file_count"} <= keywords for keywords in summary_calls)
     assert len(operation_calls) == 4
     assert all("stored_file_count" in keywords for keywords in operation_calls)
-    assert pipeline_calls == [frozenset({
-        "status",
-        "stored_file_count",
-        "document_id",
-        "internal_document_id",
-        "primary_document",
-        "deleted",
-        "skip_reason",
-        "document_version",
-        "source_fingerprint",
-        "failure_reason",
-    })]
+    assert pipeline_calls == [
+        frozenset(
+            {
+                "status",
+                "stored_file_count",
+                "document_id",
+                "internal_document_id",
+                "primary_document",
+                "deleted",
+                "skip_reason",
+                "document_version",
+                "source_fingerprint",
+                "failure_reason",
+            }
+        )
+    ]
 
 
 def _valid_runtime_filing_request(*, ticker: str = "AAPL") -> FinsUploadFilingRequest:
@@ -1372,7 +1362,13 @@ def test_validate_fins_upload_filing_request_resolves_state_aware_contract(
     assert validated.company_meta_decision.disposition == "stage"
 
     present = FilingUploadPublishedState(
-        company_meta=validated.company_meta_decision.company_meta,
+        company_meta=CompanyMeta(
+            company_id="AAPL_US",
+            company_name="Apple Inc.",
+            ticker_identity=build_company_ticker_identity("AAPL", ()),
+            resolver_version=RESOLVER_VERSION,
+            updated_at="2026-08-15T00:00:00+00:00",
+        ),
         source_meta={"source_fingerprint": "old"},
     )
     updated = validate_fins_upload_filing_request(
@@ -1789,9 +1785,7 @@ def test_filing_calendar_year_static_admission_precedes_all_side_effects(
     assert _snapshot_runtime_workspace_tree(preflight_workspace) == before_preflight
 
     runtime_workspace = tmp_path / "runtime-workspace"
-    runtime, executor, state_repository, runner = _build_static_admission_guarded_runtime(
-        runtime_workspace
-    )
+    runtime, executor, state_repository, runner = _build_static_admission_guarded_runtime(runtime_workspace)
     before_runtime = _snapshot_runtime_workspace_tree(runtime_workspace)
 
     with pytest.raises(FinsUploadUsageError) as start_exc:
@@ -5932,17 +5926,19 @@ async def test_direct_upload_filing_success_publishes_fins_assets_without_host_o
         SourceKind.FILING,
     )
     published_names = sorted(
-        item.uri.rsplit("/", maxsplit=1)[-1]
-        for item in default_runtime.blob_repository.list_files(source_handle)
+        item.uri.rsplit("/", maxsplit=1)[-1] for item in default_runtime.blob_repository.list_files(source_handle)
     )
     assert source_meta["ingest_method"] == "upload"
     assert source_meta["primary_document"] == "report_docling.json"
     assert published_names == ["report.pdf", "report_docling.json"]
     assert default_runtime.blob_repository.read_file_bytes(source_handle, "report.pdf") == original_bytes
-    assert default_runtime.blob_repository.read_file_bytes(
-        source_handle,
-        "report_docling.json",
-    ) == b'{"name": "report.pdf", "format": "docling"}'
+    assert (
+        default_runtime.blob_repository.read_file_bytes(
+            source_handle,
+            "report_docling.json",
+        )
+        == b'{"name": "report.pdf", "format": "docling"}'
+    )
     assert default_runtime.company_repository.get_company_meta("AAPL").company_name == "Apple Inc."
 
     job_store = ingestion.job_store
@@ -6257,6 +6253,89 @@ async def test_direct_upload_typed_failure_projection_bypasses_string_classifier
     assert details["retry hint"] == "请提供非空文件后重试"
     assert details["file"] == "输入文件（文件名已隐藏）"
     assert upload_file.name not in repr(result)
+
+
+@pytest.mark.asyncio
+async def test_alias_conflict_failure_is_identical_across_direct_durable_and_observation(
+    tmp_path: Path,
+) -> None:
+    """alias conflict failure owner 必须同源投影 direct、durable 与 awaiting observation。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 任一 surface 重分类、重写或丢失 exact failure JSON 时抛出。
+    """
+
+    reason = fins_upload_failure_from_exception(
+        CompanyTickerAliasConflictError(
+            alias="MSFT",
+            existing_canonical_ticker="MSFT",
+            incoming_canonical_ticker="AAPL",
+        ),
+        file_label=None,
+    )
+    summary = FinsUploadResultSummary(
+        source_kind=SourceKind.MATERIAL,
+        status="failed",
+        requested_file_count=1,
+        stored_file_count=0,
+        failure_reason=reason,
+    )
+    executor = _HoldingExecutor()
+    runtime = _build_ingestion_runtime(
+        tmp_path / "fins-workspace",
+        executor=executor,
+        upload_runner=_FakeUploadRunner(summary),
+    )
+    upload_file = tmp_path / "material.pdf"
+    upload_file.write_bytes(b"material")
+    request = FinsUploadMaterialRequest(
+        ticker="AAPL",
+        action="create",
+        files=(upload_file,),
+        material_name="Deck",
+        company_name="Apple Inc.",
+        ticker_aliases=("MSFT",),
+    )
+
+    direct_events = await _collect_direct_events(runtime.upload(request))
+    direct_result = direct_events[-1].result
+    assert direct_result is not None
+    start = runtime.start_upload(request)
+    executor.run_all()
+    durable_record = runtime.read_job(start.job_id)
+    handle = runtime.prepare_observed_upload(request, _NeverCancelledToken())
+    runtime.activate_observation(handle)
+    executor.run_all()
+    observation = await runtime.poll_observation(handle)
+
+    expected_failure = {
+        "kind": "storage",
+        "code": "ticker_alias_conflict",
+        "message": "股票代码别名已属于当前工作区中的其他公司，请移除冲突别名后重试",
+        "retry_hint": "请确认公司的主代码与别名声明后重新上传",
+        "file_label": None,
+    }
+    assert reason.to_json() == expected_failure
+    assert durable_record.failure_summary == expected_failure
+    assert durable_record.result_summary["failure"] == expected_failure
+    assert observation.status is FinsObservationStatus.FAILED
+    assert observation.result == direct_result
+    assert direct_result.error_message == expected_failure["message"]
+    direct_details = {detail.label: detail.value for detail in direct_result.details}
+    assert direct_details["failure kind"] == expected_failure["kind"]
+    assert direct_details["failure code"] == expected_failure["code"]
+    assert direct_details["failure message"] == expected_failure["message"]
+    assert direct_details["retry hint"] == expected_failure["retry_hint"]
+    public_surfaces = (direct_result, durable_record.result_summary, durable_record.failure_summary, observation)
+    assert str(tmp_path) not in repr(public_surfaces)
+    assert "company_identity.lock" not in repr(public_surfaces)
+    assert "finsjob_" not in repr(observation)
 
 
 @pytest.mark.asyncio
@@ -7249,9 +7328,7 @@ def test_upload_status_owner_rejects_unknown_case_and_whitespace_variants(status
     """
 
     with pytest.raises(ValueError, match="upload status"):
-        FinsUploadPipelineResult.from_pipeline_json(
-            {"status": status, "stored_file_count": 0}
-        )
+        FinsUploadPipelineResult.from_pipeline_json({"status": status, "stored_file_count": 0})
     with pytest.raises(ValueError, match="upload status"):
         FinsUploadResultSummary(
             source_kind=SourceKind.FILING,
@@ -9445,7 +9522,8 @@ def _build_fins_workspace(
     source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
     blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
     company_batch = batching_repository.begin_batch("AAPL")
-    company_repository.upsert_company_meta(
+    stage_company_meta_fixture(
+        company_repository,
         CompanyMeta(
             company_id="0000320193",
             company_name="Apple Inc.",

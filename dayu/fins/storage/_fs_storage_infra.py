@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 import hashlib
+import errno
 import os
+import stat
 import shutil
 import threading
 import uuid
@@ -27,6 +29,7 @@ from dayu.runtime.filelock import (
 
 from dayu.fins.domain.document_models import (
     BatchToken,
+    CompanyMeta,
     FileObjectMeta,
     FilingManifestItem,
     MaterialManifestItem,
@@ -36,6 +39,10 @@ from dayu.fins.domain.document_models import (
     SourceDocumentRevision,
     SourceHandle,
     now_iso8601,
+)
+from dayu.fins.domain.company_meta_contract import (
+    CompanyMetaCommitIntent,
+    merge_company_meta_for_commit,
 )
 from dayu.fins.domain.enums import SourceKind
 
@@ -52,11 +59,16 @@ from ._fs_identity import (
     _identity_directory_for_read,
     _identity_directory_if_present_for_read,
     _identity_directory_path,
+    _identity_descriptor_path,
     _read_identity_descriptor,
     _require_external_identity,
 )
 from .file_store import FileStore
 from .local_file_store import LocalFileStore
+from .repository_protocols import (
+    CompanyTickerAliasConflictError,
+    CompanyTickerIdentityCorruptionError,
+)
 from ._fs_storage_utils import (
     _DOWNLOAD_REJECTIONS_FILENAME,
     _PROCESSED_META_FILENAME,
@@ -82,6 +94,7 @@ _BATCH_ROOT_DIRNAME = "repo_batches"
 _BACKUP_ROOT_DIRNAME = "repo_backups"
 _LOCK_ROOT_DIRNAME = "batch_locks"
 _RECOVERY_LOCK_FILENAME = "batch_recovery.lock"
+_COMPANY_IDENTITY_LOCK_FILENAME = "company_identity.lock"
 _PUBLICATION_LOCK_SUFFIX = ".publication.lock"
 _JOURNAL_FILENAME = "transaction.json"
 _PHASE_STARTED = "started"
@@ -162,6 +175,16 @@ class _ActiveBatchState:
     backup_dir: Path
     journal_path: Path
     phase: str
+    company_meta_intent: CompanyMetaCommitIntent | None
+    publishes_new_corpus: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _PublishedCompanyIdentity:
+    """一次 authoritative scan 得到的 published corpus identity。"""
+
+    canonical_ticker: str
+    company_meta: CompanyMeta | None
 
 
 def _project_runtime_lock_error(
@@ -443,6 +466,7 @@ class _FsStorageInfra:
         self.backup_root = self.dayu_root / _BACKUP_ROOT_DIRNAME
         self._batch_lock_root = self.dayu_root / _LOCK_ROOT_DIRNAME
         self._recovery_lock_path = self.dayu_root / _RECOVERY_LOCK_FILENAME
+        self._company_identity_lock_path = self.dayu_root / _COMPANY_IDENTITY_LOCK_FILENAME
         self._create_directories = create_directories
         self._batch_recovery_completed = False
         self._active_batches: dict[str, _ActiveBatchState] = {}
@@ -514,6 +538,13 @@ class _FsStorageInfra:
             self.ensure_batch_recovery()
             # 复杂逻辑说明：跨进程 writer 必须阻塞等待；本地 Condition 只串行化同实例。
             lock_token = self._acquire_ticker_lock(external_ticker)
+            target_stat = self._lstat_optional_storage_path(
+                target_ticker_dir,
+                action="检查 batch target ticker directory",
+            )
+            target_is_published = target_stat is not None
+            if target_stat is not None and not stat.S_ISDIR(target_stat.st_mode):
+                raise ValueError("batch target ticker root 必须为非 symlink 目录")
             state = _ActiveBatchState(
                 token=token,
                 lifecycle=_BATCH_LIFECYCLE_OPEN,
@@ -524,9 +555,11 @@ class _FsStorageInfra:
                 backup_dir=backup_dir,
                 journal_path=journal_path,
                 phase=_PHASE_STARTED,
+                company_meta_intent=None,
+                publishes_new_corpus=not target_is_published,
             )
             self._write_batch_journal(state, _PHASE_STARTED)
-            if target_ticker_dir.exists() or target_ticker_dir.is_symlink():
+            if target_is_published:
                 _read_identity_descriptor(
                     target_ticker_dir,
                     _TICKER_IDENTITY_NAMESPACE,
@@ -602,54 +635,21 @@ class _FsStorageInfra:
         state.lifecycle = _BATCH_LIFECYCLE_COMMIT_STARTED
         commit_error: Exception | None = None
         rollback_error: Exception | None = None
-        post_commit_error: Exception | None = None
-        publication_token: RuntimeFileLockToken | None = None
         try:
             # 复杂逻辑说明：完整性校验只读 transaction staging，必须先于 publication guard。
             self._validate_complete_source_tree(state)
-            publication_token = self._acquire_publication_guard(state.token.ticker)
-            try:
-                # 复杂逻辑说明：publication guard 只覆盖 published tree 的物理切换与失败恢复。
-                if state.target_ticker_dir.exists():
-                    self._replace_directory(state.target_ticker_dir, state.backup_dir)
-                self._write_batch_journal(state, _PHASE_BACKED_UP_TARGET)
-                self._replace_directory(state.staging_ticker_dir, state.target_ticker_dir)
-                self._write_batch_journal(state, _PHASE_SWAPPED_TARGET)
-                self._write_batch_journal(state, _PHASE_COMMITTED)
-            except Exception as exc:
-                commit_error = exc
+            if state.company_meta_intent is not None or state.publishes_new_corpus:
+                self._commit_batch_with_identity_guards(state)
+            else:
+                self._commit_batch_with_publication_guard(state)
+        except Exception as exc:
+            commit_error = exc
+            if state.phase not in {_PHASE_COMMITTED, _PHASE_ROLLED_BACK}:
                 try:
                     self._rollback_precommit_batch(state)
                 except Exception as rollback_exc:
                     rollback_error = rollback_exc
-            finally:
-                if publication_token is not None:
-                    try:
-                        self._release_lock_token(publication_token)
-                    except Exception as release_error:
-                        if commit_error is not None:
-                            _append_secondary_error_note(
-                                commit_error,
-                                release_error,
-                                action="publication guard release failed",
-                            )
-                        elif state.phase == _PHASE_COMMITTED:
-                            post_commit_error = release_error
-                            Log.warn(
-                                "commit_batch 已 durable 提交但 publication guard 释放失败，"
-                                "将作为 post-commit terminal error 抛出: "
-                                f"ticker={state.token.ticker}",
-                                module=self.MODULE,
-                            )
-                        else:
-                            commit_error = release_error
-        except Exception as exc:
-            commit_error = exc
-            try:
-                self._rollback_precommit_batch(state)
-            except Exception as rollback_exc:
-                rollback_error = rollback_exc
-        if commit_error is not None:
+        if commit_error is not None and state.phase != _PHASE_COMMITTED:
             self._close_active_batch(state, primary_error=commit_error)
             if rollback_error is not None:
                 commit_error.add_note("commit_batch rollback failed; journal/backup/staging recovery evidence retained")
@@ -668,7 +668,7 @@ class _FsStorageInfra:
             self._cleanup_committed_batch(state)
         except Exception as exc:
             cleanup_error = exc
-        terminal_error = post_commit_error
+        terminal_error = commit_error if state.phase == _PHASE_COMMITTED else None
         if cleanup_error is not None:
             if terminal_error is None:
                 terminal_error = cleanup_error
@@ -689,6 +689,449 @@ class _FsStorageInfra:
         self._close_active_batch(state, primary_error=terminal_error)
         if terminal_error is not None:
             raise terminal_error
+
+    def _commit_batch_with_identity_guards(self, state: _ActiveBatchState) -> None:
+        """按固定全局锁序准备 identity 并提交 batch。
+
+        Args:
+            state: 已进入 commit-started 的活动 batch state。
+
+        Returns:
+            无。
+
+        Raises:
+            CompanyTickerAliasConflictError: incoming lookup ticker 已被其它 corpus 占用时抛出。
+            CompanyTickerIdentityCorruptionError: published identity durable state 损坏时抛出。
+            CompanyMetaConcurrentUpdateError: CompanyMeta 乐观前置条件失效时抛出。
+            RuntimeFileLockError: recovery、identity 或 publication guard 操作失败时抛出。
+            OSError: recovery、扫描、staging 写入或 physical commit 失败时抛出。
+            ValueError: staged descriptor 或 intent 不符合契约时抛出。
+        """
+
+        recovery_token = self._acquire_recovery_lock()
+        primary_error: Exception | None = None
+        try:
+            self._recover_orphan_state_under_recovery_guard(dry_run=False)
+            identity_token = self._acquire_company_identity_guard()
+            identity_error: Exception | None = None
+            try:
+                self._prepare_company_identity_commit(state)
+                self._commit_batch_with_publication_guard(state)
+            except Exception as exc:
+                identity_error = exc
+                raise
+            finally:
+                try:
+                    self._release_lock_token(identity_token)
+                except Exception as release_error:
+                    if identity_error is not None:
+                        _append_secondary_error_note(
+                            identity_error,
+                            release_error,
+                            action="company identity guard release failed",
+                        )
+                    else:
+                        raise
+        except Exception as exc:
+            primary_error = exc
+            raise
+        finally:
+            try:
+                self._release_lock_token(recovery_token)
+            except Exception as release_error:
+                if primary_error is not None:
+                    _append_secondary_error_note(
+                        primary_error,
+                        release_error,
+                        action="recovery guard release failed during identity commit",
+                    )
+                else:
+                    raise
+
+    def _commit_batch_with_publication_guard(self, state: _ActiveBatchState) -> None:
+        """在 target publication guard 内执行 physical swap 与 precommit restore。
+
+        Args:
+            state: 已完成 staging 校验的活动 batch state。
+
+        Returns:
+            无。
+
+        Raises:
+            RuntimeFileLockError: publication guard 获取或释放失败时抛出。
+            OSError: swap、journal 或 restore 失败时抛出。
+            ValueError: commit-time target 存在但不是 non-symlink directory 时抛出。
+        """
+
+        publication_token = self._acquire_publication_guard(state.token.ticker)
+        primary_error: Exception | None = None
+        try:
+            target_stat = self._lstat_optional_storage_path(
+                state.target_ticker_dir,
+                action="检查 commit backup target ticker directory",
+            )
+            if target_stat is not None and not stat.S_ISDIR(target_stat.st_mode):
+                raise ValueError("commit backup target ticker root 必须为非 symlink 目录")
+            if target_stat is not None:
+                self._replace_directory(state.target_ticker_dir, state.backup_dir)
+            self._write_batch_journal(state, _PHASE_BACKED_UP_TARGET)
+            self._replace_directory(state.staging_ticker_dir, state.target_ticker_dir)
+            self._write_batch_journal(state, _PHASE_SWAPPED_TARGET)
+            self._write_batch_journal(state, _PHASE_COMMITTED)
+        except Exception as exc:
+            primary_error = exc
+            try:
+                self._rollback_precommit_batch(state)
+            except Exception as rollback_error:
+                primary_error.add_note(
+                    "commit_batch rollback failed; journal/backup/staging recovery evidence retained"
+                )
+                raise primary_error from rollback_error
+            raise
+        finally:
+            try:
+                self._release_lock_token(publication_token)
+            except Exception as release_error:
+                if primary_error is not None:
+                    _append_secondary_error_note(
+                        primary_error,
+                        release_error,
+                        action="publication guard release failed",
+                    )
+                else:
+                    if state.phase == _PHASE_COMMITTED:
+                        Log.warn(
+                            "commit_batch 已 durable 提交但 publication guard 释放失败，"
+                            "将作为 post-commit terminal error 抛出: "
+                            f"ticker={state.token.ticker}",
+                            module=self.MODULE,
+                        )
+                    raise
+
+    def _prepare_company_identity_commit(self, state: _ActiveBatchState) -> None:
+        """权威合并 CompanyMeta 并在 physical publication 前校验唯一性。
+
+        Args:
+            state: 已持 writer、recovery 与 company identity guards 的 batch state。
+
+        Returns:
+            无。
+
+        Raises:
+            CompanyTickerAliasConflictError: incoming lookup ticker 属于另一 corpus 时抛出。
+            CompanyTickerIdentityCorruptionError: published descriptor/meta/index 损坏时抛出。
+            CompanyMetaConcurrentUpdateError: intent 的乐观前置条件失效时抛出。
+            RuntimeFileLockError: publication guard 获取或释放失败时抛出。
+            OSError: descriptor/meta 读取或最终 meta staging 写入失败时抛出。
+            ValueError: staged descriptor 或 intent 不匹配时抛出。
+        """
+
+        staged_canonical = _read_identity_descriptor(
+            state.staging_ticker_dir,
+            _TICKER_IDENTITY_NAMESPACE,
+            expected_external_identity=state.token.ticker,
+        )
+        final_meta: CompanyMeta | None = None
+        if state.company_meta_intent is not None:
+            current_published = self._read_current_company_meta_for_commit(state)
+            final_meta = merge_company_meta_for_commit(
+                current_published=current_published,
+                intent=state.company_meta_intent,
+                committed_at=now_iso8601(),
+            )
+            _write_json(
+                state.staging_ticker_dir / _SOURCE_META_FILENAME,
+                final_meta.to_dict(),
+            )
+        published_identities = self._scan_actual_published_company_identities()
+        unique_index = self._build_unique_company_identity_index(published_identities)
+        incoming_lookup_tickers = (
+            final_meta.ticker_identity.lookup_tickers() if final_meta is not None else (staged_canonical,)
+        )
+        for lookup_ticker in incoming_lookup_tickers:
+            existing_owner = unique_index.get(lookup_ticker)
+            if existing_owner is None or existing_owner == staged_canonical:
+                continue
+            raise CompanyTickerAliasConflictError(
+                alias=lookup_ticker,
+                existing_canonical_ticker=existing_owner,
+                incoming_canonical_ticker=staged_canonical,
+            )
+
+    def _read_current_company_meta_for_commit(
+        self,
+        state: _ActiveBatchState,
+    ) -> CompanyMeta | None:
+        """在 incoming publication guard 内读取 authoritative current CompanyMeta。
+
+        Args:
+            state: 已持 writer、recovery 与 company identity guards 的 batch state。
+
+        Returns:
+            descriptor 合法但 meta 缺失时返回 ``None``；否则返回 strict CompanyMeta。
+
+        Raises:
+            CompanyTickerIdentityCorruptionError: descriptor、meta 或 identity mismatch 时抛出。
+            RuntimeFileLockError: publication guard 获取或释放失败时抛出。
+            OSError: filesystem 访问失败时抛出。
+        """
+
+        publication_token = self._acquire_publication_guard(state.token.ticker)
+        primary_error: Exception | None = None
+        try:
+            directory_stat = self._lstat_optional_storage_path(
+                state.target_ticker_dir,
+                action="检查 authoritative ticker directory",
+            )
+            if directory_stat is None:
+                return None
+            identity = self._read_published_company_identity(
+                state.target_ticker_dir,
+                expected_storage_key=state.target_ticker_dir.name,
+                known_directory_stat=directory_stat,
+            )
+            return identity.company_meta
+        except Exception as exc:
+            primary_error = exc
+            raise
+        finally:
+            self._release_lock_after_operation(
+                publication_token,
+                primary_error=primary_error,
+                action="authoritative publication guard release",
+            )
+
+    def _scan_actual_published_company_identities(
+        self,
+    ) -> tuple[_PublishedCompanyIdentity, ...]:
+        """扫描实际 published corpus 并严格读取 descriptor 与可选 CompanyMeta。
+
+        Caller 必须先持 workspace company identity guard；本方法按 candidate key
+        排序逐一取得 publication guard，绝不枚举 backup、staging 或 lock locator。
+
+        Args:
+            无。
+
+        Returns:
+            按 private candidate key 排序的 published identity tuple。
+
+        Raises:
+            CompanyTickerIdentityCorruptionError: descriptor、meta 或 identity mismatch 时抛出。
+            RuntimeFileLockError: publication guard 获取或释放失败时抛出。
+            OSError: portfolio 枚举或 filesystem 访问失败时抛出。
+        """
+
+        portfolio_stat = self._lstat_optional_storage_path(
+            self.portfolio_root,
+            action="检查 published ticker root",
+        )
+        if portfolio_stat is None:
+            return ()
+        if not stat.S_ISDIR(portfolio_stat.st_mode):
+            raise CompanyTickerIdentityCorruptionError(kind="invalid_descriptor")
+        identities: list[_PublishedCompanyIdentity] = []
+        candidates = sorted(
+            (
+                candidate
+                for candidate in _list_directory(
+                    self.portfolio_root,
+                    action="枚举 actual published ticker root",
+                )
+                if not candidate.name.startswith(".")
+            ),
+            key=lambda item: item.name,
+        )
+        for candidate in candidates:
+            publication_token = self._acquire_publication_guard_for_key(candidate.name)
+            primary_error: Exception | None = None
+            try:
+                directory_stat = self._lstat_optional_storage_path(
+                    candidate,
+                    action="检查 published ticker directory",
+                )
+                if directory_stat is None:
+                    continue
+                identities.append(
+                    self._read_published_company_identity(
+                        candidate,
+                        expected_storage_key=candidate.name,
+                        known_directory_stat=directory_stat,
+                    )
+                )
+            except Exception as exc:
+                primary_error = exc
+                raise
+            finally:
+                self._release_lock_after_operation(
+                    publication_token,
+                    primary_error=primary_error,
+                    action="published corpus publication guard release",
+                )
+        return tuple(identities)
+
+    def _read_published_company_identity(
+        self,
+        directory: Path,
+        *,
+        expected_storage_key: str,
+        known_directory_stat: os.stat_result,
+    ) -> _PublishedCompanyIdentity:
+        """分类并读取单个 published corpus identity。
+
+        Args:
+            directory: actual portfolio 直系条目。
+            expected_storage_key: 枚举得到的 exact locator key。
+            known_directory_stat: 通过显式 ``os.lstat`` 取得的目录状态。
+
+        Returns:
+            descriptor canonical 与可选 strict CompanyMeta。
+
+        Raises:
+            CompanyTickerIdentityCorruptionError: descriptor、meta 或 identity mismatch 时抛出。
+            OSError: permission 或普通 filesystem I/O 失败时抛出。
+        """
+
+        if not stat.S_ISDIR(known_directory_stat.st_mode):
+            raise CompanyTickerIdentityCorruptionError(kind="invalid_descriptor")
+        descriptor_path = _identity_descriptor_path(directory)
+        descriptor_stat = self._lstat_optional_storage_path(
+            descriptor_path,
+            action="检查 ticker identity descriptor",
+        )
+        if descriptor_stat is None or not stat.S_ISREG(descriptor_stat.st_mode):
+            raise CompanyTickerIdentityCorruptionError(kind="invalid_descriptor")
+        try:
+            canonical_ticker = _read_identity_descriptor(
+                directory,
+                _TICKER_IDENTITY_NAMESPACE,
+                expected_storage_key=expected_storage_key,
+            )
+        except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
+            raise CompanyTickerIdentityCorruptionError(
+                kind="invalid_descriptor",
+            ) from exc
+
+        meta_path = directory / _SOURCE_META_FILENAME
+        meta_stat = self._lstat_optional_storage_path(
+            meta_path,
+            action="检查 published CompanyMeta",
+        )
+        if meta_stat is None:
+            return _PublishedCompanyIdentity(
+                canonical_ticker=canonical_ticker,
+                company_meta=None,
+            )
+        if not stat.S_ISREG(meta_stat.st_mode):
+            raise CompanyTickerIdentityCorruptionError(
+                kind="invalid_meta",
+                lookup_ticker=canonical_ticker,
+            )
+        try:
+            company_meta = CompanyMeta.from_dict(_read_json_object(meta_path))
+        except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
+            raise CompanyTickerIdentityCorruptionError(
+                kind="invalid_meta",
+                lookup_ticker=canonical_ticker,
+            ) from exc
+        meta_identity = company_meta.ticker_identity
+        if meta_identity.canonical_ticker != canonical_ticker:
+            raise CompanyTickerIdentityCorruptionError(
+                kind="identity_mismatch",
+                lookup_ticker=canonical_ticker,
+            )
+        return _PublishedCompanyIdentity(
+            canonical_ticker=canonical_ticker,
+            company_meta=company_meta,
+        )
+
+    def _build_unique_company_identity_index(
+        self,
+        identities: tuple[_PublishedCompanyIdentity, ...],
+    ) -> dict[str, str]:
+        """从 descriptor canonicals 与 valid CompanyMeta aliases 派生唯一 index。
+
+        Args:
+            identities: authoritative published identity scan 结果。
+
+        Returns:
+            normalized lookup ticker 到唯一 canonical corpus 的映射。
+
+        Raises:
+            CompanyTickerIdentityCorruptionError: 任一 lookup ticker 有多个 owner 时抛出。
+        """
+
+        index: dict[str, str] = {}
+        for identity in identities:
+            self._register_company_identity_owner(
+                index,
+                lookup_ticker=identity.canonical_ticker,
+                canonical_ticker=identity.canonical_ticker,
+            )
+        for identity in identities:
+            if identity.company_meta is None:
+                continue
+            for alias in identity.company_meta.ticker_identity.accepted_aliases:
+                self._register_company_identity_owner(
+                    index,
+                    lookup_ticker=alias,
+                    canonical_ticker=identity.canonical_ticker,
+                )
+        return index
+
+    def _register_company_identity_owner(
+        self,
+        index: dict[str, str],
+        *,
+        lookup_ticker: str,
+        canonical_ticker: str,
+    ) -> None:
+        """向唯一 index 登记一个 owner。
+
+        Args:
+            index: 正在构建的单值 index。
+            lookup_ticker: canonical 或 accepted alias。
+            canonical_ticker: corpus owner。
+
+        Returns:
+            无。
+
+        Raises:
+            CompanyTickerIdentityCorruptionError: lookup ticker 已属于另一 owner 时抛出。
+        """
+
+        existing_owner = index.get(lookup_ticker)
+        if existing_owner is not None and existing_owner != canonical_ticker:
+            raise CompanyTickerIdentityCorruptionError(
+                kind="duplicate_owner",
+                lookup_ticker=lookup_ticker,
+            )
+        index[lookup_ticker] = canonical_ticker
+
+    def _lstat_optional_storage_path(
+        self,
+        path: Path,
+        *,
+        action: str,
+    ) -> os.stat_result | None:
+        """用显式 ``os.lstat`` 区分缺失、结构状态与 operational I/O。
+
+        Args:
+            path: storage owner 已派生的 locator。
+            action: 不含 path 的操作说明。
+
+        Returns:
+            路径存在时的 lstat；``ENOENT`` 时返回 ``None``。
+
+        Raises:
+            OSError: permission 或其它普通 filesystem failure 时抛出 path-free 异常。
+        """
+
+        try:
+            return os.lstat(path)
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                return None
+            _raise_path_free_error(_project_filesystem_error(exc, action=action))
 
     def _validate_complete_source_tree(self, state: _ActiveBatchState) -> None:
         """校验完整 staged ticker tree 中全部 source publication facts。
@@ -1348,12 +1791,37 @@ class _FsStorageInfra:
             return ()
         self._ensure_batch_storage_dirs()
         recovery_token = self._acquire_recovery_lock()
+        primary_error: Exception | None = None
         try:
-            actions = self._recover_orphan_batch_dirs(dry_run=dry_run)
-            actions.extend(self._recover_orphan_backup_dirs(dry_run=dry_run))
+            actions = self._recover_orphan_state_under_recovery_guard(dry_run=dry_run)
+        except Exception as exc:
+            primary_error = exc
+            raise
         finally:
-            self._release_lock_token(recovery_token)
+            self._release_lock_after_operation(
+                recovery_token,
+                primary_error=primary_error,
+                action="orphan recovery guard release",
+            )
         return tuple(actions)
+
+    def _recover_orphan_state_under_recovery_guard(self, *, dry_run: bool) -> list[str]:
+        """在 caller 已持 recovery guard 时恢复全部 orphan state。
+
+        Args:
+            dry_run: 是否只返回拟执行动作。
+
+        Returns:
+            按扫描顺序记录的恢复动作列表。
+
+        Raises:
+            RuntimeFileLockError: writer、identity 或 publication guard 操作失败时抛出。
+            OSError: evidence 枚举、读取或 physical restore 失败时抛出。
+        """
+
+        actions = self._recover_orphan_batch_dirs(dry_run=dry_run)
+        actions.extend(self._recover_orphan_backup_dirs(dry_run=dry_run))
+        return actions
 
     def _should_manage_batch_state(self) -> bool:
         """判断当前是否需要接触 batch 持久化状态。
@@ -1493,6 +1961,34 @@ class _FsStorageInfra:
 
         _release_storage_lock_token(token)
 
+    def _release_lock_after_operation(
+        self,
+        token: RuntimeFileLockToken,
+        *,
+        primary_error: BaseException | None,
+        action: str,
+    ) -> None:
+        """释放锁，并在已有主异常时保留原始失败语义。
+
+        Args:
+            token: 已持有的 runtime 文件锁 token。
+            primary_error: 受锁操作已经抛出的主异常；成功时为 ``None``。
+            action: 不包含 filesystem locator 的释放动作说明。
+
+        Returns:
+            无。
+
+        Raises:
+            RuntimeFileLockError: 操作成功但释放锁失败时抛出。
+        """
+
+        try:
+            self._release_lock_token(token)
+        except Exception as release_error:
+            if primary_error is None:
+                raise
+            primary_error.add_note(f"{action}失败：{release_error}")
+
     def _acquire_ticker_lock(self, ticker: str) -> RuntimeFileLockToken:
         """获取某个 ticker 的跨进程事务锁。
 
@@ -1583,6 +2079,24 @@ class _FsStorageInfra:
 
         return self._acquire_lock_token(self._recovery_lock_path, blocking=True)
 
+    def _acquire_company_identity_guard(self) -> RuntimeFileLockToken:
+        """获取 workspace company identity guard。
+
+        Args:
+            无。
+
+        Returns:
+            已持有的 runtime lock token。
+
+        Raises:
+            RuntimeFileLockError: identity guard 获取失败时抛出。
+        """
+
+        return self._acquire_lock_token(
+            self._company_identity_lock_path,
+            blocking=True,
+        )
+
     def _write_batch_journal(self, state: _ActiveBatchState, phase: str) -> None:
         """把事务 phase 写入 journal。
 
@@ -1645,6 +2159,9 @@ class _FsStorageInfra:
         """
 
         actions: list[str] = []
+        with self._batch_condition:
+            if token_dir.name in self._active_batches:
+                return actions
         journal_path = token_dir / _JOURNAL_FILENAME
         if not _is_contained_recovery_path(token_dir, self.batch_root):
             actions.append(f"skip batch transaction={token_dir.name} reason=invalid_token_dir")
@@ -1687,6 +2204,7 @@ class _FsStorageInfra:
         ticker_token = self._try_acquire_recovery_ticker_lock(external_ticker)
         if ticker_token is None:
             return actions
+        ticker_error: Exception | None = None
         try:
             target_dir = self._target_ticker_dir(external_ticker)
             backup_dir = self.backup_root / f"{ticker_key}.bak.{transaction_id}"
@@ -1718,60 +2236,87 @@ class _FsStorageInfra:
             except (FileNotFoundError, ValueError, OSError):
                 actions.append(f"skip batch transaction={transaction_id} reason=invalid_identity_descriptor")
                 return actions
-            publication_token = self._acquire_publication_guard(external_ticker)
+            identity_token = self._acquire_company_identity_guard()
+            identity_error: Exception | None = None
             try:
-                if phase == _PHASE_COMMITTED:
-                    if not target_dir.exists():
+                publication_token = self._acquire_publication_guard(external_ticker)
+                publication_error: Exception | None = None
+                try:
+                    if phase == _PHASE_COMMITTED:
+                        if not target_dir.exists():
+                            actions.append(
+                                f"preserve committed evidence ticker={external_ticker} "
+                                f"transaction={transaction_id} reason=missing_target"
+                            )
+                            return actions
+                        if backup_dir.exists():
+                            actions.append(
+                                f"delete backup ticker={external_ticker} transaction={transaction_id} phase={phase}"
+                            )
+                            if not dry_run:
+                                self._remove_directory(backup_dir)
+                    elif phase in {_PHASE_BACKED_UP_TARGET, _PHASE_SWAPPED_TARGET}:
+                        if target_dir.exists():
+                            actions.append(
+                                f"remove uncommitted target ticker={external_ticker} "
+                                f"transaction={transaction_id} phase={phase}"
+                            )
+                            if not dry_run:
+                                if staging_dir.exists():
+                                    self._remove_directory(target_dir)
+                                else:
+                                    self._replace_directory(target_dir, staging_dir)
+                        if backup_dir.exists():
+                            actions.append(
+                                f"restore backup ticker={external_ticker} transaction={transaction_id} phase={phase}"
+                            )
+                            if not dry_run:
+                                self._replace_directory(backup_dir, target_dir)
+                    elif backup_dir.exists() and not target_dir.exists():
                         actions.append(
-                            f"preserve committed evidence ticker={external_ticker} "
-                            f"transaction={transaction_id} reason=missing_target"
-                        )
-                        return actions
-                    if backup_dir.exists():
-                        actions.append(
-                            f"delete backup ticker={external_ticker} transaction={transaction_id} phase={phase}"
-                        )
-                        if not dry_run:
-                            self._remove_directory(backup_dir)
-                elif phase in {_PHASE_BACKED_UP_TARGET, _PHASE_SWAPPED_TARGET}:
-                    if target_dir.exists():
-                        actions.append(
-                            f"remove uncommitted target ticker={external_ticker} "
-                            f"transaction={transaction_id} phase={phase}"
-                        )
-                        if not dry_run:
-                            if staging_dir.exists():
-                                self._remove_directory(target_dir)
-                            else:
-                                self._replace_directory(target_dir, staging_dir)
-                    if backup_dir.exists():
-                        actions.append(
-                            f"restore backup ticker={external_ticker} transaction={transaction_id} phase={phase}"
+                            f"restore backup ticker={external_ticker} transaction={transaction_id} "
+                            f"phase={phase or 'unknown'}"
                         )
                         if not dry_run:
                             self._replace_directory(backup_dir, target_dir)
-                elif backup_dir.exists() and not target_dir.exists():
-                    actions.append(
-                        f"restore backup ticker={external_ticker} transaction={transaction_id} "
-                        f"phase={phase or 'unknown'}"
+                    elif backup_dir.exists() and target_dir.exists() and phase != _PHASE_STARTED:
+                        actions.append(
+                            f"preserve ambiguous backup ticker={external_ticker} "
+                            f"transaction={transaction_id} phase={phase or 'unknown'}"
+                        )
+                        return actions
+                except Exception as exc:
+                    publication_error = exc
+                    raise
+                finally:
+                    self._release_lock_after_operation(
+                        publication_token,
+                        primary_error=publication_error,
+                        action="orphan batch publication guard release",
                     )
-                    if not dry_run:
-                        self._replace_directory(backup_dir, target_dir)
-                elif backup_dir.exists() and target_dir.exists() and phase != _PHASE_STARTED:
-                    actions.append(
-                        f"preserve ambiguous backup ticker={external_ticker} "
-                        f"transaction={transaction_id} phase={phase or 'unknown'}"
-                    )
-                    return actions
+                actions.append(
+                    f"cleanup batch ticker={external_ticker} transaction={transaction_id} phase={phase or 'unknown'}"
+                )
+                if not dry_run:
+                    self._remove_directory(token_dir)
+            except Exception as exc:
+                identity_error = exc
+                raise
             finally:
-                self._release_lock_token(publication_token)
-            actions.append(
-                f"cleanup batch ticker={external_ticker} transaction={transaction_id} phase={phase or 'unknown'}"
-            )
-            if not dry_run:
-                self._remove_directory(token_dir)
+                self._release_lock_after_operation(
+                    identity_token,
+                    primary_error=identity_error,
+                    action="orphan batch identity guard release",
+                )
+        except Exception as exc:
+            ticker_error = exc
+            raise
         finally:
-            self._release_lock_token(ticker_token)
+            self._release_lock_after_operation(
+                ticker_token,
+                primary_error=ticker_error,
+                action="orphan batch writer guard release",
+            )
         return actions
 
     def _recover_orphan_backup_dirs(self, *, dry_run: bool) -> list[str]:
@@ -1821,6 +2366,7 @@ class _FsStorageInfra:
             ticker_token = self._try_acquire_recovery_ticker_lock(external_ticker)
             if ticker_token is None:
                 continue
+            ticker_error: Exception | None = None
             try:
                 target_dir = self._target_ticker_dir(external_ticker)
                 if not (
@@ -1845,20 +2391,47 @@ class _FsStorageInfra:
                             f"transaction={token_id} reason=target_identity_mismatch"
                         )
                         continue
-                publication_token = self._acquire_publication_guard(external_ticker)
+                identity_token = self._acquire_company_identity_guard()
+                identity_error: Exception | None = None
                 try:
-                    if target_dir.exists():
-                        actions.append(f"delete backup ticker={external_ticker} transaction={token_id}")
+                    publication_token = self._acquire_publication_guard(external_ticker)
+                    publication_error: Exception | None = None
+                    try:
+                        if target_dir.exists():
+                            actions.append(f"delete backup ticker={external_ticker} transaction={token_id}")
+                            if not dry_run:
+                                self._remove_directory(backup_dir)
+                            continue
+                        actions.append(f"restore backup ticker={external_ticker} transaction={token_id}")
                         if not dry_run:
-                            self._remove_directory(backup_dir)
-                        continue
-                    actions.append(f"restore backup ticker={external_ticker} transaction={token_id}")
-                    if not dry_run:
-                        self._replace_directory(backup_dir, target_dir)
+                            self._replace_directory(backup_dir, target_dir)
+                    except Exception as exc:
+                        publication_error = exc
+                        raise
+                    finally:
+                        self._release_lock_after_operation(
+                            publication_token,
+                            primary_error=publication_error,
+                            action="orphan backup publication guard release",
+                        )
+                except Exception as exc:
+                    identity_error = exc
+                    raise
                 finally:
-                    self._release_lock_token(publication_token)
+                    self._release_lock_after_operation(
+                        identity_token,
+                        primary_error=identity_error,
+                        action="orphan backup identity guard release",
+                    )
+            except Exception as exc:
+                ticker_error = exc
+                raise
             finally:
-                self._release_lock_token(ticker_token)
+                self._release_lock_after_operation(
+                    ticker_token,
+                    primary_error=ticker_error,
+                    action="orphan backup writer guard release",
+                )
         return actions
 
     def _try_acquire_recovery_ticker_lock(self, ticker: str) -> RuntimeFileLockToken | None:

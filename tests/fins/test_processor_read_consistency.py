@@ -16,6 +16,8 @@ from threading import Barrier, Event, Lock
 from typing import Final
 
 import pytest
+
+from tests.fins.company_meta_test_support import stage_company_meta_fixture
 import pandas as pd
 
 import dayu.fins.storage._fs_source_snapshot as source_snapshot_module
@@ -1136,7 +1138,8 @@ def _build_runtime(
     registry = _CountingProcessorRegistry()
     batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
     batch = batching_repository.begin_batch("AAPL")
-    company_repository.upsert_company_meta(
+    stage_company_meta_fixture(
+        company_repository,
         CompanyMeta(
             company_id="0000320193",
             company_name="Apple Inc.",

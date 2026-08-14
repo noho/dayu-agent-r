@@ -12,6 +12,9 @@ from .local_file_store import LocalFileStore
 from .repository_protocols import (
     BatchingRepositoryProtocol,
     CompanyMetaRepositoryProtocol,
+    CompanyTickerAliasConflictError,
+    CompanyTickerIdentityCorruptionError,
+    CompanyTickerIdentityCorruptionKind,
     DocumentBlobRepositoryProtocol,
     FilingMaintenanceRepositoryProtocol,
     FilingUploadPublishedState,
@@ -37,6 +40,9 @@ from .source_meta_contract import require_source_meta_is_deleted
 __all__ = [
     "BatchingRepositoryProtocol",
     "CompanyMetaRepositoryProtocol",
+    "CompanyTickerAliasConflictError",
+    "CompanyTickerIdentityCorruptionError",
+    "CompanyTickerIdentityCorruptionKind",
     "SourceDocumentRepositoryProtocol",
     "ProcessedDocumentRepositoryProtocol",
     "DocumentBlobRepositoryProtocol",

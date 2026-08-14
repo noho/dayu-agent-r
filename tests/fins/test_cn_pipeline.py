@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.fins.company_meta_test_support import stage_company_meta_fixture
+
 import dayu.fins.pipelines.cn_pipeline as cn_pipeline_module
 from dayu.contracts.cancellation import CancellationToken
 from dayu.fins.downloaders.hkexnews_downloader import HkexnewsDiscoveryClient
@@ -520,7 +522,8 @@ def _seed_cn_upload_company_meta(
     """
 
     batch = pipeline.batching_repository.begin_batch("600519")
-    pipeline._company_repository.upsert_company_meta(
+    stage_company_meta_fixture(
+        pipeline._company_repository,
         CompanyMeta(
             company_id="600519_CN",
             company_name=company_name,
@@ -975,8 +978,8 @@ async def test_upload_material_stream_uploads_files_with_docling(tmp_path: Path)
     assert str(result_value["document_id"]).startswith("mat_")
     company_meta = pipeline._company_repository.get_company_meta("600519")
     assert company_meta.ticker_identity.accepted_aliases == ("MSFT", "V-BA")
-    assert pipeline._company_repository.resolve_existing_ticker(["MSFT"]) == "600519"
-    assert pipeline._company_repository.resolve_existing_ticker(["V.BA"]) == "600519"
+    assert pipeline._company_repository.resolve_company_ticker("MSFT") == "600519"
+    assert pipeline._company_repository.resolve_company_ticker("V.BA") == "600519"
     meta = pipeline._source_repository.get_source_meta(
         "600519",
         str(result_value["document_id"]),
@@ -986,8 +989,8 @@ async def test_upload_material_stream_uploads_files_with_docling(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_upload_material_failure_preserves_existing_user_visible_semantics(tmp_path: Path) -> None:
-    """Filing typed failure 收束不得改变 CN material 的既有错误文案 contract。
+async def test_upload_material_failure_uses_shared_typed_failure_owner(tmp_path: Path) -> None:
+    """CN material terminal catch 必须复用共享 typed failure owner。
 
     Args:
         tmp_path: 临时目录。
@@ -996,7 +999,7 @@ async def test_upload_material_failure_preserves_existing_user_visible_semantics
         无。
 
     Raises:
-        AssertionError: material 被改为 filing typed failure projection 时抛出。
+        AssertionError: material 未使用 bounded typed failure projection 时抛出。
     """
 
     pipeline = CnPipeline(
@@ -1023,9 +1026,69 @@ async def test_upload_material_failure_preserves_existing_user_visible_semantics
     assert isinstance(result, dict)
     assert result["status"] == "failed"
     assert result["stored_file_count"] == 0
-    assert result["message"] == "create/update 时必须提供 --company-name"
-    assert "failure" not in result
-    assert events[-1].payload["error"] == "create/update 时必须提供 --company-name"
+    assert result["message"] == "上传执行失败，请检查运行日志后重试"
+    assert result["failure"] == {
+        "kind": "runtime",
+        "code": "unexpected_runtime",
+        "message": "上传执行失败，请检查运行日志后重试",
+        "retry_hint": None,
+        "file_label": None,
+    }
+    assert events[-1].payload["error"] == "上传执行失败，请检查运行日志后重试"
+
+
+@pytest.mark.asyncio
+async def test_upload_material_alias_conflict_projects_exact_typed_terminal(tmp_path: Path) -> None:
+    """CN material alias conflict 必须从 storage typed error 投影 exact failure JSON。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: conflict 未原子拒绝或 terminal JSON 漂移时抛出。
+    """
+
+    pipeline = CnPipeline(
+        workspace_root=tmp_path,
+        docling_converter=_PipelineDownloadFakeConversionRunner(),
+    )
+    existing = pipeline._batching_repository.begin_batch("MSFT")
+    pipeline._batching_repository.commit_batch(existing)
+    material_file = tmp_path / "deck.pdf"
+    material_file.write_text("demo cn material", encoding="utf-8")
+
+    events = [
+        event
+        async for event in pipeline.upload_material_stream(
+            ticker="600519",
+            action="create",
+            form_type="MATERIAL_OTHER",
+            material_name="Roadshow Deck",
+            files=[material_file],
+            company_name="贵州茅台",
+            ticker_aliases=["MSFT"],
+            overwrite=False,
+        )
+    ]
+
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    expected_failure = {
+        "kind": "storage",
+        "code": "ticker_alias_conflict",
+        "message": "股票代码别名已属于当前工作区中的其他公司，请移除冲突别名后重试",
+        "retry_hint": "请确认公司的主代码与别名声明后重新上传",
+        "file_label": None,
+    }
+    assert events[-1].event_type is UploadMaterialEventType.UPLOAD_FAILED
+    assert result["status"] == "failed"
+    assert result["stored_file_count"] == 0
+    assert result["failure"] == expected_failure
+    assert events[-1].payload["error"] == expected_failure["message"]
+    assert not (tmp_path / "portfolio" / "600519").exists()
 
 
 @pytest.mark.asyncio
@@ -1348,6 +1411,49 @@ async def test_upload_filing_storage_and_generic_failures_use_distinct_typed_cat
     assert operator_marker in caplog.text
     assert str(error) in caplog.text
     assert str(error) not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_upload_filing_alias_conflict_projects_exact_typed_terminal(tmp_path: Path) -> None:
+    """CN filing alias conflict 必须原子拒绝并投影 exact failure JSON。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: conflict 类型、count 或 durable tree 漂移时抛出。
+    """
+
+    pipeline, batching, _company, _source = _tracking_cn_pipeline(tmp_path)
+    existing = batching.begin_batch("MSFT")
+    batching.commit_batch(existing)
+    filing_file = tmp_path / "annual.pdf"
+    filing_file.write_text("demo cn filing", encoding="utf-8")
+    request = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action="create",
+        company_name="贵州茅台",
+        ticker_aliases=("MSFT",),
+    )
+
+    events = [event async for event in pipeline.upload_filing_stream(request)]
+
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    assert events[-1].event_type is UploadFilingEventType.UPLOAD_FAILED
+    assert result["stored_file_count"] == 0
+    assert result["failure"] == {
+        "kind": "storage",
+        "code": "ticker_alias_conflict",
+        "message": "股票代码别名已属于当前工作区中的其他公司，请移除冲突别名后重试",
+        "retry_hint": "请确认公司的主代码与别名声明后重新上传",
+        "file_label": None,
+    }
+    assert not (tmp_path / "portfolio" / "600519").exists()
 
 
 @pytest.mark.asyncio

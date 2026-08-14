@@ -8,8 +8,11 @@ from pathlib import Path
 
 import pytest
 
+from tests.fins.company_meta_test_support import stage_company_meta_fixture
+
 import dayu.fins.pipelines.sec_upload_workflow as sec_upload_workflow
 from dayu.contracts.cancellation import CancellationToken
+from dayu.fins.domain.company_meta_contract import CompanyMetaCommitIntent
 from dayu.fins.domain.document_models import BatchToken, CompanyMeta, CompanyMetaInventoryEntry, now_iso8601
 from dayu.fins.ticker_normalization import build_company_ticker_identity
 from dayu.fins.domain.enums import SourceKind
@@ -65,7 +68,7 @@ class _SpyCompanyMetaRepository:
             无。
         """
 
-        self.writes: list[CompanyMeta] = []
+        self.writes: list[CompanyMetaCommitIntent] = []
 
     def scan_company_meta_inventory(self) -> list[CompanyMetaInventoryEntry]:
         """返回空盘点结果。
@@ -97,11 +100,17 @@ class _SpyCompanyMetaRepository:
 
         raise FileNotFoundError(ticker)
 
-    def upsert_company_meta(self, meta: CompanyMeta, *, batch: BatchToken) -> None:
-        """记录一次 company meta 写入。
+    def stage_company_meta_intent(
+        self,
+        intent: CompanyMetaCommitIntent,
+        *,
+        batch: BatchToken,
+    ) -> None:
+        """记录一次 company meta 提交意图。
 
         Args:
-            meta: 待写入公司元数据。
+            intent: 待提交公司元数据意图。
+            batch: 测试 batch capability。
 
         Returns:
             无。
@@ -111,13 +120,13 @@ class _SpyCompanyMetaRepository:
         """
 
         del batch
-        self.writes.append(meta)
+        self.writes.append(intent)
 
-    def resolve_existing_ticker(self, ticker_candidates: list[str]) -> str | None:
-        """模拟无候选 ticker 已存在。
+    def resolve_company_ticker(self, ticker: str) -> str | None:
+        """模拟无 ticker 已存在。
 
         Args:
-            ticker_candidates: ticker 候选列表。
+            ticker: ticker 查询值。
 
         Returns:
             始终返回 ``None``。
@@ -126,7 +135,7 @@ class _SpyCompanyMetaRepository:
             无。
         """
 
-        del ticker_candidates
+        del ticker
         return None
 
 
@@ -360,7 +369,8 @@ def _seed_sec_upload_company_meta(
     """
 
     batch = pipeline._batching_repository.begin_batch("AAPL")
-    pipeline._company_repository.upsert_company_meta(
+    stage_company_meta_fixture(
+        pipeline._company_repository,
         CompanyMeta(
             company_id="AAPL_US",
             company_name=company_name,
@@ -1322,6 +1332,49 @@ async def test_upload_filing_commit_failure_never_publishes_staged_count(
     assert failure["code"] == expected_code
     assert published_tree_sha256(tmp_path, "AAPL") == before_tree == {}
     assert batching.rollback_tokens == []
+
+
+@pytest.mark.asyncio
+async def test_upload_filing_alias_conflict_projects_exact_typed_terminal(tmp_path: Path) -> None:
+    """SEC filing alias conflict 必须原子拒绝并投影 exact failure JSON。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: conflict 类型、count 或 durable tree 漂移时抛出。
+    """
+
+    pipeline, batching, _company, _source = _tracking_sec_pipeline(tmp_path)
+    existing = batching.begin_batch("MSFT")
+    batching.commit_batch(existing)
+    filing_file = tmp_path / "filing.pdf"
+    filing_file.write_text("demo filing", encoding="utf-8")
+    request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action="create",
+        company_name="Apple Inc.",
+        ticker_aliases=("MSFT",),
+    )
+
+    events = [event async for event in pipeline.upload_filing_stream(request)]
+
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    assert events[-1].event_type is UploadFilingEventType.UPLOAD_FAILED
+    assert result["stored_file_count"] == 0
+    assert result["failure"] == {
+        "kind": "storage",
+        "code": "ticker_alias_conflict",
+        "message": "股票代码别名已属于当前工作区中的其他公司，请移除冲突别名后重试",
+        "retry_hint": "请确认公司的主代码与别名声明后重新上传",
+        "file_label": None,
+    }
+    assert not (tmp_path / "portfolio" / "AAPL").exists()
 
 
 @pytest.mark.asyncio

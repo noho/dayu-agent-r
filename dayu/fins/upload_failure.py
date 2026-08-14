@@ -9,15 +9,19 @@ from typing import Final
 
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.direct_events import validate_fins_public_file_label
+from dayu.fins.domain.company_meta_contract import CompanyMetaConcurrentUpdateError
 from dayu.fins.pipelines.docling_process_converter import (
     DoclingConversionError,
     DoclingConversionFailureKind,
 )
+from dayu.fins.storage import (
+    CompanyTickerAliasConflictError,
+    CompanyTickerIdentityCorruptionError,
+)
+from dayu.runtime.filelock import RuntimeFileLockError
 
 _MAX_FAILURE_TEXT_CHARS: Final[int] = 240
-_FAILURE_KEYS: Final[frozenset[str]] = frozenset(
-    {"kind", "code", "message", "retry_hint", "file_label"}
-)
+_FAILURE_KEYS: Final[frozenset[str]] = frozenset({"kind", "code", "message", "retry_hint", "file_label"})
 
 
 class FinsUploadFailureKind(str, Enum):
@@ -39,6 +43,7 @@ class FinsUploadFailureCode(str, Enum):
     DOCLING_CLEANUP = "docling_cleanup"
     EMPTY_INPUT_FILE = "empty_input_file"
     STORAGE_IO = "storage_io"
+    TICKER_ALIAS_CONFLICT = "ticker_alias_conflict"
     UNEXPECTED_RUNTIME = "unexpected_runtime"
 
 
@@ -156,6 +161,12 @@ _DOCLING_FAILURE_CODES: Final[Mapping[DoclingConversionFailureKind, FinsUploadFa
 _CONTENT_FAILURE_CODES: Final[frozenset[FinsUploadFailureCode]] = frozenset(
     (*_DOCLING_FAILURE_CODES.values(), FinsUploadFailureCode.EMPTY_INPUT_FILE)
 )
+_STORAGE_FAILURE_CODES: Final[frozenset[FinsUploadFailureCode]] = frozenset(
+    {
+        FinsUploadFailureCode.STORAGE_IO,
+        FinsUploadFailureCode.TICKER_ALIAS_CONFLICT,
+    }
+)
 
 
 def fins_upload_failure_from_exception(
@@ -184,7 +195,31 @@ def fins_upload_failure_from_exception(
             retry_hint="请确认文件可正常打开并重新上传",
             file_label=file_label,
         )
-    if isinstance(error, OSError):
+    if isinstance(error, CompanyTickerAliasConflictError):
+        return FinsUploadFailureReason(
+            kind=FinsUploadFailureKind.STORAGE,
+            code=FinsUploadFailureCode.TICKER_ALIAS_CONFLICT,
+            message="股票代码别名已属于当前工作区中的其他公司，请移除冲突别名后重试",
+            retry_hint="请确认公司的主代码与别名声明后重新上传",
+            file_label=None,
+        )
+    if isinstance(error, CompanyTickerIdentityCorruptionError):
+        return FinsUploadFailureReason(
+            kind=FinsUploadFailureKind.STORAGE,
+            code=FinsUploadFailureCode.STORAGE_IO,
+            message="工作区公司代码身份数据损坏，无法安全提交",
+            retry_hint="请修复工作区公司元数据后重试",
+            file_label=None,
+        )
+    if isinstance(error, CompanyMetaConcurrentUpdateError):
+        return FinsUploadFailureReason(
+            kind=FinsUploadFailureKind.STORAGE,
+            code=FinsUploadFailureCode.STORAGE_IO,
+            message="公司元数据已被并发更新，本次上传未提交",
+            retry_hint="请基于最新公司元数据重试",
+            file_label=None,
+        )
+    if isinstance(error, (OSError, RuntimeFileLockError)):
         return FinsUploadFailureReason(
             kind=FinsUploadFailureKind.STORAGE,
             code=FinsUploadFailureCode.STORAGE_IO,
@@ -292,9 +327,7 @@ def upload_failure_reason_from_json(value: JsonValue | None) -> FinsUploadFailur
     expected_kind = (
         FinsUploadFailureKind.CONTENT
         if code in _CONTENT_FAILURE_CODES
-        else (
-            FinsUploadFailureKind.STORAGE if code is FinsUploadFailureCode.STORAGE_IO else FinsUploadFailureKind.RUNTIME
-        )
+        else (FinsUploadFailureKind.STORAGE if code in _STORAGE_FAILURE_CODES else FinsUploadFailureKind.RUNTIME)
     )
     if kind is not expected_kind:
         raise ValueError("upload failure kind 与 code 不一致")

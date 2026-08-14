@@ -20,6 +20,8 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.fins.company_meta_test_support import stage_company_meta_fixture
+
 import dayu.fins.storage._fs_storage_infra as storage_infra_module
 import dayu.fins.storage._fs_source_snapshot as source_snapshot_module
 import dayu.fins.storage._fs_storage_utils as storage_utils_module
@@ -176,7 +178,8 @@ def test_filing_upload_state_reads_company_and_source_from_one_published_version
     blob = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
     state = FsFilingUploadStateRepository(workspace_root, repository_set=repository_set)
     batch = batching.begin_batch("AAPL")
-    company.upsert_company_meta(
+    stage_company_meta_fixture(
+        company,
         CompanyMeta(
             company_id="company-aapl",
             company_name="Apple Inc.",
@@ -970,14 +973,13 @@ def test_company_owner_reads_only_published_meta_inventory_and_aliases(tmp_path:
     repository_set = build_fs_repository_set(workspace_root=workspace_root)
     batching = FsBatchingRepository(workspace_root, repository_set=repository_set)
     company = FsCompanyMetaRepository(workspace_root, repository_set=repository_set)
-    batches = {ticker: batching.begin_batch(ticker) for ticker in ("AAPL", "MSFT", "DUP-A", "DUP-B")}
+    batches = {ticker: batching.begin_batch(ticker) for ticker in ("AAPL", "MSFT")}
     for ticker, aliases in (
         ("AAPL", ["APPLE"]),
         ("MSFT", ["MSFT-A"]),
-        ("DUP-A", ["DUP-C"]),
-        ("DUP-B", ["DUP-C"]),
     ):
-        company.upsert_company_meta(
+        stage_company_meta_fixture(
+            company,
             CompanyMeta(
                 company_id=f"company-{ticker}",
                 company_name=f"{ticker} Inc.",
@@ -993,12 +995,10 @@ def test_company_owner_reads_only_published_meta_inventory_and_aliases(tmp_path:
     assert company.get_company_meta("AAPL").company_name == "AAPL Inc."
     with pytest.raises(ValueError, match="canonical ticker"):
         company.get_company_meta("aapl")
-    assert company.resolve_existing_ticker(["aapl"]) == "AAPL"
-    assert company.resolve_existing_ticker(["aapl.us"]) == "AAPL"
-    assert company.resolve_existing_ticker(["apple"]) == "AAPL"
-    assert company.resolve_existing_ticker(["not-listed"]) is None
-    with pytest.raises(ValueError, match="命中多个公司目录"):
-        company.resolve_existing_ticker(["dup.c"])
+    assert company.resolve_company_ticker("aapl") == "AAPL"
+    assert company.resolve_company_ticker("aapl.us") == "AAPL"
+    assert company.resolve_company_ticker("apple") == "AAPL"
+    assert company.resolve_company_ticker("not-listed") is None
     with pytest.raises(FileNotFoundError):
         company.get_company_meta("NONE")
 

@@ -24,6 +24,8 @@ from typing import Final, Literal, cast
 
 import pytest
 
+from tests.fins.company_meta_test_support import stage_company_meta_fixture
+
 import dayu.fins.storage._fs_source_snapshot as source_snapshot_module
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
@@ -1090,7 +1092,8 @@ def test_rollback_and_non_source_batch_preserve_published_revision(tmp_path: Pat
     )
 
     company_batch = batching.begin_batch("AAPL")
-    company_repository.upsert_company_meta(
+    stage_company_meta_fixture(
+        company_repository,
         CompanyMeta(
             company_id="0000320193",
             company_name="Apple Inc.",
@@ -2266,7 +2269,8 @@ def test_identity_mapping_detects_collision_corruption_and_business_meta_mismatc
     mismatch_batches = FsBatchingRepository(mismatch_root, repository_set=mismatch_set)
     company = FsCompanyMetaRepository(mismatch_root, repository_set=mismatch_set)
     mismatch_batch = mismatch_batches.begin_batch("AAPL")
-    company.upsert_company_meta(
+    stage_company_meta_fixture(
+        company,
         CompanyMeta(
             company_id="company-aapl",
             company_name="Apple Inc.",
@@ -2382,7 +2386,8 @@ def test_public_storage_errors_never_expose_internal_locator_or_workspace_path(
     ticker = "AAPL"
     document_id = "fil_缺失/错误\\.."
     batch = batching.begin_batch(ticker)
-    company.upsert_company_meta(
+    stage_company_meta_fixture(
+        company,
         CompanyMeta(
             company_id="opaque-company",
             company_name="Opaque Company",
@@ -2473,7 +2478,8 @@ def test_public_storage_os_errors_are_path_free_across_read_and_inventory_bounda
         source_kind=SourceKind.FILING.value,
     )
     batch = batching.begin_batch(ticker)
-    company.upsert_company_meta(
+    stage_company_meta_fixture(
+        company,
         CompanyMeta(
             company_id="permission-company",
             company_name="Permission Company",
@@ -2939,7 +2945,8 @@ def test_read_runtime_citation_reuses_same_snapshot_provenance(tmp_path: Path) -
     blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
     processed_repository = FsProcessedDocumentRepository(workspace_root, repository_set=repository_set)
     batch = batching_repository.begin_batch("AAPL")
-    company_repository.upsert_company_meta(
+    stage_company_meta_fixture(
+        company_repository,
         CompanyMeta(
             company_id="0000320193",
             company_name="Apple Inc.",
@@ -3069,7 +3076,8 @@ def test_fins_read_tool_schemas_do_not_expose_execution_context(tmp_path: Path) 
     ticker_schema: Mapping[str, JsonValue] = {
         "type": "string",
         "description": (
-            "股票代码。直接使用自然的股票代码写法，例如 AAPL、600519 或 0700；不要传公司名称，也不要手工穷举代码变体。"
+            "公司财报代码。可传工作区已接收的主代码或该公司的任一已接收别名；"
+            "两者会查询同一家公司归档。不要传公司名称，也不要手工穷举代码变体。"
         ),
     }
     document_id_schema: Mapping[str, JsonValue] = {
@@ -3163,6 +3171,161 @@ def test_fins_read_process_target_fast_path_uses_default_runtime(tmp_path: Path)
     value = _completed_envelope_value(envelope)
     assert isinstance(value, Mapping)
     assert value.get("matched") == 1
+
+
+def test_list_documents_canonical_and_accepted_alias_route_same_corpus(
+    tmp_path: Path,
+) -> None:
+    """canonical 与 accepted alias 应通过唯一 storage contract 返回同一 corpus。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: alias 被下游猜测、未命中或路由到不同 corpus 时抛出。
+    """
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    canonical_value = _completed_envelope_value(
+        _build_process_target(
+            workspace_root,
+            "list_documents",
+            {"ticker": "AAPL"},
+        )()
+    )
+    alias_value = _completed_envelope_value(
+        _build_process_target(
+            workspace_root,
+            "list_documents",
+            {"ticker": "apple"},
+        )()
+    )
+
+    assert alias_value == canonical_value
+    assert isinstance(alias_value, Mapping)
+    assert alias_value.get("matched") == 1
+
+
+def test_list_documents_meta_less_corpus_coexists_with_healthy_alias_corpus(
+    tmp_path: Path,
+) -> None:
+    """meta-less corpus 应 canonical-only，且不影响 healthy corpus 的 alias e2e 路由。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: meta-less 被视为损坏、获得隐式 alias 或污染其它 corpus 时抛出。
+    """
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    company_repository = FsCompanyMetaRepository(workspace_root, repository_set=repository_set)
+    source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    batch = batching_repository.begin_batch("DELTA")
+    request = SourceDocumentUpsertRequest(
+        ticker="DELTA",
+        document_id="delta-material",
+        internal_document_id="delta-material",
+        form_type="material",
+        primary_document="delta.md",
+        meta={
+            "fiscal_year": 2025,
+            "fiscal_period": "FY",
+            "ingest_method": "upload",
+            "source_provider": "user_upload",
+        },
+    )
+    source_repository.create_source_document(request, SourceKind.MATERIAL, batch=batch)
+    handle = SourceHandle(
+        ticker="DELTA",
+        document_id="delta-material",
+        source_kind=SourceKind.MATERIAL.value,
+    )
+    file_meta = blob_repository.store_file(
+        handle,
+        "delta.md",
+        io.BytesIO(b"# Delta material\n"),
+        batch=batch,
+        content_type="text/markdown",
+    )
+    source_repository.update_source_document(
+        SourceDocumentUpsertRequest(
+            ticker=request.ticker,
+            document_id=request.document_id,
+            internal_document_id=request.internal_document_id,
+            form_type=request.form_type,
+            primary_document=request.primary_document,
+            meta=request.meta,
+            files=[file_meta],
+        ),
+        SourceKind.MATERIAL,
+        batch=batch,
+    )
+    batching_repository.commit_batch(batch)
+
+    delta_value = _completed_envelope_value(
+        _build_process_target(workspace_root, "list_documents", {"ticker": "DELTA"})()
+    )
+    delta_variant_value = _completed_envelope_value(
+        _build_process_target(workspace_root, "list_documents", {"ticker": "delta.us"})()
+    )
+    aapl_value = _completed_envelope_value(
+        _build_process_target(workspace_root, "list_documents", {"ticker": "AAPL"})()
+    )
+    apple_value = _completed_envelope_value(
+        _build_process_target(workspace_root, "list_documents", {"ticker": "APPLE"})()
+    )
+
+    assert delta_variant_value == delta_value
+    assert isinstance(delta_value, Mapping)
+    assert delta_value.get("matched") == 1
+    assert apple_value == aapl_value
+    assert company_repository.resolve_company_ticker("DLTA") is None
+    assert not (workspace_root / "portfolio" / "DELTA" / "meta.json").exists()
+
+
+def test_list_documents_projects_descriptor_corruption_as_actionable_business_error(
+    tmp_path: Path,
+) -> None:
+    """read owner 应把 typed descriptor corruption 投影为固定可行动错误。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: corruption 泄露路径、落入 NOT_FOUND 或 execution error 时抛出。
+    """
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    descriptor_candidates = tuple(
+        path
+        for path in (workspace_root / "portfolio" / "AAPL").iterdir()
+        if path.name.startswith(".") and path.suffix == ".json"
+    )
+    assert len(descriptor_candidates) == 1
+    descriptor_path = descriptor_candidates[0]
+    descriptor_path.write_text("{}", encoding="utf-8")
+    read_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_read_runtime()
+
+    with pytest.raises(FinsReadBusinessError) as exc_info:
+        read_runtime.list_documents(ticker="AAPL")
+
+    assert exc_info.value.code is ErrorCode.WORKSPACE_IDENTITY_CORRUPTED
+    assert exc_info.value.message == "工作区中的公司代码身份数据不一致，当前无法安全解析该公司"
+    assert exc_info.value.hint == "请修复该工作区的公司元数据后重试"
+    assert str(workspace_root) not in str(exc_info.value)
 
 
 def test_fins_read_process_target_processor_and_table_paths(tmp_path: Path) -> None:
@@ -4858,7 +5021,8 @@ def _build_fins_workspace(tmp_path: Path) -> Path:
     blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
     token = batching_repository.begin_batch("AAPL")
     try:
-        company_repository.upsert_company_meta(
+        stage_company_meta_fixture(
+            company_repository,
             CompanyMeta(
                 company_id="0000320193",
                 company_name="Apple Inc.",
@@ -5235,7 +5399,8 @@ def _build_read_runtime_with_provenance_documents(tmp_path: Path) -> FinsReadRun
         ("600519", "600519_CNINFO", "CN"),
         ("0700", "0700_HKEX", "HK"),
     ):
-        company_repository.upsert_company_meta(
+        stage_company_meta_fixture(
+            company_repository,
             CompanyMeta(
                 company_id=company_id,
                 company_name=f"{ticker} Test Company",
@@ -5332,7 +5497,8 @@ def _build_fins_financial_html_workspace(tmp_path: Path) -> Path:
     blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
     token = batching_repository.begin_batch("AAPL")
     try:
-        company_repository.upsert_company_meta(
+        stage_company_meta_fixture(
+            company_repository,
             CompanyMeta(
                 company_id="0000320193",
                 company_name="Apple Inc.",
@@ -5416,7 +5582,8 @@ def _build_fins_aapl_xbrl_workspace(
     source_meta = _source_meta_without_files(meta)
     token = batching_repository.begin_batch("AAPL")
     try:
-        company_repository.upsert_company_meta(
+        stage_company_meta_fixture(
+            company_repository,
             CompanyMeta(
                 company_id="0000320193",
                 company_name="Apple Inc.",

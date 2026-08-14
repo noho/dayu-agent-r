@@ -10,7 +10,11 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Final, Literal
 
-from dayu.fins.domain.document_models import BatchToken, CompanyMeta, now_iso8601
+from dayu.fins.domain.company_meta_contract import (
+    CompanyMetaCommitIntent,
+    build_company_meta_commit_intent,
+)
+from dayu.fins.domain.document_models import BatchToken, CompanyMeta
 from dayu.fins.storage import CompanyMetaRepositoryProtocol
 from dayu.fins.ticker_normalization import (
     build_company_ticker_identity,
@@ -32,11 +36,11 @@ class UploadCompanyMetaDecision:
 
     Attributes:
         disposition: 保留既有 meta、不处理或在 batch 中 stage 新 meta。
-        company_meta: stage 时的完整 company meta；其它 disposition 为 ``None``。
+        company_meta_intent: stage 时的提交意图；其它 disposition 为 ``None``。
     """
 
     disposition: Literal["keep", "skip", "stage"]
-    company_meta: CompanyMeta | None
+    company_meta_intent: CompanyMetaCommitIntent | None
 
 
 def resolve_upload_company_meta_decision(
@@ -65,9 +69,8 @@ def resolve_upload_company_meta_decision(
     """
 
     if action not in UPLOAD_ACTIONS_REQUIRING_COMPANY_META:
-        return UploadCompanyMetaDecision(disposition="skip", company_meta=None)
+        return UploadCompanyMetaDecision(disposition="skip", company_meta_intent=None)
     proposed_identity = build_company_ticker_identity(ticker, ticker_aliases)
-    merged_identity = proposed_identity
     if existing_meta is not None:
         existing_identity = existing_meta.ticker_identity
         if (
@@ -88,25 +91,27 @@ def resolve_upload_company_meta_decision(
             resolver_version=RESOLVER_VERSION,
         ):
             if merged_identity == existing_identity:
-                return UploadCompanyMetaDecision(disposition="keep", company_meta=None)
+                return UploadCompanyMetaDecision(disposition="keep", company_meta_intent=None)
             return UploadCompanyMetaDecision(
                 disposition="stage",
-                company_meta=CompanyMeta(
-                    company_id=existing_meta.company_id,
-                    company_name=existing_meta.company_name,
-                    ticker_identity=merged_identity,
-                    resolver_version=existing_meta.resolver_version,
-                    updated_at=now_iso8601(),
+                company_meta_intent=build_company_meta_commit_intent(
+                    proposed_identity=proposed_identity,
+                    merge_mode="preserve_published",
+                    observed_meta=existing_meta,
+                    proposed_company_id=None,
+                    proposed_company_name=None,
+                    resolver_version=RESOLVER_VERSION,
                 ),
             )
     return UploadCompanyMetaDecision(
         disposition="stage",
-        company_meta=CompanyMeta(
-            company_id=ticker_to_company_id(normalize_ticker(proposed_identity.canonical_ticker)),
-            company_name=_require_upload_company_name(company_name),
-            ticker_identity=merged_identity,
+        company_meta_intent=build_company_meta_commit_intent(
+            proposed_identity=proposed_identity,
+            merge_mode="refresh_if_stale",
+            observed_meta=existing_meta,
+            proposed_company_id=ticker_to_company_id(normalize_ticker(proposed_identity.canonical_ticker)),
+            proposed_company_name=_require_upload_company_name(company_name),
             resolver_version=RESOLVER_VERSION,
-            updated_at=now_iso8601(),
         ),
     )
 
@@ -134,9 +139,9 @@ def stage_upload_company_meta_decision(
 
     if decision.disposition != "stage":
         return
-    if decision.company_meta is None:
-        raise ValueError("stage company meta decision 缺少 company_meta")
-    repository.upsert_company_meta(decision.company_meta, batch=batch)
+    if decision.company_meta_intent is None:
+        raise ValueError("stage company meta decision 缺少 company_meta_intent")
+    repository.stage_company_meta_intent(decision.company_meta_intent, batch=batch)
 
 
 def stage_company_meta_for_upload(

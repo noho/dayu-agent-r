@@ -292,7 +292,7 @@ HK 的中期业绩可显示覆盖 H1，但不能代替独立中期报告消除 H
 
 ```bash
 dayu-cli upload_filing \
-  --ticker AAPL \
+  --ticker AAPL,APPL \
   --action create \
   --files ./AAPL-2024-10K.pdf \
   --fiscal-year 2024 \
@@ -300,7 +300,7 @@ dayu-cli upload_filing \
   --company-name "Apple Inc."
 
 dayu-cli upload_material \
-  --ticker AAPL \
+  --ticker AAPL,APPL \
   --action create \
   --forms 10-K \
   --material-name "Investor Day" \
@@ -315,6 +315,8 @@ dayu-cli upload_material --help
 ```
 
 `upload_filing` 会在启动运行时前完成参数、文件与当前目标状态校验。可由用户修正的输入错误会输出一行具体原因并退出 `2`，不会创建上传任务或发布财报；文件解析、存储或执行失败会输出脱敏的可操作原因并退出 `1`。filing 的公司信息与文档内容只会一起发布，失败时不会留下只发布一半的结果。
+
+`upload_filing` 与 `upload_material` 的 `--ticker` 都可使用逗号分隔值：首项是公司的主代码，后续项是用户明确声明的同公司别名。上传成功后，使用主代码或任一已接收别名查询都会进入同一家公司归档；不要填写公司名称，也不要重复列出只是写法不同但含义相同的代码。若某个别名已属于工作区中的另一家公司，本次上传会在发布任何文件前拒绝，并提示移除冲突别名后重试。
 
 直接调用 `upload_filing` 或通过 `start_fins_upload` 工具上传 filing 时，`fiscal_year`
 必须是 `1000..9999` 的整数；可选的 `filing_date` 与 `report_date` 若填写，必须是实际
@@ -345,7 +347,7 @@ dayu-cli upload_filings_from \
   --recursive
 ```
 
-`--ticker` 接受逗号分隔值：首项是规范 ticker，其余项作为 aliases，脚本中的每条上传命令都使用同一组值。
+`--ticker` 接受逗号分隔值：首项是公司的主代码，其余项是用户明确声明的同公司别名，脚本中的每条上传命令都使用同一组值；成功上传后，任一已接收代码都查询同一家公司归档。
 `--action` 默认 `auto`；需要固定动作时可显式传 `--action create` 或 `--action update`。
 
 未传 `--output` 时，脚本写到 `--base` 工作区根目录：POSIX 使用

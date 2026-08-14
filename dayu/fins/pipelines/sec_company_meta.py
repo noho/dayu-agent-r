@@ -6,9 +6,12 @@ from collections.abc import Sequence
 from typing import Optional
 
 from dayu.contracts.json_value import JsonValue
-from dayu.fins.domain.document_models import BatchToken, CompanyMeta, now_iso8601
+from dayu.fins.domain.company_meta_contract import build_company_meta_commit_intent
+from dayu.fins.domain.document_models import BatchToken, CompanyMeta
 from dayu.fins.storage import CompanyMetaRepositoryProtocol
 from dayu.fins.ticker_normalization import build_company_ticker_identity, try_normalize_ticker
+
+_SEC_RESOLVER_VERSION = "market_resolver_v1"
 
 
 def extract_sec_ticker_aliases(
@@ -32,9 +35,7 @@ def extract_sec_ticker_aliases(
     raw_aliases = submissions.get("tickers")
     alias_list = raw_aliases if isinstance(raw_aliases, list) else []
     valid_external_aliases = tuple(
-        alias
-        for alias in alias_list
-        if isinstance(alias, str) and try_normalize_ticker(alias) is not None
+        alias for alias in alias_list if isinstance(alias, str) and try_normalize_ticker(alias) is not None
     )
     return build_company_ticker_identity(
         primary_ticker,
@@ -99,16 +100,54 @@ def upsert_company_meta(
     """
 
     ticker_identity = build_company_ticker_identity(ticker, ticker_aliases or ())
-    repository.upsert_company_meta(
-        CompanyMeta(
-            company_id=company_id,
-            company_name=company_name or ticker,
-            ticker_identity=ticker_identity,
-            resolver_version="market_resolver_v1",
-            updated_at=now_iso8601(),
-        ),
-        batch=batch,
+    existing_meta = _load_existing_company_meta(repository, ticker_identity.canonical_ticker)
+    if existing_meta is not None and existing_meta.resolver_version == _SEC_RESOLVER_VERSION:
+        merged_identity = build_company_ticker_identity(
+            ticker_identity.canonical_ticker,
+            (*existing_meta.ticker_identity.accepted_aliases, *ticker_identity.accepted_aliases),
+        )
+        if merged_identity == existing_meta.ticker_identity:
+            return
+        merge_mode = "preserve_published"
+        proposed_company_id: str | None = None
+        proposed_company_name: str | None = None
+    else:
+        merge_mode = "refresh_if_stale"
+        proposed_company_id = company_id
+        proposed_company_name = company_name or ticker
+    intent = build_company_meta_commit_intent(
+        proposed_identity=ticker_identity,
+        merge_mode=merge_mode,
+        observed_meta=existing_meta,
+        proposed_company_id=proposed_company_id,
+        proposed_company_name=proposed_company_name,
+        resolver_version=_SEC_RESOLVER_VERSION,
     )
+    repository.stage_company_meta_intent(intent, batch=batch)
+
+
+def _load_existing_company_meta(
+    repository: CompanyMetaRepositoryProtocol,
+    ticker: str,
+) -> CompanyMeta | None:
+    """读取 SEC producer 当前可见的 CompanyMeta。
+
+    Args:
+        repository: 公司元数据仓储。
+        ticker: canonical ticker。
+
+    Returns:
+        已发布 CompanyMeta；不存在时返回 ``None``。
+
+    Raises:
+        ValueError: 已发布元数据非法时抛出。
+        OSError: 仓储读取失败时抛出。
+    """
+
+    try:
+        return repository.get_company_meta(ticker)
+    except FileNotFoundError:
+        return None
 
 
 __all__ = [
