@@ -81,9 +81,7 @@ _UNPARSABLE_DOCX_BYTES = b"not a DOCX"
 _TYPED_CONTENT_FAILURE_REASON = "文件无法解析或已损坏，请检查文件后重试"
 _MAX_PUBLIC_CONTENT_FAILURE_STDERR_CHARS = 1024
 _UNKNOWN_DIRECT_FAILURE_MARKER = "private /absolute/path traceback marker"
-_UNKNOWN_DIRECT_FAILURE_STDERR = (
-    "dayu-cli download: 命令执行失败，请使用 --log-file PATH 重试并查看日志\n"
-)
+_UNKNOWN_DIRECT_FAILURE_STDERR = "dayu-cli download: 命令执行失败，请使用 --log-file PATH 重试并查看日志\n"
 
 
 class _NeverCancelledJobChecker(FinsJobCancellationChecker):
@@ -1097,9 +1095,7 @@ def test_download_partial_year_rejects_values_outside_shared_year_domain(
     with pytest.raises(download_contract.FinsDownloadUsageError) as exc_info:
         build_fins_download_request(ticker="AAPL", start=partial_bound)
 
-    assert str(exc_info.value) == (
-        "--start 不是有效日期，请使用 YYYY、YYYY-MM 或 YYYY-MM-DD"
-    )
+    assert str(exc_info.value) == ("--start 不是有效日期，请使用 YYYY、YYYY-MM 或 YYYY-MM-DD")
 
 
 @pytest.mark.parametrize(
@@ -1124,9 +1120,7 @@ def test_download_full_date_rejects_nonexistent_calendar_dates(
     with pytest.raises(download_contract.FinsDownloadUsageError) as exc_info:
         build_fins_download_request(ticker="AAPL", start=full_date_bound)
 
-    assert str(exc_info.value) == (
-        "--start 不是有效日期，请使用 YYYY、YYYY-MM 或 YYYY-MM-DD"
-    )
+    assert str(exc_info.value) == ("--start 不是有效日期，请使用 YYYY、YYYY-MM 或 YYYY-MM-DD")
 
 
 def test_download_date_bound_delegates_shared_year_and_full_date_owners(
@@ -1982,15 +1976,28 @@ def test_upload_filing_repository_resolve_failure_preserves_cli_boundary_contrac
     assert not workspace_root.exists()
 
 
-def test_upload_filing_prevalidation_descriptor_corruption_is_typed_and_path_free(
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "descriptor_malformed",
+        "meta_malformed",
+        "meta_symlink",
+        "meta_directory",
+        "target_symlink",
+        "target_regular_file",
+    ),
+)
+def test_upload_filing_prevalidation_identity_corruption_is_typed_and_path_free(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    corruption: str,
 ) -> None:
-    """descriptor corruption 必须 exit 1 且只输出 closed bounded reason。
+    """真实 descriptor/meta/target corruption 必须只输出 closed bounded reason。
 
     Args:
         tmp_path: pytest 临时目录。
         capsys: 标准流捕获夹具。
+        corruption: 待注入的 durable corruption 形态。
 
     Returns:
         无。
@@ -2000,9 +2007,34 @@ def test_upload_filing_prevalidation_descriptor_corruption_is_typed_and_path_fre
     """
 
     workspace_root = tmp_path / "workspace"
-    ticker_root = workspace_root / "portfolio" / "AAPL"
-    ticker_root.mkdir(parents=True)
-    (ticker_root / ".identity.json").write_text("{}", encoding="utf-8")
+    portfolio_root = workspace_root / "portfolio"
+    portfolio_root.mkdir(parents=True)
+    ticker_root = portfolio_root / "AAPL"
+    if corruption == "target_symlink":
+        outside_root = tmp_path / "outside-company"
+        outside_root.mkdir()
+        ticker_root.symlink_to(outside_root, target_is_directory=True)
+    elif corruption == "target_regular_file":
+        ticker_root.write_bytes(b"foreign locator")
+    else:
+        ticker_root.mkdir()
+        descriptor_path = ticker_root / ".identity.json"
+        if corruption == "descriptor_malformed":
+            descriptor_path.write_text("{}", encoding="utf-8")
+        else:
+            descriptor_path.write_text(
+                '{"namespace":"ticker","external_identity":"AAPL"}',
+                encoding="utf-8",
+            )
+            meta_path = ticker_root / "meta.json"
+            if corruption == "meta_malformed":
+                meta_path.write_text("{}", encoding="utf-8")
+            elif corruption == "meta_symlink":
+                outside_meta = tmp_path / "outside-meta.json"
+                outside_meta.write_text("{}", encoding="utf-8")
+                meta_path.symlink_to(outside_meta)
+            else:
+                meta_path.mkdir()
     input_file = tmp_path / "filing.pdf"
     input_file.write_text("filing", encoding="utf-8")
 
@@ -2338,6 +2370,46 @@ def test_upload_commands_map_args_and_validate_files(
             overwrite=False,
         )
     ]
+
+
+def test_upload_material_alias_count_uses_typed_upload_admission(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """material 超量 aliases 必须由共享 upload usage owner 有界拒绝。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        capsys: 标准流捕获夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: material 绕过数量准入、错误命令名前缀或启动 stream 时抛出。
+    """
+
+    ticker_csv = ",".join(("AAPL", *(f"A-{index}" for index in range(101))))
+    exit_code = cli_main.main(
+        (
+            "upload_material",
+            "--base",
+            str(tmp_path / "workspace"),
+            "--ticker",
+            ticker_csv,
+            "--action",
+            "delete",
+            "--forms",
+            "MATERIAL_OTHER",
+            "--material-name",
+            "Deck",
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_USAGE_ERROR
+    assert captured.out == ""
+    assert captured.err == ("dayu-cli upload_material: --ticker 别名数量不能超过 100 个\n")
 
 
 def test_process_commands_map_to_service(
@@ -2757,10 +2829,7 @@ def test_upload_terminal_summary_renderer_uses_typed_requested_and_stored_counts
         AssertionError: typed RESULT 到 CLI 摘要的计数或字段名投影漂移时抛出。
     """
 
-    input_files = tuple(
-        tmp_path / f"input-{index}.pdf"
-        for index in range(summary.requested_file_count)
-    )
+    input_files = tuple(tmp_path / f"input-{index}.pdf" for index in range(summary.requested_file_count))
     for input_file in input_files:
         input_file.write_bytes(b"typed filing input")
     raw_request = FinsUploadFilingRequest(

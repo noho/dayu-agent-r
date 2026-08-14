@@ -143,6 +143,7 @@ from dayu.fins.service_runtime import (
 from dayu.fins.storage import (
     BatchingRepositoryProtocol,
     CompanyTickerAliasConflictError,
+    CompanyTickerIdentityCorruptionError,
     DocumentBlobRepositoryProtocol,
     FsBatchingRepository,
     FsCompanyMetaRepository,
@@ -7146,6 +7147,14 @@ def test_upload_request_and_result_summaries_enforce_bounds(tmp_path: Path) -> N
     with pytest.raises(FinsUploadUsageError) as aliases_exc:
         runtime.start_upload(FinsUploadFilingRequest(ticker="AAPL", ticker_aliases=too_many_aliases))
     assert aliases_exc.value.failure.code is FinsUploadUsageCode.TOO_MANY_TICKER_ALIASES
+    with pytest.raises(FinsUploadUsageError) as material_aliases_exc:
+        runtime.start_upload(
+            FinsUploadMaterialRequest(
+                ticker="AAPL",
+                ticker_aliases=too_many_aliases,
+            )
+        )
+    assert material_aliases_exc.value.failure.code is FinsUploadUsageCode.TOO_MANY_TICKER_ALIASES
     with pytest.raises(ValueError, match="requested_file_count"):
         FinsUploadResultSummary(
             source_kind=SourceKind.FILING,
@@ -7154,6 +7163,89 @@ def test_upload_request_and_result_summaries_enforce_bounds(tmp_path: Path) -> N
             stored_file_count=0,
         )
     assert executor.operations == []
+
+
+@pytest.mark.parametrize(
+    ("upload_request", "expected_code"),
+    (
+        (
+            FinsUploadMaterialRequest(ticker="Apple Inc."),
+            FinsUploadUsageCode.INVALID_TICKER,
+        ),
+        (
+            FinsUploadMaterialRequest(ticker="AAPL", ticker_aliases=("a apl",)),
+            FinsUploadUsageCode.INVALID_TICKER_ALIAS,
+        ),
+    ),
+)
+def test_material_upload_reuses_ticker_identity_admission_before_job_creation(
+    tmp_path: Path,
+    upload_request: FinsUploadMaterialRequest,
+    expected_code: FinsUploadUsageCode,
+) -> None:
+    """material 非法 ticker/alias 必须复用 typed usage owner 且不创建 job。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        upload_request: 当前非法 material request。
+        expected_code: 预期 closed usage code。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: material 绕过共享准入或产生 durable job 时抛出。
+    """
+
+    workspace_root = tmp_path / "fins-workspace"
+    executor = _HoldingExecutor()
+    runtime = _build_ingestion_runtime(workspace_root, executor=executor)
+
+    with pytest.raises(FinsUploadUsageError) as exc_info:
+        runtime.start_upload(upload_request)
+
+    assert exc_info.value.failure.code is expected_code
+    assert executor.operations == []
+    assert not tuple((workspace_root / ".dayu" / "fins_ingestion" / "jobs").glob("*.json"))
+
+
+def test_start_upload_projects_real_corrupt_company_meta_before_job_creation(
+    tmp_path: Path,
+) -> None:
+    """真实 malformed CompanyMeta 必须由 start boundary 透出 typed corruption。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: corruption 被归类为参数错误或 durable job 已创建时抛出。
+    """
+
+    workspace_root = tmp_path / "fins-workspace"
+    ticker_dir = workspace_root / "portfolio" / "AAPL"
+    ticker_dir.mkdir(parents=True)
+    (ticker_dir / ".identity.json").write_text(
+        json.dumps({"namespace": "ticker", "external_identity": "AAPL"}),
+        encoding="utf-8",
+    )
+    (ticker_dir / "meta.json").write_text("{}", encoding="utf-8")
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+
+    with pytest.raises(CompanyTickerIdentityCorruptionError) as exc_info:
+        runtime.start_upload(
+            FinsUploadFilingRequest(
+                ticker="AAPL",
+                action="delete",
+                fiscal_year=2024,
+                fiscal_period="FY",
+            )
+        )
+
+    assert exc_info.value.kind == "invalid_meta"
+    assert not tuple((workspace_root / ".dayu" / "fins_ingestion" / "jobs").glob("*.json"))
 
 
 def test_upload_requests_use_source_kind_for_filing_material_discrimination(tmp_path: Path) -> None:

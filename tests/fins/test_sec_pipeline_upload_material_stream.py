@@ -292,3 +292,95 @@ async def test_upload_material_alias_conflict_projects_exact_typed_terminal(tmp_
     assert result["failure"] == expected_failure
     assert events[-1].payload["error"] == expected_failure["message"]
     assert not (tmp_path / "portfolio" / "AAPL").exists()
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "malformed_meta",
+        "meta_symlink",
+        "meta_directory",
+        "target_symlink",
+        "target_regular_file",
+    ),
+)
+@pytest.mark.asyncio
+async def test_upload_material_identity_corruption_projects_storage_terminal(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    """material 真实 meta/target corruption 必须走共享 typed terminal owner。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        corruption: 待注入的 durable corruption 形态。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: corruption 落成 unexpected_runtime、泄露 schema 原文或
+            发布 material source 时抛出。
+        OSError: 测试环境无法创建 symlink 时抛出。
+    """
+
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        processor_registry=build_fins_processor_registry(),
+        docling_converter=_FakeDoclingConverter(),
+    )
+    ticker_dir = tmp_path / "portfolio" / "AAPL"
+    if corruption.startswith("target_"):
+        ticker_dir.parent.mkdir(parents=True, exist_ok=True)
+        if corruption == "target_symlink":
+            outside_dir = tmp_path / "outside-company"
+            outside_dir.mkdir()
+            ticker_dir.symlink_to(outside_dir, target_is_directory=True)
+        else:
+            ticker_dir.write_bytes(b"foreign locator")
+    else:
+        batch = pipeline._batching_repository.begin_batch("AAPL")
+        pipeline._batching_repository.commit_batch(batch)
+        meta_path = ticker_dir / "meta.json"
+        if corruption == "malformed_meta":
+            meta_path.write_text("{}", encoding="utf-8")
+        elif corruption == "meta_symlink":
+            outside_meta = tmp_path / "outside-meta.json"
+            outside_meta.write_text("{}", encoding="utf-8")
+            meta_path.symlink_to(outside_meta)
+        else:
+            meta_path.mkdir()
+    material_file = tmp_path / "material.pdf"
+    material_file.write_text("demo material", encoding="utf-8")
+
+    events = [
+        event
+        async for event in pipeline.upload_material_stream(
+            ticker="AAPL",
+            action="create",
+            form_type="MATERIAL_OTHER",
+            material_name="Deck",
+            files=[material_file],
+            company_name="Apple Inc.",
+            overwrite=False,
+        )
+    ]
+
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    expected_failure = {
+        "kind": "storage",
+        "code": "storage_io",
+        "message": "工作区公司代码身份数据损坏，无法安全提交",
+        "retry_hint": "请修复工作区公司元数据后重试",
+        "file_label": None,
+    }
+    assert events[-1].event_type is UploadMaterialEventType.UPLOAD_FAILED
+    assert result["status"] == "failed"
+    assert result["stored_file_count"] == 0
+    assert result["failure"] == expected_failure
+    assert events[-1].payload["error"] == expected_failure["message"]
+    assert "CompanyMeta" not in str(events[-1].payload)
+    assert "ticker_aliases 必须" not in str(events[-1].payload)
+    if ticker_dir.is_dir() and not ticker_dir.is_symlink():
+        assert not tuple((ticker_dir / "materials").glob("*"))

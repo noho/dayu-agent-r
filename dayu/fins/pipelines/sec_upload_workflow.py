@@ -15,7 +15,6 @@ from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.document_models import FinsIngestMethod
 from dayu.fins.domain.enums import SourceKind
-from dayu.fins.downloaders.sec_downloader import SecDownloader
 from dayu.fins.ingestion_runtime import (
     ValidatedFinsUploadFilingRequest,
     validate_fins_upload_filing_request,
@@ -64,12 +63,6 @@ class SecUploadWorkflowHost(Protocol):
     @property
     def _batching_repository(self) -> BatchingRepositoryProtocol:
         """返回 batch lifecycle 唯一仓储。"""
-
-        ...
-
-    @property
-    def _downloader(self) -> SecDownloader:
-        """返回 SEC 下载器实例。"""
 
         ...
 
@@ -443,7 +436,7 @@ async def run_upload_material_stream(
     normalized = normalize_ticker(ticker)
     if normalized.market != "US":
         raise ValueError(f"SecPipeline 仅支持 US，当前 market={normalized.market}")
-    normalized_ticker = host._downloader.normalize_ticker(ticker)
+    normalized_ticker = normalized.canonical
     normalized_company_id = build_upload_company_id(normalized_ticker)
     file_list = files or []
     normalized_fiscal_period = str(fiscal_period or "").strip().upper() or None
@@ -459,36 +452,37 @@ async def run_upload_material_stream(
         document_id=document_id,
         internal_document_id=internal_document_id,
     )
-    previous_meta = host._safe_get_document_meta(
-        normalized_ticker,
-        resolved_document_id,
-        SourceKind.MATERIAL,
-    )
     requested_action = str(action or "").strip().lower() or None
-    normalized_action = resolve_upload_action(action, previous_meta)
-    yield UploadMaterialEvent(
-        event_type=UploadMaterialEventType.UPLOAD_STARTED,
-        ticker=normalized_ticker,
-        document_id=resolved_document_id,
-        payload={
-            "action": normalized_action,
-            "requested_action": requested_action,
-            "resolved_action": normalized_action,
-            "form_type": form_type,
-            "material_name": material_name,
-            "internal_document_id": resolved_internal_id,
-            "fiscal_year": fiscal_year,
-            "fiscal_period": normalized_fiscal_period,
-            "filing_date": filing_date,
-            "report_date": report_date,
-            "company_id": normalized_company_id,
-            "company_name": company_name,
-            "ticker_aliases": _json_text_list(ticker_aliases),
-            "overwrite": overwrite,
-            "file_count": len(file_list),
-        },
-    )
+    normalized_action: str | None = None
     try:
+        previous_meta = host._safe_get_document_meta(
+            normalized_ticker,
+            resolved_document_id,
+            SourceKind.MATERIAL,
+        )
+        normalized_action = resolve_upload_action(action, previous_meta)
+        yield UploadMaterialEvent(
+            event_type=UploadMaterialEventType.UPLOAD_STARTED,
+            ticker=normalized_ticker,
+            document_id=resolved_document_id,
+            payload={
+                "action": normalized_action,
+                "requested_action": requested_action,
+                "resolved_action": normalized_action,
+                "form_type": form_type,
+                "material_name": material_name,
+                "internal_document_id": resolved_internal_id,
+                "fiscal_year": fiscal_year,
+                "fiscal_period": normalized_fiscal_period,
+                "filing_date": filing_date,
+                "report_date": report_date,
+                "company_id": normalized_company_id,
+                "company_name": company_name,
+                "ticker_aliases": _json_text_list(ticker_aliases),
+                "overwrite": overwrite,
+                "file_count": len(file_list),
+            },
+        )
         company_batch = host._batching_repository.begin_batch(normalized_ticker)
         try:
             stage_company_meta_for_upload(

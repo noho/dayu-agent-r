@@ -167,7 +167,9 @@ class FilingUploadStateRepositoryProtocol(Protocol):
             同版 published state；独立缺失的成员分别为 ``None``。
 
         Raises:
-            ValueError: ticker、identity descriptor 或元数据不合法时抛出。
+            CompanyTickerIdentityCorruptionError: published target、descriptor、meta
+                或 identity durable state 损坏时抛出。
+            ValueError: ticker 或 document identity 非法时抛出。
             RuntimeFileLockError: publication guard 获取或释放失败时抛出。
             OSError: published state 读取失败时抛出。
         """

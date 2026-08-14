@@ -18,6 +18,7 @@ from ._fs_storage_infra import (
     _parse_backup_directory_name,
 )
 from ._fs_identity import _require_external_identity
+from .repository_protocols import CompanyTickerIdentityCorruptionError
 from ._fs_storage_utils import (
     _SOURCE_META_FILENAME,
     _list_directory,
@@ -41,7 +42,8 @@ class _FsCompanyMetaMixin(_FsStorageInfra):
 
         Raises:
             FileNotFoundError: 元数据文件不存在时抛出。
-            ValueError: 元数据字段缺失或格式错误时抛出。
+            CompanyTickerIdentityCorruptionError: descriptor、meta 或 identity
+                durable state 损坏时抛出。
             RuntimeFileLockError: publication guard 获取或释放失败时抛出。
             OSError: published meta 读取失败时抛出。
         """
@@ -64,18 +66,28 @@ class _FsCompanyMetaMixin(_FsStorageInfra):
 
         Raises:
             FileNotFoundError: 元数据文件不存在时抛出。
-            ValueError: 元数据字段缺失或格式错误时抛出。
+            CompanyTickerIdentityCorruptionError: descriptor、meta 或 identity
+                durable state 损坏时抛出。
             OSError: descriptor 或元数据读取失败时抛出。
         """
 
-        company_meta_path = self._company_meta_path_for_read(external_ticker)
-        if not company_meta_path.exists():
+        ticker_dir = self._target_ticker_dir(external_ticker)
+        directory_stat = self._lstat_optional_storage_path(
+            ticker_dir,
+            action="检查 published CompanyMeta ticker directory",
+        )
+        if directory_stat is None:
             raise FileNotFoundError(f"公司元数据不存在: ticker={external_ticker}")
-        data = _read_json_object(company_meta_path)
-        company_meta = CompanyMeta.from_dict(data)
-        if company_meta.ticker_identity.canonical_ticker != external_ticker:
-            raise ValueError("公司元数据 ticker 与 identity descriptor 不一致")
-        return company_meta
+        identity = self._read_published_company_identity(
+            ticker_dir,
+            expected_storage_key=ticker_dir.name,
+            known_directory_stat=directory_stat,
+        )
+        if identity.canonical_ticker != external_ticker:
+            raise CompanyTickerIdentityCorruptionError(kind="invalid_descriptor")
+        if identity.company_meta is None:
+            raise FileNotFoundError(f"公司元数据不存在: ticker={external_ticker}")
+        return identity.company_meta
 
     def scan_company_meta_inventory(self) -> list[CompanyMetaInventoryEntry]:
         """按 ticker publication guard 扫描 published 公司目录并返回盘点结果。

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import stat
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Protocol, cast
@@ -13,14 +15,27 @@ from dayu.fins.ticker_normalization import normalize_ticker
 from dayu.runtime.filelock import RuntimeFileLockToken
 
 from ._fs_storage_infra import _FsStorageInfra
-from .repository_protocols import FilingUploadPublishedState
+from .repository_protocols import (
+    CompanyTickerIdentityCorruptionError,
+    FilingUploadPublishedState,
+)
 
 
 class _FilingUploadStateCoreProtocol(Protocol):
     """snapshot mixin 依赖的 storage core 私有能力集合。"""
 
-    def _ticker_dir_if_present_for_read(self, ticker: str) -> Path | None:
-        """返回 ticker locator 是否存在。"""
+    def _target_ticker_dir(self, ticker: str) -> Path:
+        """返回 canonical ticker 的 published locator。"""
+
+        ...
+
+    def _lstat_optional_storage_path(
+        self,
+        path: Path,
+        *,
+        action: str,
+    ) -> os.stat_result | None:
+        """显式区分 missing、结构状态与 operational I/O。"""
 
         ...
 
@@ -68,16 +83,24 @@ class _FsFilingUploadStateMixin(_FsStorageInfra):
             同一 publication guard 下读取的两个独立可缺失成员。
 
         Raises:
-            ValueError: ticker、document identity 或元数据不合法时抛出。
+            CompanyTickerIdentityCorruptionError: published target、descriptor、meta
+                或 identity durable state 损坏时抛出。
+            ValueError: ticker 或 document identity 非法时抛出。
             RuntimeFileLockError: publication guard 获取或释放失败时抛出。
             OSError: published state 读取失败时抛出。
         """
 
         external_ticker = normalize_ticker(ticker).canonical
         core = cast(_FilingUploadStateCoreProtocol, self)
-        if core._ticker_dir_if_present_for_read(external_ticker) is None:
+        target_dir = core._target_ticker_dir(external_ticker)
+        target_stat = core._lstat_optional_storage_path(
+            target_dir,
+            action="检查 filing upload published ticker directory",
+        )
+        if target_stat is None:
             return FilingUploadPublishedState(company_meta=None, source_meta=None)
-
+        if not stat.S_ISDIR(target_stat.st_mode):
+            raise CompanyTickerIdentityCorruptionError(kind="invalid_descriptor")
         guard_token = core._acquire_publication_guard(external_ticker)
         try:
             try:

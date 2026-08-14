@@ -513,6 +513,8 @@ class _FsStorageInfra:
 
         Raises:
             ValueError: ticker 非法时抛出。
+            CompanyTickerIdentityCorruptionError: existing target、descriptor、meta
+                或 tree durable state 损坏时抛出。
             RuntimeError: 本地 reservation 或跨进程 writer lock 失败时抛出。
             RuntimeFileLockError: writer lock 获取或初始化失败后的释放失败时抛出。
             OSError: 暂存目录准备失败时抛出。
@@ -544,7 +546,7 @@ class _FsStorageInfra:
             )
             target_is_published = target_stat is not None
             if target_stat is not None and not stat.S_ISDIR(target_stat.st_mode):
-                raise ValueError("batch target ticker root 必须为非 symlink 目录")
+                raise CompanyTickerIdentityCorruptionError(kind="invalid_descriptor")
             state = _ActiveBatchState(
                 token=token,
                 lifecycle=_BATCH_LIFECYCLE_OPEN,
@@ -560,11 +562,14 @@ class _FsStorageInfra:
             )
             self._write_batch_journal(state, _PHASE_STARTED)
             if target_is_published:
-                _read_identity_descriptor(
+                assert target_stat is not None
+                published_identity = self._read_published_company_identity(
                     target_ticker_dir,
-                    _TICKER_IDENTITY_NAMESPACE,
-                    expected_external_identity=external_ticker,
+                    expected_storage_key=target_ticker_dir.name,
+                    known_directory_stat=target_stat,
                 )
+                if published_identity.canonical_ticker != external_ticker:
+                    raise CompanyTickerIdentityCorruptionError(kind="invalid_descriptor")
                 self._require_copyable_ticker_tree(target_ticker_dir)
                 shutil.copytree(target_ticker_dir, staging_ticker_dir)
                 _read_identity_descriptor(
@@ -760,7 +765,8 @@ class _FsStorageInfra:
         Raises:
             RuntimeFileLockError: publication guard 获取或释放失败时抛出。
             OSError: swap、journal 或 restore 失败时抛出。
-            ValueError: commit-time target 存在但不是 non-symlink directory 时抛出。
+            CompanyTickerIdentityCorruptionError: commit-time target 存在但不是
+                non-symlink directory 时抛出。
         """
 
         publication_token = self._acquire_publication_guard(state.token.ticker)
@@ -771,7 +777,7 @@ class _FsStorageInfra:
                 action="检查 commit backup target ticker directory",
             )
             if target_stat is not None and not stat.S_ISDIR(target_stat.st_mode):
-                raise ValueError("commit backup target ticker root 必须为非 symlink 目录")
+                raise CompanyTickerIdentityCorruptionError(kind="invalid_descriptor")
             if target_stat is not None:
                 self._replace_directory(state.target_ticker_dir, state.backup_dir)
             self._write_batch_journal(state, _PHASE_BACKED_UP_TARGET)
@@ -2709,20 +2715,26 @@ class _FsStorageInfra:
             无。
 
         Raises:
-            ValueError: tree 含 symlink、特殊文件或 containment escape 时抛出。
+            CompanyTickerIdentityCorruptionError: tree 含 symlink、特殊文件、
+                missing race 或 containment escape 时抛出。
             OSError: 文件系统枚举或路径解析失败时抛出。
         """
 
         for path in ticker_dir.rglob("*"):
-            if path.is_symlink():
-                raise ValueError("published ticker tree 禁止 symlink")
-            if not path.is_dir() and not path.is_file():
-                raise ValueError("published ticker tree 只允许 directory/regular file")
-            self._require_contained_path(
+            path_stat = self._lstat_optional_storage_path(
                 path,
-                ticker_dir,
-                label="published ticker tree entry",
+                action="检查 published ticker tree entry",
             )
+            if path_stat is None or not (stat.S_ISDIR(path_stat.st_mode) or stat.S_ISREG(path_stat.st_mode)):
+                raise CompanyTickerIdentityCorruptionError(kind="invalid_descriptor")
+            try:
+                self._require_contained_path(
+                    path,
+                    ticker_dir,
+                    label="published ticker tree entry",
+                )
+            except ValueError as exc:
+                raise CompanyTickerIdentityCorruptionError(kind="invalid_descriptor") from exc
 
     def _storage_subdirectory_for_read(
         self,
@@ -3160,16 +3172,28 @@ class _FsStorageInfra:
             可读目录路径。
 
         Raises:
-            ValueError: ticker、identity root 或 descriptor 不合法时抛出。
+            CompanyTickerIdentityCorruptionError: published target、descriptor、meta
+                或 identity durable state 损坏时抛出。
+            ValueError: ticker 非法时抛出。
             OSError: descriptor 读取失败时抛出。
         """
 
         external_ticker = _require_external_identity(ticker, field_name="ticker")
-        return _identity_directory_for_read(
-            self.portfolio_root,
-            _TICKER_IDENTITY_NAMESPACE,
-            external_ticker,
+        ticker_dir = self._target_ticker_dir(external_ticker)
+        directory_stat = self._lstat_optional_storage_path(
+            ticker_dir,
+            action="检查 published ticker directory for read",
         )
+        if directory_stat is None:
+            return ticker_dir
+        identity = self._read_published_company_identity(
+            ticker_dir,
+            expected_storage_key=ticker_dir.name,
+            known_directory_stat=directory_stat,
+        )
+        if identity.canonical_ticker != external_ticker:
+            raise CompanyTickerIdentityCorruptionError(kind="invalid_descriptor")
+        return ticker_dir
 
     def _ticker_dir_if_present_for_read(self, ticker: str) -> Path | None:
         """返回已存在且合法的 published ticker directory。
@@ -3317,24 +3341,6 @@ class _FsStorageInfra:
             external_document_id,
         )
         return document_dir / _SOURCE_META_FILENAME
-
-    def _company_meta_path(self, ticker: str, state: _ActiveBatchState) -> Path:
-        """返回公司级 meta 路径。
-
-        Args:
-            ticker: 股票代码。
-            state: 已解析的内部 transaction state。
-
-        Returns:
-            公司级 meta 路径。
-
-        Raises:
-            ValueError: ticker、capability 或 descriptor 不合法时抛出。
-            OSError: 路径构建失败时抛出。
-        """
-
-        external_ticker = _require_external_identity(ticker, field_name="ticker")
-        return self._ticker_dir_for_write(external_ticker, state) / _SOURCE_META_FILENAME
 
     def _company_meta_path_for_read(self, ticker: str) -> Path:
         """返回公司级 meta 路径（用于读取）。

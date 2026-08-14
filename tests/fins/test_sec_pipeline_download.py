@@ -766,24 +766,6 @@ class StubDownloader:
 
         return None
 
-    def normalize_ticker(self, ticker: str) -> str:
-        """标准化 ticker。
-
-        Args:
-            ticker: 股票代码。
-
-        Returns:
-            标准化 ticker。
-
-        Raises:
-            ValueError: ticker 为空时抛出。
-        """
-
-        normalized = ticker.strip().upper()
-        if not normalized:
-            raise ValueError("ticker 不能为空")
-        return normalized
-
     def resolve_company(
         self,
         ticker: str,
@@ -1373,24 +1355,6 @@ class RebuildOnlyDownloader:
 
         del user_agent, sleep_seconds, max_retries
         self.configure_called = True
-
-    def normalize_ticker(self, ticker: str) -> str:
-        """标准化 ticker。
-
-        Args:
-            ticker: 股票代码。
-
-        Returns:
-            大写 ticker。
-
-        Raises:
-            ValueError: ticker 为空时抛出。
-        """
-
-        normalized = ticker.strip().upper()
-        if not normalized:
-            raise ValueError("ticker 不能为空")
-        return normalized
 
     def resolve_company(
         self,

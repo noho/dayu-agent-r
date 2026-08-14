@@ -46,6 +46,7 @@ from dayu.fins.domain.document_models import (
 )
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.storage import (
+    CompanyTickerIdentityCorruptionError,
     FsBatchingRepository,
     FsCompanyMetaRepository,
     FsDocumentBlobRepository,
@@ -519,8 +520,8 @@ def test_begin_batch_preserves_initialization_primary_when_lock_release_fails(
         core.begin_batch("AAPL")
 
     if failure_point == "descriptor":
-        assert isinstance(exc_info.value, ValueError)
-        assert "identity descriptor" in str(exc_info.value)
+        assert isinstance(exc_info.value, CompanyTickerIdentityCorruptionError)
+        assert exc_info.value.kind == "invalid_descriptor"
     else:
         assert exc_info.value is primary_error
     assert any("writer mutex release failed during batch initialization" in note for note in exc_info.value.__notes__)

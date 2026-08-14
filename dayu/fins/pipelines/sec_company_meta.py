@@ -6,7 +6,10 @@ from collections.abc import Sequence
 from typing import Optional
 
 from dayu.contracts.json_value import JsonValue
-from dayu.fins.domain.company_meta_contract import build_company_meta_commit_intent
+from dayu.fins.domain.company_meta_contract import (
+    CompanyMetaCommitIntent,
+    build_company_meta_commit_intent,
+)
 from dayu.fins.domain.document_models import BatchToken, CompanyMeta
 from dayu.fins.storage import CompanyMetaRepositoryProtocol
 from dayu.fins.ticker_normalization import build_company_ticker_identity, try_normalize_ticker
@@ -80,7 +83,7 @@ def upsert_company_meta(
     company_name: str,
     ticker_aliases: Optional[Sequence[str]] = None,
     batch: BatchToken,
-) -> None:
+) -> CompanyMetaCommitIntent | None:
     """写入 SEC 公司级元数据。
 
     Args:
@@ -92,7 +95,7 @@ def upsert_company_meta(
         batch: caller 显式传入的 batch capability。
 
     Returns:
-        无。
+        已 stage 的提交意图；fresh 且 identity 未变化时返回 ``None``。
 
     Raises:
         OSError: 仓储写入失败时抛出。
@@ -107,7 +110,7 @@ def upsert_company_meta(
             (*existing_meta.ticker_identity.accepted_aliases, *ticker_identity.accepted_aliases),
         )
         if merged_identity == existing_meta.ticker_identity:
-            return
+            return None
         merge_mode = "preserve_published"
         proposed_company_id: str | None = None
         proposed_company_name: str | None = None
@@ -124,6 +127,7 @@ def upsert_company_meta(
         resolver_version=_SEC_RESOLVER_VERSION,
     )
     repository.stage_company_meta_intent(intent, batch=batch)
+    return intent
 
 
 def _load_existing_company_meta(

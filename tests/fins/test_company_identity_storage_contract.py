@@ -984,6 +984,8 @@ def test_commit_rejects_meta_disappearance_before_swap(
         ("malformed_descriptor", "invalid_descriptor"),
         ("descriptor_symlink", "invalid_descriptor"),
         ("malformed_meta", "invalid_meta"),
+        ("meta_symlink", "invalid_meta"),
+        ("meta_directory", "invalid_meta"),
         ("identity_mismatch", "identity_mismatch"),
     ),
 )
@@ -1027,10 +1029,22 @@ def test_published_descriptor_and_meta_corruption_are_typed(
         descriptor_path.symlink_to(outside)
     elif corruption == "malformed_meta":
         meta_path.write_text("{}", encoding="utf-8")
+    elif corruption == "meta_symlink":
+        outside_meta = tmp_path / "outside-meta.json"
+        outside_meta.write_bytes(meta_path.read_bytes())
+        meta_path.unlink()
+        meta_path.symlink_to(outside_meta)
+    elif corruption == "meta_directory":
+        meta_path.unlink()
+        meta_path.mkdir()
     else:
         payload = json.loads(meta_path.read_text(encoding="utf-8"))
         payload["ticker"] = "MSFT"
         meta_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(CompanyTickerIdentityCorruptionError) as read_exc_info:
+        company.get_company_meta("DELTA")
+    assert read_exc_info.value.kind == expected_kind
 
     with pytest.raises(CompanyTickerIdentityCorruptionError) as exc_info:
         company.resolve_company_ticker("DELTA")
@@ -1190,8 +1204,9 @@ def test_begin_batch_rejects_non_directory_locator_and_releases_writer(
         target_dir.write_bytes(regular_payload)
         expected_link = None
 
-    with pytest.raises(ValueError, match="batch target ticker root"):
+    with pytest.raises(CompanyTickerIdentityCorruptionError) as exc_info:
         batching.begin_batch("DELTA")
+    assert exc_info.value.kind == "invalid_descriptor"
 
     target_stat = os.lstat(target_dir)
     if locator_kind == "symlink":
@@ -1302,8 +1317,9 @@ def test_commit_backup_rejects_non_directory_before_replace_and_preserves_locato
     replace_forbidden = _ReplaceDirectoryForbidden()
     monkeypatch.setattr(core, "_replace_directory", replace_forbidden)
 
-    with pytest.raises(ValueError, match="commit backup target ticker root"):
+    with pytest.raises(CompanyTickerIdentityCorruptionError) as exc_info:
         batching.commit_batch(update_batch)
+    assert exc_info.value.kind == "invalid_descriptor"
 
     assert replace_forbidden.calls == []
     assert stat.S_ISREG(os.lstat(target_dir).st_mode)

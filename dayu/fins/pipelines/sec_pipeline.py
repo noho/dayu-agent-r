@@ -19,6 +19,7 @@ from typing import AsyncIterator, Callable, Coroutine, Final, Optional, TypeAlia
 
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.fins._log import Log
+from dayu.fins.domain.company_meta_contract import CompanyMetaCommitIntent
 from dayu.fins.domain.document_models import (
     BatchToken,
     CompanyMeta,
@@ -1705,7 +1706,7 @@ class SecPipeline:
         ticker_aliases: Optional[Sequence[str]] = None,
         *,
         batch: BatchToken,
-    ) -> None:
+    ) -> CompanyMetaCommitIntent | None:
         """写入公司元数据。
 
         Args:
@@ -1716,13 +1717,13 @@ class SecPipeline:
             batch: caller 显式传入的 batch capability。
 
         Returns:
-            无。
+            已 stage 的提交意图；fresh 且 identity 未变化时返回 ``None``。
 
         Raises:
             OSError: 仓储写入失败时由底层抛出。
         """
 
-        _upsert_company_meta_impl(
+        return _upsert_company_meta_impl(
             repository=self._company_repository,
             ticker=ticker,
             company_id=company_id,

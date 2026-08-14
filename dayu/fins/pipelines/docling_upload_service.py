@@ -45,7 +45,7 @@ from dayu.fins.storage import (
     SourceDocumentRepositoryProtocol,
     require_source_meta_is_deleted,
 )
-from dayu.fins.ticker_normalization import try_normalize_ticker
+from dayu.fins.ticker_normalization import normalize_ticker
 from dayu.fins.upload_failure import (
     FinsUploadFailureError,
     fins_upload_empty_input_failure,
@@ -284,7 +284,7 @@ class DoclingUploadService:
         normalized_action = action.strip().lower()
         if normalized_action not in UPLOAD_ACTIONS:
             raise ValueError(f"不支持的 action: {action}")
-        normalized_ticker = _normalize_ticker(ticker)
+        normalized_ticker = normalize_ticker(ticker).canonical
         if not document_id.strip():
             raise ValueError("document_id 不能为空")
         if not internal_document_id.strip():
@@ -495,9 +495,7 @@ class DoclingUploadService:
             OSError: 仓储写入失败时抛出。
         """
 
-        replace_existing = previous_meta is not None and (
-            action == "update" or (action == "create" and overwrite)
-        )
+        replace_existing = previous_meta is not None and (action == "update" or (action == "create" and overwrite))
         if replace_existing:
             # 完整输入的既有目标先在同一 staging batch 删除，再由下方 blob-first + create
             # 一次性重建；reset 前持有的 previous_meta 仍是版本与首次创建时间真源。
@@ -605,7 +603,7 @@ class DoclingUploadService:
             ValueError: 元数据格式非法时抛出。
         """
 
-        normalized_ticker = _normalize_ticker(ticker)
+        normalized_ticker = normalize_ticker(ticker).canonical
         target_internal_id = internal_document_id.strip()
         for document_id in self._source_repository.list_source_document_ids(normalized_ticker, source_kind):
             meta = self._safe_get_document_meta(normalized_ticker, document_id, source_kind)
@@ -709,9 +707,7 @@ class DoclingUploadService:
                     raw_basename,
                 )
                 file_label = canonicalize_fins_public_file_label(raw_basename)
-                raise FinsUploadFailureError(
-                    fins_upload_empty_input_failure(file_label)
-                )
+                raise FinsUploadFailureError(fins_upload_empty_input_failure(file_label))
             raw_sha256 = hashlib.sha256(raw_data).hexdigest()
             raw_content_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
             assets.append(
@@ -1150,28 +1146,6 @@ def _increment_document_version(previous_version: str) -> str:
     if not suffix.isdigit():
         return "v2"
     return f"v{int(suffix) + 1}"
-
-
-def _normalize_ticker(ticker: str) -> str:
-    """标准化 ticker。
-
-    Args:
-        ticker: 原始 ticker。
-
-    Returns:
-        标准化 ticker。
-
-    Raises:
-        ValueError: ticker 为空时抛出。
-    """
-
-    normalized_source = try_normalize_ticker(ticker)
-    if normalized_source is not None:
-        return normalized_source.canonical
-    normalized = ticker.strip().upper()
-    if not normalized:
-        raise ValueError("ticker 不能为空")
-    return normalized
 
 
 def build_material_ids(

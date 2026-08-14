@@ -126,3 +126,70 @@ SEC/CN material terminal catch 原先仍直接使用 `str(exc)`，这是补测�
 ### 8.5 Stop
 
 两个 accepted low findings 已完成窄修复且未提交。按用户指令停在同一 S2 fix，不开始 review/re-review。
+
+## 9. Aggregate deepreview fix addendum
+
+### 9.1 Gate、输入与裁决边界
+
+- 已完整读取 aggregate deepreview artifact `code-review-20260815-023958.md`，并以 accepted plan、既有 S2 owner/锁图和本轮用户 scope 为约束。
+- Finding 1、Finding 2 为本轮 blocker，均在现有 storage/ticker/failure owner 边界收口；没有新增下游 catch、字符串解析、compat shim 或第二套 normalizer。
+- Finding 3 具备明确的 `CompanyMetaCommitIntent | None` mutation signal，因此采用 caller 侧最小修复；Finding 4 的无调用 `_company_meta_path(...)` 已删除。
+- 未处理 material company-name open question、UF-PF05、oracle/scenario registry、冻结 evidence 或其它 finding；未改变 workspace identity lock graph。
+
+### 9.2 Finding 1 — durable corruption 的唯一 typed owner
+
+storage 现在按 durable fact 统一分类，而不是让入口根据偶然异常类型重分类：
+
+- `_get_company_meta_unguarded(...)` 对 published target 先做显式 `lstat`，再复用 `_read_published_company_identity(...)`；descriptor/meta schema、symlink/non-regular 与 identity mismatch 分别进入 closed `invalid_descriptor`、`invalid_meta`、`identity_mismatch` corruption kind。合法 meta-less corpus 仍返回 `FileNotFoundError`，不被误判为 corruption。
+- `read_filing_upload_state(...)` 只把 `ENOENT` 当作无 published state；target symlink/regular file 直接产生 `invalid_descriptor`。权限与 I/O 保留原始 operational errno，不经 `Path.exists/is_file` 抹平。
+- `begin_batch(...)`、commit backup 判定、published read locator 与 copyable tree 校验均把 durable target/tree 结构问题投影为 `CompanyTickerIdentityCorruptionError`；首次 replace 前 fail closed，未改 publication/recovery 锁序。
+- SEC/CN material workflow 把既有 failure boundary 前移到 published document/meta 观察之前，继续只调用 `fins_upload_failure_from_exception(...)`。因此 storage typed corruption 投影为同一个 `storage/storage_io` terminal，不会落入 `unexpected_runtime`；tool 的既有 typed branch 现在由真实 prepare 链可达，且早于宽 `ValueError` branch。
+
+入口级直接证据：
+
+- owner：`test_published_descriptor_and_meta_corruption_are_typed` 以真实 malformed meta、meta symlink/directory、descriptor corruption/mismatch 断言 closed kind。
+- tool：`test_upload_tool_projects_real_workspace_identity_corruption` 参数化 malformed meta、meta symlink/directory、target symlink/regular file，精确断言 `fins_upload_start_failed` 的 bounded message/hint、无 schema 原文、无 durable job。
+- start：`test_start_upload_projects_real_corrupt_company_meta_before_job_creation` 断言真实 malformed meta 透出 `invalid_meta`，且 job store 未创建。
+- CLI：`test_upload_filing_prevalidation_identity_corruption_is_typed_and_path_free` 参数化 descriptor/meta/target corruption，精确断言单行 bounded failure，不含路径、traceback 或内部异常类型。
+- material：`test_upload_material_identity_corruption_projects_storage_terminal` 参数化 meta symlink/non-regular 与 target symlink/regular file，精确断言 failed terminal 为 `storage/storage_io`、`stored_file_count=0`、无 source publication 或内部 schema 泄漏。
+
+### 9.3 Finding 2 — filing/material 共用 ticker identity 准入
+
+- 新增的 `_admit_fins_upload_ticker_identity(...)` 是 upload admission owner：只拥有 `<=100` 数量边界与 typed usage 投影；canonical/alias grammar、market normalization、canonical-equivalent 去重仍只由 `ticker_normalization.normalize_ticker(...)` 与 `build_company_ticker_identity(...)` 负责。filing static validation 与 material normalization 都调用该 owner。
+- material 非法 ticker、非法 alias 与超量 aliases 均在 observation/job 创建前分别投影为 `INVALID_TICKER`、`INVALID_TICKER_ALIAS`、`TOO_MANY_TICKER_ALIASES`；tool/CLI 测试断言 exact bounded error。CLI usage prefix 使用实际 command name，material 不再误报为 filing。
+- 删除 `SecDownloader.normalize_ticker(...)` 及其 `strip().upper()` fallback；SEC download workflow、SEC material workflow、`SecDownloader.resolve_company(...)` 与 Docling material service 全部直接消费公共 normalizer。相应 downloader protocol/property 和 Docling 私有 `_normalize_ticker(...)` 一并删除，没有 re-export、wrapper 或兼容分支。
+- browse-edgar 私有 fallback 只接收 `resolve_company(...)` 已产生的 canonical ticker；其残留 `strip().upper()` 也已删除。逐点 residue 仅剩对 SEC 外部 ticker-map 字段的大小写比较，不承担用户输入准入或 canonical 派生。
+
+直接测试包括 `test_material_upload_reuses_ticker_identity_admission_before_job_creation`、`test_upload_tool_material_ticker_identity_usage_is_bounded_and_typed` 与 `test_upload_material_alias_count_uses_typed_upload_admission`，覆盖非法 ticker、非法 alias 与 101 aliases 的 runtime/tool/CLI 投影和零 job/零 observation 副作用。
+
+### 9.4 Finding 3 / Finding 4 裁决
+
+- Finding 3 已最小修复：SEC `upsert_company_meta(...)` 与现有 CN stage owner 都把 `CompanyMetaCommitIntent | None` 作为明确 mutation signal；caller 在 `None` 时 rollback staging batch，只在存在 intent 时 commit。没有让 storage 猜测 mutation，也没有新增 durable 字段或锁。
+- `test_repeat_sec_company_publication_rolls_back_zero_mutation_batch` 与 `test_repeat_cn_company_publication_rolls_back_zero_mutation_batch` 均断言首次 publication 只 commit 一次、同事实重复 publication 只 rollback 一次、published `meta.json` bytes 不变。
+- Finding 4 已删除 `_FsStorageInfra._company_meta_path(...)`；staging CompanyMeta locator 仍只有 `_prepare_company_identity_commit(...)` 的真实写入点。`_company_meta_path_for_read(...)` 是不同的 read locator contract，按 review 建议保留。
+
+### 9.5 README decision
+
+aggregate re-review artifact `code-review-20260815-033322.md` 的唯一 low finding 指出：material 新增的启动前 ticker/alias usage 拒绝是用户可见行为变化，而根 README 原说明只把“启动前校验、用法错误退出 `2`”明确归给 `upload_filing`。该 finding 成立，命中根 README 的用户参数校验与排障职责。
+
+根 README 已做最小更新：自足说明 `upload_filing` 与 `upload_material` 都会在任务启动前校验 ticker 逗号分隔值，首项是规范主代码、后续项是用户声明的查询别名，每项须符合支持市场的 ticker 写法且后续别名最多 100 个；非法写法或超量别名作为用法错误输出具体原因并退出 `2`。文档未使用内部类型名，也未扩展其它用户流程、架构或治理内容。`dayu/fins/README.md` 与 `tests/README.md` 的职责未被本次纯用户手册修正触发，因此保持不变。
+
+### 9.6 Final validation
+
+全部命令均在 `source .venv/bin/activate` 后执行：
+
+- SEC downloader/workflow focused：`180 passed`；新增 SEC zero-mutation owner test：`1 passed`。
+- final full relevant branch run：`coverage run --branch -m pytest -q tests/fins tests/tools/test_combined_tools_acceptance.py tests/cli/test_fins_commands.py` -> `1753 passed, 1 skipped, 3 warnings`；skip 为既有环境条件，warnings 为 `edgar` dependency deprecation。
+- 修改生产文件逐文件 branch coverage 全部 `>=80%`：`fins.py=81%`、`sec_downloader.py=88%`、`ingestion_runtime.py=88%`、`cn_download_workflow.py=91%`、`cn_pipeline.py=92%`、`docling_upload_service.py=84%`、`sec_company_meta.py=91%`、`sec_download_workflow.py=87%`、`sec_pipeline.py=81%`、`sec_upload_workflow.py=92%`、`_fs_company_meta_core.py=82%`、`_fs_filing_upload_state_core.py=100%`、`_fs_storage_infra.py=85%`、`repository_protocols.py=96%`。
+- 全量 `python -m pyright dayu/ tests/ utils/`：`0 errors, 0 warnings, 0 informations`。
+- 全部 25 个修改 Python 文件 `ruff format --check` 与 `ruff check`：通过。
+- residue：`SecDownloader.normalize_ticker`、downloader/workflow `.normalize_ticker(...)`、ticker `strip().upper()` fallback、`resolve_existing_ticker`、dead `_company_meta_path(...)` 均零命中；storage 相关 `Path.exists/is_file` 命中均不位于本轮 CompanyMeta/descriptor/target owner 判定路径。
+- `git diff --check`：通过。
+- aggregate re-review 文档 follow-up：逐句核对根 README 的 Agent 更新约束与上传 usage 段；确认两条单份上传命令、ticker CSV 主代码/查询别名语义、grammar、100 个别名上限及用法错误退出 `2` 均自足可见。此次只修改文档，未改生产代码或测试，既有测试、coverage、pyright 与 ruff 结果不受影响；最终 `git diff --check` 通过。
+
+完整 branch run 首次曾有一项既有 SEC debug-log 测试捕获到并行后台任务的 `asyncio.sleep(10)`；该项独立复跑通过，随后从 clean coverage data 重跑完整 relevant suite 得到上述全绿结果。本轮未以该偶发结果替代最终通过证据。
+
+### 9.7 Stop 与 residual
+
+- 本轮 accepted blocker 与可最小闭环的 low finding 已实现；没有已知未覆盖的本轮 owner 分支。
+- 未执行 UF-PF05，未刷新 registry，未触碰冻结 evidence，未提交，也未启动 aggregate re-review。按用户指令停在 S2 aggregate deepreview fix implementation，等待 review。

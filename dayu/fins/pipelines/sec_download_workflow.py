@@ -10,6 +10,7 @@ import time
 from collections.abc import Sequence
 from typing import AsyncIterator, Awaitable, Callable, Final, Optional, Protocol, TypeVar, cast
 
+from dayu.fins.domain.company_meta_contract import CompanyMetaCommitIntent
 from dayu.fins.domain.document_models import BatchToken, DownloadRejectionRegistry
 from dayu.fins.downloaders.sec_downloader import RemoteFileDescriptor, SecDownloadCancelledError
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
@@ -43,11 +44,6 @@ class _DownloadWorkflowDownloader(Protocol):
 
     def configure(self, user_agent: Optional[str], sleep_seconds: float, max_retries: int) -> None:
         """配置下载器。"""
-
-        ...
-
-    def normalize_ticker(self, ticker: str) -> str:
-        """标准化 ticker。"""
 
         ...
 
@@ -182,7 +178,7 @@ class SecDownloadWorkflowHost(Protocol):
         ticker_aliases: Optional[Sequence[str]],
         *,
         batch: BatchToken,
-    ) -> None:
+    ) -> CompanyMetaCommitIntent | None:
         """写入公司元数据。"""
 
         ...
@@ -366,7 +362,7 @@ async def run_download_stream_impl(
     normalized = normalize_ticker(ticker)
     if normalized.market != "US":
         raise ValueError(f"SecPipeline 仅支持 US，当前 market={normalized.market}")
-    normalized_ticker = host._downloader.normalize_ticker(ticker)
+    normalized_ticker = normalized.canonical
     if rebuild:
         yield DownloadEvent(
             event_type=DownloadEventType.PIPELINE_STARTED,
@@ -814,7 +810,7 @@ async def _publish_sec_post_repair_mutations(
 
     company_batch = host._batching_repository.begin_batch(ticker)
     try:
-        host._upsert_company_meta(
+        intent = host._upsert_company_meta(
             ticker=ticker,
             company_id=cik,
             company_name=company_name,
@@ -824,7 +820,10 @@ async def _publish_sec_post_repair_mutations(
     except BaseException:
         host._batching_repository.rollback_batch(company_batch)
         raise
-    host._batching_repository.commit_batch(company_batch)
+    if intent is None:
+        host._batching_repository.rollback_batch(company_batch)
+    else:
+        host._batching_repository.commit_batch(company_batch)
 
     for decision in rejection_decisions:
         if isinstance(decision, Sc13DirectionRejectedAlreadyRegistered):

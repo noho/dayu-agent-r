@@ -98,9 +98,7 @@ _FINS_DIAGNOSTIC_TEXT_MAX_CHARS: Final[int] = 120
 _FINS_DIAGNOSTIC_DETAIL_MAX_ITEMS: Final[int] = 4
 _FINS_DIAGNOSTIC_TRUNCATED_SUFFIX: Final[str] = "..."
 _FINS_DIRECT_DEBUG_BASE_PART_COUNT: Final[int] = 2
-_FINS_DIRECT_UNKNOWN_FAILURE_MESSAGE: Final[str] = (
-    "命令执行失败，请使用 --log-file PATH 重试并查看日志"
-)
+_FINS_DIRECT_UNKNOWN_FAILURE_MESSAGE: Final[str] = "命令执行失败，请使用 --log-file PATH 重试并查看日志"
 _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
 
@@ -195,7 +193,7 @@ def run_fins_direct_command(args: ParsedCliArgs) -> int:
         render_cli_error(f"dayu-cli {args.command_name}: {exc}")
         return EXIT_USAGE_ERROR
     except FinsUploadUsageError as exc:
-        render_cli_error(f"dayu-cli upload_filing: {exc.failure.message}")
+        render_cli_error(f"dayu-cli {args.command_name}: {exc.failure.message}")
         return EXIT_USAGE_ERROR
     except FinsUploadPrevalidationError as exc:
         _LOGGER.exception("upload_filing prevalidation operational failure")
@@ -211,9 +209,7 @@ def run_fins_direct_command(args: ParsedCliArgs) -> int:
             "Fins direct command failed; command=%s",
             args.command_name,
         )
-        render_cli_error(
-            f"dayu-cli {args.command_name}: {_FINS_DIRECT_UNKNOWN_FAILURE_MESSAGE}"
-        )
+        render_cli_error(f"dayu-cli {args.command_name}: {_FINS_DIRECT_UNKNOWN_FAILURE_MESSAGE}")
         return EXIT_FAILURE
 
 
@@ -311,9 +307,7 @@ def _run_upload_filings_from(args: ParsedCliArgs) -> int:
         api_key = os.environ.get(_FMP_API_KEY_ENV)
         if api_key is None or api_key.strip() == "":
             raise CliFinsUsageError("--infer requires non-empty FMP_API_KEY")
-        resolved_info = FmpCompanyInfoResolver(api_key=api_key).resolve_company_info(
-            ticker.canonical_ticker
-        )
+        resolved_info = FmpCompanyInfoResolver(api_key=api_key).resolve_company_info(ticker.canonical_ticker)
         if resolved_info.ticker_identity.canonical_ticker != ticker.canonical_ticker:
             raise RuntimeError("FMP resolved canonical ticker does not match the requested ticker")
         resolved_identity = build_company_ticker_identity(

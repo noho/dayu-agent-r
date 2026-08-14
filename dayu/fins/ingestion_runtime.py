@@ -647,7 +647,7 @@ class FinsUploadFilingRequest:
 
 
 class FinsUploadUsageCode(str, Enum):
-    """filing 上传调用方可修正的 closed usage failure code。"""
+    """上传调用方可修正的 closed usage failure code。"""
 
     EMPTY_TICKER = "empty_ticker"
     INVALID_TICKER = "invalid_ticker"
@@ -677,7 +677,7 @@ class FinsUploadUsageCode(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class FinsUploadUsageFailure:
-    """filing 上传 usage failure 的 typed public fact。
+    """上传 usage failure 的 typed public fact。
 
     Attributes:
         code: closed usage failure code。
@@ -689,7 +689,7 @@ class FinsUploadUsageFailure:
 
 
 class FinsUploadUsageError(ValueError):
-    """filing 上传请求违反调用方可修正契约。"""
+    """上传请求违反调用方可修正契约。"""
 
     failure: FinsUploadUsageFailure
 
@@ -801,7 +801,13 @@ def fins_upload_usage_failure(
 
     template = _USAGE_MESSAGES[code]
     if code in _FILE_USAGE_CODES:
-        if file_name is None or file_name == "" or Path(file_name).name != file_name or "/" in file_name or "\\" in file_name:
+        if (
+            file_name is None
+            or file_name == ""
+            or Path(file_name).name != file_name
+            or "/" in file_name
+            or "\\" in file_name
+        ):
             raise ValueError("文件 usage failure 必须提供不含路径的 basename")
         message = template.format(file_name=file_name)
     else:
@@ -853,6 +859,48 @@ def _admit_fins_upload_file_basename(basename: str) -> None:
         _raise_upload_usage(FinsUploadUsageCode.INVALID_FILE_BASENAME)
 
 
+def _admit_fins_upload_ticker_identity(
+    ticker: str,
+    ticker_aliases: tuple[str, ...],
+) -> NormalizedTicker:
+    """统一校验 filing/material 的 canonical ticker 与显式 aliases。
+
+    grammar、市场归一化与 canonical-equivalent 去重只由
+    ``ticker_normalization`` 的 identity builder 负责；本函数只拥有上传入口的
+    数量边界和 typed usage failure 投影。
+
+    Args:
+        ticker: 请求声明的 canonical ticker。
+        ticker_aliases: 请求声明的 accepted aliases。
+
+    Returns:
+        canonical ticker 的 normalized profile。
+
+    Raises:
+        FinsUploadUsageError: ticker/alias 为空、grammar 非法或 alias 数量超限时抛出。
+    """
+
+    ticker_text = ticker.strip()
+    if ticker_text == "":
+        _raise_upload_usage(FinsUploadUsageCode.EMPTY_TICKER)
+    if len(ticker_aliases) > _MAX_TUPLE_ITEMS:
+        _raise_upload_usage(FinsUploadUsageCode.TOO_MANY_TICKER_ALIASES)
+    try:
+        normalized_ticker = ticker_normalization.normalize_ticker(ticker_text)
+    except ValueError:
+        _raise_upload_usage(FinsUploadUsageCode.INVALID_TICKER)
+    if any(alias.strip() == "" for alias in ticker_aliases):
+        _raise_upload_usage(FinsUploadUsageCode.EMPTY_TICKER)
+    try:
+        ticker_normalization.build_company_ticker_identity(
+            normalized_ticker.canonical,
+            ticker_aliases,
+        )
+    except ValueError:
+        _raise_upload_usage(FinsUploadUsageCode.INVALID_TICKER_ALIAS)
+    return normalized_ticker
+
+
 def _validate_fins_upload_filing_static(
     request: FinsUploadFilingRequest,
 ) -> _StaticFinsUploadFilingValidation:
@@ -868,13 +916,10 @@ def _validate_fins_upload_filing_static(
         FinsUploadUsageError: 任一静态 usage rule 不满足时抛出。
     """
 
-    ticker_text = request.ticker.strip()
-    if ticker_text == "":
-        _raise_upload_usage(FinsUploadUsageCode.EMPTY_TICKER)
-    try:
-        normalized_ticker = ticker_normalization.normalize_ticker(ticker_text)
-    except ValueError:
-        _raise_upload_usage(FinsUploadUsageCode.INVALID_TICKER)
+    normalized_ticker = _admit_fins_upload_ticker_identity(
+        request.ticker,
+        request.ticker_aliases,
+    )
     if request.source_kind is not SourceKind.FILING:
         _raise_upload_usage(FinsUploadUsageCode.INVALID_SOURCE_KIND)
     action = request.action.strip().lower()
@@ -882,15 +927,6 @@ def _validate_fins_upload_filing_static(
         _raise_upload_usage(FinsUploadUsageCode.INVALID_ACTION)
     if len(request.files) > _MAX_TUPLE_ITEMS:
         _raise_upload_usage(FinsUploadUsageCode.TOO_MANY_FILES)
-    if len(request.ticker_aliases) > _MAX_TUPLE_ITEMS:
-        _raise_upload_usage(FinsUploadUsageCode.TOO_MANY_TICKER_ALIASES)
-    for alias in request.ticker_aliases:
-        if alias.strip() == "":
-            _raise_upload_usage(FinsUploadUsageCode.EMPTY_TICKER)
-        try:
-            ticker_normalization.normalize_ticker(alias.strip())
-        except ValueError:
-            _raise_upload_usage(FinsUploadUsageCode.INVALID_TICKER_ALIAS)
     if request.fiscal_year is None:
         _raise_upload_usage(FinsUploadUsageCode.MISSING_FISCAL_YEAR)
     try:
@@ -7188,6 +7224,7 @@ def _normalize_upload_request(request: FinsUploadRequest) -> FinsUploadRequest:
         ValueError: source_kind、action 或有界字段非法时抛出。
     """
 
+    _admit_fins_upload_ticker_identity(request.ticker, request.ticker_aliases)
     action = _normalize_upload_action(request.action)
     _validate_upload_source_kind(request)
     if isinstance(request, FinsUploadFilingRequest):
@@ -7279,9 +7316,7 @@ def _upload_request_summary(
     raw_request = _raw_upload_request(request)
     _validate_upload_file_count(raw_request.files)
     summary_action = (
-        request.resolved_action
-        if isinstance(request, ValidatedFinsUploadFilingRequest)
-        else raw_request.action
+        request.resolved_action if isinstance(request, ValidatedFinsUploadFilingRequest) else raw_request.action
     )
     summary: dict[str, JsonValue] = {
         "source_kind": raw_request.source_kind.value,

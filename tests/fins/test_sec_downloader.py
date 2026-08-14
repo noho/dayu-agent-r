@@ -121,10 +121,7 @@ def test_sec_downloader_explicit_sec_defaults_are_stable() -> None:
 def test_basic_helpers_cover_edge_cases(tmp_path: Path) -> None:
     """验证基础辅助函数边界行为。"""
 
-    downloader = _create_downloader(tmp_path)
-    assert downloader.normalize_ticker(" aapl ") == "AAPL"
-    with pytest.raises(ValueError, match="ticker 不能为空"):
-        downloader.normalize_ticker("  ")
+    _create_downloader(tmp_path)
 
     assert accession_to_no_dash(" 0001-0002 ") == "00010002"
     with pytest.raises(ValueError, match="accession_number 不能为空"):

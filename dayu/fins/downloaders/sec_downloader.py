@@ -68,7 +68,7 @@ from dayu.fins.download_contract import (
     FinsDownloadTransportCategory,
     SecUserAgentConfigurationError,
 )
-from dayu.fins.ticker_normalization import try_normalize_ticker
+from dayu.fins.ticker_normalization import normalize_ticker
 
 DownloadFileResultValue: TypeAlias = JsonValue | FileObjectMeta
 """下载器聚合结果值。
@@ -1122,31 +1122,6 @@ class SecDownloader:
             await self._client.aclose()
             self._client_event_loop = None
 
-    def normalize_ticker(self, ticker: str) -> str:
-        """标准化 ticker。
-
-        代理到 ``dayu.fins.ticker_normalization`` 真源；识别失败时回退到
-        ``strip().upper()`` 以保留空值校验（保留本方法以便上游 pipeline 通过
-        ``host._downloader.normalize_ticker(...)`` 调用）。
-
-        Args:
-            ticker: 原始 ticker。
-
-        Returns:
-            canonical 或大写 ticker。
-
-        Raises:
-            ValueError: ticker 为空时抛出。
-        """
-
-        normalized_source = try_normalize_ticker(ticker)
-        if normalized_source is not None:
-            return normalized_source.canonical
-        normalized = ticker.strip().upper()
-        if not normalized:
-            raise ValueError("ticker 不能为空")
-        return normalized
-
     def configure(
         self,
         user_agent: Optional[str],
@@ -1202,7 +1177,7 @@ class SecDownloader:
             SecDownloadCancelledError: 取消检查点观察到取消请求时抛出。
         """
 
-        normalized = self.normalize_ticker(ticker)
+        normalized = normalize_ticker(ticker).canonical
         mapping = await _await_if_needed(
             self._http_get_json(
                 SEC_TICKER_MAP_URL,
@@ -1230,14 +1205,14 @@ class SecDownloader:
 
     async def _resolve_company_via_browse_edgar_ticker(
         self,
-        ticker: str,
+        normalized_ticker: str,
         count: int = 40,
         cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> Optional[tuple[str, str, str]]:
         """通过 browse-edgar 反查 ticker 对应公司信息。
 
         Args:
-            ticker: 已标准化的大写 ticker。
+            normalized_ticker: 已由公共 ticker contract 标准化的 ticker。
             count: browse-edgar 拉取条数上限。
             cancellation_checker: 可选协作式取消检查器。
 
@@ -1248,9 +1223,6 @@ class SecDownloader:
             SecDownloadCancelledError: 取消检查点观察到取消请求时抛出。
         """
 
-        normalized_ticker = ticker.strip().upper()
-        if not normalized_ticker:
-            return None
         url = BROWSE_EDGAR_TICKER_ATOM_URL.format(ticker=normalized_ticker, count=count)
         payload = await _await_if_needed(self._http_get_bytes(url, cancellation_checker=cancellation_checker))
         try:

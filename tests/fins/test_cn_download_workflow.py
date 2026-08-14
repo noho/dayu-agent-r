@@ -951,6 +951,60 @@ def _collect_events(
     )
 
 
+def test_repeat_cn_company_publication_rolls_back_zero_mutation_batch(
+    tmp_path: Path,
+) -> None:
+    """fresh 且 identity 未变化时 caller 必须 rollback，禁止 full-tree swap。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 明确 ``None`` mutation signal 未被 caller 消费时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching_repository = _BatchIdentityCnBatchingRepository(tmp_path, repository_set)
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=())
+    pipeline = _build_pipeline(
+        tmp_path=tmp_path,
+        discovery=discovery,
+        converter=_FakeConverter(),
+        repository_set=repository_set,
+        batching_repository=batching_repository,
+    )
+    profile = CnCompanyProfile(
+        provider="cninfo",
+        company_id="CNINFO:9900000600",
+        company_name="贵州茅台",
+        ticker="600519",
+    )
+
+    _cn_download_workflow._publish_cn_company_after_repair(
+        host=pipeline,
+        profile=profile,
+        normalized_ticker="600519",
+        ticker_aliases=None,
+    )
+    published_meta_path = tmp_path / "portfolio" / "600519" / "meta.json"
+    first_meta = published_meta_path.read_bytes()
+    _cn_download_workflow._publish_cn_company_after_repair(
+        host=pipeline,
+        profile=profile,
+        normalized_ticker="600519",
+        ticker_aliases=None,
+    )
+
+    assert batching_repository.commit_calls == 1
+    assert batching_repository.rollback_calls == 1
+    assert batching_repository.phases[-2][0] == "begin"
+    assert batching_repository.phases[-1][0] == "rollback"
+    assert published_meta_path.read_bytes() == first_meta
+
+
 async def _collect_events_async(
     *,
     pipeline: CnPipeline,
@@ -1726,7 +1780,7 @@ def test_cn_replacement_separates_company_and_document_transactions(
     assert result["status"] == "ok"
     assert phases == [
         "begin",
-        "commit",
+        "rollback",
         "begin",
         "reset",
         "blob:pdf",
@@ -1737,8 +1791,8 @@ def test_cn_replacement_separates_company_and_document_transactions(
     ]
     assert len(batch_ids) == 2
     assert batching_repository.begin_calls == begin_calls + 2
-    assert batching_repository.commit_calls == commit_calls + 2
-    assert batching_repository.rollback_calls == rollback_calls
+    assert batching_repository.commit_calls == commit_calls + 1
+    assert batching_repository.rollback_calls == rollback_calls + 1
 
 
 def test_cn_complete_phase_a_skips_transport_without_source_mutation(tmp_path: Path) -> None:
@@ -1777,11 +1831,11 @@ def test_cn_complete_phase_a_skips_transport_without_source_mutation(tmp_path: P
     summary = result["summary"]
     assert isinstance(summary, dict)
     assert summary["skipped"] == 1
-    assert phases == ["begin", "commit"]
+    assert phases == ["begin", "rollback"]
     assert len(batch_ids) == 1
     assert batching_repository.begin_calls == begin_calls + 1
-    assert batching_repository.commit_calls == commit_calls + 1
-    assert batching_repository.rollback_calls == rollback_calls
+    assert batching_repository.commit_calls == commit_calls
+    assert batching_repository.rollback_calls == rollback_calls + 1
     assert discovery.download_calls == download_calls
 
 
@@ -1818,6 +1872,7 @@ def test_cn_replacement_final_failure_restores_old_source_and_blobs(tmp_path: Pa
     old_meta = source_repository.get_source_meta("600519", document_id, SourceKind.FILING)
     old_pdf = blob_repository.read_file_bytes(handle, f"{document_id}.pdf")
     old_docling = blob_repository.read_file_bytes(handle, f"{document_id}_docling.json")
+    rollback_calls = batching_repository.rollback_calls
     source_repository.fail_final = True
     discovery.pdf_bytes = _PDF_BYTES + b"replacement"
 
@@ -1829,7 +1884,7 @@ def test_cn_replacement_final_failure_restores_old_source_and_blobs(tmp_path: Pa
     assert source_repository.get_source_meta("600519", document_id, SourceKind.FILING) == old_meta
     assert blob_repository.read_file_bytes(handle, f"{document_id}.pdf") == old_pdf
     assert blob_repository.read_file_bytes(handle, f"{document_id}_docling.json") == old_docling
-    assert batching_repository.rollback_calls == 1
+    assert batching_repository.rollback_calls == rollback_calls + 2
 
 
 def test_cn_replacement_success_exposes_source_blobs_and_processed_marker_together(

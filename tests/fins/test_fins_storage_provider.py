@@ -87,6 +87,7 @@ from dayu.fins.domain.filing_semantics import FISCAL_PERIODS
 from dayu.fins.domain.xbrl_result_contract import XbrlQueryExecutionError
 from dayu.fins.domain.tool_models import Citation
 from dayu.fins.storage import (
+    CompanyTickerIdentityCorruptionError,
     FsBatchingRepository,
     FsCompanyMetaRepository,
     FsDocumentBlobRepository,
@@ -2248,8 +2249,9 @@ def test_identity_mapping_detects_collision_corruption_and_business_meta_mismatc
     original_dir = collision_set.core._target_ticker_dir("AAPL")
     collision_dir = collision_set.core._target_ticker_dir("MSFT")
     original_dir.rename(collision_dir)
-    with pytest.raises(ValueError, match="identity descriptor"):
+    with pytest.raises(CompanyTickerIdentityCorruptionError) as collision_error:
         collision_batches.begin_batch("MSFT")
+    assert collision_error.value.kind == "invalid_descriptor"
 
     corrupt_root = tmp_path / "corrupt"
     corrupt_set = build_fs_repository_set(workspace_root=corrupt_root)
@@ -2261,8 +2263,9 @@ def test_identity_mapping_detects_collision_corruption_and_business_meta_mismatc
         path for path in corrupt_dir.iterdir() if path.name.startswith(".") and path.suffix == ".json"
     )
     descriptor_path.write_text("{}", encoding="utf-8")
-    with pytest.raises(ValueError, match="descriptor"):
+    with pytest.raises(CompanyTickerIdentityCorruptionError) as descriptor_error:
         corrupt_batches.begin_batch("AAPL")
+    assert descriptor_error.value.kind == "invalid_descriptor"
 
     mismatch_root = tmp_path / "business-mismatch"
     mismatch_set = build_fs_repository_set(workspace_root=mismatch_root)
@@ -2286,8 +2289,9 @@ def test_identity_mapping_detects_collision_corruption_and_business_meta_mismatc
     assert isinstance(meta_payload, dict)
     meta_payload["ticker"] = "MSFT"
     meta_path.write_text(json.dumps(meta_payload), encoding="utf-8")
-    with pytest.raises(ValueError, match="identity descriptor"):
+    with pytest.raises(CompanyTickerIdentityCorruptionError) as mismatch_error:
         company.get_company_meta("AAPL")
+    assert mismatch_error.value.kind == "identity_mismatch"
 
 
 def test_company_inventory_projects_canonical_ticker_and_hides_invalid_candidate(
@@ -2422,8 +2426,9 @@ def test_public_storage_errors_never_expose_internal_locator_or_workspace_path(
         )
     company_meta_path = repository_set.core._company_meta_path_for_read(ticker)
     company_meta_path.write_text("{", encoding="utf-8")
-    with pytest.raises(ValueError, match="JSON 解析失败") as company_error:
+    with pytest.raises(CompanyTickerIdentityCorruptionError) as company_error:
         company.get_company_meta(ticker)
+    assert company_error.value.kind == "invalid_meta"
 
     errors = (
         source_error.value,

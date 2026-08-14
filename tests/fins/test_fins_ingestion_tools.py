@@ -64,10 +64,7 @@ from dayu.fins.direct_events import (
     FinsResultSummary,
 )
 from dayu.fins.service_runtime import DefaultFinsRuntime
-from dayu.fins.storage import (
-    CompanyTickerIdentityCorruptionError,
-    FilingUploadPublishedState,
-)
+from dayu.fins.storage import FilingUploadPublishedState
 from dayu.fins.tools import download_provider, preprocess_provider, provider as read_provider
 from dayu.fins.tools.download_tools import DOWNLOAD_TOOL_NAME, FinsDownloadToolCallable
 from dayu.fins.tools.preprocess_tools import PREPROCESS_TOOL_NAME, FinsPreprocessToolCallable
@@ -1092,29 +1089,61 @@ def test_upload_tool_returns_external_job_awaiting_outcome(tmp_path: Path) -> No
     assert "finsjob_" not in outcome.snapshot.snapshot_id
 
 
-def test_upload_tool_does_not_swallow_typed_corruption_as_invalid_argument(
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "malformed_meta",
+        "meta_symlink",
+        "meta_directory",
+        "target_symlink",
+        "target_regular_file",
+    ),
+)
+def test_upload_tool_projects_real_workspace_identity_corruption(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    corruption: str,
 ) -> None:
-    """typed workspace corruption 必须先于宽泛 ValueError 投影。
+    """真实 meta/target corruption 必须投影为安全 typed 启动失败。
 
     Args:
         tmp_path: pytest 临时目录。
-        monkeypatch: pytest monkeypatch fixture。
+        corruption: 待注入的 durable corruption 形态。
 
     Returns:
         无。
 
     Raises:
-        AssertionError: corruption 被 except ValueError 误投影为用户参数错误时抛出。
+        AssertionError: corruption 被投影为 invalid_argument、泄露内部 schema
+            原文或创建 job 时抛出。
+        OSError: 测试环境无法创建 symlink 时抛出。
     """
 
-    runtime = DefaultFinsRuntime.create(workspace_root=_build_workspace(tmp_path)).get_ingestion_runtime()
-    monkeypatch.setattr(
-        runtime,
-        "prepare_observed_upload",
-        _raise_identity_corruption_on_prepare,
-    )
+    workspace_root = _build_workspace(tmp_path)
+    portfolio_root = workspace_root / "portfolio"
+    portfolio_root.mkdir()
+    ticker_dir = portfolio_root / "AAPL"
+    if corruption == "target_symlink":
+        outside_dir = tmp_path / "outside-company"
+        outside_dir.mkdir()
+        ticker_dir.symlink_to(outside_dir, target_is_directory=True)
+    elif corruption == "target_regular_file":
+        ticker_dir.write_bytes(b"foreign locator")
+    else:
+        ticker_dir.mkdir()
+        (ticker_dir / ".identity.json").write_text(
+            json.dumps({"namespace": "ticker", "external_identity": "AAPL"}),
+            encoding="utf-8",
+        )
+        meta_path = ticker_dir / "meta.json"
+        if corruption == "malformed_meta":
+            meta_path.write_text("{}", encoding="utf-8")
+        elif corruption == "meta_symlink":
+            outside_meta = tmp_path / "outside-meta.json"
+            outside_meta.write_text("{}", encoding="utf-8")
+            meta_path.symlink_to(outside_meta)
+        else:
+            meta_path.mkdir()
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
     outcome = asyncio.run(
         FinsUploadToolCallable(runtime=runtime)(
             _call(
@@ -1135,27 +1164,9 @@ def test_upload_tool_does_not_swallow_typed_corruption_as_invalid_argument(
     assert outcome.result.error == "fins_upload_start_failed"
     assert outcome.result.message == "工作区公司代码身份数据损坏，上传任务未启动。"
     assert outcome.result.hint == "请修复工作区公司元数据后重试。"
-
-
-def _raise_identity_corruption_on_prepare(
-    request: FinsUploadRequest,
-    cancellation_token: CancellationToken,
-) -> FinsObservationHandle:
-    """为 upload tool catch-order 测试注入 typed corruption。
-
-    Args:
-        request: 上传请求。
-        cancellation_token: operation-scoped 取消 token。
-
-    Returns:
-        不返回。
-
-    Raises:
-        CompanyTickerIdentityCorruptionError: 始终抛出。
-    """
-
-    del request, cancellation_token
-    raise CompanyTickerIdentityCorruptionError(kind="invalid_descriptor")
+    assert "CompanyMeta" not in outcome.result.message
+    assert "ticker_aliases" not in outcome.result.message
+    assert not tuple(_job_store_root(workspace_root).glob("*.json"))
 
 
 @pytest.mark.parametrize(
@@ -1227,6 +1238,65 @@ def test_upload_tool_filing_calendar_year_invalid_input_has_zero_side_effects(
     assert runtime._observations == {}
     assert not tuple(_job_store_root(workspace_root).glob("*.json"))
     assert _snapshot_tool_workspace_tree(workspace_root) == before_tree
+
+
+@pytest.mark.parametrize(
+    ("argument_overrides", "expected_message"),
+    (
+        ({"ticker": "Apple Inc."}, "--ticker 无法识别，请提供有效公司代码"),
+        (
+            {"ticker_aliases": ["a apl"]},
+            "--ticker 别名无法识别，请提供有效公司代码",
+        ),
+        (
+            {"ticker_aliases": [f"A{index}" for index in range(101)]},
+            "--ticker 别名数量不能超过 100 个",
+        ),
+    ),
+)
+def test_upload_tool_material_ticker_identity_usage_is_bounded_and_typed(
+    tmp_path: Path,
+    argument_overrides: Mapping[str, JsonValue],
+    expected_message: str,
+) -> None:
+    """material ticker/alias grammar 与数量必须在 observation 前 typed 拒绝。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        argument_overrides: 当前非法 ticker identity 参数。
+        expected_message: usage owner 产生的精确业务文案。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: material 绕过共享准入或创建 observation/job 时抛出。
+    """
+
+    workspace_root = _build_workspace(tmp_path)
+    runtime, executor, _ = _runtime_with_static_admission_guard(workspace_root=workspace_root)
+    arguments: dict[str, JsonValue] = {
+        "ticker": "AAPL",
+        "upload_kind": "material",
+        "action": "delete",
+        "form_type": "MATERIAL_OTHER",
+        "material_name": "Deck",
+    }
+    arguments.update(argument_overrides)
+
+    outcome = asyncio.run(
+        FinsUploadToolCallable(runtime=runtime)(
+            _call(UPLOAD_TOOL_NAME, arguments),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "invalid_argument"
+    assert outcome.result.message == expected_message
+    assert executor.submitted_job_ids == ()
+    assert runtime._observations == {}
+    assert not tuple(_job_store_root(workspace_root).glob("*.json"))
 
 
 @pytest.mark.parametrize(

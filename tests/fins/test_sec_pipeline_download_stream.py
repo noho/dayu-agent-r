@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from dayu.contracts.json_value import JsonValue
 
 from collections.abc import AsyncIterator, Callable, Mapping
@@ -14,6 +16,7 @@ import pytest
 from dayu.fins.domain.document_models import (
     BatchToken,
     DocumentHandle,
+    DownloadRejectionRegistry,
     FileObjectMeta,
     ProcessedHandle,
     SourceDocumentUpsertRequest,
@@ -38,6 +41,7 @@ from dayu.fins.download_contract import (
     FinsDownloadTransportCategory,
 )
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
+from dayu.fins.pipelines import sec_download_workflow as _sec_download_workflow
 from dayu.fins.pipelines.sec_pipeline import (
     SecPipeline,
     SecPipelineDownloadResult,
@@ -46,6 +50,7 @@ from dayu.fins.pipelines.sec_pipeline import (
 from dayu.fins.processors.registry import build_fins_processor_registry
 from dayu.fins.storage.fs_source_document_repository import FsSourceDocumentRepository
 from dayu.fins.storage import (
+    FilingMaintenanceRepositoryProtocol,
     FsBatchingRepository,
     FsCompanyMetaRepository,
     FsDocumentBlobRepository,
@@ -69,6 +74,149 @@ def _event_filing_result(event: DownloadEvent) -> Mapping[str, JsonValue]:
     raw_result = event.payload.get("filing_result")
     assert isinstance(raw_result, Mapping)
     return raw_result
+
+
+class _BatchIdentitySecBatchingRepository(FsBatchingRepository):
+    """记录 SEC company publication 的 commit/rollback 选择。"""
+
+    def __init__(self, workspace_root: Path, repository_set: _FsRepositorySet) -> None:
+        """初始化 batch operation spy。
+
+        Args:
+            workspace_root: 工作区根目录。
+            repository_set: 共享 filesystem repository set。
+
+        Returns:
+            无。
+
+        Raises:
+            OSError: storage 初始化失败时抛出。
+        """
+
+        super().__init__(workspace_root, repository_set=repository_set)
+        self.commit_calls = 0
+        self.rollback_calls = 0
+
+    def commit_batch(self, batch: BatchToken) -> None:
+        """记录并提交 batch。
+
+        Args:
+            batch: 待提交 batch capability。
+
+        Returns:
+            无。
+
+        Raises:
+            OSError: storage commit 失败时抛出。
+            ValueError: capability 非法时抛出。
+        """
+
+        self.commit_calls += 1
+        super().commit_batch(batch)
+
+    def rollback_batch(self, batch: BatchToken) -> None:
+        """记录并回滚 batch。
+
+        Args:
+            batch: 待回滚 batch capability。
+
+        Returns:
+            无。
+
+        Raises:
+            OSError: storage rollback 失败时抛出。
+            ValueError: capability 非法时抛出。
+        """
+
+        self.rollback_calls += 1
+        super().rollback_batch(batch)
+
+
+def _reject_unexpected_registry_save(
+    repository: FilingMaintenanceRepositoryProtocol,
+    ticker: str,
+    registry: DownloadRejectionRegistry,
+    *,
+    batch: BatchToken,
+) -> None:
+    """拒绝 zero-rejection 测试中的意外 registry 写入。
+
+    Args:
+        repository: maintenance repository。
+        ticker: canonical ticker。
+        registry: rejection registry。
+        batch: batch capability。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 测试路径意外尝试写 registry 时抛出。
+    """
+
+    del repository, ticker, registry, batch
+    raise AssertionError("zero-rejection company publication 不应写 registry")
+
+
+def test_repeat_sec_company_publication_rolls_back_zero_mutation_batch(
+    tmp_path: Path,
+) -> None:
+    """fresh 且 identity 未变化时 SEC caller 必须 rollback，禁止 full-tree swap。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 明确 ``None`` mutation signal 未被 caller 消费时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching_repository = _BatchIdentitySecBatchingRepository(tmp_path, repository_set)
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        batching_repository=batching_repository,
+        company_repository=FsCompanyMetaRepository(tmp_path, repository_set=repository_set),
+        processor_registry=build_fins_processor_registry(),
+    )
+    asyncio.run(
+        _sec_download_workflow._publish_sec_post_repair_mutations(
+            host=cast(_sec_download_workflow.SecDownloadWorkflowHost, pipeline),
+            ticker="AAPL",
+            cik="320193",
+            company_name="Apple Inc.",
+            ticker_aliases=(),
+            rejection_decisions=(),
+            rejection_registry={},
+            overwrite=False,
+            record_rejection=lambda _registry, _document_id, _reason, _category, _form, _date: None,
+            save_rejection_registry=_reject_unexpected_registry_save,
+            cancel_checker=None,
+        )
+    )
+    published_meta_path = tmp_path / "portfolio" / "AAPL" / "meta.json"
+    first_meta = published_meta_path.read_bytes()
+    asyncio.run(
+        _sec_download_workflow._publish_sec_post_repair_mutations(
+            host=cast(_sec_download_workflow.SecDownloadWorkflowHost, pipeline),
+            ticker="AAPL",
+            cik="320193",
+            company_name="Apple Inc.",
+            ticker_aliases=(),
+            rejection_decisions=(),
+            rejection_registry={},
+            overwrite=False,
+            record_rejection=lambda _registry, _document_id, _reason, _category, _form, _date: None,
+            save_rejection_registry=_reject_unexpected_registry_save,
+            cancel_checker=None,
+        )
+    )
+
+    assert batching_repository.commit_calls == 1
+    assert batching_repository.rollback_calls == 1
+    assert published_meta_path.read_bytes() == first_meta
 
 
 class StreamStubDownloader(SecDownloader):
@@ -128,11 +276,6 @@ class StreamStubDownloader(SecDownloader):
 
         del user_agent, sleep_seconds, max_retries
         self.configure_called = True
-
-    def normalize_ticker(self, ticker: str) -> str:
-        """标准化 ticker。"""
-
-        return ticker.strip().upper()
 
     async def resolve_company(
         self,
