@@ -521,7 +521,7 @@ Processors 在 `dayu.documents.processors` 通用能力上增加财报语义：
 
 虚拟章节 mixin 是表单专项 section / table 发布语义的唯一 owner。刷新时先校验原始表格标记、章节树和同一份候选双向映射，再一次性发布结果：完整映射（包括零表格）发布虚拟章节；没有矛盾但映射缺失或不完整时整体发布基础处理器结果；悬空、重复或双向不一致等矛盾直接失败关闭。已发布模式是终态，重复刷新保持幂等；章节列表、章节读取、搜索、表格列表和表格读取五个公共消费者只读取同一已发布模式与映射，不按可用性静默过滤，也不按位置猜测归属。
 
-`dayu.fins.domain.filing_semantics` 是 fiscal year、fiscal period 与财期 recency rank 的 domain 真源；processor 和 pipeline 负责产生直接 fiscal 事实，read runtime 只校验、排序和投影。`dayu.fins.processors.value_normalization.normalize_optional_dataframe_string(...)` 是 dataframe 可选字符串真源：`None`、空白、NaN、`pd.NA` 与 `pd.NaT` 表示缺失，数字 `0` 与 bool `False` 保留为文本。SEC section、table 与 XBRL processor 直接消费该 helper，不维护本地 wrapper。
+`dayu.fins.domain.filing_semantics` 是 fiscal year、partial calendar year、canonical Gregorian full-date、fiscal period 与财期 recency rank 的 domain 真源。财年和 partial year 只接受非 bool 的 `1000..9999` 整数；canonical full-date 只接受实际存在、月日补零且无首尾空白的 `YYYY-MM-DD`，公历年份域为 `0001..9999`，不继承财年的 `1000` 下界。processor 和 pipeline 负责产生直接 fiscal 事实，read runtime 只校验、排序和投影。`dayu.fins.processors.value_normalization.normalize_optional_dataframe_string(...)` 是 dataframe 可选字符串真源：`None`、空白、NaN、`pd.NA` 与 `pd.NaT` 表示缺失，数字 `0` 与 bool `False` 保留为文本。SEC section、table 与 XBRL processor 直接消费该 helper，不维护本地 wrapper。
 
 ### FinsReadRuntime
 
@@ -541,6 +541,8 @@ Read、download、preprocess、upload 是四个独立 provider：
 ### Ingestion runtime
 
 `FinsIngestionRuntime` 负责 download / preprocess / upload 的业务执行、direct event stream、awaiting observation 和 legacy job-store helper。下载入口只消费 `FinsDownloadRequest` 的 canonical ticker、市场化表单、包含边界的日期窗口、overwrite policy 与 `rebuild_local_artifacts`；下载 pipeline 通过 `FinsSourceDownloadAdapter` 返回待持久化文档，或在 adapter 内通过仓储完成 source / blob / rejected filing artifact 写入并返回有界已持久化摘要。预处理 pipeline 从 source repository 读取文档，经 processor registry 生成 sections / tables，再写入 processed repository；upload 通过 `FinsUploadRunner` 边界执行上传业务。runtime 的业务真源是仓储产物与有界 result summary，不是 Host EventLog，也不是 CLI-facing job id。
+
+Download request wrapper 保留原始日期的首尾空白清理、`YYYY` / `YYYY-M[M]` / `YYYY-M[M]-D[D]` shape、partial inclusive 展开和 `FinsDownloadDateRange` ordering。year 与 year-month 把年份合法性委托给 domain 的 `1000..9999` year owner；full-date 先把一至两位月日补零，再只委托 canonical full-date owner，因此实际公历 `0001..9999` 均可作为完整日期。partial period 的结束边界仍由 wrapper 使用真实月末展开，闰年二月包含 29 日。
 
 Preprocess result summary 使用同一个 typed status helper 判定业务成功或失败。`skipped_count` 只表示已支持但因已有 processed 产物等原因跳过的文档；无可用 processor 的文档单独计入 `not_supported_count` 与 `not_supported_document_ids`，不会混入 skipped。
 
@@ -644,6 +646,8 @@ direct caller
 ```
 
 当前 upload 同时具备 direct stream runtime contract、production runner、`start_fins_upload` awaiting tool provider 与 Service wait adapter binding。`FinsUploadFilingRequest` 与 `FinsUploadMaterialRequest` 使用已有 `SourceKind.FILING` / `SourceKind.MATERIAL` 区分 filing 与 material；direct result 只暴露有界业务字段和文件数量，不保存或输出本地文件路径。未装配 `FinsUploadRunner` 时，upload stream 产出 unsupported upload runtime 的 failed RESULT。
+
+直接 `upload_filing` 与 `start_fins_upload` 的 filing 分支在 workspace state read、operation / observation / job 创建和 converter / storage mutation 前执行同一静态 admission：required `fiscal_year` 必须是 `1000..9999` 整数，可选 `filing_date` / `report_date` 若提供则必须是 canonical Gregorian full-date。两个入口都把日期 raw text 原样交给 admission，不 trim，也不把空串或纯空白折叠为缺失；material 分支保持自身既有 normalization。`upload_filings_from` 的扫描与脚本生成元数据处理不属于这两个直接入口的 strict raw-admission contract。
 
 Upload workflow 返回的 summary 表示 publication/no-op/cancellation 已完成 first-commit 仲裁。Direct stream 在同一把 operation lock 上 claim 一次 summary，再从该 claim 投影 progress 与唯一 RESULT；cancelled 不发 completed progress，failed 只发 completed-with-failures，completed 只发 completed。Legacy upload job 使用 upload 专属 atomic save：completed/failed summary 不会被 runner 返回后的迟到取消改写，cancelled summary 走 cancelled save；terminal record 保存后，progress 与 terminal event 才从最终 record 投影。Download 与 preprocess 原有 success-or-cancelled / failed-or-cancelled 终态语义不受 upload 规则影响。
 

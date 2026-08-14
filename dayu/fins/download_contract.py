@@ -18,7 +18,9 @@ from typing import Final
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.filing_semantics import (
     FISCAL_PERIODS,
+    parse_calendar_year,
     parse_fiscal_period_filter_value,
+    parse_iso_calendar_date,
     parse_sec_form_filter_value,
 )
 from dayu.fins.ticker_normalization import NormalizedTicker, normalize_ticker
@@ -795,17 +797,20 @@ def _parse_date_bound(
         raise FinsDownloadUsageError(f"{field_name} 过长，请使用 YYYY、YYYY-MM 或 YYYY-MM-DD")
     try:
         if _YEAR_PATTERN.fullmatch(value) is not None:
-            year = int(value)
+            year = parse_calendar_year(int(value), field_name=field_name)
             return dt.date(year, 12, 31) if is_end else dt.date(year, 1, 1)
         if _YEAR_MONTH_PATTERN.fullmatch(value) is not None:
             year_text, month_text = value.split("-")
-            year = int(year_text)
+            year = parse_calendar_year(int(year_text), field_name=field_name)
             month = int(month_text)
             day = calendar.monthrange(year, month)[1] if is_end else 1
             return dt.date(year, month, day)
         if _FULL_DATE_PATTERN.fullmatch(value) is not None:
             year_text, month_text, day_text = value.split("-")
-            return dt.date(int(year_text), int(month_text), int(day_text))
+            canonical_value = (
+                f"{int(year_text):04d}-{int(month_text):02d}-{int(day_text):02d}"
+            )
+            return parse_iso_calendar_date(canonical_value, field_name=field_name)
     except (ValueError, OverflowError) as exc:
         raise FinsDownloadUsageError(f"{field_name} 不是有效日期，请使用 YYYY、YYYY-MM 或 YYYY-MM-DD") from exc
     raise FinsDownloadUsageError(f"{field_name} 格式错误，请使用 YYYY、YYYY-MM 或 YYYY-MM-DD")
@@ -851,12 +856,9 @@ def _parse_optional_iso_date(value: str | None, *, field_name: str) -> dt.date |
         return None
     _validate_public_text(value, field_name=field_name, allow_none=False)
     try:
-        parsed = dt.date.fromisoformat(value)
+        return parse_iso_calendar_date(value, field_name=field_name)
     except ValueError as exc:
         raise ValueError(f"{field_name} must be an ISO date") from exc
-    if parsed.isoformat() != value:
-        raise ValueError(f"{field_name} must use canonical ISO format")
-    return parsed
 
 
 def _validate_public_text(

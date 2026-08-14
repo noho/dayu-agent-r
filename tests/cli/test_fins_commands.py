@@ -12,7 +12,7 @@ import subprocess
 import sys
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from functools import partial
 from pathlib import Path
 from typing import NoReturn, TextIO, cast
@@ -22,6 +22,7 @@ import pytest
 import dayu.cli.commands.fins as fins_command
 import dayu.cli.main as cli_main
 import dayu.cli.output as cli_output
+import dayu.fins.download_contract as download_contract
 import dayu.fins.ingestion_runtime as ingestion_runtime
 from dayu.cli.agent_entrypoint import CliSigintMonitor
 from dayu.cli.arg_parsing import parse_cli_args
@@ -45,6 +46,7 @@ from dayu.fins.direct_events import (
 )
 from dayu.fins.direct_events import ValidatedFinsEventStream
 from dayu.fins.download_contract import (
+    FinsDownloadEffectiveFilters,
     FinsDownloadRequest,
     build_fins_download_request,
 )
@@ -1035,6 +1037,257 @@ def test_download_command_maps_single_mutation_mode_to_service(
             rebuild_local_artifacts=expected_rebuild,
         )
     ]
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "expected_start", "expected_end"),
+    (
+        ("1000", "9999", "1000-01-01", "9999-12-31"),
+        ("2024-2", "2024-2", "2024-02-01", "2024-02-29"),
+        ("0001-1-1", "0999-12-31", "0001-01-01", "0999-12-31"),
+        (" 2024-2-9 ", " 2024-2-9 ", "2024-02-09", "2024-02-09"),
+    ),
+)
+def test_download_date_bounds_preserve_shape_canonicalization_and_inclusive_expansion(
+    start: str,
+    end: str,
+    expected_start: str,
+    expected_end: str,
+) -> None:
+    """下载日期应保留三种 shape、外围空白与 inclusive 展开契约。
+
+    Args:
+        start: 原始起始边界。
+        end: 原始结束边界。
+        expected_start: 预期 canonical inclusive 起始日期。
+        expected_end: 预期 canonical inclusive 结束日期。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: canonicalization 或 inclusive 展开不符合契约时抛出。
+    """
+
+    request = build_fins_download_request(ticker="AAPL", start=start, end=end)
+
+    assert request.date_range.start_text == expected_start
+    assert request.date_range.end_text == expected_end
+
+
+@pytest.mark.parametrize(
+    "partial_bound",
+    ("0999", "0000", "0999-12", "0000-1"),
+)
+def test_download_partial_year_rejects_values_outside_shared_year_domain(
+    partial_bound: str,
+) -> None:
+    """year 与 year-month 应共同拒绝 ``1000..9999`` 之外的 partial year。
+
+    Args:
+        partial_bound: 当前非法 year 或 year-month 边界。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法 partial year 未按 download usage contract 拒绝时抛出。
+    """
+
+    with pytest.raises(download_contract.FinsDownloadUsageError) as exc_info:
+        build_fins_download_request(ticker="AAPL", start=partial_bound)
+
+    assert str(exc_info.value) == (
+        "--start 不是有效日期，请使用 YYYY、YYYY-MM 或 YYYY-MM-DD"
+    )
+
+
+@pytest.mark.parametrize(
+    "full_date_bound",
+    ("0000-12-31", "2023-2-29", "2024-13-1", "2024-4-31"),
+)
+def test_download_full_date_rejects_nonexistent_calendar_dates(
+    full_date_bound: str,
+) -> None:
+    """full-date 应拒绝公历年零、非闰日和非法月日。
+
+    Args:
+        full_date_bound: 当前不存在的 full-date 边界。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 不存在的公历日期未被拒绝时抛出。
+    """
+
+    with pytest.raises(download_contract.FinsDownloadUsageError) as exc_info:
+        build_fins_download_request(ticker="AAPL", start=full_date_bound)
+
+    assert str(exc_info.value) == (
+        "--start 不是有效日期，请使用 YYYY、YYYY-MM 或 YYYY-MM-DD"
+    )
+
+
+def test_download_date_bound_delegates_shared_year_and_full_date_owners(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """download wrapper 应只把共同年份与 full-date 合法性委托 domain owner。
+
+    Args:
+        monkeypatch: owner 调用记录替换夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: wrapper 未调用 shared owner 或错误耦合两类年份时抛出。
+    """
+
+    year_calls: list[tuple[int, str]] = []
+    date_calls: list[tuple[str, str]] = []
+    real_parse_calendar_year = download_contract.parse_calendar_year
+    real_parse_iso_calendar_date = download_contract.parse_iso_calendar_date
+
+    def record_year(value: int, *, field_name: str = "year") -> int:
+        """记录并调用真实 partial-year owner。
+
+        Args:
+            value: 待校验年份。
+            field_name: download wrapper 字段名。
+
+        Returns:
+            真实 owner 返回的年份。
+
+        Raises:
+            ValueError: 真实 owner 拒绝年份时抛出。
+        """
+
+        year_calls.append((value, field_name))
+        return real_parse_calendar_year(value, field_name=field_name)
+
+    def record_date(value: str, *, field_name: str = "date") -> date:
+        """记录并调用真实 canonical full-date owner。
+
+        Args:
+            value: 已由 download wrapper 补零的 full-date 文本。
+            field_name: download wrapper 字段名。
+
+        Returns:
+            真实 owner 返回的公历日期。
+
+        Raises:
+            ValueError: 真实 owner 拒绝日期时抛出。
+        """
+
+        date_calls.append((value, field_name))
+        return real_parse_iso_calendar_date(value, field_name=field_name)
+
+    monkeypatch.setattr(download_contract, "parse_calendar_year", record_year)
+    monkeypatch.setattr(download_contract, "parse_iso_calendar_date", record_date)
+
+    partial_request = build_fins_download_request(
+        ticker="AAPL",
+        start="1000",
+        end="2024-2",
+    )
+    assert partial_request.date_range.start_text == "1000-01-01"
+    assert partial_request.date_range.end_text == "2024-02-29"
+    assert year_calls == [(1000, "--start"), (2024, "--end")]
+    assert date_calls == []
+
+    full_date_request = build_fins_download_request(
+        ticker="AAPL",
+        start="0001-1-1",
+        end="0999-12-31",
+    )
+    assert full_date_request.date_range.start_text == "0001-01-01"
+    assert full_date_request.date_range.end_text == "0999-12-31"
+    assert year_calls == [(1000, "--start"), (2024, "--end")]
+    assert date_calls == [
+        ("0001-01-01", "--start"),
+        ("0999-12-31", "--end"),
+    ]
+
+
+def test_download_public_iso_dates_delegate_shared_full_date_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """download public DTO 的 calendar validity 应委托 shared full-date owner。
+
+    Args:
+        monkeypatch: owner 调用记录替换夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: public DTO 未委托 owner 或接受非法日期时抛出。
+    """
+
+    date_calls: list[tuple[str, str]] = []
+    real_parse_iso_calendar_date = download_contract.parse_iso_calendar_date
+
+    def record_date(value: str, *, field_name: str = "date") -> date:
+        """记录并调用真实 canonical full-date owner。
+
+        Args:
+            value: public DTO 日期文本。
+            field_name: public DTO 字段名。
+
+        Returns:
+            真实 owner 返回的公历日期。
+
+        Raises:
+            ValueError: 真实 owner 拒绝日期时抛出。
+        """
+
+        date_calls.append((value, field_name))
+        return real_parse_iso_calendar_date(value, field_name=field_name)
+
+    monkeypatch.setattr(download_contract, "parse_iso_calendar_date", record_date)
+
+    filters = FinsDownloadEffectiveFilters(
+        form_types=(),
+        start_date="0001-01-01",
+        end_date="2024-02-29",
+        overwrite_existing=False,
+        rebuild_local_artifacts=False,
+    )
+    assert filters.start_date == "0001-01-01"
+    assert filters.end_date == "2024-02-29"
+    assert date_calls == [
+        ("0001-01-01", "start_date"),
+        ("2024-02-29", "end_date"),
+    ]
+
+    with pytest.raises(ValueError, match="start_date must be an ISO date"):
+        FinsDownloadEffectiveFilters(
+            form_types=(),
+            start_date="2023-02-29",
+            end_date=None,
+            overwrite_existing=False,
+            rebuild_local_artifacts=False,
+        )
+
+
+def test_download_date_range_ordering_remains_owned_by_range_contract() -> None:
+    """展开后的 start/end ordering 应继续由 ``FinsDownloadDateRange`` 拒绝。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: ordering error 类型或 message 发生漂移时抛出。
+    """
+
+    with pytest.raises(download_contract.FinsDownloadUsageError) as exc_info:
+        build_fins_download_request(ticker="AAPL", start="2025", end="2024-12")
+
+    assert str(exc_info.value) == "--start 不能晚于 --end，请检查下载日期范围"
 
 
 @pytest.mark.parametrize(

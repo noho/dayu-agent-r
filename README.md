@@ -261,7 +261,10 @@ dayu-cli download --ticker 0700 --rebuild
 `--ticker` 只接受一个 ticker，并统一转换为市场对应的规范写法；`--forms` 会按市场
 规范化并稳定去重，SEC 表单还会统一大小写。`--start` 与 `--end` 接受 `YYYY`、
 `YYYY-MM` 或 `YYYY-MM-DD`，分别展开为所给期间的起始日和结束日，形成包含边界的日期
-窗口。下载 SEC 文件前必须提供合规的 User-Agent 身份，例如：
+窗口。单独年份和年月中的年份必须在 `1000..9999`；完整日期允许实际公历
+`0001..9999`，月、日可写一位或两位。命令会忽略日期文本首尾空白、校验真实月末与
+闰年，并把接受的边界统一显示为补零的 `YYYY-MM-DD`。下载 SEC 文件前必须提供合规的
+User-Agent 身份，例如：
 
 ```bash
 export SEC_USER_AGENT="Your Organization contact@example.com"
@@ -312,6 +315,13 @@ dayu-cli upload_material --help
 ```
 
 `upload_filing` 会在启动运行时前完成参数、文件与当前目标状态校验。可由用户修正的输入错误会输出一行具体原因并退出 `2`，不会创建上传任务或发布财报；文件解析、存储或执行失败会输出脱敏的可操作原因并退出 `1`。filing 的公司信息与文档内容只会一起发布，失败时不会留下只发布一半的结果。
+
+直接调用 `upload_filing` 或通过 `start_fins_upload` 工具上传 filing 时，`fiscal_year`
+必须是 `1000..9999` 的整数；可选的 `filing_date` 与 `report_date` 若填写，必须是实际
+存在、月日补零且无首尾空白的 `YYYY-MM-DD`，完整日期年份允许 `0001..9999`。空串、
+纯空白、非补零日期和不存在的月日都会在运行期或上传任务创建前拒绝。该严格原始输入
+承诺只适用于这两个直接 filing 入口，不覆盖 `upload_filings_from` 的扫描与脚本生成元数据
+处理。
 
 上传终态摘要中的 `requested files` 是本次已校验的输入文件数，`stored files` 是本次成功发布的原始文件数；Docling 派生文件不重复计数。空文件、损坏文件或一组文件中任一文件无法解析时，整批上传失败且 `stored files` 为 `0`，不会把先处理成功的文件计为已保存；stderr 会同时显示触发失败的文件名和有界原因。若 direct 命令遇到无法归入这些已知原因的内部异常，普通 stderr 只显示 `命令执行失败，请使用 --log-file PATH 重试并查看日志`；按提示为 `PATH` 选择可写文件并重新执行命令，即可在该文件中保留完整诊断。
 
