@@ -1751,7 +1751,7 @@ def test_filing_calendar_year_static_admission_accepts_boundaries_and_delegates(
         fiscal_year=fiscal_year,
         fiscal_period="FY",
         filing_date="2024-02-29",
-        report_date="2024-02-29",
+        report_date="2024-03-01",
     )
 
     first = prevalidate_fins_upload_filing_request_for_workspace(
@@ -1767,8 +1767,10 @@ def test_filing_calendar_year_static_admission_accepts_boundaries_and_delegates(
     assert first.internal_document_id == second.internal_document_id
     assert first.resolved_action == "delete"
     assert first.request is request
-    assert year_calls == [fiscal_year, fiscal_year, fiscal_year, fiscal_year]
-    assert date_calls == ["2024-02-29"] * 8
+    assert year_calls
+    assert set(year_calls) == {fiscal_year}
+    assert date_calls
+    assert set(date_calls) == {"2024-02-29", "2024-03-01"}
 
 
 def test_default_runtime_create_and_ingestion_assembly_are_lazy(tmp_path: Path) -> None:

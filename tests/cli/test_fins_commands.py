@@ -1270,6 +1270,16 @@ def test_download_public_iso_dates_delegate_shared_full_date_owner(
             rebuild_local_artifacts=False,
         )
 
+    with pytest.raises(ValueError) as basic_format_exc:
+        FinsDownloadEffectiveFilters(
+            form_types=(),
+            start_date="20240229",
+            end_date=None,
+            overwrite_existing=False,
+            rebuild_local_artifacts=False,
+        )
+    assert str(basic_format_exc.value) == "start_date must be an ISO date"
+
 
 def test_download_date_range_ordering_remains_owned_by_range_contract() -> None:
     """展开后的 start/end ordering 应继续由 ``FinsDownloadDateRange`` 拒绝。
