@@ -72,6 +72,7 @@ COMMAND_HELP_EXPECTATIONS: dict[str, tuple[str, ...]] = {
         "第一项是该公司财报归档的 canonical ticker",
         "--action",
         "--files",
+        "--primary",
         "--fiscal-year",
         "--filing-date",
         "--company-name",
@@ -376,10 +377,10 @@ def test_command_help_contains_core_arguments(
         assert expected_fragment in help_text
 
 
-def test_upload_filing_files_help_consumes_self_contained_format_projection(
+def test_upload_filing_help_consumes_self_contained_format_projections(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """upload_filing ``--files`` help 必须直接消费 Fins owner 文本投影。
+    """upload_filing ``--files``/``--primary`` help 必须直接消费 Fins owner 投影。
 
     Args:
         capsys: pytest 标准输出捕获夹具。
@@ -388,19 +389,22 @@ def test_upload_filing_files_help_consumes_self_contained_format_projection(
         无。
 
     Raises:
-        AssertionError: help source、角色准入或候选格式限定文案漂移时抛出。
+        AssertionError: help source、primary 规则或候选格式限定文案漂移时抛出。
     """
 
     parser = build_parser()
     filing_parser = next(child for child in _collect_parser_tree(parser) if child.prog.endswith(" upload_filing"))
     files_action = next(action for action in filing_parser._actions if "--files" in action.option_strings)
+    primary_action = next(
+        action for action in filing_parser._actions if "--primary" in action.option_strings
+    )
     assert files_action.help == FINS_UPLOAD_FORMAT_TEXT.filing_files
+    assert primary_action.help == FINS_UPLOAD_FORMAT_TEXT.filing_primary
 
     help_text = "".join(_capture_help(capsys, ("upload_filing",)).split())
     for expected_fragment in (
         "auto/create/update 必须至少提供一个文件",
-        "首文件是主文件",
-        "必须实际转换成功",
+        "已选主文件必须实际转换成功",
         "仅原样保存、不转换",
         ".xsd",
         ".xml 仅是 XBRL XML 候选",
@@ -411,8 +415,57 @@ def test_upload_filing_files_help_consumes_self_contained_format_projection(
         "不保证文件内容转换成功",
         "随附文件只校验可随批保存的后缀，不执行转换",
         "delete 不得提供文件",
+        "单文件 filing 可省略 --primary",
+        "多文件 filing 必须恰好指定一个 --primary",
+        "--primary 必须精确匹配 --files 中的一个路径",
+        "--files 的顺序不决定主文件角色",
+        "delete 必须省略 --files 和 --primary",
     ):
         assert "".join(expected_fragment.split()) in help_text
+    assert "首文件是主文件" not in help_text
+
+
+def test_upload_filing_primary_is_append_only_on_filing_command() -> None:
+    """``--primary`` 必须保留每次 filing occurrence，且不污染其它 upload 命令。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: occurrence 被覆盖或其它命令接受 primary 时抛出。
+    """
+
+    filing = parse_cli_args(
+        (
+            "upload_filing",
+            "--ticker",
+            "AAPL",
+            "--primary",
+            "first.pdf",
+            "--primary",
+            "second.pdf",
+        )
+    )
+
+    assert filing.primary == ["first.pdf", "second.pdf"]
+    for command in (
+        ("upload_material", "--ticker", "AAPL", "--primary", "report.pdf"),
+        (
+            "upload_filings_from",
+            "--ticker",
+            "AAPL",
+            "--from",
+            "source",
+            "--primary",
+            "report.pdf",
+        ),
+    ):
+        with pytest.raises(SystemExit) as raised:
+            parse_cli_args(command)
+        assert raised.value.code == EXIT_USAGE_ERROR
 
 
 def test_upload_material_files_help_consumes_self_contained_format_projection(
@@ -614,7 +667,17 @@ def test_tool_trace_parser_returns_explicit_analyze_fields() -> None:
 
 
 def test_upload_actions_default_to_auto_and_batch_rejects_delete() -> None:
-    """三个 upload parser 默认 auto，direct 可 delete，batch 必须拒绝 delete。"""
+    """三个 upload parser 默认 auto，direct 可 delete，batch 必须拒绝 delete。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: action、primary 默认值或 batch delete 拒绝行为漂移时抛出。
+    """
 
     filing = parse_cli_args(("upload_filing", "--ticker", "AAPL"))
     material = parse_cli_args(("upload_material", "--ticker", "AAPL"))
@@ -626,6 +689,7 @@ def test_upload_actions_default_to_auto_and_batch_rejects_delete() -> None:
     )
 
     assert filing.action == "auto"
+    assert filing.primary is None
     assert material.action == "auto"
     assert batch.action == "auto"
     assert batch.infer is False

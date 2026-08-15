@@ -384,6 +384,8 @@ class _FakeFinsDirectService:
                 ticker=request.normalized_ticker.canonical,
                 action=raw_request.action,
                 files=raw_request.files,
+                primary_selectors=raw_request.primary_selectors,
+                selected_primary=request.file_selection.primary,
                 fiscal_year=raw_request.fiscal_year,
                 fiscal_period=request.normalized_fiscal_period,
                 amended=raw_request.amended,
@@ -1543,6 +1545,80 @@ def test_download_static_usage_error_precedes_workspace_and_service_factory(
             ),
             "上传路径不是普通文件：input",
         ),
+        (
+            "UF-FIX07-repeated-primary",
+            (
+                "--ticker",
+                "AAPL",
+                "--fiscal-year",
+                "2024",
+                "--fiscal-period",
+                "FY",
+                "--company-name",
+                "Apple Inc.",
+                "--files",
+                "{input}/probe.txt",
+                "--primary",
+                "{input}/probe.txt",
+                "--primary",
+                "{input}/probe.xsd",
+            ),
+            "--primary 只能指定一次",
+        ),
+        (
+            "UF-FIX07-missing-multi-primary",
+            (
+                "--ticker",
+                "AAPL",
+                "--fiscal-year",
+                "2024",
+                "--fiscal-period",
+                "FY",
+                "--company-name",
+                "Apple Inc.",
+                "--files",
+                "{input}/probe.txt",
+                "{input}/probe.xsd",
+            ),
+            "多文件 filing 必须使用 --primary 明确指定主文件",
+        ),
+        (
+            "UF-FIX07-primary-outside-files",
+            (
+                "--ticker",
+                "AAPL",
+                "--fiscal-year",
+                "2024",
+                "--fiscal-period",
+                "FY",
+                "--company-name",
+                "Apple Inc.",
+                "--files",
+                "{input}/probe.txt",
+                "--primary",
+                "{input}/outside.txt",
+            ),
+            "--primary 必须精确匹配 --files 中的一个文件",
+        ),
+        (
+            "UF-FIX07-duplicate-files",
+            (
+                "--ticker",
+                "AAPL",
+                "--fiscal-year",
+                "2024",
+                "--fiscal-period",
+                "FY",
+                "--company-name",
+                "Apple Inc.",
+                "--files",
+                "{input}/probe.txt",
+                "{input}/probe.txt",
+                "--primary",
+                "{input}/probe.txt",
+            ),
+            "--files 不能包含解析后相同的重复路径",
+        ),
         *tuple(
             (
                 case_id,
@@ -1803,6 +1879,8 @@ def test_upload_filing_existing_update_projects_typed_request_to_service(
             ticker="AAPL",
             action="update",
             files=(input_file.resolve(),),
+            primary_selectors=(),
+            selected_primary=input_file.resolve(),
             fiscal_year=2024,
             fiscal_period="FY",
             amended=False,
@@ -1814,6 +1892,57 @@ def test_upload_filing_existing_update_projects_typed_request_to_service(
         )
     ]
     assert service.stream_calls == [FinsOperationKind.UPLOAD_FILING]
+
+
+def test_upload_filing_non_first_primary_is_preserved_into_validated_service_request(
+    tmp_path: Path,
+    fake_service: _FakeFinsDirectService,
+) -> None:
+    """CLI 必须保留非首位 primary，并由 Fins owner 产生 authoritative selection。
+
+    Args:
+        tmp_path: 用于创建两个 filing 输入文件。
+        fake_service: 记录 validated request 的 direct Service 替身。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: raw selector 或 validated primary 被改成首文件时抛出。
+    """
+
+    companion = tmp_path / "schema.xsd"
+    primary = tmp_path / "report.pdf"
+    companion.write_text("schema", encoding="utf-8")
+    primary.write_text("filing", encoding="utf-8")
+
+    exit_code = cli_main.main(
+        (
+            "upload_filing",
+            "--ticker",
+            "AAPL",
+            "--action",
+            "create",
+            "--files",
+            str(companion),
+            str(primary),
+            "--primary",
+            str(primary),
+            "--fiscal-year",
+            "2024",
+            "--fiscal-period",
+            "FY",
+            "--company-name",
+            "Apple Inc.",
+        )
+    )
+
+    assert exit_code == EXIT_SUCCESS
+    assert len(fake_service.upload_filing_requests) == 1
+    call = fake_service.upload_filing_requests[0]
+    assert call.files == (companion.resolve(), primary.resolve())
+    assert call.primary_selectors == (primary.resolve(),)
+    assert call.selected_primary == primary.resolve()
 
 
 def test_upload_filing_prevalidation_io_failure_is_typed_bounded_and_path_free(
@@ -2337,6 +2466,8 @@ def test_upload_commands_map_args_and_validate_files(
             ticker="AAPL",
             action="create",
             files=(filing_file.resolve(),),
+            primary_selectors=(),
+            selected_primary=filing_file.resolve(),
             fiscal_year=2024,
             fiscal_period="FY",
             amended=True,
@@ -2887,6 +3018,7 @@ def test_upload_terminal_summary_renderer_uses_typed_requested_and_stored_counts
         ticker="AAPL",
         action="delete" if summary.status == "deleted" else "create",
         files=input_files,
+        primary_selectors=(input_files[0],) if len(input_files) > 1 else (),
         fiscal_year=2024,
         fiscal_period="FY",
         company_name=None if summary.status == "deleted" else "Apple Inc.",
@@ -3479,6 +3611,8 @@ class _UploadFilingCall:
     ticker: str
     action: str
     files: tuple[Path, ...]
+    primary_selectors: tuple[Path, ...]
+    selected_primary: Path | None
     fiscal_year: int | None
     fiscal_period: str | None
     amended: bool

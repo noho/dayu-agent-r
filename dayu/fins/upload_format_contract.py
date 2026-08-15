@@ -541,16 +541,49 @@ class FinsUploadFormatTextProjection:
 
     Args:
         filing_files: filing ``--files`` 的自足说明。
+        filing_primary: filing ``--primary`` 的自足说明。
         material_files: material ``--files`` 的自足说明。
         upload_tool_files: 同时覆盖 filing 与 material 的工具字段说明。
+        upload_tool_primary: 工具 ``primary`` 字段的自足说明。
+        upload_tool_material_primary_failure: material 携带 ``primary`` 时的工具失败说明。
 
     Raises:
         无。
     """
 
     filing_files: str
+    filing_primary: str
     material_files: str
     upload_tool_files: str
+    upload_tool_primary: str
+    upload_tool_material_primary_failure: str
+
+
+def _project_filing_primary_rules(
+    *,
+    files_label: str,
+    primary_label: str,
+) -> str:
+    """按入口字段名投影同一组 filing 主文件选择规则。
+
+    Args:
+        files_label: 当前入口的文件集合字段名。
+        primary_label: 当前入口的主文件 selector 字段名。
+
+    Returns:
+        包含单文件、多文件、membership、顺序与 delete 规则的自足文本。
+
+    Raises:
+        无。
+    """
+
+    return (
+        f"单文件 filing 可省略 {primary_label}，省略时唯一文件就是主文件；"
+        f"多文件 filing 必须恰好指定一个 {primary_label}；"
+        f"{primary_label} 必须精确匹配 {files_label} 中的一个路径；"
+        f"{files_label} 的顺序不决定主文件角色；"
+        f"delete 必须省略 {files_label} 和 {primary_label}。"
+    )
 
 
 def project_fins_upload_format_text(
@@ -570,11 +603,22 @@ def project_fins_upload_format_text(
 
     suffixes = ", ".join(capability.primary_suffixes)
     companion_only_suffixes = ", ".join(sorted(capability.companion_only_suffixes))
+    filing_primary = _project_filing_primary_rules(
+        files_label="--files",
+        primary_label="--primary",
+    )
+    upload_tool_primary_rules = _project_filing_primary_rules(
+        files_label="files",
+        primary_label="primary",
+    )
+    upload_tool_material_primary_failure = (
+        "upload_kind=material 不得提供 primary；请省略 primary 字段"
+    )
     filing_files = (
-        "auto/create/update 必须至少提供一个文件，并按给定顺序上传：首文件是主文件，必须实际转换成功；"
-        "后续文件是仅原样保存、不转换的随附文件。"
+        "auto/create/update 必须至少提供一个文件。已选主文件必须实际转换成功；"
+        "其余文件是仅原样保存、不转换的随附文件。"
         f"主文件支持后缀：{suffixes}；随附文件支持这些后缀以及 {companion_only_suffixes}，"
-        f"且 {companion_only_suffixes} 只能作为后续随附文件。"
+        f"且 {companion_only_suffixes} 只能作为随附文件。"
         ".xml 仅是 XBRL XML 候选，不代表任意 XML；主文件后缀通过只表示具备转换资格，不保证文件内容转换成功。"
         "随附文件只校验可随批保存的后缀，不执行转换。"
         ".json 仅是 Docling JSON 候选，不代表任意 JSON 内容可转换。delete 不得提供文件。"
@@ -586,12 +630,19 @@ def project_fins_upload_format_text(
     )
     return FinsUploadFormatTextProjection(
         filing_files=filing_files,
+        filing_primary=filing_primary,
         material_files=material_files,
         upload_tool_files=(
             f"upload_kind=filing 时，{filing_files}"
             f"upload_kind=material 时，{material_files}"
             "每个路径必须指向已存在、非空的普通文件。"
         ),
+        upload_tool_primary=(
+            f"仅用于 upload_kind=filing：{upload_tool_primary_rules}"
+            f"{upload_tool_material_primary_failure}。"
+            "primary 是用户选择的业务角色，不能根据质量、重要性或转换是否成功推断。"
+        ),
+        upload_tool_material_primary_failure=upload_tool_material_primary_failure,
     )
 
 

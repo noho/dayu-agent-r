@@ -182,6 +182,7 @@ class ParsedCliArgs(argparse.Namespace):
     rebuild: bool
     action: str
     files: list[str] | None
+    primary: list[str] | None
     fiscal_year: int | None
     fiscal_period: str | None
     amended: bool
@@ -353,6 +354,7 @@ def _new_default_namespace() -> ParsedCliArgs:
     namespace.rebuild = False
     namespace.action = "auto"
     namespace.files = None
+    namespace.primary = None
     namespace.fiscal_year = None
     namespace.fiscal_period = None
     namespace.amended = False
@@ -922,6 +924,12 @@ def _register_upload_filing_command(
         "--files",
         nargs="+",
         help=FINS_UPLOAD_FORMAT_TEXT.filing_files,
+    )
+    parser.add_argument(
+        "--primary",
+        action="append",
+        metavar="PATH",
+        help=FINS_UPLOAD_FORMAT_TEXT.filing_primary,
     )
     _add_filing_metadata_arguments(parser)
     parser.add_argument("--overwrite", action="store_true", help="允许覆盖已有文档。")

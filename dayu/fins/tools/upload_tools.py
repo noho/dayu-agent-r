@@ -55,6 +55,9 @@ _UPLOAD_KIND_MATERIAL: Final[str] = "material"
 _UPLOAD_ACTION_DELETE: Final[str] = "delete"
 _UPLOAD_ACTIONS: Final[frozenset[str]] = frozenset({"auto", "create", "update", "delete"})
 _UPLOAD_KINDS: Final[frozenset[str]] = frozenset({_UPLOAD_KIND_FILING, _UPLOAD_KIND_MATERIAL})
+_INVALID_ARGUMENT_HINT: Final[str] = (
+    "请检查 ticker、upload_kind、action、files、primary、会计期间和材料字段后重试。"
+)
 _CANCELLED_MESSAGE: Final[str] = "财报上传任务启动已停止。"
 _CANCELLED_HINT: Final[str] = "当前工具调用已停止；如仍需要该结果，请等待用户确认后再重新发起。"
 
@@ -117,7 +120,7 @@ class FinsUploadToolCallable:
                 started_at=started_at,
                 error=_ERROR_INVALID_ARGUMENT,
                 message=str(exc),
-                hint="请检查 ticker、upload_kind、action、文件路径、会计期间和材料字段。",
+                hint=_INVALID_ARGUMENT_HINT,
             )
         except OSError:
             return _failed_outcome(
@@ -237,6 +240,11 @@ def _upload_parameters_schema() -> ToolParametersSchema:
             "type": "array",
             "description": FINS_UPLOAD_FORMAT_TEXT.upload_tool_files,
             "items": string_items_schema,
+            "maxItems": 100,
+        },
+        "primary": {
+            "type": "string",
+            "description": FINS_UPLOAD_FORMAT_TEXT.upload_tool_primary,
         },
         "fiscal_year": {
             "type": "integer",
@@ -317,12 +325,17 @@ def _upload_request_from_arguments(arguments: Mapping[str, JsonValue]) -> FinsUp
 
     upload_kind = _required_upload_kind(arguments)
     action = _required_upload_action(arguments)
+    primary_selectors = _upload_primary_selectors_from_arguments(
+        arguments,
+        upload_kind=upload_kind,
+    )
     files = _upload_files_from_arguments(arguments, action=action)
     if upload_kind == _UPLOAD_KIND_FILING:
         return FinsUploadFilingRequest(
             ticker=_required_text(arguments, "ticker"),
             action=action,
             files=files,
+            primary_selectors=primary_selectors,
             fiscal_year=_required_int(arguments, "fiscal_year"),
             fiscal_period=_required_text(arguments, "fiscal_period"),
             amended=_optional_bool(arguments, "amended", default=False),
@@ -349,6 +362,32 @@ def _upload_request_from_arguments(arguments: Mapping[str, JsonValue]) -> FinsUp
         ticker_aliases=_optional_text_tuple(arguments, "ticker_aliases"),
         overwrite=_optional_bool(arguments, "overwrite", default=False),
     )
+
+
+def _upload_primary_selectors_from_arguments(
+    arguments: Mapping[str, JsonValue],
+    *,
+    upload_kind: UploadKind,
+) -> tuple[Path, ...]:
+    """把工具的可选单值 primary 机械投影为 raw selector tuple。
+
+    Args:
+        arguments: 工具参数。
+        upload_kind: 已由请求 union 边界识别的上传类别。
+
+    Returns:
+        filing 未提供 primary 时返回空 tuple，提供时返回单元素规范路径 tuple。
+
+    Raises:
+        ValueError: primary 不是非空字符串，或 material 请求携带 primary 时抛出。
+    """
+
+    raw_primary = _optional_nullable_text(arguments, "primary")
+    if raw_primary is None:
+        return ()
+    if upload_kind == _UPLOAD_KIND_MATERIAL:
+        raise ValueError(FINS_UPLOAD_FORMAT_TEXT.upload_tool_material_primary_failure)
+    return (Path(raw_primary).expanduser().resolve(strict=False),)
 
 
 def _optional_raw_nullable_text(

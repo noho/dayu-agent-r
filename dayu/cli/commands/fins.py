@@ -680,6 +680,10 @@ def _prevalidate_upload_filing_request(
         ticker=raw_ticker,
         action=args.action,
         files=tuple(Path(raw_file).expanduser().resolve(strict=False) for raw_file in (args.files or ())),
+        primary_selectors=tuple(
+            Path(raw_selector).expanduser().resolve(strict=False)
+            for raw_selector in (args.primary or ())
+        ),
         fiscal_year=args.fiscal_year,
         fiscal_period=_optional_stripped_text(args.fiscal_period),
         amended=args.amended,
