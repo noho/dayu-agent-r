@@ -949,7 +949,11 @@ def _register_upload_material_command(
     _add_upload_action_argument(parser, choices=FILING_ACTION_CHOICES)
     parser.add_argument("--forms", nargs="+", help="关联的报表类型。")
     parser.add_argument("--material-name", help="材料名称。")
-    parser.add_argument("--files", nargs="+", help="待上传文件路径。")
+    parser.add_argument(
+        "--files",
+        nargs="+",
+        help=FINS_UPLOAD_FORMAT_TEXT.material_files,
+    )
     parser.add_argument("--document-id", help="已有文档标识。")
     parser.add_argument("--internal-document-id", help="内部文档标识。")
     _add_filing_metadata_arguments(parser)

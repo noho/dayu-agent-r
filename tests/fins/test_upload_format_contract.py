@@ -13,9 +13,11 @@ from dayu.fins.upload_format_contract import (
     FINS_UPLOAD_FORMAT_TEXT,
     FinsUploadFileRole,
     FinsUploadFilingFiles,
+    FinsUploadFormatCapability,
     FinsUploadFormatError,
     FinsUploadFormatFailureKind,
     FinsUploadMaterialFiles,
+    project_fins_upload_format_text,
 )
 
 _PRIMARY_SUFFIXES: tuple[str, ...] = (
@@ -278,6 +280,7 @@ def test_text_projection_is_self_contained_and_uses_exact_suffix_order() -> None
 
     suffix_text = ", ".join(_PRIMARY_SUFFIXES)
     filing_text = FINS_UPLOAD_FORMAT_TEXT.filing_files
+    material_text = FINS_UPLOAD_FORMAT_TEXT.material_files
     tool_text = FINS_UPLOAD_FORMAT_TEXT.upload_tool_files
 
     expected_filing_text = (
@@ -288,14 +291,19 @@ def test_text_projection_is_self_contained_and_uses_exact_suffix_order() -> None
         "随附文件只校验可随批保存的后缀，不执行转换。"
         ".json 仅是 Docling JSON 候选，不代表任意 JSON 内容可转换。delete 不得提供文件。"
     )
+    expected_material_text = (
+        "auto/create/update 必须至少提供一个文件；"
+        f"每个文件都必须使用转换器支持的后缀：{suffix_text}，并逐个实际转换成功；"
+        "后缀通过只表示具备转换资格，不保证文件内容转换成功。delete 不得提供文件。"
+    )
     expected_tool_text = (
         f"upload_kind=filing 时，{expected_filing_text}"
-        "upload_kind=material 时，auto/create/update 必须至少提供一个文件；"
-        "每个文件都必须使用上述主文件支持后缀并逐个实际转换；delete 不得提供文件。"
+        f"upload_kind=material 时，{expected_material_text}"
         "每个路径必须指向已存在、非空的普通文件。"
     )
 
     assert filing_text == expected_filing_text
+    assert material_text == expected_material_text
     assert tool_text == expected_tool_text
     for required_text in (
         "auto/create/update 必须至少提供一个文件",
@@ -318,7 +326,31 @@ def test_text_projection_is_self_contained_and_uses_exact_suffix_order() -> None
     assert "upload_kind=material" in tool_text
     assert "upload_kind=material 时，auto/create/update 必须至少提供一个文件" in tool_text
     assert "每个文件" in tool_text
-    assert "逐个实际转换" in tool_text
+    assert "逐个实际转换成功" in tool_text
+
+
+def test_text_projection_mechanically_consumes_companion_only_suffixes() -> None:
+    """随附文件文案必须随 capability 输入变化，不能保留 XSD 字面量真源。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 文案没有机械投影 companion-only 集合时抛出。
+    """
+
+    capability = FinsUploadFormatCapability(
+        converter_capability=FINS_UPLOAD_FORMAT_CAPABILITY.converter_capability,
+        companion_only_suffixes=frozenset({".schema"}),
+    )
+
+    projection = project_fins_upload_format_text(capability)
+
+    assert ".schema" in projection.filing_files
+    assert ".xsd" not in projection.filing_files
 
 
 def test_contract_and_cli_projection_import_without_loading_docling() -> None:

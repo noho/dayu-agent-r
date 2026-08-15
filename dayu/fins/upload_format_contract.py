@@ -534,6 +534,7 @@ class FinsUploadFormatTextProjection:
 
     Args:
         filing_files: filing ``--files`` 的自足说明。
+        material_files: material ``--files`` 的自足说明。
         upload_tool_files: 同时覆盖 filing 与 material 的工具字段说明。
 
     Raises:
@@ -541,43 +542,55 @@ class FinsUploadFormatTextProjection:
     """
 
     filing_files: str
+    material_files: str
     upload_tool_files: str
 
 
-def project_fins_upload_format_text() -> FinsUploadFormatTextProjection:
+def project_fins_upload_format_text(
+    capability: FinsUploadFormatCapability,
+) -> FinsUploadFormatTextProjection:
     """从 Fins 格式 capability 产生稳定、自足的用户与 LLM 文案。
 
     Args:
-        无。
+        capability: 负责上传格式与文件角色语义的 Fins capability。
 
     Returns:
-        CLI filing help 与 upload tool schema 共用的不可变文本投影。
+        CLI filing/material help 与 upload tool schema 共用的不可变文本投影。
 
     Raises:
         无。
     """
 
-    suffixes = ", ".join(FINS_UPLOAD_FORMAT_CAPABILITY.primary_suffixes)
+    suffixes = ", ".join(capability.primary_suffixes)
+    companion_only_suffixes = ", ".join(sorted(capability.companion_only_suffixes))
     filing_files = (
         "auto/create/update 必须至少提供一个文件，并按给定顺序上传：首文件是主文件，必须实际转换成功；"
         "后续文件是仅原样保存、不转换的随附文件。"
-        f"主文件支持后缀：{suffixes}；随附文件支持这些后缀以及 .xsd，且 .xsd 只能作为后续随附文件。"
+        f"主文件支持后缀：{suffixes}；随附文件支持这些后缀以及 {companion_only_suffixes}，"
+        f"且 {companion_only_suffixes} 只能作为后续随附文件。"
         ".xml 仅是 XBRL XML 候选，不代表任意 XML；主文件后缀通过只表示具备转换资格，不保证文件内容转换成功。"
         "随附文件只校验可随批保存的后缀，不执行转换。"
         ".json 仅是 Docling JSON 候选，不代表任意 JSON 内容可转换。delete 不得提供文件。"
     )
+    material_files = (
+        "auto/create/update 必须至少提供一个文件；"
+        f"每个文件都必须使用转换器支持的后缀：{suffixes}，并逐个实际转换成功；"
+        "后缀通过只表示具备转换资格，不保证文件内容转换成功。delete 不得提供文件。"
+    )
     return FinsUploadFormatTextProjection(
         filing_files=filing_files,
+        material_files=material_files,
         upload_tool_files=(
             f"upload_kind=filing 时，{filing_files}"
-            "upload_kind=material 时，auto/create/update 必须至少提供一个文件；"
-            "每个文件都必须使用上述主文件支持后缀并逐个实际转换；delete 不得提供文件。"
+            f"upload_kind=material 时，{material_files}"
             "每个路径必须指向已存在、非空的普通文件。"
         ),
     )
 
 
-FINS_UPLOAD_FORMAT_TEXT: Final[FinsUploadFormatTextProjection] = project_fins_upload_format_text()
+FINS_UPLOAD_FORMAT_TEXT: Final[FinsUploadFormatTextProjection] = project_fins_upload_format_text(
+    FINS_UPLOAD_FORMAT_CAPABILITY
+)
 
 
 __all__: tuple[str, ...] = (

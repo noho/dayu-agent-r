@@ -415,6 +415,42 @@ def test_upload_filing_files_help_consumes_self_contained_format_projection(
         assert "".join(expected_fragment.split()) in help_text
 
 
+def test_upload_material_files_help_consumes_self_contained_format_projection(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """upload_material ``--files`` help 必须直接消费 Fins owner 文本投影。
+
+    Args:
+        capsys: pytest 标准输出捕获夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: help source、转换要求或文件空状态文案漂移时抛出。
+    """
+
+    parser = build_parser()
+    material_parser = next(
+        child for child in _collect_parser_tree(parser) if child.prog.endswith(" upload_material")
+    )
+    files_action = next(
+        action for action in material_parser._actions if "--files" in action.option_strings
+    )
+    assert files_action.help == FINS_UPLOAD_FORMAT_TEXT.material_files
+
+    help_text = "".join(_capture_help(capsys, ("upload_material",)).split())
+    for expected_fragment in (
+        "auto/create/update 必须至少提供一个文件",
+        "每个文件都必须使用转换器支持的后缀",
+        "逐个实际转换成功",
+        "后缀通过只表示具备转换资格",
+        "不保证文件内容转换成功",
+        "delete 不得提供文件",
+    ):
+        assert "".join(expected_fragment.split()) in help_text
+
+
 @pytest.mark.parametrize(
     "command_path",
     (
