@@ -562,7 +562,8 @@ def project_fins_upload_format_text() -> FinsUploadFormatTextProjection:
         "auto/create/update 必须至少提供一个文件，并按给定顺序上传：首文件是主文件，必须实际转换成功；"
         "后续文件是仅原样保存、不转换的随附文件。"
         f"主文件支持后缀：{suffixes}；随附文件支持这些后缀以及 .xsd，且 .xsd 只能作为后续随附文件。"
-        ".xml 仅是 XBRL XML 候选，不代表任意 XML；后缀通过只表示具备转换资格，不保证文件内容转换成功。"
+        ".xml 仅是 XBRL XML 候选，不代表任意 XML；主文件后缀通过只表示具备转换资格，不保证文件内容转换成功。"
+        "随附文件只校验可随批保存的后缀，不执行转换。"
         ".json 仅是 Docling JSON 候选，不代表任意 JSON 内容可转换。delete 不得提供文件。"
     )
     return FinsUploadFormatTextProjection(

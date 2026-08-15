@@ -132,6 +132,32 @@ pytest -q tests/cli/test_fins_commands.py \
 
 该集合覆盖 unknown exception 的 operator traceback 与提示使用 `--log-file PATH` 重试的固定 stderr 分离、typed failure 在 renderer 上限内同时展示 canonical 文件名与有界原因、真实 `FinsUploadResultSummary` 经 typed RESULT details 和既有 CLI renderer 展示 success/delete/skip/failure 的 requested/stored 且不出现旧 `uploaded_files`，以及 production upload direct stream 成功读回 original/Docling 资产后仍不创建 Host SQLite/artifact、runtime SQLite 或 legacy ingestion job record。
 
+运行 upload converter capability / Fins role owner 与 typed workflow 的 focused 回归：
+
+```bash
+pytest tests/documents/test_docling_runtime.py \
+  tests/fins/test_upload_format_contract.py \
+  tests/fins/test_fins_ingestion_runtime.py \
+  tests/fins/test_upload_batch.py \
+  tests/cli/test_arg_parsing.py \
+  tests/cli/test_fins_commands.py \
+  tests/fins/test_fins_ingestion_tools.py \
+  tests/fins/test_docling_upload_service.py \
+  tests/fins/test_docling_upload_service_integration.py \
+  tests/fins/test_sec_pipeline_upload_filing_stream.py \
+  tests/fins/test_sec_pipeline_upload_material_stream.py \
+  tests/fins/test_cn_pipeline.py \
+  tests/fins/test_upload_failure.py \
+  tests/fins/test_docling_process_converter.py -q
+```
+
+该集合在 owner boundary 断言：Documents 产品 capability 与实际 converter allowed formats 同源；
+Fins 把 filing 首项建模为 primary、后续项建模为 raw companions，并保持 material 全转换；CLI
+help、LLM-facing tool schema 与 batch admission 复用同一投影；filing 只转换 primary，全部
+originals 原子发布，任一读取、转换、取消或存储失败不产生部分 publication；
+requested/stored 只计算 original 输入。这是 deterministic owner-level 回归，不替代真实全格式
+fixture 矩阵或全量 CLI scenario evidence。
+
 运行 Tool Trace Analyzer、Service publication 与 CLI focused 回归：
 
 ```bash
@@ -345,6 +371,7 @@ Service composition 测试，覆盖 `dayu.service` 在 Host 外部把 runtime ty
 共享文档基础测试，覆盖 `dayu.documents` 的层中立边界与轻量处理器 fixture：
 
 - import boundary：阻止 `dayu.documents` 反向依赖 Engine、Host、Service、UI、Fins 或具体工具实现，并确认 Docling runtime、processors 子包与完整 source snapshot helper 被边界扫描覆盖。
+- Docling converter capability：精确锁定受控格式标识、有序产品扩展名投影、构造期第三方元数据子集校验、converter `allowed_formats` 同源、第三方新增扩展名不自动扩面，以及格式或已承诺扩展名缺失时 fail closed。
 - processors：使用确定性 fixture 覆盖 Markdown、HTML 与 Docling JSON 处理器的章节提取、表格读取与搜索片段输出；完整 source snapshot 测试覆盖声明长度不参与拒绝、实际来源复制到 EOF、独立 cursor、processor snapshot 接入、正常/异常/取消/resource failure cleanup、系统临时物化文件清理、单 snapshot 单物化路径复用和关闭状态约束。
 
 ### `tests/tools/`
@@ -381,6 +408,14 @@ SEC pipeline 测试还覆盖取消检查器贯穿 submissions history、Browse E
 UF-FIX01 owner coverage 进一步固定：全部 frozen filing usage argv 在 CLI factory 前由同一 typed validator 精确 exit `2`、factory/service 零调用且 fresh workspace tree 不变；prevalidation storage I/O 与 descriptor corruption 以 path-free typed reason exit `1`。Service、runtime runner 与 SEC/CN/HK facade 原样传递 validated request；workflow fresh recheck 核对 identity并丢弃旧 action/company decision，只把 authoritative source meta 交给 `prepare_upload`、把 authoritative company decision 交给同一 batch stage。SEC/CN 真实 FS tests 逐项断言 company/source 使用同一 `BatchToken`、begin/commit/rollback 次数、fresh/existing published tree 与逐文件 SHA，以及 company/source stage failure 与 rollback failure 的 primary/recovery evidence；cancelled、Docling、storage 与 generic failure 有可观察的 typed 分类顺序和 operator cause，material 继续保持原有状态 owner与用户可见 failure 语义。shared interruptible converter 与 cancellation token 保持 identity；closed typed failure 在 pipeline result、runtime summary、direct RESULT 与 durable failure summary 同源，并拒绝未知、pathful、control 或过长字段。测试在自有临时目录构造不可解析 `corrupt.pdf`，再经真实 subprocess / `dayu-cli` / converter 固定 exit `1`、bounded typed reason、stderr 无 traceback/repo/input 绝对路径且 fresh workspace 零 mutation，不依赖仓库外 calibration 路径。
 
 UF-FIX02 S2 owner/workflow coverage 固定 shared Docling publication contract：同名 changed update、改名且未 overwrite 的 update、existing create-overwrite 都以 exact reset、blob-first、final create 发布完整新文件集合，并保持 reset 前 version / `first_ingested_at` 真源；filing 的 deleted equal/changed input 与 material 的最小 deleted-equal parity 均恢复为 active、完整 source。reset 后任一 blob/final create 失败，以及 final checkpoint/precommit 取消，都断言整棵 published ticker tree SHA 不变。SEC tests 覆盖 renamed update、fresh create-existing conversion/batch 零调用、delete 后 equal/changed auto 恢复及非目标 filing/company 不变；CN/HK shared facade tests 覆盖 fresh update-missing 在 overwrite 两种取值下 conversion/batch 零调用，以及 changed update 的完整替换。
+
+Upload format owner coverage 进一步锁定 Documents converter capability 到 Fins role overlay 的单向依赖：
+primary/companion/material selection 的角色、顺序与 delete 空状态均由 typed contract 产生；`.xsd`
+只能作为 filing companion；legacy 与未选择格式不进入 primary 或 material conversion；static
+admission、batch scanner、CLI help、upload tool schema、SEC/CN workflow 与 `DoclingUploadService` 消费同一
+owner projection。Service regressions 分别覆盖 filing 单次 primary conversion + 全 originals 原子保存、
+material 全转换、selection/source kind 不匹配、action/空状态不匹配、companion 读取失败、
+primary 转换失败、取消与 storage rollback 的零部分发布边界。
 
 Fins fixture 由测试通过仓储 public API 写入临时 workspace，不依赖隐式 cwd、环境变量或手工拼生产路径。
 

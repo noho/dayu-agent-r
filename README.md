@@ -314,6 +314,13 @@ dayu-cli upload_filing --help
 dayu-cli upload_material --help
 ```
 
+`upload_filing --files` 按给定顺序解释文件：首项是 primary，必须由实际转换器成功
+转换；后续项是 companions，只保留原始文件，不执行 Docling 转换。XBRL companion
+可以作为后续文件随同一批上传并原样保存。`.xml` 只是 XBRL XML candidate，`.json`
+只是 Docling JSON candidate；主文件后缀通过只表示具备转换资格，不保证其内容一定转换成功；
+随附文件（含 `.xsd`）只按可随批保存的后缀准入，不做转换。当前支持的格式清单以
+`dayu-cli upload_filing --help` 的即时输出为准；不要将 legacy DOC/PPT/XLS 或 ZIP 视为已支持格式。
+
 `upload_filing` 与 `upload_material` 都会在上传任务启动前校验 `--ticker` 的逗号分隔值：首项必须是公司的规范主代码，后续项是用户声明、用于查询同一家公司归档的别名；每一项都必须符合支持市场的 ticker 写法，后续别名最多 100 个。ticker 写法非法或别名超过数量限制时，命令会作为用法错误输出一行具体原因并退出 `2`，不会创建上传任务或发布文件。
 
 `upload_filing` 还会在任务启动前校验文件与当前目标状态。文件解析、存储或执行失败会输出脱敏的可操作原因并退出 `1`；filing 的公司信息与文档内容只会一起发布，失败时不会留下只发布一半的结果。上传成功后，使用主代码或任一已接收别名查询都会进入同一家公司归档；不要填写公司名称，也不要重复列出只是写法不同但含义相同的代码。若某个别名已属于工作区中的另一家公司，本次上传会在发布任何文件前拒绝，并提示移除冲突别名后重试。
@@ -325,7 +332,7 @@ dayu-cli upload_material --help
 承诺只适用于这两个直接 filing 入口，不覆盖 `upload_filings_from` 的扫描与脚本生成元数据
 处理。
 
-上传终态摘要中的 `requested files` 是本次已校验的输入文件数，`stored files` 是本次成功发布的原始文件数；Docling 派生文件不重复计数。空文件、损坏文件或一组文件中任一文件无法解析时，整批上传失败且 `stored files` 为 `0`，不会把先处理成功的文件计为已保存；stderr 会同时显示触发失败的文件名和有界原因。若 direct 命令遇到无法归入这些已知原因的内部异常，普通 stderr 只显示 `命令执行失败，请使用 --log-file PATH 重试并查看日志`；按提示为 `PATH` 选择可写文件并重新执行命令，即可在该文件中保留完整诊断。
+上传终态摘要中的 `requested files` 是本次已校验的输入文件数，`stored files` 是本次成功发布的原始文件数；Docling 派生文件不重复计数。空文件、任一原始文件读取失败，或 filing primary / material 任一需要转换的文件内容无法成功转换时，整批上传失败且 `stored files` 为 `0`，不会把先处理成功的文件计为已保存；filing 失败时也不会回退为只保存原文件或 companions。stderr 会同时显示触发失败的文件名和有界原因。若 direct 命令遇到无法归入这些已知原因的内部异常，普通 stderr 只显示 `命令执行失败，请使用 --log-file PATH 重试并查看日志`；按提示为 `PATH` 选择可写文件并重新执行命令，即可在该文件中保留完整诊断。
 
 三个上传命令的 `--action` 默认都是 `auto`。单份上传还可显式使用
 `create`、`update` 或 `delete`；批量脚本只会生成 `auto`、`create` 或 `update`。

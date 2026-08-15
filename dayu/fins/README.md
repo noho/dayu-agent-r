@@ -64,6 +64,7 @@ Fins 与其它层的稳定边界如下：
 - `dayu.contracts` 是 Dayu Agent 公共契约包，承载 UI / Service / Host / Engine / ToolRuntime / tools 可共同使用的层中立数据与协议，例如 JSON 值、取消 token、工具声明、工具 schema、工具调用请求、工具执行 outcome、工具等待 outcome 和 `ToolExecutor`；它不承载 Host / Engine 状态机，也不承载财报业务事实。
 - `dayu.runtime` 是层中立运行期基础设施包，提供工具发现 provider contract、取消等待、日志级别、诊断文本脱敏、截断、filelock、lane 等可复用 helper；它不得依赖 `dayu.engine` / `dayu.host` / `dayu.service` / `dayu.ui` / `dayu.fins`，也不承载任何层的状态机或业务语义。
 - `dayu.documents` 提供文档处理器公共协议、ProcessorRegistry 和通用 Docling / Markdown / BeautifulSoup 处理器；Fins 在其上注册财报业务增强处理器和 SEC 表单专项处理器。
+- `dayu.documents.docling_runtime` 的 immutable converter capability 是产品选定 Docling 格式、有序扩展名投影与实际 converter `allowed_formats` 的唯一 owner；构造 converter 时才延迟校验已安装 Docling 的格式元数据，第三方新增扩展名不会自动扩大产品承诺。
 - 工具声明契约属于 `dayu.contracts`；具体 Fins read / download / preprocess / upload 工具实现属于 `dayu.fins.tools`，工具发现装配属于 runtime discovery / Service assembly，工具运行时治理属于 Host / ToolRuntime。
 
 ## 接口
@@ -198,8 +199,10 @@ parser，并把 typed mode 保存到独立私有 metadata，而不是改写 raw 
 `dayu.fins.upload_batch` 是本地批量上传领域事实的唯一 owner。它接收不可变的
 `UploadBatchPlanRequest`，在 lexical / resolved containment 与内部 symlink fail-closed 边界内扫描调用方显式传入的
 源目录，并返回由 `UploadBatchFilingEntry`、`UploadBatchMaterialEntry` 和 `UploadBatchSkippedEntry` 组成的
-`UploadBatchPlan`。公开常量 `FINS_UPLOAD_FILE_SUFFIXES` 是 upload 输入后缀真源；默认只扫描直属文件，显式
-recursive 或直接存在 `20YY` / `20YYQn` / `20YYH1` 结构目录时才递归。
+`UploadBatchPlan`。候选文件能否作为 standalone filing 由 `dayu.fins.upload_format_contract`
+投影的 primary capability 决定，batch scanner 不维护独立扩展名集合。默认只扫描直属文件，显式
+recursive 或直接存在 `20YY` / `20YYQn` / `20YYH1` 结构目录时才递归。companion-only 文件不作为 standalone
+candidate，batch 也不从目录位置猜测 primary/companion 关联。
 
 Fins 根据文件名与直接结构父目录产生财年、财期、material routing/name、同期优先级、去重、数量限制和业务可读
 skip reason。年度 filing 最多保留 5 份；周期 filing 只保留最新财年并最多 6 份；presentation 最多 6 份；
@@ -372,6 +375,7 @@ Fins 公共契约分为 Fins 专属契约、Dayu Agent 公共契约和文档处�
 
 - `dayu.fins.domain`：财报领域模型、枚举与共享业务值 parser，包括 `Market`、`SourceKind`、公司元数据、源文档、processed 文档、文件对象、批处理 token、rejected filing artifact、SEC form parser / alias expansion、财期、文档质量与财务数据质量等数据对象和封闭值。
 - `dayu.fins.ticker_normalization`：ticker 标准化结果与 market / exchange 推导。
+- `dayu.fins.upload_format_contract`：在 Documents converter capability 之上叠加 Fins 文件角色，持有 filing primary/companion 与 material 的 immutable typed selection，并为 CLI help 和 LLM-facing upload tool schema 产生同源业务文案。filing 首项唯一建模为必须转换的 primary，后续项是只原样保存的 companions；material 每项都是 converter-required。
 - `dayu.fins.storage.repository_protocols`：公司、源文档、processed、blob、filing maintenance 与批处理事务仓储协议。
 - `FinsDownloadRequest` / `FinsPreprocessRequest` / `FinsUploadFilingRequest` / `FinsUploadMaterialRequest`：下载、预处理与上传请求。
 - `FinsSourceDownloadAdapter` / `FinsSourceDownloadAdapterRequest` / `FinsSourceDownloadAdapterResult`：下载来源 adapter 协议。
@@ -465,6 +469,7 @@ dayu.fins
 ├── ingestion_runtime.py      # download/preprocess/upload direct stream、observation 与 legacy job runtime
 ├── ingestion                 # awaiting resolution、legacy job helper 与 lightweight observation contract
 ├── service_runtime.py        # DefaultFinsRuntime shared assembly root
+├── upload_format_contract.py # converter capability 上的 filing/material 角色与 typed selection owner
 └── ticker_normalization.py   # ticker 标准化
 ```
 
@@ -560,11 +565,13 @@ production download overwrite 只替换本轮实际写入的目标文档。SEC �
 
 Download terminal 由同一个 typed `FinsResultSummary` 收口：成功、失败与取消具有固定 status/exit code，downloaded、skipped、rejected 与 failed 对同一候选集合互斥且守恒，并携带有界文档明细和缺失期间。每个 `FinsDownloadDocumentResult` 与 public document row 都必填 `covered_fiscal_periods`；CN/HK 原样投影 workflow coverage，SEC 与不适用来源显式投影空 tuple/JSON array。CLI、Service、awaiting observation 与 legacy job projection 只消费该 terminal truth，不从日志、文件树或 provider payload 重建结果。SEC transport 在首个 HTTP 请求前要求显式 User-Agent 或 `SEC_USER_AGENT`；缺失身份、provider failure、取消与完整性失败均按封闭类型进入 download terminal，不用隐式 provider fallback 伪造成功。
 
-当前 `DefaultFinsRuntime` 内置 production upload runner：US filing/material 上传走 SEC upload workflow，CN/HK filing/material 上传走 CN/HK upload facade，通用文件校验、Docling 转换、source document create/update/delete/skip/overwrite 与 blob 写入由 `DoclingUploadService` 通过仓储协议完成。production upload runner 把 pipeline JSON result 收敛为 Fins-local typed upload result，`status` 必须由 pipeline 显式提供，且只接受 exact lowercase `ok`、`skipped`、`deleted`、`failed`、`cancelled`；前三者映射 completed，后两者分别映射 failed 与 cancelled，大小写、空白变体和未知值都失败关闭。direct stream 与 legacy upload job 共用这一 typed terminal disposition 真源，不从 UI、日志或取消时间重建上传终态。直接调用 `FinsIngestionRuntime.create(...)` 且不装配 `FinsUploadRunner` 时，upload job 仍会进入明确的 failed 终态，不执行真实上传、文件读取或仓储写入。
+当前 `DefaultFinsRuntime` 内置 production upload runner：US filing/material 上传走 SEC upload workflow，CN/HK filing/material 上传走 CN/HK upload facade。两类 workflow 在任何文件读取、converter 调用或发布前产生与 source kind 一致的 typed selection；filing 直接消费 fresh validation 产生的 authoritative selection，material 用同一 Fins owner 将全部输入建模为 converter-required selection。通用文件校验、Docling 转换、source document create/update/delete/skip/overwrite 与 blob 写入由 `DoclingUploadService` 通过仓储协议完成。production upload runner 把 pipeline JSON result 收敛为 Fins-local typed upload result，`status` 必须由 pipeline 显式提供，且只接受 exact lowercase `ok`、`skipped`、`deleted`、`failed`、`cancelled`；前三者映射 completed，后两者分别映射 failed 与 cancelled，大小写、空白变体和未知值都失败关闭。direct stream 与 legacy upload job 共用这一 typed terminal disposition 真源，不从 UI、日志或取消时间重建上传终态。直接调用 `FinsIngestionRuntime.create(...)` 且不装配 `FinsUploadRunner` 时，upload job 仍会进入明确的 failed 终态，不执行真实上传、文件读取或仓储写入。
 
 上传结果中的 `requested_file_count` 来自已校验请求，`stored_file_count` 只统计成功 commit 的 original 文件；Docling 派生资产不增加 stored count。`skipped`、`deleted`、`failed` 与 `cancelled` 的 stored count 固定为 `0`，direct RESULT 与 legacy durable summary 都只消费同一个 `FinsUploadResultSummary`，不从目录、basename 或派生资产数量重算。
 
-filing original 会在 publication batch 开始前完成读取与顺序转换。空文件或 Docling closed conversion failure 由 upload failure owner 产生带 canonical public file label 的 typed content reason；typed terminal detail 投影先排列 requested/stored、closed kind/code、canonical file label 与 bounded message，再排列 retry hint、document 等辅助信息，使有界前缀消费者仍从同一个 reason/count 真源取得可行动失败事实。mixed input 在首个失败处 fail-fast，先转换成功的内存产物不形成 company/source/blob publication。第三方异常文本、异常链和本地绝对路径只保留在 operator 日志，不进入 direct event 或 durable summary；material 仍保留自己的既有 generic failure 与 company publication 语义。
+filing selection 的全部 originals 会在 publication batch 开始前按输入顺序读取，但 converter inputs 只包含首个 primary；后续 companions 不产生 `conversion_started` 事实，也不产生 Docling 派生资产。primary 的单次转换结果显式产生 `primary_document`，全部 raw originals 与该唯一派生资产在同一 storage batch 原子发布。material selection 则保持全部文件逐个转换。空文件或 Docling closed conversion failure 由 upload failure owner 产生带 canonical public file label 的 typed content reason；typed terminal detail 投影先排列 requested/stored、closed kind/code、canonical file label 与 bounded message，再排列 retry hint、document 等辅助信息，使有界前缀消费者仍从同一个 reason/count 真源取得可行动失败事实。mixed input 在首个失败处 fail-fast，先转换成功的内存产物不形成 company/source/blob publication。第三方异常文本、异常链和本地绝对路径只保留在 operator 日志，不进入 direct event 或 durable summary。
+
+material workflow 在 prepare 前以独立 company batch 提交 company meta；后续转换或存储失败不会回滚已提交的 company meta，但 source/blob 仍由后续单一 publication batch 保持零部分发布。filing 的 company meta 则与 source/blob 保持同一 publication batch 的原子边界。
 
 production upload 的 existing full-input update 与 create-overwrite 完整替换由 `DoclingUploadService` 在同一个 storage batch 内执行；filing/material 共用该 publication owner。SEC/CN/HK upload facade 只解析动作、写 company meta 并调用 upload service；它们不得在 Docling 转换、取消检查或新材料构建前删除旧 source document。
 
@@ -642,8 +649,11 @@ direct caller
   -> ticker_normalization.normalize_ticker(...)
   -> validate SourceKind filing/material discrimination
   -> direct stream producer delegates to FinsUploadRunner
-  -> SEC/CN upload workflow
-  -> DoclingUploadService writes through storage repositories
+  -> SEC/CN upload workflow fresh validation
+  -> Fins role overlay produces typed filing/material selection
+  -> DoclingUploadService reads all originals
+  -> filing: convert primary once; material: convert every file
+  -> publish originals and derived assets through one storage batch
   -> emit PROGRESS events and terminal RESULT
 ```
 

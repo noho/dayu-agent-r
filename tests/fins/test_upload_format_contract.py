@@ -280,7 +280,23 @@ def test_text_projection_is_self_contained_and_uses_exact_suffix_order() -> None
     filing_text = FINS_UPLOAD_FORMAT_TEXT.filing_files
     tool_text = FINS_UPLOAD_FORMAT_TEXT.upload_tool_files
 
-    assert f"主文件支持后缀：{suffix_text}" in filing_text
+    expected_filing_text = (
+        "auto/create/update 必须至少提供一个文件，并按给定顺序上传：首文件是主文件，必须实际转换成功；"
+        "后续文件是仅原样保存、不转换的随附文件。"
+        f"主文件支持后缀：{suffix_text}；随附文件支持这些后缀以及 .xsd，且 .xsd 只能作为后续随附文件。"
+        ".xml 仅是 XBRL XML 候选，不代表任意 XML；主文件后缀通过只表示具备转换资格，不保证文件内容转换成功。"
+        "随附文件只校验可随批保存的后缀，不执行转换。"
+        ".json 仅是 Docling JSON 候选，不代表任意 JSON 内容可转换。delete 不得提供文件。"
+    )
+    expected_tool_text = (
+        f"upload_kind=filing 时，{expected_filing_text}"
+        "upload_kind=material 时，auto/create/update 必须至少提供一个文件；"
+        "每个文件都必须使用上述主文件支持后缀并逐个实际转换；delete 不得提供文件。"
+        "每个路径必须指向已存在、非空的普通文件。"
+    )
+
+    assert filing_text == expected_filing_text
+    assert tool_text == expected_tool_text
     for required_text in (
         "auto/create/update 必须至少提供一个文件",
         "首文件是主文件",
@@ -292,7 +308,9 @@ def test_text_projection_is_self_contained_and_uses_exact_suffix_order() -> None
         "不代表任意 XML",
         ".json 仅是 Docling JSON 候选",
         "不代表任意 JSON 内容可转换",
+        "主文件后缀通过只表示具备转换资格",
         "不保证文件内容转换成功",
+        "随附文件只校验可随批保存的后缀，不执行转换",
         "delete 不得提供文件",
     ):
         assert required_text in filing_text

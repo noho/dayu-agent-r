@@ -388,7 +388,7 @@ def test_upload_filing_files_help_consumes_self_contained_format_projection(
         无。
 
     Raises:
-        AssertionError: help source、角色语义或 XML 限定文案漂移时抛出。
+        AssertionError: help source、角色准入或候选格式限定文案漂移时抛出。
     """
 
     parser = build_parser()
@@ -407,7 +407,9 @@ def test_upload_filing_files_help_consumes_self_contained_format_projection(
         "不代表任意 XML",
         ".json 仅是 Docling JSON 候选",
         "不代表任意 JSON 内容可转换",
+        "主文件后缀通过只表示具备转换资格",
         "不保证文件内容转换成功",
+        "随附文件只校验可随批保存的后缀，不执行转换",
         "delete 不得提供文件",
     ):
         assert "".join(expected_fragment.split()) in help_text
