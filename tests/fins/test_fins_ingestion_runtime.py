@@ -1162,6 +1162,12 @@ def test_fins_upload_usage_failure_mapping_is_closed_bounded_and_path_free() -> 
         "invalid_source_kind",
         "invalid_action",
         "too_many_files",
+        "files_not_allowed_for_delete",
+        "duplicate_file_path",
+        "multiple_primary_selectors",
+        "missing_multi_file_primary",
+        "primary_not_in_files",
+        "primary_not_allowed_for_delete",
         "missing_fiscal_year",
         "invalid_fiscal_year",
         "missing_fiscal_period",
@@ -1186,6 +1192,12 @@ def test_fins_upload_usage_failure_mapping_is_closed_bounded_and_path_free() -> 
         FinsUploadUsageCode.MISSING_FISCAL_YEAR: "--fiscal-year 不能为空",
         FinsUploadUsageCode.MISSING_FISCAL_PERIOD: "--fiscal-period 不能为空",
         FinsUploadUsageCode.MISSING_FILES: "create/update 上传必须提供 --files",
+        FinsUploadUsageCode.FILES_NOT_ALLOWED_FOR_DELETE: "delete 不得提供 --files",
+        FinsUploadUsageCode.DUPLICATE_FILE_PATH: "--files 不能包含解析后相同的重复路径",
+        FinsUploadUsageCode.MULTIPLE_PRIMARY_SELECTORS: "--primary 只能指定一次",
+        FinsUploadUsageCode.MISSING_MULTI_FILE_PRIMARY: "多文件 filing 必须使用 --primary 明确指定主文件",
+        FinsUploadUsageCode.PRIMARY_NOT_IN_FILES: "--primary 必须精确匹配 --files 中的一个文件",
+        FinsUploadUsageCode.PRIMARY_NOT_ALLOWED_FOR_DELETE: "delete 不得提供 --primary",
         FinsUploadUsageCode.INVALID_FILE_BASENAME: "上传文件名无效；请提供单个非空文件名",
         FinsUploadUsageCode.COMPANY_NAME_REQUIRED: "当前公司缺少有效元数据；create/update 必须提供 --company-name",
         FinsUploadUsageCode.INVALID_FISCAL_YEAR: "财年（fiscal_year）必须是 1000..9999 的整数",
@@ -1377,7 +1389,10 @@ def test_validate_fins_upload_filing_request_resolves_state_aware_contract(
     assert validated.resolved_action == "create"
     assert validated.published_state is absent
     assert validated.company_meta_decision.disposition == "stage"
-    assert validated.file_selection == FinsUploadFilingFiles.from_upsert_paths((upload_file,))
+    assert validated.file_selection == FinsUploadFilingFiles.for_upsert(
+        primary=upload_file.resolve(strict=False),
+        companions=(),
+    )
 
     present = FilingUploadPublishedState(
         company_meta=CompanyMeta(
@@ -1395,7 +1410,10 @@ def test_validate_fins_upload_filing_request_resolves_state_aware_contract(
     )
     assert updated.resolved_action == "update"
     assert updated.company_meta_decision.disposition == "keep"
-    assert updated.file_selection == FinsUploadFilingFiles.from_upsert_paths((upload_file,))
+    assert updated.file_selection == FinsUploadFilingFiles.for_upsert(
+        primary=upload_file.resolve(strict=False),
+        companions=(),
+    )
 
 
 def test_filing_validator_builds_role_selection_and_typed_delete_empty(
@@ -1421,6 +1439,7 @@ def test_filing_validator_builds_role_selection_and_typed_delete_empty(
         FinsUploadFilingRequest(
             ticker="AAPL",
             files=(primary, companion),
+            primary_selectors=(primary,),
             fiscal_year=2024,
             fiscal_period="FY",
             company_name="Apple Inc.",
@@ -1428,9 +1447,12 @@ def test_filing_validator_builds_role_selection_and_typed_delete_empty(
         published_state=FilingUploadPublishedState(company_meta=None, source_meta=None),
     )
 
-    assert upsert.file_selection.primary == primary
-    assert upsert.file_selection.companions == (companion,)
-    assert upsert.file_selection.ordered_files == (primary, companion)
+    assert upsert.file_selection.primary == primary.resolve(strict=False)
+    assert upsert.file_selection.companions == (companion.resolve(strict=False),)
+    assert upsert.file_selection.ordered_files == (
+        primary.resolve(strict=False),
+        companion.resolve(strict=False),
+    )
     assert upsert.file_selection.is_empty is False
 
     deleted = validate_fins_upload_filing_request(
@@ -1448,6 +1470,597 @@ def test_filing_validator_builds_role_selection_and_typed_delete_empty(
     assert deleted.resolved_action == "delete"
     assert deleted.file_selection == FinsUploadFilingFiles.for_delete()
     assert deleted.file_selection.is_empty is True
+
+
+@pytest.mark.parametrize("primary_index", (0, 1, 2))
+def test_filing_validator_selects_explicit_primary_at_any_position(
+    tmp_path: Path,
+    primary_index: int,
+) -> None:
+    """多文件 filing 的 authoritative primary 不得由输入位置推断。
+
+    Args:
+        tmp_path: 用于创建三个合法 filing 文件的临时目录。
+        primary_index: selector 在 raw files 中的位置。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: primary 角色或 companion 相对顺序依赖首项时抛出。
+    """
+
+    files = tuple(tmp_path / f"part-{index}.txt" for index in range(3))
+    for path in files:
+        path.write_text(path.name, encoding="utf-8")
+    primary = files[primary_index]
+    request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        files=files,
+        primary_selectors=(primary,),
+        fiscal_year=2024,
+        fiscal_period="FY",
+        company_name="Apple Inc.",
+    )
+
+    validated = validate_fins_upload_filing_request(
+        request,
+        published_state=FilingUploadPublishedState(company_meta=None, source_meta=None),
+    )
+
+    normalized_files = tuple(path.resolve(strict=False) for path in files)
+    normalized_primary = primary.resolve(strict=False)
+    assert validated.request is request
+    assert validated.request.files == files
+    assert validated.request.primary_selectors == (primary,)
+    assert validated.file_selection.primary == normalized_primary
+    assert validated.file_selection.companions == tuple(
+        path for path in normalized_files if path != normalized_primary
+    )
+
+
+@pytest.mark.parametrize(
+    ("files_count", "selectors_count", "expected_code", "expected_message"),
+    (
+        (
+            2,
+            0,
+            FinsUploadUsageCode.MISSING_MULTI_FILE_PRIMARY,
+            "多文件 filing 必须使用 --primary 明确指定主文件",
+        ),
+        (
+            1,
+            2,
+            FinsUploadUsageCode.MULTIPLE_PRIMARY_SELECTORS,
+            "--primary 只能指定一次",
+        ),
+        (
+            1,
+            1,
+            FinsUploadUsageCode.PRIMARY_NOT_IN_FILES,
+            "--primary 必须精确匹配 --files 中的一个文件",
+        ),
+    ),
+)
+def test_filing_validator_rejects_invalid_primary_selector_contract(
+    tmp_path: Path,
+    files_count: int,
+    selectors_count: int,
+    expected_code: FinsUploadUsageCode,
+    expected_message: str,
+) -> None:
+    """缺失、重复或集合外 selector 必须产生精确 closed failure。
+
+    Args:
+        tmp_path: 用于创建合法文件与集合外 selector 的临时目录。
+        files_count: raw files 数量。
+        selectors_count: raw selector occurrence 数量。
+        expected_code: 预期 closed usage code。
+        expected_message: 预期固定中文文案。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: selector admission 分类或文案漂移时抛出。
+    """
+
+    files = tuple(tmp_path / f"file-{index}.txt" for index in range(files_count))
+    for path in files:
+        path.write_text(path.name, encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    selectors = (
+        (outside,)
+        if selectors_count == 1
+        else tuple(files[0] for _ in range(selectors_count))
+    )
+    request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        files=files,
+        primary_selectors=selectors,
+        fiscal_year=2024,
+        fiscal_period="FY",
+        company_name="Apple Inc.",
+    )
+
+    with pytest.raises(FinsUploadUsageError) as exc_info:
+        ingestion_runtime._filing_upload_request_identity(request)
+
+    assert exc_info.value.failure.code is expected_code
+    assert exc_info.value.failure.message == expected_message
+
+
+@pytest.mark.parametrize(
+    ("include_files", "include_primary", "expected_code", "expected_message"),
+    (
+        (
+            True,
+            False,
+            FinsUploadUsageCode.FILES_NOT_ALLOWED_FOR_DELETE,
+            "delete 不得提供 --files",
+        ),
+        (
+            True,
+            True,
+            FinsUploadUsageCode.FILES_NOT_ALLOWED_FOR_DELETE,
+            "delete 不得提供 --files",
+        ),
+        (
+            False,
+            True,
+            FinsUploadUsageCode.PRIMARY_NOT_ALLOWED_FOR_DELETE,
+            "delete 不得提供 --primary",
+        ),
+    ),
+)
+def test_filing_delete_rejects_files_before_primary_and_path_normalization(
+    monkeypatch: pytest.MonkeyPatch,
+    include_files: bool,
+    include_primary: bool,
+    expected_code: FinsUploadUsageCode,
+    expected_message: str,
+) -> None:
+    """delete 必须按 files→primary 优先级在任一路径规范化前拒绝。
+
+    Args:
+        monkeypatch: 用于禁止路径规范化的 pytest 夹具。
+        include_files: 是否携带 raw files。
+        include_primary: 是否携带 raw primary selector。
+        expected_code: 预期 closed usage code。
+        expected_message: 预期固定中文文案。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: delete 校验越过静态边界或 precedence 漂移时抛出。
+    """
+
+    def forbid_expanduser(path: Path) -> Path:
+        """禁止 delete rejection 进入路径规范化。
+
+        Args:
+            path: 不应被规范化的 raw 路径。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: static admission 错误进入路径规范化时始终抛出。
+        """
+
+        raise AssertionError(f"delete rejection 前禁止规范路径：{path!s}")
+
+    monkeypatch.setattr(Path, "expanduser", forbid_expanduser)
+    raw_path = Path("never-resolve.pdf")
+    request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        action="delete",
+        files=(raw_path,) if include_files else (),
+        primary_selectors=(raw_path,) if include_primary else (),
+        fiscal_year=2024,
+        fiscal_period="FY",
+    )
+
+    with pytest.raises(FinsUploadUsageError) as exc_info:
+        ingestion_runtime._filing_upload_request_identity(request)
+
+    assert exc_info.value.failure.code is expected_code
+    assert exc_info.value.failure.message == expected_message
+
+
+def test_filing_delete_over_raw_limit_precedes_files_rejection() -> None:
+    """delete 的 101 个 raw files 必须先返回 TOO_MANY_FILES。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: raw count 不再先于 delete-with-files contract 时抛出。
+    """
+
+    raw_path = Path("never-resolve.pdf")
+    request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        action="delete",
+        files=(raw_path,) * 101,
+        primary_selectors=(raw_path,),
+        fiscal_year=2024,
+        fiscal_period="FY",
+    )
+
+    with pytest.raises(FinsUploadUsageError) as exc_info:
+        ingestion_runtime._filing_upload_request_identity(request)
+
+    assert exc_info.value.failure.code is FinsUploadUsageCode.TOO_MANY_FILES
+    assert exc_info.value.failure.message == "--files 数量不能超过 100 个"
+
+
+@pytest.mark.parametrize("loop_is_selector", (False, True))
+def test_filing_symlink_loop_is_typed_file_not_found_before_all_side_effects(
+    tmp_path: Path,
+    loop_is_selector: bool,
+) -> None:
+    """file/selector symlink loop 必须安全映射并阻断全部下游副作用。
+
+    Args:
+        tmp_path: 用于创建 symlink loop、合法文件与受保护 workspace。
+        loop_is_selector: ``True`` 时把 loop 作为 selector，否则作为 raw file。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: code/message、路径安全或 static admission 边界漂移时抛出。
+        OSError: 测试平台无法创建 symlink 时由 pytest 环境抛出。
+    """
+
+    loop = tmp_path / "loop.pdf"
+    loop.symlink_to(loop.name)
+    valid_file = tmp_path / "valid.pdf"
+    valid_file.write_bytes(b"valid")
+    request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        files=(valid_file,) if loop_is_selector else (loop,),
+        primary_selectors=(loop,) if loop_is_selector else (),
+        fiscal_year=2024,
+        fiscal_period="FY",
+        company_name="Apple Inc.",
+    )
+    workspace_root = tmp_path / "guarded-workspace"
+    runtime, executor, state_repository, runner = _build_static_admission_guarded_runtime(
+        workspace_root
+    )
+    before = _snapshot_runtime_workspace_tree(workspace_root)
+
+    with pytest.raises(FinsUploadUsageError) as exc_info:
+        runtime.start_upload(request)
+
+    assert exc_info.value.failure.code is FinsUploadUsageCode.FILE_NOT_FOUND
+    assert exc_info.value.failure.message == "上传文件不存在：loop.pdf"
+    assert str(tmp_path) not in exc_info.value.failure.message
+    assert state_repository.calls == []
+    assert executor.operations == []
+    assert runner.requests == []
+    assert runtime._observations == {}
+    assert _snapshot_runtime_workspace_tree(workspace_root) == before
+    assert not (workspace_root / ".dayu" / "fins_ingestion" / "jobs").exists()
+    assert not (workspace_root / "portfolio").exists()
+
+
+def test_new_filing_admission_failures_precede_state_jobs_runner_and_workspace_mutation(
+    tmp_path: Path,
+) -> None:
+    """本 slice 新增的静态失败必须阻断 state、job、runner 与 workspace mutation。
+
+    Args:
+        tmp_path: 用于创建输入文件与受保护 workspace 的临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 任一新规则越过 static admission owner boundary 时抛出。
+    """
+
+    first = tmp_path / "first.pdf"
+    second = tmp_path / "second.pdf"
+    outside = tmp_path / "outside.pdf"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    base_request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        fiscal_year=2024,
+        fiscal_period="FY",
+        company_name="Apple Inc.",
+    )
+    invalid_requests = (
+        (
+            replace(
+                base_request,
+                action="delete",
+                files=(first,),
+            ),
+            FinsUploadUsageCode.FILES_NOT_ALLOWED_FOR_DELETE,
+        ),
+        (
+            replace(
+                base_request,
+                action="delete",
+                primary_selectors=(first,),
+            ),
+            FinsUploadUsageCode.PRIMARY_NOT_ALLOWED_FOR_DELETE,
+        ),
+        (
+            replace(
+                base_request,
+                files=(first, first),
+                primary_selectors=(first,),
+            ),
+            FinsUploadUsageCode.DUPLICATE_FILE_PATH,
+        ),
+        (
+            replace(
+                base_request,
+                files=(first,),
+                primary_selectors=(first, first),
+            ),
+            FinsUploadUsageCode.MULTIPLE_PRIMARY_SELECTORS,
+        ),
+        (
+            replace(
+                base_request,
+                files=(first, second),
+            ),
+            FinsUploadUsageCode.MISSING_MULTI_FILE_PRIMARY,
+        ),
+        (
+            replace(
+                base_request,
+                files=(first,),
+                primary_selectors=(outside,),
+            ),
+            FinsUploadUsageCode.PRIMARY_NOT_IN_FILES,
+        ),
+    )
+    workspace_root = tmp_path / "guarded-workspace"
+    runtime, executor, state_repository, runner = _build_static_admission_guarded_runtime(
+        workspace_root
+    )
+    before = _snapshot_runtime_workspace_tree(workspace_root)
+
+    for request, expected_code in invalid_requests:
+        with pytest.raises(FinsUploadUsageError) as exc_info:
+            runtime.start_upload(request)
+        assert exc_info.value.failure.code is expected_code
+
+    assert state_repository.calls == []
+    assert executor.operations == []
+    assert runner.requests == []
+    assert runtime._observations == {}
+    assert _snapshot_runtime_workspace_tree(workspace_root) == before
+    assert not (workspace_root / ".dayu" / "fins_ingestion" / "jobs").exists()
+    assert not (workspace_root / "portfolio").exists()
+
+
+def test_filing_duplicate_normalized_paths_precede_selector_errors(
+    tmp_path: Path,
+) -> None:
+    """规范后重复路径必须在 selector cardinality 与 membership 前拒绝。
+
+    Args:
+        tmp_path: 用于创建原文件、父目录别名与 symlink 的临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: duplicate identity、错误优先级或 symlink resolve 契约漂移时抛出。
+        OSError: 测试平台无法创建 symlink 时由 pytest 环境抛出。
+    """
+
+    report = tmp_path / "report.pdf"
+    report.write_bytes(b"report")
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    aliases = (
+        tmp_path / "." / "report.pdf",
+        nested / ".." / "report.pdf",
+        tmp_path / "report-link.pdf",
+    )
+    aliases[-1].symlink_to(report)
+
+    for alias in aliases:
+        request = FinsUploadFilingRequest(
+            ticker="AAPL",
+            files=(report, alias),
+            primary_selectors=(report, alias),
+            fiscal_year=2024,
+            fiscal_period="FY",
+            company_name="Apple Inc.",
+        )
+        with pytest.raises(FinsUploadUsageError) as exc_info:
+            ingestion_runtime._filing_upload_request_identity(request)
+        assert exc_info.value.failure.code is FinsUploadUsageCode.DUPLICATE_FILE_PATH
+        assert exc_info.value.failure.message == "--files 不能包含解析后相同的重复路径"
+
+
+def test_filing_path_identity_is_case_sensitive_and_does_not_merge_hardlinks(
+    tmp_path: Path,
+) -> None:
+    """path identity 不得 case-fold，也不得按 inode 合并 hardlink。
+
+    Args:
+        tmp_path: 用于创建两个不同 resolved path string 的 hardlink。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: exact string 或 hardlink admission contract 漂移时抛出。
+        OSError: 测试平台无法创建 hardlink 时由 pytest 环境抛出。
+    """
+
+    assert ingestion_runtime._fins_upload_path_identity(Path("/tmp/Report.pdf")) != (
+        ingestion_runtime._fins_upload_path_identity(Path("/tmp/report.pdf"))
+    )
+    with pytest.raises(FinsUploadUsageError) as case_exc:
+        ingestion_runtime._select_fins_upload_filing_files(
+            files=(Path("/tmp/report.pdf"),),
+            primary_selectors=(Path("/tmp/Report.pdf"),),
+        )
+    assert case_exc.value.failure.code is FinsUploadUsageCode.PRIMARY_NOT_IN_FILES
+
+    original = tmp_path / "original.pdf"
+    linked = tmp_path / "linked.pdf"
+    original.write_bytes(b"same inode")
+    os.link(original, linked)
+    request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        files=(original, linked),
+        primary_selectors=(linked,),
+        fiscal_year=2024,
+        fiscal_period="FY",
+        company_name="Apple Inc.",
+    )
+
+    validated = validate_fins_upload_filing_request(
+        request,
+        published_state=FilingUploadPublishedState(company_meta=None, source_meta=None),
+    )
+
+    assert validated.file_selection.primary == linked.resolve(strict=False)
+    assert validated.file_selection.companions == (original.resolve(strict=False),)
+
+
+def test_filing_distinct_same_basename_and_same_stem_paths_are_accepted(
+    tmp_path: Path,
+) -> None:
+    """不同规范路径不得因 basename 或 stem 相同被误判为重复。
+
+    Args:
+        tmp_path: 用于创建同 basename 与同 stem 的不同文件。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: duplicate owner 错用 basename 或 stem 时抛出。
+    """
+
+    first_directory = tmp_path / "first"
+    second_directory = tmp_path / "second"
+    first_directory.mkdir()
+    second_directory.mkdir()
+    first = first_directory / "report.html"
+    second = second_directory / "report.html"
+    same_stem = tmp_path / "report.xsd"
+    for path in (first, second, same_stem):
+        path.write_text(path.name, encoding="utf-8")
+    request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        files=(first, same_stem, second),
+        primary_selectors=(second,),
+        fiscal_year=2024,
+        fiscal_period="FY",
+        company_name="Apple Inc.",
+    )
+
+    validated = validate_fins_upload_filing_request(
+        request,
+        published_state=FilingUploadPublishedState(company_meta=None, source_meta=None),
+    )
+
+    assert validated.file_selection.primary == second.resolve(strict=False)
+    assert validated.file_selection.companions == (
+        first.resolve(strict=False),
+        same_stem.resolve(strict=False),
+    )
+
+
+def test_filing_file_count_limit_counts_raw_entries_before_duplicates(
+    tmp_path: Path,
+) -> None:
+    """100 个不同文件应接受，101 个 raw entries 应先于 duplicate 拒绝。
+
+    Args:
+        tmp_path: 用于创建 100 个合法 filing 文件。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: inclusive 上限或 raw-entry precedence 漂移时抛出。
+    """
+
+    files = tuple(tmp_path / f"file-{index:03d}.txt" for index in range(100))
+    for path in files:
+        path.write_text(path.name, encoding="utf-8")
+    accepted = validate_fins_upload_filing_request(
+        FinsUploadFilingRequest(
+            ticker="AAPL",
+            files=files,
+            primary_selectors=(files[-1],),
+            fiscal_year=2024,
+            fiscal_period="FY",
+            company_name="Apple Inc.",
+        ),
+        published_state=FilingUploadPublishedState(company_meta=None, source_meta=None),
+    )
+    assert len(accepted.file_selection.ordered_files) == 100
+    assert accepted.file_selection.primary == files[-1].resolve(strict=False)
+
+    with pytest.raises(FinsUploadUsageError) as exc_info:
+        ingestion_runtime._filing_upload_request_identity(
+            FinsUploadFilingRequest(
+                ticker="AAPL",
+                files=(files[0],) * 101,
+                fiscal_year=2024,
+                fiscal_period="FY",
+                company_name="Apple Inc.",
+            )
+        )
+    assert exc_info.value.failure.code is FinsUploadUsageCode.TOO_MANY_FILES
+
+
+def test_filing_explicit_roles_control_primary_and_companion_suffixes(
+    tmp_path: Path,
+) -> None:
+    """primary/companion suffix 必须由 explicit role 而非 index 校验。
+
+    Args:
+        tmp_path: 用于创建 XSD companion 与 HTML primary。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: role suffix validation 仍依赖首项时抛出。
+    """
+
+    companion = tmp_path / "schema.xsd"
+    primary = tmp_path / "report.html"
+    companion.write_text("schema", encoding="utf-8")
+    primary.write_text("report", encoding="utf-8")
+    request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        files=(companion, primary),
+        primary_selectors=(primary,),
+        fiscal_year=2024,
+        fiscal_period="FY",
+        company_name="Apple Inc.",
+    )
+
+    validated = validate_fins_upload_filing_request(
+        request,
+        published_state=FilingUploadPublishedState(company_meta=None, source_meta=None),
+    )
+
+    assert validated.file_selection.primary == primary.resolve(strict=False)
+    assert validated.file_selection.companions == (companion.resolve(strict=False),)
 
 
 @pytest.mark.parametrize("suffix", (".doc", ".ppt", ".xls", ".zip", ".xsd"))
@@ -6226,6 +6839,7 @@ async def test_direct_upload_filing_corrupt_primary_fails_without_partial_public
                 ticker="AAPL",
                 action="create",
                 files=(corrupt_file, valid_file),
+                primary_selectors=(corrupt_file,),
                 fiscal_year=2024,
                 fiscal_period="FY",
                 company_name="Apple Inc.",

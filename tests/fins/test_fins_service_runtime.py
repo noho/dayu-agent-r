@@ -14,6 +14,8 @@ from dayu.fins.ingestion_runtime import (
     FinsUploadFilingRequest,
     FinsUploadMaterialRequest,
     FinsUploadPipelineResult,
+    FinsUploadUsageCode,
+    FinsUploadUsageError,
 )
 from dayu.fins.service_runtime import (
     DefaultFinsRuntime,
@@ -89,6 +91,68 @@ class _AlwaysCancelledChecker(FinsJobCancellationChecker):
         """
 
         return None
+
+
+def test_delete_contract_rejects_before_workspace_repository_bootstrap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """delete 携带 files/primary 必须在 Service repository bootstrap 前拒绝。
+
+    Args:
+        tmp_path: 用于声明不得创建的 workspace。
+        monkeypatch: 用于禁止 workspace resolve 的 pytest 夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: static admission 越界进入 repository bootstrap 时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    raw_file = tmp_path / "never-read.pdf"
+    real_resolve = Path.resolve
+
+    def forbid_workspace_resolve(path: Path, strict: bool = False) -> Path:
+        """禁止非法 delete 请求进入 workspace repository 路径解析。
+
+        Args:
+            path: 当前待解析路径。
+            strict: 是否要求路径已存在。
+
+        Returns:
+            非 workspace 路径的真实解析结果。
+
+        Raises:
+            AssertionError: workspace repository 被提前构造时抛出。
+            OSError: 非目标路径解析失败时由真实实现抛出。
+            RuntimeError: 非目标路径存在 symlink loop 时由真实实现抛出。
+        """
+
+        if path == workspace_root:
+            raise AssertionError("delete static rejection 前禁止构造 workspace repository")
+        return real_resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", forbid_workspace_resolve)
+    request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        action="delete",
+        files=(raw_file,),
+        primary_selectors=(raw_file,),
+        fiscal_year=2024,
+        fiscal_period="FY",
+    )
+
+    with pytest.raises(FinsUploadUsageError) as exc_info:
+        prevalidate_fins_upload_filing_request_for_workspace(
+            request,
+            workspace_root=workspace_root,
+        )
+
+    assert exc_info.value.failure.code is FinsUploadUsageCode.FILES_NOT_ALLOWED_FOR_DELETE
+    assert exc_info.value.failure.message == "delete 不得提供 --files"
+    assert not workspace_root.exists()
 
 
 def test_prevalidation_maps_repository_resolve_failure_to_typed_reason(

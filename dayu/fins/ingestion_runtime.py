@@ -626,7 +626,8 @@ class FinsUploadFilingRequest:
         ticker: 用户提供的 ticker 文本，运行时会先调用公共 ticker 归一化 API。
         source_kind: 源文档类别；filing 上传必须为 ``SourceKind.FILING``。
         action: 上传动作，允许 ``auto``、``create``、``update`` 或 ``delete``。
-        files: 待上传文件路径；Slice 1 只保存文件数量摘要，不读取文件。
+        files: 待上传的原始文件路径，保留调用方给定顺序与重复项。
+        primary_selectors: 调用方声明的原始主文件 selector，保留每次 occurrence，不表示已验证角色。
         fiscal_year: 可选会计年度。
         fiscal_period: 可选会计期间。
         amended: 是否为修正 filing。
@@ -641,6 +642,7 @@ class FinsUploadFilingRequest:
     source_kind: SourceKind = SourceKind.FILING
     action: str = _UPLOAD_ACTION_AUTO
     files: tuple[Path, ...] = ()
+    primary_selectors: tuple[Path, ...] = ()
     fiscal_year: int | None = None
     fiscal_period: str | None = None
     amended: bool = False
@@ -660,6 +662,12 @@ class FinsUploadUsageCode(str, Enum):
     INVALID_SOURCE_KIND = "invalid_source_kind"
     INVALID_ACTION = "invalid_action"
     TOO_MANY_FILES = "too_many_files"
+    FILES_NOT_ALLOWED_FOR_DELETE = "files_not_allowed_for_delete"
+    DUPLICATE_FILE_PATH = "duplicate_file_path"
+    MULTIPLE_PRIMARY_SELECTORS = "multiple_primary_selectors"
+    MISSING_MULTI_FILE_PRIMARY = "missing_multi_file_primary"
+    PRIMARY_NOT_IN_FILES = "primary_not_in_files"
+    PRIMARY_NOT_ALLOWED_FOR_DELETE = "primary_not_allowed_for_delete"
     MISSING_FISCAL_YEAR = "missing_fiscal_year"
     INVALID_FISCAL_YEAR = "invalid_fiscal_year"
     MISSING_FISCAL_PERIOD = "missing_fiscal_period"
@@ -749,7 +757,7 @@ class ValidatedFinsUploadFilingRequest:
         resolved_action: published state 下解析后的动作。
         published_state: 本次验证使用的同版只读状态。
         company_meta_decision: company meta owner 产生的发布决策。
-        file_selection: 首文件 primary、后续 companion 或 delete 空状态的强类型选择。
+        file_selection: authoritative primary/companions 或 delete 空状态的强类型选择。
     """
 
     request: FinsUploadFilingRequest
@@ -787,6 +795,12 @@ _USAGE_MESSAGES: Final[Mapping[FinsUploadUsageCode, str]] = {
     FinsUploadUsageCode.INVALID_SOURCE_KIND: "upload_filing 必须使用 filing source kind",
     FinsUploadUsageCode.INVALID_ACTION: "--action 仅支持 auto、create、update、delete",
     FinsUploadUsageCode.TOO_MANY_FILES: "--files 数量不能超过 100 个",
+    FinsUploadUsageCode.FILES_NOT_ALLOWED_FOR_DELETE: "delete 不得提供 --files",
+    FinsUploadUsageCode.DUPLICATE_FILE_PATH: "--files 不能包含解析后相同的重复路径",
+    FinsUploadUsageCode.MULTIPLE_PRIMARY_SELECTORS: "--primary 只能指定一次",
+    FinsUploadUsageCode.MISSING_MULTI_FILE_PRIMARY: "多文件 filing 必须使用 --primary 明确指定主文件",
+    FinsUploadUsageCode.PRIMARY_NOT_IN_FILES: "--primary 必须精确匹配 --files 中的一个文件",
+    FinsUploadUsageCode.PRIMARY_NOT_ALLOWED_FOR_DELETE: "delete 不得提供 --primary",
     FinsUploadUsageCode.MISSING_FISCAL_YEAR: "--fiscal-year 不能为空",
     FinsUploadUsageCode.INVALID_FISCAL_YEAR: "财年（fiscal_year）必须是 1000..9999 的整数",
     FinsUploadUsageCode.MISSING_FISCAL_PERIOD: "--fiscal-period 不能为空",
@@ -942,6 +956,92 @@ def _admit_fins_upload_ticker_identity(
     return normalized_ticker
 
 
+def _normalize_fins_upload_path(path: Path) -> Path:
+    """把 raw upload path 规范化为静态 admission 的 canonical path。
+
+    路径展开或解析失败属于调用方可修正的文件缺失事实；本 owner 只把 raw basename
+    投影给 public failure，不让底层异常中的本地路径进入业务消息。
+
+    Args:
+        path: 调用方提供的原始文件或 selector 路径。
+
+    Returns:
+        经过用户目录展开与 ``resolve(strict=False)`` 的绝对路径。
+
+    Raises:
+        TypeError: ``path`` 不是 ``Path`` 时抛出。
+        FinsUploadUsageError: 用户目录展开或路径解析发生 ``OSError``/``RuntimeError`` 时，
+            携带既有 ``FILE_NOT_FOUND`` code 与 raw basename 文案抛出。
+    """
+
+    if not isinstance(path, Path):
+        raise TypeError("upload path 必须是 Path")
+    try:
+        return path.expanduser().resolve(strict=False)
+    except (OSError, RuntimeError):
+        _raise_upload_usage(FinsUploadUsageCode.FILE_NOT_FOUND, file_name=path.name)
+
+
+def _fins_upload_path_identity(path: Path) -> str:
+    """投影规范路径的 case-sensitive exact string identity。
+
+    Args:
+        path: 已由 ``_normalize_fins_upload_path`` 规范化的路径。
+
+    Returns:
+        不进行 case folding、inode 查询或平台别名合并的路径字符串。
+
+    Raises:
+        TypeError: ``path`` 不是 ``Path`` 时抛出。
+    """
+
+    if not isinstance(path, Path):
+        raise TypeError("normalized upload path 必须是 Path")
+    return str(path)
+
+
+def _select_fins_upload_filing_files(
+    *,
+    files: tuple[Path, ...],
+    primary_selectors: tuple[Path, ...],
+) -> tuple[Path, tuple[Path, ...]]:
+    """从规范路径确定唯一 filing primary 与 companions。
+
+    Args:
+        files: 已规范化、保序且没有 exact path-string 重复的 upsert 文件。
+        primary_selectors: 已规范化并保留 raw cardinality 的 selector。
+
+    Returns:
+        单文件隐式或显式选择、多文件显式选择产生的 primary 与保序 companions。
+
+    Raises:
+        FinsUploadUsageError: selector 数量、必填性或 membership 违反 closed contract 时抛出。
+        ValueError: 上游违反内部不变量并传入空 upsert 文件集合时抛出。
+    """
+
+    if not files:
+        raise ValueError("filing upsert 角色选择必须接收非空文件集合")
+    if len(primary_selectors) > 1:
+        _raise_upload_usage(FinsUploadUsageCode.MULTIPLE_PRIMARY_SELECTORS)
+    if len(files) > 1 and not primary_selectors:
+        _raise_upload_usage(FinsUploadUsageCode.MISSING_MULTI_FILE_PRIMARY)
+
+    if primary_selectors:
+        primary = primary_selectors[0]
+    else:
+        primary = next(iter(files))
+    primary_identity = _fins_upload_path_identity(primary)
+    file_identities = tuple(_fins_upload_path_identity(path) for path in files)
+    if primary_identity not in file_identities:
+        _raise_upload_usage(FinsUploadUsageCode.PRIMARY_NOT_IN_FILES)
+    companions = tuple(
+        path
+        for path, path_identity in zip(files, file_identities, strict=True)
+        if path_identity != primary_identity
+    )
+    return primary, companions
+
+
 def _validate_fins_upload_filing_static(
     request: FinsUploadFilingRequest,
 ) -> _StaticFinsUploadFilingValidation:
@@ -989,28 +1089,50 @@ def _validate_fins_upload_filing_static(
     _validate_optional_upload_iso_date(request.filing_date, FinsUploadUsageCode.INVALID_FILING_DATE)
     _validate_optional_upload_iso_date(request.report_date, FinsUploadUsageCode.INVALID_REPORT_DATE)
     _validate_optional_upload_text(request.company_name, FinsUploadUsageCode.COMPANY_NAME_TOO_LONG)
-    if action != _UPLOAD_ACTION_DELETE and not request.files:
+    if action == _UPLOAD_ACTION_DELETE:
+        if request.files:
+            _raise_upload_usage(FinsUploadUsageCode.FILES_NOT_ALLOWED_FOR_DELETE)
+        if request.primary_selectors:
+            _raise_upload_usage(FinsUploadUsageCode.PRIMARY_NOT_ALLOWED_FOR_DELETE)
+        file_selection = FinsUploadFilingFiles.for_delete()
+    elif not request.files:
         _raise_upload_usage(FinsUploadUsageCode.MISSING_FILES)
-    for index, file_path in enumerate(request.files):
-        basename = file_path.name
-        _admit_fins_upload_file_basename(basename)
-        if not file_path.exists():
-            _raise_upload_usage(FinsUploadUsageCode.FILE_NOT_FOUND, file_name=basename)
-        if not file_path.is_file():
-            _raise_upload_usage(FinsUploadUsageCode.FILE_NOT_REGULAR, file_name=basename)
-        role = FinsUploadFileRole.PRIMARY if index == 0 else FinsUploadFileRole.COMPANION
+    else:
+        normalized_files = tuple(_normalize_fins_upload_path(path) for path in request.files)
+        normalized_selectors = tuple(
+            _normalize_fins_upload_path(path) for path in request.primary_selectors
+        )
+        file_identities = tuple(_fins_upload_path_identity(path) for path in normalized_files)
+        if len(set(file_identities)) != len(file_identities):
+            _raise_upload_usage(FinsUploadUsageCode.DUPLICATE_FILE_PATH)
+        primary, companions = _select_fins_upload_filing_files(
+            files=normalized_files,
+            primary_selectors=normalized_selectors,
+        )
+        primary_identity = _fins_upload_path_identity(primary)
+        for file_path in normalized_files:
+            basename = file_path.name
+            _admit_fins_upload_file_basename(basename)
+            if not file_path.exists():
+                _raise_upload_usage(FinsUploadUsageCode.FILE_NOT_FOUND, file_name=basename)
+            if not file_path.is_file():
+                _raise_upload_usage(FinsUploadUsageCode.FILE_NOT_REGULAR, file_name=basename)
+            role = (
+                FinsUploadFileRole.PRIMARY
+                if _fins_upload_path_identity(file_path) == primary_identity
+                else FinsUploadFileRole.COMPANION
+            )
+            try:
+                FINS_UPLOAD_FORMAT_CAPABILITY.require_filing_path(file_path, role=role)
+            except FinsUploadFormatError as error:
+                _raise_upload_format_usage(error)
         try:
-            FINS_UPLOAD_FORMAT_CAPABILITY.require_filing_path(file_path, role=role)
+            file_selection = FinsUploadFilingFiles.for_upsert(
+                primary=primary,
+                companions=companions,
+            )
         except FinsUploadFormatError as error:
             _raise_upload_format_usage(error)
-    try:
-        file_selection = (
-            FinsUploadFilingFiles.for_delete()
-            if action == _UPLOAD_ACTION_DELETE
-            else FinsUploadFilingFiles.from_upsert_paths(request.files)
-        )
-    except FinsUploadFormatError as error:
-        _raise_upload_format_usage(error)
     if normalized_ticker.market == "US":
         document_id, internal_document_id = build_sec_filing_ids(
             ticker=normalized_ticker.canonical,

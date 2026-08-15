@@ -72,7 +72,7 @@ def test_capability_projects_exact_frozen_primary_and_companion_suffixes() -> No
 
 
 def test_filing_upsert_selection_preserves_primary_and_companion_order() -> None:
-    """filing upsert 必须把首项建模为 primary，并保留所有 companion 顺序。
+    """filing upsert 必须保存 authoritative primary，并保留 companion 相对顺序。
 
     Args:
         无。
@@ -86,7 +86,10 @@ def test_filing_upsert_selection_preserves_primary_and_companion_order() -> None
 
     primary = Path("report.html")
     companions = (Path("schema.xsd"), Path("tables.xlsx"), Path("notes.docx"))
-    selection = FinsUploadFilingFiles.from_upsert_paths((primary, *companions))
+    selection = FinsUploadFilingFiles.for_upsert(
+        primary=primary,
+        companions=companions,
+    )
 
     assert selection.primary == primary
     assert selection.require_primary() == primary
@@ -95,8 +98,8 @@ def test_filing_upsert_selection_preserves_primary_and_companion_order() -> None
     assert selection.is_empty is False
 
 
-def test_filing_delete_is_typed_empty_and_upsert_rejects_empty() -> None:
-    """filing delete 必须使用明确空状态，upsert 入口不能产生空 selection。
+def test_filing_delete_is_typed_empty_and_upsert_has_no_order_inference_entry() -> None:
+    """filing delete 必须使用明确空状态，upsert 不能保留顺序推断入口。
 
     Args:
         无。
@@ -105,11 +108,10 @@ def test_filing_delete_is_typed_empty_and_upsert_rejects_empty() -> None:
         无。
 
     Raises:
-        AssertionError: delete/upsert 空状态边界漂移时抛出。
+        AssertionError: delete 空状态或 upsert 构造边界漂移时抛出。
     """
 
-    with pytest.raises(ValueError, match="至少包含一个文件"):
-        FinsUploadFilingFiles.from_upsert_paths(())
+    assert "from_upsert_paths" not in FinsUploadFilingFiles.__dict__
 
     selection = FinsUploadFilingFiles.for_delete()
     assert selection.primary is None
@@ -138,7 +140,7 @@ def test_primary_rejects_legacy_unselected_and_companion_only_suffixes(suffix: s
 
     path = Path(f"report{suffix}")
     with pytest.raises(FinsUploadFormatError) as exc_info:
-        FinsUploadFilingFiles.from_upsert_paths((path,))
+        FinsUploadFilingFiles.for_upsert(primary=path, companions=())
 
     assert exc_info.value.kind is FinsUploadFormatFailureKind.PRIMARY_SUFFIX_UNSUPPORTED
     assert exc_info.value.file_label == path.name
@@ -146,7 +148,7 @@ def test_primary_rejects_legacy_unselected_and_companion_only_suffixes(suffix: s
 
 
 def test_xsd_is_accepted_only_as_filing_companion() -> None:
-    """XSD 必须只在非首位置通过，且 companion 失败保持角色明确。
+    """XSD 必须只以 explicit companion 角色通过，且失败保持角色明确。
 
     Args:
         无。
@@ -158,7 +160,10 @@ def test_xsd_is_accepted_only_as_filing_companion() -> None:
         AssertionError: XSD 角色边界或 companion failure kind 漂移时抛出。
     """
 
-    accepted = FinsUploadFilingFiles.from_upsert_paths((Path("report.html"), Path("schema.xsd")))
+    accepted = FinsUploadFilingFiles.for_upsert(
+        primary=Path("report.html"),
+        companions=(Path("schema.xsd"),),
+    )
     assert accepted.ordered_files == (Path("report.html"), Path("schema.xsd"))
 
     with pytest.raises(FinsUploadFormatError) as primary_error:
@@ -169,7 +174,10 @@ def test_xsd_is_accepted_only_as_filing_companion() -> None:
     assert primary_error.value.kind is FinsUploadFormatFailureKind.PRIMARY_SUFFIX_UNSUPPORTED
 
     with pytest.raises(FinsUploadFormatError) as companion_error:
-        FinsUploadFilingFiles.from_upsert_paths((Path("report.html"), Path("archive.zip")))
+        FinsUploadFilingFiles.for_upsert(
+            primary=Path("report.html"),
+            companions=(Path("archive.zip"),),
+        )
     assert companion_error.value.kind is FinsUploadFormatFailureKind.COMPANION_SUFFIX_UNSUPPORTED
     assert str(companion_error.value) == "财报随附文件格式不受支持：archive.zip"
 
@@ -220,7 +228,7 @@ def test_format_error_is_bounded_and_never_exposes_parent_path(tmp_path: Path) -
 
     path = tmp_path / "private" / "legacy.doc"
     with pytest.raises(FinsUploadFormatError) as exc_info:
-        FinsUploadFilingFiles.from_upsert_paths((path,))
+        FinsUploadFilingFiles.for_upsert(primary=path, companions=())
 
     error = exc_info.value
     assert error.file_label == "legacy.doc"
@@ -249,7 +257,7 @@ def test_long_canonical_basename_keeps_label_and_bounds_primary_material_message
     path = tmp_path / "private" / basename
 
     with pytest.raises(FinsUploadFormatError) as primary_exc:
-        FinsUploadFilingFiles.from_upsert_paths((path,))
+        FinsUploadFilingFiles.for_upsert(primary=path, companions=())
     with pytest.raises(FinsUploadFormatError) as material_exc:
         FinsUploadMaterialFiles.from_upsert_paths((path,))
 

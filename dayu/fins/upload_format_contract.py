@@ -1,8 +1,8 @@
 """Fins 上传文件格式、角色与业务文案真源。
 
-本模块在 Documents 转换能力之上定义 Fins 上传语义：filing 的首文件是必须转换的
-主文件，后续文件是不会转换的原始随附文件；material 的每个文件都必须转换。
-本模块只校验路径扩展名与角色，不读取文件，也不承担内容、存储、重复或显式主文件选择语义。
+本模块在 Documents 转换能力之上定义 Fins 上传语义：filing 具有一个显式主文件，
+其余文件是不会转换的原始随附文件；material 的每个文件都必须转换。
+本模块只校验路径扩展名与已确定角色，不读取文件，也不承担内容、存储、重复或主文件选择语义。
 """
 
 from __future__ import annotations
@@ -315,11 +315,11 @@ class FinsUploadFilingFiles:
     """带明确 primary/companion 角色的 filing 文件 selection。
 
     Args:
-        primary: 首个、必须转换的 filing 主文件；delete selection 为 ``None``。
-        companions: 后续仅原样保存、不转换的随附文件。
+        primary: 已验证、必须转换的 filing 主文件；delete selection 为 ``None``。
+        companions: 按原请求相对顺序保存、仅原样上传的随附文件。
 
     Raises:
-        TypeError: 任一文件不是 ``Path`` 时抛出。
+        TypeError: companions 不是 tuple 或任一文件不是 ``Path`` 时抛出。
         ValueError: 空 primary 携带 companion 时抛出。
         FinsUploadFormatError: 任一文件扩展名不符合其角色时抛出。
     """
@@ -337,11 +337,13 @@ class FinsUploadFilingFiles:
             无。
 
         Raises:
-            TypeError: 任一文件不是 ``Path`` 时抛出。
+            TypeError: companions 不是 tuple 或任一文件不是 ``Path`` 时抛出。
             ValueError: 空 primary 携带 companion 时抛出。
             FinsUploadFormatError: 任一文件扩展名不符合其角色时抛出。
         """
 
+        if not isinstance(self.companions, tuple):
+            raise TypeError("companions 必须是 Path tuple")
         if self.primary is None:
             if self.companions:
                 raise ValueError("delete filing selection 不能包含 companion")
@@ -357,24 +359,29 @@ class FinsUploadFilingFiles:
             )
 
     @classmethod
-    def from_upsert_paths(cls, paths: tuple[Path, ...]) -> FinsUploadFilingFiles:
-        """从非空有序路径构造 filing upsert selection。
+    def for_upsert(
+        cls,
+        *,
+        primary: Path,
+        companions: tuple[Path, ...],
+    ) -> FinsUploadFilingFiles:
+        """从已确定角色的路径构造 filing upsert selection。
 
         Args:
-            paths: 用户给定顺序的非空路径 tuple。
+            primary: 上游 admission 已确定的唯一主文件。
+            companions: 上游 admission 已确定且保持相对顺序的随附文件。
 
         Returns:
-            首项为 primary、其余项为 companions 的不可变 selection。
+            保留 authoritative primary/companions 的不可变 selection。
 
         Raises:
-            ValueError: ``paths`` 为空时抛出。
-            TypeError: 任一文件不是 ``Path`` 时抛出。
+            TypeError: ``primary`` 不是 ``Path``、companions 不是 tuple 或任一随附文件不是 ``Path`` 时抛出。
             FinsUploadFormatError: 任一文件扩展名不符合其角色时抛出。
         """
 
-        if not paths:
-            raise ValueError("filing upsert selection 必须至少包含一个文件")
-        return cls(primary=paths[0], companions=paths[1:])
+        if not isinstance(primary, Path):
+            raise TypeError("primary 必须是 Path")
+        return cls(primary=primary, companions=companions)
 
     @classmethod
     def for_delete(cls) -> FinsUploadFilingFiles:
@@ -394,13 +401,13 @@ class FinsUploadFilingFiles:
 
     @property
     def ordered_files(self) -> tuple[Path, ...]:
-        """按原始请求顺序投影全部 filing 文件。
+        """按角色顺序投影全部 filing 文件。
 
         Args:
             无。
 
         Returns:
-            upsert 时为 ``(primary, *companions)``；delete 时为空 tuple。
+            upsert 时先返回 authoritative primary，再返回保持原相对顺序的 companions；delete 时为空 tuple。
 
         Raises:
             无。
