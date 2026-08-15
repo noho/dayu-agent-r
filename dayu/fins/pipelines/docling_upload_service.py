@@ -14,10 +14,10 @@ import mimetypes
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import Enum
 from io import BytesIO
 from pathlib import Path
 from typing import Final, Literal, TypeAlias
-from enum import Enum
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
@@ -63,6 +63,7 @@ DOCLING_FILE_SUFFIX: Final[str] = "_docling.json"
 _FILING_ASSET_IDENTITY_NAMESPACE: Final[str] = "fins-upload-asset-v1"
 _FILING_ASSET_IDENTITY_SEPARATOR: Final[bytes] = b"\0"
 _FILING_ORIGINAL_ASSET_PREFIX: Final[str] = "original-"
+_FILING_PRIMARY_ROLE_FINGERPRINT_VERSION: Final[str] = "filing-primary-role-v2"
 _AssetSource: TypeAlias = Literal["original", "docling"]
 _ASSET_SOURCE_ORIGINAL: Final[_AssetSource] = "original"
 _ASSET_SOURCE_DOCLING: Final[_AssetSource] = "docling"
@@ -137,6 +138,19 @@ class _PendingFileAsset:
     source: _AssetSource
 
 
+@dataclass(frozen=True, slots=True)
+class _UploadSourceFingerprint:
+    """上传指纹及 identical-skip 安全性。
+
+    Attributes:
+        value: 可持久化到 source meta 的 SHA-256 摘要。
+        identical_skip_safe: 当前输入是否可安全按相同摘要提前跳过。
+    """
+
+    value: str
+    identical_skip_safe: bool
+
+
 @dataclass(frozen=True)
 class _PreparedDeleteMutation:
     """已完成业务校验、等待短事务发布的删除动作。"""
@@ -173,6 +187,7 @@ class _UploadSelectionPreparation:
 
     ordered_files: tuple[Path, ...]
     converter_inputs: tuple[Path, ...]
+    filing_primary: Path | None
 
 
 PreparedDoclingUpload: TypeAlias = UploadOperationResult | _PreparedDeleteMutation | _PreparedAssetMutation
@@ -346,6 +361,7 @@ class DoclingUploadService:
         source_fingerprint = _build_upload_source_fingerprint(
             original_assets,
             source_kind=source_kind,
+            filing_primary=selection_preparation.filing_primary,
         )
         if _can_skip_upload(normalized_previous_meta, source_fingerprint, overwrite):
             Log.info(
@@ -383,7 +399,7 @@ class DoclingUploadService:
         current_version = _resolve_document_version(normalized_previous_meta, source_fingerprint)
         staging_meta = self._build_upsert_meta(
             previous_meta=normalized_previous_meta,
-            source_fingerprint=source_fingerprint,
+            source_fingerprint=source_fingerprint.value,
             document_version=current_version,
             base_meta=meta,
         )
@@ -400,7 +416,7 @@ class DoclingUploadService:
             primary_document=primary_document,
             previous_meta=normalized_previous_meta,
             meta=staging_meta,
-            source_fingerprint=source_fingerprint,
+            source_fingerprint=source_fingerprint.value,
             document_version=current_version,
         )
 
@@ -1072,10 +1088,12 @@ def _prepare_upload_selection(
         if not isinstance(selection, FinsUploadFilingFiles):
             raise ValueError("filing source_kind 必须使用 filing selection")
         ordered_files = selection.ordered_files
-        converter_inputs = () if selection.is_empty else (selection.require_primary(),)
+        filing_primary = None if selection.is_empty else selection.require_primary()
+        converter_inputs = () if filing_primary is None else (filing_primary,)
         return _UploadSelectionPreparation(
             ordered_files=ordered_files,
             converter_inputs=converter_inputs,
+            filing_primary=filing_primary,
         )
     if source_kind is SourceKind.MATERIAL:
         if not isinstance(selection, FinsUploadMaterialFiles):
@@ -1083,6 +1101,7 @@ def _prepare_upload_selection(
         return _UploadSelectionPreparation(
             ordered_files=selection.files,
             converter_inputs=selection.files,
+            filing_primary=None,
         )
     raise ValueError(f"不支持的 source_kind: {source_kind}")
 
@@ -1194,7 +1213,7 @@ def _validate_source_files(files: tuple[Path, ...]) -> list[Path]:
 
 def _can_skip_upload(
     previous_meta: Mapping[str, JsonValue] | None,
-    source_fingerprint: str,
+    source_fingerprint: _UploadSourceFingerprint,
     overwrite: bool,
 ) -> bool:
     """判断是否可跳过上传。
@@ -1216,47 +1235,87 @@ def _can_skip_upload(
         return False
     if require_source_meta_is_deleted(previous_meta):
         return False
+    if not source_fingerprint.identical_skip_safe:
+        return False
     previous_fingerprint = _text_meta(previous_meta, "source_fingerprint")
-    return bool(previous_fingerprint) and previous_fingerprint == source_fingerprint
+    return bool(previous_fingerprint) and previous_fingerprint == source_fingerprint.value
 
 
 def _build_upload_source_fingerprint(
     assets: list[_PendingFileAsset],
     *,
     source_kind: SourceKind,
-) -> str:
+    filing_primary: Path | None,
+) -> _UploadSourceFingerprint:
     """构建上传源指纹。
 
     Args:
         assets: 待上传资产列表。
         source_kind: filing 或 material 来源类型。
+        filing_primary: filing selection 的 authoritative primary；material 必须为 ``None``。
 
     Returns:
-        指纹字符串。
+        指纹摘要与 identical-skip 安全性的 typed 结果。
 
     Raises:
-        ValueError: filing asset 缺少 ``original_filename``，或 source kind 不受支持时抛出。
+        ValueError: filing 缺少 original 或 primary、primary identity 未 exact 命中一次、filing asset
+            缺少 ``original_filename``、material 非法携带 filing primary，或 source kind 不受支持时抛出。
     """
 
     if source_kind is SourceKind.FILING:
-        payload: list[JsonObject] = [
-            {
-                "original_filename": _require_filing_original_filename(asset),
-                "sha256": asset.sha256,
-                "size": asset.size,
-                "source": asset.source,
-            }
-            for asset in sorted(
-                assets,
-                key=lambda item: (
-                    _require_filing_original_filename(item),
-                    item.sha256,
-                    item.size,
-                    item.source,
-                ),
+        if not assets:
+            raise ValueError("filing fingerprint 必须携带非空 originals")
+        if filing_primary is None:
+            raise ValueError("filing fingerprint 必须携带 authoritative primary")
+        primary_identity = _build_filing_original_asset_identity(filing_primary)
+        primary_matches = [asset for asset in assets if asset.name == primary_identity]
+        if len(primary_matches) != 1:
+            raise ValueError("filing primary identity 必须 exact 命中一个 original asset")
+        descriptors: list[tuple[_PendingFileAsset, JsonObject]] = [
+            (
+                asset,
+                {
+                    "original_filename": _require_filing_original_filename(asset),
+                    "sha256": asset.sha256,
+                    "size": asset.size,
+                    "source": asset.source,
+                },
             )
+            for asset in assets
         ]
+        sorted_descriptors = sorted(
+            descriptors,
+            key=lambda item: (
+                _require_filing_original_filename(item[0]),
+                item[0].sha256,
+                item[0].size,
+                item[0].source,
+            ),
+        )
+        if len(assets) == 1:
+            payload: JsonValue = [descriptor for _, descriptor in sorted_descriptors]
+            identical_skip_safe = True
+        else:
+            primary_descriptor = next(
+                descriptor
+                for asset, descriptor in descriptors
+                if asset.name == primary_identity
+            )
+            companion_descriptors: list[JsonValue] = [
+                descriptor
+                for asset, descriptor in sorted_descriptors
+                if asset.name != primary_identity
+            ]
+            role_payload: JsonObject = {
+                "fingerprint_version": _FILING_PRIMARY_ROLE_FINGERPRINT_VERSION,
+                "primary": primary_descriptor,
+                "companions": companion_descriptors,
+            }
+            payload = role_payload
+            identical_skip_safe = primary_descriptor not in companion_descriptors
     elif source_kind is SourceKind.MATERIAL:
+        if filing_primary is not None:
+            raise ValueError("material fingerprint 不得携带 filing primary")
         payload = [
             {
                 "name": asset.name,
@@ -1266,13 +1325,20 @@ def _build_upload_source_fingerprint(
             }
             for asset in sorted(assets, key=lambda item: item.name)
         ]
+        identical_skip_safe = True
     else:
         raise ValueError(f"不支持的 source_kind: {source_kind}")
     serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return _UploadSourceFingerprint(
+        value=hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+        identical_skip_safe=identical_skip_safe,
+    )
 
 
-def _resolve_document_version(previous_meta: Mapping[str, JsonValue] | None, source_fingerprint: str) -> str:
+def _resolve_document_version(
+    previous_meta: Mapping[str, JsonValue] | None,
+    source_fingerprint: _UploadSourceFingerprint,
+) -> str:
     """解析文档版本号。
 
     Args:
@@ -1289,8 +1355,10 @@ def _resolve_document_version(previous_meta: Mapping[str, JsonValue] | None, sou
     if previous_meta is None:
         return "v1"
     previous_version = _text_meta(previous_meta, "document_version") or "v1"
+    if not source_fingerprint.identical_skip_safe:
+        return _increment_document_version(previous_version)
     previous_fingerprint = _text_meta(previous_meta, "source_fingerprint")
-    if previous_fingerprint and previous_fingerprint != source_fingerprint:
+    if previous_fingerprint and previous_fingerprint != source_fingerprint.value:
         return _increment_document_version(previous_version)
     return previous_version
 

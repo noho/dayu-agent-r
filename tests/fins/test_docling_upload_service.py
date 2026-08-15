@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,8 +30,10 @@ from dayu.fins.pipelines.docling_upload_service import (
     UploadOperationResult,
     _PendingFileAsset,
     _PreparedAssetMutation,
+    _UploadSourceFingerprint,
     _build_filing_original_asset_identity,
     _build_upload_source_fingerprint,
+    _can_skip_upload,
     _increment_document_version,
     _resolve_document_version,
     build_cn_filing_ids,
@@ -69,6 +72,85 @@ from .upload_filing_test_support import published_tree_sha256
 
 _INITIAL_CREATED_AT = "2020-01-01T00:00:00+00:00"
 _REPLACEMENT_CREATED_AT = "2020-01-02T00:00:00+00:00"
+
+
+def _build_filing_original_asset_for_test(file_path: Path) -> _PendingFileAsset:
+    """从真实测试文件构造 filing original asset。
+
+    Args:
+        file_path: 已存在的绝对规范测试文件路径。
+
+    Returns:
+        与 production original projection 字段一致的待上传资产。
+
+    Raises:
+        OSError: 测试文件无法读取时抛出。
+        ValueError: 路径不满足 filing identity contract 时抛出。
+    """
+
+    raw = file_path.read_bytes()
+    return _PendingFileAsset(
+        name=_build_filing_original_asset_identity(file_path),
+        original_filename=file_path.name,
+        derived_from=None,
+        data=raw,
+        content_type="application/pdf",
+        sha256=hashlib.sha256(raw).hexdigest(),
+        size=len(raw),
+        source="original",
+    )
+
+
+def _require_original_filename_for_test(asset: _PendingFileAsset) -> str:
+    """读取旧 fingerprint fixture 所需的 filing basename。
+
+    Args:
+        asset: 待投影的 filing original asset。
+
+    Returns:
+        非空 original filename。
+
+    Raises:
+        ValueError: 资产缺少 filing original filename 时抛出。
+    """
+
+    if asset.original_filename is None or not asset.original_filename:
+        raise ValueError("旧 filing fingerprint fixture 要求 original_filename")
+    return asset.original_filename
+
+
+def _build_old_filing_fingerprint_for_test(assets: list[_PendingFileAsset]) -> str:
+    """独立复现 amendment 前无角色 filing fingerprint 公式。
+
+    Args:
+        assets: filing original assets。
+
+    Returns:
+        旧单层 descriptor list 的 SHA-256 摘要。
+
+    Raises:
+        ValueError: 任一资产缺少 filing original filename 时抛出。
+    """
+
+    payload = [
+        {
+            "original_filename": _require_original_filename_for_test(asset),
+            "sha256": asset.sha256,
+            "size": asset.size,
+            "source": asset.source,
+        }
+        for asset in sorted(
+            assets,
+            key=lambda item: (
+                _require_original_filename_for_test(item),
+                item.sha256,
+                item.size,
+                item.source,
+            ),
+        )
+    ]
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def _set_upload_clock(monkeypatch: pytest.MonkeyPatch, timestamp: str) -> None:
@@ -2519,7 +2601,7 @@ def test_prepare_upload_requires_canonical_boolean_deleted_state(
     fingerprint = _build_upload_source_fingerprint(
         [
             _PendingFileAsset(
-                name=sample_file.name,
+                name=_build_filing_original_asset_identity(sample_file),
                 original_filename=sample_file.name,
                 derived_from=None,
                 data=raw,
@@ -2530,8 +2612,9 @@ def test_prepare_upload_requires_canonical_boolean_deleted_state(
             )
         ],
         source_kind=SourceKind.FILING,
+        filing_primary=sample_file,
     )
-    previous_meta: dict[str, JsonValue] = {"source_fingerprint": fingerprint}
+    previous_meta: dict[str, JsonValue] = {"source_fingerprint": fingerprint.value}
     expected_error: type[KeyError] | type[ValueError]
     if deleted_value is None:
         expected_error = KeyError
@@ -2843,6 +2926,481 @@ def test_execute_upload_skips_when_source_fingerprint_matches(tmp_path: Path) ->
     assert all(event.event_type == "file_skipped" for event in second.file_events)
 
 
+def test_distinguishable_filing_primary_flip_updates_v2_then_skips_replay(tmp_path: Path) -> None:
+    """可区分 multi-file primary 翻转必须更新下游主文档并允许 v2 重放 skip。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: role-aware fingerprint、版本或 downstream primary 漂移时抛出。
+    """
+
+    calls: list[str] = []
+    context = _build_service_context(tmp_path)
+    context.service._docling_converter = _FakeDoclingConverter(calls)
+    first = (tmp_path / "first.pdf").resolve(strict=False)
+    second = (tmp_path / "second.pdf").resolve(strict=False)
+    third = (tmp_path / "third.xsd").resolve(strict=False)
+    first.write_bytes(b"first primary")
+    second.write_bytes(b"second primary")
+    third.write_bytes(b"companion")
+
+    created = _execute_upload(
+        service=context.service,
+        batching_repository=context.batching_repository,
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        action="create",
+        document_id="primary_flip",
+        internal_document_id="primary_flip",
+        form_type="10-K",
+        files=[first, second, third],
+        filing_primary=first,
+        overwrite=False,
+        meta={"ingest_method": "upload"},
+    )
+    created_meta = context.source_repository.get_source_meta("AAPL", "primary_flip", SourceKind.FILING)
+    flipped = _execute_upload(
+        service=context.service,
+        batching_repository=context.batching_repository,
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        action="update",
+        document_id="primary_flip",
+        internal_document_id="primary_flip",
+        form_type="10-K",
+        files=[third, first, second],
+        filing_primary=second,
+        overwrite=False,
+        meta={"ingest_method": "upload"},
+    )
+    flipped_meta = context.source_repository.get_source_meta("AAPL", "primary_flip", SourceKind.FILING)
+    replayed = _execute_upload(
+        service=context.service,
+        batching_repository=context.batching_repository,
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        action="update",
+        document_id="primary_flip",
+        internal_document_id="primary_flip",
+        form_type="10-K",
+        files=[first, third, second],
+        filing_primary=second,
+        overwrite=False,
+        meta={"ingest_method": "upload"},
+    )
+    replayed_meta = context.source_repository.get_source_meta("AAPL", "primary_flip", SourceKind.FILING)
+    first_derived = f"{_build_filing_original_asset_identity(first)}_docling.json"
+    second_original = _build_filing_original_asset_identity(second)
+    second_derived = f"{second_original}_docling.json"
+    entries = flipped_meta["files"]
+    assert isinstance(entries, list)
+    second_derived_entry = next(
+        entry
+        for entry in entries
+        if isinstance(entry, dict) and entry.get("name") == second_derived
+    )
+
+    assert created.status == "uploaded"
+    assert created_meta["document_version"] == "v1"
+    assert flipped.status == "uploaded"
+    assert flipped_meta["document_version"] == "v2"
+    assert flipped_meta["source_fingerprint"] != created_meta["source_fingerprint"]
+    assert flipped_meta["primary_document"] == second_derived
+    assert second_derived_entry["derived_from"] == second_original
+    assert first_derived != second_derived
+    assert replayed.status == "skipped"
+    assert replayed_meta["document_version"] == "v2"
+    assert replayed_meta["source_fingerprint"] == flipped_meta["source_fingerprint"]
+    assert calls == [first.name, second.name]
+    with context.source_repository.read_source_snapshot(
+        "AAPL",
+        "primary_flip",
+        SourceKind.FILING,
+        materialize_files=True,
+    ) as snapshot:
+        primary_source = snapshot.get_primary_source()
+        with primary_source.open() as stream:
+            assert stream.read() == b'{"name": "second.pdf", "source": "docling"}'
+        assert primary_source.uri.endswith(f"/{second_derived}")
+
+
+def test_ambiguous_filing_primary_forces_versions_then_recovers_safe_skip(tmp_path: Path) -> None:
+    """不可区分 primary 等价类必须 v1→v2→v3，并在恢复可区分后 v4+skip。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: conservative unsafe、角色指针或恢复边界漂移时抛出。
+    """
+
+    calls: list[str] = []
+    context = _build_service_context(tmp_path)
+    context.service._docling_converter = _FakeDoclingConverter(calls)
+    first_dir = (tmp_path / "first").resolve(strict=False)
+    second_dir = (tmp_path / "second").resolve(strict=False)
+    third_dir = (tmp_path / "third").resolve(strict=False)
+    first_dir.mkdir()
+    second_dir.mkdir()
+    third_dir.mkdir()
+    first = first_dir / "report.pdf"
+    second = second_dir / "report.pdf"
+    unique = third_dir / "primary.pdf"
+    duplicate_companion = third_dir / "report.pdf"
+    first.write_bytes(b"identical")
+    second.write_bytes(b"identical")
+    unique.write_bytes(b"unique")
+    duplicate_companion.write_bytes(b"identical")
+    first_asset = _build_filing_original_asset_for_test(first)
+    second_asset = _build_filing_original_asset_for_test(second)
+    first_primary_fingerprint = _build_upload_source_fingerprint(
+        [first_asset, second_asset],
+        source_kind=SourceKind.FILING,
+        filing_primary=first,
+    )
+    second_primary_fingerprint = _build_upload_source_fingerprint(
+        [second_asset, first_asset],
+        source_kind=SourceKind.FILING,
+        filing_primary=second,
+    )
+    companions_only_duplicate = _build_upload_source_fingerprint(
+        [
+            _build_filing_original_asset_for_test(unique),
+            first_asset,
+            _build_filing_original_asset_for_test(duplicate_companion),
+        ],
+        source_kind=SourceKind.FILING,
+        filing_primary=unique,
+    )
+
+    assert first_primary_fingerprint.value == second_primary_fingerprint.value
+    assert first_primary_fingerprint.identical_skip_safe is False
+    assert second_primary_fingerprint.identical_skip_safe is False
+    assert companions_only_duplicate.identical_skip_safe is True
+
+    created = _execute_upload(
+        service=context.service,
+        batching_repository=context.batching_repository,
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        action="create",
+        document_id="ambiguous_primary",
+        internal_document_id="ambiguous_primary",
+        form_type="10-K",
+        files=[first, second],
+        filing_primary=first,
+        overwrite=False,
+        meta={"ingest_method": "upload"},
+    )
+    created_meta = context.source_repository.get_source_meta(
+        "AAPL", "ambiguous_primary", SourceKind.FILING
+    )
+    replayed_ambiguous = _execute_upload(
+        service=context.service,
+        batching_repository=context.batching_repository,
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        action="update",
+        document_id="ambiguous_primary",
+        internal_document_id="ambiguous_primary",
+        form_type="10-K",
+        files=[first, second],
+        filing_primary=first,
+        overwrite=False,
+        meta={"ingest_method": "upload"},
+    )
+    replayed_meta = context.source_repository.get_source_meta(
+        "AAPL", "ambiguous_primary", SourceKind.FILING
+    )
+    flipped = _execute_upload(
+        service=context.service,
+        batching_repository=context.batching_repository,
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        action="update",
+        document_id="ambiguous_primary",
+        internal_document_id="ambiguous_primary",
+        form_type="10-K",
+        files=[first, second],
+        filing_primary=second,
+        overwrite=False,
+        meta={"ingest_method": "upload"},
+    )
+    flipped_meta = context.source_repository.get_source_meta(
+        "AAPL", "ambiguous_primary", SourceKind.FILING
+    )
+    second_original = _build_filing_original_asset_identity(second)
+    second_derived = f"{second_original}_docling.json"
+    flipped_entries = flipped_meta["files"]
+    assert isinstance(flipped_entries, list)
+    flipped_derived_entry = next(
+        entry
+        for entry in flipped_entries
+        if isinstance(entry, dict) and entry.get("name") == second_derived
+    )
+
+    assert created.status == "uploaded"
+    assert created_meta["document_version"] == "v1"
+    assert replayed_ambiguous.status == "uploaded"
+    assert replayed_meta["document_version"] == "v2"
+    assert flipped.status == "uploaded"
+    assert flipped_meta["document_version"] == "v3"
+    assert flipped_meta["primary_document"] == second_derived
+    assert flipped_derived_entry["derived_from"] == second_original
+    assert "identical_skip_safe" not in flipped_meta
+    assert "filing_primary" not in flipped_meta
+    with context.source_repository.read_source_snapshot(
+        "AAPL",
+        "ambiguous_primary",
+        SourceKind.FILING,
+        materialize_files=True,
+    ) as snapshot:
+        primary_source = snapshot.get_primary_source()
+        with primary_source.open() as stream:
+            assert stream.read() == b'{"name": "report.pdf", "source": "docling"}'
+        assert primary_source.uri.endswith(f"/{second_derived}")
+
+    first.write_bytes(b"now distinguishable")
+    recovered = _execute_upload(
+        service=context.service,
+        batching_repository=context.batching_repository,
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        action="update",
+        document_id="ambiguous_primary",
+        internal_document_id="ambiguous_primary",
+        form_type="10-K",
+        files=[first, second],
+        filing_primary=second,
+        overwrite=False,
+        meta={"ingest_method": "upload"},
+    )
+    recovered_meta = context.source_repository.get_source_meta(
+        "AAPL", "ambiguous_primary", SourceKind.FILING
+    )
+    safe_replay = _execute_upload(
+        service=context.service,
+        batching_repository=context.batching_repository,
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        action="update",
+        document_id="ambiguous_primary",
+        internal_document_id="ambiguous_primary",
+        form_type="10-K",
+        files=[second, first],
+        filing_primary=second,
+        overwrite=False,
+        meta={"ingest_method": "upload"},
+    )
+    safe_replay_meta = context.source_repository.get_source_meta(
+        "AAPL", "ambiguous_primary", SourceKind.FILING
+    )
+
+    assert recovered.status == "uploaded"
+    assert recovered_meta["document_version"] == "v4"
+    assert safe_replay.status == "skipped"
+    assert safe_replay_meta["document_version"] == "v4"
+    assert calls == [first.name, first.name, second.name, second.name]
+
+
+def test_safe_multifile_whole_set_move_keeps_v1_and_published_tree(tmp_path: Path) -> None:
+    """可安全比较的 multi-file 整组移动必须命中相同 v2 fingerprint 并 skip。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: role association 混入路径或 skip 错误发布新 identity 时抛出。
+    """
+
+    calls: list[str] = []
+    context = _build_service_context(tmp_path)
+    context.service._docling_converter = _FakeDoclingConverter(calls)
+    old_dir = (tmp_path / "old").resolve(strict=False)
+    new_dir = (tmp_path / "new").resolve(strict=False)
+    old_dir.mkdir()
+    new_dir.mkdir()
+    old_primary = old_dir / "main.pdf"
+    old_companion = old_dir / "appendix.xlsx"
+    new_primary = new_dir / "main.pdf"
+    new_companion = new_dir / "appendix.xlsx"
+    old_primary.write_bytes(b"main")
+    old_companion.write_bytes(b"appendix")
+    new_primary.write_bytes(b"main")
+    new_companion.write_bytes(b"appendix")
+    old_fingerprint = _build_upload_source_fingerprint(
+        [
+            _build_filing_original_asset_for_test(old_primary),
+            _build_filing_original_asset_for_test(old_companion),
+        ],
+        source_kind=SourceKind.FILING,
+        filing_primary=old_primary,
+    )
+    new_fingerprint = _build_upload_source_fingerprint(
+        [
+            _build_filing_original_asset_for_test(new_primary),
+            _build_filing_original_asset_for_test(new_companion),
+        ],
+        source_kind=SourceKind.FILING,
+        filing_primary=new_primary,
+    )
+    old_identities = {
+        _build_filing_original_asset_identity(old_primary),
+        _build_filing_original_asset_identity(old_companion),
+    }
+    new_identities = {
+        _build_filing_original_asset_identity(new_primary),
+        _build_filing_original_asset_identity(new_companion),
+    }
+
+    created = _execute_upload(
+        service=context.service,
+        batching_repository=context.batching_repository,
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        action="create",
+        document_id="whole_set_move",
+        internal_document_id="whole_set_move",
+        form_type="10-K",
+        files=[old_primary, old_companion],
+        filing_primary=old_primary,
+        overwrite=False,
+        meta={"ingest_method": "upload"},
+    )
+    moved = _execute_upload(
+        service=context.service,
+        batching_repository=context.batching_repository,
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        action="update",
+        document_id="whole_set_move",
+        internal_document_id="whole_set_move",
+        form_type="10-K",
+        files=[new_companion, new_primary],
+        filing_primary=new_primary,
+        overwrite=False,
+        meta={"ingest_method": "upload"},
+    )
+    meta = context.source_repository.get_source_meta("AAPL", "whole_set_move", SourceKind.FILING)
+    entries = meta["files"]
+    assert isinstance(entries, list)
+    published_originals = {
+        str(entry["name"])
+        for entry in entries
+        if isinstance(entry, dict) and entry.get("source") == "original"
+    }
+
+    assert old_identities.isdisjoint(new_identities)
+    assert old_fingerprint.value == new_fingerprint.value
+    assert old_fingerprint.identical_skip_safe is True
+    assert new_fingerprint.identical_skip_safe is True
+    assert created.status == "uploaded"
+    assert moved.status == "skipped"
+    assert meta["document_version"] == "v1"
+    assert published_originals == old_identities
+    assert calls == [old_primary.name]
+
+
+def test_old_v1_multifile_fingerprint_transitions_once_to_v2_and_then_skips(tmp_path: Path) -> None:
+    """旧无角色 multi-file digest 必须 fail-safe 更新到 v2，随后同角色重放 skip。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: legacy fixture、版本 transition 或 replay contract 漂移时抛出。
+    """
+
+    calls: list[str] = []
+    context = _build_service_context(tmp_path)
+    context.service._docling_converter = _FakeDoclingConverter(calls)
+    primary = (tmp_path / "main.pdf").resolve(strict=False)
+    companion = (tmp_path / "appendix.xlsx").resolve(strict=False)
+    primary.write_bytes(b"main")
+    companion.write_bytes(b"appendix")
+    assets = [
+        _build_filing_original_asset_for_test(primary),
+        _build_filing_original_asset_for_test(companion),
+    ]
+    old_digest = _build_old_filing_fingerprint_for_test(assets)
+    current_fingerprint = _build_upload_source_fingerprint(
+        assets,
+        source_kind=SourceKind.FILING,
+        filing_primary=primary,
+    )
+    old_meta: dict[str, JsonValue] = {
+        "document_version": "v1",
+        "source_fingerprint": old_digest,
+        "is_deleted": False,
+    }
+
+    assert current_fingerprint.value != old_digest
+    assert current_fingerprint.identical_skip_safe is True
+    assert _can_skip_upload(old_meta, current_fingerprint, False) is False
+    prepared = asyncio.run(
+        context.service.prepare_upload(
+            ticker="AAPL",
+            source_kind=SourceKind.FILING,
+            action="update",
+            document_id="old_v1_transition",
+            internal_document_id="old_v1_transition",
+            form_type="10-K",
+            selection=FinsUploadFilingFiles.for_upsert(primary=primary, companions=(companion,)),
+            overwrite=False,
+            previous_meta=old_meta,
+            meta={"ingest_method": "upload"},
+            cancellation=None,
+        )
+    )
+    assert isinstance(prepared, _PreparedAssetMutation)
+    assert prepared.document_version == "v2"
+    assert prepared.source_fingerprint == current_fingerprint.value
+    assert isinstance(prepared.source_fingerprint, str)
+    replayed = asyncio.run(
+        context.service.prepare_upload(
+            ticker="AAPL",
+            source_kind=SourceKind.FILING,
+            action="update",
+            document_id="old_v1_transition",
+            internal_document_id="old_v1_transition",
+            form_type="10-K",
+            selection=FinsUploadFilingFiles.for_upsert(primary=primary, companions=(companion,)),
+            overwrite=False,
+            previous_meta=prepared.meta,
+            meta={"ingest_method": "upload"},
+            cancellation=None,
+        )
+    )
+    assert isinstance(replayed, UploadOperationResult)
+    assert replayed.status == "skipped"
+    assert prepared.meta["document_version"] == "v2"
+    assert calls == [primary.name]
+
+    single_assets = [_build_filing_original_asset_for_test(primary)]
+    old_single_digest = _build_old_filing_fingerprint_for_test(single_assets)
+    current_single = _build_upload_source_fingerprint(
+        single_assets,
+        source_kind=SourceKind.FILING,
+        filing_primary=primary,
+    )
+    assert current_single.value == old_single_digest
+    assert current_single.identical_skip_safe is True
+
+
 def test_filing_fingerprint_excludes_path_identity_but_tracks_filename_and_content(tmp_path: Path) -> None:
     """filing fingerprint 必须忽略目录 identity，同时保留 basename 与内容语义。
 
@@ -2950,6 +3508,7 @@ def test_filing_fingerprint_excludes_path_identity_but_tracks_filename_and_conte
 
     assert _build_filing_original_asset_identity(first) != _build_filing_original_asset_identity(moved)
     assert created.status == "uploaded"
+    assert created_meta["source_fingerprint"] == "e7d70a19bec88c733e519eace405aea9e0a357db2f7a53cdc9450d545c430848"
     assert moved_result.status == "skipped"
     assert moved_meta["source_fingerprint"] == created_meta["source_fingerprint"]
     assert moved_meta["document_version"] == "v1"
@@ -3316,8 +3875,20 @@ def test_upload_helper_id_and_version_rules() -> None:
     assert normalize_cn_fiscal_period("h1") == "H1"
     assert derive_report_kind("FY") == "annual"
     assert _increment_document_version("v2") == "v3"
-    assert _resolve_document_version(None, "fp") == "v1"
-    assert _resolve_document_version({"document_version": "v1", "source_fingerprint": "old"}, "new") == "v2"
+    safe_fingerprint = _UploadSourceFingerprint(value="new", identical_skip_safe=True)
+    unsafe_fingerprint = _UploadSourceFingerprint(value="same", identical_skip_safe=False)
+    assert _resolve_document_version(None, safe_fingerprint) == "v1"
+    assert _resolve_document_version(
+        {"document_version": "v1", "source_fingerprint": "old"},
+        safe_fingerprint,
+    ) == "v2"
+    assert _resolve_document_version(None, unsafe_fingerprint) == "v1"
+    assert _resolve_document_version({"document_version": "v7"}, unsafe_fingerprint) == "v8"
+    assert _can_skip_upload(
+        {"is_deleted": False, "source_fingerprint": "same"},
+        unsafe_fingerprint,
+        False,
+    ) is False
     assert validate_material_upload_ids(
         stable_document_id="mat_a",
         stable_internal_document_id="mat_a",
@@ -3357,8 +3928,132 @@ def test_upload_source_fingerprint_is_stable() -> None:
 
     expected_digest = "099dc9636e306c75f1d5d64dd0210123956ba73888e968088c7279baab1d7fdd"
 
-    assert _build_upload_source_fingerprint(first, source_kind=SourceKind.MATERIAL) == expected_digest
-    assert _build_upload_source_fingerprint(second, source_kind=SourceKind.MATERIAL) == expected_digest
+    first_fingerprint = _build_upload_source_fingerprint(
+        first,
+        source_kind=SourceKind.MATERIAL,
+        filing_primary=None,
+    )
+    second_fingerprint = _build_upload_source_fingerprint(
+        second,
+        source_kind=SourceKind.MATERIAL,
+        filing_primary=None,
+    )
+
+    assert first_fingerprint.value == expected_digest
+    assert second_fingerprint.value == expected_digest
+    assert first_fingerprint.identical_skip_safe is True
+    assert second_fingerprint.identical_skip_safe is True
+
+
+def test_filing_fingerprint_rejects_empty_original_assets(tmp_path: Path) -> None:
+    """filing fingerprint 必须拒绝空 original assets。
+
+    Args:
+        tmp_path: pytest 临时目录，用于提供合法绝对 primary 路径。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: owner 未以安全有界 ValueError fail closed 时抛出。
+    """
+
+    primary = (tmp_path / "report.pdf").resolve(strict=False)
+
+    with pytest.raises(ValueError, match="^filing fingerprint 必须携带非空 originals$"):
+        _build_upload_source_fingerprint(
+            [],
+            source_kind=SourceKind.FILING,
+            filing_primary=primary,
+        )
+
+
+def test_filing_fingerprint_rejects_missing_authoritative_primary(tmp_path: Path) -> None:
+    """filing fingerprint 必须拒绝缺失的 authoritative primary。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: owner 未以安全有界 ValueError fail closed 时抛出。
+    """
+
+    original = (tmp_path / "report.pdf").resolve(strict=False)
+    original.write_bytes(b"report")
+    asset = _build_filing_original_asset_for_test(original)
+
+    with pytest.raises(ValueError, match="^filing fingerprint 必须携带 authoritative primary$"):
+        _build_upload_source_fingerprint(
+            [asset],
+            source_kind=SourceKind.FILING,
+            filing_primary=None,
+        )
+
+
+def test_filing_fingerprint_rejects_primary_without_exact_original_match(tmp_path: Path) -> None:
+    """filing primary identity 未 exact 命中 original asset 时必须 fail closed。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: owner 接受不匹配 identity 或泄漏无界错误时抛出。
+    """
+
+    original = (tmp_path / "original.pdf").resolve(strict=False)
+    unmatched_primary = (tmp_path / "other.pdf").resolve(strict=False)
+    original.write_bytes(b"original")
+    unmatched_primary.write_bytes(b"other")
+    asset = _build_filing_original_asset_for_test(original)
+
+    with pytest.raises(
+        ValueError,
+        match="^filing primary identity 必须 exact 命中一个 original asset$",
+    ):
+        _build_upload_source_fingerprint(
+            [asset],
+            source_kind=SourceKind.FILING,
+            filing_primary=unmatched_primary,
+        )
+
+
+def test_material_fingerprint_rejects_filing_primary(tmp_path: Path) -> None:
+    """material fingerprint 必须拒绝非法携带的 filing primary。
+
+    Args:
+        tmp_path: pytest 临时目录，用于提供合法绝对 primary 路径。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: owner 未以安全有界 ValueError fail closed 时抛出。
+    """
+
+    illegal_primary = (tmp_path / "report.pdf").resolve(strict=False)
+    asset = _PendingFileAsset(
+        name="deck.pdf",
+        original_filename=None,
+        derived_from=None,
+        data=b"deck",
+        content_type="application/pdf",
+        sha256=hashlib.sha256(b"deck").hexdigest(),
+        size=4,
+        source="original",
+    )
+
+    with pytest.raises(ValueError, match="^material fingerprint 不得携带 filing primary$"):
+        _build_upload_source_fingerprint(
+            [asset],
+            source_kind=SourceKind.MATERIAL,
+            filing_primary=illegal_primary,
+        )
 
 
 def test_execute_upload_counts_only_successful_original_stores(tmp_path: Path) -> None:
