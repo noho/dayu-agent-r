@@ -299,6 +299,15 @@ dayu-cli upload_filing \
   --fiscal-period FY \
   --company-name "Apple Inc."
 
+dayu-cli upload_filing \
+  --ticker AAPL,APPL \
+  --action create \
+  --files ./filing/AAPL-2024-10K.pdf ./filing/AAPL-2024-instance.xml \
+  --primary ./filing/AAPL-2024-10K.pdf \
+  --fiscal-year 2024 \
+  --fiscal-period FY \
+  --company-name "Apple Inc."
+
 dayu-cli upload_material \
   --ticker AAPL,APPL \
   --action create \
@@ -314,12 +323,21 @@ dayu-cli upload_filing --help
 dayu-cli upload_material --help
 ```
 
-`upload_filing --files` 按给定顺序解释文件：首项是 primary，必须由实际转换器成功
-转换；后续项是 companions，只保留原始文件，不执行 Docling 转换。XBRL companion
-可以作为后续文件随同一批上传并原样保存。`.xml` 只是 XBRL XML candidate，`.json`
-只是 Docling JSON candidate；主文件后缀通过只表示具备转换资格，不保证其内容一定转换成功；
-随附文件（含 `.xsd`）只按可随批保存的后缀准入，不做转换。当前支持的格式清单以
+`upload_filing --files` 声明同一 filing 的文件集合，文件顺序不决定主文件角色。单文件
+filing 可以省略 `--primary`，省略时唯一文件就是 primary；多文件 filing 必须恰好提供
+一次 `--primary PATH`，且该路径必须精确匹配 `--files` 中的一个文件。除 primary 外的
+文件都是 companions，只按输入内容原样保存；只有 primary 会执行 Docling 转换，后续
+预处理与读取也只消费该 primary 的 Docling 结果。不同目录中 basename 相同的文件，或
+stem 相同但后缀不同的文件，可以在同一 filing 中共存，不会互相覆盖。XBRL companion
+可以随同一批上传并原样保存。`.xml` 只是 XBRL XML candidate，`.json` 只是 Docling
+JSON candidate；主文件后缀通过只表示具备转换资格，不保证其内容一定转换成功；随附
+文件（含 `.xsd`）只按可随批保存的后缀准入，不做转换。当前支持的格式清单以
 `dayu-cli upload_filing --help` 的即时输出为准；不要将 legacy DOC/PPT/XLS 或 ZIP 视为已支持格式。
+
+以下情况都会在上传任务启动前作为用法错误退出 `2`，不会发布文件：`--files` 中包含
+解析后相同的重复路径；多文件没有 `--primary`；重复提供多个 `--primary`；primary 不在
+files 集合内；文件数超过 100；或 `delete` 携带 `--files` / `--primary`。恰好 100 个
+不同文件允许上传。
 
 `upload_filing` 与 `upload_material` 都会在上传任务启动前校验 `--ticker` 的逗号分隔值：首项必须是公司的规范主代码，后续项是用户声明、用于查询同一家公司归档的别名；每一项都必须符合支持市场的 ticker 写法，后续别名最多 100 个。ticker 写法非法或别名超过数量限制时，命令会作为用法错误输出一行具体原因并退出 `2`，不会创建上传任务或发布文件。
 

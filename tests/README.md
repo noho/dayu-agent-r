@@ -29,6 +29,23 @@ pytest tests/contracts tests/cli tests/documents tests/fins tests/tools tests/ho
 python -m pyright dayu/ tests/ utils/
 ```
 
+运行 filing 多文件 primary、碰撞隔离与原子发布的 focused 回归：
+
+```bash
+python -m pytest tests/fins/test_upload_format_contract.py \
+  tests/fins/test_fins_ingestion_runtime.py \
+  tests/fins/test_fins_service_runtime.py \
+  tests/cli/test_arg_parsing.py tests/cli/test_fins_commands.py \
+  tests/fins/test_fins_ingestion_tools.py \
+  tests/fins/test_docling_upload_service.py \
+  tests/fins/test_docling_upload_service_integration.py \
+  tests/fins/test_sec_pipeline_upload_filing_stream.py \
+  tests/fins/test_sec_pipeline_upload_material_stream.py \
+  tests/fins/test_cn_pipeline.py \
+  tests/fins/test_fins_storage_atomicity.py \
+  tests/fins/test_processor_read_consistency.py -q
+```
+
 运行 workspace 初始化、模型家族、Service 装配与 provider matrix harness 的完整
 focused 回归：
 
@@ -152,9 +169,9 @@ pytest tests/documents/test_docling_runtime.py \
 ```
 
 该集合在 owner boundary 断言：Documents 产品 capability 与实际 converter allowed formats 同源；
-Fins 把 filing 首项建模为 primary、后续项建模为 raw companions，并保持 material 全转换；CLI
-help、LLM-facing tool schema 与 batch admission 复用同一投影；filing 只转换 primary，全部
-originals 原子发布，任一读取、转换、取消或存储失败不产生部分 publication；
+Fins raw request 保留 selector 声明次数，validated selection 显式产生唯一 primary 与保序
+companions，并保持 material 全转换；CLI help、LLM-facing tool schema 与 batch admission 复用同一
+投影；filing 只转换 authoritative primary，全部 originals 原子发布，任一读取、转换、取消或存储失败不产生部分 publication；
 requested/stored 只计算 original 输入。这是 deterministic owner-level 回归，不替代真实全格式
 fixture 矩阵或全量 CLI scenario evidence。
 
@@ -410,12 +427,24 @@ UF-FIX01 owner coverage 进一步固定：全部 frozen filing usage argv 在 CL
 UF-FIX02 S2 owner/workflow coverage 固定 shared Docling publication contract：同名 changed update、改名且未 overwrite 的 update、existing create-overwrite 都以 exact reset、blob-first、final create 发布完整新文件集合，并保持 reset 前 version / `first_ingested_at` 真源；filing 的 deleted equal/changed input 与 material 的最小 deleted-equal parity 均恢复为 active、完整 source。reset 后任一 blob/final create 失败，以及 final checkpoint/precommit 取消，都断言整棵 published ticker tree SHA 不变。SEC tests 覆盖 renamed update、fresh create-existing conversion/batch 零调用、delete 后 equal/changed auto 恢复及非目标 filing/company 不变；CN/HK shared facade tests 覆盖 fresh update-missing 在 overwrite 两种取值下 conversion/batch 零调用，以及 changed update 的完整替换。
 
 Upload format owner coverage 进一步锁定 Documents converter capability 到 Fins role overlay 的单向依赖：
-primary/companion/material selection 的角色、顺序与 delete 空状态均由 typed contract 产生；`.xsd`
-只能作为 filing companion；legacy 与未选择格式不进入 primary 或 material conversion；static
-admission、batch scanner、CLI help、upload tool schema、SEC/CN workflow 与 `DoclingUploadService` 消费同一
-owner projection。Service regressions 分别覆盖 filing 单次 primary conversion + 全 originals 原子保存、
-material 全转换、selection/source kind 不匹配、action/空状态不匹配、companion 读取失败、
-primary 转换失败、取消与 storage rollback 的零部分发布边界。
+raw request 保留 primary selector cardinality，static admission 在 workspace read 前覆盖单文件隐式选择、
+多文件显式选择、重复规范路径、多个 selector、集合外 selector、100/101 文件边界以及 delete 携带
+files/primary 的精确 failure precedence；validated typed contract 显式产生唯一 primary 与保序 companions。
+`.xsd` 只能作为 filing companion；legacy 与未选择格式不进入 primary 或 material conversion。CLI parser/help
+覆盖 append 型 `--primary` 及重复 occurrence 不丢失，direct command 覆盖 usage failure 在 Service factory
+前 exit `2` 且 workspace 零 mutation；upload tool schema/adapter 覆盖可选单值 primary、`files.maxItems=100`、
+material/delete 禁止 primary 与 observation start 前失败。batch scanner、SEC/CN workflow 与
+`DoclingUploadService` 均消费同一 owner projection。
+
+`DoclingUploadService` tests 进一步覆盖 filing 的 path-derived collision-free original identity、
+`original_filename` 与 `derived_from` 精确 metadata、不同目录同 basename 与同 stem 不同后缀共存、
+authoritative primary 非首项时只转换一次、companions 仅原样保存、100 originals + 1 derived 的发布守恒，
+以及 fingerprint 排除 path identity 后的跨目录 identical-skip、basename 改名 update 和内容改变 update。
+storage atomicity 与 processor/read consistency tests 覆盖 `primary_document` 精确命中 derived identity、
+snapshot `get_primary_source()` 到 `process_filing` / read runtime 的单一路径，以及 primary conversion、
+original 读取、blob/final source/commit 失败时 `stored_file_count=0`、fresh 零发布与 existing tree 不变。
+material regressions继续固定全部文件逐项转换、既有 basename/stem-derived name、metadata、fingerprint、
+事件和 failure 边界不变。
 
 Fins fixture 由测试通过仓储 public API 写入临时 workspace，不依赖隐式 cwd、环境变量或手工拼生产路径。
 
