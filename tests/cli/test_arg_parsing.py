@@ -37,6 +37,7 @@ from dayu.cli.exit_codes import (
     EXIT_SUCCESS,
     EXIT_USAGE_ERROR,
 )
+from dayu.fins.upload_format_contract import FINS_UPLOAD_FORMAT_TEXT
 
 COMMAND_HELP_EXPECTATIONS: dict[str, tuple[str, ...]] = {
     "init": ("--base", "--workspace", "--reset", "--overwrite"),
@@ -373,6 +374,43 @@ def test_command_help_contains_core_arguments(
 
     for expected_fragment in COMMAND_HELP_EXPECTATIONS[command_name]:
         assert expected_fragment in help_text
+
+
+def test_upload_filing_files_help_consumes_self_contained_format_projection(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """upload_filing ``--files`` help 必须直接消费 Fins owner 文本投影。
+
+    Args:
+        capsys: pytest 标准输出捕获夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: help source、角色语义或 XML 限定文案漂移时抛出。
+    """
+
+    parser = build_parser()
+    filing_parser = next(child for child in _collect_parser_tree(parser) if child.prog.endswith(" upload_filing"))
+    files_action = next(action for action in filing_parser._actions if "--files" in action.option_strings)
+    assert files_action.help == FINS_UPLOAD_FORMAT_TEXT.filing_files
+
+    help_text = "".join(_capture_help(capsys, ("upload_filing",)).split())
+    for expected_fragment in (
+        "auto/create/update 必须至少提供一个文件",
+        "首文件是主文件",
+        "必须实际转换成功",
+        "仅原样保存、不转换",
+        ".xsd",
+        ".xml 仅是 XBRL XML 候选",
+        "不代表任意 XML",
+        ".json 仅是 Docling JSON 候选",
+        "不代表任意 JSON 内容可转换",
+        "不保证文件内容转换成功",
+        "delete 不得提供文件",
+    ):
+        assert "".join(expected_fragment.split()) in help_text
 
 
 @pytest.mark.parametrize(

@@ -11,6 +11,7 @@ import sys
 from collections.abc import Sequence
 from typing import Protocol, cast
 
+from dayu.fins.upload_format_contract import FINS_UPLOAD_FORMAT_TEXT
 from dayu.runtime.log import DiagnosticLogLevel
 
 CLI_PROGRAM_NAME: str = "dayu-cli"
@@ -917,7 +918,11 @@ def _register_upload_filing_command(
     )
     _add_upload_ticker_argument(parser)
     _add_upload_action_argument(parser, choices=FILING_ACTION_CHOICES)
-    parser.add_argument("--files", nargs="+", help="待上传文件路径。")
+    parser.add_argument(
+        "--files",
+        nargs="+",
+        help=FINS_UPLOAD_FORMAT_TEXT.filing_files,
+    )
     _add_filing_metadata_arguments(parser)
     parser.add_argument("--overwrite", action="store_true", help="允许覆盖已有文档。")
 

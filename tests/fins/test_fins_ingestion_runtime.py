@@ -101,6 +101,7 @@ from dayu.fins.ingestion_runtime import (
     FinsSourceDownloadAdapterRequest,
     FinsSourceDownloadAdapterResult,
     FinsUploadFilingRequest,
+    FinsUploadUsageFailure,
     FinsUploadUsageCode,
     FinsUploadUsageError,
     ValidatedFinsUploadFilingRequest,
@@ -118,6 +119,11 @@ from dayu.fins.upload_failure import (
     FinsUploadFailureReason,
     fins_upload_failure_from_exception,
     upload_failure_reason_from_json,
+)
+from dayu.fins.upload_format_contract import (
+    FinsUploadFilingFiles,
+    FinsUploadFormatError,
+    FinsUploadFormatFailureKind,
 )
 from dayu.fins.pipelines.cn_pipeline import CnDownloadAdapter, CnPipeline
 from dayu.fins.pipelines.docling_process_converter import (
@@ -1169,8 +1175,6 @@ def test_fins_upload_usage_failure_mapping_is_closed_bounded_and_path_free() -> 
         "invalid_file_basename",
         "file_not_found",
         "file_not_regular",
-        "file_suffix_not_allowed",
-        "converter_suffix_unsupported",
         "company_name_required",
         "create_target_exists",
         "update_target_missing",
@@ -1194,8 +1198,6 @@ def test_fins_upload_usage_failure_mapping_is_closed_bounded_and_path_free() -> 
         if code in {
             FinsUploadUsageCode.FILE_NOT_FOUND,
             FinsUploadUsageCode.FILE_NOT_REGULAR,
-            FinsUploadUsageCode.FILE_SUFFIX_NOT_ALLOWED,
-            FinsUploadUsageCode.CONVERTER_SUFFIX_UNSUPPORTED,
         }:
             failure = fins_upload_usage_failure(code, file_name="report.pdf")
         else:
@@ -1227,20 +1229,34 @@ def test_fins_upload_usage_failure_mapping_is_closed_bounded_and_path_free() -> 
         ).message
         == "上传路径不是普通文件：report.pdf"
     )
-    assert (
-        fins_upload_usage_failure(
-            FinsUploadUsageCode.FILE_SUFFIX_NOT_ALLOWED,
-            file_name="report.exe",
-        ).message
-        == "上传文件后缀不在命令允许范围：report.exe"
+
+
+def test_upload_usage_failure_fact_rejects_open_code_and_unbounded_message() -> None:
+    """usage public fact 必须自身校验 closed code union 与 240 字符消息上界。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 直接 dataclass 构造可绕过 closed/bounded invariant 时抛出。
+    """
+
+    invalid_code = cast(
+        FinsUploadUsageCode | FinsUploadFormatFailureKind,
+        "open_code",
     )
-    assert (
-        fins_upload_usage_failure(
-            FinsUploadUsageCode.CONVERTER_SUFFIX_UNSUPPORTED,
-            file_name="report.doc",
-        ).message
-        == "当前上传转换器不支持该文件后缀：report.doc"
-    )
+    with pytest.raises(TypeError, match="closed contract"):
+        FinsUploadUsageFailure(code=invalid_code, message="非法 code")
+    with pytest.raises(ValueError, match="不能为空"):
+        FinsUploadUsageFailure(code=FinsUploadUsageCode.EMPTY_TICKER, message="")
+    with pytest.raises(ValueError, match="长度上限"):
+        FinsUploadUsageFailure(
+            code=FinsUploadFormatFailureKind.PRIMARY_SUFFIX_UNSUPPORTED,
+            message="x" * 241,
+        )
 
 
 def test_filing_static_admission_rejects_pathful_basename_before_filesystem_probes(
@@ -1361,6 +1377,7 @@ def test_validate_fins_upload_filing_request_resolves_state_aware_contract(
     assert validated.resolved_action == "create"
     assert validated.published_state is absent
     assert validated.company_meta_decision.disposition == "stage"
+    assert validated.file_selection == FinsUploadFilingFiles.from_upsert_paths((upload_file,))
 
     present = FilingUploadPublishedState(
         company_meta=CompanyMeta(
@@ -1378,6 +1395,138 @@ def test_validate_fins_upload_filing_request_resolves_state_aware_contract(
     )
     assert updated.resolved_action == "update"
     assert updated.company_meta_decision.disposition == "keep"
+    assert updated.file_selection == FinsUploadFilingFiles.from_upsert_paths((upload_file,))
+
+
+def test_filing_validator_builds_role_selection_and_typed_delete_empty(
+    tmp_path: Path,
+) -> None:
+    """validator 必须直接产生 non-Optional upsert/delete filing selection。
+
+    Args:
+        tmp_path: 用于创建 primary 与 companion 文件的临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: selection 角色、顺序或 delete 空状态漂移时抛出。
+    """
+
+    primary = tmp_path / "report.html"
+    companion = tmp_path / "schema.xsd"
+    primary.write_text("<html></html>", encoding="utf-8")
+    companion.write_text("<schema></schema>", encoding="utf-8")
+    upsert = validate_fins_upload_filing_request(
+        FinsUploadFilingRequest(
+            ticker="AAPL",
+            files=(primary, companion),
+            fiscal_year=2024,
+            fiscal_period="FY",
+            company_name="Apple Inc.",
+        ),
+        published_state=FilingUploadPublishedState(company_meta=None, source_meta=None),
+    )
+
+    assert upsert.file_selection.primary == primary
+    assert upsert.file_selection.companions == (companion,)
+    assert upsert.file_selection.ordered_files == (primary, companion)
+    assert upsert.file_selection.is_empty is False
+
+    deleted = validate_fins_upload_filing_request(
+        FinsUploadFilingRequest(
+            ticker="AAPL",
+            action="delete",
+            fiscal_year=2024,
+            fiscal_period="FY",
+        ),
+        published_state=FilingUploadPublishedState(
+            company_meta=None,
+            source_meta={"source_fingerprint": "published"},
+        ),
+    )
+    assert deleted.resolved_action == "delete"
+    assert deleted.file_selection == FinsUploadFilingFiles.for_delete()
+    assert deleted.file_selection.is_empty is True
+
+
+@pytest.mark.parametrize("suffix", (".doc", ".ppt", ".xls", ".zip", ".xsd"))
+def test_filing_validator_rejects_unsupported_primary_with_role_specific_usage(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    """legacy、ZIP 与 companion-only XSD primary 必须产生角色明确的 usage failure。
+
+    Args:
+        tmp_path: 用于创建当前后缀测试文件的临时目录。
+        suffix: 当前应被 primary contract 拒绝的扩展名。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: failure kind、文案或路径安全边界漂移时抛出。
+    """
+
+    upload_file = tmp_path / f"report{suffix}"
+    upload_file.write_text("fixture", encoding="utf-8")
+    with pytest.raises(FinsUploadUsageError) as exc_info:
+        validate_fins_upload_filing_request(
+            FinsUploadFilingRequest(
+                ticker="AAPL",
+                files=(upload_file,),
+                fiscal_year=2024,
+                fiscal_period="FY",
+                company_name="Apple Inc.",
+            ),
+            published_state=FilingUploadPublishedState(company_meta=None, source_meta=None),
+        )
+
+    failure = exc_info.value.failure
+    assert failure.code is FinsUploadFormatFailureKind.PRIMARY_SUFFIX_UNSUPPORTED
+    assert failure.message == f"财报主文件格式不受支持：{upload_file.name}"
+    assert str(tmp_path) not in failure.message
+
+
+def test_filing_validator_keeps_long_canonical_label_with_bounded_usage_message(
+    tmp_path: Path,
+) -> None:
+    """长合法 basename 的 primary failure 必须保持 usage 分类且不转成 runtime error。
+
+    Args:
+        tmp_path: 用于创建长 basename primary 文件的临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: canonical label、usage code 或消息边界漂移时抛出。
+    """
+
+    basename = f"{'a' * 226}.doc"
+    upload_file = tmp_path / basename
+    upload_file.write_text("fixture", encoding="utf-8")
+
+    with pytest.raises(FinsUploadUsageError) as exc_info:
+        validate_fins_upload_filing_request(
+            FinsUploadFilingRequest(
+                ticker="AAPL",
+                files=(upload_file,),
+                fiscal_year=2024,
+                fiscal_period="FY",
+                company_name="Apple Inc.",
+            ),
+            published_state=FilingUploadPublishedState(company_meta=None, source_meta=None),
+        )
+
+    failure = exc_info.value.failure
+    cause = exc_info.value.__cause__
+    assert isinstance(cause, FinsUploadFormatError)
+    assert cause.file_label == basename
+    assert failure.code is FinsUploadFormatFailureKind.PRIMARY_SUFFIX_UNSUPPORTED
+    assert failure.message == "财报主文件格式不受支持"
+    assert 0 < len(failure.message) <= 240
+    assert str(tmp_path) not in failure.message
 
 
 @pytest.mark.parametrize(

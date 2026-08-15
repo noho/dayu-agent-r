@@ -8,6 +8,7 @@ from typing import cast
 
 import pytest
 
+import dayu.fins.upload_batch as upload_batch
 from dayu.fins.upload_batch import (
     BatchUploadAction,
     UploadBatchPlanEmptyError,
@@ -362,6 +363,114 @@ def test_unsupported_suffix_is_readable_skip_evidence(tmp_path: Path) -> None:
     skipped = raised.value.skipped_entries[0]
     assert skipped.reason_code == "unsupported_suffix"
     assert ".exe" in skipped.reason
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    (
+        ".pdf",
+        ".docx",
+        ".pptx",
+        ".htm",
+        ".html",
+        ".xhtml",
+        ".md",
+        ".txt",
+        ".csv",
+        ".xlsx",
+        ".xbrl",
+        ".xml",
+        ".json",
+    ),
+)
+def test_batch_enters_every_frozen_primary_suffix(tmp_path: Path, suffix: str) -> None:
+    """batch 必须让每个冻结 primary suffix 进入 standalone filing 计划。
+
+    Args:
+        tmp_path: 用于创建单格式 source 的临时目录。
+        suffix: 当前冻结 primary 扩展名。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: batch primary admission 与 capability 真源漂移时抛出。
+    """
+
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    filing = source_dir / f"2024FY正式年报{suffix}"
+    filing.write_text("filing", encoding="utf-8")
+
+    plan = generate_upload_batch_plan(UploadBatchPlanRequest(ticker="AAPL", source_dir=source_dir))
+
+    assert [entry.file for entry in plan.recognized_entries] == [filing.resolve()]
+    assert plan.material_entries == ()
+    assert plan.skipped_entries == ()
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    (
+        ".doc",
+        ".ppt",
+        ".xls",
+        ".zip",
+        ".xsd",
+        ".text",
+        ".rmd",
+        ".qmd",
+        ".xlsm",
+        ".potx",
+    ),
+)
+def test_batch_skips_legacy_companion_only_and_unselected_suffixes(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    """batch 必须稳定 skip 非产品 primary，且不得自动关联 XSD companion。
+
+    Args:
+        tmp_path: 用于创建单格式 source 的临时目录。
+        suffix: 当前冻结 skip 扩展名。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: skip code、standalone admission 或 association 边界漂移时抛出。
+    """
+
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    candidate = source_dir / f"2024FY正式年报{suffix}"
+    candidate.write_text("filing", encoding="utf-8")
+
+    with pytest.raises(UploadBatchPlanEmptyError) as exc_info:
+        generate_upload_batch_plan(UploadBatchPlanRequest(ticker="AAPL", source_dir=source_dir))
+
+    assert exc_info.value.skipped_entries[0].path == candidate.resolve()
+    assert exc_info.value.skipped_entries[0].reason_code == "unsupported_suffix"
+
+
+def test_batch_consumes_format_owner_without_legacy_allowlist() -> None:
+    """batch 源码必须消费 Fins capability，不再声明或导出旧 allow-list。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: batch 重新建立 suffix owner 或遗留旧常量时抛出。
+    """
+
+    # Governance audit：锁定唯一 owner 边界，避免行为测试无法察觉的重复 allow-list 回流。
+    source = Path(upload_batch.__file__).read_text(encoding="utf-8")
+    legacy_allowlist_name = "FINS_UPLOAD_FILE_" + "SUFFIXES"
+    assert legacy_allowlist_name not in source
+    assert "FINS_UPLOAD_FORMAT_CAPABILITY.accepts_primary" in source
 
 
 def test_explicit_recursive_and_non_recursive_policy(tmp_path: Path) -> None:

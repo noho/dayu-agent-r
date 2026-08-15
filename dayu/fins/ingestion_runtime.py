@@ -108,7 +108,6 @@ from dayu.fins.storage import (
     SourceDocumentRepositoryProtocol,
 )
 from dayu.fins.pipelines.docling_upload_service import (
-    SUPPORTED_UPLOAD_SUFFIXES,
     UploadOverwritePrecondition,
     build_cn_filing_ids,
     build_sec_filing_ids,
@@ -126,7 +125,13 @@ from dayu.fins.upload_failure import (
     fins_upload_failure_from_exception,
     upload_failure_reason_from_json,
 )
-from dayu.fins.upload_batch import FINS_UPLOAD_FILE_SUFFIXES
+from dayu.fins.upload_format_contract import (
+    FINS_UPLOAD_FORMAT_CAPABILITY,
+    FinsUploadFileRole,
+    FinsUploadFilingFiles,
+    FinsUploadFormatError,
+    FinsUploadFormatFailureKind,
+)
 from dayu.fins.ticker_normalization import Exchange as NormalizedTickerExchange
 from dayu.fins.ticker_normalization import Market as NormalizedTickerMarket
 from dayu.fins.ticker_normalization import NormalizedTicker
@@ -668,8 +673,6 @@ class FinsUploadUsageCode(str, Enum):
     INVALID_FILE_BASENAME = "invalid_file_basename"
     FILE_NOT_FOUND = "file_not_found"
     FILE_NOT_REGULAR = "file_not_regular"
-    FILE_SUFFIX_NOT_ALLOWED = "file_suffix_not_allowed"
-    CONVERTER_SUFFIX_UNSUPPORTED = "converter_suffix_unsupported"
     COMPANY_NAME_REQUIRED = "company_name_required"
     CREATE_TARGET_EXISTS = "create_target_exists"
     UPDATE_TARGET_MISSING = "update_target_missing"
@@ -680,12 +683,35 @@ class FinsUploadUsageFailure:
     """上传 usage failure 的 typed public fact。
 
     Attributes:
-        code: closed usage failure code。
+        code: closed usage failure code；格式错误直接使用角色 owner 的 failure kind。
         message: 最大 240 字符的可行动中文文案。
     """
 
-    code: FinsUploadUsageCode
+    code: FinsUploadUsageCode | FinsUploadFormatFailureKind
     message: str
+
+    def __post_init__(self) -> None:
+        """校验 usage public fact 的 closed code 与消息边界。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            TypeError: code 不属于 closed enum union 或 message 不是字符串时抛出。
+            ValueError: message 为空或超过 240 字符时抛出。
+        """
+
+        if not isinstance(self.code, (FinsUploadUsageCode, FinsUploadFormatFailureKind)):
+            raise TypeError("upload usage failure code 不属于 closed contract")
+        if not isinstance(self.message, str):
+            raise TypeError("upload usage failure message 必须是字符串")
+        if not self.message:
+            raise ValueError("upload usage failure message 不能为空")
+        if len(self.message) > _MAX_TEXT_CHARS:
+            raise ValueError("upload usage failure message 超出长度上限")
 
 
 class FinsUploadUsageError(ValueError):
@@ -723,6 +749,7 @@ class ValidatedFinsUploadFilingRequest:
         resolved_action: published state 下解析后的动作。
         published_state: 本次验证使用的同版只读状态。
         company_meta_decision: company meta owner 产生的发布决策。
+        file_selection: 首文件 primary、后续 companion 或 delete 空状态的强类型选择。
     """
 
     request: FinsUploadFilingRequest
@@ -733,6 +760,7 @@ class ValidatedFinsUploadFilingRequest:
     resolved_action: Literal["create", "update", "delete"]
     published_state: FilingUploadPublishedState
     company_meta_decision: UploadCompanyMetaDecision
+    file_selection: FinsUploadFilingFiles
 
 
 @dataclass(frozen=True, slots=True)
@@ -743,14 +771,13 @@ class _StaticFinsUploadFilingValidation:
     normalized_fiscal_period: str
     document_id: str
     internal_document_id: str
+    file_selection: FinsUploadFilingFiles
 
 
 _FILE_USAGE_CODES: Final[frozenset[FinsUploadUsageCode]] = frozenset(
     {
         FinsUploadUsageCode.FILE_NOT_FOUND,
         FinsUploadUsageCode.FILE_NOT_REGULAR,
-        FinsUploadUsageCode.FILE_SUFFIX_NOT_ALLOWED,
-        FinsUploadUsageCode.CONVERTER_SUFFIX_UNSUPPORTED,
     }
 )
 _USAGE_MESSAGES: Final[Mapping[FinsUploadUsageCode, str]] = {
@@ -773,8 +800,6 @@ _USAGE_MESSAGES: Final[Mapping[FinsUploadUsageCode, str]] = {
     FinsUploadUsageCode.INVALID_FILE_BASENAME: "上传文件名无效；请提供单个非空文件名",
     FinsUploadUsageCode.FILE_NOT_FOUND: "上传文件不存在：{file_name}",
     FinsUploadUsageCode.FILE_NOT_REGULAR: "上传路径不是普通文件：{file_name}",
-    FinsUploadUsageCode.FILE_SUFFIX_NOT_ALLOWED: "上传文件后缀不在命令允许范围：{file_name}",
-    FinsUploadUsageCode.CONVERTER_SUFFIX_UNSUPPORTED: "当前上传转换器不支持该文件后缀：{file_name}",
     FinsUploadUsageCode.COMPANY_NAME_REQUIRED: "当前公司缺少有效元数据；create/update 必须提供 --company-name",
     FinsUploadUsageCode.CREATE_TARGET_EXISTS: "create 目标已存在；请改用 update 或允许覆盖",
     FinsUploadUsageCode.UPDATE_TARGET_MISSING: "update 目标不存在；请改用 create",
@@ -838,6 +863,22 @@ def _raise_upload_usage(
     """
 
     raise FinsUploadUsageError(fins_upload_usage_failure(code, file_name=file_name))
+
+
+def _raise_upload_format_usage(error: FinsUploadFormatError) -> NoReturn:
+    """把格式 owner 的角色错误投影为既有 filing usage error。
+
+    Args:
+        error: Fins 格式 owner 产生的有界、去路径化错误。
+
+    Returns:
+        不返回。
+
+    Raises:
+        FinsUploadUsageError: 始终携带原始 role-specific failure kind 抛出。
+    """
+
+    raise FinsUploadUsageError(FinsUploadUsageFailure(code=error.kind, message=str(error))) from error
 
 
 def _admit_fins_upload_file_basename(basename: str) -> None:
@@ -950,17 +991,26 @@ def _validate_fins_upload_filing_static(
     _validate_optional_upload_text(request.company_name, FinsUploadUsageCode.COMPANY_NAME_TOO_LONG)
     if action != _UPLOAD_ACTION_DELETE and not request.files:
         _raise_upload_usage(FinsUploadUsageCode.MISSING_FILES)
-    for file_path in request.files:
+    for index, file_path in enumerate(request.files):
         basename = file_path.name
         _admit_fins_upload_file_basename(basename)
         if not file_path.exists():
             _raise_upload_usage(FinsUploadUsageCode.FILE_NOT_FOUND, file_name=basename)
         if not file_path.is_file():
             _raise_upload_usage(FinsUploadUsageCode.FILE_NOT_REGULAR, file_name=basename)
-        if file_path.suffix.lower() not in FINS_UPLOAD_FILE_SUFFIXES:
-            _raise_upload_usage(FinsUploadUsageCode.FILE_SUFFIX_NOT_ALLOWED, file_name=basename)
-        if file_path.suffix.lower() not in SUPPORTED_UPLOAD_SUFFIXES:
-            _raise_upload_usage(FinsUploadUsageCode.CONVERTER_SUFFIX_UNSUPPORTED, file_name=basename)
+        role = FinsUploadFileRole.PRIMARY if index == 0 else FinsUploadFileRole.COMPANION
+        try:
+            FINS_UPLOAD_FORMAT_CAPABILITY.require_filing_path(file_path, role=role)
+        except FinsUploadFormatError as error:
+            _raise_upload_format_usage(error)
+    try:
+        file_selection = (
+            FinsUploadFilingFiles.for_delete()
+            if action == _UPLOAD_ACTION_DELETE
+            else FinsUploadFilingFiles.from_upsert_paths(request.files)
+        )
+    except FinsUploadFormatError as error:
+        _raise_upload_format_usage(error)
     if normalized_ticker.market == "US":
         document_id, internal_document_id = build_sec_filing_ids(
             ticker=normalized_ticker.canonical,
@@ -981,6 +1031,7 @@ def _validate_fins_upload_filing_static(
         normalized_fiscal_period=normalized_period,
         document_id=document_id,
         internal_document_id=internal_document_id,
+        file_selection=file_selection,
     )
 
 
@@ -1104,6 +1155,7 @@ def validate_fins_upload_filing_request(
         resolved_action=resolved_action,
         published_state=published_state,
         company_meta_decision=company_decision,
+        file_selection=static.file_selection,
     )
 
 

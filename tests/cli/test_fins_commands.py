@@ -1561,16 +1561,12 @@ def test_download_static_usage_error_precedes_workspace_and_service_factory(
                 expected_reason,
             )
             for case_id, suffix, expected_reason in (
-                ("UF-028", "bin", "上传文件后缀不在命令允许范围：probe.bin"),
-                ("UF-030", "doc", "上传文件后缀不在命令允许范围：probe.doc"),
-                ("UF-031", "ppt", "上传文件后缀不在命令允许范围：probe.ppt"),
-                ("UF-032", "pptx", "上传文件后缀不在命令允许范围：probe.pptx"),
-                ("UF-033", "csv", "当前上传转换器不支持该文件后缀：probe.csv"),
-                ("UF-034", "json", "当前上传转换器不支持该文件后缀：probe.json"),
-                ("UF-035", "xbrl", "当前上传转换器不支持该文件后缀：probe.xbrl"),
-                ("UF-036", "xhtml", "当前上传转换器不支持该文件后缀：probe.xhtml"),
-                ("UF-037", "xml", "当前上传转换器不支持该文件后缀：probe.xml"),
-                ("UF-038", "zip", "当前上传转换器不支持该文件后缀：probe.zip"),
+                ("UF-028", "bin", "财报主文件格式不受支持：probe.bin"),
+                ("UF-030", "doc", "财报主文件格式不受支持：probe.doc"),
+                ("UF-031", "ppt", "财报主文件格式不受支持：probe.ppt"),
+                ("UF-FIX06-XLS", "xls", "财报主文件格式不受支持：probe.xls"),
+                ("UF-038", "zip", "财报主文件格式不受支持：probe.zip"),
+                ("UF-FIX06-XSD", "xsd", "财报主文件格式不受支持：probe.xsd"),
             )
         ),
     ),
@@ -1608,7 +1604,7 @@ def test_upload_filing_usage_matrix_precedes_service_factory_and_workspace_mutat
     before_tree = _snapshot_cli_workspace_tree(workspace_root)
     input_root = tmp_path / "input"
     input_root.mkdir()
-    for suffix in ("txt", "bin", "doc", "ppt", "pptx", "csv", "json", "xbrl", "xhtml", "xml", "zip"):
+    for suffix in ("txt", "bin", "doc", "ppt", "xls", "zip", "xsd"):
         (input_root / f"probe.{suffix}").write_text("fixture", encoding="utf-8")
     resolved_argv = tuple(token.format(input=str(input_root)) for token in argv_suffix)
     service = _FakeFinsDirectService()
@@ -2370,6 +2366,61 @@ def test_upload_commands_map_args_and_validate_files(
             overwrite=False,
         )
     ]
+
+
+@pytest.mark.parametrize(
+    ("basename", "expected_message"),
+    (
+        ("schema.xsd", "补充材料文件格式不受支持：schema.xsd"),
+        (f"{'a' * 226}.doc", "补充材料文件格式不受支持"),
+    ),
+)
+def test_upload_material_cli_uses_bounded_converter_required_format_owner(
+    tmp_path: Path,
+    fake_service: _FakeFinsDirectService,
+    capsys: pytest.CaptureFixture[str],
+    basename: str,
+    expected_message: str,
+) -> None:
+    """material CLI 必须用 Fins owner 把普通及长文件名投影为 bounded usage error。
+
+    Args:
+        tmp_path: 用于创建非法 material 文件的临时目录。
+        fake_service: 记录 direct Service 调用的替身。
+        capsys: 标准输出与错误输出捕获夹具。
+        basename: 当前非法 material 文件的 canonical basename。
+        expected_message: 预期有界格式错误文案。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: failure kind 的 CLI 投影或零调用边界漂移时抛出。
+    """
+
+    material_file = tmp_path / basename
+    material_file.write_text("<schema></schema>", encoding="utf-8")
+
+    exit_code = cli_main.main(
+        (
+            "upload_material",
+            "--ticker",
+            "AAPL",
+            "--forms",
+            "MATERIAL_OTHER",
+            "--material-name",
+            "Schema",
+            "--files",
+            str(material_file),
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_USAGE_ERROR
+    assert captured.out == ""
+    assert captured.err == f"dayu-cli upload_material: {expected_message}\n"
+    assert fake_service.upload_material_requests == []
+    assert fake_service.stream_calls == []
 
 
 def test_upload_material_alias_count_uses_typed_upload_admission(
@@ -3266,8 +3317,21 @@ def test_keyboard_interrupt_before_stream_exits_130(
 def test_upload_file_allowlist_fail_fast(
     tmp_path: Path,
     fake_service: _FakeFinsDirectService,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """upload 文件路径只做存在性与 allowlist 前置校验。"""
+    """upload_filing 必须按 primary 角色在 Service 前拒绝非法格式。
+
+    Args:
+        tmp_path: 用于创建非法 primary 文件的临时目录。
+        fake_service: 记录 direct Service 调用的替身。
+        capsys: 标准输出与错误输出捕获夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 角色错误投影或 fail-fast 边界漂移时抛出。
+    """
 
     disallowed = tmp_path / "filing.exe"
     disallowed.write_text("bad", encoding="utf-8")
@@ -3277,25 +3341,66 @@ def test_upload_file_allowlist_fail_fast(
             "upload_filing",
             "--ticker",
             "AAPL",
+            "--fiscal-year",
+            "2024",
+            "--fiscal-period",
+            "FY",
+            "--company-name",
+            "Apple Inc.",
             "--files",
             str(disallowed),
         )
     )
 
+    captured = capsys.readouterr()
     assert exit_code == EXIT_USAGE_ERROR
+    assert captured.err == "dayu-cli upload_filing: 财报主文件格式不受支持：filing.exe\n"
     assert fake_service.upload_filing_requests == []
 
 
+@pytest.mark.parametrize(
+    "suffix",
+    (
+        ".pdf",
+        ".docx",
+        ".pptx",
+        ".htm",
+        ".html",
+        ".xhtml",
+        ".md",
+        ".txt",
+        ".csv",
+        ".xlsx",
+        ".xbrl",
+        ".xml",
+        ".json",
+    ),
+)
 def test_upload_filings_from_does_not_start_live_stream(
     tmp_path: Path,
     fake_service: _FakeFinsDirectService,
     capsys: pytest.CaptureFixture[str],
+    suffix: str,
 ) -> None:
-    """upload_filings_from 只生成可执行脚本，不启动 direct stream。"""
+    """13 个冻结 primary suffix 必须各自产生 standalone filing 命令。
+
+    Args:
+        tmp_path: 用于创建单格式 source 与 workspace 的临时目录。
+        fake_service: 记录 direct Service 调用的替身。
+        capsys: 标准输出与错误输出捕获夹具。
+        suffix: 当前冻结 primary 扩展名。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: batch admission、命令生成或零 live-stream 边界漂移时抛出。
+    """
 
     source_dir = tmp_path / "source"
     source_dir.mkdir()
-    (source_dir / "2024FY AAPL Annual Report.pdf").write_text("filing", encoding="utf-8")
+    source_file = source_dir / f"2024FY AAPL Annual Report{suffix}"
+    source_file.write_text("filing", encoding="utf-8")
 
     assert (
         cli_main.main(
@@ -3316,8 +3421,10 @@ def test_upload_filings_from_does_not_start_live_stream(
     script = tmp_path / "workspace" / "upload_filings_AAPL.sh"
     assert "Generated upload script:" in captured.out
     assert "Recognized filings: 1" in captured.out
-    assert "upload_filing" in script.read_text(encoding="utf-8")
-    assert "schema_version" not in script.read_text(encoding="utf-8")
+    script_text = script.read_text(encoding="utf-8")
+    assert "upload_filing" in script_text
+    assert str(source_file.resolve()) in script_text
+    assert "schema_version" not in script_text
     assert "Fins progress" not in captured.out
     assert fake_service.stream_calls == []
 

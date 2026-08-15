@@ -67,7 +67,6 @@ from dayu.fins.ticker_normalization import (
     build_company_ticker_identity,
 )
 from dayu.fins.upload_batch import (
-    FINS_UPLOAD_FILE_SUFFIXES,
     BatchUploadAction,
     UploadBatchFilingEntry,
     UploadBatchMaterialEntry,
@@ -76,6 +75,10 @@ from dayu.fins.upload_batch import (
     UploadBatchPlanUsageError,
     UploadBatchSkippedEntry,
     generate_upload_batch_plan,
+)
+from dayu.fins.upload_format_contract import (
+    FinsUploadFormatError,
+    FinsUploadMaterialFiles,
 )
 from dayu.service.fins_direct import (
     FinsDirectCommandService,
@@ -93,7 +96,6 @@ _EMPTY_DOCUMENT_ID_MESSAGE: Final[str] = "--document-id must not contain empty i
 _EMPTY_FORM_MESSAGE: Final[str] = "--forms must not contain empty item"
 _MISSING_UPLOAD_FILE_TEMPLATE: Final[str] = "upload file does not exist: {path}"
 _UPLOAD_PATH_NOT_FILE_TEMPLATE: Final[str] = "upload path is not a file: {path}"
-_UPLOAD_SUFFIX_NOT_ALLOWED_TEMPLATE: Final[str] = "upload file suffix is not allowed: {path}"
 _FINS_DIAGNOSTIC_TEXT_MAX_CHARS: Final[int] = 120
 _FINS_DIAGNOSTIC_DETAIL_MAX_ITEMS: Final[int] = 4
 _FINS_DIAGNOSTIC_TRUNCATED_SUFFIX: Final[str] = "..."
@@ -194,6 +196,9 @@ def run_fins_direct_command(args: ParsedCliArgs) -> int:
         return EXIT_USAGE_ERROR
     except FinsUploadUsageError as exc:
         render_cli_error(f"dayu-cli {args.command_name}: {exc.failure.message}")
+        return EXIT_USAGE_ERROR
+    except FinsUploadFormatError as exc:
+        render_cli_error(f"dayu-cli {args.command_name}: {exc}")
         return EXIT_USAGE_ERROR
     except FinsUploadPrevalidationError as exc:
         _LOGGER.exception("upload_filing prevalidation operational failure")
@@ -703,6 +708,7 @@ def _upload_material_stream(
     :param cancellation_token: 当前 operation 的取消 token。
     :returns: Fins owner 已验证的 direct 事件流。
     :raises CliFinsUsageError: ticker、forms 或文件路径非法时抛出。
+    :raises FinsUploadFormatError: 任一文件不具备 converter-required 格式时抛出。
     """
 
     ticker = _parse_ticker_csv(args.ticker)
@@ -710,7 +716,7 @@ def _upload_material_stream(
     return service.upload_material(
         ticker=ticker.canonical_ticker,
         action=args.action,
-        files=_validated_upload_files(args.files),
+        files=_validated_upload_files(args.files).files,
         form_type=form_type,
         material_name=_optional_stripped_text(args.material_name),
         document_id=_optional_stripped_text(_single_document_id(args.document_id)),
@@ -1110,16 +1116,17 @@ def _parse_ticker_csv(raw_value: str | None) -> CompanyTickerIdentity:
         raise CliFinsUsageError(str(exc)) from exc
 
 
-def _validated_upload_files(raw_files: list[str] | None) -> tuple[Path, ...]:
-    """校验并解析 upload 文件路径。
+def _validated_upload_files(raw_files: list[str] | None) -> FinsUploadMaterialFiles:
+    """校验并解析 material upload 文件路径与转换格式。
 
     :param raw_files: CLI 收到的 ``--files`` 值。
-    :returns: 已解析绝对路径元组。
-    :raises CliFinsUsageError: 文件不存在、不是普通文件或后缀不在 allowlist 时抛出。
+    :returns: Fins owner 产生的 material typed selection。
+    :raises CliFinsUsageError: 文件不存在或不是普通文件时抛出。
+    :raises FinsUploadFormatError: 任一文件不具备 converter-required 格式时抛出。
     """
 
     if raw_files is None:
-        return ()
+        return FinsUploadMaterialFiles.for_delete()
     paths: list[Path] = []
     for raw_file in raw_files:
         path = Path(raw_file).expanduser().resolve(strict=False)
@@ -1127,10 +1134,8 @@ def _validated_upload_files(raw_files: list[str] | None) -> tuple[Path, ...]:
             raise CliFinsUsageError(_MISSING_UPLOAD_FILE_TEMPLATE.format(path=path))
         if not path.is_file():
             raise CliFinsUsageError(_UPLOAD_PATH_NOT_FILE_TEMPLATE.format(path=path))
-        if path.suffix.lower() not in FINS_UPLOAD_FILE_SUFFIXES:
-            raise CliFinsUsageError(_UPLOAD_SUFFIX_NOT_ALLOWED_TEMPLATE.format(path=path))
         paths.append(path)
-    return tuple(paths)
+    return FinsUploadMaterialFiles.from_upsert_paths(tuple(paths))
 
 
 def _normalized_text_tuple(

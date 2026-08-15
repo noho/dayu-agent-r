@@ -65,6 +65,7 @@ from dayu.fins.direct_events import (
 )
 from dayu.fins.service_runtime import DefaultFinsRuntime
 from dayu.fins.storage import FilingUploadPublishedState
+from dayu.fins.upload_format_contract import FINS_UPLOAD_FORMAT_TEXT
 from dayu.fins.tools import download_provider, preprocess_provider, provider as read_provider
 from dayu.fins.tools.download_tools import DOWNLOAD_TOOL_NAME, FinsDownloadToolCallable
 from dayu.fins.tools.preprocess_tools import PREPROCESS_TOOL_NAME, FinsPreprocessToolCallable
@@ -1381,17 +1382,38 @@ def test_upload_tool_calendar_year_schema_and_usage_messages_are_business_neutra
     report_date_schema = properties["report_date"]
     ticker_schema = properties["ticker"]
     aliases_schema = properties["ticker_aliases"]
+    files_schema = properties["files"]
 
     assert isinstance(fiscal_year_schema, dict)
     assert isinstance(filing_date_schema, dict)
     assert isinstance(report_date_schema, dict)
     assert isinstance(ticker_schema, dict)
     assert isinstance(aliases_schema, dict)
+    assert isinstance(files_schema, dict)
     assert "canonical ticker" in str(ticker_schema["description"])
     assert "不要填写 CSV" in str(ticker_schema["description"])
     assert "filing 与 material 上传都适用" in str(aliases_schema["description"])
     assert "系统信任声明且不联网核验" in str(aliases_schema["description"])
     assert "查询同一财报归档" in str(aliases_schema["description"])
+    assert files_schema["description"] == FINS_UPLOAD_FORMAT_TEXT.upload_tool_files
+    for expected_fragment in (
+        "auto/create/update 必须至少提供一个文件",
+        "首文件是主文件",
+        "必须实际转换成功",
+        "仅原样保存、不转换",
+        ".xsd 只能作为后续随附文件",
+        ".xml 仅是 XBRL XML 候选",
+        "不代表任意 XML",
+        ".json 仅是 Docling JSON 候选",
+        "不代表任意 JSON 内容可转换",
+        "不保证文件内容转换成功",
+        "upload_kind=material",
+        "upload_kind=material 时，auto/create/update 必须至少提供一个文件",
+        "每个文件",
+        "逐个实际转换",
+        "delete 不得提供文件",
+    ):
+        assert expected_fragment in str(files_schema["description"])
     assert fiscal_year_schema["description"] == (
         "财年。上传 filing 时必填，且只接受 1000..9999 的整数；上传 material 时可选。"
     )

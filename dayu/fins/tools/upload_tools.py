@@ -31,6 +31,7 @@ from dayu.fins.ingestion_runtime import (
     FinsUploadRequest,
 )
 from dayu.fins.storage import CompanyTickerIdentityCorruptionError
+from dayu.fins.upload_format_contract import FINS_UPLOAD_FORMAT_TEXT
 from dayu.fins.tools._ingestion_tool_helpers import (
     _awaiting_outcome_from_observation_handle,
     _failed_outcome,
@@ -234,7 +235,7 @@ def _upload_parameters_schema() -> ToolParametersSchema:
         },
         "files": {
             "type": "array",
-            "description": "要上传的本地文件路径列表。每个路径必须指向已存在、非空的普通文件；auto、create、update 必填，delete 禁止提供。",
+            "description": FINS_UPLOAD_FORMAT_TEXT.upload_tool_files,
             "items": string_items_schema,
         },
         "fiscal_year": {
