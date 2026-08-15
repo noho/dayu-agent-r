@@ -28,6 +28,8 @@ from dayu.fins.pipelines.docling_upload_service import (
     PreparedDoclingUpload,
     UploadOperationResult,
     _PendingFileAsset,
+    _PreparedAssetMutation,
+    _build_filing_original_asset_identity,
     _build_upload_source_fingerprint,
     _increment_document_version,
     _resolve_document_version,
@@ -760,6 +762,7 @@ def _execute_upload(
     files: list[Path],
     overwrite: bool,
     meta: dict[str, JsonValue],
+    filing_primary: Path | None = None,
     cancellation_checker: CancellationToken | None = None,
 ) -> UploadOperationResult:
     """准备上传并由测试 top-level owner 执行短 publication transaction。
@@ -776,6 +779,7 @@ def _execute_upload(
         files: 上传文件。
         overwrite: 是否覆盖。
         meta: source 业务元数据。
+        filing_primary: filing upsert 的 explicit primary；其它请求为 ``None``。
         cancellation_checker: 可选取消检查器。
 
     Returns:
@@ -797,6 +801,7 @@ def _execute_upload(
         source_kind=source_kind,
         action=action,
         files=files,
+        filing_primary=filing_primary,
     )
     prepared = asyncio.run(
         service.prepare_upload(
@@ -827,6 +832,7 @@ def _selection_for_test(
     source_kind: SourceKind,
     action: str,
     files: list[Path],
+    filing_primary: Path | None,
 ) -> FinsUploadFilingFiles | FinsUploadMaterialFiles:
     """按 production source/action contract 构造测试 selection。
 
@@ -834,6 +840,7 @@ def _selection_for_test(
         source_kind: filing 或 material 来源类型。
         action: create、update 或 delete。
         files: 有序原始文件列表。
+        filing_primary: filing upsert 的 explicit primary；其它请求为 ``None``。
 
     Returns:
         与 source kind 和 action 一致的 typed selection。
@@ -845,7 +852,12 @@ def _selection_for_test(
     if source_kind is SourceKind.FILING:
         if action == "delete":
             return FinsUploadFilingFiles.for_delete()
-        return FinsUploadFilingFiles.from_upsert_paths(tuple(files))
+        if filing_primary is None or filing_primary not in files:
+            raise ValueError("filing upsert 测试必须显式提供集合内 primary")
+        return FinsUploadFilingFiles.for_upsert(
+            primary=filing_primary,
+            companions=tuple(path for path in files if path != filing_primary),
+        )
     if source_kind is SourceKind.MATERIAL:
         if action == "delete":
             return FinsUploadMaterialFiles.for_delete()
@@ -956,12 +968,14 @@ def _prepare_filing_for_admission_test(
     *,
     service: DoclingUploadService,
     files: list[Path],
+    primary: Path,
 ) -> PreparedDoclingUpload:
     """调用 filing prepare owner，不进入 publication batch。
 
     Args:
         service: 使用目标 converter 的上传服务。
         files: 按用户请求顺序排列的 filing 文件。
+        primary: explicit filing primary。
 
     Returns:
         prepare 成功时返回 typed publication plan。
@@ -980,7 +994,10 @@ def _prepare_filing_for_admission_test(
             document_id="filing_admission",
             internal_document_id="filing_admission",
             form_type="Q1",
-            selection=FinsUploadFilingFiles.from_upsert_paths(tuple(files)),
+            selection=FinsUploadFilingFiles.for_upsert(
+                primary=primary,
+                companions=tuple(path for path in files if path != primary),
+            ),
             overwrite=False,
             previous_meta=None,
             meta={"ingest_method": "upload"},
@@ -1021,13 +1038,17 @@ def test_empty_filing_is_rejected_before_converter_and_publication(
     """
 
     calls: list[str] = []
-    context = _build_service_context(tmp_path)
+    context = _build_batch_tracking_service_context(tmp_path)
     context.service._docling_converter = _FakeDoclingConverter(calls)
     empty_file = tmp_path / file_name
     empty_file.write_bytes(b"")
 
     with pytest.raises(FinsUploadFailureError) as exc_info:
-        _prepare_filing_for_admission_test(service=context.service, files=[empty_file])
+        _prepare_filing_for_admission_test(
+            service=context.service,
+            files=[empty_file],
+            primary=empty_file,
+        )
 
     failure = exc_info.value.failure
     assert failure.kind is FinsUploadFailureKind.CONTENT
@@ -1083,7 +1104,11 @@ def test_corrupt_filing_wraps_each_closed_docling_failure_with_label_and_cause(
     )
 
     with pytest.raises(FinsUploadFailureError) as exc_info:
-        _prepare_filing_for_admission_test(service=context.service, files=[filing_file])
+        _prepare_filing_for_admission_test(
+            service=context.service,
+            files=[filing_file],
+            primary=filing_file,
+        )
 
     failure = exc_info.value.failure
     assert failure.kind is FinsUploadFailureKind.CONTENT
@@ -1111,7 +1136,7 @@ def test_corrupt_primary_with_valid_companions_fails_without_publication(
         AssertionError: fail-fast 或 zero-publication 不变量漂移时抛出。
     """
 
-    context = _build_service_context(tmp_path)
+    context = _build_batch_tracking_service_context(tmp_path)
     files = [tmp_path / name for name in ("bad.pdf", "later.docx")]
     for file_path in files:
         file_path.write_bytes(b"filing input")
@@ -1128,30 +1153,36 @@ def test_corrupt_primary_with_valid_companions_fails_without_publication(
     )
 
     with pytest.raises(FinsUploadFailureError):
-        _prepare_filing_for_admission_test(service=context.service, files=files)
+        _prepare_filing_for_admission_test(
+            service=context.service,
+            files=files,
+            primary=files[0],
+        )
 
     assert calls == [files[0].name]
+    assert isinstance(context.batching_repository, _BatchIdentityUploadBatchingRepository)
+    assert context.batching_repository.begin_calls == 0
     assert published_tree_sha256(tmp_path, "AAPL") == {}
 
 
 @pytest.mark.parametrize(
-    ("names", "expected_primary"),
+    ("names", "primary_index"),
     (
-        (("primary.html", "schema.xsd"), "primary_docling.json"),
-        (("primary.docx", "sheet.xlsx", "appendix.docx"), "primary_docling.json"),
+        (("report.xsd", "report.html"), 1),
+        (("sheet.xlsx", "primary.docx", "appendix.docx"), 1),
     ),
 )
 def test_filing_converts_only_primary_and_publishes_all_companions(
     tmp_path: Path,
     names: tuple[str, ...],
-    expected_primary: str,
+    primary_index: int,
 ) -> None:
     """filing 只转换 primary，companions 作为 original 同批发布。
 
     Args:
         tmp_path: pytest 临时目录。
-        names: primary 与 companions 的有序文件名。
-        expected_primary: 首文件转换直接产生的 primary document 名。
+        names: 用户请求顺序中的文件名。
+        primary_index: explicit primary 在请求中的位置。
 
     Returns:
         无。
@@ -1163,9 +1194,16 @@ def test_filing_converts_only_primary_and_publishes_all_companions(
     calls: list[str] = []
     context = _build_service_context(tmp_path)
     context.service._docling_converter = _FakeDoclingConverter(calls)
-    files = [tmp_path / name for name in names]
+    files = [(tmp_path / name).resolve(strict=False) for name in names]
     for file_path in files:
         file_path.write_bytes(f"original:{file_path.name}".encode())
+    primary = files[primary_index]
+    ordered_files = [primary, *(path for path in files if path != primary)]
+    original_identities = [
+        _build_filing_original_asset_identity(path)
+        for path in ordered_files
+    ]
+    expected_primary = f"{original_identities[0]}_docling.json"
 
     result = _execute_upload(
         service=context.service,
@@ -1177,6 +1215,7 @@ def test_filing_converts_only_primary_and_publishes_all_companions(
         internal_document_id="filing_roles",
         form_type="10-K",
         files=files,
+        filing_primary=primary,
         overwrite=False,
         meta={"ingest_method": "upload"},
     )
@@ -1188,18 +1227,123 @@ def test_filing_converts_only_primary_and_publishes_all_companions(
     entries = meta["files"]
     assert isinstance(entries, list)
 
-    assert calls == [names[0]]
+    assert calls == [primary.name]
     assert result.stored_file_count == len(names)
     assert result.payload["primary_document"] == expected_primary
     assert meta["primary_document"] == expected_primary
     assert len(entries) == len(names) + 1
-    assert [event.name for event in result.file_events if event.event_type == "conversion_started"] == [names[0]]
+    assert [event.name for event in result.file_events if event.event_type == "conversion_started"] == [primary.name]
     original_uploads = [
         event.name
         for event in result.file_events
         if event.event_type == "file_uploaded" and event.payload["source"] == "original"
     ]
-    assert original_uploads == list(names)
+    assert original_uploads == [path.name for path in ordered_files]
+    assert [entry["name"] for entry in entries] == [*original_identities, expected_primary]
+    for entry, file_path in zip(entries[:-1], ordered_files, strict=True):
+        assert entry["original_filename"] == file_path.name
+        assert "derived_from" not in entry
+        assert str(entry["uri"]).endswith(f"/{entry['name']}")
+    derived_entry = entries[-1]
+    assert derived_entry["original_filename"] == primary.name
+    assert derived_entry["derived_from"] == original_identities[0]
+    assert str(derived_entry["uri"]).endswith(f"/{expected_primary}")
+
+
+def test_filing_same_basename_assets_are_collision_free_and_path_private(tmp_path: Path) -> None:
+    """不同目录同 basename 必须产生不同且不泄漏绝对路径的 filing identity。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: identity、metadata 或 physical publication 发生碰撞时抛出。
+    """
+
+    first_dir = (tmp_path / "first").resolve(strict=False)
+    second_dir = (tmp_path / "second").resolve(strict=False)
+    first_dir.mkdir()
+    second_dir.mkdir()
+    first = first_dir / "report.pdf"
+    second = second_dir / "report.pdf"
+    first.write_bytes(b"first report")
+    second.write_bytes(b"second report")
+    context = _build_service_context(tmp_path)
+
+    result = _execute_upload(
+        service=context.service,
+        batching_repository=context.batching_repository,
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        action="create",
+        document_id="same_basename",
+        internal_document_id="same_basename",
+        form_type="10-K",
+        files=[first, second],
+        filing_primary=second,
+        overwrite=False,
+        meta={"ingest_method": "upload"},
+    )
+    meta = context.source_repository.get_source_meta("AAPL", "same_basename", SourceKind.FILING)
+    entries = meta["files"]
+    assert isinstance(entries, list)
+    originals = [entry for entry in entries if entry["source"] == "original"]
+    identities = [str(entry["name"]) for entry in originals]
+    expected_primary_original = _build_filing_original_asset_identity(second)
+
+    assert len(identities) == len(set(identities)) == 2
+    assert [entry["original_filename"] for entry in originals] == ["report.pdf", "report.pdf"]
+    assert all(str(tmp_path) not in identity for identity in identities)
+    assert all(len(identity.removeprefix("original-").removesuffix(".pdf")) == 64 for identity in identities)
+    assert result.payload["primary_document"] == f"{expected_primary_original}_docling.json"
+    handle = SourceHandle("AAPL", "same_basename", SourceKind.FILING.value)
+    assert {entry.uri.rsplit("/", maxsplit=1)[-1] for entry in context.blob_repository.list_files(handle)} == {
+        *identities,
+        f"{expected_primary_original}_docling.json",
+    }
+    with context.source_repository.read_source_snapshot(
+        "AAPL",
+        "same_basename",
+        SourceKind.FILING,
+        materialize_files=True,
+    ) as snapshot:
+        primary_source = snapshot.get_primary_source()
+        with primary_source.open() as stream:
+            assert stream.read() == b'{"name": "report.pdf", "source": "docling"}'
+        assert primary_source.uri.endswith(f"/{expected_primary_original}_docling.json")
+
+
+def test_filing_identity_is_stable_and_request_order_independent(tmp_path: Path) -> None:
+    """同一 normalized path 的 filing identity 必须稳定且不依赖请求顺序。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: identity 不稳定、混入顺序或泄漏路径明文时抛出。
+    """
+
+    first = (tmp_path / "first.pdf").resolve(strict=False)
+    second = (tmp_path / "second.pdf").resolve(strict=False)
+    forward = {
+        path: _build_filing_original_asset_identity(path)
+        for path in (first, second)
+    }
+    reverse = {
+        path: _build_filing_original_asset_identity(path)
+        for path in (second, first)
+    }
+
+    assert forward == reverse
+    assert forward[first] == _build_filing_original_asset_identity(first)
+    assert forward[first] != forward[second]
+    assert all(path.as_posix() not in identity for path, identity in forward.items())
 
 
 def test_empty_filing_companion_fails_before_conversion_and_publication(tmp_path: Path) -> None:
@@ -1227,11 +1371,122 @@ def test_empty_filing_companion_fails_before_conversion_and_publication(tmp_path
         _prepare_filing_for_admission_test(
             service=context.service,
             files=[primary, companion],
+            primary=primary,
         )
 
     assert exc_info.value.failure.code is FinsUploadFailureCode.EMPTY_INPUT_FILE
     assert exc_info.value.failure.file_label == companion.name
     assert calls == []
+    assert published_tree_sha256(tmp_path, "AAPL") == {}
+
+
+def test_filing_preparation_exactly_associates_derived_with_primary_original(tmp_path: Path) -> None:
+    """filing preparation 必须在 typed plan 中保存 exact original/derived 关联。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: pending asset 三字段或 converter 绑定漂移时抛出。
+    """
+
+    calls: list[str] = []
+    context = _build_service_context(tmp_path)
+    context.service._docling_converter = _FakeDoclingConverter(calls)
+    companion = (tmp_path / "report.xsd").resolve(strict=False)
+    primary = (tmp_path / "report.html").resolve(strict=False)
+    companion.write_bytes(b"companion")
+    primary.write_bytes(b"primary")
+
+    prepared = asyncio.run(
+        context.service.prepare_upload(
+            ticker="AAPL",
+            source_kind=SourceKind.FILING,
+            action="create",
+            document_id="exact_association",
+            internal_document_id="exact_association",
+            form_type="10-K",
+            selection=FinsUploadFilingFiles.for_upsert(
+                primary=primary,
+                companions=(companion,),
+            ),
+            overwrite=False,
+            previous_meta=None,
+            meta={"ingest_method": "upload"},
+            cancellation=None,
+        )
+    )
+    assert isinstance(prepared, _PreparedAssetMutation)
+    primary_identity = _build_filing_original_asset_identity(primary)
+    companion_identity = _build_filing_original_asset_identity(companion)
+
+    assert calls == [primary.name]
+    assert [(asset.name, asset.original_filename, asset.derived_from) for asset in prepared.pending_assets] == [
+        (primary_identity, primary.name, None),
+        (companion_identity, companion.name, None),
+        (f"{primary_identity}_docling.json", primary.name, primary_identity),
+    ]
+    assert prepared.primary_document == f"{primary_identity}_docling.json"
+    assert [event.name for event in prepared.conversion_events] == [primary.name]
+
+
+def test_filing_generated_identity_collision_fails_before_converter_and_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """defensive filing identity collision 必须在 converter/publication 前 fail closed。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest 属性替换器。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: collision 越过 preparation owner 时抛出。
+    """
+
+    def collide(_: Path) -> str:
+        """为两个不同路径返回同一合法形状 identity。
+
+        Args:
+            _: 忽略的 normalized path。
+
+        Returns:
+            固定 collision identity。
+
+        Raises:
+            无。
+        """
+
+        return f"original-{'0' * 64}.pdf"
+
+    calls: list[str] = []
+    context = _build_batch_tracking_service_context(tmp_path)
+    context.service._docling_converter = _FakeDoclingConverter(calls)
+    primary = (tmp_path / "primary.pdf").resolve(strict=False)
+    companion = (tmp_path / "companion.pdf").resolve(strict=False)
+    primary.write_bytes(b"primary")
+    companion.write_bytes(b"companion")
+    monkeypatch.setattr(
+        "dayu.fins.pipelines.docling_upload_service._build_filing_original_asset_identity",
+        collide,
+    )
+
+    with pytest.raises(RuntimeError, match="identity 必须唯一"):
+        _prepare_filing_for_admission_test(
+            service=context.service,
+            files=[primary, companion],
+            primary=primary,
+        )
+
+    assert calls == []
+    assert isinstance(context.batching_repository, _BatchIdentityUploadBatchingRepository)
+    assert context.batching_repository.begin_calls == 0
     assert published_tree_sha256(tmp_path, "AAPL") == {}
 
 
@@ -1315,6 +1570,27 @@ def test_execute_upload_material_converts_every_selected_file(tmp_path: Path) ->
     assert result.stored_file_count == 2
     assert result.payload["primary_document"] == "first_docling.json"
     assert len(result.file_events) == 6
+    meta = context.source_repository.get_source_meta(
+        "AAPL",
+        "material_multiple",
+        SourceKind.MATERIAL,
+    )
+    entries = meta["files"]
+    assert isinstance(entries, list)
+    assert [entry["name"] for entry in entries] == [
+        "first.pdf",
+        "second.docx",
+        "first_docling.json",
+        "second_docling.json",
+    ]
+    assert all("original_filename" not in entry for entry in entries)
+    assert all("derived_from" not in entry for entry in entries)
+    assert [event.name for event in result.file_events if event.event_type == "file_uploaded"] == [
+        "first.pdf",
+        "second.docx",
+        "first_docling.json",
+        "second_docling.json",
+    ]
 
 
 def test_prepare_material_cancellation_before_second_conversion_discards_partial_work(
@@ -1418,7 +1694,10 @@ def test_prepare_material_nth_conversion_failure_discards_partial_work(
         ),
         (
             SourceKind.MATERIAL,
-            FinsUploadFilingFiles.from_upsert_paths((Path("filing.pdf"),)),
+            FinsUploadFilingFiles.for_upsert(
+                primary=Path("filing.pdf"),
+                companions=(),
+            ),
         ),
     ),
 )
@@ -1525,7 +1804,9 @@ def test_prepare_upload_rejects_action_emptiness_mismatch_before_io(
     candidate = Path("candidate.pdf")
     if source_kind is SourceKind.FILING:
         selection: FinsUploadFilingFiles | FinsUploadMaterialFiles = (
-            FinsUploadFilingFiles.for_delete() if use_empty else FinsUploadFilingFiles.from_upsert_paths((candidate,))
+            FinsUploadFilingFiles.for_delete()
+            if use_empty
+            else FinsUploadFilingFiles.for_upsert(primary=candidate, companions=())
         )
     else:
         selection = (
@@ -1754,6 +2035,174 @@ def test_execute_upload_commit_failure_does_not_call_caller_rollback(tmp_path: P
         )
 
 
+def test_filing_final_source_failure_rolls_back_once_with_zero_publication(tmp_path: Path) -> None:
+    """filing final source failure 必须恰好一次 rollback 且 fresh target 零发布。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: rollback 次数或 published tree 原子性漂移时抛出。
+    """
+
+    events: list[str] = []
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching_repository = _BatchIdentityUploadBatchingRepository(tmp_path, repository_set, events)
+    source_repository = _FailingFinalUploadSourceRepository(tmp_path, repository_set, events)
+    service = DoclingUploadService(
+        source_repository=source_repository,
+        blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=repository_set),
+        docling_converter=_FakeDoclingConverter(),
+    )
+    sample_file = (tmp_path / "report.pdf").resolve(strict=False)
+    sample_file.write_bytes(b"filing")
+
+    with pytest.raises(RuntimeError, match="forced final upsert failure"):
+        _execute_upload(
+            service=service,
+            batching_repository=batching_repository,
+            ticker="AAPL",
+            source_kind=SourceKind.FILING,
+            action="create",
+            document_id="filing_final_failure",
+            internal_document_id="filing_final_failure",
+            form_type="10-K",
+            files=[sample_file],
+            filing_primary=sample_file,
+            overwrite=False,
+            meta={"ingest_method": "upload"},
+        )
+
+    assert batching_repository.begin_calls == 1
+    assert batching_repository.commit_calls == 0
+    assert batching_repository.rollback_calls == 1
+    assert published_tree_sha256(tmp_path, "AAPL") == {}
+    with pytest.raises(FileNotFoundError):
+        source_repository.get_source_meta(
+            "AAPL",
+            "filing_final_failure",
+            SourceKind.FILING,
+        )
+
+
+@pytest.mark.parametrize("fail_at", (1, 2, 3))
+def test_filing_fresh_blob_store_failure_rolls_back_once_with_zero_publication(
+    tmp_path: Path,
+    fail_at: int,
+) -> None:
+    """fresh filing 第 N 次 blob store 失败必须恰好回滚一次且零发布。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        fail_at: original/derived staging 中需要失败的写入次序。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: batch 计数、零发布或 source 不存在契约漂移时抛出。
+    """
+
+    events: list[str] = []
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching_repository = _BatchIdentityUploadBatchingRepository(tmp_path, repository_set, events)
+    source_repository = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    service = DoclingUploadService(
+        source_repository=source_repository,
+        blob_repository=_FailingNthUploadBlobRepository(
+            tmp_path,
+            repository_set,
+            fail_at=fail_at,
+        ),
+        docling_converter=_FakeDoclingConverter(),
+    )
+    companion = (tmp_path / "companion.pdf").resolve(strict=False)
+    primary = (tmp_path / "primary.pdf").resolve(strict=False)
+    companion.write_bytes(b"companion")
+    primary.write_bytes(b"primary")
+
+    with pytest.raises(RuntimeError, match="forced replacement blob failure"):
+        _execute_upload(
+            service=service,
+            batching_repository=batching_repository,
+            ticker="AAPL",
+            source_kind=SourceKind.FILING,
+            action="create",
+            document_id="filing_fresh_blob_failure",
+            internal_document_id="filing_fresh_blob_failure",
+            form_type="10-K",
+            files=[companion, primary],
+            filing_primary=primary,
+            overwrite=False,
+            meta={"ingest_method": "upload"},
+        )
+
+    assert batching_repository.begin_calls == 1
+    assert batching_repository.commit_calls == 0
+    assert batching_repository.rollback_calls == 1
+    assert published_tree_sha256(tmp_path, "AAPL") == {}
+    with pytest.raises(FileNotFoundError):
+        source_repository.get_source_meta(
+            "AAPL",
+            "filing_fresh_blob_failure",
+            SourceKind.FILING,
+        )
+
+
+def test_filing_commit_failure_leaves_fresh_target_unpublished(tmp_path: Path) -> None:
+    """storage-owned filing commit failure 必须清空 staging 且不触发 caller 二次 rollback。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: commit ownership 或零发布不变量漂移时抛出。
+    """
+
+    events: list[str] = []
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching_repository = _CommitFailingUploadBatchingRepository(tmp_path, repository_set, events)
+    source_repository = _SpyUploadSourceRepository(tmp_path, repository_set, events)
+    service = DoclingUploadService(
+        source_repository=source_repository,
+        blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=repository_set),
+        docling_converter=_FakeDoclingConverter(),
+    )
+    sample_file = (tmp_path / "report.pdf").resolve(strict=False)
+    sample_file.write_bytes(b"filing")
+
+    with pytest.raises(OSError, match="forced storage commit failure"):
+        _execute_upload(
+            service=service,
+            batching_repository=batching_repository,
+            ticker="AAPL",
+            source_kind=SourceKind.FILING,
+            action="create",
+            document_id="filing_commit_failure",
+            internal_document_id="filing_commit_failure",
+            form_type="10-K",
+            files=[sample_file],
+            filing_primary=sample_file,
+            overwrite=False,
+            meta={"ingest_method": "upload"},
+        )
+
+    assert batching_repository.caller_rollback_calls == 0
+    assert published_tree_sha256(tmp_path, "AAPL") == {}
+    with pytest.raises(FileNotFoundError):
+        source_repository.get_source_meta(
+            "AAPL",
+            "filing_commit_failure",
+            SourceKind.FILING,
+        )
+
+
 def test_commit_winner_ignores_cancel_after_ownership_transfer(tmp_path: Path) -> None:
     """commit ownership transfer 后的取消不得触发读取、rollback 或结果改写。
 
@@ -1961,6 +2410,7 @@ def test_prepare_upload_rejects_missing_update_before_shared_conversion(
                     source_kind=source_kind,
                     action="update",
                     files=[sample_file],
+                    filing_primary=sample_file if source_kind is SourceKind.FILING else None,
                 ),
                 overwrite=overwrite,
                 previous_meta=None,
@@ -2004,6 +2454,7 @@ def test_prepare_upload_rejects_existing_filing_create_before_conversion(tmp_pat
         internal_document_id="filing_existing",
         form_type="10-K",
         files=[sample_file],
+        filing_primary=sample_file,
         overwrite=False,
         meta={"ingest_method": "upload"},
     )
@@ -2023,7 +2474,10 @@ def test_prepare_upload_rejects_existing_filing_create_before_conversion(tmp_pat
                 document_id="filing_existing",
                 internal_document_id="filing_existing",
                 form_type="10-K",
-                selection=FinsUploadFilingFiles.from_upsert_paths((sample_file,)),
+                selection=FinsUploadFilingFiles.for_upsert(
+                    primary=sample_file,
+                    companions=(),
+                ),
                 overwrite=False,
                 previous_meta=previous_meta,
                 meta={"ingest_method": "upload"},
@@ -2066,13 +2520,16 @@ def test_prepare_upload_requires_canonical_boolean_deleted_state(
         [
             _PendingFileAsset(
                 name=sample_file.name,
+                original_filename=sample_file.name,
+                derived_from=None,
                 data=raw,
                 content_type="text/plain",
                 sha256=hashlib.sha256(raw).hexdigest(),
                 size=len(raw),
                 source="original",
             )
-        ]
+        ],
+        source_kind=SourceKind.FILING,
     )
     previous_meta: dict[str, JsonValue] = {"source_fingerprint": fingerprint}
     expected_error: type[KeyError] | type[ValueError]
@@ -2091,7 +2548,10 @@ def test_prepare_upload_requires_canonical_boolean_deleted_state(
                 document_id="filing_corrupt_meta",
                 internal_document_id="filing_corrupt_meta",
                 form_type="10-K",
-                selection=FinsUploadFilingFiles.from_upsert_paths((sample_file,)),
+                selection=FinsUploadFilingFiles.for_upsert(
+                    primary=sample_file,
+                    companions=(),
+                ),
                 overwrite=False,
                 previous_meta=previous_meta,
                 meta={"ingest_method": "upload"},
@@ -2156,6 +2616,7 @@ def test_execute_upload_deleted_input_republishes_complete_source(
         internal_document_id=document_id,
         form_type=form_type,
         files=[sample_file],
+        filing_primary=sample_file if source_kind is SourceKind.FILING else None,
         overwrite=False,
         meta=base_meta,
     )
@@ -2186,6 +2647,7 @@ def test_execute_upload_deleted_input_republishes_complete_source(
         internal_document_id=document_id,
         form_type=form_type,
         files=[sample_file],
+        filing_primary=sample_file if source_kind is SourceKind.FILING else None,
         overwrite=False,
         meta=base_meta,
     )
@@ -2244,8 +2706,8 @@ def test_execute_upload_existing_full_input_replaces_exact_complete_set(
     """
 
     context = _build_service_context(tmp_path)
-    old_dir = tmp_path / "old-input"
-    new_dir = tmp_path / "new-input"
+    old_dir = (tmp_path / "old-input").resolve(strict=False)
+    new_dir = (tmp_path / "new-input").resolve(strict=False)
     old_dir.mkdir()
     new_dir.mkdir()
     old_file = old_dir / old_name
@@ -2268,6 +2730,7 @@ def test_execute_upload_existing_full_input_replaces_exact_complete_set(
         internal_document_id=document_id,
         form_type=form_type,
         files=[old_file],
+        filing_primary=old_file if source_kind is SourceKind.FILING else None,
         overwrite=False,
         meta=base_meta,
     )
@@ -2284,6 +2747,7 @@ def test_execute_upload_existing_full_input_replaces_exact_complete_set(
         internal_document_id=document_id,
         form_type=form_type,
         files=[new_file],
+        filing_primary=new_file if source_kind is SourceKind.FILING else None,
         overwrite=overwrite,
         meta=base_meta,
     )
@@ -2293,13 +2757,23 @@ def test_execute_upload_existing_full_input_replaces_exact_complete_set(
     published_names = sorted(
         item.uri.rsplit("/", maxsplit=1)[-1] for item in context.blob_repository.list_files(handle)
     )
-    expected_names = sorted((new_name, f"{Path(new_name).stem}_docling.json"))
+    published_original_name = (
+        _build_filing_original_asset_identity(new_file)
+        if source_kind is SourceKind.FILING
+        else new_name
+    )
+    published_derived_name = (
+        f"{published_original_name}_docling.json"
+        if source_kind is SourceKind.FILING
+        else f"{Path(new_name).stem}_docling.json"
+    )
+    expected_names = sorted((published_original_name, published_derived_name))
     integrity = context.source_repository.classify_source_integrity("AAPL", document_id, source_kind)
 
     assert result.status == "uploaded"
     assert result.stored_file_count == 1
     assert published_names == expected_names
-    assert context.blob_repository.read_file_bytes(handle, new_name) == b"new bytes"
+    assert context.blob_repository.read_file_bytes(handle, published_original_name) == b"new bytes"
     assert final_meta["document_version"] == "v2"
     assert final_meta["first_ingested_at"] == initial_meta["first_ingested_at"]
     assert final_meta["created_at"] == initial_meta["created_at"]
@@ -2367,6 +2841,174 @@ def test_execute_upload_skips_when_source_fingerprint_matches(tmp_path: Path) ->
     assert second.stored_file_count == 0
     assert calls == ["deck.pdf"]
     assert all(event.event_type == "file_skipped" for event in second.file_events)
+
+
+def test_filing_fingerprint_excludes_path_identity_but_tracks_filename_and_content(tmp_path: Path) -> None:
+    """filing fingerprint 必须忽略目录 identity，同时保留 basename 与内容语义。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: move/rename/content change 的 skip/version 语义漂移时抛出。
+    """
+
+    calls: list[str] = []
+    context = _build_service_context(tmp_path)
+    context.service._docling_converter = _FakeDoclingConverter(calls)
+    first_dir = (tmp_path / "first").resolve(strict=False)
+    moved_dir = (tmp_path / "moved").resolve(strict=False)
+    first_dir.mkdir()
+    moved_dir.mkdir()
+    first = first_dir / "report.pdf"
+    moved = moved_dir / "report.pdf"
+    renamed = moved_dir / "renamed.pdf"
+    first.write_bytes(b"same content")
+    moved.write_bytes(b"same content")
+    renamed.write_bytes(b"same content")
+
+    created = _execute_upload(
+        service=context.service,
+        batching_repository=context.batching_repository,
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        action="create",
+        document_id="fingerprint_contract",
+        internal_document_id="fingerprint_contract",
+        form_type="10-K",
+        files=[first],
+        filing_primary=first,
+        overwrite=False,
+        meta={"ingest_method": "upload"},
+    )
+    created_meta = context.source_repository.get_source_meta(
+        "AAPL",
+        "fingerprint_contract",
+        SourceKind.FILING,
+    )
+    moved_result = _execute_upload(
+        service=context.service,
+        batching_repository=context.batching_repository,
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        action="update",
+        document_id="fingerprint_contract",
+        internal_document_id="fingerprint_contract",
+        form_type="10-K",
+        files=[moved],
+        filing_primary=moved,
+        overwrite=False,
+        meta={"ingest_method": "upload"},
+    )
+    moved_meta = context.source_repository.get_source_meta(
+        "AAPL",
+        "fingerprint_contract",
+        SourceKind.FILING,
+    )
+    renamed_result = _execute_upload(
+        service=context.service,
+        batching_repository=context.batching_repository,
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        action="update",
+        document_id="fingerprint_contract",
+        internal_document_id="fingerprint_contract",
+        form_type="10-K",
+        files=[renamed],
+        filing_primary=renamed,
+        overwrite=False,
+        meta={"ingest_method": "upload"},
+    )
+    renamed_meta = context.source_repository.get_source_meta(
+        "AAPL",
+        "fingerprint_contract",
+        SourceKind.FILING,
+    )
+    renamed.write_bytes(b"changed content")
+    changed_result = _execute_upload(
+        service=context.service,
+        batching_repository=context.batching_repository,
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        action="update",
+        document_id="fingerprint_contract",
+        internal_document_id="fingerprint_contract",
+        form_type="10-K",
+        files=[renamed],
+        filing_primary=renamed,
+        overwrite=False,
+        meta={"ingest_method": "upload"},
+    )
+    changed_meta = context.source_repository.get_source_meta(
+        "AAPL",
+        "fingerprint_contract",
+        SourceKind.FILING,
+    )
+
+    assert _build_filing_original_asset_identity(first) != _build_filing_original_asset_identity(moved)
+    assert created.status == "uploaded"
+    assert moved_result.status == "skipped"
+    assert moved_meta["source_fingerprint"] == created_meta["source_fingerprint"]
+    assert moved_meta["document_version"] == "v1"
+    assert renamed_result.status == "uploaded"
+    assert renamed_meta["document_version"] == "v2"
+    assert renamed_meta["source_fingerprint"] != created_meta["source_fingerprint"]
+    assert changed_result.status == "uploaded"
+    assert changed_meta["document_version"] == "v3"
+    assert changed_meta["source_fingerprint"] != renamed_meta["source_fingerprint"]
+    assert calls == ["report.pdf", "renamed.pdf", "renamed.pdf"]
+
+
+def test_filing_one_hundred_originals_publish_with_one_conversion(tmp_path: Path) -> None:
+    """100 个 filing inputs 必须发布 N+1 资产且只转换 explicit primary 一次。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: inclusive 上限、守恒计数或单转换语义漂移时抛出。
+    """
+
+    calls: list[str] = []
+    context = _build_service_context(tmp_path)
+    context.service._docling_converter = _FakeDoclingConverter(calls)
+    files = [
+        (tmp_path / f"input-{index:03d}.pdf").resolve(strict=False)
+        for index in range(100)
+    ]
+    for index, file_path in enumerate(files):
+        file_path.write_bytes(f"content:{index}".encode())
+    primary = files[73]
+
+    result = _execute_upload(
+        service=context.service,
+        batching_repository=context.batching_repository,
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        action="create",
+        document_id="hundred_inputs",
+        internal_document_id="hundred_inputs",
+        form_type="10-K",
+        files=files,
+        filing_primary=primary,
+        overwrite=False,
+        meta={"ingest_method": "upload"},
+    )
+    meta = context.source_repository.get_source_meta("AAPL", "hundred_inputs", SourceKind.FILING)
+    entries = meta["files"]
+    assert isinstance(entries, list)
+
+    assert result.stored_file_count == 100
+    assert len(entries) == 101
+    assert len({str(entry["name"]) for entry in entries}) == 101
+    assert calls == [primary.name]
+    assert meta["primary_document"] == f"{_build_filing_original_asset_identity(primary)}_docling.json"
 
 
 @pytest.mark.parametrize("cancel_at", (2, 4, 5))
@@ -2482,6 +3124,7 @@ def test_existing_replacement_blob_failure_keeps_entire_published_tree(
         internal_document_id="filing_blob_failure",
         form_type="10-K",
         files=[old_file],
+        filing_primary=old_file,
         overwrite=False,
         meta={"ingest_method": "upload"},
     )
@@ -2507,6 +3150,7 @@ def test_existing_replacement_blob_failure_keeps_entire_published_tree(
             internal_document_id="filing_blob_failure",
             form_type="10-K",
             files=[new_file],
+            filing_primary=new_file,
             overwrite=False,
             meta={"ingest_method": "upload"},
         )
@@ -2703,18 +3347,18 @@ def test_upload_source_fingerprint_is_stable() -> None:
     """
 
     first = [
-        _PendingFileAsset("b.pdf", b"b", "application/pdf", "sha-b", 1, "original"),
-        _PendingFileAsset("a.pdf", b"a", "application/pdf", "sha-a", 1, "original"),
+        _PendingFileAsset("b.pdf", None, None, b"b", "application/pdf", "sha-b", 1, "original"),
+        _PendingFileAsset("a.pdf", None, None, b"a", "application/pdf", "sha-a", 1, "original"),
     ]
     second = [
-        _PendingFileAsset("a.pdf", b"a", "application/pdf", "sha-a", 1, "original"),
-        _PendingFileAsset("b.pdf", b"b", "application/pdf", "sha-b", 1, "original"),
+        _PendingFileAsset("a.pdf", None, None, b"a", "application/pdf", "sha-a", 1, "original"),
+        _PendingFileAsset("b.pdf", None, None, b"b", "application/pdf", "sha-b", 1, "original"),
     ]
 
     expected_digest = "099dc9636e306c75f1d5d64dd0210123956ba73888e968088c7279baab1d7fdd"
 
-    assert _build_upload_source_fingerprint(first) == expected_digest
-    assert _build_upload_source_fingerprint(second) == expected_digest
+    assert _build_upload_source_fingerprint(first, source_kind=SourceKind.MATERIAL) == expected_digest
+    assert _build_upload_source_fingerprint(second, source_kind=SourceKind.MATERIAL) == expected_digest
 
 
 def test_execute_upload_counts_only_successful_original_stores(tmp_path: Path) -> None:
@@ -2746,6 +3390,7 @@ def test_execute_upload_counts_only_successful_original_stores(tmp_path: Path) -
         internal_document_id="filing_two_originals",
         form_type="10-K",
         files=[first_file, second_file],
+        filing_primary=first_file,
         overwrite=False,
         meta={"ingest_method": "upload"},
     )

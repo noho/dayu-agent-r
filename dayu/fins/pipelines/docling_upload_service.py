@@ -60,6 +60,9 @@ JsonObject: TypeAlias = dict[str, JsonValue]
 
 UPLOAD_ACTIONS: Final[frozenset[str]] = frozenset({"create", "update", "delete"})
 DOCLING_FILE_SUFFIX: Final[str] = "_docling.json"
+_FILING_ASSET_IDENTITY_NAMESPACE: Final[str] = "fins-upload-asset-v1"
+_FILING_ASSET_IDENTITY_SEPARATOR: Final[bytes] = b"\0"
+_FILING_ORIGINAL_ASSET_PREFIX: Final[str] = "original-"
 _AssetSource: TypeAlias = Literal["original", "docling"]
 _ASSET_SOURCE_ORIGINAL: Final[_AssetSource] = "original"
 _ASSET_SOURCE_DOCLING: Final[_AssetSource] = "docling"
@@ -111,9 +114,22 @@ class UploadOperationResult:
 
 @dataclass(frozen=True)
 class _PendingFileAsset:
-    """待落盘文件资产。"""
+    """待落盘文件资产。
+
+    Attributes:
+        name: 仓储文件身份。
+        original_filename: filing 用户输入 basename；material 为 ``None``。
+        derived_from: filing derived 对应的 exact original identity；其余为 ``None``。
+        data: 文件内容。
+        content_type: 文件内容类型。
+        sha256: 文件内容 SHA-256。
+        size: 文件字节数。
+        source: original 或 Docling 派生来源。
+    """
 
     name: str
+    original_filename: str | None
+    derived_from: str | None
     data: bytes
     content_type: str | None
     sha256: str
@@ -327,7 +343,10 @@ class DoclingUploadService:
             validated_files,
             source_kind=source_kind,
         )
-        source_fingerprint = _build_upload_source_fingerprint(original_assets)
+        source_fingerprint = _build_upload_source_fingerprint(
+            original_assets,
+            source_kind=source_kind,
+        )
         if _can_skip_upload(normalized_previous_meta, source_fingerprint, overwrite):
             Log.info(
                 f"文档已存在且未变更，跳过上传: ticker={normalized_ticker} document_id={document_id}",
@@ -540,11 +559,22 @@ class DoclingUploadService:
             )
             if asset.source == _ASSET_SOURCE_ORIGINAL:
                 stored_original_count += 1
-            stored_entries.append(_build_stored_file_entry(asset=asset, file_meta=file_meta))
+            stored_entries.append(
+                _build_stored_file_entry(
+                    asset=asset,
+                    file_meta=file_meta,
+                    source_kind=source_kind,
+                )
+            )
+            event_name = (
+                _require_filing_original_filename(asset)
+                if source_kind is SourceKind.FILING
+                else asset.name
+            )
             file_events.append(
                 UploadFileEventPayload(
                     event_type="file_uploaded",
-                    name=asset.name,
+                    name=event_name,
                     payload={
                         "source": asset.source,
                         "size": file_meta.size,
@@ -718,9 +748,16 @@ class DoclingUploadService:
                 raise FinsUploadFailureError(fins_upload_empty_input_failure(file_label))
             raw_sha256 = hashlib.sha256(raw_data).hexdigest()
             raw_content_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+            asset_name = (
+                _build_filing_original_asset_identity(file_path)
+                if source_kind is SourceKind.FILING
+                else file_path.name
+            )
             assets.append(
                 _PendingFileAsset(
-                    name=file_path.name,
+                    name=asset_name,
+                    original_filename=file_path.name if source_kind is SourceKind.FILING else None,
+                    derived_from=None,
                     data=raw_data,
                     content_type=raw_content_type,
                     sha256=raw_sha256,
@@ -728,6 +765,8 @@ class DoclingUploadService:
                     source=_ASSET_SOURCE_ORIGINAL,
                 )
             )
+        if source_kind is SourceKind.FILING:
+            _require_unique_filing_original_identities(assets)
         return assets
 
     async def _build_pending_assets(
@@ -764,9 +803,16 @@ class DoclingUploadService:
         conversion_events: list[UploadFileEventPayload] = []
         primary_document: str | None = None
         for index, file_path in enumerate(preparation.converter_inputs):
-            if preparation.ordered_files[index] != file_path:
-                raise ValueError("converter_inputs 必须保持 ordered_files 的前缀顺序")
-            original_asset = original_assets[index]
+            if source_kind is SourceKind.FILING:
+                try:
+                    original_index = preparation.ordered_files.index(file_path)
+                except ValueError as exc:
+                    raise ValueError("filing converter input 必须精确命中 original") from exc
+            else:
+                if preparation.ordered_files[index] != file_path:
+                    raise ValueError("material converter_inputs 必须保持 ordered_files 的前缀顺序")
+                original_index = index
+            original_asset = original_assets[original_index]
             if _is_cancelled(cancellation):
                 raise DoclingConversionCancelledError()
             conversion_events.append(
@@ -801,13 +847,22 @@ class DoclingUploadService:
                 )
                 raise FinsUploadFailureError(failure) from exc
             docling_data = conversion.json_bytes
-            docling_name = f"{file_path.stem}{DOCLING_FILE_SUFFIX}"
+            if source_kind is SourceKind.FILING:
+                docling_name = _build_filing_derived_asset_identity(original_asset.name)
+                original_filename = _require_filing_original_filename(original_asset)
+                derived_from = original_asset.name
+            else:
+                docling_name = f"{file_path.stem}{DOCLING_FILE_SUFFIX}"
+                original_filename = None
+                derived_from = None
             if primary_document is None:
                 primary_document = docling_name
             docling_sha256 = conversion.sha256
             assets.append(
                 _PendingFileAsset(
                     name=docling_name,
+                    original_filename=original_filename,
+                    derived_from=derived_from,
                     data=docling_data,
                     content_type="application/json",
                     sha256=docling_sha256,
@@ -1032,6 +1087,87 @@ def _prepare_upload_selection(
     raise ValueError(f"不支持的 source_kind: {source_kind}")
 
 
+def _build_filing_original_asset_identity(normalized_path: Path) -> str:
+    """从已规范化绝对路径构建 filing original 仓储身份。
+
+    Args:
+        normalized_path: validated selection 提供的绝对规范路径。
+
+    Returns:
+        不含绝对路径明文、使用完整 SHA-256 的稳定文件身份。
+
+    Raises:
+        TypeError: 输入不是 ``Path`` 时抛出。
+        ValueError: 输入不是 absolute normalized path 时抛出。
+    """
+
+    if not isinstance(normalized_path, Path):
+        raise TypeError("filing asset identity 输入必须是 Path")
+    if not normalized_path.is_absolute() or normalized_path.resolve(strict=False) != normalized_path:
+        raise ValueError("filing asset identity 输入必须是 absolute normalized path")
+    digest_input = (
+        _FILING_ASSET_IDENTITY_NAMESPACE.encode("utf-8")
+        + _FILING_ASSET_IDENTITY_SEPARATOR
+        + normalized_path.as_posix().encode("utf-8")
+    )
+    path_digest = hashlib.sha256(digest_input).hexdigest()
+    return f"{_FILING_ORIGINAL_ASSET_PREFIX}{path_digest}{normalized_path.suffix.lower()}"
+
+
+def _build_filing_derived_asset_identity(original_identity: str) -> str:
+    """从 exact filing original identity 构建 Docling 派生身份。
+
+    Args:
+        original_identity: 同次 preparation 产生的 original 仓储身份。
+
+    Returns:
+        直接追加 Docling 后缀的派生身份。
+
+    Raises:
+        ValueError: original identity 为空或不属于 filing namespace 时抛出。
+    """
+
+    if not original_identity.startswith(_FILING_ORIGINAL_ASSET_PREFIX):
+        raise ValueError("filing derived identity 必须来自 exact original identity")
+    return f"{original_identity}{DOCLING_FILE_SUFFIX}"
+
+
+def _require_unique_filing_original_identities(assets: list[_PendingFileAsset]) -> None:
+    """断言同次请求产生的 filing original identities 唯一。
+
+    Args:
+        assets: 已读取并完成身份投影的 filing originals。
+
+    Returns:
+        全部 identity 唯一时返回 ``None``。
+
+    Raises:
+        RuntimeError: digest collision 或 identity 实现错误导致重复时抛出。
+    """
+
+    identities = [asset.name for asset in assets]
+    if len(identities) != len(set(identities)):
+        raise RuntimeError("filing original asset identity 必须唯一")
+
+
+def _require_filing_original_filename(asset: _PendingFileAsset) -> str:
+    """读取 filing asset 的用户可读 original filename。
+
+    Args:
+        asset: filing original 或 derived 资产。
+
+    Returns:
+        非空用户输入 basename。
+
+    Raises:
+        ValueError: filing asset 缺少 original filename 时抛出。
+    """
+
+    if asset.original_filename is None or not asset.original_filename:
+        raise ValueError("filing asset 必须携带 original_filename")
+    return asset.original_filename
+
+
 def _validate_source_files(files: tuple[Path, ...]) -> list[Path]:
     """校验上传文件列表。
 
@@ -1084,28 +1220,54 @@ def _can_skip_upload(
     return bool(previous_fingerprint) and previous_fingerprint == source_fingerprint
 
 
-def _build_upload_source_fingerprint(assets: list[_PendingFileAsset]) -> str:
+def _build_upload_source_fingerprint(
+    assets: list[_PendingFileAsset],
+    *,
+    source_kind: SourceKind,
+) -> str:
     """构建上传源指纹。
 
     Args:
         assets: 待上传资产列表。
+        source_kind: filing 或 material 来源类型。
 
     Returns:
         指纹字符串。
 
     Raises:
-        无。
+        ValueError: filing asset 缺少 ``original_filename``，或 source kind 不受支持时抛出。
     """
 
-    payload: list[JsonObject] = [
-        {
-            "name": asset.name,
-            "sha256": asset.sha256,
-            "size": asset.size,
-            "source": asset.source,
-        }
-        for asset in sorted(assets, key=lambda item: item.name)
-    ]
+    if source_kind is SourceKind.FILING:
+        payload: list[JsonObject] = [
+            {
+                "original_filename": _require_filing_original_filename(asset),
+                "sha256": asset.sha256,
+                "size": asset.size,
+                "source": asset.source,
+            }
+            for asset in sorted(
+                assets,
+                key=lambda item: (
+                    _require_filing_original_filename(item),
+                    item.sha256,
+                    item.size,
+                    item.source,
+                ),
+            )
+        ]
+    elif source_kind is SourceKind.MATERIAL:
+        payload = [
+            {
+                "name": asset.name,
+                "sha256": asset.sha256,
+                "size": asset.size,
+                "source": asset.source,
+            }
+            for asset in sorted(assets, key=lambda item: item.name)
+        ]
+    else:
+        raise ValueError(f"不支持的 source_kind: {source_kind}")
     serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
@@ -1430,21 +1592,27 @@ def _normalize_optional_upload_fiscal_period(fiscal_period: str | None) -> str |
     return normalized_period
 
 
-def _build_stored_file_entry(*, asset: _PendingFileAsset, file_meta: FileObjectMeta) -> JsonObject:
+def _build_stored_file_entry(
+    *,
+    asset: _PendingFileAsset,
+    file_meta: FileObjectMeta,
+    source_kind: SourceKind,
+) -> JsonObject:
     """构建已落盘文件条目。
 
     Args:
         asset: 上传资产。
         file_meta: blob 仓储返回的文件元数据。
+        source_kind: filing 或 material 来源类型。
 
     Returns:
         source meta files 条目。
 
     Raises:
-        无。
+        ValueError: filing asset 缺少 ``original_filename`` 时抛出。
     """
 
-    return {
+    entry: JsonObject = {
         "name": asset.name,
         "uri": file_meta.uri,
         "etag": file_meta.etag,
@@ -1455,6 +1623,11 @@ def _build_stored_file_entry(*, asset: _PendingFileAsset, file_meta: FileObjectM
         "ingested_at": now_iso8601(),
         "source": asset.source,
     }
+    if source_kind is SourceKind.FILING:
+        entry["original_filename"] = _require_filing_original_filename(asset)
+        if asset.derived_from is not None:
+            entry["derived_from"] = asset.derived_from
+    return entry
 
 
 def _build_cancelled_result(*, document_id: str, internal_document_id: str) -> UploadOperationResult:

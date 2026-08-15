@@ -25,6 +25,7 @@ from tests.fins.company_meta_test_support import stage_company_meta_fixture
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.source import Source
+from dayu.documents.processors.base import DocumentProcessor
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.fins import ticker_normalization
 import dayu.fins.download_contract as download_contract
@@ -113,6 +114,7 @@ from dayu.fins.ingestion_runtime import (
     fins_upload_usage_failure,
     validate_fins_upload_filing_request,
 )
+from dayu.fins.pipelines.docling_upload_service import _build_filing_original_asset_identity
 from dayu.fins.upload_failure import (
     FinsUploadFailureCode,
     FinsUploadFailureKind,
@@ -6627,11 +6629,13 @@ def test_start_upload_with_runner_writes_bounded_result_summary(tmp_path: Path) 
 @pytest.mark.asyncio
 async def test_direct_upload_filing_success_publishes_fins_assets_without_host_or_legacy_artifacts(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """direct upload_filing 成功正控只发布 Fins 资产，不创建 Host 或 legacy job 事实。
 
     Args:
         tmp_path: pytest 临时目录夹具。
+        monkeypatch: processor registry spy 注入夹具。
 
     Returns:
         无。
@@ -6691,17 +6695,69 @@ async def test_direct_upload_filing_success_publishes_fins_assets_without_host_o
     published_names = sorted(
         item.uri.rsplit("/", maxsplit=1)[-1] for item in default_runtime.blob_repository.list_files(source_handle)
     )
+    original_identity = _build_filing_original_asset_identity(upload_file.resolve(strict=False))
+    derived_identity = f"{original_identity}_docling.json"
     assert source_meta["ingest_method"] == "upload"
-    assert source_meta["primary_document"] == "report_docling.json"
-    assert published_names == ["report.pdf", "report_docling.json"]
-    assert default_runtime.blob_repository.read_file_bytes(source_handle, "report.pdf") == original_bytes
+    assert source_meta["primary_document"] == derived_identity
+    assert published_names == sorted((original_identity, derived_identity))
+    assert default_runtime.blob_repository.read_file_bytes(source_handle, original_identity) == original_bytes
     assert (
         default_runtime.blob_repository.read_file_bytes(
             source_handle,
-            "report_docling.json",
+            derived_identity,
         )
         == b'{"name": "report.pdf", "format": "docling"}'
     )
+    processor_inputs: list[bytes] = []
+    original_create = ingestion.processor_registry.create_with_fallback
+
+    def observe_processor_source(
+        source: Source,
+        *,
+        form_type: str | None = None,
+        media_type: str | None = None,
+        on_fallback: Callable[[type[DocumentProcessor], Exception, int, int], None] | None = None,
+    ) -> DocumentProcessor:
+        """记录 process_filing 交给 registry 的 exact snapshot primary。
+
+        Args:
+            source: snapshot ``get_primary_source()`` 返回的 source。
+            form_type: 可选 filing form type。
+            media_type: 可选媒体类型。
+            on_fallback: 可选 processor fallback 回调。
+
+        Returns:
+            真实 registry 创建的 processor。
+
+        Raises:
+            OSError: source 无法读取时抛出。
+            ValueError: 没有候选 processor 时抛出。
+            RuntimeError: 全部候选 processor 创建失败时抛出。
+        """
+
+        with source.open() as stream:
+            processor_inputs.append(stream.read())
+        return original_create(
+            source,
+            form_type=form_type,
+            media_type=media_type,
+            on_fallback=on_fallback,
+        )
+
+    monkeypatch.setattr(
+        ingestion.processor_registry,
+        "create_with_fallback",
+        observe_processor_source,
+    )
+    process_status = ingestion._preprocess_one_document(
+        ticker="AAPL",
+        document_id=document_id,
+        source_kind=SourceKind.FILING,
+        rebuild_processed=False,
+    )
+
+    assert process_status == "processed"
+    assert processor_inputs == [b'{"name": "report.pdf", "format": "docling"}']
     assert default_runtime.company_repository.get_company_meta("AAPL").company_name == "Apple Inc."
 
     job_store = ingestion.job_store
@@ -7839,11 +7895,13 @@ def test_default_runtime_start_upload_sec_filing_uses_production_runner(tmp_path
     assert record.status is FinsIngestionJobStatus.SUCCEEDED
     assert record.result_summary["source_kind"] == "filing"
     assert record.result_summary["status"] == "ok"
-    assert record.result_summary["primary_document"] == "aapl-10q_docling.json"
+    original_identity = _build_filing_original_asset_identity(filing_file.resolve(strict=False))
+    derived_identity = f"{original_identity}_docling.json"
+    assert record.result_summary["primary_document"] == derived_identity
     document_id = str(record.result_summary["document_id"])
     meta = ingestion.source_repository.get_source_meta("AAPL", document_id, SourceKind.FILING)
     assert meta["ingest_method"] == "upload"
-    assert meta["primary_document"] == "aapl-10q_docling.json"
+    assert meta["primary_document"] == derived_identity
     assert [event.source_event_type for event in progress_events] == [
         "upload.started",
         "upload.completed",

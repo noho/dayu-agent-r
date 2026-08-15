@@ -1196,6 +1196,89 @@ def _build_runtime(
     return runtime, source_repository, registry
 
 
+def test_read_runtime_consumes_exact_opaque_primary_instead_of_original_or_companion(tmp_path: Path) -> None:
+    """read runtime 必须只把 snapshot exact primary 交给 processor registry。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: read runtime 扫描 original/companion 或重选 primary 时抛出。
+    """
+
+    runtime, repository, registry = _build_runtime(tmp_path)
+    original_name = f"original-{'a' * 64}.pdf"
+    companion_name = f"original-{'b' * 64}.xsd"
+    derived_name = f"{original_name}_docling.json"
+    batch = repository._batching_repository.begin_batch("AAPL")
+    try:
+        repository.reset_source_document(
+            ticker="AAPL",
+            document_id="doc-1",
+            source_kind=SourceKind.FILING,
+            batch=batch,
+        )
+        handle = SourceHandle("AAPL", "doc-1", SourceKind.FILING.value)
+        files = [
+            repository._blob_repository.store_file(
+                handle,
+                original_name,
+                BytesIO(b"original-must-not-be-selected"),
+                batch=batch,
+                content_type="application/pdf",
+            ),
+            repository._blob_repository.store_file(
+                handle,
+                companion_name,
+                BytesIO(b"companion-must-not-be-selected"),
+                batch=batch,
+                content_type="application/xml",
+            ),
+            repository._blob_repository.store_file(
+                handle,
+                derived_name,
+                BytesIO(b"exact-derived-primary"),
+                batch=batch,
+                content_type="application/json",
+            ),
+        ]
+        repository.create_source_document(
+            SourceDocumentUpsertRequest(
+                ticker="AAPL",
+                document_id="doc-1",
+                internal_document_id="doc-1",
+                form_type="10-K",
+                primary_document=derived_name,
+                files=files,
+                meta={
+                    "ingest_method": "upload",
+                    "source_provider": FinsSourceProvider.USER_UPLOAD.to_storage_value(),
+                    "ingest_complete": True,
+                    "is_deleted": False,
+                    "source_fingerprint": "opaque-primary",
+                },
+            ),
+            SourceKind.FILING,
+            batch=batch,
+        )
+    except BaseException:
+        repository._batching_repository.rollback_batch(batch)
+        raise
+    repository._batching_repository.commit_batch(batch)
+
+    result = runtime.get_document_sections(ticker="AAPL", document_id="doc-1")
+    section = runtime.read_section(ticker="AAPL", document_id="doc-1", ref="s_0001")
+
+    assert registry.create_count == 1
+    assert [processor.label for processor in registry.created] == ["exact-derived-primary"]
+    assert result["sections"][0]["title"] == "Overview"
+    assert section["content"] == "exact-derived-primary"
+    runtime.close()
+
+
 def _update_source(
     repository: _RevisionProbeRepository,
     *,

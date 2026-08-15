@@ -23,6 +23,7 @@ from dayu.fins.ingestion_runtime import (
     ValidatedFinsUploadFilingRequest,
 )
 from dayu.fins.pipelines.sec_pipeline import SecPipeline
+from dayu.fins.pipelines.docling_upload_service import _build_filing_original_asset_identity
 from dayu.fins.pipelines.docling_process_converter import (
     DoclingConversionConfig,
     DoclingConversionCancelledError,
@@ -288,7 +289,7 @@ def _validated_sec_filing_request(
         FinsUploadFilingRequest(
             ticker="AAPL",
             action=action or "auto",
-            files=(filing_file,),
+            files=() if action == "delete" else (filing_file,),
             fiscal_year=fiscal_year,
             fiscal_period=fiscal_period,
             filing_date=filing_date,
@@ -730,7 +731,8 @@ async def test_upload_filing_stream_renamed_update_without_overwrite_replaces_co
         SourceKind.FILING,
     )
     file_names = sorted(meta.uri.split("/")[-1] for meta in pipeline._blob_repository.list_files(handle))
-    assert file_names == ["q1_renamed.pdf", "q1_renamed_docling.json"]
+    original_identity = _build_filing_original_asset_identity(new_file.resolve(strict=False))
+    assert file_names == sorted((original_identity, f"{original_identity}_docling.json"))
     assert pipeline._company_repository.get_company_meta("AAPL") == company_meta
     assert (
         pipeline._source_repository.get_source_meta(
@@ -1034,7 +1036,10 @@ async def test_upload_filing_consumes_fresh_authoritative_file_selection(
         validated = owner_validator(raw_request, published_state=published_state)
         return replace(
             validated,
-            file_selection=FinsUploadFilingFiles.from_upsert_paths((authoritative_file,)),
+            file_selection=FinsUploadFilingFiles.for_upsert(
+                primary=authoritative_file,
+                companions=(),
+            ),
         )
 
     monkeypatch.setattr(
@@ -1054,7 +1059,8 @@ async def test_upload_filing_consumes_fresh_authoritative_file_selection(
     stored_names = sorted(item.uri.rsplit("/", maxsplit=1)[-1] for item in pipeline._blob_repository.list_files(handle))
 
     assert calls == ["authoritative.docx"]
-    assert stored_names == ["authoritative.docx", "authoritative_docling.json"]
+    original_identity = _build_filing_original_asset_identity(authoritative_file.resolve(strict=False))
+    assert stored_names == sorted((original_identity, f"{original_identity}_docling.json"))
 
 
 @pytest.mark.asyncio
@@ -1316,7 +1322,11 @@ async def test_upload_filing_corrupt_primary_with_valid_companions_fails_atomica
     )
     request = replace(
         first_request,
-        request=replace(first_request.request, files=(corrupt_file, companion_file, later_file)),
+        request=replace(
+            first_request.request,
+            files=(corrupt_file, companion_file, later_file),
+            primary_selectors=(corrupt_file,),
+        ),
     )
 
     with caplog.at_level("ERROR"):
