@@ -1,14 +1,19 @@
-"""Docling 运行时各次尝试独立输入流的契约测试。"""
+"""Docling 产品转换能力与运行时回退装配的 owner 契约测试。"""
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import pytest
+from docling.backend.docling_parse_backend import DoclingParseDocumentBackend
 from docling.datamodel.accelerator_options import AcceleratorDevice
-from docling.datamodel.base_models import DocumentStream
-from docling.datamodel.pipeline_options import TableFormerMode
+from docling.datamodel.base_models import DocumentStream, FormatToExtensions, InputFormat
+from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode
+from docling.document_converter import PdfFormatOption
 
 from dayu.documents import docling_runtime
 
@@ -32,6 +37,34 @@ _NON_WINDOWS_PLATFORM = "darwin"
 _WINDOWS_PLATFORM = "win32"
 _STREAM_NAME = "annual-report.pdf"
 _PDF_BYTES = b"%PDF-1.7\nowner-stream-contract\n%%EOF"
+_EXPECTED_PRODUCT_FORMATS = (
+    ("PDF", (".pdf",)),
+    ("DOCX", (".docx",)),
+    ("PPTX", (".pptx",)),
+    ("HTML", (".htm", ".html", ".xhtml")),
+    ("MD", (".md", ".txt")),
+    ("CSV", (".csv",)),
+    ("XLSX", (".xlsx",)),
+    ("XML_XBRL", (".xbrl", ".xml")),
+    ("JSON_DOCLING", (".json",)),
+)
+_EXPECTED_PRODUCT_SUFFIXES = (
+    ".pdf",
+    ".docx",
+    ".pptx",
+    ".htm",
+    ".html",
+    ".xhtml",
+    ".md",
+    ".txt",
+    ".csv",
+    ".xlsx",
+    ".xbrl",
+    ".xml",
+    ".json",
+)
+_KNOWN_UNSELECTED_THIRD_PARTY_SUFFIXES = frozenset({".text", ".rmd", ".qmd", ".xlsm", ".potx"})
+_FUTURE_PDF_EXTENSION = "future-pdf"
 
 
 class _ConversionResultMarker:
@@ -233,6 +266,261 @@ def _prepare_auto_attempts(
     monkeypatch.delenv(docling_runtime.DOCLING_DEVICE_ENV, raising=False)
     monkeypatch.setattr(docling_runtime, "_is_windows_platform", _is_not_windows)
     monkeypatch.setattr(docling_runtime, "build_docling_pdf_converter", factory)
+
+
+def test_product_capability_freezes_exact_formats_suffixes_and_metadata_subset() -> None:
+    """验证 9 个格式与 13 个有序扩展名精确冻结且受安装元数据支持。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    capability = docling_runtime.DOCLING_CONVERTER_CAPABILITY
+    product_formats = tuple((format_item.format_id, format_item.suffixes) for format_item in capability.formats)
+    resolved_formats = docling_runtime._resolve_docling_allowed_formats(capability)
+
+    assert product_formats == _EXPECTED_PRODUCT_FORMATS
+    assert capability.format_ids == tuple(format_id for format_id, _suffixes in _EXPECTED_PRODUCT_FORMATS)
+    assert capability.product_suffixes == _EXPECTED_PRODUCT_SUFFIXES
+    assert capability.accepts_product_suffix(" .PDF ") is True
+    assert capability.accepts_product_suffix("zip") is False
+    assert tuple(input_format.name for input_format in resolved_formats) == capability.format_ids
+    for format_item, input_format in zip(capability.formats, resolved_formats, strict=True):
+        installed_suffixes = frozenset(
+            docling_runtime._normalize_docling_product_suffix(extension)
+            for extension in FormatToExtensions[input_format]
+        )
+        assert frozenset(format_item.suffixes).issubset(installed_suffixes)
+    assert _KNOWN_UNSELECTED_THIRD_PARTY_SUFFIXES.isdisjoint(capability.product_suffixes)
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    ("", "   ", ".", " \t.\n", Path("README").suffix, Path(".DS_Store").suffix),
+    ids=("empty", "blank", "dot", "padded-dot", "no-suffix", "dotfile"),
+)
+def test_product_suffix_predicate_returns_false_for_inputs_without_effective_suffix(
+    candidate: str,
+) -> None:
+    """验证 admission predicate 对无有效扩展名的任意字符串安全返回 False。
+
+    Args:
+        candidate: 空串、空白、点或由无扩展名路径投影出的候选值。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    assert docling_runtime.DOCLING_CONVERTER_CAPABILITY.accepts_product_suffix(candidate) is False
+
+
+def test_product_capability_rejects_minimal_invalid_declarations() -> None:
+    """验证 capability owner 拒绝裁决指定的四类最小非法声明。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    with pytest.raises(ValueError, match="扩展名不能为空"):
+        docling_runtime.DoclingConverterFormat(format_id="PDF", suffixes=("",))
+
+    with pytest.raises(ValueError, match="至少声明一个格式"):
+        docling_runtime.DoclingConverterCapability(formats=())
+
+    with pytest.raises(ValueError, match="重复格式标识"):
+        docling_runtime.DoclingConverterCapability(
+            formats=(
+                docling_runtime.DoclingConverterFormat(format_id="PDF", suffixes=(".pdf",)),
+                docling_runtime.DoclingConverterFormat(format_id="PDF", suffixes=(".pdf2",)),
+            )
+        )
+
+    with pytest.raises(ValueError, match="跨格式声明重复扩展名"):
+        docling_runtime.DoclingConverterCapability(
+            formats=(
+                docling_runtime.DoclingConverterFormat(format_id="PDF", suffixes=(".shared",)),
+                docling_runtime.DoclingConverterFormat(format_id="DOCX", suffixes=(".shared",)),
+            )
+        )
+
+
+def test_static_capability_projection_does_not_import_docling() -> None:
+    """验证模块导入与 help 所需静态投影不会加载 Docling。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    probe = (
+        "import sys\n"
+        "sys.modules['docling'] = None\n"
+        "from dayu.documents.docling_runtime import DOCLING_CONVERTER_CAPABILITY\n"
+        "print('|'.join(DOCLING_CONVERTER_CAPABILITY.product_suffixes))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", probe],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "|".join(_EXPECTED_PRODUCT_SUFFIXES)
+
+
+def test_converter_allowed_formats_share_product_capability_and_ignore_added_suffix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证第三方新增扩展名不扩面，构造器 allowed_formats 仍与产品声明同源。
+
+    Args:
+        monkeypatch: pytest 映射替换工具。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    installed_pdf_extensions = FormatToExtensions[InputFormat.PDF]
+    monkeypatch.setitem(
+        FormatToExtensions,
+        InputFormat.PDF,
+        [*installed_pdf_extensions, _FUTURE_PDF_EXTENSION],
+    )
+
+    converter = docling_runtime.build_docling_pdf_converter(
+        do_ocr=False,
+        do_table_structure=False,
+        device_name=_CPU_DEVICE,
+    )
+
+    assert tuple(input_format.name for input_format in converter.allowed_formats) == (
+        docling_runtime.DOCLING_CONVERTER_CAPABILITY.format_ids
+    )
+    assert tuple(converter.format_to_options) == tuple(converter.allowed_formats)
+    pdf_option = converter.format_to_options[InputFormat.PDF]
+    assert isinstance(pdf_option, PdfFormatOption)
+    pdf_pipeline_options = pdf_option.pipeline_options
+    assert isinstance(pdf_pipeline_options, PdfPipelineOptions)
+    assert pdf_option.backend is DoclingParseDocumentBackend
+    assert pdf_pipeline_options.do_ocr is False
+    assert pdf_pipeline_options.do_table_structure is False
+    assert pdf_pipeline_options.accelerator_options is not None
+    assert pdf_pipeline_options.accelerator_options.device is AcceleratorDevice.CPU
+    assert docling_runtime.DOCLING_CONVERTER_CAPABILITY.product_suffixes == _EXPECTED_PRODUCT_SUFFIXES
+    assert f".{_FUTURE_PDF_EXTENSION}" not in (docling_runtime.DOCLING_CONVERTER_CAPABILITY.product_suffixes)
+
+
+def test_converter_construction_fails_typed_when_format_extension_mapping_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证第三方扩展名 mapping 整项缺失时 constructor path typed fail。
+
+    Args:
+        monkeypatch: pytest 映射替换工具。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    monkeypatch.delitem(FormatToExtensions, InputFormat.PDF)
+
+    with pytest.raises(
+        docling_runtime.DoclingRuntimeInitializationError,
+        match="缺少产品格式 'PDF' 的扩展名映射",
+    ):
+        docling_runtime.build_docling_pdf_converter(
+            do_ocr=False,
+            do_table_structure=False,
+            device_name=_CPU_DEVICE,
+        )
+
+
+@pytest.mark.parametrize(
+    ("capability", "expected_message"),
+    [
+        (
+            docling_runtime.DoclingConverterCapability(
+                formats=(
+                    docling_runtime.DoclingConverterFormat(
+                        format_id="REMOVED_FORMAT",
+                        suffixes=(".removed",),
+                    ),
+                )
+            ),
+            "缺少产品声明的格式",
+        ),
+        (
+            docling_runtime.DoclingConverterCapability(
+                formats=(
+                    docling_runtime.DoclingConverterFormat(
+                        format_id="PDF",
+                        suffixes=(".removed",),
+                    ),
+                )
+            ),
+            "缺少产品扩展名",
+        ),
+    ],
+    ids=("format-id-missing", "product-suffix-missing"),
+)
+def test_converter_construction_fails_typed_when_product_metadata_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    capability: docling_runtime.DoclingConverterCapability,
+    expected_message: str,
+) -> None:
+    """验证格式或扩展名缺失时 constructor path typed fail 且不回退默认能力。
+
+    Args:
+        monkeypatch: pytest 属性替换工具。
+        capability: 本例注入的缺失元数据 capability。
+        expected_message: 预期稳定错误片段。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    monkeypatch.setattr(docling_runtime, "DOCLING_CONVERTER_CAPABILITY", capability)
+
+    with pytest.raises(
+        docling_runtime.DoclingRuntimeInitializationError,
+        match=expected_message,
+    ):
+        docling_runtime.build_docling_pdf_converter(
+            do_ocr=False,
+            do_table_structure=False,
+            device_name=_CPU_DEVICE,
+        )
 
 
 @pytest.mark.parametrize(
