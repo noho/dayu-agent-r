@@ -18,6 +18,7 @@ from dayu.fins.storage import (
     CompanyTickerAliasConflictError,
     CompanyTickerIdentityCorruptionError,
 )
+from dayu.fins.upload_format_contract import FinsUploadFormatError
 from dayu.runtime.filelock import RuntimeFileLockError
 
 _MAX_FAILURE_TEXT_CHARS: Final[int] = 240
@@ -27,6 +28,7 @@ _FAILURE_KEYS: Final[frozenset[str]] = frozenset({"kind", "code", "message", "re
 class FinsUploadFailureKind(str, Enum):
     """上传失败的 closed public category。"""
 
+    USAGE = "usage"
     CONTENT = "content"
     STORAGE = "storage"
     RUNTIME = "runtime"
@@ -35,6 +37,7 @@ class FinsUploadFailureKind(str, Enum):
 class FinsUploadFailureCode(str, Enum):
     """上传失败的 closed public reason code。"""
 
+    UNSUPPORTED_UPLOAD_FORMAT = "unsupported_upload_format"
     DOCLING_CONVERTER_CONSTRUCTION = "docling_converter_construction"
     DOCLING_CONVERTER_EXECUTION = "docling_converter_execution"
     DOCLING_RESULT_SERIALIZATION = "docling_result_serialization"
@@ -74,7 +77,7 @@ class FinsUploadFailureReason:
     """上传失败的有界、安全且可行动 public reason。
 
     Attributes:
-        kind: content、storage 或 runtime 分类。
+        kind: usage、content、storage 或 runtime 分类。
         code: closed failure code。
         message: 不含路径或异常 repr 的安全文案。
         retry_hint: 可选安全重试建议。
@@ -88,7 +91,7 @@ class FinsUploadFailureReason:
     file_label: str | None
 
     def __post_init__(self) -> None:
-        """校验 failure reason 的长度与 path-free 边界。
+        """校验 failure reason 的 closed kind/code 与 path-free 文本边界。
 
         Args:
             无。
@@ -97,9 +100,17 @@ class FinsUploadFailureReason:
             无。
 
         Raises:
-            ValueError: 文本或 file label 不符合 public contract 时抛出。
+            TypeError: kind 或 code 不是对应 enum 具体类型时抛出。
+            ValueError: kind/code 错配，或文本/file label 不符合 public contract 时抛出。
         """
 
+        if type(self.kind) is not FinsUploadFailureKind:
+            raise TypeError("failure.kind 必须是 FinsUploadFailureKind")
+        if type(self.code) is not FinsUploadFailureCode:
+            raise TypeError("failure.code 必须是 FinsUploadFailureCode")
+        expected_kind = _FAILURE_KIND_BY_CODE[self.code]
+        if self.kind is not expected_kind:
+            raise ValueError("failure.kind 与 failure.code 不一致")
         _validate_failure_reason_text(self.message, "failure.message")
         if self.retry_hint is not None:
             _validate_failure_reason_text(self.retry_hint, "failure.retry_hint")
@@ -161,12 +172,35 @@ _DOCLING_FAILURE_CODES: Final[Mapping[DoclingConversionFailureKind, FinsUploadFa
 _CONTENT_FAILURE_CODES: Final[frozenset[FinsUploadFailureCode]] = frozenset(
     (*_DOCLING_FAILURE_CODES.values(), FinsUploadFailureCode.EMPTY_INPUT_FILE)
 )
+_USAGE_FAILURE_CODES: Final[frozenset[FinsUploadFailureCode]] = frozenset(
+    {FinsUploadFailureCode.UNSUPPORTED_UPLOAD_FORMAT}
+)
 _STORAGE_FAILURE_CODES: Final[frozenset[FinsUploadFailureCode]] = frozenset(
     {
         FinsUploadFailureCode.STORAGE_IO,
         FinsUploadFailureCode.TICKER_ALIAS_CONFLICT,
     }
 )
+_RUNTIME_FAILURE_CODES: Final[frozenset[FinsUploadFailureCode]] = frozenset({FinsUploadFailureCode.UNEXPECTED_RUNTIME})
+_FAILURE_CODES_BY_KIND: Final[Mapping[FinsUploadFailureKind, frozenset[FinsUploadFailureCode]]] = {
+    FinsUploadFailureKind.USAGE: _USAGE_FAILURE_CODES,
+    FinsUploadFailureKind.CONTENT: _CONTENT_FAILURE_CODES,
+    FinsUploadFailureKind.STORAGE: _STORAGE_FAILURE_CODES,
+    FinsUploadFailureKind.RUNTIME: _RUNTIME_FAILURE_CODES,
+}
+if frozenset(_FAILURE_CODES_BY_KIND) != frozenset(FinsUploadFailureKind):
+    raise RuntimeError("upload failure kind 分组必须完整")
+_GROUPED_FAILURE_CODE_COUNT: Final[int] = sum(len(codes) for codes in _FAILURE_CODES_BY_KIND.values())
+_ALL_GROUPED_FAILURE_CODES: Final[frozenset[FinsUploadFailureCode]] = frozenset(
+    code for codes in _FAILURE_CODES_BY_KIND.values() for code in codes
+)
+if _GROUPED_FAILURE_CODE_COUNT != len(_ALL_GROUPED_FAILURE_CODES):
+    raise RuntimeError("upload failure code 分组必须互斥")
+if _ALL_GROUPED_FAILURE_CODES != frozenset(FinsUploadFailureCode):
+    raise RuntimeError("upload failure code 分组必须完整")
+_FAILURE_KIND_BY_CODE: Final[Mapping[FinsUploadFailureCode, FinsUploadFailureKind]] = {
+    code: kind for kind, codes in _FAILURE_CODES_BY_KIND.items() for code in codes
+}
 
 
 def fins_upload_failure_from_exception(
@@ -187,6 +221,14 @@ def fins_upload_failure_from_exception(
         ValueError: ``file_label`` 未经过唯一 canonicalizer 时抛出。
     """
 
+    if isinstance(error, FinsUploadFormatError):
+        return FinsUploadFailureReason(
+            kind=FinsUploadFailureKind.USAGE,
+            code=FinsUploadFailureCode.UNSUPPORTED_UPLOAD_FORMAT,
+            message="文件格式不受支持，请选择支持的文件后重试",
+            retry_hint="请查看上传帮助中的支持格式后重试",
+            file_label=error.file_label,
+        )
     if isinstance(error, DoclingConversionError):
         return FinsUploadFailureReason(
             kind=FinsUploadFailureKind.CONTENT,
@@ -324,11 +366,7 @@ def upload_failure_reason_from_json(value: JsonValue | None) -> FinsUploadFailur
     message = _required_failure_text(value, "message")
     retry_hint = _optional_failure_text(value, "retry_hint")
     file_label = _optional_failure_text(value, "file_label")
-    expected_kind = (
-        FinsUploadFailureKind.CONTENT
-        if code in _CONTENT_FAILURE_CODES
-        else (FinsUploadFailureKind.STORAGE if code in _STORAGE_FAILURE_CODES else FinsUploadFailureKind.RUNTIME)
-    )
+    expected_kind = _FAILURE_KIND_BY_CODE[code]
     if kind is not expected_kind:
         raise ValueError("upload failure kind 与 code 不一致")
     return FinsUploadFailureReason(

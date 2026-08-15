@@ -51,6 +51,7 @@ from dayu.fins.storage import (
     FsFilingUploadStateRepository,
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
+from dayu.fins.upload_format_contract import FinsUploadFilingFiles
 
 from .upload_filing_test_support import (
     TrackingBatchingRepository,
@@ -1038,6 +1039,111 @@ async def test_upload_material_failure_uses_shared_typed_failure_owner(tmp_path:
 
 
 @pytest.mark.asyncio
+async def test_upload_material_unsupported_suffix_fails_before_reads_or_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CN/HK material 格式 admission 必须先于 published read 与 mutation。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: 外部读取与 mutation 禁用夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 格式错误逃逸、重分类或产生副作用时抛出。
+    """
+
+    converter = _PipelineDownloadFakeConversionRunner()
+    pipeline = CnPipeline(
+        workspace_root=tmp_path,
+        docling_converter=converter,
+    )
+    unsupported_file = tmp_path / "deck.zip"
+    unsupported_file.write_bytes(b"not read")
+
+    def reject_state_read(ticker: str, document_id: str, source_kind: SourceKind) -> None:
+        """拒绝 published-state 读取。
+
+        Args:
+            ticker: 意外 ticker。
+            document_id: 意外文档 ID。
+            source_kind: 意外 source kind。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 始终抛出。
+        """
+
+        del ticker, document_id, source_kind
+        raise AssertionError("格式 admission 前禁止读取 published state")
+
+    def reject_batch(ticker: str) -> None:
+        """拒绝任何 company/source batch。
+
+        Args:
+            ticker: 意外 batch ticker。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 始终抛出。
+        """
+
+        del ticker
+        raise AssertionError("格式 admission 失败禁止开启 batch")
+
+    def reject_file_read(path: Path) -> bytes:
+        """拒绝输入文件读取。
+
+        Args:
+            path: 意外读取路径。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 始终抛出。
+        """
+
+        raise AssertionError(f"格式 admission 失败禁止读取文件: {path.name}")
+
+    monkeypatch.setattr(pipeline, "_safe_get_upload_document_meta", reject_state_read)
+    monkeypatch.setattr(pipeline._batching_repository, "begin_batch", reject_batch)
+    monkeypatch.setattr(Path, "read_bytes", reject_file_read)
+
+    events = [
+        event
+        async for event in pipeline.upload_material_stream(
+            ticker="600519",
+            action="create",
+            form_type="MATERIAL_OTHER",
+            material_name="Roadshow Deck",
+            files=[unsupported_file],
+            company_name="贵州茅台",
+        )
+    ]
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+
+    assert [event.event_type for event in events] == [UploadMaterialEventType.UPLOAD_FAILED]
+    assert result["failure"] == {
+        "kind": "usage",
+        "code": "unsupported_upload_format",
+        "message": "文件格式不受支持，请选择支持的文件后重试",
+        "retry_hint": "请查看上传帮助中的支持格式后重试",
+        "file_label": "deck.zip",
+    }
+    assert converter.calls == 0
+    assert not (tmp_path / "portfolio" / "600519").exists()
+
+
+@pytest.mark.asyncio
 async def test_upload_material_alias_conflict_projects_exact_typed_terminal(tmp_path: Path) -> None:
     """CN material alias conflict 必须从 storage typed error 投影 exact failure JSON。
 
@@ -1351,6 +1457,85 @@ async def test_upload_filing_fresh_recheck_discards_stale_action_and_company_dec
     assert published_tree_sha256(tmp_path, "600519") == published_tree
 
 
+@pytest.mark.asyncio
+async def test_upload_filing_consumes_fresh_authoritative_file_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CN/HK workflow 必须原样消费 fresh validator 的 typed selection。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: fresh validator selection 注入夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: workflow 从 raw files 重建 selection 时抛出。
+    """
+
+    converter = _PipelineDownloadFakeConversionRunner()
+    pipeline, _batching, _company, _source = _tracking_cn_pipeline(
+        tmp_path,
+        converter=converter,
+    )
+    raw_file = tmp_path / "raw.pdf"
+    authoritative_file = tmp_path / "authoritative.docx"
+    raw_file.write_bytes(b"raw")
+    authoritative_file.write_bytes(b"authoritative")
+    request = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=raw_file,
+        action="create",
+        company_name="贵州茅台",
+    )
+    owner_validator = cn_pipeline_module.validate_fins_upload_filing_request
+
+    def authoritative_validator(
+        raw_request: FinsUploadFilingRequest,
+        *,
+        published_state: FilingUploadPublishedState,
+    ) -> ValidatedFinsUploadFilingRequest:
+        """保留 fresh identity，仅替换 owner 产生的 typed selection。
+
+        Args:
+            raw_request: immutable raw request。
+            published_state: fresh published snapshot。
+
+        Returns:
+            携带 authoritative file selection 的 validated request。
+
+        Raises:
+            FinsUploadUsageError: owner validator 拒绝请求时抛出。
+        """
+
+        validated = owner_validator(raw_request, published_state=published_state)
+        return replace(
+            validated,
+            file_selection=FinsUploadFilingFiles.from_upsert_paths((authoritative_file,)),
+        )
+
+    monkeypatch.setattr(
+        cn_pipeline_module,
+        "validate_fins_upload_filing_request",
+        authoritative_validator,
+    )
+
+    events = [event async for event in pipeline.upload_filing_stream(request)]
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    handle = pipeline._source_repository.get_source_handle(
+        "600519",
+        str(result["document_id"]),
+        SourceKind.FILING,
+    )
+    stored_names = sorted(item.uri.rsplit("/", maxsplit=1)[-1] for item in pipeline._blob_repository.list_files(handle))
+
+    assert converter.calls == 1
+    assert stored_names == ["authoritative.docx", "authoritative_docling.json"]
+
+
 @pytest.mark.parametrize(
     ("error", "expected_code", "operator_marker"),
     (
@@ -1457,12 +1642,12 @@ async def test_upload_filing_alias_conflict_projects_exact_typed_terminal(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_upload_filing_valid_and_corrupt_mixed_batch_fails_atomically(
+async def test_upload_filing_corrupt_primary_with_valid_companions_fails_atomically(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """CN/HK valid+corrupt mixed filing 必须在首个损坏文件整批 typed fail。
+    """CN/HK corrupt primary 必须只转换一次并整批 typed fail。
 
     Args:
         tmp_path: pytest 临时目录。
@@ -1504,10 +1689,10 @@ async def test_upload_filing_valid_and_corrupt_mixed_batch_fails_atomically(
         "fins_upload_failure_from_exception",
         reject_workflow_reclassification,
     )
-    valid_file = tmp_path / "valid.pdf"
-    corrupt_file = tmp_path / "corrupt.docx"
-    later_file = tmp_path / "later.pdf"
-    for file_path in (valid_file, corrupt_file, later_file):
+    corrupt_file = tmp_path / "corrupt.pdf"
+    companion_file = tmp_path / "companion.docx"
+    later_file = tmp_path / "later.xlsx"
+    for file_path in (corrupt_file, companion_file, later_file):
         file_path.write_bytes(b"filing input")
     calls: list[str] = []
     cause = DoclingConversionError(
@@ -1522,13 +1707,13 @@ async def test_upload_filing_valid_and_corrupt_mixed_batch_fails_atomically(
     )
     first_request = _validated_cn_filing_request(
         pipeline=pipeline,
-        filing_file=valid_file,
+        filing_file=corrupt_file,
         action="create",
         company_name="贵州茅台",
     )
     request = replace(
         first_request,
-        request=replace(first_request.request, files=(valid_file, corrupt_file, later_file)),
+        request=replace(first_request.request, files=(corrupt_file, companion_file, later_file)),
     )
 
     with caplog.at_level("ERROR"):
@@ -1541,8 +1726,8 @@ async def test_upload_filing_valid_and_corrupt_mixed_batch_fails_atomically(
     assert result["stored_file_count"] == 0
     assert failure["kind"] == "content"
     assert failure["code"] == "docling_converter_execution"
-    assert failure["file_label"] == "corrupt.docx"
-    assert calls == ["valid.pdf", "corrupt.docx"]
+    assert failure["file_label"] == "corrupt.pdf"
+    assert calls == ["corrupt.pdf"]
     assert "typed content admission failed" in caplog.text
     assert str(cause) in caplog.text
     assert str(cause) not in str(result)

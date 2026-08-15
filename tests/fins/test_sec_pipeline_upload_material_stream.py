@@ -12,6 +12,8 @@ from dayu.fins.domain.enums import SourceKind
 from dayu.fins.pipelines.sec_pipeline import SecPipeline
 from dayu.fins.pipelines.docling_process_converter import (
     DoclingConversionConfig,
+    DoclingConversionError,
+    DoclingConversionFailureKind,
     DoclingConversionResult,
 )
 from dayu.fins.pipelines.upload_material_events import UploadMaterialEventType
@@ -20,6 +22,21 @@ from dayu.fins.processors.registry import build_fins_processor_registry
 
 class _FakeDoclingConverter:
     """SEC material 测试用 typed converter。"""
+
+    def __init__(self, calls: list[str] | None = None) -> None:
+        """初始化可选转换调用记录器。
+
+        Args:
+            calls: 可选 basename 调用记录。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self._calls = calls
 
     async def convert_to_json_bytes(
         self,
@@ -45,6 +62,63 @@ class _FakeDoclingConverter:
         """
 
         del input_bytes, config, cancellation
+        if self._calls is not None:
+            self._calls.append(stream_name)
+        data = ('{"name": "' + stream_name + '", "format": "docling"}').encode()
+        return DoclingConversionResult(data, len(data), hashlib.sha256(data).hexdigest())
+
+
+class _FailingMaterialDoclingConverter:
+    """在指定 material 文件注入 typed conversion failure 的测试 converter。"""
+
+    def __init__(self, *, failing_name: str, calls: list[str]) -> None:
+        """初始化逐文件 failure converter。
+
+        Args:
+            failing_name: 应抛出异常的 basename。
+            calls: 转换调用顺序记录。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self._failing_name = failing_name
+        self._calls = calls
+
+    async def convert_to_json_bytes(
+        self,
+        input_bytes: bytes,
+        stream_name: str,
+        *,
+        config: DoclingConversionConfig,
+        cancellation: CancellationToken | None,
+    ) -> DoclingConversionResult:
+        """记录调用并在目标文件抛出 closed typed conversion failure。
+
+        Args:
+            input_bytes: 输入字节。
+            stream_name: 输入名称。
+            config: 闭合转换配置。
+            cancellation: canonical token。
+
+        Returns:
+            非目标文件的 typed conversion result。
+
+        Raises:
+            DoclingConversionError: 当前文件命中 failure fixture 时抛出。
+        """
+
+        del input_bytes, config, cancellation
+        self._calls.append(stream_name)
+        if stream_name == self._failing_name:
+            raise DoclingConversionError(
+                DoclingConversionFailureKind.CONVERTER_EXECUTION,
+                "Docling conversion execution failed",
+                23,
+            )
         data = ('{"name": "' + stream_name + '", "format": "docling"}').encode()
         return DoclingConversionResult(data, len(data), hashlib.sha256(data).hexdigest())
 
@@ -237,6 +311,180 @@ async def test_upload_material_failure_uses_shared_typed_failure_owner(tmp_path:
         "file_label": None,
     }
     assert events[-1].payload["error"] == "上传执行失败，请检查运行日志后重试"
+
+
+@pytest.mark.asyncio
+async def test_upload_material_nth_conversion_failure_is_content_terminal_without_source_publication(
+    tmp_path: Path,
+) -> None:
+    """第 N 项 material 转换失败必须投影 content terminal 且不发布 source。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: failure 分类、文件归属或零 source 发布边界漂移时抛出。
+    """
+
+    calls: list[str] = []
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        processor_registry=build_fins_processor_registry(),
+        docling_converter=_FailingMaterialDoclingConverter(
+            failing_name="corrupt.docx",
+            calls=calls,
+        ),
+    )
+    files = [tmp_path / "ok.pdf", tmp_path / "corrupt.docx"]
+    for file_path in files:
+        file_path.write_bytes(file_path.name.encode())
+
+    events = [
+        event
+        async for event in pipeline.upload_material_stream(
+            ticker="AAPL",
+            action="create",
+            form_type="MATERIAL_OTHER",
+            material_name="Deck",
+            files=files,
+            company_name="Apple Inc.",
+            overwrite=False,
+        )
+    ]
+
+    assert [event.event_type for event in events] == [
+        UploadMaterialEventType.UPLOAD_STARTED,
+        UploadMaterialEventType.UPLOAD_FAILED,
+    ]
+    assert calls == ["ok.pdf", "corrupt.docx"]
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    assert result["status"] == "failed"
+    assert result["stored_file_count"] == 0
+    assert result["failure"] == {
+        "kind": "content",
+        "code": "docling_converter_execution",
+        "message": "文件无法解析或已损坏，请检查文件后重试",
+        "retry_hint": "请确认文件可正常打开并重新上传",
+        "file_label": None,
+    }
+    document_id = str(result["document_id"])
+    with pytest.raises(FileNotFoundError):
+        pipeline._source_repository.get_source_meta(
+            "AAPL",
+            document_id,
+            SourceKind.MATERIAL,
+        )
+    assert not tuple((tmp_path / "portfolio" / "AAPL" / "materials").glob("*"))
+
+
+@pytest.mark.asyncio
+async def test_upload_material_unsupported_suffix_fails_before_reads_or_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SEC material 格式 admission 必须在现有 catch 内先于任何外部副作用。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: 外部读取与 mutation 禁用夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 格式错误逃逸、被重分类或产生副作用时抛出。
+    """
+
+    calls: list[str] = []
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        processor_registry=build_fins_processor_registry(),
+        docling_converter=_FakeDoclingConverter(calls),
+    )
+    unsupported_file = tmp_path / "deck.zip"
+    unsupported_file.write_bytes(b"not read")
+
+    def reject_state_read(ticker: str, document_id: str, source_kind: SourceKind) -> None:
+        """拒绝 published-state 读取。
+
+        Args:
+            ticker: 意外 ticker。
+            document_id: 意外文档 ID。
+            source_kind: 意外 source kind。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 始终抛出。
+        """
+
+        del ticker, document_id, source_kind
+        raise AssertionError("格式 admission 前禁止读取 published state")
+
+    def reject_batch(ticker: str) -> None:
+        """拒绝任何 company/source batch。
+
+        Args:
+            ticker: 意外 batch ticker。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 始终抛出。
+        """
+
+        del ticker
+        raise AssertionError("格式 admission 失败禁止开启 batch")
+
+    def reject_file_read(path: Path) -> bytes:
+        """拒绝输入文件读取。
+
+        Args:
+            path: 意外读取路径。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 始终抛出。
+        """
+
+        raise AssertionError(f"格式 admission 失败禁止读取文件: {path.name}")
+
+    monkeypatch.setattr(pipeline, "_safe_get_document_meta", reject_state_read)
+    monkeypatch.setattr(pipeline._batching_repository, "begin_batch", reject_batch)
+    monkeypatch.setattr(Path, "read_bytes", reject_file_read)
+
+    events = [
+        event
+        async for event in pipeline.upload_material_stream(
+            ticker="AAPL",
+            action="create",
+            form_type="MATERIAL_OTHER",
+            material_name="Deck",
+            files=[unsupported_file],
+            company_name="Apple Inc.",
+        )
+    ]
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+
+    assert [event.event_type for event in events] == [UploadMaterialEventType.UPLOAD_FAILED]
+    assert result["failure"] == {
+        "kind": "usage",
+        "code": "unsupported_upload_format",
+        "message": "文件格式不受支持，请选择支持的文件后重试",
+        "retry_hint": "请查看上传帮助中的支持格式后重试",
+        "file_label": "deck.zip",
+    }
+    assert calls == []
+    assert not (tmp_path / "portfolio" / "AAPL").exists()
 
 
 @pytest.mark.asyncio

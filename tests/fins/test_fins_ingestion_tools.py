@@ -26,9 +26,11 @@ from dayu.contracts.tool_outcome import (
     ToolFailedOutcome,
 )
 from dayu.fins.download_contract import FinsDownloadRequest
+from dayu.fins.domain.enums import SourceKind
 from dayu.fins.ingestion_runtime import (
     FinsIngestionExecutor,
     FinsIngestionRuntime,
+    FinsJobCancellationChecker,
     FinsPreprocessRequest,
     FinsUploadRequest,
     FinsUploadUsageCode,
@@ -63,7 +65,7 @@ from dayu.fins.direct_events import (
     FinsResultStatus,
     FinsResultSummary,
 )
-from dayu.fins.service_runtime import DefaultFinsRuntime
+from dayu.fins.service_runtime import DefaultFinsRuntime, ProductionFinsUploadRunner
 from dayu.fins.storage import FilingUploadPublishedState
 from dayu.fins.upload_format_contract import FINS_UPLOAD_FORMAT_TEXT
 from dayu.fins.tools import download_provider, preprocess_provider, provider as read_provider
@@ -438,6 +440,21 @@ def _observation_result(status: FinsResultStatus) -> FinsResultSummary:
 
 class _OpenCancellationToken:
     """测试用未取消 token。"""
+
+    def __call__(self) -> bool:
+        """返回未取消状态以满足 job checker 协议。
+
+        Args:
+            无。
+
+        Returns:
+            始终返回 ``False``。
+
+        Raises:
+            无。
+        """
+
+        return False
 
     def is_cancelled(self) -> bool:
         """返回是否已取消。
@@ -1620,6 +1637,115 @@ def test_upload_tool_accepts_local_file_outside_workspace_without_source_side_ef
     assert executor.submitted_job_ids == ()
     assert all(str(outside_file.parent) not in job_id for job_id in executor.submitted_job_ids)
     assert not (outside_file.parent / ".dayu").exists()
+
+
+def test_upload_tool_raw_material_request_reaches_production_usage_failure_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LLM tool raw material 请求必须经 production runner 得到格式 usage 终态。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: 外部读取与 mutation 禁用夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: tool adapter、runner、workflow 或 failure owner 发生旁路时抛出。
+    """
+
+    workspace_root = _build_workspace(tmp_path)
+    unsupported_file = tmp_path / "deck.zip"
+    unsupported_file.write_bytes(b"not read")
+    request = upload_tools._upload_request_from_arguments(
+        {
+            "ticker": "AAPL",
+            "upload_kind": "material",
+            "action": "create",
+            "files": [str(unsupported_file)],
+            "form_type": "MATERIAL_OTHER",
+            "material_name": "Deck",
+            "company_name": "Apple Inc.",
+        }
+    )
+    assert isinstance(request, FinsUploadMaterialRequest)
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+    runner = runtime.upload_runner
+    assert isinstance(runner, ProductionFinsUploadRunner)
+
+    def reject_state_read(ticker: str, document_id: str, source_kind: SourceKind) -> None:
+        """拒绝 material published-state 读取。
+
+        Args:
+            ticker: 意外 ticker。
+            document_id: 意外文档 ID。
+            source_kind: 意外 source kind。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 始终抛出。
+        """
+
+        del ticker, document_id, source_kind
+        raise AssertionError("格式 admission 前禁止读取 published state")
+
+    def reject_batch(ticker: str) -> None:
+        """拒绝 production workflow 开启 batch。
+
+        Args:
+            ticker: 意外 batch ticker。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 始终抛出。
+        """
+
+        del ticker
+        raise AssertionError("格式 admission 失败禁止开启 batch")
+
+    def reject_file_read(path: Path) -> bytes:
+        """拒绝输入文件内容读取。
+
+        Args:
+            path: 意外读取路径。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 始终抛出。
+        """
+
+        raise AssertionError(f"格式 admission 失败禁止读取文件: {path.name}")
+
+    monkeypatch.setattr(runner.sec_pipeline, "_safe_get_document_meta", reject_state_read)
+    monkeypatch.setattr(runner.sec_pipeline._batching_repository, "begin_batch", reject_batch)
+    monkeypatch.setattr(Path, "read_bytes", reject_file_read)
+    cancellation_checker: FinsJobCancellationChecker = _OpenCancellationToken()
+
+    summary = runner.run_upload(
+        request,
+        cancellation_checker=cancellation_checker,
+    )
+
+    assert summary.status == "failed"
+    assert summary.requested_file_count == 1
+    assert summary.stored_file_count == 0
+    assert summary.failure_reason is not None
+    assert summary.failure_reason.to_json() == {
+        "kind": "usage",
+        "code": "unsupported_upload_format",
+        "message": "文件格式不受支持，请选择支持的文件后重试",
+        "retry_hint": "请查看上传帮助中的支持格式后重试",
+        "file_label": "deck.zip",
+    }
+    assert not (workspace_root / "portfolio" / "AAPL").exists()
 
 
 def test_upload_tool_empty_file_returns_failed_outcome_before_observation_start(tmp_path: Path) -> None:

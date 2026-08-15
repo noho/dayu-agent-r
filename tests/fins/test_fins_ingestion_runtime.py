@@ -6194,10 +6194,10 @@ async def test_direct_upload_filing_content_failure_is_typed_and_has_zero_public
 
 
 @pytest.mark.asyncio
-async def test_direct_upload_filing_mixed_input_fails_fast_without_partial_publication(
+async def test_direct_upload_filing_corrupt_primary_fails_without_partial_publication(
     tmp_path: Path,
 ) -> None:
-    """direct mixed filing 在首个损坏文件失败，先转换成功的文件不得形成 stored fact。
+    """direct filing 的损坏 primary 失败，有效 companion 不得形成 stored fact。
 
     Args:
         tmp_path: pytest 临时目录夹具。
@@ -6206,26 +6206,26 @@ async def test_direct_upload_filing_mixed_input_fails_fast_without_partial_publi
         无。
 
     Raises:
-        AssertionError: fail-fast 顺序、count 或原子 publication 边界漂移时抛出。
+        AssertionError: 单次 primary 转换、count 或原子 publication 边界漂移时抛出。
     """
 
     workspace_root = tmp_path / "fins-workspace"
-    converter = _UploadRuntimeConverter(failing_stream_names=frozenset({"corrupt.docx"}))
+    converter = _UploadRuntimeConverter(failing_stream_names=frozenset({"corrupt.pdf"}))
     default_runtime, ingestion, executor = _build_direct_upload_test_runtime(
         workspace_root=workspace_root,
         converter=converter,
     )
-    valid_file = tmp_path / "valid.pdf"
-    corrupt_file = tmp_path / "corrupt.docx"
-    valid_file.write_bytes(b"valid filing")
+    corrupt_file = tmp_path / "corrupt.pdf"
+    valid_file = tmp_path / "valid.docx"
     corrupt_file.write_bytes(b"corrupt filing")
+    valid_file.write_bytes(b"valid companion")
 
     events = await _collect_direct_events(
         ingestion.upload(
             FinsUploadFilingRequest(
                 ticker="AAPL",
                 action="create",
-                files=(valid_file, corrupt_file),
+                files=(corrupt_file, valid_file),
                 fiscal_year=2024,
                 fiscal_period="FY",
                 company_name="Apple Inc.",
@@ -6240,8 +6240,8 @@ async def test_direct_upload_filing_mixed_input_fails_fast_without_partial_publi
     assert details["requested files"] == "2"
     assert details["stored files"] == "0"
     assert details["failure code"] == "docling_converter_execution"
-    assert details["file"] == "corrupt.docx"
-    assert converter.calls == ["valid.pdf", "corrupt.docx"]
+    assert details["file"] == "corrupt.pdf"
+    assert converter.calls == ["corrupt.pdf"]
     assert executor.operations == []
     _assert_direct_test_filing_was_not_published(default_runtime)
 

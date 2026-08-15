@@ -46,6 +46,10 @@ from dayu.fins.storage import (
     require_source_meta_is_deleted,
 )
 from dayu.fins.ticker_normalization import normalize_ticker
+from dayu.fins.upload_format_contract import (
+    FinsUploadFilingFiles,
+    FinsUploadMaterialFiles,
+)
 from dayu.fins.upload_failure import (
     FinsUploadFailureError,
     fins_upload_empty_input_failure,
@@ -54,21 +58,6 @@ from dayu.fins.upload_failure import (
 
 JsonObject: TypeAlias = dict[str, JsonValue]
 
-SUPPORTED_UPLOAD_SUFFIXES: Final[frozenset[str]] = frozenset(
-    {
-        ".pdf",
-        ".doc",
-        ".docx",
-        ".ppt",
-        ".pptx",
-        ".xls",
-        ".xlsx",
-        ".htm",
-        ".html",
-        ".txt",
-        ".md",
-    }
-)
 UPLOAD_ACTIONS: Final[frozenset[str]] = frozenset({"create", "update", "delete"})
 DOCLING_FILE_SUFFIX: Final[str] = "_docling.json"
 _AssetSource: TypeAlias = Literal["original", "docling"]
@@ -155,10 +144,19 @@ class _PreparedAssetMutation:
     overwrite: bool
     pending_assets: tuple[_PendingFileAsset, ...]
     conversion_events: tuple[UploadFileEventPayload, ...]
+    primary_document: str
     previous_meta: JsonObject | None
     meta: JsonObject
     source_fingerprint: str
     document_version: str
+
+
+@dataclass(frozen=True)
+class _UploadSelectionPreparation:
+    """Service 入口已收窄的有序 original 与转换输入。"""
+
+    ordered_files: tuple[Path, ...]
+    converter_inputs: tuple[Path, ...]
 
 
 PreparedDoclingUpload: TypeAlias = UploadOperationResult | _PreparedDeleteMutation | _PreparedAssetMutation
@@ -247,7 +245,7 @@ class DoclingUploadService:
         document_id: str,
         internal_document_id: str,
         form_type: str,
-        files: list[Path],
+        selection: FinsUploadFilingFiles | FinsUploadMaterialFiles,
         overwrite: bool,
         previous_meta: Mapping[str, JsonValue] | None,
         meta: Mapping[str, JsonValue],
@@ -262,7 +260,7 @@ class DoclingUploadService:
             document_id: 文档 ID。
             internal_document_id: 内部文档 ID。
             form_type: 文档 form type。
-            files: 上传文件列表。
+            selection: 与 ``source_kind`` 一致的 typed 文件选择。
             overwrite: 是否强制覆盖。
             previous_meta: caller 从当前 state owner 取得的 source meta。
             meta: 业务元数据字段。
@@ -281,9 +279,18 @@ class DoclingUploadService:
             OSError: 仓储读写失败时抛出。
         """
 
+        selection_preparation = _prepare_upload_selection(
+            source_kind=source_kind,
+            selection=selection,
+        )
         normalized_action = action.strip().lower()
         if normalized_action not in UPLOAD_ACTIONS:
             raise ValueError(f"不支持的 action: {action}")
+        is_empty = not selection_preparation.ordered_files
+        if normalized_action == "delete" and not is_empty:
+            raise ValueError("delete 上传必须使用空文件 selection")
+        if normalized_action != "delete" and is_empty:
+            raise ValueError("create/update 上传必须使用非空文件 selection")
         normalized_ticker = normalize_ticker(ticker).canonical
         if not document_id.strip():
             raise ValueError("document_id 不能为空")
@@ -303,7 +310,7 @@ class DoclingUploadService:
             )
 
         normalized_previous_meta = dict(previous_meta) if previous_meta is not None else None
-        validated_files = _validate_source_files(files)
+        validated_files = _validate_source_files(selection_preparation.ordered_files)
         precondition = evaluate_upload_overwrite_precondition(
             action=normalized_action,
             previous_meta=normalized_previous_meta,
@@ -341,8 +348,8 @@ class DoclingUploadService:
             )
 
         try:
-            pending_assets, conversion_events = await self._build_pending_assets(
-                validated_files,
+            pending_assets, conversion_events, primary_document = await self._build_pending_assets(
+                selection_preparation,
                 original_assets,
                 source_kind=source_kind,
                 cancellation=cancellation,
@@ -371,6 +378,7 @@ class DoclingUploadService:
             overwrite=overwrite,
             pending_assets=tuple(pending_assets),
             conversion_events=tuple(conversion_events),
+            primary_document=primary_document,
             previous_meta=normalized_previous_meta,
             meta=staging_meta,
             source_fingerprint=source_fingerprint,
@@ -431,6 +439,7 @@ class DoclingUploadService:
             overwrite=prepared.overwrite,
             pending_assets=list(prepared.pending_assets),
             conversion_events=list(prepared.conversion_events),
+            primary_document=prepared.primary_document,
             previous_meta=prepared.previous_meta,
             meta=prepared.meta,
             source_fingerprint=prepared.source_fingerprint,
@@ -461,6 +470,7 @@ class DoclingUploadService:
         overwrite: bool,
         pending_assets: list[_PendingFileAsset],
         conversion_events: list[UploadFileEventPayload],
+        primary_document: str,
         previous_meta: JsonObject | None,
         meta: JsonObject,
         source_fingerprint: str,
@@ -480,6 +490,7 @@ class DoclingUploadService:
             overwrite: 是否开启覆盖。
             pending_assets: 已完成转换、等待落盘的文件资产。
             conversion_events: 转换阶段产生的文件事件。
+            primary_document: preparation 明确产生的主 Docling 文件名。
             previous_meta: 旧 source meta。
             meta: 本次写入的 source meta。
             source_fingerprint: 本次上传源指纹。
@@ -542,9 +553,6 @@ class DoclingUploadService:
                 )
             )
 
-        primary_document = _pick_primary_docling_file(stored_entries)
-        if primary_document is None:
-            raise RuntimeError("未生成 docling 主文件，无法写入 primary_document")
         if _is_cancelled(cancellation):
             return _build_cancelled_result(
                 document_id=document_id,
@@ -724,37 +732,43 @@ class DoclingUploadService:
 
     async def _build_pending_assets(
         self,
-        files: list[Path],
+        preparation: _UploadSelectionPreparation,
         original_assets: list[_PendingFileAsset],
         *,
         source_kind: SourceKind,
         cancellation: CancellationToken | None,
-    ) -> tuple[list[_PendingFileAsset], list[UploadFileEventPayload]]:
+    ) -> tuple[list[_PendingFileAsset], list[UploadFileEventPayload], str]:
         """构建待上传资产列表与转换阶段事件。
 
         Args:
-            files: 源文件列表。
+            preparation: 入口 typed selection 投影的 ordered/converter inputs。
             original_assets: 已读取完成的原始文件资产列表。
             source_kind: filing 或 material 文档类型。
             cancellation: 公共取消观察 token；``None`` 表示无取消源。
 
         Returns:
-            待上传资产列表与转换阶段事件列表。
+            待上传资产、转换阶段事件与明确的主 Docling 文件名。
 
         Raises:
+            DoclingConversionCancelledError: 转换前或两次转换之间观察到取消时抛出。
             FinsUploadFailureError: filing Docling 转换失败时抛出。
-            RuntimeError: material Docling 转换失败时抛出。
-            ValueError: ``files`` 与 ``original_assets`` 长度不一致时抛出。
+            DoclingConversionError: material Docling 转换失败时原样抛出。
+            RuntimeError: 未产生主 Docling 文件时抛出。
+            ValueError: preparation 与 ``original_assets`` 不一致时抛出。
         """
 
-        if len(files) != len(original_assets):
-            raise ValueError("files 与 original_assets 数量不一致")
+        if len(preparation.ordered_files) != len(original_assets):
+            raise ValueError("ordered_files 与 original_assets 数量不一致")
 
         assets = list(original_assets)
         conversion_events: list[UploadFileEventPayload] = []
-        for file_path, original_asset in zip(files, original_assets):
+        primary_document: str | None = None
+        for index, file_path in enumerate(preparation.converter_inputs):
+            if preparation.ordered_files[index] != file_path:
+                raise ValueError("converter_inputs 必须保持 ordered_files 的前缀顺序")
+            original_asset = original_assets[index]
             if _is_cancelled(cancellation):
-                break
+                raise DoclingConversionCancelledError()
             conversion_events.append(
                 UploadFileEventPayload(
                     event_type="conversion_started",
@@ -788,6 +802,8 @@ class DoclingUploadService:
                 raise FinsUploadFailureError(failure) from exc
             docling_data = conversion.json_bytes
             docling_name = f"{file_path.stem}{DOCLING_FILE_SUFFIX}"
+            if primary_document is None:
+                primary_document = docling_name
             docling_sha256 = conversion.sha256
             assets.append(
                 _PendingFileAsset(
@@ -799,7 +815,9 @@ class DoclingUploadService:
                     source=_ASSET_SOURCE_DOCLING,
                 )
             )
-        return assets, conversion_events
+        if primary_document is None:
+            raise RuntimeError("未生成 docling 主文件，无法写入 primary_document")
+        return assets, conversion_events, primary_document
 
     def _build_upsert_meta(
         self,
@@ -977,7 +995,44 @@ def rollback_prepared_upload_batch(
         raise
 
 
-def _validate_source_files(files: list[Path]) -> list[Path]:
+def _prepare_upload_selection(
+    *,
+    source_kind: SourceKind,
+    selection: FinsUploadFilingFiles | FinsUploadMaterialFiles,
+) -> _UploadSelectionPreparation:
+    """按 source kind 收窄 typed selection 并确定转换输入。
+
+    Args:
+        source_kind: filing 或 material 来源类型。
+        selection: Fins role owner 产生的 typed selection。
+
+    Returns:
+        保序 original 与 converter inputs。
+
+    Raises:
+        ValueError: source kind 与 selection 具体类型不一致时抛出。
+    """
+
+    if source_kind is SourceKind.FILING:
+        if not isinstance(selection, FinsUploadFilingFiles):
+            raise ValueError("filing source_kind 必须使用 filing selection")
+        ordered_files = selection.ordered_files
+        converter_inputs = () if selection.is_empty else (selection.require_primary(),)
+        return _UploadSelectionPreparation(
+            ordered_files=ordered_files,
+            converter_inputs=converter_inputs,
+        )
+    if source_kind is SourceKind.MATERIAL:
+        if not isinstance(selection, FinsUploadMaterialFiles):
+            raise ValueError("material source_kind 必须使用 material selection")
+        return _UploadSelectionPreparation(
+            ordered_files=selection.files,
+            converter_inputs=selection.files,
+        )
+    raise ValueError(f"不支持的 source_kind: {source_kind}")
+
+
+def _validate_source_files(files: tuple[Path, ...]) -> list[Path]:
     """校验上传文件列表。
 
     Args:
@@ -987,41 +1042,18 @@ def _validate_source_files(files: list[Path]) -> list[Path]:
         标准化后的文件路径列表。
 
     Raises:
-        ValueError: 文件列表为空或扩展名不支持时抛出。
+        ValueError: 文件路径类型非法时抛出。
         FileNotFoundError: 文件不存在时抛出。
     """
 
-    if not files:
-        raise ValueError("上传文件不能为空")
     normalized: list[Path] = []
     for file_path in files:
+        if not isinstance(file_path, Path):
+            raise ValueError("上传文件必须是 Path")
         if not file_path.exists() or not file_path.is_file():
             raise FileNotFoundError(f"上传文件不存在: {file_path}")
-        suffix = file_path.suffix.lower()
-        if suffix not in SUPPORTED_UPLOAD_SUFFIXES:
-            raise ValueError(f"不支持的文件类型: {file_path.name}")
         normalized.append(file_path)
     return normalized
-
-
-def _pick_primary_docling_file(file_entries: list[JsonObject]) -> str | None:
-    """从文件条目中选择主 Docling 文件。
-
-    Args:
-        file_entries: 文件条目列表。
-
-    Returns:
-        主文件名；不存在返回 ``None``。
-
-    Raises:
-        无。
-    """
-
-    for entry in file_entries:
-        name = str(entry.get("name", "")).strip()
-        if name.endswith(DOCLING_FILE_SUFFIX):
-            return name
-    return None
 
 
 def _can_skip_upload(
@@ -1492,7 +1524,6 @@ def _text_meta(meta: Mapping[str, JsonValue], key: str) -> str:
 __all__ = [
     "DOCLING_FILE_SUFFIX",
     "DoclingUploadService",
-    "SUPPORTED_UPLOAD_SUFFIXES",
     "UPLOAD_ACTIONS",
     "UploadFileEventPayload",
     "UploadFileEventType",

@@ -16,6 +16,7 @@ from dayu.fins.pipelines.docling_upload_service import (
 from dayu.fins.pipelines.docling_process_converter import ProcessDoclingConverter
 from dayu.fins.storage import FsBatchingRepository, FsDocumentBlobRepository, FsSourceDocumentRepository
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
+from dayu.fins.upload_format_contract import FinsUploadMaterialFiles
 
 _RUN_DOCLING_UPLOAD_INTEGRATION = "DAYU_RUN_DOCLING_UPLOAD_INTEGRATION"
 _MINIMAL_PDF = (
@@ -64,7 +65,7 @@ async def test_real_docling_upload_service_conversion_when_enabled(tmp_path: Pat
         document_id="mat_docling_integration",
         internal_document_id="mat_docling_integration",
         form_type="MATERIAL_OTHER",
-        files=[sample_file],
+        selection=FinsUploadMaterialFiles.from_upsert_paths((sample_file,)),
         overwrite=False,
         previous_meta=None,
         meta={"material_name": "Docling Fixture", "ingest_method": "upload"},

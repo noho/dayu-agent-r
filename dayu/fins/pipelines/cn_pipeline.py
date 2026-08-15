@@ -99,6 +99,7 @@ from dayu.fins.storage import (
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
 from dayu.fins.ticker_normalization import normalize_ticker, try_normalize_ticker
+from dayu.fins.upload_format_contract import FinsUploadMaterialFiles
 from dayu.fins.upload_failure import (
     FinsUploadFailureError,
     FinsUploadFailureReason,
@@ -834,7 +835,7 @@ class CnPipeline:
                 document_id=document_id,
                 internal_document_id=internal_document_id,
                 form_type=form_type,
-                files=list(raw_request.files),
+                selection=authoritative_request.file_selection,
                 overwrite=raw_request.overwrite,
                 previous_meta=previous_meta,
                 cancellation=cancellation_checker,
@@ -1070,6 +1071,11 @@ class CnPipeline:
         requested_action = str(action or "").strip().lower() or None
         resolved_action: str | None = None
         try:
+            selection = (
+                FinsUploadMaterialFiles.for_delete()
+                if requested_action == "delete"
+                else FinsUploadMaterialFiles.from_upsert_paths(tuple(file_list))
+            )
             previous_meta = self._safe_get_upload_document_meta(
                 normalized_ticker,
                 resolved_document_id,
@@ -1119,7 +1125,7 @@ class CnPipeline:
                 document_id=resolved_document_id,
                 internal_document_id=resolved_internal_id,
                 form_type=form_type,
-                files=file_list,
+                selection=selection,
                 overwrite=overwrite,
                 previous_meta=previous_meta,
                 cancellation=cancellation_checker,

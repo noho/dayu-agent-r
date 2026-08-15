@@ -58,9 +58,12 @@ from dayu.fins.upload_failure import (
     FinsUploadFailureError,
     FinsUploadFailureKind,
 )
+from dayu.fins.upload_format_contract import (
+    FinsUploadFilingFiles,
+    FinsUploadMaterialFiles,
+)
 
 from .upload_filing_test_support import published_tree_sha256
-
 
 _INITIAL_CREATED_AT = "2020-01-01T00:00:00+00:00"
 _REPLACEMENT_CREATED_AT = "2020-01-02T00:00:00+00:00"
@@ -790,6 +793,11 @@ def _execute_upload(
         )
     except FileNotFoundError:
         previous_meta = None
+    selection = _selection_for_test(
+        source_kind=source_kind,
+        action=action,
+        files=files,
+    )
     prepared = asyncio.run(
         service.prepare_upload(
             ticker=ticker,
@@ -798,7 +806,7 @@ def _execute_upload(
             document_id=document_id,
             internal_document_id=internal_document_id,
             form_type=form_type,
-            files=files,
+            selection=selection,
             overwrite=overwrite,
             previous_meta=previous_meta,
             meta=meta,
@@ -812,6 +820,37 @@ def _execute_upload(
         prepared=prepared,
         cancellation=cancellation_checker,
     )
+
+
+def _selection_for_test(
+    *,
+    source_kind: SourceKind,
+    action: str,
+    files: list[Path],
+) -> FinsUploadFilingFiles | FinsUploadMaterialFiles:
+    """按 production source/action contract 构造测试 selection。
+
+    Args:
+        source_kind: filing 或 material 来源类型。
+        action: create、update 或 delete。
+        files: 有序原始文件列表。
+
+    Returns:
+        与 source kind 和 action 一致的 typed selection。
+
+    Raises:
+        ValueError: source kind 不受支持或 upsert 文件为空时抛出。
+    """
+
+    if source_kind is SourceKind.FILING:
+        if action == "delete":
+            return FinsUploadFilingFiles.for_delete()
+        return FinsUploadFilingFiles.from_upsert_paths(tuple(files))
+    if source_kind is SourceKind.MATERIAL:
+        if action == "delete":
+            return FinsUploadMaterialFiles.for_delete()
+        return FinsUploadMaterialFiles.from_upsert_paths(tuple(files))
+    raise ValueError(f"不支持的 source_kind: {source_kind}")
 
 
 def _build_service_context(tmp_path: Path) -> _UploadServiceContext:
@@ -844,6 +883,75 @@ def _build_service_context(tmp_path: Path) -> _UploadServiceContext:
     )
 
 
+def _build_batch_tracking_service_context(tmp_path: Path) -> _UploadServiceContext:
+    """构建可观察 prepare 阶段是否错误开启 batch 的测试上下文。
+
+    Args:
+        tmp_path: 临时工作区目录。
+
+    Returns:
+        batching repository 带调用计数的上传服务测试上下文。
+
+    Raises:
+        OSError: 底层仓储初始化失败时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching_repository = _BatchIdentityUploadBatchingRepository(tmp_path, repository_set, [])
+    source_repository = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    service = DoclingUploadService(
+        source_repository=source_repository,
+        blob_repository=blob_repository,
+        docling_converter=_FakeDoclingConverter(),
+    )
+    return _UploadServiceContext(
+        batching_repository=batching_repository,
+        source_repository=source_repository,
+        blob_repository=blob_repository,
+        service=service,
+    )
+
+
+def _prepare_material_for_admission_test(
+    *,
+    service: DoclingUploadService,
+    files: list[Path],
+    cancellation: CancellationToken | None = None,
+) -> PreparedDoclingUpload:
+    """调用 material prepare owner，不进入 publication batch。
+
+    Args:
+        service: 使用目标 converter 的上传服务。
+        files: 按用户请求顺序排列的 material 文件。
+        cancellation: 可选公共取消观察 token。
+
+    Returns:
+        prepare 结果或 typed publication plan。
+
+    Raises:
+        DoclingConversionError: 任一 material 转换失败时原样抛出。
+        OSError: 文件读取失败时抛出。
+        ValueError: 测试输入不符合 upload contract 时抛出。
+    """
+
+    return asyncio.run(
+        service.prepare_upload(
+            ticker="AAPL",
+            source_kind=SourceKind.MATERIAL,
+            action="create",
+            document_id="material_admission",
+            internal_document_id="material_admission",
+            form_type="MATERIAL_OTHER",
+            selection=FinsUploadMaterialFiles.from_upsert_paths(tuple(files)),
+            overwrite=False,
+            previous_meta=None,
+            meta={"ingest_method": "upload"},
+            cancellation=cancellation,
+        )
+    )
+
+
 def _prepare_filing_for_admission_test(
     *,
     service: DoclingUploadService,
@@ -872,7 +980,7 @@ def _prepare_filing_for_admission_test(
             document_id="filing_admission",
             internal_document_id="filing_admission",
             form_type="Q1",
-            files=files,
+            selection=FinsUploadFilingFiles.from_upsert_paths(tuple(files)),
             overwrite=False,
             previous_meta=None,
             meta={"ingest_method": "upload"},
@@ -988,26 +1096,13 @@ def test_corrupt_filing_wraps_each_closed_docling_failure_with_label_and_cause(
     assert published_tree_sha256(tmp_path, "AAPL") == {}
 
 
-@pytest.mark.parametrize(
-    ("names", "failing_name", "expected_calls"),
-    (
-        (("bad.pdf", "later.docx"), "bad.pdf", ("bad.pdf",)),
-        (("valid.pdf", "bad.docx", "later.pdf"), "bad.docx", ("valid.pdf", "bad.docx")),
-    ),
-)
-def test_corrupt_mixed_filing_fails_fast_without_publication(
+def test_corrupt_primary_with_valid_companions_fails_without_publication(
     tmp_path: Path,
-    names: tuple[str, ...],
-    failing_name: str,
-    expected_calls: tuple[str, ...],
 ) -> None:
-    """mixed filing 必须在首个损坏文件 fail-fast 且不产生 partial publication。
+    """损坏 primary 必须只转换一次并在 companions 发布前失败。
 
     Args:
         tmp_path: pytest 临时目录。
-        names: 用户输入顺序。
-        failing_name: 首个损坏文件 basename。
-        expected_calls: 截止首个损坏文件的 converter 调用顺序。
 
     Returns:
         无。
@@ -1017,7 +1112,7 @@ def test_corrupt_mixed_filing_fails_fast_without_publication(
     """
 
     context = _build_service_context(tmp_path)
-    files = [tmp_path / name for name in names]
+    files = [tmp_path / name for name in ("bad.pdf", "later.docx")]
     for file_path in files:
         file_path.write_bytes(b"filing input")
     cause = DoclingConversionError(
@@ -1027,7 +1122,7 @@ def test_corrupt_mixed_filing_fails_fast_without_publication(
     )
     calls: list[str] = []
     context.service._docling_converter = _SelectiveFailingDoclingConverter(
-        failing_name=failing_name,
+        failing_name=files[0].name,
         error=cause,
         calls=calls,
     )
@@ -1035,7 +1130,108 @@ def test_corrupt_mixed_filing_fails_fast_without_publication(
     with pytest.raises(FinsUploadFailureError):
         _prepare_filing_for_admission_test(service=context.service, files=files)
 
-    assert calls == list(expected_calls)
+    assert calls == [files[0].name]
+    assert published_tree_sha256(tmp_path, "AAPL") == {}
+
+
+@pytest.mark.parametrize(
+    ("names", "expected_primary"),
+    (
+        (("primary.html", "schema.xsd"), "primary_docling.json"),
+        (("primary.docx", "sheet.xlsx", "appendix.docx"), "primary_docling.json"),
+    ),
+)
+def test_filing_converts_only_primary_and_publishes_all_companions(
+    tmp_path: Path,
+    names: tuple[str, ...],
+    expected_primary: str,
+) -> None:
+    """filing 只转换 primary，companions 作为 original 同批发布。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        names: primary 与 companions 的有序文件名。
+        expected_primary: 首文件转换直接产生的 primary document 名。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 转换、事件、计数或 primary contract 漂移时抛出。
+    """
+
+    calls: list[str] = []
+    context = _build_service_context(tmp_path)
+    context.service._docling_converter = _FakeDoclingConverter(calls)
+    files = [tmp_path / name for name in names]
+    for file_path in files:
+        file_path.write_bytes(f"original:{file_path.name}".encode())
+
+    result = _execute_upload(
+        service=context.service,
+        batching_repository=context.batching_repository,
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        action="create",
+        document_id="filing_roles",
+        internal_document_id="filing_roles",
+        form_type="10-K",
+        files=files,
+        overwrite=False,
+        meta={"ingest_method": "upload"},
+    )
+    meta = context.source_repository.get_source_meta(
+        "AAPL",
+        "filing_roles",
+        SourceKind.FILING,
+    )
+    entries = meta["files"]
+    assert isinstance(entries, list)
+
+    assert calls == [names[0]]
+    assert result.stored_file_count == len(names)
+    assert result.payload["primary_document"] == expected_primary
+    assert meta["primary_document"] == expected_primary
+    assert len(entries) == len(names) + 1
+    assert [event.name for event in result.file_events if event.event_type == "conversion_started"] == [names[0]]
+    original_uploads = [
+        event.name
+        for event in result.file_events
+        if event.event_type == "file_uploaded" and event.payload["source"] == "original"
+    ]
+    assert original_uploads == list(names)
+
+
+def test_empty_filing_companion_fails_before_conversion_and_publication(tmp_path: Path) -> None:
+    """空 companion 仍须在转换与 publication 前由 original 读取 owner 拒绝。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: companion 被跳过读取或产生副作用时抛出。
+    """
+
+    calls: list[str] = []
+    context = _build_service_context(tmp_path)
+    context.service._docling_converter = _FakeDoclingConverter(calls)
+    primary = tmp_path / "primary.html"
+    companion = tmp_path / "schema.xsd"
+    primary.write_bytes(b"primary")
+    companion.write_bytes(b"")
+
+    with pytest.raises(FinsUploadFailureError) as exc_info:
+        _prepare_filing_for_admission_test(
+            service=context.service,
+            files=[primary, companion],
+        )
+
+    assert exc_info.value.failure.code is FinsUploadFailureCode.EMPTY_INPUT_FILE
+    assert exc_info.value.failure.file_label == companion.name
+    assert calls == []
     assert published_tree_sha256(tmp_path, "AAPL") == {}
 
 
@@ -1081,6 +1277,301 @@ def test_execute_upload_create_material_success(tmp_path: Path) -> None:
     assert len(meta["files"]) == 2
 
 
+def test_execute_upload_material_converts_every_selected_file(tmp_path: Path) -> None:
+    """material 多文件必须全部转换并保持首项 Docling primary。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: material 被 filing 单转换语义误伤时抛出。
+    """
+
+    calls: list[str] = []
+    context = _build_service_context(tmp_path)
+    context.service._docling_converter = _FakeDoclingConverter(calls)
+    files = [tmp_path / "first.pdf", tmp_path / "second.docx"]
+    for file_path in files:
+        file_path.write_bytes(file_path.name.encode())
+
+    result = _execute_upload(
+        service=context.service,
+        batching_repository=context.batching_repository,
+        ticker="AAPL",
+        source_kind=SourceKind.MATERIAL,
+        action="create",
+        document_id="material_multiple",
+        internal_document_id="material_multiple",
+        form_type="MATERIAL_OTHER",
+        files=files,
+        overwrite=False,
+        meta={"material_name": "Deck", "ingest_method": "upload"},
+    )
+
+    assert calls == ["first.pdf", "second.docx"]
+    assert result.stored_file_count == 2
+    assert result.payload["primary_document"] == "first_docling.json"
+    assert len(result.file_events) == 6
+
+
+def test_prepare_material_cancellation_before_second_conversion_discards_partial_work(
+    tmp_path: Path,
+) -> None:
+    """第二项转换前取消必须丢弃首项 partial plan 且不得开启 publication batch。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 取消结果、事件丢弃或零发布边界漂移时抛出。
+    """
+
+    calls: list[str] = []
+    context = _build_batch_tracking_service_context(tmp_path)
+    context.service._docling_converter = _FakeDoclingConverter(calls)
+    files = [tmp_path / "first.pdf", tmp_path / "second.docx"]
+    for file_path in files:
+        file_path.write_bytes(file_path.name.encode())
+    cancellation = _CancelOnNthCheck(cancel_at=4)
+
+    prepared = _prepare_material_for_admission_test(
+        service=context.service,
+        files=files,
+        cancellation=cancellation,
+    )
+
+    assert isinstance(prepared, UploadOperationResult)
+    assert prepared.status == "cancelled"
+    assert prepared.file_events == []
+    assert prepared.stored_file_count == 0
+    assert calls == ["first.pdf"]
+    assert isinstance(context.batching_repository, _BatchIdentityUploadBatchingRepository)
+    assert context.batching_repository.begin_calls == 0
+    assert published_tree_sha256(tmp_path, "AAPL") == {}
+    with pytest.raises(FileNotFoundError):
+        context.source_repository.get_source_meta(
+            "AAPL",
+            "material_admission",
+            SourceKind.MATERIAL,
+        )
+
+
+def test_prepare_material_nth_conversion_failure_discards_partial_work(
+    tmp_path: Path,
+) -> None:
+    """material 第 N 项 typed conversion failure 必须原样传播且零发布。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: fail-fast、异常身份或零发布边界漂移时抛出。
+    """
+
+    calls: list[str] = []
+    context = _build_batch_tracking_service_context(tmp_path)
+    files = [tmp_path / "ok.pdf", tmp_path / "corrupt.docx"]
+    for file_path in files:
+        file_path.write_bytes(file_path.name.encode())
+    cause = DoclingConversionError(
+        DoclingConversionFailureKind.CONVERTER_EXECUTION,
+        "Docling conversion execution failed",
+        19,
+    )
+    context.service._docling_converter = _SelectiveFailingDoclingConverter(
+        failing_name="corrupt.docx",
+        error=cause,
+        calls=calls,
+    )
+
+    with pytest.raises(DoclingConversionError) as exc_info:
+        _prepare_material_for_admission_test(service=context.service, files=files)
+
+    assert exc_info.value is cause
+    assert calls == ["ok.pdf", "corrupt.docx"]
+    assert isinstance(context.batching_repository, _BatchIdentityUploadBatchingRepository)
+    assert context.batching_repository.begin_calls == 0
+    assert published_tree_sha256(tmp_path, "AAPL") == {}
+    with pytest.raises(FileNotFoundError):
+        context.source_repository.get_source_meta(
+            "AAPL",
+            "material_admission",
+            SourceKind.MATERIAL,
+        )
+
+
+@pytest.mark.parametrize(
+    ("source_kind", "selection"),
+    (
+        (
+            SourceKind.FILING,
+            FinsUploadMaterialFiles.from_upsert_paths((Path("material.pdf"),)),
+        ),
+        (
+            SourceKind.MATERIAL,
+            FinsUploadFilingFiles.from_upsert_paths((Path("filing.pdf"),)),
+        ),
+    ),
+)
+def test_prepare_upload_rejects_source_kind_selection_mismatch_before_io(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_kind: SourceKind,
+    selection: FinsUploadFilingFiles | FinsUploadMaterialFiles,
+) -> None:
+    """source kind 与 selection 类型错配必须在任何文件读取和转换前拒绝。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: 文件读取禁用夹具。
+        source_kind: 当前 source kind。
+        selection: 与 source kind 故意错配的 typed selection。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法组合越过入口边界时抛出。
+    """
+
+    calls: list[str] = []
+    context = _build_service_context(tmp_path)
+    context.service._docling_converter = _FakeDoclingConverter(calls)
+
+    def reject_read(path: Path) -> bytes:
+        """拒绝任何意外文件读取。
+
+        Args:
+            path: 意外读取的路径。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 始终抛出。
+        """
+
+        raise AssertionError(f"非法 selection 触发文件读取: {path.name}")
+
+    monkeypatch.setattr(Path, "read_bytes", reject_read)
+
+    with pytest.raises(ValueError, match="selection"):
+        asyncio.run(
+            context.service.prepare_upload(
+                ticker="AAPL",
+                source_kind=source_kind,
+                action="create",
+                document_id="invalid_selection",
+                internal_document_id="invalid_selection",
+                form_type="TEST",
+                selection=selection,
+                overwrite=False,
+                previous_meta=None,
+                meta={},
+                cancellation=None,
+            )
+        )
+
+    assert calls == []
+    assert published_tree_sha256(tmp_path, "AAPL") == {}
+
+
+@pytest.mark.parametrize(
+    ("source_kind", "action", "use_empty"),
+    (
+        (SourceKind.FILING, "create", True),
+        (SourceKind.FILING, "update", True),
+        (SourceKind.FILING, "delete", False),
+        (SourceKind.MATERIAL, "create", True),
+        (SourceKind.MATERIAL, "update", True),
+        (SourceKind.MATERIAL, "delete", False),
+    ),
+)
+def test_prepare_upload_rejects_action_emptiness_mismatch_before_io(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_kind: SourceKind,
+    action: str,
+    use_empty: bool,
+) -> None:
+    """create/update 与 delete 的 selection 空性必须双向严格一致。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: 文件读取禁用夹具。
+        source_kind: filing 或 material。
+        action: 当前动作。
+        use_empty: 是否构造 delete empty selection。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法组合触发文件读取、转换或 publication 时抛出。
+    """
+
+    calls: list[str] = []
+    context = _build_service_context(tmp_path)
+    context.service._docling_converter = _FakeDoclingConverter(calls)
+    candidate = Path("candidate.pdf")
+    if source_kind is SourceKind.FILING:
+        selection: FinsUploadFilingFiles | FinsUploadMaterialFiles = (
+            FinsUploadFilingFiles.for_delete() if use_empty else FinsUploadFilingFiles.from_upsert_paths((candidate,))
+        )
+    else:
+        selection = (
+            FinsUploadMaterialFiles.for_delete()
+            if use_empty
+            else FinsUploadMaterialFiles.from_upsert_paths((candidate,))
+        )
+
+    def reject_read(path: Path) -> bytes:
+        """拒绝任何意外文件读取。
+
+        Args:
+            path: 意外读取的路径。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 始终抛出。
+        """
+
+        raise AssertionError(f"非法 action/selection 触发文件读取: {path.name}")
+
+    monkeypatch.setattr(Path, "read_bytes", reject_read)
+
+    with pytest.raises(ValueError, match="selection"):
+        asyncio.run(
+            context.service.prepare_upload(
+                ticker="AAPL",
+                source_kind=source_kind,
+                action=action,
+                document_id="invalid_emptiness",
+                internal_document_id="invalid_emptiness",
+                form_type="TEST",
+                selection=selection,
+                overwrite=False,
+                previous_meta=None,
+                meta={},
+                cancellation=None,
+            )
+        )
+
+    assert calls == []
+    assert published_tree_sha256(tmp_path, "AAPL") == {}
+
+
 def test_prepare_maps_shared_converter_cancel_without_starting_publication(tmp_path: Path) -> None:
     """converter cancel 必须收敛为 cancelled plan 且不创建 document batch。
 
@@ -1113,7 +1604,7 @@ def test_prepare_maps_shared_converter_cancel_without_starting_publication(tmp_p
             document_id="mat_cancelled",
             internal_document_id="mat_cancelled",
             form_type="MATERIAL_OTHER",
-            files=[sample_file],
+            selection=FinsUploadMaterialFiles.from_upsert_paths((sample_file,)),
             overwrite=False,
             previous_meta=None,
             meta={"material_name": "Deck", "ingest_method": "upload"},
@@ -1296,7 +1787,7 @@ def test_commit_winner_ignores_cancel_after_ownership_transfer(tmp_path: Path) -
             document_id="mat_commit_winner",
             internal_document_id="mat_commit_winner",
             form_type="MATERIAL_OTHER",
-            files=[sample_file],
+            selection=FinsUploadMaterialFiles.from_upsert_paths((sample_file,)),
             overwrite=False,
             previous_meta=None,
             meta={"material_name": "Deck", "ingest_method": "upload"},
@@ -1466,7 +1957,11 @@ def test_prepare_upload_rejects_missing_update_before_shared_conversion(
                 document_id="missing_document",
                 internal_document_id="missing_document",
                 form_type="10-K" if source_kind is SourceKind.FILING else "MATERIAL_OTHER",
-                files=[sample_file],
+                selection=_selection_for_test(
+                    source_kind=source_kind,
+                    action="update",
+                    files=[sample_file],
+                ),
                 overwrite=overwrite,
                 previous_meta=None,
                 meta={"ingest_method": "upload"},
@@ -1528,7 +2023,7 @@ def test_prepare_upload_rejects_existing_filing_create_before_conversion(tmp_pat
                 document_id="filing_existing",
                 internal_document_id="filing_existing",
                 form_type="10-K",
-                files=[sample_file],
+                selection=FinsUploadFilingFiles.from_upsert_paths((sample_file,)),
                 overwrite=False,
                 previous_meta=previous_meta,
                 meta={"ingest_method": "upload"},
@@ -1596,7 +2091,7 @@ def test_prepare_upload_requires_canonical_boolean_deleted_state(
                 document_id="filing_corrupt_meta",
                 internal_document_id="filing_corrupt_meta",
                 form_type="10-K",
-                files=[sample_file],
+                selection=FinsUploadFilingFiles.from_upsert_paths((sample_file,)),
                 overwrite=False,
                 previous_meta=previous_meta,
                 meta={"ingest_method": "upload"},
@@ -1795,7 +2290,9 @@ def test_execute_upload_existing_full_input_replaces_exact_complete_set(
 
     final_meta = context.source_repository.get_source_meta("AAPL", document_id, source_kind)
     handle = SourceHandle(ticker="AAPL", document_id=document_id, source_kind=source_kind.value)
-    published_names = sorted(item.uri.rsplit("/", maxsplit=1)[-1] for item in context.blob_repository.list_files(handle))
+    published_names = sorted(
+        item.uri.rsplit("/", maxsplit=1)[-1] for item in context.blob_repository.list_files(handle)
+    )
     expected_names = sorted((new_name, f"{Path(new_name).stem}_docling.json"))
     integrity = context.source_repository.classify_source_integrity("AAPL", document_id, source_kind)
 
@@ -1919,7 +2416,7 @@ def test_existing_replacement_cancellation_keeps_entire_published_tree(
             document_id="mat_demo",
             internal_document_id="mat_demo",
             form_type="MATERIAL_OTHER",
-            files=[new_file],
+            selection=FinsUploadMaterialFiles.from_upsert_paths((new_file,)),
             overwrite=False,
             previous_meta=old_meta,
             meta={"material_name": "Deck", "ingest_method": "upload"},
@@ -2258,5 +2755,5 @@ def test_execute_upload_counts_only_successful_original_stores(tmp_path: Path) -
         SourceKind.FILING,
     )
 
-    assert len(meta["files"]) == 4
+    assert len(meta["files"]) == 3
     assert result.stored_file_count == 2

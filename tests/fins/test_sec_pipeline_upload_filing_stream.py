@@ -43,6 +43,7 @@ from dayu.fins.storage import (
     FsFilingUploadStateRepository,
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
+from dayu.fins.upload_format_contract import FinsUploadFilingFiles
 
 from .upload_filing_test_support import (
     TrackingBatchingRepository,
@@ -978,6 +979,85 @@ async def test_upload_filing_fresh_recheck_discards_stale_action_and_company_dec
 
 
 @pytest.mark.asyncio
+async def test_upload_filing_consumes_fresh_authoritative_file_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SEC workflow 必须原样消费 fresh validator 产生的 typed selection。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: fresh validator selection 注入夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: workflow 从 raw files 重建 selection 时抛出。
+    """
+
+    calls: list[str] = []
+    pipeline, _batching, _company, _source = _tracking_sec_pipeline(
+        tmp_path,
+        converter_calls=calls,
+    )
+    raw_file = tmp_path / "raw.pdf"
+    authoritative_file = tmp_path / "authoritative.docx"
+    raw_file.write_bytes(b"raw")
+    authoritative_file.write_bytes(b"authoritative")
+    request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=raw_file,
+        action="create",
+        company_name="Apple Inc.",
+    )
+    owner_validator = sec_upload_workflow.validate_fins_upload_filing_request
+
+    def authoritative_validator(
+        raw_request: FinsUploadFilingRequest,
+        *,
+        published_state: FilingUploadPublishedState,
+    ) -> ValidatedFinsUploadFilingRequest:
+        """保留 fresh identity，仅替换 owner 产生的 typed selection。
+
+        Args:
+            raw_request: immutable raw request。
+            published_state: fresh published snapshot。
+
+        Returns:
+            携带 authoritative file selection 的 validated request。
+
+        Raises:
+            FinsUploadUsageError: owner validator 拒绝请求时抛出。
+        """
+
+        validated = owner_validator(raw_request, published_state=published_state)
+        return replace(
+            validated,
+            file_selection=FinsUploadFilingFiles.from_upsert_paths((authoritative_file,)),
+        )
+
+    monkeypatch.setattr(
+        sec_upload_workflow,
+        "validate_fins_upload_filing_request",
+        authoritative_validator,
+    )
+
+    events = [event async for event in pipeline.upload_filing_stream(request)]
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    handle = pipeline._source_repository.get_source_handle(
+        "AAPL",
+        str(result["document_id"]),
+        SourceKind.FILING,
+    )
+    stored_names = sorted(item.uri.rsplit("/", maxsplit=1)[-1] for item in pipeline._blob_repository.list_files(handle))
+
+    assert calls == ["authoritative.docx"]
+    assert stored_names == ["authoritative.docx", "authoritative_docling.json"]
+
+
+@pytest.mark.asyncio
 async def test_upload_filing_rollback_failure_logs_primary_and_recovery_evidence(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -1165,12 +1245,12 @@ async def test_upload_filing_empty_fails_before_batch_with_typed_label(
 
 
 @pytest.mark.asyncio
-async def test_upload_filing_valid_and_corrupt_mixed_batch_fails_atomically(
+async def test_upload_filing_corrupt_primary_with_valid_companions_fails_atomically(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """SEC valid+corrupt mixed filing 必须 fail-fast 且整批不开始 publication。
+    """SEC corrupt primary 必须只转换一次且整批不开始 publication。
 
     Args:
         tmp_path: pytest 临时目录。
@@ -1212,10 +1292,10 @@ async def test_upload_filing_valid_and_corrupt_mixed_batch_fails_atomically(
         "fins_upload_failure_from_exception",
         reject_workflow_reclassification,
     )
-    valid_file = tmp_path / "valid.pdf"
-    corrupt_file = tmp_path / "corrupt.docx"
-    later_file = tmp_path / "later.pdf"
-    for file_path in (valid_file, corrupt_file, later_file):
+    corrupt_file = tmp_path / "corrupt.pdf"
+    companion_file = tmp_path / "companion.docx"
+    later_file = tmp_path / "later.xlsx"
+    for file_path in (corrupt_file, companion_file, later_file):
         file_path.write_bytes(b"filing input")
     calls: list[str] = []
     cause = DoclingConversionError(
@@ -1230,13 +1310,13 @@ async def test_upload_filing_valid_and_corrupt_mixed_batch_fails_atomically(
     )
     first_request = _validated_sec_filing_request(
         pipeline=pipeline,
-        filing_file=valid_file,
+        filing_file=corrupt_file,
         action="create",
         company_name="Apple Inc.",
     )
     request = replace(
         first_request,
-        request=replace(first_request.request, files=(valid_file, corrupt_file, later_file)),
+        request=replace(first_request.request, files=(corrupt_file, companion_file, later_file)),
     )
 
     with caplog.at_level("ERROR"):
@@ -1248,8 +1328,8 @@ async def test_upload_filing_valid_and_corrupt_mixed_batch_fails_atomically(
     assert isinstance(failure, dict)
     assert result["stored_file_count"] == 0
     assert failure["code"] == "docling_converter_execution"
-    assert failure["file_label"] == "corrupt.docx"
-    assert calls == ["valid.pdf", "corrupt.docx"]
+    assert failure["file_label"] == "corrupt.pdf"
+    assert calls == ["corrupt.pdf"]
     assert "typed content admission failed" in caplog.text
     assert str(cause) in caplog.text
     assert str(cause) not in str(result)

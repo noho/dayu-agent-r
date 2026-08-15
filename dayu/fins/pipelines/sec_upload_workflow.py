@@ -47,6 +47,7 @@ from dayu.fins.storage import (
     SourceDocumentRepositoryProtocol,
 )
 from dayu.fins.ticker_normalization import normalize_ticker
+from dayu.fins.upload_format_contract import FinsUploadMaterialFiles
 from dayu.fins.upload_failure import (
     FinsUploadFailureError,
     FinsUploadFailureReason,
@@ -205,7 +206,7 @@ async def run_upload_filing_stream(
             document_id=document_id,
             internal_document_id=internal_document_id,
             form_type=filing_form_type,
-            files=list(raw_request.files),
+            selection=authoritative_request.file_selection,
             overwrite=raw_request.overwrite,
             previous_meta=previous_meta,
             cancellation=cancellation_checker,
@@ -455,6 +456,11 @@ async def run_upload_material_stream(
     requested_action = str(action or "").strip().lower() or None
     normalized_action: str | None = None
     try:
+        selection = (
+            FinsUploadMaterialFiles.for_delete()
+            if requested_action == "delete"
+            else FinsUploadMaterialFiles.from_upsert_paths(tuple(file_list))
+        )
         previous_meta = host._safe_get_document_meta(
             normalized_ticker,
             resolved_document_id,
@@ -504,7 +510,7 @@ async def run_upload_material_stream(
             document_id=resolved_document_id,
             internal_document_id=resolved_internal_id,
             form_type=form_type,
-            files=file_list,
+            selection=selection,
             overwrite=overwrite,
             previous_meta=previous_meta,
             cancellation=cancellation_checker,
