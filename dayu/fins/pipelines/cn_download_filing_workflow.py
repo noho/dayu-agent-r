@@ -48,6 +48,8 @@ from dayu.fins.storage import (
     ProcessedDocumentRepositoryProtocol,
     SourceDocumentRepositoryProtocol,
     SourceIntegrityClassification,
+    SourceIntegrityPreflightError,
+    SourceIntegrityPreflightReason,
     SourceIntegrityRevisionConflictError,
     SourceIntegrityStatus,
     has_same_source_publication_identity,
@@ -154,6 +156,8 @@ async def run_cn_download_single_filing_stream(
     Raises:
         CnDownloadFilingError: 仓储、下载或转换失败时抛出。
         CnDownloadCancelledError: 取消检查命中时抛出。
+        SourceIntegrityPreflightError: Phase A 或 Phase B target 为 UNSAFE 时抛出。
+        SourceIntegrityRevisionConflictError: publication identity 连续变化耗尽重试时抛出。
     """
 
     _raise_if_cancelled(module=module, ticker=ticker, document_id="", cancel_checker=cancel_checker)
@@ -171,6 +175,8 @@ async def run_cn_download_single_filing_stream(
         document_id,
         SourceKind.FILING,
     )
+    if phase_a_integrity.status is SourceIntegrityStatus.UNSAFE:
+        raise SourceIntegrityPreflightError(SourceIntegrityPreflightReason.UNSAFE_PUBLICATION)
     previous_meta = (
         None
         if phase_a_integrity.status is SourceIntegrityStatus.MISSING
@@ -560,6 +566,7 @@ def _commit_cn_filing_assets_batch(
 
     Raises:
         CnDownloadCancelledError: batch 内阶段边界命中取消时抛出并回滚。
+        SourceIntegrityPreflightError: staged target 为 UNSAFE 时抛出并回滚。
         OSError: 任一仓储写入、commit 或 rollback 失败时抛出。
         RuntimeError: batch/token owner 契约不成立时抛出。
     """
@@ -573,6 +580,8 @@ def _commit_cn_filing_assets_batch(
             SourceKind.FILING,
             batch=token,
         )
+        if phase_b_integrity.status is SourceIntegrityStatus.UNSAFE:
+            raise SourceIntegrityPreflightError(SourceIntegrityPreflightReason.UNSAFE_PUBLICATION)
         if not has_same_source_publication_identity(
             phase_a_integrity,
             phase_b_integrity,

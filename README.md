@@ -355,7 +355,7 @@ files 集合内；文件数超过 100；或 `delete` 携带 `--files` / `--prima
 三个上传命令的 `--action` 默认都是 `auto`。单份上传还可显式使用
 `create`、`update` 或 `delete`；批量脚本只会生成 `auto`、`create` 或 `update`。
 
-`update` 只更新已经存在的同一 filing identity；目标不存在时即使同时传入 `--overwrite` 也会拒绝，请改用 `create`。`--overwrite` 不是 upsert 开关，只允许覆盖已存在的 create 目标或强制重建已存在目标。`auto` 遇到已逻辑删除的目标会执行 update 并恢复为 active，不会因输入内容相同而跳过。existing update 会把该 filing 的完整文件集合原子替换为本次输入及其 Docling 文件；改名后旧文件名不会残留，失败或发布前取消仍保留完整旧集合。
+`update` 只更新已经存在的同一 filing identity；目标不存在时即使同时传入 `--overwrite` 也会拒绝，请改用 `create`。`--overwrite` 不是 upsert 开关，只允许覆盖已存在的 create 目标或强制重建已存在目标。`auto` 遇到已逻辑删除的目标会执行 update 并恢复为 active，不会因输入内容相同而跳过；若本地目标已损坏但仍能由本次完整输入安全重建，`auto` 会原子替换全部原始文件和 Docling 文件并恢复完整索引。此类目标若显式使用 `create`、`update` 或 `delete` 会失败，并提示改用 `auto` 提供完整文件；无法确认身份或无法安全重建的本地状态也会在发布前失败，并提示先修复工作区。existing update 或安全重建后旧文件名不会残留，失败或发布前取消仍保留完整旧集合。
 
 上传期间第一次按下 `Ctrl-C` 只会请求一次协作取消，命令会继续等待并展示上传运行期给出的最终结果。若取消在文档发布前生效，最终显示 cancelled 并退出 `130`，不会先显示 completed；若文档发布或确定的跳过/删除结果已经完成，随后到达的 `Ctrl-C` 不会把该结果改写为 cancelled，也不会回滚已发布内容。
 
