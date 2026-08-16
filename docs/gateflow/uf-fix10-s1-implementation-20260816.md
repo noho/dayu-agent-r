@@ -101,3 +101,25 @@ S1 frozen scope 明确禁止修改 README，且当前 implementation 未完成�
 - 未运行 UF-PF10、UF-PF12，未修改 material、UF-FIX11、SEC/CN/HK workflow、oracle、scenario、registry 或 frozen evidence。
 - 无新增通用 OCC、global lock、retry、sleep、directory fallback 或兼容分支。
 - remaining risk 已分类为 `requiring explicit user decision`：允许对 `_FixedFilingUploadStateRepository` 做最小 required protocol method fixture 更新，或回到 plan review 重划 protocol/fixture allowed scope。
+
+## 第二次 blocker 历史（2026-08-17）
+
+首次 amendment 通过 re-review 并授权恢复后，S1 已完成首次 amendment 明列的两个 runtime fake conformance，以及 owner tests、focused/full tests 与 coverage closure。对应直接结果为：focused 八文件 `834 passed`，完整 `tests/fins` 为 `1871 passed, 1 skipped`，精确四模块冻结测试集总 coverage `82%`、加入各 owner tests 后逐文件 coverage 均达到 80%，`tests/fins/test_fins_ingestion_runtime.py` focused pyright 为 `0 errors`。
+
+随后 full pyright 暴露第二个 scope blocker：
+
+```text
+tests/fins/test_fins_ingestion_tools.py:2474:40
+_ForbiddenFilingUploadStateRepository is incompatible with
+FilingUploadStateRepositoryProtocol: read_filing_upload_state_in_batch is not present
+```
+
+该 tool static-admission fake 无 cast 地直接注入 runtime，只实现 published read；root cause 是首次 amendment 的 structural implementer census 仍漏列第三个 required fake。`tests/fins/test_fins_ingestion_tools.py` 不在当时 S1 allowlist，不能在 implementation gate 内越界修改，也不能用 cast/default/fallback 规避，因此按 stop condition 停止。当前 production/tests partial diff保持原样、不可提交；未接通 S2 lifecycle，未修改 SEC/CN/HK workflow、workflow tests、README、oracle、scenario 或 evidence。
+
+当前 implementation status 更新为：`BLOCKED / SECOND PLAN AMENDMENT RE-REVIEW REQUIRED`。新的 amendment artifact 为 `docs/gateflow/uf-fix10-s1-second-blocker-plan-amendment-20260817.md`；下一入口为 `plan re-review`，re-review pass 与 Controller 明确恢复授权前不得继续 S1 implementation。
+
+## 第二次 amendment acceptance（2026-08-17）
+
+`docs/reviews/plan-review-20260817-010842-mimo.md` 与 `docs/reviews/plan-review-20260817-010619-ds.md` 两路结论均为 `pass`。Controller 接受 second amendment，并 pin 定 tools fake 只在现有 filing static-admission cases 已有 `calls == []` 的位置补 `batch_calls == []`；material ticker-identity case不动。service runtime 的动态 monkeypatch fake在本 work unit 无 batch-read可达路径，分类为未来触发式、非阻塞 residual，不纳入 S1/S2。
+
+当前 implementation status 更新为：`SECOND AMENDMENT ACCEPTED / S1 RESUME AUTHORIZED`。acceptance artifact 为 `docs/gateflow/uf-fix10-s1-second-blocker-plan-acceptance-20260817.md`；下一入口恢复为 `S1 implementation resume`。本 acceptance gate 未修改 production/tests/README，未运行 pytest、pyright、coverage，未 commit，也未授权提前接通 S2 lifecycle。
