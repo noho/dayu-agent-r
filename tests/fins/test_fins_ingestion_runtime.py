@@ -8529,6 +8529,61 @@ def test_default_runtime_start_upload_sec_filing_uses_production_runner(tmp_path
     assert progress_events[1].payload["upload_status"] == "ok"
 
 
+def test_durable_upload_fresh_unsafe_persists_exact_typed_failure_reason(tmp_path: Path) -> None:
+    """异步 job 必须原样持久化 workflow fresh validator 的 typed failure。
+
+    Args:
+        tmp_path: 临时 workspace。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: failure reason 被异常字符串或 generic runtime 改写时抛出。
+        OSError: 真实 filesystem fixture 读写失败时抛出。
+    """
+
+    workspace_root = tmp_path / "fins-workspace"
+    default_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    ingestion = default_runtime.get_ingestion_runtime()
+    _inject_upload_runtime_converter(default_runtime, ingestion)
+    filing_file = tmp_path / "aapl-fresh-unsafe.pdf"
+    filing_file.write_bytes(b"durable fresh unsafe")
+    raw_request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        action="auto",
+        files=(filing_file,),
+        fiscal_year=2025,
+        fiscal_period="Q1",
+        company_name="Apple Inc.",
+    )
+    created = ingestion.start_upload(raw_request)
+    created_record = _wait_terminal(ingestion, created.job_id)
+    assert created_record.status is FinsIngestionJobStatus.SUCCEEDED
+    validated = prevalidate_fins_upload_filing_request_for_workspace(
+        raw_request,
+        workspace_root=workspace_root,
+    )
+    locator = default_runtime.source_repository.get_source_document_locator(
+        validated.normalized_ticker.canonical,
+        validated.document_id,
+        SourceKind.FILING,
+    )
+    (workspace_root / locator / "private-undeclared.bin").write_bytes(b"unsafe")
+
+    failed = ingestion.start_upload(validated)
+    failed_record = _wait_terminal(ingestion, failed.job_id)
+
+    expected = fins_upload_source_integrity_unsafe_failure().to_json()
+    assert failed_record.status is FinsIngestionJobStatus.FAILED
+    assert failed_record.failure_summary == expected
+    assert failed_record.result_summary["failure"] == expected
+    assert failed_record.result_summary["status"] == "failed"
+    assert failed_record.result_summary["stored_file_count"] == 0
+    assert "unexpected_runtime" not in json.dumps(failed_record.failure_summary)
+    assert "private-undeclared.bin" not in json.dumps(failed_record.failure_summary)
+
+
 def test_default_runtime_start_upload_cn_material_uses_production_runner(tmp_path: Path) -> None:
     """DefaultFinsRuntime 应装配 production runner 并执行 CN material 上传。
 

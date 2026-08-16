@@ -43,6 +43,8 @@ from dayu.fins.domain.document_models import (
     now_iso8601,
 )
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.direct_events import FinsEventType, FinsResultStatus
+from dayu.fins.ingestion_runtime import FinsUploadFilingRequest
 from dayu.fins.processors.bs_ten_q_processor import BsTenQFormProcessor
 from dayu.fins.processors.bs_ten_k_processor import BsTenKFormProcessor
 from dayu.fins.processors.sec_form_section_common import (
@@ -73,13 +75,22 @@ from dayu.fins.processors.source_text import (
 )
 from dayu.fins.processors.ten_q_processor import TenQFormProcessor
 from dayu.fins.processors.ten_k_processor import TenKFormProcessor
-from dayu.fins.pipelines.docling_process_converter import DoclingConversionResult
+from dayu.fins.pipelines.docling_process_converter import (
+    DoclingConversionConfig,
+    DoclingConversionResult,
+)
+from dayu.fins.pipelines.sec_pipeline import SecPipeline
+from dayu.fins.service_runtime import (
+    DefaultFinsRuntime,
+    prevalidate_fins_upload_filing_request_for_workspace,
+)
 from dayu.fins.storage import (
     FsBatchingRepository,
     FsCompanyMetaRepository,
     FsDocumentBlobRepository,
     FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
+    SourceIntegrityStatus,
 )
 from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
 from dayu.fins.storage.local_file_source import LocalFileSource
@@ -92,8 +103,67 @@ from dayu.fins.tools.read_runtime_helpers import (
     FinsReadBusinessError,
     FinsReadCancelledError,
 )
+from dayu.service.fins_direct import FinsDirectCommandService
 
 _LOCK_REGISTRY_CACHE_CAPACITY: Final[int] = 4
+
+
+class _RepairPrimaryConverter:
+    """为 workflow/downstream 测试生成逐次不同的 Docling primary。"""
+
+    def __init__(self) -> None:
+        """初始化空转换记录。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.calls: list[str] = []
+
+    async def convert_to_json_bytes(
+        self,
+        input_bytes: bytes,
+        stream_name: str,
+        *,
+        config: DoclingConversionConfig,
+        cancellation: CancellationToken | None,
+    ) -> DoclingConversionResult:
+        """返回包含本次转换序号的确定性 Docling bytes。
+
+        Args:
+            input_bytes: authoritative primary bytes。
+            stream_name: public input basename。
+            config: 闭合转换配置。
+            cancellation: canonical cancellation token。
+
+        Returns:
+            digest 与 size 同源的 typed conversion result。
+
+        Raises:
+            无。
+        """
+
+        del input_bytes, config, cancellation
+        self.calls.append(stream_name)
+        payload = json.dumps(
+            {
+                "name": stream_name,
+                "format": "docling",
+                "version": f"repair-primary-v{len(self.calls)}",
+            },
+            separators=(",", ":"),
+        ).encode()
+        return DoclingConversionResult(
+            json_bytes=payload,
+            size=len(payload),
+            sha256=hashlib.sha256(payload).hexdigest(),
+        )
 
 
 def test_shared_converter_utf8_json_fixture_is_readable_by_source_decoder() -> None:
@@ -1312,6 +1382,183 @@ def test_read_runtime_consumes_exact_opaque_primary_instead_of_original_or_compa
     assert result["sections"][0]["title"] == "Overview"
     assert section["content"] == "exact-derived-primary"
     runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_repaired_snapshot_and_process_entry_consume_only_new_primary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """repair 后 snapshot 与 process 入口必须只消费新发布的 exact primary。
+
+    Args:
+        tmp_path: 临时 workspace。
+        monkeypatch: processor registry source spy 注入夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: repair revision、snapshot primary 或 process 输入漂移时抛出。
+        OSError: 真实 filesystem publication 读写失败时抛出。
+        ValueError: persisted source contract 非法时抛出。
+    """
+
+    workspace_root = tmp_path / "repair-downstream"
+    default_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    ingestion = default_runtime.get_ingestion_runtime()
+    converter = _RepairPrimaryConverter()
+    pipeline = SecPipeline(
+        workspace_root=workspace_root,
+        processor_registry=default_runtime.processor_registry,
+        batching_repository=default_runtime.batching_repository,
+        company_repository=default_runtime.company_repository,
+        source_repository=default_runtime.source_repository,
+        processed_repository=default_runtime.processed_repository,
+        blob_repository=default_runtime.blob_repository,
+        filing_maintenance_repository=default_runtime.filing_maintenance_repository,
+        filing_upload_state_repository=default_runtime.filing_upload_state_repository,
+        docling_converter=converter,
+    )
+    primary = tmp_path / "repair-process-primary.pdf"
+    companion = tmp_path / "repair-process-companion.xlsx"
+    primary.write_bytes(b"authoritative primary")
+    companion.write_bytes(b"authoritative companion")
+    raw_request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        action="auto",
+        files=(primary, companion),
+        primary_selectors=(primary,),
+        fiscal_year=2025,
+        fiscal_period="Q1",
+        company_name="Apple Inc.",
+    )
+    create_request = prevalidate_fins_upload_filing_request_for_workspace(
+        raw_request,
+        workspace_root=workspace_root,
+    )
+    create_events = [event async for event in pipeline.upload_filing_stream(create_request)]
+    created = create_events[-1].payload["result"]
+    assert isinstance(created, dict)
+    assert created["status"] == "ok"
+    document_id = create_request.document_id
+    old_revision = default_runtime.source_repository.classify_source_integrity(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+    ).revision
+    source_meta = default_runtime.source_repository.get_source_meta(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+    )
+    old_primary = source_meta.get("primary_document")
+    assert isinstance(old_primary, str)
+    locator = default_runtime.source_repository.get_source_document_locator(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+    )
+    (workspace_root / locator / old_primary).unlink()
+    with pytest.raises(ValueError, match="^source snapshot 只允许读取完整 source$"):
+        default_runtime.source_repository.read_source_snapshot(
+            "AAPL",
+            document_id,
+            SourceKind.FILING,
+            materialize_files=False,
+        )
+    repair_request = prevalidate_fins_upload_filing_request_for_workspace(
+        raw_request,
+        workspace_root=workspace_root,
+    )
+    repair_events = [event async for event in pipeline.upload_filing_stream(repair_request)]
+    repaired_result = repair_events[-1].payload["result"]
+    assert isinstance(repaired_result, dict)
+    assert repaired_result["status"] == "ok"
+    repaired_integrity = default_runtime.source_repository.classify_source_integrity(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+    )
+    assert repaired_integrity.revision is not None
+    assert repaired_integrity.revision != old_revision
+    with default_runtime.source_repository.read_source_snapshot(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+        materialize_files=True,
+    ) as snapshot:
+        with snapshot.get_primary_source().open() as stream:
+            new_primary = stream.read()
+        assert snapshot.revision == repaired_integrity.revision
+        assert json.loads(new_primary.decode()) == {
+            "name": primary.name,
+            "format": "docling",
+            "version": "repair-primary-v2",
+        }
+
+    processor_inputs: list[bytes] = []
+
+    def observe_process_source(
+        source: Source,
+        *,
+        form_type: str | None = None,
+        media_type: str | None = None,
+        on_fallback: Callable[[type[DocumentProcessor], Exception, int, int], None] | None = None,
+    ) -> DocumentProcessor:
+        """记录 process 入口收到的 snapshot exact primary 并委托真实 registry。
+
+        Args:
+            source: snapshot exact primary source。
+            form_type: 可选 filing form type。
+            media_type: 可选媒体类型。
+            on_fallback: 可选 processor fallback callback。
+
+        Returns:
+            真实 registry 创建的 processor。
+
+        Raises:
+            OSError: source 读取失败时抛出。
+            ValueError: registry 无候选时抛出。
+            RuntimeError: processor 构建失败时抛出。
+        """
+
+        with source.open() as stream:
+            processor_inputs.append(stream.read())
+        return _ReadProcessor(
+            source,
+            form_type=form_type,
+            media_type=media_type,
+        )
+
+    monkeypatch.setattr(
+        ingestion.processor_registry,
+        "create_with_fallback",
+        observe_process_source,
+    )
+    service = FinsDirectCommandService(default_runtime)
+    process_events = [
+        event
+        async for event in service.process_filing(
+            ticker="AAPL",
+            document_ids=(document_id,),
+        )
+    ]
+
+    result_event = process_events[-1]
+    assert result_event.event_type is FinsEventType.RESULT
+    assert result_event.result is not None
+    assert result_event.result.status is FinsResultStatus.SUCCESS
+    assert result_event.result.exit_code == 0
+    assert processor_inputs == [new_primary]
+    post_process_integrity = default_runtime.source_repository.classify_source_integrity(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+    )
+    assert post_process_integrity.status is SourceIntegrityStatus.COMPLETE
+    assert post_process_integrity.revision == repaired_integrity.revision
+    assert converter.calls == [primary.name, primary.name]
 
 
 def _update_source(

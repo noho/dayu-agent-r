@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -11,7 +12,9 @@ import pytest
 from tests.fins.company_meta_test_support import stage_company_meta_fixture
 
 import dayu.fins.pipelines.sec_upload_workflow as sec_upload_workflow
+import dayu.fins.pipelines._filing_upload_fresh_validation as fresh_validation_module
 from dayu.contracts.cancellation import CancellationToken
+from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.company_meta_contract import CompanyMetaCommitIntent
 from dayu.fins.domain.document_models import BatchToken, CompanyMeta, CompanyMetaInventoryEntry, now_iso8601
 from dayu.fins.ticker_normalization import build_company_ticker_identity
@@ -42,8 +45,10 @@ from dayu.fins.storage import (
     FilingUploadPublishedState,
     FsDocumentBlobRepository,
     FsFilingUploadStateRepository,
+    SourceIntegrityStatus,
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
+from dayu.runtime.filelock import RuntimeFileLockError
 
 from .upload_filing_test_support import (
     TrackingBatchingRepository,
@@ -260,6 +265,7 @@ def _validated_sec_filing_request(
     fiscal_period: str = "Q1",
     filing_date: str | None = None,
     report_date: str | None = None,
+    companion_files: tuple[Path, ...] = (),
 ) -> ValidatedFinsUploadFilingRequest:
     """使用 production validator 构造 SEC filing 测试请求。
 
@@ -274,6 +280,7 @@ def _validated_sec_filing_request(
         fiscal_period: 财期。
         filing_date: 可选披露日期。
         report_date: 可选报告日期。
+        companion_files: 可选完整 authoritative companions。
 
     Returns:
         由 production storage/validator owner 产生的 validated request。
@@ -288,7 +295,8 @@ def _validated_sec_filing_request(
         FinsUploadFilingRequest(
             ticker="AAPL",
             action=action or "auto",
-            files=() if action == "delete" else (filing_file,),
+            files=() if action == "delete" else (filing_file, *companion_files),
+            primary_selectors=(filing_file,) if companion_files else (),
             fiscal_year=fiscal_year,
             fiscal_period=fiscal_period,
             filing_date=filing_date,
@@ -299,6 +307,107 @@ def _validated_sec_filing_request(
         ),
         workspace_root=pipeline._workspace_root,
     )
+
+
+def _read_json_object(path: Path) -> dict[str, JsonValue]:
+    """读取 workflow filesystem fixture 的 JSON 对象。
+
+    Args:
+        path: 已知 storage-owned JSON 文件。
+
+    Returns:
+        JSON object。
+
+    Raises:
+        OSError: 文件读取失败时抛出。
+        ValueError: JSON 根不是对象时抛出。
+    """
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("workflow repair fixture JSON 必须是对象")
+    return payload
+
+
+def _write_json_object(path: Path, payload: dict[str, JsonValue]) -> None:
+    """确定性写回 workflow filesystem fixture JSON 对象。
+
+    Args:
+        path: 已知 storage-owned JSON 文件。
+        payload: 单点损坏后的 JSON object。
+
+    Returns:
+        无。
+
+    Raises:
+        OSError: 文件写入失败时抛出。
+    """
+
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+
+def _corrupt_published_filing_for_repair(
+    *,
+    pipeline: SecPipeline,
+    document_id: str,
+    corruption: str,
+) -> None:
+    """对 SEC published filing 注入一个 repairable filesystem fact。
+
+    Args:
+        pipeline: 持有真实 filesystem repositories 的 SEC pipeline。
+        document_id: exact filing document ID。
+        corruption: repairable corruption case。
+
+    Returns:
+        无。
+
+    Raises:
+        OSError: fixture 文件读写失败时抛出。
+        ValueError: persisted meta 或 corruption case 非法时抛出。
+    """
+
+    locator = pipeline._source_repository.get_source_document_locator(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+    )
+    source_dir = pipeline._workspace_root / locator
+    meta_path = source_dir / "meta.json"
+    meta = _read_json_object(meta_path)
+    raw_files = meta.get("files")
+    if not isinstance(raw_files, list):
+        raise ValueError("workflow repair fixture files 必须是数组")
+    files = [item for item in raw_files if isinstance(item, dict)]
+    originals = [item for item in files if item.get("source") == "original"]
+    derived = [item for item in files if item.get("source") == "docling"]
+    if not originals or len(derived) != 1:
+        raise ValueError("workflow repair fixture 角色不完整")
+    original_name = originals[0].get("name")
+    derived_name = derived[0].get("name")
+    if not isinstance(original_name, str) or not isinstance(derived_name, str):
+        raise ValueError("workflow repair fixture 文件名非法")
+    if corruption == "original_missing":
+        (source_dir / original_name).unlink()
+        return
+    if corruption == "original_digest":
+        original_path = source_dir / original_name
+        original_path.write_bytes(b"X" * len(original_path.read_bytes()))
+        return
+    if corruption == "docling_missing":
+        (source_dir / derived_name).unlink()
+        return
+    if corruption == "meta_digest":
+        originals[0]["sha256"] = "0" * 64
+        _write_json_object(meta_path, meta)
+        return
+    if corruption == "manifest_missing":
+        (source_dir.parent / "filing_manifest.json").unlink()
+        return
+    raise ValueError("未知 workflow repair corruption")
 
 
 def _tracking_sec_pipeline(
@@ -1010,7 +1119,7 @@ async def test_upload_filing_consumes_fresh_authoritative_file_selection(
         action="create",
         company_name="Apple Inc.",
     )
-    owner_validator = sec_upload_workflow.validate_fins_upload_filing_request
+    owner_validator = fresh_validation_module.validate_fins_upload_filing_request
     validator_calls: list[FinsUploadFilingRequest] = []
 
     def authoritative_validator(
@@ -1035,7 +1144,7 @@ async def test_upload_filing_consumes_fresh_authoritative_file_selection(
         return owner_validator(raw_request, published_state=published_state)
 
     monkeypatch.setattr(
-        sec_upload_workflow,
+        fresh_validation_module,
         "validate_fins_upload_filing_request",
         authoritative_validator,
     )
@@ -1313,7 +1422,7 @@ async def test_upload_filing_corrupt_primary_with_valid_companions_fails_atomica
         action="create",
         company_name="Apple Inc.",
     )
-    request = sec_upload_workflow.validate_fins_upload_filing_request(
+    request = fresh_validation_module.validate_fins_upload_filing_request(
         replace(
             first_request.request,
             files=(corrupt_file, companion_file, later_file),
@@ -1487,7 +1596,7 @@ async def test_upload_filing_authoritative_identity_mismatch_fails_closed(
         action="create",
         company_name="Apple Inc.",
     )
-    owner_validator = sec_upload_workflow.validate_fins_upload_filing_request
+    owner_validator = fresh_validation_module.validate_fins_upload_filing_request
 
     def mismatched_validator(
         raw_request: FinsUploadFilingRequest,
@@ -1514,7 +1623,7 @@ async def test_upload_filing_authoritative_identity_mismatch_fails_closed(
         )
 
     monkeypatch.setattr(
-        sec_upload_workflow,
+        fresh_validation_module,
         "validate_fins_upload_filing_request",
         mismatched_validator,
     )
@@ -1523,4 +1632,225 @@ async def test_upload_filing_authoritative_identity_mismatch_fails_closed(
         _ = [event async for event in pipeline.upload_filing_stream(request)]
 
     assert batching.begin_tokens == []
+    assert published_tree_sha256(tmp_path, "AAPL") == {}
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "original_missing",
+        "original_digest",
+        "docling_missing",
+        "meta_digest",
+        "manifest_missing",
+    ),
+)
+@pytest.mark.asyncio
+async def test_upload_filing_repairs_real_filesystem_and_atomically_publishes_company_source(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    """SEC auto repair 必须原子发布完整新 source 与同批 company decision。
+
+    Args:
+        tmp_path: 临时 workspace。
+        corruption: original、Docling、meta 或 manifest repair case。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: fresh disposition、原子 publication 或新 snapshot 漂移时抛出。
+        OSError: 真实 filesystem fixture 读写失败时抛出。
+        ValueError: persisted source contract 非法时抛出。
+    """
+
+    calls: list[str] = []
+    pipeline, batching, company, source = _tracking_sec_pipeline(
+        tmp_path,
+        converter_calls=calls,
+    )
+    primary = tmp_path / "repair-primary.pdf"
+    companion = tmp_path / "repair-companion.xlsx"
+    primary.write_bytes(b"authoritative-primary")
+    companion.write_bytes(b"authoritative-companion")
+    create_request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=primary,
+        companion_files=(companion,),
+        action="create",
+        company_name="Apple Original",
+    )
+    create_events = [event async for event in pipeline.upload_filing_stream(create_request)]
+    create_result = create_events[-1].payload["result"]
+    assert isinstance(create_result, dict)
+    document_id = str(create_result["document_id"])
+    old_integrity = source.classify_source_integrity("AAPL", document_id, SourceKind.FILING)
+    assert old_integrity.status is SourceIntegrityStatus.COMPLETE
+    _seed_sec_upload_company_meta(
+        pipeline=pipeline,
+        company_name="Apple Stale",
+        resolver_version="market_resolver_v0.9.0",
+        ticker_aliases=[],
+    )
+    batching.begin_tokens.clear()
+    batching.commit_tokens.clear()
+    batching.rollback_tokens.clear()
+    company.stage_tokens.clear()
+    source.stage_tokens.clear()
+    _corrupt_published_filing_for_repair(
+        pipeline=pipeline,
+        document_id=document_id,
+        corruption=corruption,
+    )
+    repair_request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=primary,
+        companion_files=(companion,),
+        action=None,
+        company_name="Apple Repaired",
+    )
+    assert repair_request.published_state.source_integrity.status is (
+        SourceIntegrityStatus.REPAIR_REQUIRED
+    )
+
+    events = [event async for event in pipeline.upload_filing_stream(repair_request)]
+
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    assert events[-1].event_type is UploadFilingEventType.UPLOAD_COMPLETED
+    assert result["status"] == "ok"
+    assert result["filing_action"] == "update"
+    assert result["stored_file_count"] == len(repair_request.request.files) == 2
+    assert result["files"] == [str(primary), str(companion)]
+    repaired = source.classify_source_integrity("AAPL", document_id, SourceKind.FILING)
+    assert repaired.status is SourceIntegrityStatus.COMPLETE
+    assert repaired.revision is not None
+    assert repaired.revision != old_integrity.revision
+    repaired_meta = source.get_source_meta("AAPL", document_id, SourceKind.FILING)
+    raw_files = repaired_meta.get("files")
+    assert isinstance(raw_files, list)
+    assert sum(isinstance(item, dict) and item.get("source") == "original" for item in raw_files) == 2
+    assert sum(isinstance(item, dict) and item.get("source") == "docling" for item in raw_files) == 1
+    primary_document = repaired_meta.get("primary_document")
+    assert isinstance(primary_document, str)
+    locator = source.get_source_document_locator("AAPL", document_id, SourceKind.FILING)
+    source_dir = tmp_path / locator
+    declared_names: set[str] = set()
+    for raw_file in raw_files:
+        assert isinstance(raw_file, dict)
+        name = raw_file.get("name")
+        size = raw_file.get("size")
+        digest = raw_file.get("sha256")
+        assert isinstance(name, str)
+        assert isinstance(size, int) and not isinstance(size, bool)
+        assert isinstance(digest, str)
+        payload = (source_dir / name).read_bytes()
+        assert len(payload) == size
+        assert hashlib.sha256(payload).hexdigest() == digest
+        declared_names.add(name)
+    assert primary_document in declared_names
+    assert (source_dir.parent / "filing_manifest.json").is_file()
+    with source.read_source_snapshot(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+        materialize_files=True,
+    ) as snapshot:
+        assert snapshot.revision == repaired.revision
+        assert snapshot.primary_filename == primary_document
+        with snapshot.get_primary_source().open() as stream:
+            assert stream.read() == (
+                b'{"name": "repair-primary.pdf", "format": "docling"}'
+            )
+    assert calls == [primary.name, primary.name]
+    assert len(batching.begin_tokens) == 1
+    assert batching.commit_tokens == batching.begin_tokens
+    assert batching.rollback_tokens == []
+    assert company.stage_tokens == batching.begin_tokens
+    assert source.stage_tokens == batching.begin_tokens
+    assert pipeline._company_repository.get_company_meta("AAPL").company_name == "Apple Repaired"
+
+
+@pytest.mark.parametrize(
+    ("read_error", "expected_message"),
+    (
+        (FileNotFoundError("private published path"), "上传状态读取失败，请检查工作区存储状态"),
+        (RuntimeFileLockError("private lock detail"), "上传状态读取失败，请检查工作区存储状态"),
+        (ValueError("private structural detail"), "上传状态已损坏，请检查工作区存储状态"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_upload_filing_fresh_read_failures_use_prevalidation_failure_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    read_error: Exception,
+    expected_message: str,
+) -> None:
+    """SEC fresh state path-free failures 必须投影唯一 typed failed event。
+
+    Args:
+        tmp_path: 临时 workspace。
+        monkeypatch: fresh state failure 注入夹具。
+        read_error: fresh repository read 抛出的异常。
+        expected_message: upload-failure owner 的固定 public message。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: raw exception、generic runtime 或 mutation 泄漏时抛出。
+    """
+
+    converter_calls: list[str] = []
+    pipeline, batching, company, source = _tracking_sec_pipeline(
+        tmp_path,
+        converter_calls=converter_calls,
+    )
+    filing_file = tmp_path / "fresh-read.pdf"
+    filing_file.write_bytes(b"fresh read")
+    request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action="create",
+        company_name="Apple Inc.",
+    )
+
+    def fail_fresh_read(ticker: str, document_id: str) -> FilingUploadPublishedState:
+        """在 workflow fresh read boundary 抛出指定 path-free failure。
+
+        Args:
+            ticker: canonical ticker。
+            document_id: exact filing document ID。
+
+        Returns:
+            不返回。
+
+        Raises:
+            Exception: 始终抛出参数化异常。
+        """
+
+        del ticker, document_id
+        raise read_error
+
+    monkeypatch.setattr(
+        pipeline._filing_upload_state_repository,
+        "read_filing_upload_state",
+        fail_fresh_read,
+    )
+    events = [event async for event in pipeline.upload_filing_stream(request)]
+
+    assert [event.event_type for event in events] == [UploadFilingEventType.UPLOAD_FAILED]
+    result = events[0].payload["result"]
+    assert isinstance(result, dict)
+    failure = result["failure"]
+    assert isinstance(failure, dict)
+    assert failure["kind"] == "storage"
+    assert failure["code"] == "storage_io"
+    assert failure["message"] == expected_message
+    assert str(read_error) not in str(result)
+    assert converter_calls == []
+    assert batching.begin_tokens == []
+    assert company.stage_tokens == []
+    assert source.stage_tokens == []
     assert published_tree_sha256(tmp_path, "AAPL") == {}

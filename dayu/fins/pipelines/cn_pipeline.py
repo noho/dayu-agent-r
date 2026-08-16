@@ -42,7 +42,6 @@ from dayu.fins.ingestion_runtime import (
     FinsSourceDownloadAdapterRequest,
     FinsSourceDownloadAdapterResult,
     ValidatedFinsUploadFilingRequest,
-    validate_fins_upload_filing_request,
 )
 from dayu.fins.domain.document_models import FinsIngestMethod
 from dayu.fins.domain.enums import SourceKind
@@ -55,6 +54,9 @@ from dayu.fins.pipelines.cn_download_protocols import (
     CnReportDiscoveryClientProtocol,
 )
 from dayu.fins.pipelines.cn_download_workflow import run_cn_download_stream_impl
+from dayu.fins.pipelines._filing_upload_fresh_validation import (
+    resolve_fresh_filing_request,
+)
 from dayu.fins.pipelines.docling_upload_service import (
     DoclingUploadService,
     UploadOperationResult,
@@ -788,14 +790,20 @@ class CnPipeline:
         """
 
         raw_request = request.request
-        fresh_state = self._filing_upload_state_repository.read_filing_upload_state(
-            request.normalized_ticker.canonical,
-            request.document_id,
+        requested_action = raw_request.action.strip().lower()
+        fresh_resolution = resolve_fresh_filing_request(
+            repository=self._filing_upload_state_repository,
+            request=request,
         )
-        authoritative_request = validate_fins_upload_filing_request(
-            raw_request,
-            published_state=fresh_state,
-        )
+        if isinstance(fresh_resolution, FinsUploadFailureReason):
+            yield _build_cn_filing_failure_event(
+                pipeline=self,
+                request=request,
+                requested_action=requested_action,
+                failure_reason=fresh_resolution,
+            )
+            return
+        authoritative_request = fresh_resolution
         _assert_authoritative_filing_identity(request, authoritative_request)
         if raw_request.fiscal_year is None:
             raise AssertionError("validated filing request 缺少 fiscal_year")
@@ -803,7 +811,6 @@ class CnPipeline:
         normalized_company_id = build_upload_company_id(normalized_ticker)
         normalized_period = authoritative_request.normalized_fiscal_period
         form_type = normalized_period
-        requested_action = raw_request.action.strip().lower()
         document_id = authoritative_request.document_id
         internal_document_id = authoritative_request.internal_document_id
         previous_meta = authoritative_request.published_state.source_meta
