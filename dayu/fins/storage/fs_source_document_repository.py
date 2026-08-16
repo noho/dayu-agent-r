@@ -451,6 +451,44 @@ class FsSourceDocumentRepository(SourceDocumentRepositoryProtocol):
             batch=batch,
         )
 
+    def reset_source_document_for_repair(
+        self,
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+        expected_integrity: SourceIntegrityClassification,
+        *,
+        batch: BatchToken,
+    ) -> None:
+        """委托共享 storage core 执行受约束的 staged source repair reset。
+
+        Args:
+            ticker: exact external ticker。
+            document_id: exact external document ID。
+            source_kind: filing 来源类型。
+            expected_integrity: validator 携带的 Phase A repair-required classification。
+            batch: 同一 shared core、ticker 且仍 open 的显式 capability。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: capability、identity、source kind 或 expected classification 非法时抛出。
+            SourceIntegrityRevisionConflictError: staged target 的 presence、revision 或 repair status
+                与 expected classification 不再匹配时抛出。
+            SourceIntegrityRepairBlockedError: target 仍匹配但其它 source 或 canonical manifest
+                阻断安全 repair 时抛出。
+            OSError: staging 文件系统操作失败时抛出。
+        """
+
+        self._repository_set.core.reset_source_document_for_repair(
+            ticker,
+            document_id,
+            source_kind,
+            expected_integrity,
+            batch=batch,
+        )
+
     def restore_source_document(
         self,
         req: SourceDocumentStateChangeRequest,

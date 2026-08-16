@@ -10,7 +10,7 @@ import os
 import traceback
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from enum import Enum
 from multiprocessing.connection import Connection
 from pathlib import Path
@@ -22,10 +22,12 @@ from unittest.mock import patch
 import pytest
 
 from tests.fins.company_meta_test_support import stage_company_meta_fixture
+from tests.fins.upload_filing_test_support import published_tree_sha256
 
 from dayu.contracts.json_value import JsonValue
 import dayu.fins.storage._fs_storage_infra as storage_infra_module
 import dayu.fins.storage._fs_source_document_core as source_document_core_module
+import dayu.fins.storage._fs_source_integrity as source_integrity_owner_module
 import dayu.fins.storage.source_integrity as source_integrity_module
 import dayu.fins.storage._fs_source_snapshot as source_snapshot_module
 import dayu.fins.storage._fs_storage_utils as storage_utils_module
@@ -65,6 +67,7 @@ from dayu.fins.storage import (
     SourceIntegrityRepairBlockedError,
     SourceIntegrityRepairBlockedReason,
     SourceIntegrityReason,
+    SourceIntegrityRevisionConflictError,
     SourceIntegrityStatus,
     classify_source_integrity_preflight,
     has_same_source_publication_identity,
@@ -7193,42 +7196,496 @@ def test_existing_source_repair_contract_requires_trusted_repairable_filing() ->
     assert blocked.reason is SourceIntegrityRepairBlockedReason.NON_TARGET_SOURCE_INCOMPLETE
 
 
-def test_source_repository_repair_contract_rejects_mutation_before_owner_implementation(
+def test_source_repository_repair_facade_resets_target_and_rewrites_canonical_sibling_manifest(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Slice 1 protocol surface 不得静默执行或伪造 staged repair mutation。
+    """真实 facade 必须进入 core 并仅用 sibling 单点投影完成 staged repair reset。
 
     Args:
-        tmp_path: 不应被 repair contract 调用写入的临时目录。
+        tmp_path: storage publication 测试工作区。
+        monkeypatch: pytest 属性替换器。
 
     Returns:
         无。
 
     Raises:
-        AssertionError: 未实现 repair mutation 未被确定性拒绝或产生文件时抛出。
+        AssertionError: facade 未进入真实 owner、canonical sibling 丢失或 repair
+            publication 不完整时抛出。
+        OSError: fixture publication、corruption 或 manifest 读取失败时抛出。
     """
 
-    workspace_root = tmp_path / "workspace"
-    repository = FsSourceDocumentRepository(workspace_root, create_directories=False)
-    expected_integrity = SourceIntegrityClassification(
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    target_id = "repair-target"
+    sibling_id = "repair-sibling"
+    material_id = "repair-clean-material"
+    initial_batch = batching.begin_batch("AAPL")
+    _create_complete_source(source, blob, batch=initial_batch, document_id=target_id)
+    _create_complete_source(source, blob, batch=initial_batch, document_id=sibling_id)
+    _create_complete_source(
+        source,
+        blob,
+        batch=initial_batch,
+        document_id=material_id,
+        source_kind=SourceKind.MATERIAL,
+    )
+    batching.commit_batch(initial_batch)
+    _apply_repairable_integrity_corruption(
+        repository_set.core,
+        document_id=target_id,
+        source_kind=SourceKind.FILING,
+        corruption="original_missing",
+    )
+    expected_integrity = source.classify_source_integrity(
+        "AAPL",
+        target_id,
+        SourceKind.FILING,
+    )
+    assert expected_integrity.status is SourceIntegrityStatus.REPAIR_REQUIRED
+
+    repair_batch = batching.begin_batch("AAPL")
+    state = _only_active_batch_state(repository_set.core)
+    staged_root = state.staging_ticker_dir / "filings"
+    before_reset = _inspect_source_kind_unguarded(
         ticker="AAPL",
         source_kind=SourceKind.FILING,
-        document_id="filing-a",
-        revision=SourceDocumentRevision("revision-a"),
-        status=SourceIntegrityStatus.REPAIR_REQUIRED,
-        reasons=(SourceIntegrityReason.ORIGINAL_FILE_MISSING,),
+        ticker_dir=state.staging_ticker_dir,
+        source_root=staged_root,
+        requested_document_id=target_id,
+    )
+    assert before_reset.canonical_manifest_items == ()
+    sibling_inspection = next(
+        item
+        for item in before_reset.inventory
+        if item.classification.document_id == sibling_id
+    )
+    assert sibling_inspection.canonical_manifest_item is not None
+
+    counter = _InspectorCallCounter(calls=[])
+    monkeypatch.setattr(
+        source_document_core_module,
+        "_inspect_source_kind_unguarded",
+        counter.inspect,
     )
 
-    with pytest.raises(NotImplementedError, match="尚未实现"):
-        repository.reset_source_document_for_repair(
-            "AAPL",
-            "filing-a",
-            SourceKind.FILING,
-            expected_integrity,
-            batch=BatchToken(transaction_id="unimplemented-repair", ticker="AAPL"),
+    source.reset_source_document_for_repair(
+        "AAPL",
+        target_id,
+        SourceKind.FILING,
+        expected_integrity,
+        batch=repair_batch,
+    )
+    assert counter.calls == [
+        (SourceKind.FILING, target_id),
+        (SourceKind.MATERIAL, None),
+    ]
+
+    staged_target = source.classify_staged_source_integrity(
+        "AAPL",
+        target_id,
+        SourceKind.FILING,
+        batch=repair_batch,
+    )
+    manifest = _read_integrity_json(staged_root / "filing_manifest.json")
+    assert staged_target.status is SourceIntegrityStatus.MISSING
+    assert manifest["documents"] == [dict(sibling_inspection.canonical_manifest_item)]
+
+    _create_complete_source(
+        source,
+        blob,
+        batch=repair_batch,
+        document_id=target_id,
+        payload=b"repaired-target",
+    )
+    batching.commit_batch(repair_batch)
+    repaired = source.classify_source_integrity("AAPL", target_id, SourceKind.FILING)
+    sibling = source.classify_source_integrity("AAPL", sibling_id, SourceKind.FILING)
+    material = source.classify_source_integrity(
+        "AAPL",
+        material_id,
+        SourceKind.MATERIAL,
+    )
+    assert repaired.status is SourceIntegrityStatus.COMPLETE
+    assert repaired.revision != expected_integrity.revision
+    assert sibling.status is SourceIntegrityStatus.COMPLETE
+    assert material.status is SourceIntegrityStatus.COMPLETE
+
+
+@pytest.mark.parametrize(
+    ("corruption", "expected_reason"),
+    (
+        (
+            "content_missing",
+            SourceIntegrityRepairBlockedReason.CANONICAL_MANIFEST_UNAVAILABLE,
+        ),
+        (
+            "manifest_missing",
+            SourceIntegrityRepairBlockedReason.CANONICAL_MANIFEST_UNAVAILABLE,
+        ),
+    ),
+)
+def test_material_whole_inspection_owns_repair_blocked_reason(
+    tmp_path: Path,
+    corruption: Literal["content_missing", "manifest_missing"],
+    expected_reason: SourceIntegrityRepairBlockedReason,
+) -> None:
+    """material whole-kind 必须把全部 source 与 shared manifest 收敛为 closed reason。
+
+    Args:
+        tmp_path: storage publication 测试工作区。
+        corruption: material content missing 或 whole manifest missing。
+        expected_reason: integrity owner 应产生的封闭阻断原因。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: whole-kind reason owner 语义漂移时抛出。
+        OSError: fixture publication、corruption 或 inspection 失败时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    initial_batch = batching.begin_batch("AAPL")
+    _create_complete_source(
+        source,
+        blob,
+        batch=initial_batch,
+        document_id="material-owner",
+        source_kind=SourceKind.MATERIAL,
+    )
+    batching.commit_batch(initial_batch)
+    if corruption == "content_missing":
+        _apply_repairable_integrity_corruption(
+            repository_set.core,
+            document_id="material-owner",
+            source_kind=SourceKind.MATERIAL,
+            corruption="generic_declared_missing",
+        )
+    else:
+        _, _, manifest_path = _integrity_source_paths(
+            repository_set.core,
+            document_id="material-owner",
+            source_kind=SourceKind.MATERIAL,
+        )
+        manifest_path.unlink()
+
+    guard = repository_set.core._acquire_publication_guard("AAPL")
+    try:
+        ticker_dir = repository_set.core._target_ticker_dir("AAPL")
+        inspection = _inspect_source_kind_unguarded(
+            ticker="AAPL",
+            source_kind=SourceKind.MATERIAL,
+            ticker_dir=ticker_dir,
+            source_root=ticker_dir / "materials",
+            requested_document_id=None,
+        )
+    finally:
+        repository_set.core._release_lock_token(guard)
+
+    assert inspection.target is None
+    assert inspection.repair_blocked_reason is expected_reason
+
+
+def test_filing_sibling_manifest_mismatch_owner_matches_phase_b_block(
+    tmp_path: Path,
+) -> None:
+    """sibling manifest mismatch 的 typed reason 必须由 inspector 与 Phase B 共用。
+
+    Args:
+        tmp_path: storage publication 测试工作区。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: inspection reason 与 reset error reason 不一致时抛出。
+        OSError: fixture publication、inspection 或 rollback 失败时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    target_id = "manifest-target"
+    sibling_id = "manifest-sibling"
+    initial_batch = batching.begin_batch("AAPL")
+    _create_complete_source(source, blob, batch=initial_batch, document_id=target_id)
+    _create_complete_source(source, blob, batch=initial_batch, document_id=sibling_id)
+    batching.commit_batch(initial_batch)
+    _apply_repairable_integrity_corruption(
+        repository_set.core,
+        document_id=target_id,
+        source_kind=SourceKind.FILING,
+        corruption="original_missing",
+    )
+    expected = source.classify_source_integrity(
+        "AAPL",
+        target_id,
+        SourceKind.FILING,
+    )
+    assert expected.status is SourceIntegrityStatus.REPAIR_REQUIRED
+
+    repair_batch = batching.begin_batch("AAPL")
+    state = _only_active_batch_state(repository_set.core)
+    base_inspection = _inspect_source_kind_unguarded(
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        ticker_dir=state.staging_ticker_dir,
+        source_root=state.staging_ticker_dir / "filings",
+        requested_document_id=target_id,
+    )
+    target = base_inspection.target
+    if target is None:
+        raise AssertionError("exact repair inspection 必须包含 target")
+    sibling = next(
+        item
+        for item in base_inspection.inventory
+        if item.classification.document_id == sibling_id
+    )
+    sibling_mismatch = source_integrity_owner_module._with_repairable_classification(
+        sibling,
+        SourceIntegrityReason.SOURCE_MANIFEST_PROJECTION_MISMATCH,
+    )
+    owner_reason = source_integrity_owner_module._derive_repair_blocked_reason(
+        target=target,
+        inventory=(target, sibling_mismatch),
+        shared_manifest_reasons=(),
+        canonical_manifest_items=(),
+        unassignable_root_fact=False,
+    )
+    assert owner_reason is (
+        SourceIntegrityRepairBlockedReason.NON_TARGET_SOURCE_INCOMPLETE
+    )
+    inspection = replace(
+        base_inspection,
+        inventory=(target, sibling_mismatch),
+        repair_blocked_reason=owner_reason,
+    )
+
+    with pytest.raises(SourceIntegrityRepairBlockedError) as exc_info:
+        source_document_core_module._canonical_remaining_manifest_items_for_repair(
+            inspection,
+            target_document_id=target_id,
+        )
+    assert exc_info.value.reason is owner_reason
+    batching.rollback_batch(repair_batch)
+
+
+def test_repair_manifest_collection_rejects_clean_owner_shape_violation() -> None:
+    """core 必须把 clean inspection 的 canonical item shape 漂移视为 producer invariant。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: core 把 producer invariant 重建成业务 blocked reason 时抛出。
+    """
+
+    revision = SourceDocumentRevision("revision-sibling")
+    classification = SourceIntegrityClassification(
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        document_id="shape-sibling",
+        revision=revision,
+        status=SourceIntegrityStatus.COMPLETE,
+        reasons=(),
+    )
+    source_inspection = source_integrity_owner_module._SourcePublicationInspection(
+        classification=classification,
+        content_classification=classification,
+        persisted_meta=None,
+        business_meta=None,
+        provenance=None,
+        revision=revision,
+        files=(),
+        primary_document=None,
+        canonical_manifest_item={"document_id": "wrong-identity"},
+    )
+    inspection = _SourceKindPublicationInspection(
+        target=None,
+        inventory=(source_inspection,),
+        shared_manifest_reasons=(),
+        canonical_manifest_items=(),
+        repair_blocked_reason=None,
+    )
+
+    with pytest.raises(RuntimeError, match="canonical item shape 违约"):
+        source_document_core_module._canonical_remaining_manifest_items_for_repair(
+            inspection,
+            target_document_id="shape-target",
         )
 
-    assert not workspace_root.exists()
+
+@pytest.mark.parametrize(
+    "drift",
+    ("revision", "missing", "complete", "unsafe", "shared_untrusted"),
+)
+def test_source_repository_repair_rejects_staged_revision_and_status_drift(
+    tmp_path: Path,
+    drift: str,
+) -> None:
+    """Phase B 必须在 reset 前把 staged revision/非 repair status 全部收敛为 conflict。
+
+    Args:
+        tmp_path: storage publication 测试工作区。
+        drift: staged target 的 revision、missing、complete、target-local unsafe 或
+            shared manifest untrusted 漂移。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: conflict 类型、published old tree 或 batch cleanup 漂移时抛出。
+        OSError: fixture publication、corruption 或 staged mutation 失败时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    target_id = "drift-target"
+    initial_batch = batching.begin_batch("AAPL")
+    _create_complete_source(source, blob, batch=initial_batch, document_id=target_id)
+    batching.commit_batch(initial_batch)
+    _apply_repairable_integrity_corruption(
+        repository_set.core,
+        document_id=target_id,
+        source_kind=SourceKind.FILING,
+        corruption="original_missing",
+    )
+    expected_integrity = source.classify_source_integrity(
+        "AAPL",
+        target_id,
+        SourceKind.FILING,
+    )
+    old_tree = published_tree_sha256(tmp_path, "AAPL")
+
+    repair_batch = batching.begin_batch("AAPL")
+    state = _only_active_batch_state(repository_set.core)
+    staged_meta_path = repository_set.core._source_meta_path(
+        "AAPL",
+        target_id,
+        SourceKind.FILING,
+        state,
+    )
+    if drift == "missing":
+        source.reset_source_document(
+            "AAPL",
+            target_id,
+            SourceKind.FILING,
+            batch=repair_batch,
+        )
+    elif drift == "complete":
+        (staged_meta_path.parent / f"{target_id}.txt").write_bytes(
+            target_id.encode("utf-8")
+        )
+    elif drift == "shared_untrusted":
+        (state.staging_ticker_dir / "filings" / "filing_manifest.json").write_text(
+            "{",
+            encoding="utf-8",
+        )
+    else:
+        staged_meta = _read_integrity_json(staged_meta_path)
+        if drift == "revision":
+            staged_meta["_published_source_revision"] = "staged-revision-drift"
+        else:
+            del staged_meta["_published_source_revision"]
+        _write_integrity_json(staged_meta_path, staged_meta)
+
+    with pytest.raises(SourceIntegrityRevisionConflictError):
+        source.reset_source_document_for_repair(
+            "AAPL",
+            target_id,
+            SourceKind.FILING,
+            expected_integrity,
+            batch=repair_batch,
+        )
+    batching.rollback_batch(repair_batch)
+
+    assert published_tree_sha256(tmp_path, "AAPL") == old_tree
+    assert repository_set.core._active_batches == {}
+    assert not repository_set.core.batch_root.exists() or not tuple(
+        repository_set.core.batch_root.iterdir()
+    )
+
+
+def test_source_repository_repair_converts_only_comparison_value_error_to_conflict(
+    tmp_path: Path,
+) -> None:
+    """storage 必须保留 input ValueError，并仅把 staged identity comparison 违约转 conflict。
+
+    Args:
+        tmp_path: storage publication 测试工作区。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: input 与 comparison 两类 ValueError 边界或 old-tree 原子性漂移时抛出。
+        OSError: fixture publication、corruption 或 rollback 失败时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    target_id = "comparison-target"
+    initial_batch = batching.begin_batch("AAPL")
+    _create_complete_source(source, blob, batch=initial_batch, document_id=target_id)
+    batching.commit_batch(initial_batch)
+    complete = source.classify_source_integrity("AAPL", target_id, SourceKind.FILING)
+    _apply_repairable_integrity_corruption(
+        repository_set.core,
+        document_id=target_id,
+        source_kind=SourceKind.FILING,
+        corruption="original_missing",
+    )
+    expected = source.classify_source_integrity("AAPL", target_id, SourceKind.FILING)
+    old_tree = published_tree_sha256(tmp_path, "AAPL")
+    repair_batch = batching.begin_batch("AAPL")
+
+    with pytest.raises(ValueError, match="REPAIR_REQUIRED filing target"):
+        source.reset_source_document_for_repair(
+            "AAPL",
+            target_id,
+            SourceKind.FILING,
+            complete,
+            batch=repair_batch,
+        )
+    with patch.object(
+        source_document_core_module,
+        "has_same_source_publication_identity",
+        side_effect=ValueError("comparison producer invariant drift"),
+    ):
+        with pytest.raises(SourceIntegrityRevisionConflictError) as exc_info:
+            source.reset_source_document_for_repair(
+                "AAPL",
+                target_id,
+                SourceKind.FILING,
+                expected,
+                batch=repair_batch,
+            )
+    assert isinstance(exc_info.value.__cause__, ValueError)
+    batching.rollback_batch(repair_batch)
+    assert source.classify_source_integrity(
+        "AAPL",
+        target_id,
+        SourceKind.FILING,
+    ) == expected
+    assert published_tree_sha256(tmp_path, "AAPL") == old_tree
+    assert repository_set.core._active_batches == {}
+    assert not repository_set.core.batch_root.exists() or not tuple(
+        repository_set.core.batch_root.iterdir()
+    )
 
 
 def test_source_integrity_preflight_fails_closed_for_multiple_and_unselected(

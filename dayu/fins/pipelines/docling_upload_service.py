@@ -42,6 +42,8 @@ from dayu.fins.pipelines.docling_process_converter import (
 from dayu.fins.storage import (
     BatchingRepositoryProtocol,
     DocumentBlobRepositoryProtocol,
+    SourceIntegrityRepairBlockedError,
+    SourceIntegrityRevisionConflictError,
     SourceDocumentRepositoryProtocol,
     require_source_meta_is_deleted,
 )
@@ -54,6 +56,13 @@ from dayu.fins.upload_failure import (
     FinsUploadFailureError,
     fins_upload_empty_input_failure,
     fins_upload_failure_from_exception,
+    fins_upload_source_repair_blocked_failure,
+    fins_upload_source_revision_stale_failure,
+)
+from dayu.fins.upload_repair_contract import (
+    ExistingSourceAutoRepair,
+    ExistingSourceRepairDisposition,
+    NoExistingSourceRepair,
 )
 
 JsonObject: TypeAlias = dict[str, JsonValue]
@@ -179,6 +188,7 @@ class _PreparedAssetMutation:
     meta: JsonObject
     source_fingerprint: str
     document_version: str
+    repair_disposition: ExistingSourceRepairDisposition
 
 
 @dataclass(frozen=True)
@@ -280,6 +290,7 @@ class DoclingUploadService:
         overwrite: bool,
         previous_meta: Mapping[str, JsonValue] | None,
         meta: Mapping[str, JsonValue],
+        repair_disposition: ExistingSourceRepairDisposition,
         cancellation: CancellationToken | None,
     ) -> PreparedDoclingUpload:
         """完成读取与 Docling 转换，生成待发布计划。
@@ -295,6 +306,7 @@ class DoclingUploadService:
             overwrite: 是否强制覆盖。
             previous_meta: caller 从当前 state owner 取得的 source meta。
             meta: 业务元数据字段。
+            repair_disposition: authoritative validator 产生的既有 source repair 授权。
             cancellation: 公共取消观察 token；``None`` 表示无取消源。
 
         Returns:
@@ -314,9 +326,19 @@ class DoclingUploadService:
             source_kind=source_kind,
             selection=selection,
         )
+        if not isinstance(
+            repair_disposition,
+            (NoExistingSourceRepair, ExistingSourceAutoRepair),
+        ):
+            raise ValueError("repair_disposition 必须是封闭 repair contract")
         normalized_action = action.strip().lower()
         if normalized_action not in UPLOAD_ACTIONS:
             raise ValueError(f"不支持的 action: {action}")
+        if (
+            normalized_action == "delete"
+            and isinstance(repair_disposition, ExistingSourceAutoRepair)
+        ):
+            raise ValueError("delete 上传不得携带 existing source repair 授权")
         is_empty = not selection_preparation.ordered_files
         if normalized_action == "delete" and not is_empty:
             raise ValueError("delete 上传必须使用空文件 selection")
@@ -363,7 +385,12 @@ class DoclingUploadService:
             source_kind=source_kind,
             filing_primary=selection_preparation.filing_primary,
         )
-        if _can_skip_upload(normalized_previous_meta, source_fingerprint, overwrite):
+        if _can_skip_upload(
+            normalized_previous_meta,
+            source_fingerprint,
+            overwrite,
+            repair_disposition=repair_disposition,
+        ):
             Log.info(
                 f"文档已存在且未变更，跳过上传: ticker={normalized_ticker} document_id={document_id}",
                 module=self.MODULE,
@@ -418,6 +445,7 @@ class DoclingUploadService:
             meta=staging_meta,
             source_fingerprint=source_fingerprint.value,
             document_version=current_version,
+            repair_disposition=repair_disposition,
         )
 
     def publish_prepared_upload(
@@ -438,6 +466,7 @@ class DoclingUploadService:
             上传操作结果；取消结果要求 caller rollback，其他写入结果可 commit。
 
         Raises:
+            FinsUploadFailureError: repair target stale 或被其它 source 阻断时抛出。
             OSError: 仓储写入失败时抛出。
             ValueError: batch 或计划字段非法时抛出。
             RuntimeError: 完整 source 无法构造时抛出。
@@ -479,6 +508,7 @@ class DoclingUploadService:
             meta=prepared.meta,
             source_fingerprint=prepared.source_fingerprint,
             document_version=prepared.document_version,
+            repair_disposition=prepared.repair_disposition,
             cancellation=cancellation,
             batch=batch,
         )
@@ -510,6 +540,7 @@ class DoclingUploadService:
         meta: JsonObject,
         source_fingerprint: str,
         document_version: str,
+        repair_disposition: ExistingSourceRepairDisposition,
         cancellation: CancellationToken | None,
         batch: BatchToken,
     ) -> UploadOperationResult:
@@ -530,6 +561,7 @@ class DoclingUploadService:
             meta: 本次写入的 source meta。
             source_fingerprint: 本次上传源指纹。
             document_version: 本次文档版本。
+            repair_disposition: authoritative validator 产生的既有 source repair 授权。
             cancellation: 公共取消观察 token；``None`` 表示无取消源。
             batch: caller 显式传入的 batch capability。
 
@@ -537,12 +569,30 @@ class DoclingUploadService:
             上传操作结果。
 
         Raises:
+            FinsUploadFailureError: repair target stale 或被其它 source 阻断时抛出。
             RuntimeError: 未生成主 Docling 文件时抛出。
             OSError: 仓储写入失败时抛出。
         """
 
         replace_existing = previous_meta is not None and (action == "update" or (action == "create" and overwrite))
-        if replace_existing:
+        if isinstance(repair_disposition, ExistingSourceAutoRepair):
+            try:
+                self._source_repository.reset_source_document_for_repair(
+                    ticker=ticker,
+                    document_id=document_id,
+                    source_kind=source_kind,
+                    expected_integrity=repair_disposition.expected_integrity,
+                    batch=batch,
+                )
+            except SourceIntegrityRevisionConflictError as exc:
+                raise FinsUploadFailureError(
+                    fins_upload_source_revision_stale_failure()
+                ) from exc
+            except SourceIntegrityRepairBlockedError as exc:
+                raise FinsUploadFailureError(
+                    fins_upload_source_repair_blocked_failure()
+                ) from exc
+        elif replace_existing:
             # 完整输入的既有目标先在同一 staging batch 删除，再由下方 blob-first + create
             # 一次性重建；reset 前持有的 previous_meta 仍是版本与首次创建时间真源。
             self._source_repository.reset_source_document(
@@ -1215,6 +1265,8 @@ def _can_skip_upload(
     previous_meta: Mapping[str, JsonValue] | None,
     source_fingerprint: _UploadSourceFingerprint,
     overwrite: bool,
+    *,
+    repair_disposition: ExistingSourceRepairDisposition,
 ) -> bool:
     """判断是否可跳过上传。
 
@@ -1222,6 +1274,7 @@ def _can_skip_upload(
         previous_meta: 旧元数据。
         source_fingerprint: 本次源指纹。
         overwrite: 是否覆盖。
+        repair_disposition: authoritative validator 产生的既有 source repair 授权。
 
     Returns:
         满足跳过条件时返回 ``True``。
@@ -1231,6 +1284,8 @@ def _can_skip_upload(
         ValueError: 既有 source meta 的 ``is_deleted`` 不是布尔值时抛出。
     """
 
+    if isinstance(repair_disposition, ExistingSourceAutoRepair):
+        return False
     if overwrite or previous_meta is None:
         return False
     if require_source_meta_is_deleted(previous_meta):

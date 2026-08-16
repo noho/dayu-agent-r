@@ -338,6 +338,7 @@ def _inspect_source_kind_unguarded(
     repair_blocked_reason = _derive_repair_blocked_reason(
         target=target,
         inventory=inventory,
+        shared_manifest_reasons=shared_manifest_reasons,
         canonical_manifest_items=canonical_manifest_items,
         unassignable_root_fact=unassignable_root_fact,
     )
@@ -1256,6 +1257,7 @@ def _derive_repair_blocked_reason(
     *,
     target: _SourcePublicationInspection | None,
     inventory: tuple[_SourcePublicationInspection, ...],
+    shared_manifest_reasons: tuple[SourceIntegrityReason, ...],
     canonical_manifest_items: tuple[Mapping[str, JsonValue], ...],
     unassignable_root_fact: bool,
 ) -> SourceIntegrityRepairBlockedReason | None:
@@ -1264,6 +1266,7 @@ def _derive_repair_blocked_reason(
     Args:
         target: exact target；whole-kind mode 为 ``None``。
         inventory: 同一次 scan 的完整 inventory。
+        shared_manifest_reasons: 同一次 scan 的 source-kind shared manifest 原因。
         canonical_manifest_items: 同一次 scan 的 canonical aggregate。
         unassignable_root_fact: 是否存在无法归属的 root structural fact。
 
@@ -1274,29 +1277,42 @@ def _derive_repair_blocked_reason(
         无。
     """
 
+    target_id = None if target is None else target.classification.document_id
+    non_target_inventory = tuple(
+        item
+        for item in inventory
+        if target_id is None or item.classification.document_id != target_id
+    )
     if unassignable_root_fact or any(
         item.classification.status is SourceIntegrityStatus.UNSAFE
-        for item in inventory
+        for item in non_target_inventory
     ):
         return SourceIntegrityRepairBlockedReason.CROSS_SOURCE_PUBLICATION_UNSAFE
+    if SourceIntegrityReason.SOURCE_MANIFEST_UNTRUSTED in shared_manifest_reasons:
+        return SourceIntegrityRepairBlockedReason.CROSS_SOURCE_PUBLICATION_UNSAFE
+
     if target is None:
-        if inventory and not canonical_manifest_items:
+        if (
+            shared_manifest_reasons
+            or any(
+                item.content_classification.status
+                is not SourceIntegrityStatus.COMPLETE
+                or item.classification.reasons != shared_manifest_reasons
+                or item.canonical_manifest_item is None
+                for item in inventory
+            )
+            or len(canonical_manifest_items) != len(inventory)
+        ):
             return SourceIntegrityRepairBlockedReason.CANONICAL_MANIFEST_UNAVAILABLE
         return None
-    target_id = None if target is None else target.classification.document_id
+
     if any(
-        item.classification.document_id != target_id
-        and item.content_classification.status is not SourceIntegrityStatus.COMPLETE
-        for item in inventory
+        item.content_classification.status is not SourceIntegrityStatus.COMPLETE
+        or item.classification.reasons != shared_manifest_reasons
+        for item in non_target_inventory
     ):
         return SourceIntegrityRepairBlockedReason.NON_TARGET_SOURCE_INCOMPLETE
-    if (
-        target is not None
-        and target.content_classification.status
-        is SourceIntegrityStatus.REPAIR_REQUIRED
-    ):
-        return None
-    if inventory and not canonical_manifest_items:
+    if any(item.canonical_manifest_item is None for item in non_target_inventory):
         return SourceIntegrityRepairBlockedReason.CANONICAL_MANIFEST_UNAVAILABLE
     return None
 

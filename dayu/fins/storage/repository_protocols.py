@@ -15,7 +15,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from types import TracebackType
-from typing import BinaryIO, Literal, NoReturn, Optional, Protocol
+from typing import BinaryIO, Literal, Optional, Protocol
 
 from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.source import Source
@@ -56,22 +56,6 @@ CompanyTickerIdentityCorruptionKind = Literal[
     "duplicate_owner",
 ]
 """Published company ticker identity corruption 的 closed kind。"""
-
-
-def _reject_unimplemented_source_repair() -> NoReturn:
-    """拒绝尚未获得实现授权的 staged source repair mutation。
-
-    Args:
-        无。
-
-    Returns:
-        不返回。
-
-    Raises:
-        NotImplementedError: 始终抛出，直至 storage owner 实现 Phase B repair。
-    """
-
-    raise NotImplementedError("staged source repair mutation 尚未实现")
 
 
 class CompanyTickerAliasConflictError(ValueError):
@@ -735,10 +719,8 @@ class SourceDocumentRepositoryProtocol(Protocol):
             SourceIntegrityRepairBlockedError: target 仍匹配但其它 source 或 canonical manifest
                 阻断安全 repair 时抛出。
             OSError: staging 文件系统操作失败时抛出。
-            NotImplementedError: staged repair owner 尚未在当前 slice 获得 mutation 授权时抛出。
         """
-
-        _reject_unimplemented_source_repair()
+        ...
 
     def restore_source_document(
         self,

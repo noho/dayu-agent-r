@@ -53,6 +53,7 @@ from dayu.fins.upload_failure import (
     FinsUploadFailureReason,
     fins_upload_failure_from_exception,
 )
+from dayu.fins.upload_repair_contract import NoExistingSourceRepair
 
 JsonObject: TypeAlias = dict[str, JsonValue]
 _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
@@ -209,6 +210,7 @@ async def run_upload_filing_stream(
             selection=authoritative_request.file_selection,
             overwrite=raw_request.overwrite,
             previous_meta=previous_meta,
+            repair_disposition=authoritative_request.repair_disposition,
             cancellation=cancellation_checker,
             meta={
                 "company_id": normalized_company_id,
@@ -513,6 +515,7 @@ async def run_upload_material_stream(
             selection=selection,
             overwrite=overwrite,
             previous_meta=previous_meta,
+            repair_disposition=NoExistingSourceRepair(),
             cancellation=cancellation_checker,
             meta={
                 "company_id": normalized_company_id,

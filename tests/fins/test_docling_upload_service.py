@@ -9,7 +9,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event, Thread
-from typing import BinaryIO, Optional
+from typing import BinaryIO, Literal, Optional, cast
+from unittest.mock import patch
 
 import pytest
 
@@ -21,6 +22,7 @@ from dayu.fins.domain.document_models import (
     FileObjectMeta,
     ProcessedHandle,
     SourceDocumentUpsertRequest,
+    SourceDocumentRevision,
     SourceHandle,
 )
 from dayu.fins.domain.enums import SourceKind
@@ -55,8 +57,14 @@ from dayu.fins.storage import (
     FsBatchingRepository,
     FsDocumentBlobRepository,
     FsSourceDocumentRepository,
+    SourceIntegrityClassification,
+    SourceIntegrityPreflightError,
+    SourceIntegrityRepairBlockedError,
+    SourceIntegrityRepairBlockedReason,
+    SourceIntegrityReason,
     SourceIntegrityStatus,
 )
+import dayu.fins.storage._fs_source_document_core as source_document_core_module
 from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
 from dayu.fins.upload_failure import (
     FinsUploadFailureCode,
@@ -66,6 +74,11 @@ from dayu.fins.upload_failure import (
 from dayu.fins.upload_format_contract import (
     FinsUploadFilingFiles,
     FinsUploadMaterialFiles,
+)
+from dayu.fins.upload_repair_contract import (
+    ExistingSourceAutoRepair,
+    ExistingSourceRepairDisposition,
+    NoExistingSourceRepair,
 )
 
 from .upload_filing_test_support import published_tree_sha256
@@ -897,6 +910,7 @@ def _execute_upload(
             overwrite=overwrite,
             previous_meta=previous_meta,
             meta=meta,
+            repair_disposition=NoExistingSourceRepair(),
             cancellation=cancellation_checker,
         )
     )
@@ -945,6 +959,151 @@ def _selection_for_test(
             return FinsUploadMaterialFiles.for_delete()
         return FinsUploadMaterialFiles.from_upsert_paths(tuple(files))
     raise ValueError(f"不支持的 source_kind: {source_kind}")
+
+
+def _remove_published_filing_original(
+    *,
+    workspace_root: Path,
+    source_repository: FsSourceDocumentRepository,
+    document_id: str,
+) -> None:
+    """删除一个 storage 声明的 published filing original 以形成 repair target。
+
+    Args:
+        workspace_root: 当前测试工作区根。
+        source_repository: published source owner。
+        document_id: exact filing document ID。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: fixture 不含唯一可删除 original 时抛出。
+        OSError: published original 删除失败时抛出。
+        ValueError: persisted files contract 非法时抛出。
+    """
+
+    meta = source_repository.get_source_meta("AAPL", document_id, SourceKind.FILING)
+    raw_files = meta.get("files")
+    if not isinstance(raw_files, list):
+        raise ValueError("repair fixture files 必须是数组")
+    original_names: list[str] = []
+    for raw_file in raw_files:
+        if not isinstance(raw_file, dict) or raw_file.get("source") != "original":
+            continue
+        raw_name = raw_file.get("name")
+        if not isinstance(raw_name, str):
+            raise ValueError("repair fixture original name 必须是字符串")
+        original_names.append(raw_name)
+    if not original_names:
+        raise AssertionError("repair fixture 必须至少包含一个 original")
+    locator = source_repository.get_source_document_locator(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+    )
+    (workspace_root / locator / original_names[0]).unlink()
+
+
+def _remove_published_material_declared_file(
+    *,
+    workspace_root: Path,
+    source_repository: FsSourceDocumentRepository,
+    document_id: str,
+) -> None:
+    """删除一个 storage 声明的 published material 文件以形成 non-target damage。
+
+    Args:
+        workspace_root: 当前测试工作区根。
+        source_repository: published source owner。
+        document_id: exact material document ID。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: fixture 不含可删除的 declared file 时抛出。
+        OSError: published material 文件删除失败时抛出。
+        ValueError: persisted files contract 非法时抛出。
+    """
+
+    meta = source_repository.get_source_meta("AAPL", document_id, SourceKind.MATERIAL)
+    raw_files = meta.get("files")
+    if not isinstance(raw_files, list) or not raw_files:
+        raise AssertionError("material repair blocker 必须包含 declared file")
+    raw_file = raw_files[0]
+    if not isinstance(raw_file, dict):
+        raise ValueError("material repair blocker file entry 必须是对象")
+    raw_name = raw_file.get("name")
+    if not isinstance(raw_name, str):
+        raise ValueError("material repair blocker file name 必须是字符串")
+    locator = source_repository.get_source_document_locator(
+        "AAPL",
+        document_id,
+        SourceKind.MATERIAL,
+    )
+    (workspace_root / locator / raw_name).unlink()
+
+
+def _prepare_existing_filing_repair(
+    *,
+    service: DoclingUploadService,
+    source_repository: FsSourceDocumentRepository,
+    document_id: str,
+    files: tuple[Path, ...],
+    primary: Path,
+) -> _PreparedAssetMutation:
+    """用 published repair classification 准备 authoritative filing repair mutation。
+
+    Args:
+        service: 待测试的 Docling 上传服务。
+        source_repository: published integrity 与 meta owner。
+        document_id: exact filing document ID。
+        files: 完整 authoritative original 输入。
+        primary: files 中唯一 authoritative primary。
+
+    Returns:
+        已完成全部读取与唯一 primary 转换的 repair mutation。
+
+    Raises:
+        AssertionError: fixture 未产出 prepared asset mutation 时抛出。
+        BaseException: preparation 的真实 typed failure 原样传播。
+    """
+
+    expected_integrity = source_repository.classify_source_integrity(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+    )
+    previous_meta = source_repository.get_source_meta(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+    )
+    prepared = asyncio.run(
+        service.prepare_upload(
+            ticker="AAPL",
+            source_kind=SourceKind.FILING,
+            action="update",
+            document_id=document_id,
+            internal_document_id=document_id,
+            form_type="10-K",
+            selection=FinsUploadFilingFiles.for_upsert(
+                primary=primary,
+                companions=tuple(file_path for file_path in files if file_path != primary),
+            ),
+            overwrite=False,
+            previous_meta=previous_meta,
+            meta={"ingest_method": "upload"},
+            repair_disposition=ExistingSourceAutoRepair(
+                expected_integrity=expected_integrity
+            ),
+            cancellation=None,
+        )
+    )
+    if not isinstance(prepared, _PreparedAssetMutation):
+        raise AssertionError("repair preparation 必须返回 asset mutation")
+    return prepared
 
 
 def _build_service_context(tmp_path: Path) -> _UploadServiceContext:
@@ -1041,6 +1200,7 @@ def _prepare_material_for_admission_test(
             overwrite=False,
             previous_meta=None,
             meta={"ingest_method": "upload"},
+            repair_disposition=NoExistingSourceRepair(),
             cancellation=cancellation,
         )
     )
@@ -1083,6 +1243,7 @@ def _prepare_filing_for_admission_test(
             overwrite=False,
             previous_meta=None,
             meta={"ingest_method": "upload"},
+            repair_disposition=NoExistingSourceRepair(),
             cancellation=None,
         )
     )
@@ -1498,6 +1659,7 @@ def test_filing_preparation_exactly_associates_derived_with_primary_original(tmp
             overwrite=False,
             previous_meta=None,
             meta={"ingest_method": "upload"},
+            repair_disposition=NoExistingSourceRepair(),
             cancellation=None,
         )
     )
@@ -1838,6 +2000,7 @@ def test_prepare_upload_rejects_source_kind_selection_mismatch_before_io(
                 overwrite=False,
                 previous_meta=None,
                 meta={},
+                repair_disposition=NoExistingSourceRepair(),
                 cancellation=None,
             )
         )
@@ -1927,6 +2090,7 @@ def test_prepare_upload_rejects_action_emptiness_mismatch_before_io(
                 overwrite=False,
                 previous_meta=None,
                 meta={},
+                repair_disposition=NoExistingSourceRepair(),
                 cancellation=None,
             )
         )
@@ -1971,6 +2135,7 @@ def test_prepare_maps_shared_converter_cancel_without_starting_publication(tmp_p
             overwrite=False,
             previous_meta=None,
             meta={"material_name": "Deck", "ingest_method": "upload"},
+            repair_disposition=NoExistingSourceRepair(),
             cancellation=None,
         )
     )
@@ -2322,6 +2487,7 @@ def test_commit_winner_ignores_cancel_after_ownership_transfer(tmp_path: Path) -
             overwrite=False,
             previous_meta=None,
             meta={"material_name": "Deck", "ingest_method": "upload"},
+            repair_disposition=NoExistingSourceRepair(),
             cancellation=token,
         )
     )
@@ -2497,6 +2663,7 @@ def test_prepare_upload_rejects_missing_update_before_shared_conversion(
                 overwrite=overwrite,
                 previous_meta=None,
                 meta={"ingest_method": "upload"},
+                repair_disposition=NoExistingSourceRepair(),
                 cancellation=None,
             )
         )
@@ -2563,6 +2730,7 @@ def test_prepare_upload_rejects_existing_filing_create_before_conversion(tmp_pat
                 overwrite=False,
                 previous_meta=previous_meta,
                 meta={"ingest_method": "upload"},
+                repair_disposition=NoExistingSourceRepair(),
                 cancellation=None,
             )
         )
@@ -2638,6 +2806,7 @@ def test_prepare_upload_requires_canonical_boolean_deleted_state(
                 overwrite=False,
                 previous_meta=previous_meta,
                 meta={"ingest_method": "upload"},
+                repair_disposition=NoExistingSourceRepair(),
                 cancellation=None,
             )
         )
@@ -2862,6 +3031,834 @@ def test_execute_upload_existing_full_input_replaces_exact_complete_set(
     assert final_meta["created_at"] == initial_meta["created_at"]
     assert final_meta["is_deleted"] is False
     assert integrity.status is SourceIntegrityStatus.COMPLETE
+
+
+def test_prepare_upload_rejects_invalid_repair_disposition(tmp_path: Path) -> None:
+    """prepare owner 必须以固定 ValueError 拒绝封闭 union 之外的 disposition。
+
+    Args:
+        tmp_path: 上传 preparation 测试工作区。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法 disposition 未在 preparation 边界被固定拒绝时抛出。
+        OSError: fixture 文件写入失败时抛出。
+    """
+
+    context = _build_service_context(tmp_path)
+    source_file = tmp_path / "invalid-repair.pdf"
+    source_file.write_bytes(b"invalid repair disposition")
+
+    with pytest.raises(
+        ValueError,
+        match="^repair_disposition 必须是封闭 repair contract$",
+    ):
+        asyncio.run(
+            context.service.prepare_upload(
+                ticker="AAPL",
+                source_kind=SourceKind.FILING,
+                action="update",
+                document_id="invalid-repair",
+                internal_document_id="invalid-repair",
+                form_type="10-K",
+                selection=FinsUploadFilingFiles.for_upsert(
+                    primary=source_file,
+                    companions=(),
+                ),
+                overwrite=False,
+                previous_meta=None,
+                meta={"ingest_method": "upload"},
+                repair_disposition=cast(
+                    ExistingSourceRepairDisposition,
+                    "invalid-repair-disposition",
+                ),
+                cancellation=None,
+            )
+        )
+
+
+def test_prepare_upload_rejects_delete_with_existing_repair(tmp_path: Path) -> None:
+    """delete mutation 与 existing repair authorization 必须固定 fail closed。
+
+    Args:
+        tmp_path: 上传 preparation 测试工作区。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: delete 与 repair 矛盾输入未抛固定 ValueError 时抛出。
+    """
+
+    context = _build_service_context(tmp_path)
+    expected = SourceIntegrityClassification(
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        document_id="delete-repair",
+        revision=SourceDocumentRevision("delete-repair-revision"),
+        status=SourceIntegrityStatus.REPAIR_REQUIRED,
+        reasons=(SourceIntegrityReason.ORIGINAL_FILE_MISSING,),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="^delete 上传不得携带 existing source repair 授权$",
+    ):
+        asyncio.run(
+            context.service.prepare_upload(
+                ticker="AAPL",
+                source_kind=SourceKind.FILING,
+                action="delete",
+                document_id="delete-repair",
+                internal_document_id="delete-repair",
+                form_type="10-K",
+                selection=FinsUploadFilingFiles.for_delete(),
+                overwrite=False,
+                previous_meta=None,
+                meta={"ingest_method": "upload"},
+                repair_disposition=ExistingSourceAutoRepair(
+                    expected_integrity=expected
+                ),
+                cancellation=None,
+            )
+        )
+
+
+def test_existing_filing_repair_bypasses_identical_skip_and_rebuilds_full_input(
+    tmp_path: Path,
+) -> None:
+    """repair 必须转换 authoritative primary 并全量重建 originals/Docling/meta/manifest。
+
+    Args:
+        tmp_path: 上传 publication 测试工作区。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: identical skip 未绕过、完整输入丢失或新 publication 不完整时抛出。
+        OSError: fixture 文件或 published corruption 写入失败时抛出。
+    """
+
+    calls: list[str] = []
+    context = _build_service_context(tmp_path)
+    service = DoclingUploadService(
+        source_repository=context.source_repository,
+        blob_repository=context.blob_repository,
+        docling_converter=_FakeDoclingConverter(calls),
+    )
+    primary = tmp_path / "repair-primary.pdf"
+    companion = tmp_path / "repair-companion.xlsx"
+    primary.write_bytes(b"authoritative-primary")
+    companion.write_bytes(b"authoritative-companion")
+    document_id = "filing_repair_success"
+    _execute_upload(
+        service=service,
+        batching_repository=context.batching_repository,
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        action="create",
+        document_id=document_id,
+        internal_document_id=document_id,
+        form_type="10-K",
+        files=[primary, companion],
+        filing_primary=primary,
+        overwrite=False,
+        meta={"ingest_method": "upload"},
+    )
+    complete = context.source_repository.classify_source_integrity(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+    )
+    _remove_published_filing_original(
+        workspace_root=tmp_path,
+        source_repository=context.source_repository,
+        document_id=document_id,
+    )
+    expected = context.source_repository.classify_source_integrity(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+    )
+    assert expected.status is SourceIntegrityStatus.REPAIR_REQUIRED
+    assert SourceIntegrityReason.ORIGINAL_FILE_MISSING in expected.reasons
+
+    prepared = _prepare_existing_filing_repair(
+        service=service,
+        source_repository=context.source_repository,
+        document_id=document_id,
+        files=(primary, companion),
+        primary=primary,
+    )
+    assert calls == [primary.name, primary.name]
+    assert sum(asset.source == "original" for asset in prepared.pending_assets) == 2
+    assert sum(asset.source == "docling" for asset in prepared.pending_assets) == 1
+
+    result = _publish_prepared_upload(
+        service=service,
+        batching_repository=context.batching_repository,
+        ticker="AAPL",
+        prepared=prepared,
+    )
+    repaired = context.source_repository.classify_source_integrity(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+    )
+    repaired_meta = context.source_repository.get_source_meta(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+    )
+    raw_files = repaired_meta.get("files")
+    assert result.status == "uploaded"
+    assert result.stored_file_count == 2
+    assert repaired.status is SourceIntegrityStatus.COMPLETE
+    assert repaired.revision != complete.revision
+    assert isinstance(raw_files, list)
+    assert len(raw_files) == 3
+
+
+@pytest.mark.parametrize(
+    ("failure_case", "expected_code"),
+    (
+        ("stale", FinsUploadFailureCode.SOURCE_REVISION_STALE),
+        ("target_unsafe", FinsUploadFailureCode.SOURCE_REVISION_STALE),
+        ("shared_untrusted", FinsUploadFailureCode.SOURCE_REVISION_STALE),
+        ("blocked", FinsUploadFailureCode.SOURCE_REPAIR_BLOCKED),
+    ),
+)
+def test_existing_filing_repair_maps_real_staged_failures_and_rolls_back_once(
+    tmp_path: Path,
+    failure_case: Literal[
+        "stale",
+        "target_unsafe",
+        "shared_untrusted",
+        "blocked",
+    ],
+    expected_code: FinsUploadFailureCode,
+) -> None:
+    """真实 core stale/blocked 必须精确映射且恰好回滚一次、旧树不变。
+
+    Args:
+        tmp_path: 上传 publication 测试工作区。
+        failure_case: revision stale、target unsafe、shared manifest untrusted 或
+            non-target repair blocked。
+        expected_code: public failure owner 的精确 closed code。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: failure 映射、rollback 次数或 published 原子性漂移时抛出。
+        OSError: fixture 文件、published corruption 或 staged drift 写入失败时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    seed_batching = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    source_repository = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    seed_service = DoclingUploadService(
+        source_repository=source_repository,
+        blob_repository=blob_repository,
+        docling_converter=_FakeDoclingConverter(),
+    )
+    target_file = tmp_path / "repair-target.pdf"
+    sibling_file = tmp_path / "repair-sibling.pdf"
+    target_file.write_bytes(b"target")
+    sibling_file.write_bytes(b"sibling")
+    target_id = "filing_repair_failure"
+    sibling_id = "filing_repair_sibling"
+    for document_id, file_path in (
+        (target_id, target_file),
+        (sibling_id, sibling_file),
+    ):
+        _execute_upload(
+            service=seed_service,
+            batching_repository=seed_batching,
+            ticker="AAPL",
+            source_kind=SourceKind.FILING,
+            action="create",
+            document_id=document_id,
+            internal_document_id=document_id,
+            form_type="10-K",
+            files=[file_path],
+            filing_primary=file_path,
+            overwrite=False,
+            meta={"ingest_method": "upload"},
+        )
+    _remove_published_filing_original(
+        workspace_root=tmp_path,
+        source_repository=source_repository,
+        document_id=target_id,
+    )
+    prepared = _prepare_existing_filing_repair(
+        service=seed_service,
+        source_repository=source_repository,
+        document_id=target_id,
+        files=(target_file,),
+        primary=target_file,
+    )
+    old_tree = published_tree_sha256(tmp_path, "AAPL")
+    batching = _BatchIdentityUploadBatchingRepository(tmp_path, repository_set, [])
+    batch = batching.begin_batch("AAPL")
+    state = repository_set.core._active_batches[batch.transaction_id]
+    drift_document_id = target_id if failure_case != "blocked" else sibling_id
+    staged_meta_path = repository_set.core._source_meta_path(
+        "AAPL",
+        drift_document_id,
+        SourceKind.FILING,
+        state,
+    )
+    if failure_case == "shared_untrusted":
+        (state.staging_ticker_dir / "filings" / "filing_manifest.json").write_text(
+            "{",
+            encoding="utf-8",
+        )
+    else:
+        staged_meta = json.loads(staged_meta_path.read_text(encoding="utf-8"))
+        if not isinstance(staged_meta, dict):
+            raise AssertionError("staged repair meta 必须是 object")
+        if failure_case == "stale":
+            staged_meta["_published_source_revision"] = "staged-revision-drift"
+            staged_meta_path.write_text(json.dumps(staged_meta), encoding="utf-8")
+        elif failure_case == "target_unsafe":
+            del staged_meta["_published_source_revision"]
+            staged_meta_path.write_text(json.dumps(staged_meta), encoding="utf-8")
+        else:
+            raw_files = staged_meta.get("files")
+            if not isinstance(raw_files, list):
+                raise AssertionError("staged sibling files 必须是数组")
+            original_name = next(
+                raw_file.get("name")
+                for raw_file in raw_files
+                if isinstance(raw_file, dict) and raw_file.get("source") == "original"
+            )
+            if not isinstance(original_name, str):
+                raise AssertionError("staged sibling original name 必须是字符串")
+            (staged_meta_path.parent / original_name).unlink()
+
+    with pytest.raises(FinsUploadFailureError) as exc_info:
+        commit_prepared_upload_batch(
+            service=seed_service,
+            batching_repository=batching,
+            batch=batch,
+            prepared=prepared,
+            cancellation=None,
+        )
+
+    assert exc_info.value.failure.kind is FinsUploadFailureKind.STORAGE
+    assert exc_info.value.failure.code is expected_code
+    assert exc_info.value.failure.code is not FinsUploadFailureCode.UNEXPECTED_RUNTIME
+    assert batching.rollback_calls == 1
+    assert batching.commit_calls == 0
+    assert published_tree_sha256(tmp_path, "AAPL") == old_tree
+    assert repository_set.core._active_batches == {}
+    assert not repository_set.core.batch_root.exists() or not tuple(
+        repository_set.core.batch_root.iterdir()
+    )
+
+
+@pytest.mark.parametrize(
+    ("material_corruption", "expected_reason"),
+    (
+        (
+            "content_missing",
+            SourceIntegrityRepairBlockedReason.CANONICAL_MANIFEST_UNAVAILABLE,
+        ),
+        (
+            "manifest_missing",
+            SourceIntegrityRepairBlockedReason.CANONICAL_MANIFEST_UNAVAILABLE,
+        ),
+        (
+            "structural_unsafe",
+            SourceIntegrityRepairBlockedReason.CROSS_SOURCE_PUBLICATION_UNSAFE,
+        ),
+    ),
+)
+def test_existing_filing_repair_maps_material_damage_to_blocked_and_rolls_back_once(
+    tmp_path: Path,
+    material_corruption: Literal[
+        "content_missing",
+        "manifest_missing",
+        "structural_unsafe",
+    ],
+    expected_reason: SourceIntegrityRepairBlockedReason,
+) -> None:
+    """真实 material whole-kind damage 必须在 reset 前投影为 repair blocked。
+
+    Args:
+        tmp_path: 上传 publication 测试工作区。
+        material_corruption: material content、manifest 或 root structural 损坏。
+        expected_reason: integrity owner 应产生的封闭阻断原因。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: typed failure、rollback 次数或 old-tree 原子性漂移时抛出。
+        OSError: fixture publication 或 corruption 写入失败时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    seed_batching = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    service = DoclingUploadService(
+        source_repository=source,
+        blob_repository=blob,
+        docling_converter=_FakeDoclingConverter(),
+    )
+    filing_file = tmp_path / "material-blocked-filing.pdf"
+    material_file = tmp_path / "material-blocked-deck.pdf"
+    filing_file.write_bytes(b"filing repair input")
+    material_file.write_bytes(b"material publication")
+    filing_id = "filing_material_blocked"
+    material_id = "material_repair_blocker"
+    _execute_upload(
+        service=service,
+        batching_repository=seed_batching,
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        action="create",
+        document_id=filing_id,
+        internal_document_id=filing_id,
+        form_type="10-K",
+        files=[filing_file],
+        filing_primary=filing_file,
+        overwrite=False,
+        meta={"ingest_method": "upload"},
+    )
+    _execute_upload(
+        service=service,
+        batching_repository=seed_batching,
+        ticker="AAPL",
+        source_kind=SourceKind.MATERIAL,
+        action="create",
+        document_id=material_id,
+        internal_document_id=material_id,
+        form_type="MATERIAL_OTHER",
+        files=[material_file],
+        overwrite=False,
+        meta={"material_name": "Repair blocker", "ingest_method": "upload"},
+    )
+    _remove_published_filing_original(
+        workspace_root=tmp_path,
+        source_repository=source,
+        document_id=filing_id,
+    )
+    prepared = _prepare_existing_filing_repair(
+        service=service,
+        source_repository=source,
+        document_id=filing_id,
+        files=(filing_file,),
+        primary=filing_file,
+    )
+    if material_corruption == "content_missing":
+        _remove_published_material_declared_file(
+            workspace_root=tmp_path,
+            source_repository=source,
+            document_id=material_id,
+        )
+    else:
+        material_manifest = repository_set.core._material_manifest_path_for_read(
+            "AAPL"
+        )
+        if material_corruption == "manifest_missing":
+            material_manifest.unlink()
+        else:
+            (material_manifest.parent / "unsafe-root-entry.bin").write_bytes(
+                b"unsafe"
+            )
+
+    old_filing_meta = source.get_source_meta("AAPL", filing_id, SourceKind.FILING)
+    old_material_meta = source.get_source_meta("AAPL", material_id, SourceKind.MATERIAL)
+    company_meta_path = repository_set.core._company_meta_path_for_read("AAPL")
+    assert not company_meta_path.exists()
+    old_tree = published_tree_sha256(tmp_path, "AAPL")
+    batching = _BatchIdentityUploadBatchingRepository(tmp_path, repository_set, [])
+
+    with pytest.raises(FinsUploadFailureError) as exc_info:
+        _publish_prepared_upload(
+            service=service,
+            batching_repository=batching,
+            ticker="AAPL",
+            prepared=prepared,
+        )
+
+    assert exc_info.value.failure.kind is FinsUploadFailureKind.STORAGE
+    assert exc_info.value.failure.code is FinsUploadFailureCode.SOURCE_REPAIR_BLOCKED
+    blocked_error = exc_info.value.__cause__
+    assert isinstance(blocked_error, SourceIntegrityRepairBlockedError)
+    assert blocked_error.reason is expected_reason
+    if material_corruption == "structural_unsafe":
+        assert isinstance(blocked_error.__cause__, SourceIntegrityPreflightError)
+    assert batching.rollback_calls == 1
+    assert batching.commit_calls == 0
+    assert published_tree_sha256(tmp_path, "AAPL") == old_tree
+    assert source.get_source_meta("AAPL", filing_id, SourceKind.FILING) == old_filing_meta
+    assert source.get_source_meta("AAPL", material_id, SourceKind.MATERIAL) == old_material_meta
+    assert not company_meta_path.exists()
+    assert repository_set.core._active_batches == {}
+    assert not repository_set.core.batch_root.exists() or not tuple(
+        repository_set.core.batch_root.iterdir()
+    )
+
+
+def test_existing_filing_repair_manifest_rewrite_failure_rolls_back_once(
+    tmp_path: Path,
+) -> None:
+    """target reset 后 manifest rewrite OSError 必须恰好回滚并保留 old tree。
+
+    Args:
+        tmp_path: 上传 publication 测试工作区。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: OSError、rollback 次数或 published 原子性漂移时抛出。
+        OSError: fixture publication 或 corruption 写入失败时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    seed_batching = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    service = DoclingUploadService(
+        source_repository=source,
+        blob_repository=blob,
+        docling_converter=_FakeDoclingConverter(),
+    )
+    original = tmp_path / "repair-manifest-rewrite.pdf"
+    original.write_bytes(b"repair manifest rewrite")
+    document_id = "filing_repair_manifest_rewrite"
+    _execute_upload(
+        service=service,
+        batching_repository=seed_batching,
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        action="create",
+        document_id=document_id,
+        internal_document_id=document_id,
+        form_type="10-K",
+        files=[original],
+        filing_primary=original,
+        overwrite=False,
+        meta={"ingest_method": "upload"},
+    )
+    _remove_published_filing_original(
+        workspace_root=tmp_path,
+        source_repository=source,
+        document_id=document_id,
+    )
+    prepared = _prepare_existing_filing_repair(
+        service=service,
+        source_repository=source,
+        document_id=document_id,
+        files=(original,),
+        primary=original,
+    )
+    old_meta = source.get_source_meta("AAPL", document_id, SourceKind.FILING)
+    company_meta_path = repository_set.core._company_meta_path_for_read("AAPL")
+    assert not company_meta_path.exists()
+    old_tree = published_tree_sha256(tmp_path, "AAPL")
+    batching = _BatchIdentityUploadBatchingRepository(tmp_path, repository_set, [])
+
+    with patch.object(
+        source_document_core_module,
+        "_write_json",
+        side_effect=OSError("forced repair manifest rewrite failure"),
+    ):
+        with pytest.raises(
+            OSError,
+            match="^forced repair manifest rewrite failure$",
+        ):
+            _publish_prepared_upload(
+                service=service,
+                batching_repository=batching,
+                ticker="AAPL",
+                prepared=prepared,
+            )
+
+    assert batching.rollback_calls == 1
+    assert batching.commit_calls == 0
+    assert published_tree_sha256(tmp_path, "AAPL") == old_tree
+    assert source.get_source_meta("AAPL", document_id, SourceKind.FILING) == old_meta
+    assert not company_meta_path.exists()
+    assert repository_set.core._active_batches == {}
+    assert not repository_set.core.batch_root.exists() or not tuple(
+        repository_set.core.batch_root.iterdir()
+    )
+
+
+@pytest.mark.parametrize("failure_case", ("blob", "final"))
+def test_existing_filing_repair_blob_and_final_failures_keep_old_tree(
+    tmp_path: Path,
+    failure_case: Literal["blob", "final"],
+) -> None:
+    """repair reset 后 blob/final failure 必须回滚 staged mutation并保留旧树。
+
+    Args:
+        tmp_path: 上传 publication 测试工作区。
+        failure_case: 第二个 blob 写入或 final source mutation 失败。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: primary failure、rollback 或 old-tree 原子性漂移时抛出。
+        OSError: fixture 文件或 published corruption 写入失败时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    seed_batching = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    seed_source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    seed_blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    seed_service = DoclingUploadService(
+        source_repository=seed_source,
+        blob_repository=seed_blob,
+        docling_converter=_FakeDoclingConverter(),
+    )
+    original = tmp_path / "repair-failure.pdf"
+    original.write_bytes(b"repair failure input")
+    document_id = "filing_repair_io_failure"
+    _execute_upload(
+        service=seed_service,
+        batching_repository=seed_batching,
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        action="create",
+        document_id=document_id,
+        internal_document_id=document_id,
+        form_type="10-K",
+        files=[original],
+        filing_primary=original,
+        overwrite=False,
+        meta={"ingest_method": "upload"},
+    )
+    _remove_published_filing_original(
+        workspace_root=tmp_path,
+        source_repository=seed_source,
+        document_id=document_id,
+    )
+    events: list[str] = []
+    source_repository = (
+        _FailingFinalUploadSourceRepository(tmp_path, repository_set, events)
+        if failure_case == "final"
+        else seed_source
+    )
+    blob_repository = (
+        _FailingNthUploadBlobRepository(tmp_path, repository_set, fail_at=2)
+        if failure_case == "blob"
+        else seed_blob
+    )
+    failing_service = DoclingUploadService(
+        source_repository=source_repository,
+        blob_repository=blob_repository,
+        docling_converter=_FakeDoclingConverter(),
+    )
+    prepared = _prepare_existing_filing_repair(
+        service=failing_service,
+        source_repository=source_repository,
+        document_id=document_id,
+        files=(original,),
+        primary=original,
+    )
+    old_tree = published_tree_sha256(tmp_path, "AAPL")
+    batching = _BatchIdentityUploadBatchingRepository(tmp_path, repository_set, events)
+
+    expected_message = (
+        "forced replacement blob failure"
+        if failure_case == "blob"
+        else "forced final upsert failure"
+    )
+    with pytest.raises(RuntimeError, match=expected_message):
+        _publish_prepared_upload(
+            service=failing_service,
+            batching_repository=batching,
+            ticker="AAPL",
+            prepared=prepared,
+        )
+
+    assert batching.rollback_calls == 1
+    assert published_tree_sha256(tmp_path, "AAPL") == old_tree
+    assert repository_set.core._active_batches == {}
+    assert not repository_set.core.batch_root.exists() or not tuple(
+        repository_set.core.batch_root.iterdir()
+    )
+
+
+def test_existing_filing_repair_conversion_failure_starts_no_publication(
+    tmp_path: Path,
+) -> None:
+    """repair conversion failure 必须发生在 batch 前并保留 damaged old publication。
+
+    Args:
+        tmp_path: 上传 publication 测试工作区。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: typed conversion failure、零 batch 或 old-tree 原子性漂移时抛出。
+        OSError: fixture 文件或 published corruption 写入失败时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching = _BatchIdentityUploadBatchingRepository(tmp_path, repository_set, [])
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    original = tmp_path / "repair-conversion.pdf"
+    original.write_bytes(b"repair conversion")
+    document_id = "filing_repair_conversion_failure"
+    seed_service = DoclingUploadService(
+        source_repository=source,
+        blob_repository=blob,
+        docling_converter=_FakeDoclingConverter(),
+    )
+    _execute_upload(
+        service=seed_service,
+        batching_repository=batching,
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        action="create",
+        document_id=document_id,
+        internal_document_id=document_id,
+        form_type="10-K",
+        files=[original],
+        filing_primary=original,
+        overwrite=False,
+        meta={"ingest_method": "upload"},
+    )
+    _remove_published_filing_original(
+        workspace_root=tmp_path,
+        source_repository=source,
+        document_id=document_id,
+    )
+    old_tree = published_tree_sha256(tmp_path, "AAPL")
+    calls: list[str] = []
+    cause = DoclingConversionError(
+        DoclingConversionFailureKind.CONVERTER_EXECUTION,
+        "Docling conversion execution failed",
+        None,
+    )
+    failing_service = DoclingUploadService(
+        source_repository=source,
+        blob_repository=blob,
+        docling_converter=_SelectiveFailingDoclingConverter(
+            failing_name=original.name,
+            error=cause,
+            calls=calls,
+        ),
+    )
+    begin_calls_before = batching.begin_calls
+
+    with pytest.raises(FinsUploadFailureError) as exc_info:
+        _prepare_existing_filing_repair(
+            service=failing_service,
+            source_repository=source,
+            document_id=document_id,
+            files=(original,),
+            primary=original,
+        )
+
+    assert exc_info.value.failure.kind is FinsUploadFailureKind.CONTENT
+    assert exc_info.value.__cause__ is cause
+    assert calls == [original.name]
+    assert batching.begin_calls == begin_calls_before
+    assert published_tree_sha256(tmp_path, "AAPL") == old_tree
+    assert not repository_set.core.batch_root.exists() or not tuple(
+        repository_set.core.batch_root.iterdir()
+    )
+
+
+def test_existing_filing_repair_rollback_secondary_failure_preserves_primary(
+    tmp_path: Path,
+) -> None:
+    """repair final 与 rollback 同时失败时必须保留 final 主异常和旧 publication。
+
+    Args:
+        tmp_path: 上传 publication 测试工作区。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 主次异常、old-tree 原子性或测试清理漂移时抛出。
+        OSError: fixture 文件、published corruption 或最终测试清理失败时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    seed_batching = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    seed_source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    original = tmp_path / "repair-rollback.pdf"
+    original.write_bytes(b"repair rollback")
+    document_id = "filing_repair_rollback_failure"
+    seed_service = DoclingUploadService(
+        source_repository=seed_source,
+        blob_repository=blob,
+        docling_converter=_FakeDoclingConverter(),
+    )
+    _execute_upload(
+        service=seed_service,
+        batching_repository=seed_batching,
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        action="create",
+        document_id=document_id,
+        internal_document_id=document_id,
+        form_type="10-K",
+        files=[original],
+        filing_primary=original,
+        overwrite=False,
+        meta={"ingest_method": "upload"},
+    )
+    _remove_published_filing_original(
+        workspace_root=tmp_path,
+        source_repository=seed_source,
+        document_id=document_id,
+    )
+    old_tree = published_tree_sha256(tmp_path, "AAPL")
+    events: list[str] = []
+    failing_source = _FailingFinalUploadSourceRepository(tmp_path, repository_set, events)
+    failing_service = DoclingUploadService(
+        source_repository=failing_source,
+        blob_repository=blob,
+        docling_converter=_FakeDoclingConverter(),
+    )
+    prepared = _prepare_existing_filing_repair(
+        service=failing_service,
+        source_repository=failing_source,
+        document_id=document_id,
+        files=(original,),
+        primary=original,
+    )
+    batching = _RollbackFailingUploadBatchingRepository(
+        tmp_path,
+        repository_set=repository_set,
+    )
+    batch = batching.begin_batch("AAPL")
+
+    with pytest.raises(RuntimeError, match="forced final upsert failure") as exc_info:
+        commit_prepared_upload_batch(
+            service=failing_service,
+            batching_repository=batching,
+            batch=batch,
+            prepared=prepared,
+            cancellation=None,
+        )
+
+    assert isinstance(exc_info.value.__cause__, OSError)
+    assert "forced rollback failure" in str(exc_info.value.__cause__)
+    assert any("rollback_batch failed" in note for note in exc_info.value.__notes__)
+    assert published_tree_sha256(tmp_path, "AAPL") == old_tree
+    FsBatchingRepository.rollback_batch(batching, batch)
+    assert repository_set.core._active_batches == {}
 
 
 def test_execute_upload_skips_when_source_fingerprint_matches(tmp_path: Path) -> None:
@@ -3350,7 +4347,12 @@ def test_old_v1_multifile_fingerprint_transitions_once_to_v2_and_then_skips(tmp_
 
     assert current_fingerprint.value != old_digest
     assert current_fingerprint.identical_skip_safe is True
-    assert _can_skip_upload(old_meta, current_fingerprint, False) is False
+    assert _can_skip_upload(
+        old_meta,
+        current_fingerprint,
+        False,
+        repair_disposition=NoExistingSourceRepair(),
+    ) is False
     prepared = asyncio.run(
         context.service.prepare_upload(
             ticker="AAPL",
@@ -3363,6 +4365,7 @@ def test_old_v1_multifile_fingerprint_transitions_once_to_v2_and_then_skips(tmp_
             overwrite=False,
             previous_meta=old_meta,
             meta={"ingest_method": "upload"},
+            repair_disposition=NoExistingSourceRepair(),
             cancellation=None,
         )
     )
@@ -3382,6 +4385,7 @@ def test_old_v1_multifile_fingerprint_transitions_once_to_v2_and_then_skips(tmp_
             overwrite=False,
             previous_meta=prepared.meta,
             meta={"ingest_method": "upload"},
+            repair_disposition=NoExistingSourceRepair(),
             cancellation=None,
         )
     )
@@ -3621,6 +4625,7 @@ def test_existing_replacement_cancellation_keeps_entire_published_tree(
             overwrite=False,
             previous_meta=old_meta,
             meta={"material_name": "Deck", "ingest_method": "upload"},
+            repair_disposition=NoExistingSourceRepair(),
             cancellation=None,
         )
     )
@@ -3888,6 +4893,7 @@ def test_upload_helper_id_and_version_rules() -> None:
         {"is_deleted": False, "source_fingerprint": "same"},
         unsafe_fingerprint,
         False,
+        repair_disposition=NoExistingSourceRepair(),
     ) is False
     assert validate_material_upload_ids(
         stable_document_id="mat_a",

@@ -105,6 +105,7 @@ from dayu.fins.upload_failure import (
     FinsUploadFailureReason,
     fins_upload_failure_from_exception,
 )
+from dayu.fins.upload_repair_contract import NoExistingSourceRepair
 
 CN_DOWNLOAD_SOURCE: Final[str] = "cninfo"
 HK_DOWNLOAD_SOURCE: Final[str] = "hkexnews"
@@ -838,6 +839,7 @@ class CnPipeline:
                 selection=authoritative_request.file_selection,
                 overwrite=raw_request.overwrite,
                 previous_meta=previous_meta,
+                repair_disposition=authoritative_request.repair_disposition,
                 cancellation=cancellation_checker,
                 meta={
                     "company_id": normalized_company_id,
@@ -1128,6 +1130,7 @@ class CnPipeline:
                 selection=selection,
                 overwrite=overwrite,
                 previous_meta=previous_meta,
+                repair_disposition=NoExistingSourceRepair(),
                 cancellation=cancellation_checker,
                 meta={
                     "company_id": normalized_company_id,

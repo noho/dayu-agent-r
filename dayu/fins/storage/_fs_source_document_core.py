@@ -37,6 +37,7 @@ from dayu.fins.xbrl_file_discovery import has_xbrl_instance
 from .local_file_source import LocalFileSource
 from ._fs_source_integrity import (
     _SOURCE_REVISION_META_FIELD,
+    _SourceKindPublicationInspection,
     _inspect_source_kind_unguarded,
     _source_meta_without_revision,
 )
@@ -72,7 +73,62 @@ from ._fs_storage_utils import (
     _write_json,
 )
 from .repository_protocols import SourceSnapshotProtocol
-from .source_integrity import SourceIntegrityClassification
+from .source_integrity import (
+    SourceIntegrityClassification,
+    SourceIntegrityPreflightError,
+    SourceIntegrityRepairBlockedError,
+    SourceIntegrityRepairBlockedReason,
+    SourceIntegrityRevisionConflictError,
+    SourceIntegrityStatus,
+    has_same_source_publication_identity,
+)
+
+
+def _canonical_remaining_manifest_items_for_repair(
+    inspection: _SourceKindPublicationInspection,
+    *,
+    target_document_id: str,
+) -> tuple[Mapping[str, JsonValue], ...]:
+    """从同一次 staged inspection 收集 non-target canonical manifest items。
+
+    Args:
+        inspection: exact-target 模式产生的完整 source-kind inspection。
+        target_document_id: 本次将被完整重建的 exact target document ID。
+
+    Returns:
+        按 canonical document ID 稳定排序的 non-target manifest items。
+
+    Raises:
+        SourceIntegrityRepairBlockedError: inspection owner 已判定其它 source 或
+            canonical manifest 阻断 repair 时抛出。
+        RuntimeError: inspection owner 声称无阻断但 canonical item shape 或唯一性
+            不满足 producer invariant 时抛出。
+    """
+
+    if inspection.repair_blocked_reason is not None:
+        raise SourceIntegrityRepairBlockedError(
+            inspection.repair_blocked_reason
+        )
+
+    items_by_document_id: dict[str, Mapping[str, JsonValue]] = {}
+    for source_inspection in inspection.inventory:
+        document_id = source_inspection.classification.document_id
+        if document_id == target_document_id:
+            continue
+        canonical_item = source_inspection.canonical_manifest_item
+        if canonical_item is None or canonical_item.get("document_id") != document_id:
+            raise RuntimeError(
+                "source integrity inspector clean payload 的 canonical item shape 违约"
+            )
+        if document_id in items_by_document_id:
+            raise RuntimeError(
+                "source integrity inspector clean payload 的 document identity 唯一性违约"
+            )
+        items_by_document_id[document_id] = canonical_item
+    return tuple(
+        items_by_document_id[document_id]
+        for document_id in sorted(items_by_document_id)
+    )
 
 
 class _FsSourceDocumentMixin(_FsStorageInfra):
@@ -316,6 +372,119 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
 
         state = self._resolve_active_batch(batch, ticker)
         self._reset_source_document_impl(ticker, document_id, source_kind, state)
+
+    def reset_source_document_for_repair(
+        self,
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+        expected_integrity: SourceIntegrityClassification,
+        *,
+        batch: BatchToken,
+    ) -> None:
+        """按 Phase A integrity 对真实 staging target 执行受约束修复重置。
+
+        Args:
+            ticker: exact external ticker。
+            document_id: exact external document ID。
+            source_kind: filing 来源类型。
+            expected_integrity: validator 携带的 Phase A repair-required classification。
+            batch: 同一 storage core、ticker 且仍 open 的显式 capability。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: capability、identity、source kind 或 expected classification 非法时抛出。
+            SourceIntegrityRevisionConflictError: staged target 的 presence、revision 或 repair status
+                与 expected classification 不再匹配时抛出。
+            SourceIntegrityRepairBlockedError: target 仍匹配但其它 source 或 canonical manifest
+                阻断安全 repair 时抛出。
+            OSError: staging 文件系统操作失败时抛出。
+        """
+
+        external_ticker = _require_external_identity(ticker, field_name="ticker")
+        external_document_id = _require_external_identity(
+            document_id,
+            field_name="document_id",
+        )
+        normalized_source_kind = _normalize_source_kind(source_kind)
+        if normalized_source_kind is not SourceKind.FILING:
+            raise ValueError("existing source auto repair 只允许 filing")
+        if not isinstance(expected_integrity, SourceIntegrityClassification):
+            raise ValueError("expected_integrity 必须是 SourceIntegrityClassification")
+        if (
+            expected_integrity.ticker != external_ticker
+            or expected_integrity.document_id != external_document_id
+            or expected_integrity.source_kind is not normalized_source_kind
+            or expected_integrity.status is not SourceIntegrityStatus.REPAIR_REQUIRED
+            or expected_integrity.revision is None
+        ):
+            raise ValueError("expected_integrity 必须精确引用 REPAIR_REQUIRED filing target")
+
+        state = self._resolve_active_batch(batch, external_ticker)
+        ticker_dir = state.staging_ticker_dir
+        inspection = _inspect_source_kind_unguarded(
+            ticker=external_ticker,
+            source_kind=normalized_source_kind,
+            ticker_dir=ticker_dir,
+            source_root=ticker_dir / _source_dir_name(normalized_source_kind),
+            requested_document_id=external_document_id,
+        )
+        target = inspection.target
+        if target is None:
+            raise SourceIntegrityRevisionConflictError()
+        staged_integrity = target.classification
+        if (
+            staged_integrity.status is SourceIntegrityStatus.UNSAFE
+            or staged_integrity.status is not SourceIntegrityStatus.REPAIR_REQUIRED
+            or target.content_classification.status
+            not in {SourceIntegrityStatus.COMPLETE, SourceIntegrityStatus.REPAIR_REQUIRED}
+        ):
+            raise SourceIntegrityRevisionConflictError()
+        try:
+            identity_matches = has_same_source_publication_identity(
+                expected_integrity,
+                staged_integrity,
+            )
+        except ValueError as exc:
+            raise SourceIntegrityRevisionConflictError() from exc
+        if not identity_matches:
+            raise SourceIntegrityRevisionConflictError()
+
+        try:
+            material_inspection = _inspect_source_kind_unguarded(
+                ticker=external_ticker,
+                source_kind=SourceKind.MATERIAL,
+                ticker_dir=ticker_dir,
+                source_root=ticker_dir / _source_dir_name(SourceKind.MATERIAL),
+                requested_document_id=None,
+            )
+        except SourceIntegrityPreflightError as exc:
+            raise SourceIntegrityRepairBlockedError(
+                SourceIntegrityRepairBlockedReason.CROSS_SOURCE_PUBLICATION_UNSAFE
+            ) from exc
+
+        remaining_items = _canonical_remaining_manifest_items_for_repair(
+            inspection,
+            target_document_id=external_document_id,
+        )
+        if material_inspection.repair_blocked_reason is not None:
+            raise SourceIntegrityRepairBlockedError(
+                material_inspection.repair_blocked_reason
+            )
+        self._reset_source_document_directory_for_repair(
+            external_ticker,
+            external_document_id,
+            normalized_source_kind,
+            state,
+        )
+        self._rewrite_source_manifest_for_repair(
+            external_ticker,
+            normalized_source_kind,
+            remaining_items,
+            state,
+        )
 
     # ========== 查询 ==========
 
@@ -1216,6 +1385,77 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
                 external_ticker,
                 external_document_id,
             )
+
+    def _reset_source_document_directory_for_repair(
+        self,
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+        state: _ActiveBatchState,
+    ) -> None:
+        """删除已由同次 inspection 证明存在的 exact staged target 目录。
+
+        Args:
+            ticker: 已校验的 exact external ticker。
+            document_id: 已校验的 exact external document ID。
+            source_kind: 已校验的 filing source kind。
+            state: 已解析的内部 transaction state。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: identity descriptor 与 exact target 不一致时抛出。
+            OSError: target 目录读取或删除失败时抛出。
+        """
+
+        source_root = self._source_root(ticker, source_kind, state)
+        namespace = (
+            _FILING_IDENTITY_NAMESPACE
+            if source_kind is SourceKind.FILING
+            else _MATERIAL_IDENTITY_NAMESPACE
+        )
+        document_dir = _identity_directory_for_read(
+            source_root,
+            namespace,
+            document_id,
+        )
+        self._remove_directory(document_dir)
+
+    def _rewrite_source_manifest_for_repair(
+        self,
+        ticker: str,
+        source_kind: SourceKind,
+        canonical_items: tuple[Mapping[str, JsonValue], ...],
+        state: _ActiveBatchState,
+    ) -> None:
+        """仅用 non-target inspection 单点投影重写 staged source manifest。
+
+        Args:
+            ticker: 已校验的 exact external ticker。
+            source_kind: 已校验的 filing source kind。
+            canonical_items: 按 document ID 排序的 non-target canonical items。
+            state: 已解析的内部 transaction state。
+
+        Returns:
+            无。
+
+        Raises:
+            OSError: canonical manifest 写入失败时抛出。
+        """
+
+        manifest_path = (
+            self._filing_manifest_path(ticker, state)
+            if source_kind is SourceKind.FILING
+            else self._material_manifest_path(ticker, state)
+        )
+        documents: list[JsonValue] = [dict(item) for item in canonical_items]
+        payload: dict[str, JsonValue] = {
+            "ticker": ticker,
+            "updated_at": now_iso8601(),
+            "documents": documents,
+        }
+        _write_json(manifest_path, payload)
 
     # ========== handle & 文件访问 ==========
 
