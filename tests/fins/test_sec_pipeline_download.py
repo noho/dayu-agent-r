@@ -5479,6 +5479,71 @@ def test_sec_unsafe_phase_a_and_whole_tree_preflight_have_zero_mutation(
     assert not _download_rejections_path(tmp_path, "AAPL").exists()
 
 
+@pytest.mark.parametrize(
+    "manifest_corruption",
+    ("trusted_dangling", "untrusted"),
+)
+def test_sec_empty_inventory_manifest_preflight_has_zero_mutation(
+    tmp_path: Path,
+    manifest_corruption: Literal["trusted_dangling", "untrusted"],
+) -> None:
+    """真实 SEC whole-tree 对空 inventory 的 unsafe manifest 必须零副作用拒绝。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        manifest_corruption: trusted 悬空声明或无法信任的 manifest。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: preflight 未投影 typed UNSAFE，或 company/provider 副作用已发生时抛出。
+        OSError: fixture publication 或目录移动失败时抛出。
+    """
+
+    document_id = "fil_0000000000-25-000001"
+    meta_path = _seed_complete_sec_source(
+        workspace_root=tmp_path,
+        document_id=document_id,
+    )
+    source_dir = meta_path.parent
+    payload_path = source_dir / "sample-10k.htm"
+    manifest_path = _filing_manifest_path(tmp_path, "AAPL")
+    old_meta = meta_path.read_bytes()
+    old_payload = payload_path.read_bytes()
+    detached_dir = tmp_path / "detached-sec-source"
+    source_dir.rename(detached_dir)
+    if manifest_corruption == "untrusted":
+        manifest_path.write_text("{", encoding="utf-8")
+    old_manifest = manifest_path.read_bytes()
+    downloader = StubDownloader(
+        submissions=_build_submissions(),
+        remote_files=[_make_descriptor("etag")],
+        download_results=[],
+    )
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=downloader,
+        processor_registry=build_fins_processor_registry(),
+    )
+
+    with pytest.raises(SourceIntegrityPreflightError) as exc_info:
+        pipeline.download(
+            ticker="AAPL",
+            overwrite=False,
+            start_is_explicit=False,
+        )
+
+    assert exc_info.value.reason is SourceIntegrityPreflightReason.UNSAFE_PUBLICATION
+    assert downloader.list_filing_files_call_count == 0
+    assert downloader.download_files_called is False
+    assert (detached_dir / "meta.json").read_bytes() == old_meta
+    assert (detached_dir / "sample-10k.htm").read_bytes() == old_payload
+    assert manifest_path.read_bytes() == old_manifest
+    assert not _company_meta_path(tmp_path, "AAPL").exists()
+    assert not _download_rejections_path(tmp_path, "AAPL").exists()
+
+
 def test_sec_unsafe_phase_b_rolls_back_without_reset_blob_or_commit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

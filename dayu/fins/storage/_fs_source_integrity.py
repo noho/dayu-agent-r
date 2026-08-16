@@ -88,7 +88,8 @@ class _SourcePublicationInspection:
         persisted_meta: 可信且仍含 storage 私有 revision 的元数据。
         business_meta: 可信且已移除 storage 私有 revision 的业务元数据。
         provenance: 从可信 meta 解析出的来源事实。
-        revision: 与 classification 同版的可信 opaque revision。
+        revision: content 扫描对应的可信 opaque revision；当公共
+            classification 为 ``UNSAFE`` 时仅是私有 content fact，不得对外投影。
         files: 同一次扫描验证的业务文件事实。
         primary_document: 同一次扫描验证的主文件名。
         canonical_manifest_item: 由 manifest item owner 从可信 meta 产生的投影。
@@ -113,8 +114,10 @@ class _SourceKindPublicationInspection:
         target: exact-target mode 的精确目标；whole-kind mode 固定为 ``None``。
         inventory: 按 document ID 稳定排序的完整 source-kind inventory。
         shared_manifest_reasons: 同一次扫描识别出的 source-kind shared 原因。
-        canonical_manifest_items: 由全部 complete source 产生的 canonical manifest 项目。
-        repair_blocked_reason: 其它 source 或 canonical aggregate 对 repair 的阻断原因。
+        canonical_manifest_items: 由全部 complete content 产生的 canonical manifest
+            项目；消费前必须先确认 ``repair_blocked_reason`` 为 ``None``。
+        repair_blocked_reason: 其它 source 或 canonical aggregate 对 repair 的阻断原因；
+            非空时 ``canonical_manifest_items`` 不构成可执行 repair 的授权。
     """
 
     target: _SourcePublicationInspection | None
@@ -316,6 +319,17 @@ def _inspect_source_kind_unguarded(
         inventory=ordered_inventory,
         manifest=manifest,
     )
+    if (
+        external_document_id is None
+        and not inventory
+        and SourceIntegrityReason.SOURCE_MANIFEST_UNTRUSTED
+        in shared_manifest_reasons
+    ):
+        # untrusted manifest 无法提供可信 document ID，whole mode 也无实体
+        # classification 承载该 kind-level 事实，因此必须在此 typed 失败。
+        raise SourceIntegrityPreflightError(
+            SourceIntegrityPreflightReason.UNSAFE_PUBLICATION
+        )
     canonical_manifest_items = _canonical_manifest_items(inventory)
     target = _select_exact_target(
         ticker=external_ticker,
@@ -1095,7 +1109,6 @@ def _apply_manifest_facts(
         无。
     """
 
-    del ticker, source_kind
     if not manifest.exists:
         if not inventory:
             return inventory, ()
@@ -1119,10 +1132,30 @@ def _apply_manifest_facts(
 
     source_ids = {item.classification.document_id for item in inventory}
     manifest_ids = set(manifest.items)
-    if manifest_ids - source_ids:
+    dangling_ids = tuple(sorted(manifest_ids - source_ids))
+    if dangling_ids:
         reason = SourceIntegrityReason.SOURCE_MANIFEST_UNTRUSTED
+        unsafe_inventory = tuple(
+            _with_unsafe_classification(item, reason) for item in inventory
+        )
+        dangling_inventory = tuple(
+            _unsafe_source_inspection(
+                ticker=ticker,
+                source_kind=source_kind,
+                document_id=document_id,
+                reason=reason,
+            )
+            for document_id in dangling_ids
+        )
+        unsafe_by_id = {
+            item.classification.document_id: item
+            for item in (*unsafe_inventory, *dangling_inventory)
+        }
         return (
-            tuple(_with_unsafe_classification(item, reason) for item in inventory),
+            tuple(
+                unsafe_by_id[document_id]
+                for document_id in sorted(unsafe_by_id)
+            ),
             (reason,),
         )
     mismatched_ids: set[str] = set(source_ids - manifest_ids)

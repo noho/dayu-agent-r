@@ -6681,6 +6681,190 @@ def test_source_integrity_unsafe_corruption_grid_closes_without_revision(
         )
 
 
+@pytest.mark.parametrize("source_kind", (SourceKind.FILING, SourceKind.MATERIAL))
+def test_canonical_source_directory_with_foreign_descriptor_is_unsafe(
+    tmp_path: Path,
+    source_kind: SourceKind,
+) -> None:
+    """canonical 目录与 descriptor 身份冲突时 exact/staged/whole 必须失败关闭。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        source_kind: 当前 filing 或 material source kind。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 错位目录被分类为 MISSING/COMPLETE 或泄漏 revision 时抛出。
+        OSError: fixture publication、descriptor 写入或 batch 操作失败时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    document_id = "canonical-target"
+    batch = batching.begin_batch("AAPL")
+    _create_complete_source(
+        source,
+        blob,
+        batch=batch,
+        document_id=document_id,
+        source_kind=source_kind,
+    )
+    batching.commit_batch(batch)
+    source_dir, _meta_path, _manifest_path = _integrity_source_paths(
+        repository_set.core,
+        document_id=document_id,
+        source_kind=source_kind,
+    )
+    descriptor_path = _identity_descriptor_file(source_dir)
+    descriptor = _read_integrity_json(descriptor_path)
+    descriptor["external_identity"] = "foreign-document"
+    _write_integrity_json(descriptor_path, descriptor)
+
+    published = source.classify_source_integrity(
+        "AAPL",
+        document_id,
+        source_kind,
+    )
+    assert published.status is SourceIntegrityStatus.UNSAFE
+    assert published.revision is None
+    assert published.reasons == (SourceIntegrityReason.IDENTITY_UNTRUSTED,)
+
+    staged_batch = batching.begin_batch("AAPL")
+    try:
+        staged = source.classify_staged_source_integrity(
+            "AAPL",
+            document_id,
+            source_kind,
+            batch=staged_batch,
+        )
+        assert staged == published
+    finally:
+        batching.rollback_batch(staged_batch)
+
+    with pytest.raises(SourceIntegrityPreflightError) as exc_info:
+        source.list_source_integrity("AAPL")
+    assert exc_info.value.reason is SourceIntegrityPreflightReason.UNSAFE_PUBLICATION
+
+
+@pytest.mark.parametrize("source_kind", (SourceKind.FILING, SourceKind.MATERIAL))
+def test_dangling_trusted_manifest_projects_stable_unsafe_inventory(
+    tmp_path: Path,
+    source_kind: SourceKind,
+) -> None:
+    """actual inventory 为空时 trusted manifest 悬空 ID 必须成为 public UNSAFE fact。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        source_kind: 当前 filing 或 material source kind。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: exact/whole classification 不同源或 preflight 返回 clean 时抛出。
+        OSError: fixture publication 或目录移动失败时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    document_id = "dangling-manifest-target"
+    batch = batching.begin_batch("AAPL")
+    _create_complete_source(
+        source,
+        blob,
+        batch=batch,
+        document_id=document_id,
+        source_kind=source_kind,
+    )
+    batching.commit_batch(batch)
+    source_dir, _meta_path, _manifest_path = _integrity_source_paths(
+        repository_set.core,
+        document_id=document_id,
+        source_kind=source_kind,
+    )
+    detached_dir = tmp_path / f"detached-{source_kind.value}-source"
+    source_dir.rename(detached_dir)
+
+    exact = source.classify_source_integrity(
+        "AAPL",
+        document_id,
+        source_kind,
+    )
+    assert exact.status is SourceIntegrityStatus.UNSAFE
+    assert exact.revision is None
+    assert exact.reasons == (SourceIntegrityReason.SOURCE_MANIFEST_UNTRUSTED,)
+    inventory = source.list_source_integrity("AAPL")
+    assert inventory == (exact,)
+    with pytest.raises(SourceIntegrityPreflightError) as exc_info:
+        classify_source_integrity_preflight(
+            inventory,
+            accepted_filing_ids=frozenset({document_id}),
+            rejected_filing_ids=frozenset(),
+        )
+    assert exc_info.value.reason is SourceIntegrityPreflightReason.UNSAFE_PUBLICATION
+    assert detached_dir.is_dir()
+
+
+@pytest.mark.parametrize("source_kind", (SourceKind.FILING, SourceKind.MATERIAL))
+def test_empty_inventory_with_untrusted_manifest_raises_whole_preflight(
+    tmp_path: Path,
+    source_kind: SourceKind,
+) -> None:
+    """空 inventory 的 untrusted manifest 必须 exact UNSAFE 且 whole typed fail-closed。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        source_kind: 当前 filing 或 material source kind。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: exact 泄漏 revision 或 whole list 未抛 typed preflight error 时抛出。
+        OSError: fixture publication、目录移动或 manifest 写入失败时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    document_id = "untrusted-manifest-target"
+    batch = batching.begin_batch("AAPL")
+    _create_complete_source(
+        source,
+        blob,
+        batch=batch,
+        document_id=document_id,
+        source_kind=source_kind,
+    )
+    batching.commit_batch(batch)
+    source_dir, _meta_path, manifest_path = _integrity_source_paths(
+        repository_set.core,
+        document_id=document_id,
+        source_kind=source_kind,
+    )
+    source_dir.rename(tmp_path / f"detached-untrusted-{source_kind.value}-source")
+    manifest_path.write_text("{", encoding="utf-8")
+
+    exact = source.classify_source_integrity(
+        "AAPL",
+        document_id,
+        source_kind,
+    )
+    assert exact.status is SourceIntegrityStatus.UNSAFE
+    assert exact.revision is None
+    assert exact.reasons == (SourceIntegrityReason.SOURCE_MANIFEST_UNTRUSTED,)
+    with pytest.raises(SourceIntegrityPreflightError) as exc_info:
+        source.list_source_integrity("AAPL")
+    assert exc_info.value.reason is SourceIntegrityPreflightReason.UNSAFE_PUBLICATION
+
+
 def test_exact_whole_classifier_snapshot_and_commit_consume_same_inspection_facts(
     tmp_path: Path,
 ) -> None:
