@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import multiprocessing
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from threading import Barrier as ThreadBarrier, Event
+from threading import Barrier as ThreadBarrier, Event, Lock
 from typing import Protocol, cast
 
 import pytest
@@ -21,7 +23,13 @@ import dayu.fins.pipelines._filing_upload_fresh_validation as fresh_validation_m
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.company_meta_contract import CompanyMetaCommitIntent
-from dayu.fins.domain.document_models import BatchToken, CompanyMeta, CompanyMetaInventoryEntry, now_iso8601
+from dayu.fins.domain.document_models import (
+    BatchToken,
+    CompanyMeta,
+    CompanyMetaInventoryEntry,
+    SourceDocumentRevision,
+    now_iso8601,
+)
 from dayu.fins.ticker_normalization import build_company_ticker_identity
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.ingestion_runtime import (
@@ -31,7 +39,12 @@ from dayu.fins.ingestion_runtime import (
     ValidatedFinsUploadFilingRequest,
 )
 from dayu.fins.pipelines.sec_pipeline import SecPipeline, SecPipelineUploadResult
-from dayu.fins.pipelines.docling_upload_service import _build_filing_original_asset_identity
+from dayu.fins.pipelines.docling_upload_service import (
+    DoclingUploadService,
+    PreparedDoclingUpload,
+    describe_prepared_filing_publication,
+    _build_filing_original_asset_identity,
+)
 from dayu.fins.pipelines.docling_process_converter import (
     DoclingConversionConfig,
     DoclingConversionCancelledError,
@@ -40,7 +53,7 @@ from dayu.fins.pipelines.docling_process_converter import (
     DoclingConversionResult,
     DoclingConverter,
 )
-from dayu.fins.pipelines.upload_filing_events import UploadFilingEventType
+from dayu.fins.pipelines.upload_filing_events import UploadFilingEvent, UploadFilingEventType
 from dayu.fins.pipelines.upload_company_meta import (
     RESOLVER_VERSION,
     stage_company_meta_for_upload,
@@ -49,13 +62,18 @@ from dayu.fins.processors.registry import build_fins_processor_registry
 from dayu.fins.service_runtime import prevalidate_fins_upload_filing_request_for_workspace
 from dayu.fins.upload_failure import fins_upload_source_publication_conflict_failure
 from dayu.fins.storage import (
+    DocumentBlobRepositoryProtocol,
+    FilingUploadPublicationIdentity,
     FilingUploadStateRepositoryProtocol,
     FilingUploadPublishedState,
     FsDocumentBlobRepository,
     FsFilingUploadStateRepository,
+    SourceDocumentRepositoryProtocol,
     SourceIntegrityStatus,
 )
 from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
+from dayu.fins.upload_format_contract import FinsUploadFilingFiles, FinsUploadMaterialFiles
+from dayu.fins.upload_repair_contract import ExistingSourceRepairDisposition
 from dayu.runtime.filelock import RuntimeFileLockError
 
 from .upload_filing_test_support import (
@@ -278,6 +296,203 @@ class _BatchReadBarrierFilingUploadStateRepository(FsFilingUploadStateRepository
         entered.set()
         self._barrier.wait(timeout=10)
         return super().read_filing_upload_state_in_batch(batch, document_id)
+
+
+class _PreparedIdentityRecordingDoclingUploadService(DoclingUploadService):
+    """记录真实 preparation owner 已产生的 filing publication identity。"""
+
+    def __init__(
+        self,
+        source_repository: SourceDocumentRepositoryProtocol,
+        blob_repository: DocumentBlobRepositoryProtocol,
+        *,
+        docling_converter: DoclingConverter,
+        identities: list[FilingUploadPublicationIdentity],
+    ) -> None:
+        """初始化真实 Docling service 与 test-only identity sink。
+
+        Args:
+            source_repository: pipeline 共用的 source repository。
+            blob_repository: pipeline 共用的 blob repository。
+            docling_converter: 真实 workflow 使用的确定性 converter。
+            identities: 接收 production helper 产生的 prepared identity。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: 基类依赖缺失时抛出。
+        """
+
+        super().__init__(
+            source_repository,
+            blob_repository,
+            docling_converter=docling_converter,
+        )
+        self._identities = identities
+
+    async def prepare_upload(
+        self,
+        *,
+        ticker: str,
+        source_kind: SourceKind,
+        action: str,
+        document_id: str,
+        internal_document_id: str,
+        form_type: str,
+        selection: FinsUploadFilingFiles | FinsUploadMaterialFiles,
+        overwrite: bool,
+        previous_meta: Mapping[str, JsonValue] | None,
+        meta: Mapping[str, JsonValue],
+        repair_disposition: ExistingSourceRepairDisposition,
+        cancellation: CancellationToken | None,
+    ) -> PreparedDoclingUpload:
+        """执行真实 preparation，并用 production descriptor 记录 filing candidate。
+
+        Args:
+            ticker: canonical ticker。
+            source_kind: filing 或 material。
+            action: validated upload action。
+            document_id: external filing document ID。
+            internal_document_id: internal filing document ID。
+            form_type: filing form type。
+            selection: validator-owned file role selection。
+            overwrite: create overwrite 开关。
+            previous_meta: preparation observation 的 source meta。
+            meta: workflow 业务 meta。
+            repair_disposition: validator-owned repair authorization。
+            cancellation: canonical cancellation token。
+
+        Returns:
+            基类产生的原始 typed prepared outcome。
+
+        Raises:
+            BaseException: 基类 preparation 或 production descriptor 异常原样传播。
+        """
+
+        prepared = await super().prepare_upload(
+            ticker=ticker,
+            source_kind=source_kind,
+            action=action,
+            document_id=document_id,
+            internal_document_id=internal_document_id,
+            form_type=form_type,
+            selection=selection,
+            overwrite=overwrite,
+            previous_meta=previous_meta,
+            meta=meta,
+            repair_disposition=repair_disposition,
+            cancellation=cancellation,
+        )
+        if source_kind is SourceKind.FILING and action != "delete":
+            self._identities.append(describe_prepared_filing_publication(prepared))
+        return prepared
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceCommitSnapshot:
+    """一个真实 commit 后由公开 source snapshot owner 读取的 durable facts。"""
+
+    document_id: str
+    source_meta: dict[str, JsonValue]
+    revision: SourceDocumentRevision
+
+
+class _CommitSnapshotTrackingBatchingRepository(TrackingBatchingRepository):
+    """在两个真实 commit 之间确定性记录公开 source snapshot。"""
+
+    def __init__(
+        self,
+        workspace_root: Path,
+        *,
+        repository_set: _FsRepositorySet,
+        source_repository: SourceDocumentRepositoryProtocol,
+        snapshots: list[_SourceCommitSnapshot],
+    ) -> None:
+        """初始化 commit snapshot recorder。
+
+        Args:
+            workspace_root: 真实 filesystem workspace。
+            repository_set: pipeline repositories 共用的 storage core。
+            source_repository: commit 后唯一公开 source read owner。
+            snapshots: 接收按 commit 顺序记录的 durable snapshots。
+
+        Returns:
+            无。
+
+        Raises:
+            OSError: 基类初始化失败时抛出。
+        """
+
+        super().__init__(workspace_root, repository_set=repository_set)
+        self._source_repository = source_repository
+        self._snapshots = snapshots
+        self._begin_lock = Lock()
+        self._begin_attempts = 0
+        self._first_snapshot_recorded = Event()
+
+    def begin_batch(self, ticker: str) -> BatchToken:
+        """让第二个 writer 在第一个 durable snapshot 已记录后再取得 batch。
+
+        Args:
+            ticker: canonical ticker。
+
+        Returns:
+            基类取得的真实 batch capability。
+
+        Raises:
+            TimeoutError: 第一个 commit snapshot 未在期限内产生时抛出。
+            OSError: 真实 batch 初始化失败时抛出。
+            ValueError: ticker 非法时抛出。
+            RuntimeError: writer reservation 失败时抛出。
+        """
+
+        with self._begin_lock:
+            begin_index = self._begin_attempts
+            self._begin_attempts += 1
+        if begin_index > 0 and not self._first_snapshot_recorded.wait(timeout=10):
+            raise TimeoutError("first commit source snapshot 未产生")
+        return super().begin_batch(ticker)
+
+    def commit_batch(self, batch: BatchToken) -> None:
+        """执行真实 commit 后从公开仓储读取同版 meta 与 opaque revision。
+
+        Args:
+            batch: caller 转交的真实 batch capability。
+
+        Returns:
+            commit 与 snapshot 记录成功后返回 ``None``。
+
+        Raises:
+            AssertionError: 当前测试 ticker 不只包含一个 filing target 时抛出。
+            OSError: commit 或 snapshot 读取失败时抛出。
+            ValueError: capability 或 durable source 非法时抛出。
+            RuntimeError: publication/snapshot owner 失败时抛出。
+        """
+
+        super().commit_batch(batch)
+        document_ids = self._source_repository.list_source_document_ids(
+            batch.ticker,
+            SourceKind.FILING,
+        )
+        if len(document_ids) != 1:
+            raise AssertionError("create-overwrite commit 必须只有一个 filing target")
+        document_id = document_ids[0]
+        with self._source_repository.read_source_snapshot(
+            batch.ticker,
+            document_id,
+            SourceKind.FILING,
+            materialize_files=False,
+        ) as snapshot:
+            self._snapshots.append(
+                _SourceCommitSnapshot(
+                    document_id=document_id,
+                    source_meta=dict(snapshot.source_meta),
+                    revision=snapshot.revision,
+                )
+            )
+        if len(self._snapshots) == 1:
+            self._first_snapshot_recorded.set()
 
 
 class _SpawnResultQueue(Protocol):
@@ -663,6 +878,8 @@ def _tracking_sec_pipeline(
     converter: DoclingConverter | None = None,
     batch_read_barrier: _BarrierPort | None = None,
     batch_read_events: dict[str, Event] | None = None,
+    prepared_identities: list[FilingUploadPublicationIdentity] | None = None,
+    commit_snapshots: list[_SourceCommitSnapshot] | None = None,
 ) -> tuple[
     SecPipeline,
     TrackingBatchingRepository,
@@ -677,6 +894,8 @@ def _tracking_sec_pipeline(
         converter: 可选 typed converter；未提供时构造默认 fake。
         batch_read_barrier: 可选 writer-owned fresh read 会合点。
         batch_read_events: 与会合点配套的 canonical ticker 进入通知。
+        prepared_identities: 可选真实 filing preparation identity 记录 sink。
+        commit_snapshots: 可选 create-overwrite commit 后 durable snapshot 记录 sink。
 
     Returns:
         pipeline、batch、company 与 source tracking repositories。
@@ -690,9 +909,18 @@ def _tracking_sec_pipeline(
         workspace_root=workspace_root,
         create_directories=False,
     )
-    batching = TrackingBatchingRepository(workspace_root, repository_set=repository_set)
     company = TrackingCompanyMetaRepository(workspace_root, repository_set=repository_set)
     source = TrackingSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    batching: TrackingBatchingRepository
+    if commit_snapshots is None:
+        batching = TrackingBatchingRepository(workspace_root, repository_set=repository_set)
+    else:
+        batching = _CommitSnapshotTrackingBatchingRepository(
+            workspace_root,
+            repository_set=repository_set,
+            source_repository=source,
+            snapshots=commit_snapshots,
+        )
     if (batch_read_barrier is None) is not (batch_read_events is None):
         raise ValueError("batch_read_barrier 与 batch_read_events 必须成对提供")
     filing_state_repository: FilingUploadStateRepositoryProtocol
@@ -708,16 +936,28 @@ def _tracking_sec_pipeline(
             workspace_root,
             repository_set=repository_set,
         )
+    effective_converter = converter or _FakeDoclingConverter(converter_calls)
+    blob_repository = FsDocumentBlobRepository(
+        workspace_root,
+        repository_set=repository_set,
+    )
     pipeline = SecPipeline(
         workspace_root=workspace_root,
         processor_registry=build_fins_processor_registry(),
         batching_repository=batching,
         company_repository=company,
         source_repository=source,
-        blob_repository=FsDocumentBlobRepository(workspace_root, repository_set=repository_set),
+        blob_repository=blob_repository,
         filing_upload_state_repository=filing_state_repository,
-        docling_converter=converter or _FakeDoclingConverter(converter_calls),
+        docling_converter=effective_converter,
     )
+    if prepared_identities is not None:
+        pipeline._upload_service = _PreparedIdentityRecordingDoclingUploadService(
+            source,
+            blob_repository,
+            docling_converter=effective_converter,
+            identities=prepared_identities,
+        )
     return pipeline, batching, company, source
 
 
@@ -747,6 +987,105 @@ def _run_two_sec_uploads(
         first_future = executor.submit(first_pipeline.upload_filing, first_request)
         second_future = executor.submit(second_pipeline.upload_filing, second_request)
         return first_future.result(timeout=20), second_future.result(timeout=20)
+
+
+async def _collect_sec_upload_stream(
+    pipeline: SecPipeline,
+    request: ValidatedFinsUploadFilingRequest,
+) -> tuple[UploadFilingEvent, ...]:
+    """完整收集一条真实 SEC upload stream。
+
+    Args:
+        pipeline: SEC workflow composition。
+        request: 已验证 filing request。
+
+    Returns:
+        按真实 yield 顺序排列的 typed events。
+
+    Raises:
+        BaseException: stream 未封闭的异常原样传播。
+    """
+
+    return tuple([event async for event in pipeline.upload_filing_stream(request)])
+
+
+def _collect_sec_upload_stream_sync(
+    pipeline: SecPipeline,
+    request: ValidatedFinsUploadFilingRequest,
+) -> tuple[UploadFilingEvent, ...]:
+    """在线程 worker 内运行并完整收集一条 SEC upload stream。
+
+    Args:
+        pipeline: SEC workflow composition。
+        request: 已验证 filing request。
+
+    Returns:
+        按真实 yield 顺序排列的 typed events。
+
+    Raises:
+        BaseException: event loop 或 stream 异常原样传播。
+    """
+
+    return asyncio.run(_collect_sec_upload_stream(pipeline, request))
+
+
+def _run_two_sec_upload_streams(
+    *,
+    first_pipeline: SecPipeline,
+    first_request: ValidatedFinsUploadFilingRequest,
+    second_pipeline: SecPipeline,
+    second_request: ValidatedFinsUploadFilingRequest,
+) -> tuple[tuple[UploadFilingEvent, ...], tuple[UploadFilingEvent, ...]]:
+    """在两个真实线程中并发收集完整 SEC upload streams。
+
+    Args:
+        first_pipeline: 第一条 workflow composition。
+        first_request: 第一条已验证请求。
+        second_pipeline: 第二条 workflow composition。
+        second_request: 第二条已验证请求。
+
+    Returns:
+        与输入顺序一致的两条完整 event tuples。
+
+    Raises:
+        BaseException: 任一 worker 未封闭异常或 future 超时时原样传播。
+    """
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(
+            _collect_sec_upload_stream_sync,
+            first_pipeline,
+            first_request,
+        )
+        second_future = executor.submit(
+            _collect_sec_upload_stream_sync,
+            second_pipeline,
+            second_request,
+        )
+        return first_future.result(timeout=20), second_future.result(timeout=20)
+
+
+def _sec_upload_stream_result(
+    events: tuple[UploadFilingEvent, ...],
+) -> SecPipelineUploadResult:
+    """从完整 SEC upload stream 的唯一末事件读取聚合结果。
+
+    Args:
+        events: 一条完整真实 upload stream。
+
+    Returns:
+        terminal payload 中的 JSON result object。
+
+    Raises:
+        AssertionError: stream 为空、末事件非完成终态或 result 非 object 时抛出。
+    """
+
+    if not events or events[-1].event_type is not UploadFilingEventType.UPLOAD_COMPLETED:
+        raise AssertionError("SEC upload stream 必须以 UPLOAD_COMPLETED 终结")
+    result = events[-1].payload.get("result")
+    if not isinstance(result, dict):
+        raise AssertionError("SEC upload completed event 必须携带 result object")
+    return result
 
 
 def _spawn_identical_sec_upload_worker(
@@ -2208,9 +2547,11 @@ def test_concurrent_identical_auto_upload_has_one_publish_and_one_canonical_skip
     """
 
     barrier = ThreadBarrier(2)
+    prepared_identities: list[FilingUploadPublicationIdentity] = []
     pipeline, batching, company, source = _tracking_sec_pipeline(
         tmp_path,
         converter=_BarrierDoclingConverter(barrier),
+        prepared_identities=prepared_identities,
     )
     primary = tmp_path / "q1.pdf"
     companion = tmp_path / "q1.xlsx"
@@ -2232,12 +2573,13 @@ def test_concurrent_identical_auto_upload_has_one_publish_and_one_canonical_skip
         company_name="Apple Inc.",
     )
 
-    results = _run_two_sec_uploads(
+    streams = _run_two_sec_upload_streams(
         first_pipeline=pipeline,
         first_request=first_request,
         second_pipeline=pipeline,
         second_request=second_request,
     )
+    results = tuple(_sec_upload_stream_result(events) for events in streams)
 
     assert sorted(str(result["status"]) for result in results) == ["ok", "skipped"]
     first_count = results[0]["stored_file_count"]
@@ -2255,6 +2597,36 @@ def test_concurrent_identical_auto_upload_has_one_publish_and_one_canonical_skip
         first_request.document_id,
     )
     assert durable.source_integrity.status is SourceIntegrityStatus.COMPLETE
+    assert len(prepared_identities) == 2
+    assert prepared_identities[0] == prepared_identities[1]
+    prepared_identity = prepared_identities[0]
+    assert durable.publication_identity == prepared_identity
+    assert durable.source_meta is not None
+
+    loser_index = next(index for index, result in enumerate(results) if result["status"] == "skipped")
+    loser_events = streams[loser_index]
+    assert [event.event_type for event in loser_events] == [
+        UploadFilingEventType.UPLOAD_STARTED,
+        *(UploadFilingEventType.FILE_SKIPPED for _path in (primary, *companions)),
+        UploadFilingEventType.UPLOAD_COMPLETED,
+    ]
+    assert [
+        event.payload["name"] for event in loser_events if event.event_type is UploadFilingEventType.FILE_SKIPPED
+    ] == [path.name for path in (primary, *companions)]
+    assert all(event.event_type is not UploadFilingEventType.CONVERSION_STARTED for event in loser_events)
+
+    with source.read_source_snapshot(
+        "AAPL",
+        first_request.document_id,
+        SourceKind.FILING,
+        materialize_files=False,
+    ) as snapshot:
+        assert snapshot.revision == durable.source_integrity.revision
+        assert snapshot.source_meta == durable.source_meta
+        assert snapshot.primary_filename == prepared_identity.primary_document
+        snapshot_asset_names = tuple(file.name for file in snapshot.files)
+        assert len(snapshot_asset_names) == len(prepared_identity.assets)
+        assert frozenset(snapshot_asset_names) == frozenset(asset.name for asset in prepared_identity.assets)
 
 
 @pytest.mark.parametrize(
@@ -2287,9 +2659,11 @@ def test_concurrent_explicit_create_obeys_overwrite_rebase_contract(
         AssertionError: 显式 create 的 fresh arbitration 漂移时抛出。
     """
 
+    commit_snapshots: list[_SourceCommitSnapshot] = []
     pipeline, batching, _company, _source = _tracking_sec_pipeline(
         tmp_path,
         converter=_BarrierDoclingConverter(ThreadBarrier(2)),
+        commit_snapshots=commit_snapshots if overwrite else None,
     )
     primary = tmp_path / "q1.pdf"
     primary.write_bytes(b"same-primary")
@@ -2325,6 +2699,17 @@ def test_concurrent_explicit_create_obeys_overwrite_rebase_contract(
         assert failed["stored_file_count"] == 0
         assert failed["status"] != "skipped"
         assert failure["code"] != "unexpected_runtime"
+    else:
+        assert len(commit_snapshots) == 2
+        first_commit, second_commit = commit_snapshots
+        assert first_commit.document_id == requests[0].document_id
+        assert second_commit.document_id == requests[0].document_id
+        for timestamp_field in ("first_ingested_at", "created_at"):
+            assert second_commit.source_meta[timestamp_field] == (first_commit.source_meta[timestamp_field])
+        assert second_commit.source_meta["source_fingerprint"] == (first_commit.source_meta["source_fingerprint"])
+        assert second_commit.source_meta["document_version"] == (first_commit.source_meta["document_version"])
+        assert second_commit.source_meta["document_version"] == "v1"
+        assert second_commit.revision != first_commit.revision
 
 
 @pytest.mark.parametrize("mismatch", ["derived", "company"])
@@ -2405,7 +2790,7 @@ def test_concurrent_distinct_targets_preserve_exact_union(
     """
 
     batch_read_events = None if same_ticker else {"AAPL": Event(), "MSFT": Event()}
-    pipeline, batching, company, _source = _tracking_sec_pipeline(
+    pipeline, batching, company, source = _tracking_sec_pipeline(
         tmp_path,
         converter=_BarrierDoclingConverter(ThreadBarrier(2)),
         batch_read_barrier=None if same_ticker else ThreadBarrier(2),
@@ -2459,6 +2844,39 @@ def test_concurrent_distinct_targets_preserve_exact_union(
         aliases = company_meta.ticker_identity.accepted_aliases
         assert len(aliases) == 2
         assert frozenset(aliases) == frozenset({"MSFT", "GOOG"})
+        expected_document_ids = tuple(sorted((first_request.document_id, second_request.document_id)))
+        assert tuple(source.list_source_document_ids("AAPL", SourceKind.FILING)) == (expected_document_ids)
+        states = (first_state, second_state)
+        publication_identities = tuple(state.publication_identity for state in states)
+        assert all(identity is not None for identity in publication_identities)
+        expected_asset_union = {
+            (identity.document_id, asset.name)
+            for identity in publication_identities
+            if identity is not None
+            for asset in identity.assets
+        }
+        actual_asset_union: set[tuple[str, str]] = set()
+        for document_id, state in zip(
+            (first_request.document_id, second_request.document_id),
+            states,
+            strict=True,
+        ):
+            identity = state.publication_identity
+            assert identity is not None
+            with source.read_source_snapshot(
+                "AAPL",
+                document_id,
+                SourceKind.FILING,
+                materialize_files=False,
+            ) as snapshot:
+                assert snapshot.document_id == document_id
+                assert snapshot.revision == state.source_integrity.revision
+                assert snapshot.primary_filename == identity.primary_document
+                snapshot_asset_names = tuple(file.name for file in snapshot.files)
+                assert len(snapshot_asset_names) == len(identity.assets)
+                assert frozenset(snapshot_asset_names) == frozenset(asset.name for asset in identity.assets)
+                actual_asset_union.update((document_id, asset_name) for asset_name in snapshot_asset_names)
+        assert actual_asset_union == expected_asset_union
     else:
         assert batch_read_events is not None
         assert all(entered.is_set() for entered in batch_read_events.values())
