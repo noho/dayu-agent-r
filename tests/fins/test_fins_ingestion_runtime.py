@@ -161,6 +161,8 @@ from dayu.fins.storage import (
     FsSourceDocumentRepository,
     FilingUploadPublishedState,
     FilingUploadStateRepositoryProtocol,
+    SourceIntegrityClassification,
+    SourceIntegrityStatus,
     SourceDocumentRepositoryProtocol,
 )
 from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
@@ -169,6 +171,121 @@ from dayu.fins.ticker_normalization import NormalizedTicker, build_company_ticke
 from dayu.fins.tools.read_runtime import FinsReadRuntime
 import dayu.runtime.log as runtime_log
 from dayu.runtime.workspace_paths import WorkspacePaths
+
+_PUBLISHED_SOURCE_REVISION_TOKEN = "test-published-source-revision"
+
+
+def _filing_upload_published_state(
+    request: FinsUploadFilingRequest,
+    *,
+    company_meta: CompanyMeta | None = None,
+    source_meta: Mapping[str, JsonValue] | None = None,
+) -> FilingUploadPublishedState:
+    """为 request 构造 target 与 meta presence 精确匹配的 published state。
+
+    Args:
+        request: 需要静态解析 exact ticker 与 filing document ID 的原始请求。
+        company_meta: 可选同版 company meta。
+        source_meta: 可选完整 source business meta。
+
+    Returns:
+        required integrity 与 source meta presence 一致的测试 state。
+
+    Raises:
+        FinsUploadUsageError: request 无法通过 workspace read 前静态校验时抛出。
+        ValueError: 构造的 integrity 或 state 不满足 public contract 时抛出。
+    """
+
+    ticker, document_id = ingestion_runtime._filing_upload_request_identity(request)
+    source_integrity = SourceIntegrityClassification(
+        ticker=ticker,
+        source_kind=SourceKind.FILING,
+        document_id=document_id,
+        revision=(
+            None
+            if source_meta is None
+            else SourceDocumentRevision(_PUBLISHED_SOURCE_REVISION_TOKEN)
+        ),
+        status=(
+            SourceIntegrityStatus.MISSING
+            if source_meta is None
+            else SourceIntegrityStatus.COMPLETE
+        ),
+        reasons=(),
+    )
+    return FilingUploadPublishedState(
+        company_meta=company_meta,
+        source_integrity=source_integrity,
+        source_meta=source_meta,
+    )
+
+
+def test_filing_upload_published_state_requires_matching_integrity_and_meta() -> None:
+    """upload state 必须显式携带 filing integrity 并保持 meta presence 同源。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: state 接受 material target 或 status/meta 不一致组合时抛出。
+    """
+
+    missing = SourceIntegrityClassification(
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        document_id="filing-a",
+        revision=None,
+        status=SourceIntegrityStatus.MISSING,
+        reasons=(),
+    )
+    complete = SourceIntegrityClassification(
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        document_id="filing-a",
+        revision=SourceDocumentRevision(_PUBLISHED_SOURCE_REVISION_TOKEN),
+        status=SourceIntegrityStatus.COMPLETE,
+        reasons=(),
+    )
+    material = SourceIntegrityClassification(
+        ticker="AAPL",
+        source_kind=SourceKind.MATERIAL,
+        document_id="material-a",
+        revision=SourceDocumentRevision(_PUBLISHED_SOURCE_REVISION_TOKEN),
+        status=SourceIntegrityStatus.COMPLETE,
+        reasons=(),
+    )
+
+    assert FilingUploadPublishedState(
+        company_meta=None,
+        source_integrity=missing,
+        source_meta=None,
+    ).source_integrity is missing
+    assert FilingUploadPublishedState(
+        company_meta=None,
+        source_integrity=complete,
+        source_meta={"source_fingerprint": "published"},
+    ).source_integrity is complete
+    with pytest.raises(ValueError, match="MISSING/UNSAFE"):
+        FilingUploadPublishedState(
+            company_meta=None,
+            source_integrity=missing,
+            source_meta={"source_fingerprint": "published"},
+        )
+    with pytest.raises(ValueError, match="COMPLETE/REPAIR_REQUIRED"):
+        FilingUploadPublishedState(
+            company_meta=None,
+            source_integrity=complete,
+            source_meta=None,
+        )
+    with pytest.raises(ValueError, match="filing integrity"):
+        FilingUploadPublishedState(
+            company_meta=None,
+            source_integrity=material,
+            source_meta={"source_fingerprint": "published"},
+        )
 
 
 def test_failed_pipeline_result_requires_closed_typed_failure_reason() -> None:
@@ -1101,8 +1218,8 @@ def test_upload_validator_accepts_v_dot_ba_alias_from_identity_grammar() -> None
     )
     validated = validate_fins_upload_filing_request(
         request,
-        published_state=FilingUploadPublishedState(
-            company_meta=None,
+        published_state=_filing_upload_published_state(
+            request,
             source_meta={"source_fingerprint": "published"},
         ),
     )
@@ -1374,7 +1491,6 @@ def test_validate_fins_upload_filing_request_resolves_state_aware_contract(
 
     upload_file = tmp_path / "report.pdf"
     upload_file.write_bytes(b"pdf")
-    absent = FilingUploadPublishedState(company_meta=None, source_meta=None)
     request = FinsUploadFilingRequest(
         ticker="aapl.us",
         files=(upload_file,),
@@ -1382,6 +1498,7 @@ def test_validate_fins_upload_filing_request_resolves_state_aware_contract(
         fiscal_period=" fy ",
         company_name="Apple Inc.",
     )
+    absent = _filing_upload_published_state(request)
 
     validated = validate_fins_upload_filing_request(request, published_state=absent)
 
@@ -1396,7 +1513,8 @@ def test_validate_fins_upload_filing_request_resolves_state_aware_contract(
         companions=(),
     )
 
-    present = FilingUploadPublishedState(
+    present = _filing_upload_published_state(
+        request,
         company_meta=CompanyMeta(
             company_id="AAPL_US",
             company_name="Apple Inc.",
@@ -1437,16 +1555,17 @@ def test_filing_validator_builds_role_selection_and_typed_delete_empty(
     companion = tmp_path / "schema.xsd"
     primary.write_text("<html></html>", encoding="utf-8")
     companion.write_text("<schema></schema>", encoding="utf-8")
+    upsert_request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        files=(primary, companion),
+        primary_selectors=(primary,),
+        fiscal_year=2024,
+        fiscal_period="FY",
+        company_name="Apple Inc.",
+    )
     upsert = validate_fins_upload_filing_request(
-        FinsUploadFilingRequest(
-            ticker="AAPL",
-            files=(primary, companion),
-            primary_selectors=(primary,),
-            fiscal_year=2024,
-            fiscal_period="FY",
-            company_name="Apple Inc.",
-        ),
-        published_state=FilingUploadPublishedState(company_meta=None, source_meta=None),
+        upsert_request,
+        published_state=_filing_upload_published_state(upsert_request),
     )
 
     assert upsert.file_selection.primary == primary.resolve(strict=False)
@@ -1457,15 +1576,16 @@ def test_filing_validator_builds_role_selection_and_typed_delete_empty(
     )
     assert upsert.file_selection.is_empty is False
 
+    delete_request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        action="delete",
+        fiscal_year=2024,
+        fiscal_period="FY",
+    )
     deleted = validate_fins_upload_filing_request(
-        FinsUploadFilingRequest(
-            ticker="AAPL",
-            action="delete",
-            fiscal_year=2024,
-            fiscal_period="FY",
-        ),
-        published_state=FilingUploadPublishedState(
-            company_meta=None,
+        delete_request,
+        published_state=_filing_upload_published_state(
+            delete_request,
             source_meta={"source_fingerprint": "published"},
         ),
     )
@@ -1507,7 +1627,7 @@ def test_filing_validator_selects_explicit_primary_at_any_position(
 
     validated = validate_fins_upload_filing_request(
         request,
-        published_state=FilingUploadPublishedState(company_meta=None, source_meta=None),
+        published_state=_filing_upload_published_state(request),
     )
 
     normalized_files = tuple(path.resolve(strict=False) for path in files)
@@ -1931,7 +2051,7 @@ def test_filing_path_identity_is_case_sensitive_and_does_not_merge_hardlinks(
 
     validated = validate_fins_upload_filing_request(
         request,
-        published_state=FilingUploadPublishedState(company_meta=None, source_meta=None),
+        published_state=_filing_upload_published_state(request),
     )
 
     assert validated.file_selection.primary == linked.resolve(strict=False)
@@ -1973,7 +2093,7 @@ def test_filing_distinct_same_basename_and_same_stem_paths_are_accepted(
 
     validated = validate_fins_upload_filing_request(
         request,
-        published_state=FilingUploadPublishedState(company_meta=None, source_meta=None),
+        published_state=_filing_upload_published_state(request),
     )
 
     assert validated.file_selection.primary == second.resolve(strict=False)
@@ -2001,16 +2121,17 @@ def test_filing_file_count_limit_counts_raw_entries_before_duplicates(
     files = tuple(tmp_path / f"file-{index:03d}.txt" for index in range(100))
     for path in files:
         path.write_text(path.name, encoding="utf-8")
+    request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        files=files,
+        primary_selectors=(files[-1],),
+        fiscal_year=2024,
+        fiscal_period="FY",
+        company_name="Apple Inc.",
+    )
     accepted = validate_fins_upload_filing_request(
-        FinsUploadFilingRequest(
-            ticker="AAPL",
-            files=files,
-            primary_selectors=(files[-1],),
-            fiscal_year=2024,
-            fiscal_period="FY",
-            company_name="Apple Inc.",
-        ),
-        published_state=FilingUploadPublishedState(company_meta=None, source_meta=None),
+        request,
+        published_state=_filing_upload_published_state(request),
     )
     assert len(accepted.file_selection.ordered_files) == 100
     assert accepted.file_selection.primary == files[-1].resolve(strict=False)
@@ -2058,7 +2179,7 @@ def test_filing_explicit_roles_control_primary_and_companion_suffixes(
 
     validated = validate_fins_upload_filing_request(
         request,
-        published_state=FilingUploadPublishedState(company_meta=None, source_meta=None),
+        published_state=_filing_upload_published_state(request),
     )
 
     assert validated.file_selection.primary == primary.resolve(strict=False)
@@ -2085,16 +2206,17 @@ def test_filing_validator_rejects_unsupported_primary_with_role_specific_usage(
 
     upload_file = tmp_path / f"report{suffix}"
     upload_file.write_text("fixture", encoding="utf-8")
+    request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        files=(upload_file,),
+        fiscal_year=2024,
+        fiscal_period="FY",
+        company_name="Apple Inc.",
+    )
     with pytest.raises(FinsUploadUsageError) as exc_info:
         validate_fins_upload_filing_request(
-            FinsUploadFilingRequest(
-                ticker="AAPL",
-                files=(upload_file,),
-                fiscal_year=2024,
-                fiscal_period="FY",
-                company_name="Apple Inc.",
-            ),
-            published_state=FilingUploadPublishedState(company_meta=None, source_meta=None),
+            request,
+            published_state=_filing_upload_published_state(request),
         )
 
     failure = exc_info.value.failure
@@ -2121,17 +2243,18 @@ def test_filing_validator_keeps_long_canonical_label_with_bounded_usage_message(
     basename = f"{'a' * 226}.doc"
     upload_file = tmp_path / basename
     upload_file.write_text("fixture", encoding="utf-8")
+    request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        files=(upload_file,),
+        fiscal_year=2024,
+        fiscal_period="FY",
+        company_name="Apple Inc.",
+    )
 
     with pytest.raises(FinsUploadUsageError) as exc_info:
         validate_fins_upload_filing_request(
-            FinsUploadFilingRequest(
-                ticker="AAPL",
-                files=(upload_file,),
-                fiscal_year=2024,
-                fiscal_period="FY",
-                company_name="Apple Inc.",
-            ),
-            published_state=FilingUploadPublishedState(company_meta=None, source_meta=None),
+            request,
+            published_state=_filing_upload_published_state(request),
         )
 
     failure = exc_info.value.failure
@@ -2227,7 +2350,8 @@ def test_upload_validator_does_not_project_identity_mismatch_as_company_name_req
     with pytest.raises(ValueError, match="canonical ticker identity") as exc_info:
         validate_fins_upload_filing_request(
             request,
-            published_state=FilingUploadPublishedState(
+            published_state=_filing_upload_published_state(
+                request,
                 company_meta=mismatched_meta,
                 source_meta=None,
             ),
@@ -2269,7 +2393,7 @@ def test_validate_fins_upload_filing_request_rejects_missing_explicit_update(
     with pytest.raises(FinsUploadUsageError) as exc_info:
         validate_fins_upload_filing_request(
             request,
-            published_state=FilingUploadPublishedState(company_meta=None, source_meta=None),
+            published_state=_filing_upload_published_state(request),
         )
 
     assert exc_info.value.failure.code is FinsUploadUsageCode.UPDATE_TARGET_MISSING
@@ -2313,8 +2437,8 @@ def test_validate_fins_upload_filing_request_limits_create_overwrite_to_existing
         company_name="Apple Inc.",
         overwrite=overwrite,
     )
-    published_state = FilingUploadPublishedState(
-        company_meta=None,
+    published_state = _filing_upload_published_state(
+        request,
         source_meta={"is_deleted": False, "source_fingerprint": "published"},
     )
 
@@ -2355,8 +2479,8 @@ def test_validate_fins_upload_filing_request_keeps_deleted_auto_identity_filenam
         company_name="Apple Inc.",
     )
     renamed_request = replace(original_request, files=(renamed_file,))
-    deleted_state = FilingUploadPublishedState(
-        company_meta=None,
+    deleted_state = _filing_upload_published_state(
+        original_request,
         source_meta={"is_deleted": True, "source_fingerprint": "published"},
     )
 
@@ -2445,7 +2569,7 @@ def test_validate_fins_upload_filing_request_preserves_validation_priority(
     with pytest.raises(FinsUploadUsageError) as exc_info:
         validate_fins_upload_filing_request(
             upload_request,
-            published_state=FilingUploadPublishedState(company_meta=None, source_meta=None),
+            published_state=_filing_upload_published_state(upload_request),
         )
     assert exc_info.value.failure.code is expected_code
 

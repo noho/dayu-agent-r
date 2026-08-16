@@ -11,11 +11,12 @@ import traceback
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, fields
+from enum import Enum
 from multiprocessing.connection import Connection
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Event
-from typing import BinaryIO, Literal, NoReturn
+from typing import BinaryIO, Literal, NoReturn, cast
 from unittest.mock import patch
 
 import pytest
@@ -23,6 +24,7 @@ import pytest
 from tests.fins.company_meta_test_support import stage_company_meta_fixture
 
 import dayu.fins.storage._fs_storage_infra as storage_infra_module
+import dayu.fins.storage.source_integrity as source_integrity_module
 import dayu.fins.storage._fs_source_snapshot as source_snapshot_module
 import dayu.fins.storage._fs_storage_utils as storage_utils_module
 import dayu.fins.storage.local_file_store as local_file_store_module
@@ -55,12 +57,17 @@ from dayu.fins.storage import (
     FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
     LocalFileStore,
+    SourceIntegrityClassification,
     SourceIntegrityPreflightError,
     SourceIntegrityPreflightReason,
+    SourceIntegrityRepairBlockedError,
+    SourceIntegrityRepairBlockedReason,
     SourceIntegrityReason,
     SourceIntegrityStatus,
     classify_source_integrity_preflight,
+    has_same_source_publication_identity,
 )
+from dayu.fins.upload_repair_contract import ExistingSourceAutoRepair, NoExistingSourceRepair
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
 from dayu.fins.storage._fs_storage_core import FsStorageCore
 from dayu.fins.storage._fs_storage_infra import (
@@ -111,6 +118,81 @@ _ProcessedCleanupCorruption = Literal[
 _StaleMetaCorruption = Literal["missing", "corrupt", "mismatch"]
 _BatchInitializationFailurePoint = Literal["journal", "descriptor", "copy"]
 _SnapshotVersion = Literal["A", "B"]
+_WorkspaceTreeEntry = tuple[str, Literal["directory", "file"], bytes | None]
+
+
+class _FutureSourceIntegrityStatus(str, Enum):
+    """显式模拟未来扩展后的 source integrity status enum。"""
+
+    MISSING = "missing"
+    COMPLETE = "complete"
+    REPAIR_REQUIRED = "repair_required"
+    UNSAFE = "unsafe"
+    FUTURE = "future"
+
+
+def _snapshot_workspace_tree(workspace_root: Path) -> tuple[_WorkspaceTreeEntry, ...]:
+    """读取 workspace 相对目录结构与 regular file bytes 的稳定测试快照。
+
+    Args:
+        workspace_root: 已存在的测试 workspace 根目录。
+
+    Returns:
+        按相对路径排序的 directory/file 内容快照。
+
+    Raises:
+        ValueError: fixture 中出现非 directory、非 regular file 条目时抛出。
+        OSError: workspace 枚举或文件读取失败时抛出。
+    """
+
+    entries: list[_WorkspaceTreeEntry] = []
+    for path in sorted(workspace_root.rglob("*")):
+        relative_path = path.relative_to(workspace_root).as_posix()
+        if path.is_dir():
+            entries.append((relative_path, "directory", None))
+            continue
+        if path.is_file():
+            entries.append((relative_path, "file", path.read_bytes()))
+            continue
+        raise ValueError("workspace tree fixture 只允许 directory 与 regular file")
+    return tuple(entries)
+
+
+def _publish_filing_upload_state_source(
+    workspace_root: Path,
+) -> tuple[FsFilingUploadStateRepository, Path]:
+    """发布供 filing upload state 损坏读取测试使用的完整 source。
+
+    Args:
+        workspace_root: 测试 workspace 根目录。
+
+    Returns:
+        upload-state repository 与 published filing source directory。
+
+    Raises:
+        ValueError: source fixture identity 或 publication contract 非法时抛出。
+        OSError: batch staging、commit 或 locator 读取失败时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    source = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    state = FsFilingUploadStateRepository(workspace_root, repository_set=repository_set)
+    batch = batching.begin_batch("AAPL")
+    _create_complete_source(
+        source,
+        blob,
+        batch=batch,
+        document_id="filing-a",
+    )
+    batching.commit_batch(batch)
+    source_directory = workspace_root / source.get_source_document_locator(
+        "AAPL",
+        "filing-a",
+        SourceKind.FILING,
+    )
+    return state, source_directory
 
 
 def test_filing_upload_state_fresh_absent_is_pure_and_lock_free(
@@ -151,8 +233,11 @@ def test_filing_upload_state_fresh_absent_is_pure_and_lock_free(
 
     monkeypatch.setattr(core, "_acquire_publication_guard", fail_guard)
 
-    assert repository.read_filing_upload_state("AAPL", "aapl-2024-fy").company_meta is None
-    assert repository.read_filing_upload_state("AAPL", "aapl-2024-fy").source_meta is None
+    snapshot = repository.read_filing_upload_state("AAPL", "aapl-2024-fy")
+    assert snapshot.company_meta is None
+    assert snapshot.source_integrity.status is SourceIntegrityStatus.MISSING
+    assert snapshot.source_integrity.revision is None
+    assert snapshot.source_meta is None
     assert not workspace_root.exists()
 
 
@@ -217,8 +302,66 @@ def test_filing_upload_state_reads_company_and_source_from_one_published_version
 
     assert snapshot.company_meta is not None
     assert snapshot.company_meta.company_name == "Apple Inc."
+    assert snapshot.source_integrity.status is SourceIntegrityStatus.COMPLETE
+    assert snapshot.source_integrity.revision is not None
     assert snapshot.source_meta is not None
     assert snapshot.source_meta["primary_document"] == "report.md"
+
+
+def test_filing_upload_state_fails_closed_for_missing_source_meta_without_mutation(
+    tmp_path: Path,
+) -> None:
+    """既有 source 缺失 required meta 时必须 path-free fail closed且不改 publication。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: damaged meta 被视为 absent、异常泄漏路径或读取产生 mutation 时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    state, source_directory = _publish_filing_upload_state_source(workspace_root)
+    (source_directory / "meta.json").unlink()
+    corrupted_tree = _snapshot_workspace_tree(workspace_root)
+
+    with pytest.raises(ValueError, match="缺少 meta.json") as exc_info:
+        state.read_filing_upload_state("AAPL", "filing-a")
+
+    assert str(workspace_root) not in str(exc_info.value)
+    assert str(source_directory) not in str(exc_info.value)
+    assert _snapshot_workspace_tree(workspace_root) == corrupted_tree
+
+
+def test_filing_upload_state_fails_closed_for_missing_identity_descriptor_without_mutation(
+    tmp_path: Path,
+) -> None:
+    """既有 source 缺失 identity descriptor 时必须 path-free fail closed且不改 publication。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: descriptor damage 被视为 absent、异常泄漏路径或读取产生 mutation 时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    state, source_directory = _publish_filing_upload_state_source(workspace_root)
+    _identity_descriptor_file(source_directory).unlink()
+    corrupted_tree = _snapshot_workspace_tree(workspace_root)
+
+    with pytest.raises(ValueError, match="identity descriptor") as exc_info:
+        state.read_filing_upload_state("AAPL", "filing-a")
+
+    assert str(workspace_root) not in str(exc_info.value)
+    assert str(source_directory) not in str(exc_info.value)
+    assert _snapshot_workspace_tree(workspace_root) == corrupted_tree
 
 
 class _FailingCloseBytesIO(io.BytesIO):
@@ -5642,7 +5785,7 @@ def test_source_integrity_classifies_published_staged_and_whole_tree(
         "filing-a",
         SourceKind.FILING,
     )
-    assert missing_file.reasons == (SourceIntegrityReason.PHYSICAL_FILE_MISSING,)
+    assert missing_file.reasons == (SourceIntegrityReason.DECLARED_FILE_MISSING,)
     payload_path.write_bytes(original_payload)
 
     meta_path = source_dir / "meta.json"
@@ -5659,6 +5802,267 @@ def test_source_integrity_classifies_published_staged_and_whole_tree(
     with pytest.raises(ValueError, match="64位小写十六进制"):
         source.list_source_integrity("AAPL")
     meta_path.write_text(original_meta, encoding="utf-8")
+
+
+def test_source_integrity_public_contract_closes_states_reasons_and_comparison() -> None:
+    """四态 classification、reason 集与 publication identity 比较必须 fail closed。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: public integrity contract 接受非法组合或比较 UNSAFE 时抛出。
+    """
+
+    assert tuple(reason.value for reason in SourceIntegrityReason) == (
+        "original_file_missing",
+        "primary_docling_file_missing",
+        "declared_file_missing",
+        "size_mismatch",
+        "digest_mismatch",
+        "primary_projection_mismatch",
+        "derived_projection_mismatch",
+        "source_manifest_missing",
+        "source_manifest_projection_mismatch",
+        "identity_untrusted",
+        "meta_untrusted",
+        "revision_untrusted",
+        "provenance_untrusted",
+        "file_declaration_untrusted",
+        "undeclared_business_file",
+        "unsafe_filesystem_entry",
+        "source_manifest_untrusted",
+        "cross_source_inconsistency",
+    )
+    revision = SourceDocumentRevision("revision-a")
+    complete = SourceIntegrityClassification(
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        document_id="filing-a",
+        revision=revision,
+        status=SourceIntegrityStatus.COMPLETE,
+        reasons=(),
+    )
+    repair_required = SourceIntegrityClassification(
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        document_id="filing-a",
+        revision=revision,
+        status=SourceIntegrityStatus.REPAIR_REQUIRED,
+        reasons=(SourceIntegrityReason.DECLARED_FILE_MISSING,),
+    )
+    unsafe = SourceIntegrityClassification(
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        document_id="filing-a",
+        revision=None,
+        status=SourceIntegrityStatus.UNSAFE,
+        reasons=(SourceIntegrityReason.IDENTITY_UNTRUSTED,),
+    )
+
+    assert has_same_source_publication_identity(complete, repair_required) is True
+    for first, second in (
+        (unsafe, complete),
+        (complete, unsafe),
+        (unsafe, unsafe),
+    ):
+        with pytest.raises(ValueError, match="UNSAFE"):
+            has_same_source_publication_identity(first, second)
+    with pytest.raises(ValueError, match="同一 source target"):
+        has_same_source_publication_identity(
+            complete,
+            SourceIntegrityClassification(
+                ticker="AAPL",
+                source_kind=SourceKind.FILING,
+                document_id="filing-b",
+                revision=revision,
+                status=SourceIntegrityStatus.COMPLETE,
+                reasons=(),
+            ),
+        )
+
+    with pytest.raises(ValueError, match="MISSING"):
+        SourceIntegrityClassification(
+            ticker="AAPL",
+            source_kind=SourceKind.FILING,
+            document_id="filing-a",
+            revision=revision,
+            status=SourceIntegrityStatus.MISSING,
+            reasons=(),
+        )
+    with pytest.raises(ValueError, match="repairable"):
+        SourceIntegrityClassification(
+            ticker="AAPL",
+            source_kind=SourceKind.FILING,
+            document_id="filing-a",
+            revision=revision,
+            status=SourceIntegrityStatus.REPAIR_REQUIRED,
+            reasons=(SourceIntegrityReason.IDENTITY_UNTRUSTED,),
+        )
+    with pytest.raises(ValueError, match="UNSAFE"):
+        SourceIntegrityClassification(
+            ticker="AAPL",
+            source_kind=SourceKind.FILING,
+            document_id="filing-a",
+            revision=None,
+            status=SourceIntegrityStatus.UNSAFE,
+            reasons=(SourceIntegrityReason.DECLARED_FILE_MISSING,),
+        )
+    with pytest.raises(ValueError, match="enum 顺序"):
+        SourceIntegrityClassification(
+            ticker="AAPL",
+            source_kind=SourceKind.FILING,
+            document_id="filing-a",
+            revision=revision,
+            status=SourceIntegrityStatus.REPAIR_REQUIRED,
+            reasons=(
+                SourceIntegrityReason.DIGEST_MISMATCH,
+                SourceIntegrityReason.SIZE_MISMATCH,
+            ),
+        )
+
+    with pytest.raises(SourceIntegrityPreflightError) as preflight_error:
+        classify_source_integrity_preflight(
+            (unsafe,),
+            accepted_filing_ids=frozenset({"filing-a"}),
+            rejected_filing_ids=frozenset(),
+        )
+    assert preflight_error.value.reason is SourceIntegrityPreflightReason.UNSAFE_PUBLICATION
+
+
+def test_source_integrity_classification_rejects_future_status_member(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """未来新增 enum member 不得静默继承 UNSAFE 的末分支不变量。
+
+    Args:
+        monkeypatch: 临时替换 integrity 模块 status enum 的 pytest fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 未知未来状态未被显式四态 gate 拒绝时抛出。
+    """
+
+    monkeypatch.setattr(
+        source_integrity_module,
+        "SourceIntegrityStatus",
+        _FutureSourceIntegrityStatus,
+    )
+
+    with pytest.raises(ValueError, match="封闭四态"):
+        SourceIntegrityClassification(
+            ticker="AAPL",
+            source_kind=SourceKind.FILING,
+            document_id="filing-a",
+            revision=None,
+            status=cast(SourceIntegrityStatus, _FutureSourceIntegrityStatus.FUTURE),
+            reasons=(SourceIntegrityReason.IDENTITY_UNTRUSTED,),
+        )
+
+
+def test_existing_source_repair_contract_requires_trusted_repairable_filing() -> None:
+    """repair union 只允许携带可信 revision 的 REPAIR_REQUIRED filing。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: repair union 接受 complete、material 或 unsafe target 时抛出。
+    """
+
+    revision = SourceDocumentRevision("revision-a")
+    repair_required = SourceIntegrityClassification(
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        document_id="filing-a",
+        revision=revision,
+        status=SourceIntegrityStatus.REPAIR_REQUIRED,
+        reasons=(SourceIntegrityReason.ORIGINAL_FILE_MISSING,),
+    )
+    disposition = ExistingSourceAutoRepair(expected_integrity=repair_required)
+    assert disposition.kind == "existing_source_auto_repair"
+    assert disposition.expected_integrity is repair_required
+    assert NoExistingSourceRepair().kind == "not_required"
+
+    for invalid_integrity in (
+        SourceIntegrityClassification(
+            ticker="AAPL",
+            source_kind=SourceKind.FILING,
+            document_id="filing-a",
+            revision=revision,
+            status=SourceIntegrityStatus.COMPLETE,
+            reasons=(),
+        ),
+        SourceIntegrityClassification(
+            ticker="AAPL",
+            source_kind=SourceKind.MATERIAL,
+            document_id="material-a",
+            revision=revision,
+            status=SourceIntegrityStatus.REPAIR_REQUIRED,
+            reasons=(SourceIntegrityReason.DECLARED_FILE_MISSING,),
+        ),
+        SourceIntegrityClassification(
+            ticker="AAPL",
+            source_kind=SourceKind.FILING,
+            document_id="filing-a",
+            revision=None,
+            status=SourceIntegrityStatus.UNSAFE,
+            reasons=(SourceIntegrityReason.META_UNTRUSTED,),
+        ),
+    ):
+        with pytest.raises(ValueError, match="REPAIR_REQUIRED filing"):
+            ExistingSourceAutoRepair(expected_integrity=invalid_integrity)
+
+    blocked = SourceIntegrityRepairBlockedError(
+        SourceIntegrityRepairBlockedReason.NON_TARGET_SOURCE_INCOMPLETE
+    )
+    assert blocked.reason is SourceIntegrityRepairBlockedReason.NON_TARGET_SOURCE_INCOMPLETE
+
+
+def test_source_repository_repair_contract_rejects_mutation_before_owner_implementation(
+    tmp_path: Path,
+) -> None:
+    """Slice 1 protocol surface 不得静默执行或伪造 staged repair mutation。
+
+    Args:
+        tmp_path: 不应被 repair contract 调用写入的临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 未实现 repair mutation 未被确定性拒绝或产生文件时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    repository = FsSourceDocumentRepository(workspace_root, create_directories=False)
+    expected_integrity = SourceIntegrityClassification(
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        document_id="filing-a",
+        revision=SourceDocumentRevision("revision-a"),
+        status=SourceIntegrityStatus.REPAIR_REQUIRED,
+        reasons=(SourceIntegrityReason.ORIGINAL_FILE_MISSING,),
+    )
+
+    with pytest.raises(NotImplementedError, match="尚未实现"):
+        repository.reset_source_document_for_repair(
+            "AAPL",
+            "filing-a",
+            SourceKind.FILING,
+            expected_integrity,
+            batch=BatchToken(transaction_id="unimplemented-repair", ticker="AAPL"),
+        )
+
+    assert not workspace_root.exists()
 
 
 def test_source_integrity_preflight_fails_closed_for_multiple_and_unselected(

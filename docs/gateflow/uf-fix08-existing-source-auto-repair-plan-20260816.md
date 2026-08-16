@@ -553,6 +553,7 @@ raw filing request
 | `dayu/fins/storage/repository_protocols.py` | `FilingUploadPublishedState.source_integrity`、state invariants、repair reset method contract |
 | `dayu/fins/storage/_fs_filing_upload_state_core.py` | 单 guard company + source inspection 投影 |
 | `dayu/fins/storage/_fs_source_document_core.py` | classifier/inventory委托 inspector；实现 repair staged recheck/reset/manifest rewrite |
+| `dayu/fins/storage/fs_source_document_repository.py` | Slice 4删除protocol transitional rejection后，由production facade显式delegate真实core repair owner |
 | `dayu/fins/storage/_fs_storage_infra.py` | commit validator委托统一 inspector；保留 batch/swap/recovery owner |
 | `dayu/fins/storage/_fs_source_snapshot.py` | descriptor/meta/primary/revision消费 inspection，移除重复 parser |
 | `dayu/fins/storage/__init__.py` | 导出新增 public status/reason/contract；不做旧名 re-export |
@@ -601,6 +602,8 @@ allowed files（本 slice 之外不得修改）：
 - `dayu/fins/storage/source_integrity.py`
 - `dayu/fins/storage/repository_protocols.py`
 - `dayu/fins/storage/_fs_filing_upload_state_core.py`
+- `dayu/fins/storage/_fs_source_document_core.py`（implementation-time boundary amendment：仅允许两处
+  `SourceIntegrityReason.PHYSICAL_FILE_MISSING -> SourceIntegrityReason.DECLARED_FILE_MISSING` 机械替换）
 - `dayu/fins/storage/__init__.py`
 - `dayu/fins/upload_repair_contract.py`（新）
 - `tests/fins/test_fins_storage_atomicity.py`
@@ -609,9 +612,14 @@ allowed files（本 slice 之外不得修改）：
 - `tests/cli/test_fins_commands.py`（仅 required fixture迁移与CLI contract回归）
 
 1. 扩展 status/reason/invariants/comparison/preflight。
+   implementation-time boundary amendment：现有 classifier 在本 slice 开始时仍有两处旧 reason member 引用；为使 fresh closed enum、
+   focused tests 与全仓 pyright 同时闭合，Controller 批准只在 `_fs_source_document_core.py` 机械替换这两处引用。该裁决不授权
+   Slice 2 inspector、classifier 重构、分类 precedence 或其它逻辑修改。
 2. 新增 repair contract union。
 3. 扩展 repository protocol 与 upload state required field/method；为保持 slice独立可运行，state core在现有 publication guard内调用
-   当前 `_classify_source_integrity_unguarded()` 并显式构造 required field，slice 2再机械替换为统一 inspector，不增加default或双读。
+   当前 `_classify_source_integrity_unguarded()` 并显式构造 required field，Slice 3再机械替换为Slice 2冻结的统一 inspector，不增加
+   default或双读。Slice 1临时读取对既有 target 的 required meta/identity descriptor缺失必须path-free fail closed，禁止继续静默视为
+   `MISSING`；owner-level tests必须断言读取零mutation。
 4. 更新 storage exports和全仓所有 required `FilingUploadPublishedState(...)` constructors，包括两个跨目录 tests。
 5. 写 contract tests，证明 invalid combinations不能构造、`has_same_source_publication_identity(UNSAFE, *)` 与
    `has_same_source_publication_identity(*, UNSAFE)` 均为 `ValueError`。
@@ -643,7 +651,8 @@ allowed files（本 slice 之外不得修改）：
 - `tests/fins/test_fins_storage_provider.py`
 - `tests/fins/test_processor_read_consistency.py`（仅 snapshot COMPLETE-only contract）
 
-1. 新增 private inspector及完整 classification precedence。
+1. 新增 private inspector及完整 classification precedence；既有 target 的 required meta/identity descriptor缺失或损坏必须归属
+   `UNSAFE/revision=None` typed inspection，不再作为 `MISSING`，也不得抛 raw structural `ValueError/FileNotFoundError` 旁路 classification。
 2. published/staged classifier按 exact-target mode机械投影；inventory每个 source kind只调用一次 whole-kind mode并投影同一 payload。
 3. commit validator每个 staging source kind只调用一次 whole-kind mode并只接受 `COMPLETE`；不得逐 document重扫或重建 shared/
    canonical aggregate。
@@ -652,7 +661,9 @@ allowed files（本 slice 之外不得修改）：
    payload的 inventory/shared reasons/canonical facts一致，inventory/commit各 source kind调用 whole-kind mode恰好一次。
 6. slice validation：运行三个allowed test files及全仓pyright；测试同时断言commit仍拒绝staging URI mismatch/containment escape。
 
-完成条件：同一 fixture在 classifier、snapshot、commit得到一致状态；raw structural `ValueError` 不再旁路 public classification。
+完成条件：同一 fixture在 classifier、snapshot、commit得到一致状态；raw structural `ValueError/FileNotFoundError` 不再旁路 public
+classification。Slice 1 upload-state read 的临时 damaged-target raw fail-closed seam在本 slice只获得可消费的`UNSAFE` inspection真源，
+由Slice 3在同一 guard内机械接入后才成为 public typed state；Slice 2不得提前修改 state core或 validator。
 
 ### Slice 3：upload state 与 repair eligibility
 
@@ -668,7 +679,9 @@ allowed files（本 slice 之外不得修改）：
 - `tests/fins/test_fins_ingestion_runtime.py`
 - `tests/fins/test_fins_service_runtime.py`
 
-1. 同 guard read返回 classification + trusted meta。
+1. 同 guard read返回 classification + trusted meta；机械移除Slice 1临时 existing classifier seam并消费Slice 2 inspector payload，required
+   meta/identity descriptor缺失或损坏返回`source_integrity=UNSAFE/revision=None + source_meta=None` typed state，不再向Service/workflow冒出
+   raw structural `ValueError/FileNotFoundError`。
 2. validator按 status/action/selection precedence产生 disposition或 typed failure。
 3. 补 state、service prevalidation、path-free failure tests。
 4. 更新 `_validate_runtime_upload_request()` / `start_upload()` Raises和raw start zero-job contract测试；本 slice不处理workflow async event。
@@ -684,6 +697,7 @@ allowed files（本 slice 之外不得修改）：
 
 - `dayu/fins/storage/repository_protocols.py`
 - `dayu/fins/storage/_fs_source_document_core.py`
+- `dayu/fins/storage/fs_source_document_repository.py`
 - `dayu/fins/upload_repair_contract.py`
 - `dayu/fins/upload_failure.py`
 - `dayu/fins/pipelines/docling_upload_service.py`
@@ -694,13 +708,19 @@ allowed files（本 slice 之外不得修改）：
 2. repair bypass identical skip并全量准备。
 3. 实现 `reset_source_document_for_repair()` 的 staged revision/status recheck、storage-internal `ValueError -> revision conflict`转换、
    target reset，以及仅消费 non-target inspection单点 `canonical_manifest_item` 的 canonical remaining manifest rewrite。
-4. exact conflict映射为 bounded stale upload failure。
-5. service-level tests覆盖 successful stage、revision/status drift（含 staged UNSAFE与非 `REPAIR_REQUIRED` gate）、target-local damaged +
+4. 删除Slice 1在`SourceDocumentRepositoryProtocol.reset_source_document_for_repair()`中的transitional rejection body与模块级helper，protocol
+   恢复纯method contract；`FsSourceDocumentRepository` facade新增显式override并机械delegate到共享core的真实repair owner。禁止 facade
+   重判status/revision/reasons或复制mutation逻辑。
+5. exact conflict映射为 bounded stale upload failure。
+6. service-level tests覆盖 successful stage、revision/status drift（含 staged UNSAFE与非 `REPAIR_REQUIRED` gate）、target-local damaged +
    complete sibling per-source canonical item rewrite、conversion/blob/final/rollback。
-6. service tests精确覆盖`SourceIntegrityRevisionConflictError -> SOURCE_REVISION_STALE`与
+7. service tests精确覆盖`SourceIntegrityRevisionConflictError -> SOURCE_REVISION_STALE`与
    `SourceIntegrityRepairBlockedError -> SOURCE_REPAIR_BLOCKED`，二者不得落generic runtime。
+8. storage owner test必须从真实`FsSourceDocumentRepository` facade调用repair，证明进入共享core真实Phase B实现、不再命中
+   `NotImplementedError/AttributeError`；同时删除Slice 1“未授权mutation rejection”测试或迁移为真实facade delegate contract。
 
-完成条件：staging只在 expected仍有效时被重写；所有失败保持 published old tree SHA不变。
+完成条件：staging只在 expected仍有效时被重写；所有失败保持 published old tree SHA不变；protocol transitional rejection/helper已删除，
+production facade调用精确进入共享core repair owner。
 
 ### Slice 5：SEC/CN/HK workflow 与 downstream
 
@@ -720,8 +740,10 @@ allowed files（本 slice 之外不得修改）：
 2. US/CN/HK真实 filesystem deterministic tests覆盖四类 repair与 atomic company/source publication。
 3. assert public `COMPLETE`、revision changed、manifest/new files/primary/digest一致、requested=stored originals。
 4. 通过 snapshot和 `process_filing` spy/真实 processor入口证明只消费 new primary。
-5. fresh validator的 `FinsUploadPrevalidationError` 在SEC/CN/HK async stream收敛为typed failed event；runtime job持久化同一
-   `failure_reason`，不记录generic `str(exc)`。
+5. SEC/CN/HK必须把fresh `read_filing_upload_state()`与fresh validator放入同一个显式failure boundary：Slice 3已把structural damage
+   投影为`UNSAFE` typed state，由validator产生`FinsUploadPrevalidationError`；该错误与fresh re-read仍可能产生的path-free
+   `ValueError/FileNotFoundError`都必须经upload-failure owner收敛为唯一typed failed event，不得从async stream冒出raw exception，
+   不得在workflow重新推断integrity。runtime job持久化同一`failure_reason`，不记录generic `str(exc)`。
 
 完成条件：端到端 owner chain闭合，pipeline没有完整性重算。
 

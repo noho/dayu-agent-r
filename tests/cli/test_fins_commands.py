@@ -66,6 +66,8 @@ from dayu.fins.storage import (
     FsDocumentBlobRepository,
     FsFilingUploadStateRepository,
     FsSourceDocumentRepository,
+    SourceIntegrityClassification,
+    SourceIntegrityStatus,
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
 from dayu.fins.upload_failure import fins_upload_failure_from_exception
@@ -3023,7 +3025,24 @@ def test_upload_terminal_summary_renderer_uses_typed_requested_and_stored_counts
         fiscal_period="FY",
         company_name=None if summary.status == "deleted" else "Apple Inc.",
     )
-    published_state = FilingUploadPublishedState(company_meta=None, source_meta=None)
+    document_id, _internal_document_id = build_sec_filing_ids(
+        ticker="AAPL",
+        fiscal_year=2024,
+        fiscal_period="FY",
+        amended=False,
+    )
+    published_state = FilingUploadPublishedState(
+        company_meta=None,
+        source_integrity=SourceIntegrityClassification(
+            ticker="AAPL",
+            source_kind=SourceKind.FILING,
+            document_id=document_id,
+            revision=None,
+            status=SourceIntegrityStatus.MISSING,
+            reasons=(),
+        ),
+        source_meta=None,
+    )
     request = validate_fins_upload_filing_request(
         raw_request,
         published_state=published_state,

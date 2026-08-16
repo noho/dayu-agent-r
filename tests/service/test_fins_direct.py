@@ -11,6 +11,7 @@ from typing import cast
 import pytest
 
 import dayu.service.fins_direct as fins_direct_module
+import dayu.fins.ingestion_runtime as ingestion_runtime
 from dayu.contracts.cancellation import CancellationToken
 from dayu.fins.direct_events import (
     FinsErrorKind,
@@ -45,10 +46,14 @@ from dayu.fins.ingestion_runtime import (
     ValidatedFinsUploadFilingRequest,
     validate_fins_upload_filing_request,
 )
-from dayu.fins.domain.document_models import CompanyMeta
+from dayu.fins.domain.document_models import CompanyMeta, SourceDocumentRevision
 from dayu.fins.ticker_normalization import build_company_ticker_identity
 from dayu.fins.pipelines.upload_company_meta import RESOLVER_VERSION
-from dayu.fins.storage import FilingUploadPublishedState
+from dayu.fins.storage import (
+    FilingUploadPublishedState,
+    SourceIntegrityClassification,
+    SourceIntegrityStatus,
+)
 from dayu.service.fins_direct import (
     FINS_DIRECT_EXIT_FAILURE,
     FINS_DIRECT_EXIT_KEYBOARD_INTERRUPT,
@@ -58,6 +63,7 @@ from dayu.service.fins_direct import (
 from tests.host.fake_cancellation import ControllableCancellationToken
 
 _NOW: datetime = datetime(2026, 6, 14, tzinfo=timezone.utc)
+_PUBLISHED_SOURCE_REVISION_TOKEN = "test-published-source-revision"
 
 
 class _FakeIngestionRuntime:
@@ -732,6 +738,9 @@ async def test_upload_methods_build_union_requests(tmp_path: Path) -> None:
         ticker_aliases=("Apple",),
         overwrite=True,
     )
+    canonical_ticker, filing_document_id = ingestion_runtime._filing_upload_request_identity(
+        raw_filing_request
+    )
     validated_filing_request = validate_fins_upload_filing_request(
         raw_filing_request,
         published_state=FilingUploadPublishedState(
@@ -741,6 +750,14 @@ async def test_upload_methods_build_union_requests(tmp_path: Path) -> None:
                 ticker_identity=build_company_ticker_identity("AAPL", ()),
                 resolver_version=RESOLVER_VERSION,
                 updated_at="2026-08-13T00:00:00+00:00",
+            ),
+            source_integrity=SourceIntegrityClassification(
+                ticker=canonical_ticker,
+                source_kind=SourceKind.FILING,
+                document_id=filing_document_id,
+                revision=SourceDocumentRevision(_PUBLISHED_SOURCE_REVISION_TOKEN),
+                status=SourceIntegrityStatus.COMPLETE,
+                reasons=(),
             ),
             source_meta={"source_fingerprint": "old"},
         ),

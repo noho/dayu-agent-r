@@ -15,7 +15,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from types import TracebackType
-from typing import BinaryIO, Literal, Optional, Protocol
+from typing import BinaryIO, Literal, NoReturn, Optional, Protocol
 
 from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.source import Source
@@ -46,7 +46,7 @@ from dayu.fins.domain.document_models import (
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.ticker_normalization import normalize_ticker
 
-from .source_integrity import SourceIntegrityClassification
+from .source_integrity import SourceIntegrityClassification, SourceIntegrityStatus
 
 
 CompanyTickerIdentityCorruptionKind = Literal[
@@ -56,6 +56,22 @@ CompanyTickerIdentityCorruptionKind = Literal[
     "duplicate_owner",
 ]
 """Published company ticker identity corruption 的 closed kind。"""
+
+
+def _reject_unimplemented_source_repair() -> NoReturn:
+    """拒绝尚未获得实现授权的 staged source repair mutation。
+
+    Args:
+        无。
+
+    Returns:
+        不返回。
+
+    Raises:
+        NotImplementedError: 始终抛出，直至 storage owner 实现 Phase B repair。
+    """
+
+    raise NotImplementedError("staged source repair mutation 尚未实现")
 
 
 class CompanyTickerAliasConflictError(ValueError):
@@ -142,11 +158,38 @@ class FilingUploadPublishedState:
 
     Attributes:
         company_meta: 当前已发布公司元数据；不存在时为 ``None``。
+        source_integrity: exact filing target 的 storage-owned 完整性事实。
         source_meta: 当前已发布 filing source 元数据；不存在时为 ``None``。
     """
 
     company_meta: CompanyMeta | None
+    source_integrity: SourceIntegrityClassification
     source_meta: Mapping[str, JsonValue] | None
+
+    def __post_init__(self) -> None:
+        """校验 classification 与 business meta 的 required 对应关系。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: target 不是 filing，或 status 与 source_meta presence 不一致时抛出。
+        """
+
+        if self.source_integrity.source_kind is not SourceKind.FILING:
+            raise ValueError("filing upload published state 必须引用 filing integrity")
+        if self.source_integrity.status in {
+            SourceIntegrityStatus.MISSING,
+            SourceIntegrityStatus.UNSAFE,
+        }:
+            if self.source_meta is not None:
+                raise ValueError("MISSING/UNSAFE filing state 不得携带 source_meta")
+            return
+        if self.source_meta is None:
+            raise ValueError("COMPLETE/REPAIR_REQUIRED filing state 必须携带 source_meta")
 
 
 class FilingUploadStateRepositoryProtocol(Protocol):
@@ -164,14 +207,16 @@ class FilingUploadStateRepositoryProtocol(Protocol):
             document_id: 待校验的 filing 文档 ID。
 
         Returns:
-            同版 published state；独立缺失的成员分别为 ``None``。
+            同版 company meta、required source integrity 与按状态可用的 source meta。
 
         Raises:
             CompanyTickerIdentityCorruptionError: published target、descriptor、meta
                 或 identity durable state 损坏时抛出。
-            ValueError: ticker 或 document identity 非法时抛出。
+            ValueError: ticker/document identity 非法，或 published source directory、meta、
+                identity descriptor 结构损坏（含 required meta/descriptor 缺失）时抛出。
             RuntimeFileLockError: publication guard 获取或释放失败时抛出。
-            OSError: published state 读取失败时抛出。
+            OSError: identity descriptor、meta 或其它 published state operational 读取失败时
+                抛出 path-free 文件系统异常。
         """
 
         ...
@@ -659,6 +704,39 @@ class SourceDocumentRepositoryProtocol(Protocol):
             OSError: 重置底层存储失败时抛出。
         """
         ...
+
+    def reset_source_document_for_repair(
+        self,
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+        expected_integrity: SourceIntegrityClassification,
+        *,
+        batch: BatchToken,
+    ) -> None:
+        """按 Phase A integrity 对真实 staging target 执行受约束修复重置。
+
+        Args:
+            ticker: exact external ticker。
+            document_id: exact external document ID。
+            source_kind: filing 来源类型。
+            expected_integrity: validator 携带的 Phase A repair-required classification。
+            batch: 同一 storage core、ticker 且仍 open 的显式 capability。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: capability、identity、source kind 或 expected classification 非法时抛出。
+            SourceIntegrityRevisionConflictError: staged target 的 presence、revision 或 repair status
+                与 expected classification 不再匹配时抛出。
+            SourceIntegrityRepairBlockedError: target 仍匹配但其它 source 或 canonical manifest
+                阻断安全 repair 时抛出。
+            OSError: staging 文件系统操作失败时抛出。
+            NotImplementedError: staged repair owner 尚未在当前 slice 获得 mutation 授权时抛出。
+        """
+
+        _reject_unimplemented_source_repair()
 
     def restore_source_document(
         self,

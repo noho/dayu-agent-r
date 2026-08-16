@@ -644,7 +644,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             )
             physical_path = document_dir / name
             if not physical_path.exists():
-                reasons.add(SourceIntegrityReason.PHYSICAL_FILE_MISSING)
+                reasons.add(SourceIntegrityReason.DECLARED_FILE_MISSING)
                 continue
             if physical_path.is_symlink() or not physical_path.is_file():
                 raise ValueError("source business file 必须为 non-symlink regular file")
@@ -668,7 +668,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             if physical_names - declared_names:
                 raise ValueError("source directory 存在未声明业务文件")
             if missing_names:
-                reasons.add(SourceIntegrityReason.PHYSICAL_FILE_MISSING)
+                reasons.add(SourceIntegrityReason.DECLARED_FILE_MISSING)
 
         ordered_reasons = tuple(reason for reason in SourceIntegrityReason if reason in reasons)
         return SourceIntegrityClassification(
