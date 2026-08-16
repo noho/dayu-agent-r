@@ -3,17 +3,17 @@
 ## 0. Gate 元数据
 
 - work unit：`UF-FIX10 same-request-concurrency`
-- gate：`final deepreview fix`
+- gate：`final closeout pass`
 - 日期：2026-08-17
 - 当前分支：`codex/upload-filing-oracle`
-- 基线提交：`7e0941828c09d890ad04e3ff8f2c1cf5e28441ca`
+- 基线提交：`656b926c`（UF-FIX10 首个提交的直接父提交）
 - preflight：用户已确认；分支非 protected trunk，工作树中本 work unit 的 plan/fix/review artifacts 均由 Controller 明确纳入本 gate，ownership 清晰，无 merge/rebase/cherry-pick
 - goal confirmation：用户已确认
-- completion status：`FINAL DEEPREVIEW FIX COMPLETE / READY FOR RE-REVIEW`
+- completion status：`FINAL CLOSEOUT PASS`
 - artifact path：`docs/gateflow/uf-fix10-same-request-concurrency-plan-20260816.md`
-- blocking open questions：无；final deepreview 接受的三个 test-only evidence findings 已按裁决闭合
-- accepted commit：S1 `7e0941828c09d890ad04e3ff8f2c1cf5e28441ca`；S2 `047691c8`
-- 下一入口：`final deepreview re-review`
+- blocking open questions：无；两路 final deepreview re-review 均为 pass，全部 accepted findings 已闭合
+- accepted commit：S1 `7e094182`；S2 `047691c8`；final test-only fix `dd4e50ac`
+- 下一入口：无；work unit 完成
 
 S1 acceptance 由 `docs/gateflow/uf-fix10-s1-acceptance-20260817.md` 记录。S2 implementation
 evidence 记录于 `docs/gateflow/uf-fix10-s2-implementation-20260817.md`；两路 review 的
@@ -25,8 +25,11 @@ accepted findings 与修复边界由
 输入为 `docs/reviews/code-review-20260817-033113.md` 与
 `docs/reviews/code-review-20260817-034314.md`，accepted findings 由
 `docs/gateflow/uf-fix10-final-deepreview-adjudication-20260817.md` 裁决，test-only fix evidence
-记录于 `docs/gateflow/uf-fix10-final-deepreview-fix-20260817.md`。当前仅 ready for final
-deepreview re-review，不预判 acceptance，不进入 UF-PF10/UF-PF12。
+记录于 `docs/gateflow/uf-fix10-final-deepreview-fix-20260817.md`；两路最终 re-review 为
+`docs/reviews/code-review-20260817-035840.md` 与
+`docs/reviews/code-review-20260817-040335.md`，均为 pass。最终 closeout 记录于
+`docs/gateflow/uf-fix10-final-closeout-20260817.md`；按用户要求不创建 PR，且不进入
+UF-PF10/UF-PF12。
 
 ## 1. 输入、真源与边界
 
