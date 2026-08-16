@@ -9,12 +9,12 @@
 - 基线提交：`656b926c5d39a66f2b05af46e0f08f044f28bcb3`
 - preflight：用户已确认；分支非 protected trunk，工作树中本 work unit 的 plan/fix/review artifacts 均由 Controller 明确纳入本 gate，ownership 清晰，无 merge/rebase/cherry-pick
 - goal confirmation：用户已确认
-- completion status：`PLAN ACCEPTED / IMPLEMENTATION S1 AUTHORIZED`
+- completion status：`AMENDMENT ACCEPTED / S1 RESUME AUTHORIZED`
 - artifact path：`docs/gateflow/uf-fix10-same-request-concurrency-plan-20260816.md`
-- blocking open questions：无；首轮 review、re-review 与最终 review 的 accepted findings 均已由 Controller 接受并在本 plan 冻结答案
-- 下一入口：`S1 implementation`
+- blocking open questions：无新的语义所有权问题；direct pyright 已确认 §10.1 漏列两个 required protocol structural fakes，本 amendment 已冻结唯一修订路径，但在 re-review pass 前不得恢复 S1
+- 下一入口：`S1 implementation resume`
 
-本 final plan review fix gate 只允许修改本 plan 并新增 `docs/gateflow/uf-fix10-final-plan-review-fix-20260816.md`。它不接受实现性变更，不修改生产代码、测试、README、oracle、scenario、registry 或 frozen evidence，也不创建 commit。
+本 blocker plan amendment gate 只允许修改本 plan 并新增 `docs/gateflow/uf-fix10-s1-blocker-plan-amendment-20260816.md`。当前 S1 partial implementation 原样保留但不可提交；本 gate 不修改任何生产代码、测试、README、oracle、scenario、registry 或 frozen evidence，不运行测试/pyright，也不创建 commit。
 
 ## 1. 输入、真源与边界
 
@@ -30,6 +30,7 @@
 - `docs/gateflow/uf-fix10-plan-review-fix-20260816.md`；记录首轮 accepted findings 的 plan fix 与当时的 re-review 入口。
 - `docs/reviews/plan-review-20260816-224957.md` 与 `docs/reviews/plan-review-20260816-225732.md`；两路 re-review 结论均为 `pass`，Controller 将 DS residual R1/R2 提升为 accepted findings C-R1/C-R2，R3 保持已分类低风险。
 - `docs/reviews/plan-review-20260816-231939-ds.md`；最终 review 结论为 `pass-with-risks`。Controller 将其中 F-1/F-2 接受为 blockers C-F1/C-F2：C-F1 不接受 expected-red 中间态，要求重划 S1/S2 owner 边界；C-F2 要求 staging meta 只有一个构造 owner。两项均已在本 plan 修复。
+- `docs/gateflow/uf-fix10-s1-implementation-20260816.md` 中保存的 direct pyright evidence：`tests/fins/test_fins_ingestion_runtime.py:10865:40` 报 `_FixedFilingUploadStateRepository` 不满足 `FilingUploadStateRepositoryProtocol`，缺少 required `read_filing_upload_state_in_batch`。同文件 `_ForbiddenFilingUploadStateRepository` 也缺少该方法，只是其注入处 cast 暂时掩盖了相同 structural contract 缺口。该证据只授权 §10.1 的 fixture/protocol-conformance 修订，不授权生产或行为范围扩张。
 
 整个 work unit 始终禁止：
 
@@ -434,7 +435,7 @@ company-only变化不改变source observation分类；`keep`是skip硬条件，`
 | `tests/fins/test_upload_failure.py` | 新code exact JSON、kind、bounded/path-free与未知值拒绝 |
 | `tests/fins/test_sec_pipeline_upload_filing_stream.py` | SEC 线程+跨进程same-request winner/loser、explicit create/non-equivalent conflict、same-ticker union |
 | `tests/fins/test_cn_pipeline.py` | CN/HK shared wiring各一条same-request success/skip，并保持route身份 |
-| `tests/fins/test_fins_ingestion_runtime.py` | S1仅机械补required `publication_identity=None`；S2才允许增加terminal summary断言 |
+| `tests/fins/test_fins_ingestion_runtime.py` | S1机械补required `publication_identity=None`，并同步 `_FixedFilingUploadStateRepository` / `_ForbiddenFilingUploadStateRepository` 的新 required batch-read protocol method、独立调用记录、去除 fake 注入 cast 与精确零行为断言；S2才允许增加terminal summary断言 |
 | `tests/fins/test_fins_service_runtime.py` | 仅机械补required `publication_identity=None`，不改断言语义 |
 | `tests/cli/test_fins_commands.py` | 仅机械补required `publication_identity=None`，不改断言语义 |
 | `tests/service/test_fins_direct.py` | 仅机械补required `publication_identity=None`，不改断言语义 |
@@ -487,7 +488,7 @@ company-only变化不改变source observation分类；`keep`是skip硬条件，`
   - `tests/fins/test_fins_storage_atomicity.py`
   - `tests/fins/test_docling_upload_service.py`
   - `tests/fins/test_upload_failure.py`
-  - `tests/fins/test_fins_ingestion_runtime.py`（仅为全部既有direct constructor机械补required `publication_identity=None`）
+  - `tests/fins/test_fins_ingestion_runtime.py`（全部既有direct constructor机械补required `publication_identity=None`；并仅允许两个既有 structural fakes 同步新 required protocol method、独立 `batch_calls`、移除 fake 注入处 cast 及新增精确 conformance/零行为断言）
   - `tests/fins/test_fins_service_runtime.py`（仅机械补`publication_identity=None`）
   - `tests/cli/test_fins_commands.py`（仅机械补`publication_identity=None`）
   - `tests/service/test_fins_direct.py`（仅机械补`publication_identity=None`）
@@ -496,7 +497,11 @@ company-only变化不改变source observation分类；`keep`是skip硬条件，`
   1. 新增§6.1 typed identity/state contract、§6.2 batch fresh read protocol及其storage owner实现、§6.4 conflict type/reason。
   2. 在`filing_upload_publication.py`只新增无I/O closed decision type与pure arbitration helper；不得新增或接通`execute_prepared_filing_publication()` batch lifecycle route。
   3. 在`docling_upload_service.py`新增filing prepared subtype/closed disposition与`describe/read/rebase/build-skip`窄helper；将不依赖`self`的 `_build_upsert_meta()` 提升为模块级私有唯一owner，让现有prepare继续调用它。S1不得让`prepare_upload()`产生filing subtype/disposition，不得删除现有filing early-skip或令identical filing继续conversion。
-  4. 四个existing fixture文件只能对全部`FilingUploadPublishedState(...)` direct constructor机械补required `publication_identity=None`，不得改assertion/fake语义。
+  4. 四个 existing fixture 文件均对全部 `FilingUploadPublishedState(...)` direct constructor 机械补 required `publication_identity=None`；其中仅 `tests/fins/test_fins_ingestion_runtime.py` 还必须同步两个既有 structural fakes：
+     - `_FixedFilingUploadStateRepository` 新增独立于现有 `calls` 的 `batch_calls: list[tuple[BatchToken, str]]`；`read_filing_upload_state_in_batch(batch, document_id)` 使用 required protocol 精确签名，记录 `(batch, document_id)` 后返回初始化时传入的固定 `state`。
+     - `_ForbiddenFilingUploadStateRepository` 同样新增独立 `batch_calls`；同签名方法先记录 `(batch, document_id)`，再明确抛出 `AssertionError`，固定 static admission 阶段禁止任何 filing state read（包括 batch state read）。
+     - `_build_static_admission_guarded_runtime()` 的 fake 注入必须移除 `cast(FilingUploadStateRepositoryProtocol, ...)`，与 `_build_fixed_state_guarded_runtime()` 一样直接传入 structural fake，让 pyright 对两个 fake 真实执行 protocol conformance；不得新增替代 cast、default、optional method、`hasattr/getattr`、兼容 wrapper 或 runtime fallback。
+     - 除上述 protocol-conformance 与精确调用边界断言外，不得改变两个 fake、既有 assertion 或 runtime prevalidation 业务语义；其余三个 fixture 文件仍只允许 required-field 机械变更。
   5. 不得编辑SEC/CN/HK workflow、workflow tests或README；不得改变任何现有SEC/CN/HK/material terminal、event、stored count、conversion count、begin/commit/rollback行为。
 - call/data path：S1 production的现有filing call path保持原样。新增batch reader与pure arbitration只由owner tests直接调用；新增Docling helpers通过typed test candidates验证，尚未成为workflow可达路径。
 - invariants：现有 `prepare_upload()` filing identical仍early `skipped`且不继续conversion；现有SEC/CN/HK workflow byte-for-byte沿原begin/stage/commit路径；没有shared publication route activation；新增reader/helper无mutation、无global lock、无path/raw-meta leakage。
@@ -510,16 +515,19 @@ company-only变化不改变source observation分类；`keep`是skip硬条件，`
   6. 模块级 `_build_upsert_meta()` 是九字段唯一构造owner；现有prepare与rebase helper都调用它，无复制字段拼装。rebase candidate的`previous_meta`取fresh meta，`first_ingested_at/created_at`精确保持fresh值；same fingerprint保持fresh `document_version`，different fingerprint从fresh version递增。
   7. rebase helper的staging meta不自产revision；owner-level real storage publish断言storage source-document owner写入新revision，且新revision不同于fresh previous revision。该断言与version/meta断言分开，禁止把revision写入Docling meta owner。
   8. failure enum kind/code/to_json/from_json exact且240字符/path-free validator通过；未知code拒绝。
-  9. repo中全部既有`FilingUploadPublishedState(...)` direct constructor都显式提供`publication_identity`；四个fixture文件的diff只有机械`None`参数。
-  10. 现有filing identical prepare测试继续断言early `skipped`、converter未执行；现有SEC/CN/HK workflow断言不修改且全量`tests/fins`全绿。S1禁止新增或修改任何断言来接受未来S2行为。
+  9. repo中全部既有 `FilingUploadPublishedState(...)` direct constructor都显式提供 `publication_identity`；除 `tests/fins/test_fins_ingestion_runtime.py` 的两个 structural fake conformance 修订外，四个 fixture 文件的 diff 只有机械 `None` 参数。
+  10. 为两个 fake 新增 exact contract signal：以 `BatchToken(transaction_id="fixture-batch", ticker="AAPL")` 直接调用 `_Fixed...read_filing_upload_state_in_batch()` 时，返回对象必须与固定 `state` 为同一对象，`batch_calls` 精确为 `[(batch, document_id)]` 且既有 `calls` 不变；直接调用 `_Forbidden...` 同方法时必须记录同一 tuple 后抛出明确 `AssertionError`，且既有 `calls` 不变。两个 runtime builder 的 protocol 参数均直接接收 fake、没有 cast，使 focused/full pyright 同时验证两个 fake 真实 conform。
+  11. 现有 static admission tests 在断言 `state_repository.calls == []` 的同时精确断言 `batch_calls == []`；现有 runtime unsafe prevalidation 继续只产生两个 published-state `calls`，并精确断言 `batch_calls == []`。executor、runner、observation、job/workspace 零副作用断言保持不变，证明新增 required method 没有改变 static admission/runtime prevalidation 语义。
+  12. 现有filing identical prepare测试继续断言early `skipped`、converter未执行；现有SEC/CN/HK workflow断言不修改且全量`tests/fins`全绿。S1禁止新增或修改任何断言来接受未来S2行为。
 - validation commands：
   - `source .venv/bin/activate && pytest tests/fins/test_filing_upload_publication.py tests/fins/test_fins_storage_atomicity.py tests/fins/test_docling_upload_service.py tests/fins/test_upload_failure.py tests/fins/test_fins_ingestion_runtime.py tests/fins/test_fins_service_runtime.py tests/cli/test_fins_commands.py tests/service/test_fins_direct.py -q`
   - `source .venv/bin/activate && pytest tests/fins -q`
   - `source .venv/bin/activate && pytest tests/fins/test_filing_upload_publication.py tests/fins/test_docling_upload_service.py --cov=dayu.fins.pipelines.filing_upload_publication --cov=dayu.fins.pipelines.docling_upload_service --cov=dayu.fins.storage._fs_filing_upload_state_core --cov=dayu.fins.upload_failure --cov-report=term-missing --cov-fail-under=80 -q`
+  - `source .venv/bin/activate && python -m pyright tests/fins/test_fins_ingestion_runtime.py`（exact structural signal：两个 builder 均无 cast，两个 fake 均不得出现 missing `read_filing_upload_state_in_batch` 或参数/返回值不兼容）
   - `source .venv/bin/activate && python -m pyright dayu/ tests/ utils/`
   - `git diff --check`
-- expected completion signal：owner tests与现有全量`tests/fins`全部通过，无expected red；目标模块单文件coverage目标>=80%；全仓pyright无新增/扩散；`prepare_upload()` filing early-skip及全部SEC/CN/HK workflow行为未变；S2 workflow/semantic test/README files无diff，`test_fins_ingestion_runtime.py`仅允许required-field机械diff。
-- stop condition：若S1使任一现有Fins test变红、filing identical继续conversion、shared route可达、workflow observable改变，立即停止并回到plan review，不得声明expected red或提前修改S2文件；若batch staging不能在protocol内形成company/source同版state、identity/meta owner不清，也停止且不得fallback读published/raw meta。
+- expected completion signal：owner tests与现有全量`tests/fins`全部通过，无expected red；目标模块单文件coverage目标>=80%；focused/full pyright均无新增/扩散且两个 fake 真实满足 protocol；`prepare_upload()` filing early-skip及全部SEC/CN/HK workflow行为未变；S2 workflow/semantic test/README files无diff；`test_fins_ingestion_runtime.py`除required-field机械diff外只含本 amendment 明列的两个 fake conformance/独立调用记录/去 cast/零行为断言。
+- stop condition：若S1使任一现有Fins test变红、filing identical继续conversion、shared route可达、workflow observable改变，立即停止并回到plan review，不得声明expected red或提前修改S2文件；若两个 structural fake 不能在无 cast/default/getattr/兼容逃逸下满足 required protocol，或batch staging不能在protocol内形成company/source同版state、identity/meta owner不清，也停止且不得fallback读published/raw meta。
 
 ### 10.2 Slice S2 — atomic filing activation & terminal closure
 
@@ -534,7 +542,7 @@ company-only变化不改变source observation分类；`keep`是skip硬条件，`
   - `tests/fins/test_filing_upload_publication.py`
   - `tests/fins/test_sec_pipeline_upload_filing_stream.py`
   - `tests/fins/test_cn_pipeline.py`
-  - `tests/fins/test_fins_ingestion_runtime.py`（在S1机械fixture diff之上新增conflict/skipped fresh-action terminal断言；不得改production runtime）
+  - `tests/fins/test_fins_ingestion_runtime.py`（在S1 contract fixture diff之上新增conflict/skipped fresh-action terminal断言；不得改production runtime）
   - `dayu/fins/README.md`
   - `tests/README.md`
 - prerequisites：S1 implementation/code review/fix/re-review/accepted slice commit完成；S1 focused tests、完整`pytest tests/fins -q`与pyright均green；S1未改变filing early-skip或任何SEC/CN/HK workflow行为，且types/readers/helpers/meta owner contract已被owner tests固定。
@@ -628,7 +636,7 @@ C-R1/C-R2及最终C-F1/C-F2已作为accepted findings在本plan关闭，不再�
 
 | 风险 | 当前缓解 | 分类 / owner |
 | --- | --- | --- |
-| S1四个fixture文件只允许required-field机械diff；若真实equality断言受新增required field影响，原allowed scope不足 | 已完成constructor census；S1 full validation若发现真实语义冲突必须stop并返回plan review，不得修改断言或增加production兼容 | `fixed in current slice`：S1 contract closure与stop condition；对应DS re-review R3 |
+| S1 constructor census 漏掉 `FilingUploadStateRepositoryProtocol` 的两个 structural fake，新增 required batch-read method 后导致 direct pyright failure，且一个 cast 掩盖同源缺口 | 本 amendment 只扩充 `tests/fins/test_fins_ingestion_runtime.py` 的 fake conformance scope：两个 fake 同步 required method与独立 `batch_calls`，移除注入 cast，并以 exact runtime assertions + focused/full pyright 固定；不得弱化production protocol或增加兼容逃逸 | `fixed in amended S1 plan / re-review required`：plan owner；re-review pass 前 S1 resume not authorized |
 | concurrent exact `auto` retransmission若initial已为`COMPLETE`，后writer observation changed时即使identity exact equal仍conflict而非skip | §7.3-§7.4明确只有`MISSING -> COMPLETE`可作changed convergence；S2 explicit/auto changed tests与README记录该fail-closed边界 | `fixed in current slice`（S2 route tests/docs）；DS final review R-2 |
 | converter非确定性导致相同original产生不同derived；sequential重传可能因strict derived identity不等而publish，concurrent loser则conflict | prepared/durable asset metadata exact equality，不把近似结果误判skip；S1 identity tests、S2 route tests与README记录该tradeoff | `fixed in current slice`（S1 identity + S2 route tests/docs）；DS final review R-3 |
 | SHA-256理论碰撞 | 同时比较role、name、size、content-type、source requirements；physical integrity owner重算hash | `assigned to later work unit`：storage integrity policy hardening；非当前goal |
