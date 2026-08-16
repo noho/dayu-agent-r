@@ -106,6 +106,7 @@ from dayu.fins.storage import (
     FilingUploadStateRepositoryProtocol,
     ProcessedDocumentRepositoryProtocol,
     SourceDocumentRepositoryProtocol,
+    SourceIntegrityStatus,
 )
 from dayu.fins.pipelines.docling_upload_service import (
     UploadOverwritePrecondition,
@@ -122,7 +123,9 @@ from dayu.fins.pipelines.upload_company_meta import (
 )
 from dayu.fins.upload_failure import (
     FinsUploadFailureReason,
+    FinsUploadPrevalidationError,
     fins_upload_failure_from_exception,
+    fins_upload_source_integrity_unsafe_failure,
     upload_failure_reason_from_json,
 )
 from dayu.fins.upload_format_contract import (
@@ -131,6 +134,11 @@ from dayu.fins.upload_format_contract import (
     FinsUploadFilingFiles,
     FinsUploadFormatError,
     FinsUploadFormatFailureKind,
+)
+from dayu.fins.upload_repair_contract import (
+    ExistingSourceAutoRepair,
+    ExistingSourceRepairDisposition,
+    NoExistingSourceRepair,
 )
 from dayu.fins.ticker_normalization import Exchange as NormalizedTickerExchange
 from dayu.fins.ticker_normalization import Market as NormalizedTickerMarket
@@ -684,6 +692,7 @@ class FinsUploadUsageCode(str, Enum):
     COMPANY_NAME_REQUIRED = "company_name_required"
     CREATE_TARGET_EXISTS = "create_target_exists"
     UPDATE_TARGET_MISSING = "update_target_missing"
+    EXISTING_SOURCE_REPAIR_REQUIRES_AUTO = "existing_source_repair_requires_auto"
 
 
 @dataclass(frozen=True, slots=True)
@@ -758,6 +767,7 @@ class ValidatedFinsUploadFilingRequest:
         published_state: 本次验证使用的同版只读状态。
         company_meta_decision: company meta owner 产生的发布决策。
         file_selection: authoritative primary/companions 或 delete 空状态的强类型选择。
+        repair_disposition: validator 产生的唯一既有 source repair 授权。
     """
 
     request: FinsUploadFilingRequest
@@ -769,6 +779,47 @@ class ValidatedFinsUploadFilingRequest:
     published_state: FilingUploadPublishedState
     company_meta_decision: UploadCompanyMetaDecision
     file_selection: FinsUploadFilingFiles
+    repair_disposition: ExistingSourceRepairDisposition
+
+    def __post_init__(self) -> None:
+        """校验 validated request 的 target 与 repair 授权保持同一真源。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            TypeError: repair disposition 不属于封闭 union 时抛出。
+            FinsUploadUsageError: request path 在重建 authoritative selection 时无法规范化时抛出。
+            ValueError: target identity、状态、动作或文件选择与 repair 授权不一致时抛出。
+        """
+
+        integrity = self.published_state.source_integrity
+        if integrity.ticker != self.normalized_ticker.canonical:
+            raise ValueError("validated filing request 的 published ticker 不一致")
+        if integrity.source_kind is not SourceKind.FILING:
+            raise ValueError("validated filing request 必须引用 filing integrity")
+        if integrity.document_id != self.document_id:
+            raise ValueError("validated filing request 的 published document 不一致")
+        if integrity.status is SourceIntegrityStatus.UNSAFE:
+            raise ValueError("UNSAFE published state 不得构造 validated filing request")
+        _validate_filing_selection_matches_request(self.request, self.file_selection)
+        if isinstance(self.repair_disposition, NoExistingSourceRepair):
+            if integrity.status is SourceIntegrityStatus.REPAIR_REQUIRED:
+                raise ValueError("REPAIR_REQUIRED target 必须携带 existing auto repair 授权")
+            return
+        if not isinstance(self.repair_disposition, ExistingSourceAutoRepair):
+            raise TypeError("repair_disposition 必须属于封闭 repair contract")
+        if self.repair_disposition.expected_integrity != integrity:
+            raise ValueError("repair expected target 必须等于 validated published target")
+        if self.request.action != _UPLOAD_ACTION_AUTO:
+            raise ValueError("existing auto repair 要求 raw action 精确为 auto")
+        if self.resolved_action != _UPLOAD_ACTION_UPDATE:
+            raise ValueError("existing auto repair 的 resolved action 必须是 update")
+        if self.file_selection.is_empty:
+            raise ValueError("existing auto repair 必须携带非空完整文件选择")
 
 
 @dataclass(frozen=True, slots=True)
@@ -780,6 +831,182 @@ class _StaticFinsUploadFilingValidation:
     document_id: str
     internal_document_id: str
     file_selection: FinsUploadFilingFiles
+
+
+class _FinsUploadFilingSelectionFailure(str, Enum):
+    """filing files/selectors 无法投影唯一 selection 的封闭原因。"""
+
+    MISSING_FILES = "missing_files"
+    DUPLICATE_FILE_PATH = "duplicate_file_path"
+    MULTIPLE_PRIMARY_SELECTORS = "multiple_primary_selectors"
+    MISSING_MULTI_FILE_PRIMARY = "missing_multi_file_primary"
+    PRIMARY_NOT_IN_FILES = "primary_not_in_files"
+
+
+@dataclass(frozen=True, slots=True)
+class _FinsUploadFilingSelectionProjection:
+    """已从规范路径唯一投影的 filing primary 与 companions。
+
+    Attributes:
+        primary: 唯一 authoritative primary。
+        companions: 保持 files 原相对顺序的 companions。
+    """
+
+    primary: Path
+    companions: tuple[Path, ...]
+
+    def to_file_selection(self) -> FinsUploadFilingFiles:
+        """构造共享 projection 对应的 public immutable selection。
+
+        Args:
+            无。
+
+        Returns:
+            primary/companions 与 projection 精确一致的 filing selection。
+
+        Raises:
+            TypeError: projection 的路径类型违反内部不变量时抛出。
+            FinsUploadFormatError: 任一 projected path 不符合其 filing 角色格式时抛出。
+        """
+
+        return FinsUploadFilingFiles.for_upsert(
+            primary=self.primary,
+            companions=self.companions,
+        )
+
+
+_FILING_SELECTION_FAILURE_USAGE_CODES: Final[
+    Mapping[_FinsUploadFilingSelectionFailure, FinsUploadUsageCode]
+] = {
+    _FinsUploadFilingSelectionFailure.MISSING_FILES: FinsUploadUsageCode.MISSING_FILES,
+    _FinsUploadFilingSelectionFailure.DUPLICATE_FILE_PATH: (
+        FinsUploadUsageCode.DUPLICATE_FILE_PATH
+    ),
+    _FinsUploadFilingSelectionFailure.MULTIPLE_PRIMARY_SELECTORS: (
+        FinsUploadUsageCode.MULTIPLE_PRIMARY_SELECTORS
+    ),
+    _FinsUploadFilingSelectionFailure.MISSING_MULTI_FILE_PRIMARY: (
+        FinsUploadUsageCode.MISSING_MULTI_FILE_PRIMARY
+    ),
+    _FinsUploadFilingSelectionFailure.PRIMARY_NOT_IN_FILES: (
+        FinsUploadUsageCode.PRIMARY_NOT_IN_FILES
+    ),
+}
+
+
+def _normalize_fins_upload_paths(paths: tuple[Path, ...]) -> tuple[Path, ...]:
+    """用唯一 path owner 规范化一组保序 upload paths。
+
+    Args:
+        paths: raw files 或 primary selectors。
+
+    Returns:
+        保持输入顺序的 canonical absolute paths。
+
+    Raises:
+        TypeError: 任一路径不是 ``Path`` 时抛出。
+        FinsUploadUsageError: 任一路径无法展开或解析时抛出。
+    """
+
+    return tuple(_normalize_fins_upload_path(path) for path in paths)
+
+
+def _project_fins_upload_filing_selection(
+    *,
+    files: tuple[Path, ...],
+    primary_selectors: tuple[Path, ...],
+) -> _FinsUploadFilingSelectionProjection | _FinsUploadFilingSelectionFailure:
+    """从规范 files/selectors 纯投影唯一 primary/companions 或封闭失败原因。
+
+    本 owner 不读取 filesystem、不规范化路径、不产生 public usage exception。调用边界负责
+    将 closed failure 投影为自身的异常面。
+
+    Args:
+        files: 已规范化且保持 raw 顺序的 upsert 文件。
+        primary_selectors: 已规范化且保持 raw cardinality 的 primary selectors。
+
+    Returns:
+        唯一 primary/companions projection；无法唯一投影时返回封闭 failure enum。
+
+    Raises:
+        TypeError: 任一输入或其中路径不符合严格 tuple/Path contract 时抛出。
+    """
+
+    if not isinstance(files, tuple) or not isinstance(primary_selectors, tuple):
+        raise TypeError("filing selection projection 要求 Path tuple")
+    if any(not isinstance(path, Path) for path in (*files, *primary_selectors)):
+        raise TypeError("filing selection projection 只接受 Path")
+    if not files:
+        return _FinsUploadFilingSelectionFailure.MISSING_FILES
+    file_identities = tuple(_fins_upload_path_identity(path) for path in files)
+    if len(set(file_identities)) != len(file_identities):
+        return _FinsUploadFilingSelectionFailure.DUPLICATE_FILE_PATH
+    if len(primary_selectors) > 1:
+        return _FinsUploadFilingSelectionFailure.MULTIPLE_PRIMARY_SELECTORS
+    if len(files) > 1 and not primary_selectors:
+        return _FinsUploadFilingSelectionFailure.MISSING_MULTI_FILE_PRIMARY
+    primary = primary_selectors[0] if primary_selectors else next(iter(files))
+    primary_identity = _fins_upload_path_identity(primary)
+    if primary_identity not in file_identities:
+        return _FinsUploadFilingSelectionFailure.PRIMARY_NOT_IN_FILES
+    companions = tuple(
+        path
+        for path, path_identity in zip(files, file_identities, strict=True)
+        if path_identity != primary_identity
+    )
+    return _FinsUploadFilingSelectionProjection(
+        primary=primary,
+        companions=companions,
+    )
+
+
+def _validate_filing_selection_matches_request(
+    request: FinsUploadFilingRequest,
+    selection: FinsUploadFilingFiles,
+) -> None:
+    """校验 validated selection 完整覆盖 raw request 的全部文件与主文件角色。
+
+    本函数只比较 immutable request/selection contract，不读取文件内容、不调用 converter，
+    也不根据 published state 反推角色。
+
+    Args:
+        request: validated request 保存的原始 filing 请求。
+        selection: static admission 产生的 authoritative 文件选择。
+
+    Returns:
+        两者精确一致时不返回业务值。
+
+    Raises:
+        TypeError: request 或 selection 类型不符合契约时抛出。
+        FinsUploadUsageError: request path 无法由唯一 path owner 规范化时抛出。
+        ValueError: delete 空状态或 upsert 完整文件选择不一致时抛出。
+    """
+
+    if not isinstance(request, FinsUploadFilingRequest):
+        raise TypeError("validated filing request.request 类型错误")
+    if not isinstance(selection, FinsUploadFilingFiles):
+        raise TypeError("validated filing request.file_selection 类型错误")
+    normalized_action = request.action.strip().lower()
+    if normalized_action == _UPLOAD_ACTION_DELETE:
+        if request.files or request.primary_selectors or not selection.is_empty:
+            raise ValueError("delete request 必须与唯一空 file selection 一致")
+        return
+    normalized_files = _normalize_fins_upload_paths(request.files)
+    normalized_selectors = _normalize_fins_upload_paths(request.primary_selectors)
+    projection = _project_fins_upload_filing_selection(
+        files=normalized_files,
+        primary_selectors=normalized_selectors,
+    )
+    if isinstance(projection, _FinsUploadFilingSelectionFailure):
+        raise ValueError(
+            "validated filing raw selection 无法唯一投影: "
+            f"{projection.value}"
+        )
+    if selection.is_empty:
+        raise ValueError("filing upsert request 必须携带非空完整 file selection")
+    expected_selection = projection.to_file_selection()
+    if selection != expected_selection:
+        raise ValueError("validated filing file selection 与 raw request 不完整一致")
 
 
 _FILE_USAGE_CODES: Final[frozenset[FinsUploadUsageCode]] = frozenset(
@@ -817,6 +1044,9 @@ _USAGE_MESSAGES: Final[Mapping[FinsUploadUsageCode, str]] = {
     FinsUploadUsageCode.COMPANY_NAME_REQUIRED: "当前公司缺少有效元数据；create/update 必须提供 --company-name",
     FinsUploadUsageCode.CREATE_TARGET_EXISTS: "create 目标已存在；请改用 update 或允许覆盖",
     FinsUploadUsageCode.UPDATE_TARGET_MISSING: "update 目标不存在；请改用 create",
+    FinsUploadUsageCode.EXISTING_SOURCE_REPAIR_REQUIRES_AUTO: (
+        "目标 filing 不完整；请使用 auto 并提供完整文件重新上传"
+    ),
 }
 
 
@@ -1000,48 +1230,6 @@ def _fins_upload_path_identity(path: Path) -> str:
     return str(path)
 
 
-def _select_fins_upload_filing_files(
-    *,
-    files: tuple[Path, ...],
-    primary_selectors: tuple[Path, ...],
-) -> tuple[Path, tuple[Path, ...]]:
-    """从规范路径确定唯一 filing primary 与 companions。
-
-    Args:
-        files: 已规范化、保序且没有 exact path-string 重复的 upsert 文件。
-        primary_selectors: 已规范化并保留 raw cardinality 的 selector。
-
-    Returns:
-        单文件隐式或显式选择、多文件显式选择产生的 primary 与保序 companions。
-
-    Raises:
-        FinsUploadUsageError: selector 数量、必填性或 membership 违反 closed contract 时抛出。
-        ValueError: 上游违反内部不变量并传入空 upsert 文件集合时抛出。
-    """
-
-    if not files:
-        raise ValueError("filing upsert 角色选择必须接收非空文件集合")
-    if len(primary_selectors) > 1:
-        _raise_upload_usage(FinsUploadUsageCode.MULTIPLE_PRIMARY_SELECTORS)
-    if len(files) > 1 and not primary_selectors:
-        _raise_upload_usage(FinsUploadUsageCode.MISSING_MULTI_FILE_PRIMARY)
-
-    if primary_selectors:
-        primary = primary_selectors[0]
-    else:
-        primary = next(iter(files))
-    primary_identity = _fins_upload_path_identity(primary)
-    file_identities = tuple(_fins_upload_path_identity(path) for path in files)
-    if primary_identity not in file_identities:
-        _raise_upload_usage(FinsUploadUsageCode.PRIMARY_NOT_IN_FILES)
-    companions = tuple(
-        path
-        for path, path_identity in zip(files, file_identities, strict=True)
-        if path_identity != primary_identity
-    )
-    return primary, companions
-
-
 def _validate_fins_upload_filing_static(
     request: FinsUploadFilingRequest,
 ) -> _StaticFinsUploadFilingValidation:
@@ -1095,21 +1283,16 @@ def _validate_fins_upload_filing_static(
         if request.primary_selectors:
             _raise_upload_usage(FinsUploadUsageCode.PRIMARY_NOT_ALLOWED_FOR_DELETE)
         file_selection = FinsUploadFilingFiles.for_delete()
-    elif not request.files:
-        _raise_upload_usage(FinsUploadUsageCode.MISSING_FILES)
     else:
-        normalized_files = tuple(_normalize_fins_upload_path(path) for path in request.files)
-        normalized_selectors = tuple(
-            _normalize_fins_upload_path(path) for path in request.primary_selectors
-        )
-        file_identities = tuple(_fins_upload_path_identity(path) for path in normalized_files)
-        if len(set(file_identities)) != len(file_identities):
-            _raise_upload_usage(FinsUploadUsageCode.DUPLICATE_FILE_PATH)
-        primary, companions = _select_fins_upload_filing_files(
+        normalized_files = _normalize_fins_upload_paths(request.files)
+        normalized_selectors = _normalize_fins_upload_paths(request.primary_selectors)
+        projection = _project_fins_upload_filing_selection(
             files=normalized_files,
             primary_selectors=normalized_selectors,
         )
-        primary_identity = _fins_upload_path_identity(primary)
+        if isinstance(projection, _FinsUploadFilingSelectionFailure):
+            _raise_upload_usage(_FILING_SELECTION_FAILURE_USAGE_CODES[projection])
+        primary_identity = _fins_upload_path_identity(projection.primary)
         for file_path in normalized_files:
             basename = file_path.name
             _admit_fins_upload_file_basename(basename)
@@ -1127,10 +1310,7 @@ def _validate_fins_upload_filing_static(
             except FinsUploadFormatError as error:
                 _raise_upload_format_usage(error)
         try:
-            file_selection = FinsUploadFilingFiles.for_upsert(
-                primary=primary,
-                companions=companions,
-            )
+            file_selection = projection.to_file_selection()
         except FinsUploadFormatError as error:
             _raise_upload_format_usage(error)
     if normalized_ticker.market == "US":
@@ -1222,6 +1402,47 @@ def _filing_upload_request_identity(
     return validated.normalized_ticker.canonical, validated.document_id
 
 
+def _validate_filing_upload_published_state(
+    static: _StaticFinsUploadFilingValidation,
+    published_state: FilingUploadPublishedState,
+) -> None:
+    """校验 storage producer 返回的 exact target identity 与状态/meta 不变量。
+
+    Args:
+        static: request static owner 产生的 canonical target facts。
+        published_state: storage inspector 同版投影的 published state。
+
+    Returns:
+        producer contract 完整时不返回业务值。
+
+    Raises:
+        TypeError: published state 类型不符合公共契约时抛出。
+        ValueError: target identity 或 status/meta 对应关系违约时抛出。
+    """
+
+    if not isinstance(published_state, FilingUploadPublishedState):
+        raise TypeError("published_state 必须是 FilingUploadPublishedState")
+    integrity = published_state.source_integrity
+    if integrity.ticker != static.normalized_ticker.canonical:
+        raise ValueError("filing upload published state ticker 与 expected target 不一致")
+    if integrity.source_kind is not SourceKind.FILING:
+        raise ValueError("filing upload published state 必须引用 filing target")
+    if integrity.document_id != static.document_id:
+        raise ValueError("filing upload published state document 与 expected target 不一致")
+    if integrity.status in {SourceIntegrityStatus.MISSING, SourceIntegrityStatus.UNSAFE}:
+        if published_state.source_meta is not None:
+            raise ValueError("MISSING/UNSAFE published state 不得携带 source_meta")
+        return
+    if integrity.status in {
+        SourceIntegrityStatus.COMPLETE,
+        SourceIntegrityStatus.REPAIR_REQUIRED,
+    }:
+        if published_state.source_meta is None:
+            raise ValueError("COMPLETE/REPAIR_REQUIRED published state 必须携带 source_meta")
+        return
+    raise ValueError("filing upload published state status 必须是封闭四态")
+
+
 def validate_fins_upload_filing_request(
     request: FinsUploadFilingRequest,
     *,
@@ -1238,26 +1459,49 @@ def validate_fins_upload_filing_request(
 
     Raises:
         FinsUploadUsageError: 静态字段、状态前置条件或 company 要求不满足时抛出。
+        FinsUploadPrevalidationError: target 完整性为 ``UNSAFE`` 时抛出。
+        ValueError: storage producer 返回的 target identity 或状态不变量违约时抛出。
     """
 
     static = _validate_fins_upload_filing_static(request)
+    _validate_filing_upload_published_state(static, published_state)
     requested_action = request.action.strip().lower()
-    resolved_action_text = resolve_upload_action(
-        None if requested_action == _UPLOAD_ACTION_AUTO else requested_action,
-        published_state.source_meta,
-    )
-    if resolved_action_text not in {_UPLOAD_ACTION_CREATE, _UPLOAD_ACTION_UPDATE, _UPLOAD_ACTION_DELETE}:
-        raise AssertionError("upload action owner 返回未知动作")
-    resolved_action = cast(Literal["create", "update", "delete"], resolved_action_text)
-    precondition = evaluate_upload_overwrite_precondition(
-        action=resolved_action,
-        previous_meta=published_state.source_meta,
-        overwrite=request.overwrite,
-    )
-    if precondition is UploadOverwritePrecondition.CREATE_TARGET_EXISTS:
-        _raise_upload_usage(FinsUploadUsageCode.CREATE_TARGET_EXISTS)
-    if precondition is UploadOverwritePrecondition.UPDATE_TARGET_MISSING:
-        _raise_upload_usage(FinsUploadUsageCode.UPDATE_TARGET_MISSING)
+    integrity = published_state.source_integrity
+    if integrity.status is SourceIntegrityStatus.UNSAFE:
+        raise FinsUploadPrevalidationError(
+            fins_upload_source_integrity_unsafe_failure()
+        )
+    if integrity.status is SourceIntegrityStatus.REPAIR_REQUIRED:
+        if request.action != _UPLOAD_ACTION_AUTO:
+            _raise_upload_usage(FinsUploadUsageCode.EXISTING_SOURCE_REPAIR_REQUIRES_AUTO)
+        if static.file_selection.is_empty:
+            raise ValueError("REPAIR_REQUIRED auto validator 缺少完整文件选择")
+        resolved_action: Literal["create", "update", "delete"] = _UPLOAD_ACTION_UPDATE
+        repair_disposition: ExistingSourceRepairDisposition = ExistingSourceAutoRepair(
+            expected_integrity=integrity
+        )
+    else:
+        resolved_action_text = resolve_upload_action(
+            None if requested_action == _UPLOAD_ACTION_AUTO else requested_action,
+            published_state.source_meta,
+        )
+        if resolved_action_text not in {
+            _UPLOAD_ACTION_CREATE,
+            _UPLOAD_ACTION_UPDATE,
+            _UPLOAD_ACTION_DELETE,
+        }:
+            raise AssertionError("upload action owner 返回未知动作")
+        resolved_action = cast(Literal["create", "update", "delete"], resolved_action_text)
+        precondition = evaluate_upload_overwrite_precondition(
+            action=resolved_action,
+            previous_meta=published_state.source_meta,
+            overwrite=request.overwrite,
+        )
+        if precondition is UploadOverwritePrecondition.CREATE_TARGET_EXISTS:
+            _raise_upload_usage(FinsUploadUsageCode.CREATE_TARGET_EXISTS)
+        if precondition is UploadOverwritePrecondition.UPDATE_TARGET_MISSING:
+            _raise_upload_usage(FinsUploadUsageCode.UPDATE_TARGET_MISSING)
+        repair_disposition = NoExistingSourceRepair()
     try:
         company_decision = resolve_upload_company_meta_decision(
             existing_meta=published_state.company_meta,
@@ -1278,6 +1522,7 @@ def validate_fins_upload_filing_request(
         published_state=published_state,
         company_meta_decision=company_decision,
         file_selection=static.file_selection,
+        repair_disposition=repair_disposition,
     )
 
 
@@ -3368,6 +3613,7 @@ class FinsIngestionRuntime:
             Fins 唯一 owner 校验后的 direct 事件流。
 
         Raises:
+            FinsUploadPrevalidationError: raw filing target 为 ``UNSAFE`` 时在 producer 创建前原样抛出。
             ValueError: ticker、source_kind、action 或上传请求字段非法时抛出。
             OSError: 仓储读写失败时由底层实现抛出。
         """
@@ -3536,6 +3782,7 @@ class FinsIngestionRuntime:
 
         Raises:
             FinsIngestionStartCancelledError: 启动前观察到取消时抛出。
+            FinsUploadPrevalidationError: raw filing target 为 ``UNSAFE`` 时在 observation 创建前原样抛出。
             ValueError: ticker、source_kind、action 或上传字段非法时抛出。
             RuntimeError: 后台执行器无法启动 operation 时抛出。
         """
@@ -3563,6 +3810,7 @@ class FinsIngestionRuntime:
 
         Raises:
             FinsIngestionStartCancelledError: prepare 前观察到取消时抛出。
+            FinsUploadPrevalidationError: raw filing target 为 ``UNSAFE`` 时在 observation 创建前原样抛出。
             ValueError: ticker、source_kind、action 或上传字段非法时抛出。
         """
 
@@ -4379,6 +4627,7 @@ class FinsIngestionRuntime:
 
         Raises:
             FinsIngestionStartCancelledError: durable job 创建前观察到取消时抛出。
+            FinsUploadPrevalidationError: raw filing target 为 ``UNSAFE`` 时在 job 创建前原样抛出。
             ValueError: ticker、source_kind 或请求摘要字段非法时抛出。
             OSError: job record 持久化失败，或 create 后取消桥接落盘失败时抛出。
         """
@@ -4425,6 +4674,7 @@ class FinsIngestionRuntime:
 
         Raises:
             FinsUploadUsageError: raw filing request 违反 usage contract 时抛出。
+            FinsUploadPrevalidationError: raw filing target 为 ``UNSAFE`` 时原样抛出。
             ValueError: material request 非法或 published state 损坏时抛出。
             OSError: filing published state 读取失败时抛出。
         """

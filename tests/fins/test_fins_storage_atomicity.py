@@ -6490,6 +6490,97 @@ def test_source_integrity_repairable_corruption_grid_preserves_revision(
         )
 
 
+def test_source_integrity_uses_storage_name_for_same_basename_asset_identity(
+    tmp_path: Path,
+) -> None:
+    """storage name 必须拥有 asset identity、basename projection 与 fallback 歧义语义。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: identity owner、repairable projection 或真实 fallback 歧义漂移时抛出。
+        OSError: fixture publication 或单点 meta/文件修改失败时抛出。
+        ValueError: fresh fixture 不符合严格 files contract 时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    document_id = "same-basename-integrity"
+    batch = batching.begin_batch("AAPL")
+    _create_complete_source(source, blob, batch=batch, document_id=document_id)
+    batching.commit_batch(batch)
+
+    source_dir, meta_path, _ = _integrity_source_paths(
+        repository_set.core,
+        document_id=document_id,
+        source_kind=SourceKind.FILING,
+    )
+    meta = _read_integrity_json(meta_path)
+    files = _integrity_meta_files(meta)
+    if len(files) != 2:
+        raise ValueError("same-basename fixture 要求一个 original 与一个 Docling")
+    original_name = files[0].get("name")
+    if not isinstance(original_name, str):
+        raise ValueError("same-basename fixture original storage name 非法")
+    second_name = "original-second-asset.txt"
+    (source_dir / second_name).write_bytes((source_dir / original_name).read_bytes())
+    second_original = dict(files[0])
+    second_original["name"] = second_name
+    second_original["uri"] = f"local://AAPL/{second_name}"
+    second_original["original_filename"] = "report.pdf"
+    files[0]["original_filename"] = "report.pdf"
+    files[1]["original_filename"] = "report.pdf"
+    files.insert(1, second_original)
+    meta["files"] = cast(JsonValue, files)
+    _write_integrity_json(meta_path, meta)
+
+    complete = source.classify_source_integrity(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+    )
+    assert complete.status is SourceIntegrityStatus.COMPLETE
+    assert complete.reasons == ()
+    assert complete.revision is not None
+
+    files[0]["original_filename"] = "first-report.pdf"
+    files[1]["original_filename"] = "second-report.pdf"
+    files[2]["original_filename"] = "second-report.pdf"
+    _write_integrity_json(meta_path, meta)
+    mismatched_projection = source.classify_source_integrity(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+    )
+    assert mismatched_projection.status is SourceIntegrityStatus.REPAIR_REQUIRED
+    assert mismatched_projection.revision == complete.revision
+    assert mismatched_projection.reasons == (
+        SourceIntegrityReason.DERIVED_PROJECTION_MISMATCH,
+    )
+
+    files[0]["original_filename"] = "report.pdf"
+    files[1]["original_filename"] = "report.pdf"
+    files[2]["original_filename"] = "report.pdf"
+    files[2]["derived_from"] = "missing-original-asset.txt"
+    _write_integrity_json(meta_path, meta)
+    ambiguous = source.classify_source_integrity(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+    )
+    assert ambiguous.status is SourceIntegrityStatus.UNSAFE
+    assert ambiguous.revision is None
+    assert ambiguous.reasons == (
+        SourceIntegrityReason.FILE_DECLARATION_UNTRUSTED,
+    )
+
+
 @pytest.mark.parametrize(
     ("corruption", "expected_reason"),
     (

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import cast
 
 import pytest
@@ -13,6 +14,9 @@ from dayu.fins.upload_failure import (
     FinsUploadFailureKind,
     FinsUploadFailureReason,
     fins_upload_failure_from_exception,
+    fins_upload_source_integrity_unsafe_failure,
+    fins_upload_source_repair_blocked_failure,
+    fins_upload_source_revision_stale_failure,
     upload_failure_reason_from_json,
 )
 from dayu.fins.upload_format_contract import (
@@ -72,6 +76,62 @@ def test_unsupported_upload_format_reason_strict_json_round_trip() -> None:
         file_label="ignored.pdf",
     )
 
+    assert upload_failure_reason_from_json(reason.to_json()) == reason
+
+
+@pytest.mark.parametrize(
+    ("factory", "code", "message", "retry_hint"),
+    (
+        (
+            fins_upload_source_integrity_unsafe_failure,
+            FinsUploadFailureCode.SOURCE_INTEGRITY_UNSAFE,
+            "工作区中的目标 filing 状态不完整且无法安全自动修复",
+            "请先修复工作区 source 状态后再重试",
+        ),
+        (
+            fins_upload_source_revision_stale_failure,
+            FinsUploadFailureCode.SOURCE_REVISION_STALE,
+            "目标 filing 在上传准备期间已发生变化，本次上传未提交",
+            "请基于最新目标状态重新发起上传",
+        ),
+        (
+            fins_upload_source_repair_blocked_failure,
+            FinsUploadFailureCode.SOURCE_REPAIR_BLOCKED,
+            "工作区中存在本次上传无法安全重建的其它 source，本次上传未提交",
+            "请先修复工作区中的其它 source 状态后再重试",
+        ),
+    ),
+)
+def test_source_repair_storage_failure_factories_are_closed_path_free_and_actionable(
+    factory: Callable[[], FinsUploadFailureReason],
+    code: FinsUploadFailureCode,
+    message: str,
+    retry_hint: str,
+) -> None:
+    """三个 source repair storage failure 必须由唯一 factory 产生固定安全文案。
+
+    Args:
+        factory: 当前无参 failure factory。
+        code: 预期 closed storage code。
+        message: 预期固定 public message。
+        retry_hint: 预期固定可行动建议。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: code、文案、路径安全或 JSON 往返漂移时抛出。
+    """
+
+    reason = factory()
+
+    assert reason.kind is FinsUploadFailureKind.STORAGE
+    assert reason.code is code
+    assert reason.message == message
+    assert reason.retry_hint == retry_hint
+    assert reason.file_label is None
+    assert "/" not in reason.message
+    assert "\\" not in reason.message
     assert upload_failure_reason_from_json(reason.to_json()) == reason
 
 

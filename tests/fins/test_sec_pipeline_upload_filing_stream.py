@@ -44,7 +44,6 @@ from dayu.fins.storage import (
     FsFilingUploadStateRepository,
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
-from dayu.fins.upload_format_contract import FinsUploadFilingFiles
 
 from .upload_filing_test_support import (
     TrackingBatchingRepository,
@@ -1003,17 +1002,16 @@ async def test_upload_filing_consumes_fresh_authoritative_file_selection(
         tmp_path,
         converter_calls=calls,
     )
-    raw_file = tmp_path / "raw.pdf"
     authoritative_file = tmp_path / "authoritative.docx"
-    raw_file.write_bytes(b"raw")
     authoritative_file.write_bytes(b"authoritative")
     request = _validated_sec_filing_request(
         pipeline=pipeline,
-        filing_file=raw_file,
+        filing_file=authoritative_file,
         action="create",
         company_name="Apple Inc.",
     )
     owner_validator = sec_upload_workflow.validate_fins_upload_filing_request
+    validator_calls: list[FinsUploadFilingRequest] = []
 
     def authoritative_validator(
         raw_request: FinsUploadFilingRequest,
@@ -1033,14 +1031,8 @@ async def test_upload_filing_consumes_fresh_authoritative_file_selection(
             FinsUploadUsageError: owner validator 拒绝请求时抛出。
         """
 
-        validated = owner_validator(raw_request, published_state=published_state)
-        return replace(
-            validated,
-            file_selection=FinsUploadFilingFiles.for_upsert(
-                primary=authoritative_file,
-                companions=(),
-            ),
-        )
+        validator_calls.append(raw_request)
+        return owner_validator(raw_request, published_state=published_state)
 
     monkeypatch.setattr(
         sec_upload_workflow,
@@ -1058,6 +1050,7 @@ async def test_upload_filing_consumes_fresh_authoritative_file_selection(
     )
     stored_names = sorted(item.uri.rsplit("/", maxsplit=1)[-1] for item in pipeline._blob_repository.list_files(handle))
 
+    assert validator_calls == [request.request]
     assert calls == ["authoritative.docx"]
     original_identity = _build_filing_original_asset_identity(authoritative_file.resolve(strict=False))
     assert stored_names == sorted((original_identity, f"{original_identity}_docling.json"))
@@ -1320,13 +1313,13 @@ async def test_upload_filing_corrupt_primary_with_valid_companions_fails_atomica
         action="create",
         company_name="Apple Inc.",
     )
-    request = replace(
-        first_request,
-        request=replace(
+    request = sec_upload_workflow.validate_fins_upload_filing_request(
+        replace(
             first_request.request,
             files=(corrupt_file, companion_file, later_file),
             primary_selectors=(corrupt_file,),
         ),
+        published_state=first_request.published_state,
     )
 
     with caplog.at_level("ERROR"):
@@ -1501,21 +1494,24 @@ async def test_upload_filing_authoritative_identity_mismatch_fails_closed(
         *,
         published_state: FilingUploadPublishedState,
     ) -> ValidatedFinsUploadFilingRequest:
-        """返回仅 document identity 漂移的 validator 结果。
+        """返回仅 internal document identity 漂移的 validator 结果。
 
         Args:
             raw_request: immutable raw filing request。
             published_state: workflow fresh snapshot。
 
         Returns:
-            document ID 被注入漂移的 validated request。
+            internal document ID 被注入漂移的 validated request。
 
         Raises:
             FinsUploadUsageError: owner validator 拒绝请求时抛出。
         """
 
         validated = owner_validator(raw_request, published_state=published_state)
-        return replace(validated, document_id=f"{validated.document_id}-mismatch")
+        return replace(
+            validated,
+            internal_document_id=f"{validated.internal_document_id}-mismatch",
+        )
 
     monkeypatch.setattr(
         sec_upload_workflow,

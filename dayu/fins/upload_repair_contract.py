@@ -1,4 +1,4 @@
-"""既有 filing source 自动修复的共享 immutable contract。"""
+"""既有 filing source 自动修复授权的共享不可变契约。"""
 
 from __future__ import annotations
 
@@ -14,25 +14,16 @@ from dayu.fins.storage.source_integrity import (
 
 @dataclass(frozen=True, slots=True)
 class NoExistingSourceRepair:
-    """本次 filing 上传不需要修复既有 source。"""
+    """声明本次上传不包含既有 source 自动修复授权。
+
+    Attributes:
+        kind: 稳定 typed discriminator。
+    """
 
     kind: Literal["not_required"] = "not_required"
 
-
-@dataclass(frozen=True, slots=True)
-class ExistingSourceAutoRepair:
-    """validator 授权的既有 filing source 自动修复。
-
-    Attributes:
-        expected_integrity: Phase A 读取的 exact repair-required filing 状态。
-        kind: immutable union discriminator。
-    """
-
-    expected_integrity: SourceIntegrityClassification
-    kind: Literal["existing_source_auto_repair"] = "existing_source_auto_repair"
-
     def __post_init__(self) -> None:
-        """校验 expected integrity 可作为 filing repair authority。
+        """校验 no-repair discriminator。
 
         Args:
             无。
@@ -41,9 +32,43 @@ class ExistingSourceAutoRepair:
             无。
 
         Raises:
-            ValueError: expected integrity 不是携带可信 revision 的待修复 filing 时抛出。
+            ValueError: discriminator 不是唯一允许值时抛出。
         """
 
+        if self.kind != "not_required":
+            raise ValueError("no-repair kind 必须是 not_required")
+
+
+@dataclass(frozen=True, slots=True)
+class ExistingSourceAutoRepair:
+    """授权修复一个已有且具有可信 revision 的 filing source。
+
+    Attributes:
+        expected_integrity: validator 读取的 exact published target 完整性事实。
+        kind: 稳定 typed discriminator。
+    """
+
+    expected_integrity: SourceIntegrityClassification
+    kind: Literal["existing_source_auto_repair"] = "existing_source_auto_repair"
+
+    def __post_init__(self) -> None:
+        """校验授权目标是可比较的既有 filing repair target。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            TypeError: expected integrity 类型不符合契约时抛出。
+            ValueError: discriminator、source kind、状态或 revision 不符合契约时抛出。
+        """
+
+        if not isinstance(self.expected_integrity, SourceIntegrityClassification):
+            raise TypeError("expected_integrity 必须是 SourceIntegrityClassification")
+        if self.kind != "existing_source_auto_repair":
+            raise ValueError("auto-repair kind 必须是 existing_source_auto_repair")
         if (
             self.expected_integrity.source_kind is not SourceKind.FILING
             or self.expected_integrity.status is not SourceIntegrityStatus.REPAIR_REQUIRED
@@ -52,7 +77,9 @@ class ExistingSourceAutoRepair:
             raise ValueError("existing source auto repair 必须引用 REPAIR_REQUIRED filing")
 
 
-ExistingSourceRepairDisposition: TypeAlias = NoExistingSourceRepair | ExistingSourceAutoRepair
+ExistingSourceRepairDisposition: TypeAlias = (
+    NoExistingSourceRepair | ExistingSourceAutoRepair
+)
 """既有 source repair disposition 的封闭联合。"""
 
 

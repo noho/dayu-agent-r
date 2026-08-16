@@ -884,12 +884,6 @@ def _classify_role_projection(
     ):
         return None
     original_names = [item.inspected.descriptor.name for item in originals]
-    original_filenames = [
-        cast(str, item.original_filename)
-        for item in originals
-    ]
-    if len(set(original_filenames)) != len(original_filenames):
-        return None
     docling_file = docling_files[0]
     if docling_file.derived_from is None or docling_file.original_filename is None:
         return None
@@ -898,18 +892,22 @@ def _classify_role_projection(
         for item in originals
         if item.inspected.descriptor.name == docling_file.derived_from
     ]
-    filename_matches = [
-        item
-        for item in originals
-        if item.original_filename == docling_file.original_filename
-    ]
-    if len(derived_matches) == 1 and len(filename_matches) == 1:
-        if derived_matches[0] != filename_matches[0]:
-            return None
-    elif len(derived_matches) == 1 or len(filename_matches) == 1:
-        reasons.append(SourceIntegrityReason.DERIVED_PROJECTION_MISMATCH)
+    if len(derived_matches) == 1:
+        # storage name 是 authoritative asset identity；basename 只校验该 exact
+        # identity 的用户可读投影，不能用来要求不同 authoritative assets 全局唯一。
+        if derived_matches[0].original_filename != docling_file.original_filename:
+            reasons.append(SourceIntegrityReason.DERIVED_PROJECTION_MISMATCH)
     else:
-        return None
+        filename_matches = [
+            item
+            for item in originals
+            if item.original_filename == docling_file.original_filename
+        ]
+        # exact derived identity 损坏时，只允许唯一 basename 提供 repairable
+        # projection；同 basename 命中多个 assets 仍是无法安全归属的结构歧义。
+        if len(filename_matches) != 1:
+            return None
+        reasons.append(SourceIntegrityReason.DERIVED_PROJECTION_MISMATCH)
     docling_name = docling_file.inspected.descriptor.name
     if primary != docling_name:
         reasons.append(SourceIntegrityReason.PRIMARY_PROJECTION_MISMATCH)

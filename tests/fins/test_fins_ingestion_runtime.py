@@ -76,6 +76,7 @@ from dayu.fins.ingestion.observation_handle import (
 from dayu.fins.domain.document_models import (
     BatchToken,
     CompanyMeta,
+    FileObjectMeta,
     FinsSourceProvider,
     FinsIngestMethod,
     ProcessedCreateRequest,
@@ -119,13 +120,19 @@ from dayu.fins.upload_failure import (
     FinsUploadFailureCode,
     FinsUploadFailureKind,
     FinsUploadFailureReason,
+    FinsUploadPrevalidationError,
     fins_upload_failure_from_exception,
+    fins_upload_source_integrity_unsafe_failure,
     upload_failure_reason_from_json,
 )
 from dayu.fins.upload_format_contract import (
     FinsUploadFilingFiles,
     FinsUploadFormatError,
     FinsUploadFormatFailureKind,
+)
+from dayu.fins.upload_repair_contract import (
+    ExistingSourceAutoRepair,
+    NoExistingSourceRepair,
 )
 from dayu.fins.pipelines.cn_pipeline import CnDownloadAdapter, CnPipeline
 from dayu.fins.pipelines.docling_process_converter import (
@@ -162,6 +169,7 @@ from dayu.fins.storage import (
     FilingUploadPublishedState,
     FilingUploadStateRepositoryProtocol,
     SourceIntegrityClassification,
+    SourceIntegrityReason,
     SourceIntegrityStatus,
     SourceDocumentRepositoryProtocol,
 )
@@ -175,18 +183,71 @@ from dayu.runtime.workspace_paths import WorkspacePaths
 _PUBLISHED_SOURCE_REVISION_TOKEN = "test-published-source-revision"
 
 
+def _fresh_filing_file_entries(
+    original_meta: FileObjectMeta,
+    docling_meta: FileObjectMeta,
+    *,
+    original_name: str,
+    docling_name: str,
+) -> list[dict[str, JsonValue]]:
+    """构造 fresh user-upload filing 的 explicit original/Docling entries。
+
+    Args:
+        original_meta: 已 staged 的 authoritative original blob meta。
+        docling_meta: 已 staged 的唯一 primary Docling blob meta。
+        original_name: storage-owned original asset name。
+        docling_name: storage-owned Docling asset name。
+
+    Returns:
+        可直接交给 source mutation owner 的严格 file entry 列表。
+
+    Raises:
+        无。
+    """
+
+    return [
+        {
+            "name": original_name,
+            "uri": original_meta.uri,
+            "etag": original_meta.etag,
+            "last_modified": original_meta.last_modified,
+            "size": original_meta.size,
+            "content_type": original_meta.content_type,
+            "sha256": original_meta.sha256,
+            "source": "original",
+            "original_filename": original_name,
+        },
+        {
+            "name": docling_name,
+            "uri": docling_meta.uri,
+            "etag": docling_meta.etag,
+            "last_modified": docling_meta.last_modified,
+            "size": docling_meta.size,
+            "content_type": docling_meta.content_type,
+            "sha256": docling_meta.sha256,
+            "source": "docling",
+            "original_filename": original_name,
+            "derived_from": original_name,
+        },
+    ]
+
+
 def _filing_upload_published_state(
     request: FinsUploadFilingRequest,
     *,
     company_meta: CompanyMeta | None = None,
     source_meta: Mapping[str, JsonValue] | None = None,
+    status: SourceIntegrityStatus,
+    reasons: tuple[SourceIntegrityReason, ...],
 ) -> FilingUploadPublishedState:
     """为 request 构造 target 与 meta presence 精确匹配的 published state。
 
     Args:
         request: 需要静态解析 exact ticker 与 filing document ID 的原始请求。
         company_meta: 可选同版 company meta。
-        source_meta: 可选完整 source business meta。
+        source_meta: 可选可信 source business meta。
+        status: 显式完整性状态。
+        reasons: repair-required 或 unsafe 状态的 closed reasons。
 
     Returns:
         required integrity 与 source meta presence 一致的测试 state。
@@ -203,15 +264,14 @@ def _filing_upload_published_state(
         document_id=document_id,
         revision=(
             None
-            if source_meta is None
+            if status in {
+                SourceIntegrityStatus.MISSING,
+                SourceIntegrityStatus.UNSAFE,
+            }
             else SourceDocumentRevision(_PUBLISHED_SOURCE_REVISION_TOKEN)
         ),
-        status=(
-            SourceIntegrityStatus.MISSING
-            if source_meta is None
-            else SourceIntegrityStatus.COMPLETE
-        ),
-        reasons=(),
+        status=status,
+        reasons=reasons,
     )
     return FilingUploadPublishedState(
         company_meta=company_meta,
@@ -1221,6 +1281,8 @@ def test_upload_validator_accepts_v_dot_ba_alias_from_identity_grammar() -> None
         published_state=_filing_upload_published_state(
             request,
             source_meta={"source_fingerprint": "published"},
+            status=SourceIntegrityStatus.COMPLETE,
+            reasons=(),
         ),
     )
 
@@ -1303,6 +1365,7 @@ def test_fins_upload_usage_failure_mapping_is_closed_bounded_and_path_free() -> 
         "company_name_required",
         "create_target_exists",
         "update_target_missing",
+        "existing_source_repair_requires_auto",
     }
     assert {code.value for code in FinsUploadUsageCode} == expected_codes
     exact_messages = {
@@ -1324,6 +1387,9 @@ def test_fins_upload_usage_failure_mapping_is_closed_bounded_and_path_free() -> 
         FinsUploadUsageCode.INVALID_REPORT_DATE: "报告期日期（report_date）必须是实际存在的 YYYY-MM-DD 日期",
         FinsUploadUsageCode.FISCAL_PERIOD_TOO_LONG: "--fiscal-period 长度不能超过 240 个字符",
         FinsUploadUsageCode.UNSUPPORTED_CN_FISCAL_PERIOD: "CN/HK --fiscal-period 仅支持 Q1、Q2、Q3、Q4、H1、FY",
+        FinsUploadUsageCode.EXISTING_SOURCE_REPAIR_REQUIRES_AUTO: (
+            "目标 filing 不完整；请使用 auto 并提供完整文件重新上传"
+        ),
     }
     for code in FinsUploadUsageCode:
         if code in {
@@ -1498,7 +1564,11 @@ def test_validate_fins_upload_filing_request_resolves_state_aware_contract(
         fiscal_period=" fy ",
         company_name="Apple Inc.",
     )
-    absent = _filing_upload_published_state(request)
+    absent = _filing_upload_published_state(
+        request,
+        status=SourceIntegrityStatus.MISSING,
+        reasons=(),
+    )
 
     validated = validate_fins_upload_filing_request(request, published_state=absent)
 
@@ -1512,6 +1582,7 @@ def test_validate_fins_upload_filing_request_resolves_state_aware_contract(
         primary=upload_file.resolve(strict=False),
         companions=(),
     )
+    assert isinstance(validated.repair_disposition, NoExistingSourceRepair)
 
     present = _filing_upload_published_state(
         request,
@@ -1523,6 +1594,8 @@ def test_validate_fins_upload_filing_request_resolves_state_aware_contract(
             updated_at="2026-08-15T00:00:00+00:00",
         ),
         source_meta={"source_fingerprint": "old"},
+        status=SourceIntegrityStatus.COMPLETE,
+        reasons=(),
     )
     updated = validate_fins_upload_filing_request(
         replace(request, company_name=None),
@@ -1534,6 +1607,348 @@ def test_validate_fins_upload_filing_request_resolves_state_aware_contract(
         primary=upload_file.resolve(strict=False),
         companions=(),
     )
+    assert isinstance(updated.repair_disposition, NoExistingSourceRepair)
+
+
+@pytest.mark.parametrize("overwrite", (False, True))
+@pytest.mark.parametrize("is_deleted", (False, True))
+def test_filing_validator_authorizes_only_complete_auto_repair_selection(
+    tmp_path: Path,
+    overwrite: bool,
+    is_deleted: bool,
+) -> None:
+    """repair-required + exact auto 必须固定 update 并保留完整 authoritative selection。
+
+    Args:
+        tmp_path: 用于创建 primary 与 companion 输入文件。
+        overwrite: 不得扩大或缩小 repair 资格的覆盖标志。
+        is_deleted: 既有 source 的 logical deletion 状态。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: repair eligibility、selection 或 deleted/overwrite 语义漂移时抛出。
+    """
+
+    companion = tmp_path / "schema.xsd"
+    primary = tmp_path / "report.html"
+    companion.write_text("schema", encoding="utf-8")
+    primary.write_text("report", encoding="utf-8")
+    request = FinsUploadFilingRequest(
+        ticker="aapl.us",
+        action="auto",
+        files=(companion, primary),
+        primary_selectors=(primary,),
+        fiscal_year=2024,
+        fiscal_period="FY",
+        company_name="Apple Inc.",
+        overwrite=overwrite,
+    )
+    published_state = _filing_upload_published_state(
+        request,
+        source_meta={
+            "is_deleted": is_deleted,
+            "deleted_at": "2026-08-15T00:00:00+00:00" if is_deleted else None,
+            "source_fingerprint": "published",
+        },
+        status=SourceIntegrityStatus.REPAIR_REQUIRED,
+        reasons=(SourceIntegrityReason.DECLARED_FILE_MISSING,),
+    )
+
+    validated = validate_fins_upload_filing_request(
+        request,
+        published_state=published_state,
+    )
+
+    assert validated.resolved_action == "update"
+    assert validated.file_selection.primary == primary.resolve(strict=False)
+    assert validated.file_selection.companions == (companion.resolve(strict=False),)
+    assert isinstance(validated.repair_disposition, ExistingSourceAutoRepair)
+    assert (
+        validated.repair_disposition.expected_integrity
+        is published_state.source_integrity
+    )
+
+
+@pytest.mark.parametrize("action", ("create", "update", "delete", "AUTO", " auto "))
+def test_filing_validator_repair_required_non_exact_auto_precedes_company_decision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+) -> None:
+    """repair-required 的非 exact-auto 动作必须返回唯一 usage failure。
+
+    Args:
+        tmp_path: 用于创建 upsert 输入文件。
+        monkeypatch: 用于证明 company decision 尚未解析。
+        action: 当前 requested action。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: precedence、code 或文案漂移时抛出。
+    """
+
+    upload_file = tmp_path / "report.pdf"
+    upload_file.write_bytes(b"report")
+    request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        action=action,
+        files=() if action == "delete" else (upload_file,),
+        fiscal_year=2024,
+        fiscal_period="FY",
+        company_name="Apple Inc.",
+    )
+    published_state = _filing_upload_published_state(
+        request,
+        source_meta={"is_deleted": False, "source_fingerprint": "published"},
+        status=SourceIntegrityStatus.REPAIR_REQUIRED,
+        reasons=(SourceIntegrityReason.DECLARED_FILE_MISSING,),
+    )
+    monkeypatch.setattr(
+        ingestion_runtime,
+        "resolve_upload_company_meta_decision",
+        pytest.fail,
+    )
+
+    with pytest.raises(FinsUploadUsageError) as exc_info:
+        validate_fins_upload_filing_request(request, published_state=published_state)
+
+    assert (
+        exc_info.value.failure.code
+        is FinsUploadUsageCode.EXISTING_SOURCE_REPAIR_REQUIRES_AUTO
+    )
+    assert (
+        exc_info.value.failure.message
+        == "目标 filing 不完整；请使用 auto 并提供完整文件重新上传"
+    )
+
+
+@pytest.mark.parametrize("action", ("auto", "create", "update", "delete"))
+def test_filing_validator_unsafe_prevalidation_precedes_action_and_company(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+) -> None:
+    """UNSAFE 必须在 action resolution 与 company decision 前产生 typed failure。
+
+    Args:
+        tmp_path: 用于创建 upsert 输入文件。
+        monkeypatch: 用于禁止下游 action/company owner 调用。
+        action: 当前合法 requested action。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: UNSAFE precedence 或 path-free failure 漂移时抛出。
+    """
+
+    upload_file = tmp_path / "report.pdf"
+    upload_file.write_bytes(b"report")
+    request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        action=action,
+        files=() if action == "delete" else (upload_file,),
+        fiscal_year=2024,
+        fiscal_period="FY",
+        company_name="Apple Inc.",
+    )
+    published_state = _filing_upload_published_state(
+        request,
+        source_meta=None,
+        status=SourceIntegrityStatus.UNSAFE,
+        reasons=(SourceIntegrityReason.META_UNTRUSTED,),
+    )
+    monkeypatch.setattr(ingestion_runtime, "resolve_upload_action", pytest.fail)
+    monkeypatch.setattr(
+        ingestion_runtime,
+        "resolve_upload_company_meta_decision",
+        pytest.fail,
+    )
+
+    with pytest.raises(FinsUploadPrevalidationError) as exc_info:
+        validate_fins_upload_filing_request(request, published_state=published_state)
+
+    assert exc_info.value.failure == fins_upload_source_integrity_unsafe_failure()
+    assert str(tmp_path) not in exc_info.value.failure.message
+    assert _PUBLISHED_SOURCE_REVISION_TOKEN not in repr(exc_info.value.failure)
+
+
+def test_validated_filing_repair_contract_rejects_incomplete_selection_and_target(
+    tmp_path: Path,
+) -> None:
+    """validated repair contract 必须拒绝 empty/incomplete selection 与 expected target 错配。
+
+    Args:
+        tmp_path: 用于创建多文件 authoritative selection。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: direct constructor 可以绕过 validator repair contract 时抛出。
+    """
+
+    primary = tmp_path / "report.pdf"
+    companion = tmp_path / "notes.txt"
+    primary.write_bytes(b"primary")
+    companion.write_text("notes", encoding="utf-8")
+    request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        action="auto",
+        files=(primary, companion),
+        primary_selectors=(primary,),
+        fiscal_year=2024,
+        fiscal_period="FY",
+        company_name="Apple Inc.",
+    )
+    published_state = _filing_upload_published_state(
+        request,
+        source_meta={"source_fingerprint": "published"},
+        status=SourceIntegrityStatus.REPAIR_REQUIRED,
+        reasons=(SourceIntegrityReason.DECLARED_FILE_MISSING,),
+    )
+    validated = validate_fins_upload_filing_request(
+        request,
+        published_state=published_state,
+    )
+
+    with pytest.raises(ValueError, match="非空完整"):
+        replace(validated, file_selection=FinsUploadFilingFiles.for_delete())
+    with pytest.raises(ValueError, match="不完整一致"):
+        replace(
+            validated,
+            file_selection=FinsUploadFilingFiles.for_upsert(
+                primary=primary.resolve(strict=False),
+                companions=(),
+            ),
+        )
+    with pytest.raises(ValueError, match="duplicate_file_path"):
+        replace(
+            validated,
+            request=replace(
+                request,
+                files=(primary, primary),
+                primary_selectors=(primary,),
+            ),
+        )
+    mismatched_integrity = replace(
+        published_state.source_integrity,
+        document_id="other-filing",
+    )
+    with pytest.raises(ValueError, match="expected target"):
+        replace(
+            validated,
+            repair_disposition=ExistingSourceAutoRepair(
+                expected_integrity=mismatched_integrity
+            ),
+        )
+
+
+@pytest.mark.parametrize("target_field", ("ticker", "document_id"))
+def test_filing_validator_rejects_published_target_identity_mismatch(
+    tmp_path: Path,
+    target_field: str,
+) -> None:
+    """validator 必须在状态裁决前拒绝 storage producer 的 exact target 错配。
+
+    Args:
+        tmp_path: 用于创建合法静态输入。
+        target_field: 当前故意错配的 classification identity 字段。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: validator 接受 ticker/document identity 漂移时抛出。
+    """
+
+    upload_file = tmp_path / "report.pdf"
+    upload_file.write_bytes(b"report")
+    request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        files=(upload_file,),
+        fiscal_year=2024,
+        fiscal_period="FY",
+        company_name="Apple Inc.",
+    )
+    valid_state = _filing_upload_published_state(
+        request,
+        status=SourceIntegrityStatus.MISSING,
+        reasons=(),
+    )
+    replacement = "MSFT" if target_field == "ticker" else "other-filing"
+    mismatched_state = replace(
+        valid_state,
+        source_integrity=replace(
+            valid_state.source_integrity,
+            **{target_field: replacement},
+        ),
+    )
+
+    with pytest.raises(ValueError, match="expected target"):
+        validate_fins_upload_filing_request(request, published_state=mismatched_state)
+
+
+def test_raw_runtime_unsafe_prevalidation_creates_no_job_observation_or_mutation(
+    tmp_path: Path,
+) -> None:
+    """raw runtime job/observation start 必须原样抛 typed failure 且零持久化。
+
+    Args:
+        tmp_path: 用于创建输入文件与隔离 workspace。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: prevalidation 被 generic 化或创建 job/observation/runner mutation 时抛出。
+    """
+
+    upload_file = tmp_path / "report.pdf"
+    upload_file.write_bytes(b"report")
+    request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        action="auto",
+        files=(upload_file,),
+        fiscal_year=2024,
+        fiscal_period="FY",
+        company_name="Apple Inc.",
+    )
+    unsafe_state = _filing_upload_published_state(
+        request,
+        source_meta=None,
+        status=SourceIntegrityStatus.UNSAFE,
+        reasons=(SourceIntegrityReason.META_UNTRUSTED,),
+    )
+    workspace_root = tmp_path / "runtime-workspace"
+    runtime, executor, state_repository, runner = _build_fixed_state_guarded_runtime(
+        workspace_root,
+        unsafe_state,
+    )
+    before = _snapshot_runtime_workspace_tree(workspace_root)
+
+    with pytest.raises(FinsUploadPrevalidationError) as job_exc:
+        runtime.start_upload(request)
+    with pytest.raises(FinsUploadPrevalidationError) as observation_exc:
+        runtime.prepare_observed_upload(request, _NeverCancelledToken())
+
+    expected_failure = fins_upload_source_integrity_unsafe_failure()
+    assert job_exc.value.failure == expected_failure
+    assert observation_exc.value.failure == expected_failure
+    assert state_repository.calls == [
+        (unsafe_state.source_integrity.ticker, unsafe_state.source_integrity.document_id),
+        (unsafe_state.source_integrity.ticker, unsafe_state.source_integrity.document_id),
+    ]
+    assert executor.operations == []
+    assert runner.requests == []
+    assert runtime._observations == {}
+    assert _snapshot_runtime_workspace_tree(workspace_root) == before
+    jobs_root = workspace_root / ".dayu" / "fins_ingestion" / "jobs"
+    assert not jobs_root.exists() or tuple(jobs_root.glob("*.json")) == ()
 
 
 def test_filing_validator_builds_role_selection_and_typed_delete_empty(
@@ -1565,7 +1980,11 @@ def test_filing_validator_builds_role_selection_and_typed_delete_empty(
     )
     upsert = validate_fins_upload_filing_request(
         upsert_request,
-        published_state=_filing_upload_published_state(upsert_request),
+        published_state=_filing_upload_published_state(
+            upsert_request,
+            status=SourceIntegrityStatus.MISSING,
+            reasons=(),
+        ),
     )
 
     assert upsert.file_selection.primary == primary.resolve(strict=False)
@@ -1587,6 +2006,8 @@ def test_filing_validator_builds_role_selection_and_typed_delete_empty(
         published_state=_filing_upload_published_state(
             delete_request,
             source_meta={"source_fingerprint": "published"},
+            status=SourceIntegrityStatus.COMPLETE,
+            reasons=(),
         ),
     )
     assert deleted.resolved_action == "delete"
@@ -1627,7 +2048,11 @@ def test_filing_validator_selects_explicit_primary_at_any_position(
 
     validated = validate_fins_upload_filing_request(
         request,
-        published_state=_filing_upload_published_state(request),
+        published_state=_filing_upload_published_state(
+            request,
+            status=SourceIntegrityStatus.MISSING,
+            reasons=(),
+        ),
     )
 
     normalized_files = tuple(path.resolve(strict=False) for path in files)
@@ -2029,11 +2454,16 @@ def test_filing_path_identity_is_case_sensitive_and_does_not_merge_hardlinks(
     assert ingestion_runtime._fins_upload_path_identity(Path("/tmp/Report.pdf")) != (
         ingestion_runtime._fins_upload_path_identity(Path("/tmp/report.pdf"))
     )
+    case_request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        files=(Path("/tmp/report.pdf"),),
+        primary_selectors=(Path("/tmp/Report.pdf"),),
+        fiscal_year=2024,
+        fiscal_period="FY",
+        company_name="Apple Inc.",
+    )
     with pytest.raises(FinsUploadUsageError) as case_exc:
-        ingestion_runtime._select_fins_upload_filing_files(
-            files=(Path("/tmp/report.pdf"),),
-            primary_selectors=(Path("/tmp/Report.pdf"),),
-        )
+        ingestion_runtime._filing_upload_request_identity(case_request)
     assert case_exc.value.failure.code is FinsUploadUsageCode.PRIMARY_NOT_IN_FILES
 
     original = tmp_path / "original.pdf"
@@ -2051,7 +2481,11 @@ def test_filing_path_identity_is_case_sensitive_and_does_not_merge_hardlinks(
 
     validated = validate_fins_upload_filing_request(
         request,
-        published_state=_filing_upload_published_state(request),
+        published_state=_filing_upload_published_state(
+            request,
+            status=SourceIntegrityStatus.MISSING,
+            reasons=(),
+        ),
     )
 
     assert validated.file_selection.primary == linked.resolve(strict=False)
@@ -2093,7 +2527,11 @@ def test_filing_distinct_same_basename_and_same_stem_paths_are_accepted(
 
     validated = validate_fins_upload_filing_request(
         request,
-        published_state=_filing_upload_published_state(request),
+        published_state=_filing_upload_published_state(
+            request,
+            status=SourceIntegrityStatus.MISSING,
+            reasons=(),
+        ),
     )
 
     assert validated.file_selection.primary == second.resolve(strict=False)
@@ -2131,7 +2569,11 @@ def test_filing_file_count_limit_counts_raw_entries_before_duplicates(
     )
     accepted = validate_fins_upload_filing_request(
         request,
-        published_state=_filing_upload_published_state(request),
+        published_state=_filing_upload_published_state(
+            request,
+            status=SourceIntegrityStatus.MISSING,
+            reasons=(),
+        ),
     )
     assert len(accepted.file_selection.ordered_files) == 100
     assert accepted.file_selection.primary == files[-1].resolve(strict=False)
@@ -2179,7 +2621,11 @@ def test_filing_explicit_roles_control_primary_and_companion_suffixes(
 
     validated = validate_fins_upload_filing_request(
         request,
-        published_state=_filing_upload_published_state(request),
+        published_state=_filing_upload_published_state(
+            request,
+            status=SourceIntegrityStatus.MISSING,
+            reasons=(),
+        ),
     )
 
     assert validated.file_selection.primary == primary.resolve(strict=False)
@@ -2216,7 +2662,11 @@ def test_filing_validator_rejects_unsupported_primary_with_role_specific_usage(
     with pytest.raises(FinsUploadUsageError) as exc_info:
         validate_fins_upload_filing_request(
             request,
-            published_state=_filing_upload_published_state(request),
+            published_state=_filing_upload_published_state(
+                request,
+                status=SourceIntegrityStatus.MISSING,
+                reasons=(),
+            ),
         )
 
     failure = exc_info.value.failure
@@ -2254,7 +2704,11 @@ def test_filing_validator_keeps_long_canonical_label_with_bounded_usage_message(
     with pytest.raises(FinsUploadUsageError) as exc_info:
         validate_fins_upload_filing_request(
             request,
-            published_state=_filing_upload_published_state(request),
+            published_state=_filing_upload_published_state(
+                request,
+                status=SourceIntegrityStatus.MISSING,
+                reasons=(),
+            ),
         )
 
     failure = exc_info.value.failure
@@ -2354,6 +2808,8 @@ def test_upload_validator_does_not_project_identity_mismatch_as_company_name_req
                 request,
                 company_meta=mismatched_meta,
                 source_meta=None,
+                status=SourceIntegrityStatus.MISSING,
+                reasons=(),
             ),
         )
 
@@ -2393,7 +2849,11 @@ def test_validate_fins_upload_filing_request_rejects_missing_explicit_update(
     with pytest.raises(FinsUploadUsageError) as exc_info:
         validate_fins_upload_filing_request(
             request,
-            published_state=_filing_upload_published_state(request),
+            published_state=_filing_upload_published_state(
+                request,
+                status=SourceIntegrityStatus.MISSING,
+                reasons=(),
+            ),
         )
 
     assert exc_info.value.failure.code is FinsUploadUsageCode.UPDATE_TARGET_MISSING
@@ -2440,6 +2900,8 @@ def test_validate_fins_upload_filing_request_limits_create_overwrite_to_existing
     published_state = _filing_upload_published_state(
         request,
         source_meta={"is_deleted": False, "source_fingerprint": "published"},
+        status=SourceIntegrityStatus.COMPLETE,
+        reasons=(),
     )
 
     if expected_code is not None:
@@ -2482,6 +2944,8 @@ def test_validate_fins_upload_filing_request_keeps_deleted_auto_identity_filenam
     deleted_state = _filing_upload_published_state(
         original_request,
         source_meta={"is_deleted": True, "source_fingerprint": "published"},
+        status=SourceIntegrityStatus.COMPLETE,
+        reasons=(),
     )
 
     original = validate_fins_upload_filing_request(
@@ -2569,7 +3033,11 @@ def test_validate_fins_upload_filing_request_preserves_validation_priority(
     with pytest.raises(FinsUploadUsageError) as exc_info:
         validate_fins_upload_filing_request(
             upload_request,
-            published_state=_filing_upload_published_state(upload_request),
+            published_state=_filing_upload_published_state(
+                upload_request,
+                status=SourceIntegrityStatus.MISSING,
+                reasons=(),
+            ),
         )
     assert exc_info.value.failure.code is expected_code
 
@@ -3823,17 +4291,26 @@ class _BlockingArtifactUploadRunner(FinsUploadRunner):
         raw_request = request.request if isinstance(request, ValidatedFinsUploadFilingRequest) else request
         batch = self.batching_repository.begin_batch(raw_request.ticker)
         try:
-            filename = f"{self.document_id}.md"
-            file_meta = self.blob_repository.store_file(
-                SourceHandle(
-                    ticker=raw_request.ticker,
-                    document_id=self.document_id,
-                    source_kind=SourceKind.FILING.value,
-                ),
-                filename,
+            original_name = f"{self.document_id}.md"
+            docling_name = f"{self.document_id}_docling.json"
+            handle = SourceHandle(
+                ticker=raw_request.ticker,
+                document_id=self.document_id,
+                source_kind=SourceKind.FILING.value,
+            )
+            original_meta = self.blob_repository.store_file(
+                handle,
+                original_name,
                 io.BytesIO(b"# observed upload fixture"),
                 batch=batch,
                 content_type="text/markdown",
+            )
+            docling_meta = self.blob_repository.store_file(
+                handle,
+                docling_name,
+                io.BytesIO(_fixture_docling_json_bytes()),
+                batch=batch,
+                content_type="application/json",
             )
             self.source_repository.create_source_document(
                 SourceDocumentUpsertRequest(
@@ -3841,7 +4318,7 @@ class _BlockingArtifactUploadRunner(FinsUploadRunner):
                     document_id=self.document_id,
                     internal_document_id=self.document_id,
                     form_type="10-K",
-                    primary_document=filename,
+                    primary_document=docling_name,
                     meta={
                         "fiscal_year": 2024,
                         "fiscal_period": "FY",
@@ -3851,7 +4328,12 @@ class _BlockingArtifactUploadRunner(FinsUploadRunner):
                         "ingest_method": "upload",
                         "source_provider": FinsSourceProvider.USER_UPLOAD.to_storage_value(),
                     },
-                    files=[file_meta],
+                    file_entries=_fresh_filing_file_entries(
+                        original_meta,
+                        docling_meta,
+                        original_name=original_name,
+                        docling_name=docling_name,
+                    ),
                 ),
                 SourceKind.FILING,
                 batch=batch,
@@ -3870,7 +4352,7 @@ class _BlockingArtifactUploadRunner(FinsUploadRunner):
             status="ok",
             requested_file_count=1,
             stored_file_count=1,
-            primary_document=f"{self.document_id}.md",
+            primary_document=f"{self.document_id}_docling.json",
         )
 
 
@@ -6489,12 +6971,19 @@ def test_preprocess_request_round_trips_hierarchical_document_id_through_storage
         document_id=document_id,
         source_kind=SourceKind.FILING.value,
     )
-    file_meta = blob.store_file(
+    original_meta = blob.store_file(
         handle,
         "report.md",
         io.BytesIO(_fixture_markdown().encode("utf-8")),
         batch=batch,
         content_type="text/markdown",
+    )
+    docling_meta = blob.store_file(
+        handle,
+        "report_docling.json",
+        io.BytesIO(_fixture_docling_json_bytes()),
+        batch=batch,
+        content_type="application/json",
     )
     source.create_source_document(
         SourceDocumentUpsertRequest(
@@ -6502,8 +6991,13 @@ def test_preprocess_request_round_trips_hierarchical_document_id_through_storage
             document_id=document_id,
             internal_document_id=document_id,
             form_type="10-K",
-            primary_document="report.md",
-            files=[file_meta],
+            primary_document="report_docling.json",
+            file_entries=_fresh_filing_file_entries(
+                original_meta,
+                docling_meta,
+                original_name="report.md",
+                docling_name="report_docling.json",
+            ),
             meta={
                 "ingest_method": FinsIngestMethod.UPLOAD.to_storage_value(),
                 "source_provider": FinsSourceProvider.USER_UPLOAD.to_storage_value(),
@@ -10123,6 +10617,50 @@ class _ForbiddenFilingUploadStateRepository:
         raise AssertionError("calendar/year static admission 前禁止读取 filing state")
 
 
+class _FixedFilingUploadStateRepository:
+    """返回显式 typed published state 的 runtime prevalidation fixture。"""
+
+    state: FilingUploadPublishedState
+    calls: list[tuple[str, str]]
+
+    def __init__(self, state: FilingUploadPublishedState) -> None:
+        """初始化固定 state 与调用记录。
+
+        Args:
+            state: 已显式构造 classification 的 published state。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.state = state
+        self.calls = []
+
+    def read_filing_upload_state(
+        self,
+        ticker: str,
+        document_id: str,
+    ) -> FilingUploadPublishedState:
+        """返回固定 state，不读取 raw meta 或 filesystem。
+
+        Args:
+            ticker: runtime 请求的 canonical ticker。
+            document_id: runtime 请求的 exact filing document ID。
+
+        Returns:
+            初始化时传入的 typed published state。
+
+        Raises:
+            无。
+        """
+
+        self.calls.append((ticker, document_id))
+        return self.state
+
+
 class _ForbiddenUploadRunner(FinsUploadRunner):
     """静态 admission 测试中禁止调用的 upload runner。"""
 
@@ -10223,6 +10761,47 @@ def _build_static_admission_guarded_runtime(
             FilingUploadStateRepositoryProtocol,
             state_repository,
         ),
+        processed_repository=default_runtime.processed_repository,
+        processor_registry=default_runtime.processor_registry,
+        job_store=default_runtime.ingestion_job_store,
+        executor=executor,
+        upload_runner=runner,
+    )
+    return runtime, executor, state_repository, runner
+
+
+def _build_fixed_state_guarded_runtime(
+    workspace_root: Path,
+    state: FilingUploadPublishedState,
+) -> tuple[
+    ingestion_runtime.FinsIngestionRuntime,
+    _HoldingExecutor,
+    _FixedFilingUploadStateRepository,
+    _ForbiddenUploadRunner,
+]:
+    """构造只允许读取一个 typed state 的 prevalidation runtime。
+
+    Args:
+        workspace_root: Fins workspace 根目录。
+        state: 当前请求 exact target 的显式 published state。
+
+    Returns:
+        runtime、延迟执行器、固定 state 仓储与禁止 runner。
+
+    Raises:
+        OSError: 默认 runtime 仓储装配失败时抛出。
+    """
+
+    default_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    executor = _HoldingExecutor()
+    state_repository = _FixedFilingUploadStateRepository(state)
+    runner = _ForbiddenUploadRunner()
+    runtime = ingestion_runtime.FinsIngestionRuntime.create(
+        batching_repository=default_runtime.batching_repository,
+        source_repository=default_runtime.source_repository,
+        blob_repository=default_runtime.blob_repository,
+        filing_maintenance_repository=default_runtime.filing_maintenance_repository,
+        filing_upload_state_repository=state_repository,
         processed_repository=default_runtime.processed_repository,
         processor_registry=default_runtime.processor_registry,
         job_store=default_runtime.ingestion_job_store,
@@ -10343,18 +10922,26 @@ def _add_unmatched_source_documents(
     try:
         for index in range(count):
             document_id = f"aapl-2024-10q-{index:02d}"
-            filename = f"{document_id}.md"
+            original_name = f"{document_id}.md"
+            docling_name = f"{document_id}_docling.json"
             handle = SourceHandle(
                 ticker="AAPL",
                 document_id=document_id,
                 source_kind=SourceKind.FILING.value,
             )
-            file_meta = blob_repository.store_file(
+            original_meta = blob_repository.store_file(
                 handle,
-                filename,
+                original_name,
                 io.BytesIO(b"# Unmatched fixture"),
                 batch=token,
                 content_type="text/markdown",
+            )
+            docling_meta = blob_repository.store_file(
+                handle,
+                docling_name,
+                io.BytesIO(_fixture_docling_json_bytes()),
+                batch=token,
+                content_type="application/json",
             )
             source_repository.create_source_document(
                 SourceDocumentUpsertRequest(
@@ -10362,7 +10949,7 @@ def _add_unmatched_source_documents(
                     document_id=document_id,
                     internal_document_id=document_id,
                     form_type="10-Q",
-                    primary_document=filename,
+                    primary_document=docling_name,
                     meta={
                         "fiscal_year": 2024,
                         "fiscal_period": "Q",
@@ -10372,7 +10959,12 @@ def _add_unmatched_source_documents(
                         "ingest_method": "upload",
                         "source_provider": FinsSourceProvider.USER_UPLOAD.to_storage_value(),
                     },
-                    files=[file_meta],
+                    file_entries=_fresh_filing_file_entries(
+                        original_meta,
+                        docling_meta,
+                        original_name=original_name,
+                        docling_name=docling_name,
+                    ),
                 ),
                 SourceKind.FILING,
                 batch=token,
@@ -10578,12 +11170,21 @@ def _build_fins_workspace(
             document_id="aapl-2024-10k",
             source_kind=SourceKind.FILING.value,
         )
-        file_meta = blob_repository.store_file(
+        original_name = "aapl-2024-10k.md"
+        docling_name = "aapl-2024-10k_docling.json"
+        original_meta = blob_repository.store_file(
             handle,
-            "aapl-2024-10k.md",
+            original_name,
             io.BytesIO(_fixture_markdown().encode("utf-8")),
             batch=token,
             content_type=content_type,
+        )
+        docling_meta = blob_repository.store_file(
+            handle,
+            docling_name,
+            io.BytesIO(_fixture_docling_json_bytes()),
+            batch=token,
+            content_type="application/json",
         )
         source_repository.create_source_document(
             SourceDocumentUpsertRequest(
@@ -10591,7 +11192,7 @@ def _build_fins_workspace(
                 document_id="aapl-2024-10k",
                 internal_document_id="aapl-2024-10k",
                 form_type="10-K",
-                primary_document="aapl-2024-10k.md",
+                primary_document=docling_name,
                 meta={
                     "fiscal_year": 2024,
                     "fiscal_period": "FY",
@@ -10601,7 +11202,12 @@ def _build_fins_workspace(
                     "ingest_method": "upload",
                     "source_provider": FinsSourceProvider.USER_UPLOAD.to_storage_value(),
                 },
-                files=[file_meta],
+                file_entries=_fresh_filing_file_entries(
+                    original_meta,
+                    docling_meta,
+                    original_name=original_name,
+                    docling_name=docling_name,
+                ),
             ),
             SourceKind.FILING,
             batch=token,
@@ -10639,6 +11245,29 @@ def _fixture_markdown() -> str:
             "| Services | 100 |",
         )
     )
+
+
+def _fixture_docling_json_bytes() -> bytes:
+    """读取共享的完整 DoclingDocument 测试产物。
+
+    Args:
+        无。
+
+    Returns:
+        可由 production Fins Docling processor 解析的 JSON bytes。
+
+    Raises:
+        OSError: fixture 文件读取失败时抛出。
+    """
+
+    fixture_path = (
+        Path(__file__).parents[1]
+        / "tools"
+        / "fixtures"
+        / "documents"
+        / "sample_docling.json"
+    )
+    return fixture_path.read_bytes()
 
 
 def _is_terminal_job_status(status: FinsIngestionJobStatus) -> bool:

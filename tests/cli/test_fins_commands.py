@@ -681,12 +681,21 @@ def _seed_cli_filing_source(workspace_root: Path) -> None:
         document_id=document_id,
         source_kind=SourceKind.FILING.value,
     )
-    file_meta = blob_repository.store_file(
+    original_name = "published.txt"
+    docling_name = "published_docling.json"
+    original_meta = blob_repository.store_file(
         handle,
-        "published.txt",
+        original_name,
         io.BytesIO(b"published"),
         batch=batch,
         content_type="text/plain",
+    )
+    docling_meta = blob_repository.store_file(
+        handle,
+        docling_name,
+        io.BytesIO(b'{"schema_name":"DoclingDocument"}'),
+        batch=batch,
+        content_type="application/json",
     )
     source_repository.create_source_document(
         SourceDocumentUpsertRequest(
@@ -694,9 +703,33 @@ def _seed_cli_filing_source(workspace_root: Path) -> None:
             document_id=document_id,
             internal_document_id=internal_document_id,
             form_type="10-K",
-            primary_document="published.txt",
+            primary_document=docling_name,
             meta={"ingest_method": "upload", "source_provider": "user_upload"},
-            files=[file_meta],
+            file_entries=[
+                {
+                    "name": original_name,
+                    "uri": original_meta.uri,
+                    "etag": original_meta.etag,
+                    "last_modified": original_meta.last_modified,
+                    "size": original_meta.size,
+                    "content_type": original_meta.content_type,
+                    "sha256": original_meta.sha256,
+                    "source": "original",
+                    "original_filename": original_name,
+                },
+                {
+                    "name": docling_name,
+                    "uri": docling_meta.uri,
+                    "etag": docling_meta.etag,
+                    "last_modified": docling_meta.last_modified,
+                    "size": docling_meta.size,
+                    "content_type": docling_meta.content_type,
+                    "sha256": docling_meta.sha256,
+                    "source": "docling",
+                    "original_filename": original_name,
+                    "derived_from": original_name,
+                },
+            ],
         ),
         SourceKind.FILING,
         batch=batch,

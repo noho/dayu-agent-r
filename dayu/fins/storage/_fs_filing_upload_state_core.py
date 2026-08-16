@@ -4,17 +4,17 @@ from __future__ import annotations
 
 import os
 import stat
-from collections.abc import Mapping
 from pathlib import Path
 from typing import Protocol, cast
 
-from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.document_models import CompanyMeta
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.ticker_normalization import normalize_ticker
 from dayu.runtime.filelock import RuntimeFileLockToken
 
+from ._fs_source_integrity import _inspect_source_kind_unguarded
 from ._fs_storage_infra import _FsStorageInfra
+from ._fs_storage_utils import _source_dir_name
 from .repository_protocols import (
     CompanyTickerIdentityCorruptionError,
     FilingUploadPublishedState,
@@ -55,43 +55,6 @@ class _FilingUploadStateCoreProtocol(Protocol):
 
         ...
 
-    def _get_source_meta_unguarded(
-        self,
-        external_ticker: str,
-        external_document_id: str,
-        normalized_source_kind: SourceKind,
-    ) -> Mapping[str, JsonValue]:
-        """在 caller 持 guard 时读取 source meta。"""
-
-        ...
-
-    def _classify_source_integrity_unguarded(
-        self,
-        external_ticker: str,
-        external_document_id: str,
-        source_kind: SourceKind,
-        *,
-        ticker_dir: Path,
-    ) -> SourceIntegrityClassification:
-        """在 caller-held guard 下分类 exact source publication。
-
-        Args:
-            external_ticker: 已规范化 exact external ticker。
-            external_document_id: exact filing document ID。
-            source_kind: filing 来源类型。
-            ticker_dir: caller-held guard 下的 published ticker 根。
-
-        Returns:
-            exact target 的 typed integrity classification。
-
-        Raises:
-            ValueError: caller identity 或 locator precondition 非法时抛出。
-            OSError: published 文件系统读取失败时抛出。
-        """
-
-        ...
-
-
 class _FsFilingUploadStateMixin(_FsStorageInfra):
     """在单一 publication guard 下读取 filing 上传校验状态。"""
 
@@ -117,6 +80,7 @@ class _FsFilingUploadStateMixin(_FsStorageInfra):
             RuntimeFileLockError: publication guard 获取或释放失败时抛出。
             OSError: identity descriptor、meta 或其它 published state operational 读取失败时
                 抛出 path-free 文件系统异常。
+            RuntimeError: exact inspector 未返回 target，或可信状态缺少 business meta 时抛出。
         """
 
         external_ticker = normalize_ticker(ticker).canonical
@@ -147,25 +111,26 @@ class _FsFilingUploadStateMixin(_FsStorageInfra):
                 company_meta = core._get_company_meta_unguarded(external_ticker)
             except FileNotFoundError:
                 company_meta = None
-            source_integrity = core._classify_source_integrity_unguarded(
-                external_ticker,
-                document_id,
-                SourceKind.FILING,
+            inspection = _inspect_source_kind_unguarded(
+                ticker=external_ticker,
+                source_kind=SourceKind.FILING,
                 ticker_dir=target_dir,
+                source_root=target_dir / _source_dir_name(SourceKind.FILING),
+                requested_document_id=document_id,
             )
+            inspected_target = inspection.target
+            if inspected_target is None:
+                raise RuntimeError("exact filing upload-state inspection 缺少 target")
+            source_integrity = inspected_target.classification
             if source_integrity.status in {
                 SourceIntegrityStatus.MISSING,
                 SourceIntegrityStatus.UNSAFE,
             }:
                 source_meta = None
             else:
-                source_meta = dict(
-                    core._get_source_meta_unguarded(
-                        external_ticker,
-                        document_id,
-                        SourceKind.FILING,
-                    )
-                )
+                if inspected_target.business_meta is None:
+                    raise RuntimeError("可信 filing upload-state inspection 缺少 business meta")
+                source_meta = dict(inspected_target.business_meta)
             return FilingUploadPublishedState(
                 company_meta=company_meta,
                 source_integrity=source_integrity,

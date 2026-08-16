@@ -47,6 +47,9 @@ class FinsUploadFailureCode(str, Enum):
     EMPTY_INPUT_FILE = "empty_input_file"
     STORAGE_IO = "storage_io"
     TICKER_ALIAS_CONFLICT = "ticker_alias_conflict"
+    SOURCE_INTEGRITY_UNSAFE = "source_integrity_unsafe"
+    SOURCE_REVISION_STALE = "source_revision_stale"
+    SOURCE_REPAIR_BLOCKED = "source_repair_blocked"
     UNEXPECTED_RUNTIME = "unexpected_runtime"
 
 
@@ -179,6 +182,9 @@ _STORAGE_FAILURE_CODES: Final[frozenset[FinsUploadFailureCode]] = frozenset(
     {
         FinsUploadFailureCode.STORAGE_IO,
         FinsUploadFailureCode.TICKER_ALIAS_CONFLICT,
+        FinsUploadFailureCode.SOURCE_INTEGRITY_UNSAFE,
+        FinsUploadFailureCode.SOURCE_REVISION_STALE,
+        FinsUploadFailureCode.SOURCE_REPAIR_BLOCKED,
     }
 )
 _RUNTIME_FAILURE_CODES: Final[frozenset[FinsUploadFailureCode]] = frozenset({FinsUploadFailureCode.UNEXPECTED_RUNTIME})
@@ -340,6 +346,72 @@ def fins_upload_prevalidation_corruption_failure() -> FinsUploadFailureReason:
         code=FinsUploadFailureCode.STORAGE_IO,
         message="上传状态已损坏，请检查工作区存储状态",
         retry_hint="修复工作区存储后重试",
+        file_label=None,
+    )
+
+
+def fins_upload_source_integrity_unsafe_failure() -> FinsUploadFailureReason:
+    """构造目标 filing 无法安全自动修复的 closed public reason。
+
+    Args:
+        无。
+
+    Returns:
+        不含路径、revision 或内部 reason 的 storage failure reason。
+
+    Raises:
+        无。
+    """
+
+    return FinsUploadFailureReason(
+        kind=FinsUploadFailureKind.STORAGE,
+        code=FinsUploadFailureCode.SOURCE_INTEGRITY_UNSAFE,
+        message="工作区中的目标 filing 状态不完整且无法安全自动修复",
+        retry_hint="请先修复工作区 source 状态后再重试",
+        file_label=None,
+    )
+
+
+def fins_upload_source_revision_stale_failure() -> FinsUploadFailureReason:
+    """构造 repair 准备期间目标 revision 漂移的 closed public reason。
+
+    Args:
+        无。
+
+    Returns:
+        不含路径、revision 或内部异常文本的 storage failure reason。
+
+    Raises:
+        无。
+    """
+
+    return FinsUploadFailureReason(
+        kind=FinsUploadFailureKind.STORAGE,
+        code=FinsUploadFailureCode.SOURCE_REVISION_STALE,
+        message="目标 filing 在上传准备期间已发生变化，本次上传未提交",
+        retry_hint="请基于最新目标状态重新发起上传",
+        file_label=None,
+    )
+
+
+def fins_upload_source_repair_blocked_failure() -> FinsUploadFailureReason:
+    """构造其它 source 阻断本次 repair 的 closed public reason。
+
+    Args:
+        无。
+
+    Returns:
+        不含路径、target 或内部 reason 的 storage failure reason。
+
+    Raises:
+        无。
+    """
+
+    return FinsUploadFailureReason(
+        kind=FinsUploadFailureKind.STORAGE,
+        code=FinsUploadFailureCode.SOURCE_REPAIR_BLOCKED,
+        message="工作区中存在本次上传无法安全重建的其它 source，本次上传未提交",
+        retry_hint="请先修复工作区中的其它 source 状态后再重试",
         file_label=None,
     )
 

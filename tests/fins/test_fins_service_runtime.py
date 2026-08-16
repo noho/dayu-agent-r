@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import dayu.fins.service_runtime as service_runtime
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.ingestion_runtime import (
     FinsJobCancellationChecker,
@@ -26,7 +27,67 @@ from dayu.fins.service_runtime import (
 from dayu.fins.upload_failure import (
     FinsUploadPrevalidationError,
     fins_upload_prevalidation_io_failure,
+    fins_upload_source_integrity_unsafe_failure,
 )
+from dayu.fins.storage import (
+    FilingUploadPublishedState,
+    SourceIntegrityClassification,
+    SourceIntegrityReason,
+    SourceIntegrityStatus,
+)
+
+
+class _UnsafeFilingUploadStateRepository:
+    """显式返回 exact UNSAFE classification 的 Service 边界 fixture。"""
+
+    def __init__(self, workspace_root: Path, *, create_directories: bool) -> None:
+        """接受 production constructor 参数但不读取或创建 workspace。
+
+        Args:
+            workspace_root: 本测试禁止读取的 workspace 根。
+            create_directories: production prevalidation 固定传入的目录创建开关。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: Service 错误请求创建 workspace 目录时抛出。
+        """
+
+        if create_directories:
+            raise AssertionError("prevalidation repository 不得创建 workspace")
+        self.workspace_root = workspace_root
+
+    def read_filing_upload_state(
+        self,
+        ticker: str,
+        document_id: str,
+    ) -> FilingUploadPublishedState:
+        """返回调用参数 exact target 的 typed UNSAFE state。
+
+        Args:
+            ticker: canonical filing ticker。
+            document_id: exact filing document ID。
+
+        Returns:
+            显式 status/reasons 且不含 source meta 的 published state。
+
+        Raises:
+            无。
+        """
+
+        return FilingUploadPublishedState(
+            company_meta=None,
+            source_integrity=SourceIntegrityClassification(
+                ticker=ticker,
+                source_kind=SourceKind.FILING,
+                document_id=document_id,
+                revision=None,
+                status=SourceIntegrityStatus.UNSAFE,
+                reasons=(SourceIntegrityReason.META_UNTRUSTED,),
+            ),
+            source_meta=None,
+        )
 
 
 class _AlwaysCancelledChecker(FinsJobCancellationChecker):
@@ -217,6 +278,51 @@ def test_prevalidation_maps_repository_resolve_failure_to_typed_reason(
     projected_root_cause = projected_error.__cause__
     assert isinstance(projected_root_cause, PermissionError)
     assert "解析 storage workspace底层文件系统失败" in str(projected_root_cause)
+    assert not workspace_root.exists()
+
+
+def test_service_prevalidation_propagates_typed_unsafe_without_workspace_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Service prevalidation 必须原样传播 validator 的 path-free UNSAFE failure。
+
+    Args:
+        tmp_path: 用于创建输入文件与禁止创建的 workspace。
+        monkeypatch: 用于注入只返回 typed state 的 repository fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: Service 从 raw meta 重判、改写 failure 或创建 workspace 时抛出。
+    """
+
+    input_file = tmp_path / "filing.pdf"
+    input_file.write_bytes(b"filing")
+    workspace_root = tmp_path / "workspace"
+    request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        action="auto",
+        files=(input_file,),
+        fiscal_year=2024,
+        fiscal_period="FY",
+        company_name="Apple Inc.",
+    )
+    monkeypatch.setattr(
+        service_runtime,
+        "FsFilingUploadStateRepository",
+        _UnsafeFilingUploadStateRepository,
+    )
+
+    with pytest.raises(FinsUploadPrevalidationError) as exc_info:
+        prevalidate_fins_upload_filing_request_for_workspace(
+            request,
+            workspace_root=workspace_root,
+        )
+
+    assert exc_info.value.failure == fins_upload_source_integrity_unsafe_failure()
+    assert str(workspace_root) not in repr(exc_info.value.failure)
     assert not workspace_root.exists()
 
 
