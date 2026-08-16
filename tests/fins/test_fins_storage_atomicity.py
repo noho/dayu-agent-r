@@ -23,7 +23,9 @@ import pytest
 
 from tests.fins.company_meta_test_support import stage_company_meta_fixture
 
+from dayu.contracts.json_value import JsonValue
 import dayu.fins.storage._fs_storage_infra as storage_infra_module
+import dayu.fins.storage._fs_source_document_core as source_document_core_module
 import dayu.fins.storage.source_integrity as source_integrity_module
 import dayu.fins.storage._fs_source_snapshot as source_snapshot_module
 import dayu.fins.storage._fs_storage_utils as storage_utils_module
@@ -77,7 +79,14 @@ from dayu.fins.storage._fs_storage_infra import (
     _PHASE_STARTED,
     _PHASE_SWAPPED_TARGET,
 )
-from dayu.fins.storage.repository_protocols import SourceSnapshotConsistencyError
+from dayu.fins.storage._fs_source_integrity import (
+    _SourceKindPublicationInspection,
+    _inspect_source_kind_unguarded,
+)
+from dayu.fins.storage.repository_protocols import (
+    BatchingRepositoryProtocol,
+    SourceSnapshotConsistencyError,
+)
 from dayu.fins.storage._fs_storage_utils import (
     _local_path_from_uri,
     _normalize_entry_name,
@@ -119,6 +128,37 @@ _StaleMetaCorruption = Literal["missing", "corrupt", "mismatch"]
 _BatchInitializationFailurePoint = Literal["journal", "descriptor", "copy"]
 _SnapshotVersion = Literal["A", "B"]
 _WorkspaceTreeEntry = tuple[str, Literal["directory", "file"], bytes | None]
+_RepairableIntegrityCorruption = Literal[
+    "original_missing",
+    "primary_docling_missing",
+    "generic_declared_missing",
+    "physical_size_mismatch",
+    "physical_digest_mismatch",
+    "declared_size_mismatch",
+    "declared_digest_mismatch",
+    "primary_projection_mismatch",
+    "derived_projection_mismatch",
+    "manifest_missing",
+    "manifest_projection_mismatch",
+]
+_UnsafeIntegrityCorruption = Literal[
+    "identity_missing",
+    "meta_missing",
+    "meta_malformed",
+    "meta_identity_mismatch",
+    "revision_untrusted",
+    "provenance_untrusted",
+    "file_declaration_untrusted",
+    "undeclared_file",
+    "symlink_entry",
+    "special_entry",
+    "multiple_docling",
+    "ambiguous_role_with_missing",
+    "manifest_duplicate",
+    "manifest_dangling",
+    "manifest_ticker_conflict",
+    "cross_source_inconsistency",
+]
 
 
 class _FutureSourceIntegrityStatus(str, Enum):
@@ -129,6 +169,97 @@ class _FutureSourceIntegrityStatus(str, Enum):
     REPAIR_REQUIRED = "repair_required"
     UNSAFE = "unsafe"
     FUTURE = "future"
+
+
+@dataclass(slots=True)
+class _InspectorCallCounter:
+    """记录统一 inspector 的 source kind 与调用模式。
+
+    Attributes:
+        calls: 按发生顺序记录的 ``(source_kind, requested_document_id)``。
+    """
+
+    calls: list[tuple[SourceKind, str | None]]
+
+    def inspect(
+        self,
+        *,
+        ticker: str,
+        source_kind: SourceKind,
+        ticker_dir: Path,
+        source_root: Path,
+        requested_document_id: str | None,
+    ) -> _SourceKindPublicationInspection:
+        """记录调用并委托唯一 production inspector。
+
+        Args:
+            ticker: exact canonical ticker。
+            source_kind: 当前 source kind。
+            ticker_dir: 当前稳定 ticker 根。
+            source_root: 当前 source-kind 根。
+            requested_document_id: exact target；whole-kind 为 ``None``。
+
+        Returns:
+            production inspector 产生的 typed payload。
+
+        Raises:
+            SourceIntegrityPreflightError: whole-kind root fact 无法归属时抛出。
+            ValueError: 调用参数违反 inspector precondition 时抛出。
+            OSError: inspection operational I/O 失败时抛出。
+        """
+
+        self.calls.append((source_kind, requested_document_id))
+        return _inspect_source_kind_unguarded(
+            ticker=ticker,
+            source_kind=source_kind,
+            ticker_dir=ticker_dir,
+            source_root=source_root,
+            requested_document_id=requested_document_id,
+        )
+
+
+def _fresh_upload_file_entry(
+    file_meta: FileObjectMeta,
+    *,
+    name: str,
+    source: Literal["original", "docling"],
+    original_filename: str,
+    derived_from: str | None = None,
+) -> dict[str, JsonValue]:
+    """把 staged blob 投影为 UF-FIX07 fresh filing file entry。
+
+    Args:
+        file_meta: blob repository 返回的 physical file meta。
+        name: storage-owned exact asset identity。
+        source: original 或 Docling role。
+        original_filename: 用户输入 basename。
+        derived_from: Docling 对应的 exact original identity。
+
+    Returns:
+        可写入 source mutation 的严格 file entry。
+
+    Raises:
+        ValueError: role 与 derived identity 不一致时抛出。
+    """
+
+    if source == "docling" and derived_from is None:
+        raise ValueError("Docling fixture 必须携带 derived_from")
+    if source == "original" and derived_from is not None:
+        raise ValueError("original fixture 不得携带 derived_from")
+    entry: dict[str, JsonValue] = {
+        "name": name,
+        "uri": file_meta.uri,
+        "etag": file_meta.etag,
+        "last_modified": file_meta.last_modified,
+        "size": file_meta.size,
+        "content_type": file_meta.content_type,
+        "sha256": file_meta.sha256,
+        "source": source,
+        "original_filename": original_filename,
+    }
+    if derived_from is not None:
+        entry["derived_from"] = derived_from
+    return entry
 
 
 def _snapshot_workspace_tree(workspace_root: Path) -> tuple[_WorkspaceTreeEntry, ...]:
@@ -275,26 +406,11 @@ def test_filing_upload_state_reads_company_and_source_from_one_published_version
         ),
         batch=batch,
     )
-    handle = SourceHandle("AAPL", "aapl-2024-fy", SourceKind.FILING.value)
-    file_meta = blob.store_file(
-        handle,
-        "report.md",
-        io.BytesIO(b"report"),
+    _create_complete_source(
+        source,
+        blob,
         batch=batch,
-        content_type="text/markdown",
-    )
-    source.create_source_document(
-        SourceDocumentUpsertRequest(
-            ticker="AAPL",
-            document_id="aapl-2024-fy",
-            internal_document_id="aapl-2024-fy",
-            form_type="10-K",
-            primary_document="report.md",
-            meta={"ingest_method": "upload", "source_provider": "user_upload"},
-            files=[file_meta],
-        ),
-        SourceKind.FILING,
-        batch=batch,
+        document_id="aapl-2024-fy",
     )
     batching.commit_batch(batch)
 
@@ -305,7 +421,7 @@ def test_filing_upload_state_reads_company_and_source_from_one_published_version
     assert snapshot.source_integrity.status is SourceIntegrityStatus.COMPLETE
     assert snapshot.source_integrity.revision is not None
     assert snapshot.source_meta is not None
-    assert snapshot.source_meta["primary_document"] == "report.md"
+    assert snapshot.source_meta["primary_document"] == "aapl-2024-fy.txt_docling.json"
 
 
 def test_filing_upload_state_fails_closed_for_missing_source_meta_without_mutation(
@@ -328,11 +444,14 @@ def test_filing_upload_state_fails_closed_for_missing_source_meta_without_mutati
     (source_directory / "meta.json").unlink()
     corrupted_tree = _snapshot_workspace_tree(workspace_root)
 
-    with pytest.raises(ValueError, match="缺少 meta.json") as exc_info:
-        state.read_filing_upload_state("AAPL", "filing-a")
+    snapshot = state.read_filing_upload_state("AAPL", "filing-a")
 
-    assert str(workspace_root) not in str(exc_info.value)
-    assert str(source_directory) not in str(exc_info.value)
+    assert snapshot.source_integrity.status is SourceIntegrityStatus.UNSAFE
+    assert snapshot.source_integrity.revision is None
+    assert snapshot.source_integrity.reasons == (
+        SourceIntegrityReason.META_UNTRUSTED,
+    )
+    assert snapshot.source_meta is None
     assert _snapshot_workspace_tree(workspace_root) == corrupted_tree
 
 
@@ -356,11 +475,14 @@ def test_filing_upload_state_fails_closed_for_missing_identity_descriptor_withou
     _identity_descriptor_file(source_directory).unlink()
     corrupted_tree = _snapshot_workspace_tree(workspace_root)
 
-    with pytest.raises(ValueError, match="identity descriptor") as exc_info:
-        state.read_filing_upload_state("AAPL", "filing-a")
+    snapshot = state.read_filing_upload_state("AAPL", "filing-a")
 
-    assert str(workspace_root) not in str(exc_info.value)
-    assert str(source_directory) not in str(exc_info.value)
+    assert snapshot.source_integrity.status is SourceIntegrityStatus.UNSAFE
+    assert snapshot.source_integrity.revision is None
+    assert snapshot.source_integrity.reasons == (
+        SourceIntegrityReason.IDENTITY_UNTRUSTED,
+    )
+    assert snapshot.source_meta is None
     assert _snapshot_workspace_tree(workspace_root) == corrupted_tree
 
 
@@ -1536,7 +1658,7 @@ def test_filing_clear_preflight_rejects_all_invalid_evidence_before_deletion(
         (filings_root / "unexpected-control").write_text("unexpected", encoding="utf-8")
 
     entries_before = {entry.name for entry in filings_root.iterdir()}
-    with pytest.raises((ValueError, OSError)):
+    with pytest.raises((SourceIntegrityPreflightError, ValueError, OSError)):
         maintenance.clear_filing_documents("AAPL", batch=batch)
 
     assert {entry.name for entry in filings_root.iterdir()} == entries_before
@@ -2220,17 +2342,6 @@ def test_existing_source_and_processed_handles_share_blob_contract(tmp_path: Pat
     processed_repository = FsProcessedDocumentRepository(workspace_root, repository_set=repository_set)
     blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
     batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
-    source_request = SourceDocumentUpsertRequest(
-        ticker="AAPL",
-        document_id="annual-report",
-        internal_document_id="annual-report",
-        form_type="10-K",
-        primary_document="report.md",
-        meta={
-            "ingest_method": "upload",
-            "source_provider": "user_upload",
-        },
-    )
     batch = batching_repository.begin_batch("AAPL")
     source_handle = SourceHandle(
         ticker="AAPL",
@@ -2258,6 +2369,13 @@ def test_existing_source_and_processed_handles_share_blob_contract(tmp_path: Pat
             io.BytesIO(b"source"),
             batch=batch,
         )
+        docling_file_meta = blob_repository.store_file(
+            source_handle,
+            "report.md_docling.json",
+            io.BytesIO(b'{"schema_name":"DoclingDocument"}'),
+            batch=batch,
+            content_type="application/json",
+        )
         blob_repository.store_file(
             processed_handle,
             "analysis.json",
@@ -2266,13 +2384,30 @@ def test_existing_source_and_processed_handles_share_blob_contract(tmp_path: Pat
         )
         source_repository.create_source_document(
             SourceDocumentUpsertRequest(
-                ticker=source_request.ticker,
-                document_id=source_request.document_id,
-                internal_document_id=source_request.internal_document_id,
-                form_type=source_request.form_type,
-                primary_document=source_request.primary_document,
-                meta=source_request.meta,
-                files=[source_file_meta],
+                ticker="AAPL",
+                document_id="annual-report",
+                internal_document_id="annual-report",
+                form_type="10-K",
+                primary_document="report.md_docling.json",
+                meta={
+                    "ingest_method": "upload",
+                    "source_provider": "user_upload",
+                },
+                file_entries=[
+                    _fresh_upload_file_entry(
+                        source_file_meta,
+                        name="report.md",
+                        source="original",
+                        original_filename="report.md",
+                    ),
+                    _fresh_upload_file_entry(
+                        docling_file_meta,
+                        name="report.md_docling.json",
+                        source="docling",
+                        original_filename="report.md",
+                        derived_from="report.md",
+                    ),
+                ],
             ),
             SourceKind.FILING,
             batch=batch,
@@ -2287,8 +2422,9 @@ def test_existing_source_and_processed_handles_share_blob_contract(tmp_path: Pat
     assert [entry.name for entry in blob_repository.list_entries(source_handle)] == [
         "meta.json",
         "report.md",
+        "report.md_docling.json",
     ]
-    assert blob_repository.list_files(source_handle) == [source_file_meta]
+    assert blob_repository.list_files(source_handle) == [source_file_meta, docling_file_meta]
     delete_batch = batching_repository.begin_batch("AAPL")
     blob_repository.delete_entry(processed_handle, "analysis.json", batch=delete_batch)
     batching_repository.commit_batch(delete_batch)
@@ -3660,7 +3796,6 @@ def test_concurrent_composed_source_read_and_delayed_open_do_not_self_deadlock(
     source = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
     blob = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
     batch = batching.begin_batch("AAPL")
-    request = _source_request("composed-read")
     handle = SourceHandle(
         ticker="AAPL",
         document_id="composed-read",
@@ -3673,15 +3808,39 @@ def test_concurrent_composed_source_read_and_delayed_open_do_not_self_deadlock(
         batch=batch,
         content_type="text/plain",
     )
+    original_meta = blob.store_file(
+        handle,
+        "composed-read.original.txt",
+        io.BytesIO(b"original descriptor"),
+        batch=batch,
+        content_type="text/plain",
+    )
     source.create_source_document(
         SourceDocumentUpsertRequest(
-            ticker=request.ticker,
-            document_id=request.document_id,
-            internal_document_id=request.internal_document_id,
-            form_type=request.form_type,
-            primary_document=request.primary_document,
-            meta=request.meta,
-            files=[file_meta],
+            ticker="AAPL",
+            document_id="composed-read",
+            internal_document_id="composed-read",
+            form_type="10-K",
+            primary_document="composed-read.txt",
+            meta={
+                "ingest_method": "upload",
+                "source_provider": "user_upload",
+            },
+            file_entries=[
+                _fresh_upload_file_entry(
+                    original_meta,
+                    name="composed-read.original.txt",
+                    source="original",
+                    original_filename="composed-read.original.txt",
+                ),
+                _fresh_upload_file_entry(
+                    file_meta,
+                    name="composed-read.txt",
+                    source="docling",
+                    original_filename="composed-read.original.txt",
+                    derived_from="composed-read.original.txt",
+                ),
+            ],
         ),
         SourceKind.FILING,
         batch=batch,
@@ -4045,13 +4204,35 @@ def test_complete_validator_rejects_identity_descriptor_symlink_and_mismatch(
         payload["external_identity"] = "fil_other"
         descriptor_path.write_text(json.dumps(payload), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="identity descriptor"):
+    with pytest.raises(SourceIntegrityPreflightError) as preflight_error:
         batching.commit_batch(batch)
+    assert preflight_error.value.reason is SourceIntegrityPreflightReason.UNSAFE_PUBLICATION
     with pytest.raises(ValueError, match="transaction 未在当前 storage core 登记"):
         batching.commit_batch(batch)
     assert not repository_set.core._target_ticker_dir(ticker).exists()
     if outside_descriptor is not None:
         assert json.loads(outside_descriptor.read_text(encoding="utf-8"))["external_identity"] == document_id
+
+
+def test_commit_batch_contract_declares_whole_tree_preflight_error() -> None:
+    """protocol 与 filesystem facade 必须声明 whole-tree typed preflight failure。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 公开 Raises 文档遗漏真实 exception surface 时抛出。
+    """
+
+    protocol_doc = BatchingRepositoryProtocol.commit_batch.__doc__
+    facade_doc = FsBatchingRepository.commit_batch.__doc__
+    assert protocol_doc is not None
+    assert facade_doc is not None
+    assert "SourceIntegrityPreflightError" in protocol_doc
+    assert "SourceIntegrityPreflightError" in facade_doc
 
 
 def test_filename_absolute_and_local_uri_attacks_remain_rejected_for_opaque_documents(
@@ -4596,15 +4777,20 @@ def test_snapshot_fd_copy_silent_mutation_is_corruption_without_revision_change(
         with pytest.raises(ValueError) as exc_info:
             future.result(timeout=10)
     assert not isinstance(exc_info.value, SourceSnapshotConsistencyError)
-    assert (
-        _read_snapshot_revision(
-            source_repository,
+    damaged = source_repository.classify_source_integrity(
+        "AAPL",
+        "snapshot-doc",
+        SourceKind.FILING,
+    )
+    assert damaged.status is SourceIntegrityStatus.REPAIR_REQUIRED
+    assert damaged.revision == revision
+    with pytest.raises(ValueError, match="source snapshot 只允许读取完整 source"):
+        source_repository.read_source_snapshot(
             "AAPL",
             "snapshot-doc",
             SourceKind.FILING,
+            materialize_files=False,
         )
-        == revision
-    )
     assert observed_roots
     assert all(not root.exists() for root in observed_roots)
 
@@ -5681,6 +5867,7 @@ def _create_complete_source(
     """
 
     filename = f"{document_id}.txt"
+    docling_filename = f"{filename}_docling.json"
     handle = SourceHandle(
         ticker=ticker,
         document_id=document_id,
@@ -5693,23 +5880,393 @@ def _create_complete_source(
         batch=batch,
         content_type="text/plain",
     )
+    docling_file_meta = (
+        blob_repository.store_file(
+            handle,
+            docling_filename,
+            io.BytesIO(b'{"schema_name":"DoclingDocument"}'),
+            batch=batch,
+            content_type="application/json",
+        )
+        if source_kind is SourceKind.FILING
+        else None
+    )
+    file_entries = None
+    files = [file_meta]
+    primary_document = filename
+    if docling_file_meta is not None:
+        file_entries = [
+            {
+                "name": filename,
+                "uri": file_meta.uri,
+                "etag": file_meta.etag,
+                "last_modified": file_meta.last_modified,
+                "size": file_meta.size,
+                "content_type": file_meta.content_type,
+                "sha256": file_meta.sha256,
+                "source": "original",
+                "original_filename": filename,
+            },
+            {
+                "name": docling_filename,
+                "uri": docling_file_meta.uri,
+                "etag": docling_file_meta.etag,
+                "last_modified": docling_file_meta.last_modified,
+                "size": docling_file_meta.size,
+                "content_type": docling_file_meta.content_type,
+                "sha256": docling_file_meta.sha256,
+                "source": "docling",
+                "original_filename": filename,
+                "derived_from": filename,
+            },
+        ]
+        files = []
+        primary_document = docling_filename
     source_repository.create_source_document(
         SourceDocumentUpsertRequest(
             ticker=ticker,
             document_id=document_id,
             internal_document_id=document_id,
             form_type="10-K" if source_kind is SourceKind.FILING else "EX-99",
-            primary_document=filename,
+            primary_document=primary_document,
             meta={
                 "ingest_method": "upload",
                 "source_provider": "user_upload",
             },
-            files=[file_meta],
+            files=files,
+            file_entries=file_entries,
         ),
         source_kind,
         batch=batch,
     )
     return handle
+
+
+def _read_integrity_json(path: Path) -> dict[str, JsonValue]:
+    """读取 corruption grid 使用的 JSON object。
+
+    Args:
+        path: 测试已知的 storage-owned JSON 路径。
+
+    Returns:
+        可由测试精确修改的 JSON object。
+
+    Raises:
+        OSError: 文件读取失败时抛出。
+        ValueError: 内容不是 JSON object 时抛出。
+    """
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("integrity fixture JSON 必须是 object")
+    return cast(dict[str, JsonValue], payload)
+
+
+def _write_integrity_json(path: Path, payload: dict[str, JsonValue]) -> None:
+    """写回 corruption grid 的确定性 JSON object。
+
+    Args:
+        path: 测试已知的 storage-owned JSON 路径。
+        payload: 已完成单点破坏的 JSON object。
+
+    Returns:
+        无。
+
+    Raises:
+        OSError: 文件写入失败时抛出。
+    """
+
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+
+def _integrity_meta_files(meta: dict[str, JsonValue]) -> list[dict[str, JsonValue]]:
+    """收窄 fresh source meta 的严格 files 数组。
+
+    Args:
+        meta: storage owner 持久化的 source meta。
+
+    Returns:
+        可供 corruption grid 单点修改的 file objects。
+
+    Raises:
+        ValueError: fixture 不再满足非空 object array contract 时抛出。
+    """
+
+    raw_files = meta.get("files")
+    if not isinstance(raw_files, list) or not raw_files:
+        raise ValueError("integrity fixture files 必须是非空数组")
+    files: list[dict[str, JsonValue]] = []
+    for raw_file in raw_files:
+        if not isinstance(raw_file, dict):
+            raise ValueError("integrity fixture file 必须是 object")
+        files.append(cast(dict[str, JsonValue], raw_file))
+    return files
+
+
+def _integrity_source_paths(
+    core: FsStorageCore,
+    *,
+    document_id: str,
+    source_kind: SourceKind,
+) -> tuple[Path, Path, Path]:
+    """返回已发布 source 的目录、meta 与 source-kind manifest。
+
+    Args:
+        core: 当前测试唯一 storage core。
+        document_id: exact external document ID。
+        source_kind: filing 或 material。
+
+    Returns:
+        ``(source_directory, meta_path, manifest_path)``。
+
+    Raises:
+        ValueError: identity 或 source kind 非法时抛出。
+        OSError: published identity 读取失败时抛出。
+    """
+
+    meta_path = core._source_meta_path_for_read("AAPL", document_id, source_kind)
+    manifest_path = (
+        core._filing_manifest_path_for_read("AAPL")
+        if source_kind is SourceKind.FILING
+        else core._material_manifest_path_for_read("AAPL")
+    )
+    return meta_path.parent, meta_path, manifest_path
+
+
+def _apply_repairable_integrity_corruption(
+    core: FsStorageCore,
+    *,
+    document_id: str,
+    source_kind: SourceKind,
+    corruption: _RepairableIntegrityCorruption,
+) -> None:
+    """对完整 publication 注入一个 repairable owner fact。
+
+    Args:
+        core: 当前测试唯一 storage core。
+        document_id: exact external document ID。
+        source_kind: filing 或 material。
+        corruption: 待注入的 repairable grid 单元。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: corruption 与 fixture kind 不兼容时抛出。
+        OSError: fixture 读写失败时抛出。
+        ValueError: fixture JSON shape 不符合 fresh contract 时抛出。
+    """
+
+    source_dir, meta_path, manifest_path = _integrity_source_paths(
+        core,
+        document_id=document_id,
+        source_kind=source_kind,
+    )
+    meta = _read_integrity_json(meta_path)
+    files = _integrity_meta_files(meta)
+    first_name = files[0].get("name")
+    if not isinstance(first_name, str):
+        raise ValueError("integrity fixture first file name 非法")
+    first_path = source_dir / first_name
+    if corruption in {"original_missing", "generic_declared_missing"}:
+        first_path.unlink()
+        return
+    if corruption == "primary_docling_missing":
+        if len(files) != 2:
+            raise AssertionError("primary Docling corruption 只适用于 fresh filing")
+        docling_name = files[1].get("name")
+        if not isinstance(docling_name, str):
+            raise ValueError("integrity fixture Docling name 非法")
+        (source_dir / docling_name).unlink()
+        return
+    if corruption == "physical_size_mismatch":
+        first_path.write_bytes(first_path.read_bytes() + b"-changed-size")
+        return
+    if corruption == "physical_digest_mismatch":
+        original = first_path.read_bytes()
+        first_path.write_bytes(b"X" * len(original))
+        return
+    if corruption == "declared_size_mismatch":
+        raw_size = files[0].get("size")
+        if isinstance(raw_size, bool) or not isinstance(raw_size, int):
+            raise ValueError("integrity fixture declared size 非法")
+        files[0]["size"] = raw_size + 1
+        _write_integrity_json(meta_path, meta)
+        return
+    if corruption == "declared_digest_mismatch":
+        files[0]["sha256"] = "0" * 64
+        _write_integrity_json(meta_path, meta)
+        return
+    if corruption == "primary_projection_mismatch":
+        meta["primary_document"] = first_name
+        _write_integrity_json(meta_path, meta)
+        return
+    if corruption == "derived_projection_mismatch":
+        if len(files) != 2:
+            raise AssertionError("derived projection corruption 只适用于 fresh filing")
+        files[1]["derived_from"] = "missing-original.txt"
+        _write_integrity_json(meta_path, meta)
+        return
+    if corruption == "manifest_missing":
+        manifest_path.unlink()
+        return
+    manifest = _read_integrity_json(manifest_path)
+    raw_documents = manifest.get("documents")
+    if not isinstance(raw_documents, list) or len(raw_documents) != 1:
+        raise ValueError("integrity fixture manifest documents 非法")
+    raw_item = raw_documents[0]
+    if not isinstance(raw_item, dict):
+        raise ValueError("integrity fixture manifest item 非法")
+    raw_item["source_provider"] = "sec_edgar"
+    _write_integrity_json(manifest_path, manifest)
+
+
+def _append_second_docling_declaration(
+    *,
+    source_dir: Path,
+    meta: dict[str, JsonValue],
+    files: list[dict[str, JsonValue]],
+) -> None:
+    """给 fresh filing 增加第二个 declared Docling asset。
+
+    Args:
+        source_dir: 已发布 source directory。
+        meta: 可写 source meta object。
+        files: meta 内同一 files 数组的 typed view。
+
+    Returns:
+        无。
+
+    Raises:
+        OSError: Docling fixture 文件复制或 meta 写入失败时抛出。
+        ValueError: fresh fixture 不含唯一 Docling 声明时抛出。
+    """
+
+    if len(files) != 2:
+        raise ValueError("multiple Docling corruption 要求 fresh filing")
+    docling_name = files[1].get("name")
+    if not isinstance(docling_name, str):
+        raise ValueError("integrity fixture Docling name 非法")
+    second_name = "second_docling.json"
+    (source_dir / second_name).write_bytes((source_dir / docling_name).read_bytes())
+    second = dict(files[1])
+    second["name"] = second_name
+    second["uri"] = "local://AAPL/second_docling.json"
+    files.append(second)
+    meta["files"] = cast(JsonValue, files)
+
+
+def _apply_unsafe_integrity_corruption(
+    core: FsStorageCore,
+    *,
+    document_id: str,
+    corruption: _UnsafeIntegrityCorruption,
+) -> None:
+    """对完整 filing publication 注入一个 unsafe owner fact。
+
+    Args:
+        core: 当前测试唯一 storage core。
+        document_id: exact external document ID。
+        corruption: 待注入的 unsafe grid 单元。
+
+    Returns:
+        无。
+
+    Raises:
+        OSError: fixture 读写或 special-entry 创建失败时抛出。
+        ValueError: fixture JSON shape 不符合 fresh contract 时抛出。
+    """
+
+    source_dir, meta_path, manifest_path = _integrity_source_paths(
+        core,
+        document_id=document_id,
+        source_kind=SourceKind.FILING,
+    )
+    if corruption == "identity_missing":
+        _identity_descriptor_file(source_dir).unlink()
+        return
+    if corruption == "meta_missing":
+        meta_path.unlink()
+        return
+    if corruption == "meta_malformed":
+        meta_path.write_text("{", encoding="utf-8")
+        return
+    meta = _read_integrity_json(meta_path)
+    files = _integrity_meta_files(meta)
+    if corruption == "meta_identity_mismatch":
+        meta["document_id"] = "different-document"
+        _write_integrity_json(meta_path, meta)
+        return
+    if corruption == "revision_untrusted":
+        del meta["_published_source_revision"]
+        _write_integrity_json(meta_path, meta)
+        return
+    if corruption == "provenance_untrusted":
+        meta["ingest_method"] = "broken"
+        _write_integrity_json(meta_path, meta)
+        return
+    if corruption == "file_declaration_untrusted":
+        files.append(dict(files[0]))
+        meta["files"] = cast(JsonValue, files)
+        _write_integrity_json(meta_path, meta)
+        return
+    if corruption == "undeclared_file":
+        (source_dir / "undeclared.bin").write_bytes(b"undeclared")
+        return
+    if corruption == "symlink_entry":
+        (source_dir / "unsafe-link").symlink_to(meta_path)
+        return
+    if corruption == "special_entry":
+        os.mkfifo(source_dir / "unsafe-fifo")
+        return
+    if corruption in {"multiple_docling", "ambiguous_role_with_missing"}:
+        _append_second_docling_declaration(
+            source_dir=source_dir,
+            meta=meta,
+            files=files,
+        )
+        _write_integrity_json(meta_path, meta)
+        if corruption == "ambiguous_role_with_missing":
+            original_name = files[0].get("name")
+            if not isinstance(original_name, str):
+                raise ValueError("integrity fixture original name 非法")
+            (source_dir / original_name).unlink()
+        return
+    if corruption == "cross_source_inconsistency":
+        sibling_dir, sibling_meta_path, sibling_manifest_path = _integrity_source_paths(
+            core,
+            document_id="filing-sibling",
+            source_kind=SourceKind.FILING,
+        )
+        sibling_meta = _read_integrity_json(sibling_meta_path)
+        sibling_files = _integrity_meta_files(sibling_meta)
+        sibling_name = sibling_files[0].get("name")
+        if not isinstance(sibling_name, str):
+            raise ValueError("integrity sibling original name 非法")
+        (sibling_dir / sibling_name).unlink()
+        sibling_manifest_path.unlink()
+        return
+    manifest = _read_integrity_json(manifest_path)
+    raw_documents = manifest.get("documents")
+    if not isinstance(raw_documents, list) or not raw_documents:
+        raise ValueError("integrity fixture manifest documents 非法")
+    first_item = raw_documents[0]
+    if not isinstance(first_item, dict):
+        raise ValueError("integrity fixture manifest item 非法")
+    if corruption == "manifest_duplicate":
+        raw_documents.append(dict(first_item))
+    elif corruption == "manifest_dangling":
+        dangling = dict(first_item)
+        dangling["document_id"] = "ghost-document"
+        raw_documents.append(dangling)
+    elif corruption == "manifest_ticker_conflict":
+        manifest["ticker"] = "MSFT"
+    else:
+        raise AssertionError(f"未处理的 unsafe corruption: {corruption}")
+    _write_integrity_json(manifest_path, manifest)
 
 
 def test_source_integrity_classifies_published_staged_and_whole_tree(
@@ -5785,7 +6342,7 @@ def test_source_integrity_classifies_published_staged_and_whole_tree(
         "filing-a",
         SourceKind.FILING,
     )
-    assert missing_file.reasons == (SourceIntegrityReason.DECLARED_FILE_MISSING,)
+    assert missing_file.reasons == (SourceIntegrityReason.ORIGINAL_FILE_MISSING,)
     payload_path.write_bytes(original_payload)
 
     meta_path = source_dir / "meta.json"
@@ -5793,15 +6350,533 @@ def test_source_integrity_classifies_published_staged_and_whole_tree(
     meta = json.loads(original_meta)
     meta["files"][0]["sha256"] = "malformed"
     meta_path.write_text(json.dumps(meta), encoding="utf-8")
-    with pytest.raises(ValueError, match="64位小写十六进制"):
-        source.classify_source_integrity(
+    malformed_digest = source.classify_source_integrity(
+        "AAPL",
+        "filing-a",
+        SourceKind.FILING,
+    )
+    assert malformed_digest.status is SourceIntegrityStatus.UNSAFE
+    assert malformed_digest.revision is None
+    assert malformed_digest.reasons == (
+        SourceIntegrityReason.FILE_DECLARATION_UNTRUSTED,
+    )
+    assert source.list_source_integrity("AAPL")[0] == malformed_digest
+    meta_path.write_text(original_meta, encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("corruption", "source_kind", "expected_reasons"),
+    (
+        (
+            "original_missing",
+            SourceKind.FILING,
+            (SourceIntegrityReason.ORIGINAL_FILE_MISSING,),
+        ),
+        (
+            "primary_docling_missing",
+            SourceKind.FILING,
+            (SourceIntegrityReason.PRIMARY_DOCLING_FILE_MISSING,),
+        ),
+        (
+            "generic_declared_missing",
+            SourceKind.MATERIAL,
+            (SourceIntegrityReason.DECLARED_FILE_MISSING,),
+        ),
+        (
+            "physical_size_mismatch",
+            SourceKind.FILING,
+            (
+                SourceIntegrityReason.SIZE_MISMATCH,
+                SourceIntegrityReason.DIGEST_MISMATCH,
+            ),
+        ),
+        (
+            "physical_digest_mismatch",
+            SourceKind.FILING,
+            (SourceIntegrityReason.DIGEST_MISMATCH,),
+        ),
+        (
+            "declared_size_mismatch",
+            SourceKind.FILING,
+            (SourceIntegrityReason.SIZE_MISMATCH,),
+        ),
+        (
+            "declared_digest_mismatch",
+            SourceKind.FILING,
+            (SourceIntegrityReason.DIGEST_MISMATCH,),
+        ),
+        (
+            "primary_projection_mismatch",
+            SourceKind.FILING,
+            (SourceIntegrityReason.PRIMARY_PROJECTION_MISMATCH,),
+        ),
+        (
+            "derived_projection_mismatch",
+            SourceKind.FILING,
+            (SourceIntegrityReason.DERIVED_PROJECTION_MISMATCH,),
+        ),
+        (
+            "manifest_missing",
+            SourceKind.FILING,
+            (SourceIntegrityReason.SOURCE_MANIFEST_MISSING,),
+        ),
+        (
+            "manifest_projection_mismatch",
+            SourceKind.FILING,
+            (SourceIntegrityReason.SOURCE_MANIFEST_PROJECTION_MISMATCH,),
+        ),
+    ),
+)
+def test_source_integrity_repairable_corruption_grid_preserves_revision(
+    tmp_path: Path,
+    corruption: _RepairableIntegrityCorruption,
+    source_kind: SourceKind,
+    expected_reasons: tuple[SourceIntegrityReason, ...],
+) -> None:
+    """repairable corruption 必须给出 exact reasons、可信 revision 与 snapshot 拒绝。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        corruption: repairable corruption grid 单元。
+        source_kind: 当前 fixture 的 filing 或 material kind。
+        expected_reasons: owner contract 规定的稳定 reasons。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: classification、revision 或 snapshot surface 漂移时抛出。
+        OSError: fixture publication 或单点破坏失败时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    document_id = "integrity-target"
+    batch = batching.begin_batch("AAPL")
+    _create_complete_source(
+        source,
+        blob,
+        batch=batch,
+        document_id=document_id,
+        source_kind=source_kind,
+    )
+    batching.commit_batch(batch)
+    complete = source.classify_source_integrity("AAPL", document_id, source_kind)
+    assert complete.status is SourceIntegrityStatus.COMPLETE
+    assert complete.revision is not None
+
+    _apply_repairable_integrity_corruption(
+        repository_set.core,
+        document_id=document_id,
+        source_kind=source_kind,
+        corruption=corruption,
+    )
+
+    damaged = source.classify_source_integrity("AAPL", document_id, source_kind)
+    assert damaged.status is SourceIntegrityStatus.REPAIR_REQUIRED
+    assert damaged.reasons == expected_reasons
+    assert damaged.revision == complete.revision
+    with pytest.raises(
+        ValueError,
+        match="^source snapshot 只允许读取完整 source$",
+    ):
+        source.read_source_snapshot(
+            "AAPL",
+            document_id,
+            source_kind,
+            materialize_files=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("corruption", "expected_reason"),
+    (
+        ("identity_missing", SourceIntegrityReason.IDENTITY_UNTRUSTED),
+        ("meta_missing", SourceIntegrityReason.META_UNTRUSTED),
+        ("meta_malformed", SourceIntegrityReason.META_UNTRUSTED),
+        ("meta_identity_mismatch", SourceIntegrityReason.IDENTITY_UNTRUSTED),
+        ("revision_untrusted", SourceIntegrityReason.REVISION_UNTRUSTED),
+        ("provenance_untrusted", SourceIntegrityReason.PROVENANCE_UNTRUSTED),
+        (
+            "file_declaration_untrusted",
+            SourceIntegrityReason.FILE_DECLARATION_UNTRUSTED,
+        ),
+        ("undeclared_file", SourceIntegrityReason.UNDECLARED_BUSINESS_FILE),
+        ("symlink_entry", SourceIntegrityReason.UNSAFE_FILESYSTEM_ENTRY),
+        ("special_entry", SourceIntegrityReason.UNSAFE_FILESYSTEM_ENTRY),
+        ("multiple_docling", SourceIntegrityReason.FILE_DECLARATION_UNTRUSTED),
+        (
+            "ambiguous_role_with_missing",
+            SourceIntegrityReason.FILE_DECLARATION_UNTRUSTED,
+        ),
+        ("manifest_duplicate", SourceIntegrityReason.SOURCE_MANIFEST_UNTRUSTED),
+        ("manifest_dangling", SourceIntegrityReason.SOURCE_MANIFEST_UNTRUSTED),
+        (
+            "manifest_ticker_conflict",
+            SourceIntegrityReason.SOURCE_MANIFEST_UNTRUSTED,
+        ),
+        (
+            "cross_source_inconsistency",
+            SourceIntegrityReason.CROSS_SOURCE_INCONSISTENCY,
+        ),
+    ),
+)
+def test_source_integrity_unsafe_corruption_grid_closes_without_revision(
+    tmp_path: Path,
+    corruption: _UnsafeIntegrityCorruption,
+    expected_reason: SourceIntegrityReason,
+) -> None:
+    """unsafe corruption 必须闭合为 typed reasons、无 revision 与 snapshot 拒绝。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        corruption: unsafe corruption grid 单元。
+        expected_reason: 当前 grid 单元的 owner-level unsafe reason。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: unsafe 被降级为 repair/missing 或泄漏 revision 时抛出。
+        OSError: fixture publication 或单点破坏失败时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    document_id = "integrity-target"
+    batch = batching.begin_batch("AAPL")
+    _create_complete_source(source, blob, batch=batch, document_id=document_id)
+    if corruption == "cross_source_inconsistency":
+        _create_complete_source(
+            source,
+            blob,
+            batch=batch,
+            document_id="filing-sibling",
+        )
+    batching.commit_batch(batch)
+
+    _apply_unsafe_integrity_corruption(
+        repository_set.core,
+        document_id=document_id,
+        corruption=corruption,
+    )
+
+    damaged = source.classify_source_integrity(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+    )
+    assert damaged.status is SourceIntegrityStatus.UNSAFE
+    assert damaged.revision is None
+    assert expected_reason in damaged.reasons
+    if corruption == "ambiguous_role_with_missing":
+        assert SourceIntegrityReason.ORIGINAL_FILE_MISSING not in damaged.reasons
+    with pytest.raises(
+        ValueError,
+        match="^source snapshot 只允许读取完整 source$",
+    ):
+        source.read_source_snapshot(
+            "AAPL",
+            document_id,
+            SourceKind.FILING,
+            materialize_files=True,
+        )
+
+
+def test_exact_whole_classifier_snapshot_and_commit_consume_same_inspection_facts(
+    tmp_path: Path,
+) -> None:
+    """exact/whole、staged/published classifier、snapshot 与 commit 必须同源。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 任一 consumer 重建或偏离统一 payload facts 时抛出。
+        OSError: staged/published inspection 或 snapshot 读取失败时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    core = repository_set.core
+    batching = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    batch = batching.begin_batch("AAPL")
+    _create_complete_source(source, blob, batch=batch, document_id="filing-a")
+    _create_complete_source(source, blob, batch=batch, document_id="filing-b")
+    state = _only_active_batch_state(core)
+    staged_root = state.staging_ticker_dir / "filings"
+    staged_exact = _inspect_source_kind_unguarded(
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        ticker_dir=state.staging_ticker_dir,
+        source_root=staged_root,
+        requested_document_id="filing-a",
+    )
+    staged_whole = _inspect_source_kind_unguarded(
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        ticker_dir=state.staging_ticker_dir,
+        source_root=staged_root,
+        requested_document_id=None,
+    )
+    assert staged_exact.target is not None
+    assert staged_whole.target is None
+    assert staged_exact.inventory == staged_whole.inventory
+    assert staged_exact.shared_manifest_reasons == staged_whole.shared_manifest_reasons
+    assert staged_exact.canonical_manifest_items == staged_whole.canonical_manifest_items
+    staged_classification = source.classify_staged_source_integrity(
+        "AAPL",
+        "filing-a",
+        SourceKind.FILING,
+        batch=batch,
+    )
+    assert staged_classification == staged_exact.target.classification
+    batching.commit_batch(batch)
+
+    guard = core._acquire_publication_guard("AAPL")
+    try:
+        ticker_dir = core._target_ticker_dir("AAPL")
+        published_root = ticker_dir / "filings"
+        published_exact = _inspect_source_kind_unguarded(
+            ticker="AAPL",
+            source_kind=SourceKind.FILING,
+            ticker_dir=ticker_dir,
+            source_root=published_root,
+            requested_document_id="filing-a",
+        )
+        published_whole = _inspect_source_kind_unguarded(
+            ticker="AAPL",
+            source_kind=SourceKind.FILING,
+            ticker_dir=ticker_dir,
+            source_root=published_root,
+            requested_document_id=None,
+        )
+    finally:
+        core._release_lock_token(guard)
+    assert published_exact.target is not None
+    assert published_whole.target is None
+    assert published_exact.inventory == published_whole.inventory
+    assert published_exact.shared_manifest_reasons == published_whole.shared_manifest_reasons
+    assert published_exact.canonical_manifest_items == published_whole.canonical_manifest_items
+    assert source.classify_source_integrity(
+        "AAPL",
+        "filing-a",
+        SourceKind.FILING,
+    ) == published_exact.target.classification
+    with source.read_source_snapshot(
+        "AAPL",
+        "filing-a",
+        SourceKind.FILING,
+        materialize_files=False,
+    ) as snapshot:
+        target = published_exact.target
+        assert snapshot.source_meta == target.business_meta
+        assert snapshot.provenance == target.provenance
+        assert snapshot.revision == target.revision
+        assert snapshot.files == tuple(item.descriptor for item in target.files)
+        assert snapshot.primary_filename == target.primary_document
+
+
+def test_trusted_manifest_preserves_local_unsafe_without_cross_reason(
+    tmp_path: Path,
+) -> None:
+    """trusted manifest 不得把单 source local UNSAFE 虚构为跨 source 损坏。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: local reason 被叠加 cross/shared manifest reason 时抛出。
+        OSError: fixture publication 或 inspection 失败时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    core = repository_set.core
+    batching = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    batch = batching.begin_batch("AAPL")
+    _create_complete_source(source, blob, batch=batch, document_id="filing-a")
+    batching.commit_batch(batch)
+    _apply_unsafe_integrity_corruption(
+        core,
+        document_id="filing-a",
+        corruption="meta_missing",
+    )
+
+    guard = core._acquire_publication_guard("AAPL")
+    try:
+        ticker_dir = core._target_ticker_dir("AAPL")
+        source_root = ticker_dir / "filings"
+        exact = _inspect_source_kind_unguarded(
+            ticker="AAPL",
+            source_kind=SourceKind.FILING,
+            ticker_dir=ticker_dir,
+            source_root=source_root,
+            requested_document_id="filing-a",
+        )
+        whole = _inspect_source_kind_unguarded(
+            ticker="AAPL",
+            source_kind=SourceKind.FILING,
+            ticker_dir=ticker_dir,
+            source_root=source_root,
+            requested_document_id=None,
+        )
+    finally:
+        core._release_lock_token(guard)
+
+    assert exact.target is not None
+    assert exact.target.classification.reasons == (
+        SourceIntegrityReason.META_UNTRUSTED,
+    )
+    assert exact.inventory == whole.inventory
+    assert exact.shared_manifest_reasons == ()
+    assert whole.shared_manifest_reasons == ()
+    assert whole.repair_blocked_reason is (
+        SourceIntegrityRepairBlockedReason.CROSS_SOURCE_PUBLICATION_UNSAFE
+    )
+
+
+def test_inventory_and_commit_call_whole_inspector_once_per_source_kind(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """inventory 与 commit 每个 source kind 必须各消费一次 whole-kind payload。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest monkeypatch fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: consumer 逐 target 重扫或遗漏 source kind 时抛出。
+        OSError: fixture publication 或 validation I/O 失败时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    batch = batching.begin_batch("AAPL")
+    _create_complete_source(source, blob, batch=batch, document_id="filing-a")
+    _create_complete_source(
+        source,
+        blob,
+        batch=batch,
+        document_id="material-a",
+        source_kind=SourceKind.MATERIAL,
+    )
+    batching.commit_batch(batch)
+
+    inventory_counter = _InspectorCallCounter(calls=[])
+    monkeypatch.setattr(
+        source_document_core_module,
+        "_inspect_source_kind_unguarded",
+        inventory_counter.inspect,
+    )
+    assert len(source.list_source_integrity("AAPL")) == 2
+    assert inventory_counter.calls == [
+        (SourceKind.FILING, None),
+        (SourceKind.MATERIAL, None),
+    ]
+
+    commit_batch = batching.begin_batch("AAPL")
+    commit_counter = _InspectorCallCounter(calls=[])
+    monkeypatch.setattr(
+        storage_infra_module,
+        "_inspect_source_kind_unguarded",
+        commit_counter.inspect,
+    )
+    batching.commit_batch(commit_batch)
+    assert commit_counter.calls == [
+        (SourceKind.FILING, None),
+        (SourceKind.MATERIAL, None),
+    ]
+
+
+def test_damaged_fixture_classifier_snapshot_and_commit_are_consistent(
+    tmp_path: Path,
+) -> None:
+    """同一 damaged fixture 的 published/staged classifier、snapshot、commit 必须一致。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: consumer 对 original missing 得出不同状态时抛出。
+        OSError: fixture publication 或单点破坏失败时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    first_batch = batching.begin_batch("AAPL")
+    _create_complete_source(source, blob, batch=first_batch, document_id="filing-a")
+    batching.commit_batch(first_batch)
+    _apply_repairable_integrity_corruption(
+        repository_set.core,
+        document_id="filing-a",
+        source_kind=SourceKind.FILING,
+        corruption="original_missing",
+    )
+    published = source.classify_source_integrity(
+        "AAPL",
+        "filing-a",
+        SourceKind.FILING,
+    )
+    assert published.status is SourceIntegrityStatus.REPAIR_REQUIRED
+    with pytest.raises(
+        ValueError,
+        match="^source snapshot 只允许读取完整 source$",
+    ):
+        source.read_source_snapshot(
             "AAPL",
             "filing-a",
             SourceKind.FILING,
+            materialize_files=False,
         )
-    with pytest.raises(ValueError, match="64位小写十六进制"):
-        source.list_source_integrity("AAPL")
-    meta_path.write_text(original_meta, encoding="utf-8")
+
+    second_batch = batching.begin_batch("AAPL")
+    staged = source.classify_staged_source_integrity(
+        "AAPL",
+        "filing-a",
+        SourceKind.FILING,
+        batch=second_batch,
+    )
+    assert staged == published
+    state = _only_active_batch_state(repository_set.core)
+    whole = _inspect_source_kind_unguarded(
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        ticker_dir=state.staging_ticker_dir,
+        source_root=state.staging_ticker_dir / "filings",
+        requested_document_id=None,
+    )
+    assert whole.repair_blocked_reason is (
+        SourceIntegrityRepairBlockedReason.CANONICAL_MANIFEST_UNAVAILABLE
+    )
+    with pytest.raises(
+        ValueError,
+        match="filing source publication 不满足 complete canonical manifest contract",
+    ):
+        batching.commit_batch(second_batch)
 
 
 def test_source_integrity_public_contract_closes_states_reasons_and_comparison() -> None:
@@ -6252,7 +7327,36 @@ def _stage_snapshot_version(
                 "source_provider": "user_upload" if version == "A" else "sec_edgar",
                 "version_marker": version,
             },
-            files=[primary_meta, related_meta],
+            files=[primary_meta, related_meta] if version == "B" else [],
+            file_entries=(
+                None
+                if version == "B"
+                else [
+                    {
+                        "name": related_name,
+                        "uri": related_meta.uri,
+                        "etag": related_meta.etag,
+                        "last_modified": related_meta.last_modified,
+                        "size": related_meta.size,
+                        "content_type": related_meta.content_type,
+                        "sha256": related_meta.sha256,
+                        "source": "original",
+                        "original_filename": related_name,
+                    },
+                    {
+                        "name": primary_name,
+                        "uri": primary_meta.uri,
+                        "etag": primary_meta.etag,
+                        "last_modified": primary_meta.last_modified,
+                        "size": primary_meta.size,
+                        "content_type": primary_meta.content_type,
+                        "sha256": primary_meta.sha256,
+                        "source": "docling",
+                        "original_filename": related_name,
+                        "derived_from": related_name,
+                    },
+                ]
+            ),
         ),
         SourceKind.FILING,
         batch=batch,

@@ -71,6 +71,8 @@ class FsBatchingRepository(BatchingRepositoryProtocol):
 
         Raises:
             ValueError: capability 未登记、已终态或 ticker/core 不匹配时抛出。
+            SourceIntegrityPreflightError: whole-tree inspection 遇到无法归属到
+                单一 source target 的结构损坏时抛出。
             OSError: physical swap、journal 或 pre-commit restore 失败时抛出。
             RuntimeFileLockError: 没有更早 operation error 且 publication/writer lock
                 获取或释放失败时抛出；``COMMITTED`` 后 publication release failure

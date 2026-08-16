@@ -72,6 +72,7 @@ from dayu.fins.domain.document_models import (
     DocumentMeta,
     DocumentSummary,
     DownloadRejectionEntry,
+    FileObjectMeta,
     FinsSourceProvider,
     ProcessedCreateRequest,
     RejectedFilingArtifactUpsertRequest,
@@ -201,6 +202,50 @@ _CompleteSourceFailureCase = Literal[
     "duplicate_manifest_identity",
     "manifest_ticker_mismatch",
 ]
+
+
+def _fresh_upload_file_entry(
+    file_meta: FileObjectMeta,
+    *,
+    name: str,
+    source: Literal["original", "docling"],
+    original_filename: str,
+    derived_from: str | None = None,
+) -> dict[str, JsonValue]:
+    """把已 staged blob 投影为 UF-FIX07 fresh filing file entry。
+
+    Args:
+        file_meta: blob repository 返回的 physical file meta。
+        name: storage-owned exact asset identity。
+        source: original 或 Docling role。
+        original_filename: 用户输入 basename。
+        derived_from: Docling 对应的 exact original identity。
+
+    Returns:
+        可直接写入 ``SourceDocumentUpsertRequest.file_entries`` 的严格条目。
+
+    Raises:
+        ValueError: Docling 缺少 derived identity，或 original 错带 derived identity 时抛出。
+    """
+
+    if source == "docling" and derived_from is None:
+        raise ValueError("Docling fixture 必须携带 derived_from")
+    if source == "original" and derived_from is not None:
+        raise ValueError("original fixture 不得携带 derived_from")
+    entry: dict[str, JsonValue] = {
+        "name": name,
+        "uri": file_meta.uri,
+        "etag": file_meta.etag,
+        "last_modified": file_meta.last_modified,
+        "size": file_meta.size,
+        "content_type": file_meta.content_type,
+        "sha256": file_meta.sha256,
+        "source": source,
+        "original_filename": original_filename,
+    }
+    if derived_from is not None:
+        entry["derived_from"] = derived_from
+    return entry
 
 
 class _OpenCancellationToken:
@@ -1286,6 +1331,18 @@ def test_snapshot_explicit_source_kind_ignores_other_kind_with_same_document_id(
             batch=batch,
             content_type="text/html",
         )
+        original_name = f"original-{filename}"
+        original_meta = (
+            blob_repository.store_file(
+                handle,
+                original_name,
+                io.BytesIO(b"original filing version"),
+                batch=batch,
+                content_type="text/html",
+            )
+            if source_kind is SourceKind.FILING
+            else None
+        )
         repository.create_source_document(
             SourceDocumentUpsertRequest(
                 ticker="AAPL",
@@ -1297,7 +1354,26 @@ def test_snapshot_explicit_source_kind_ignores_other_kind_with_same_document_id(
                     "ingest_method": "upload",
                     "source_provider": "user_upload",
                 },
-                files=[file_meta],
+                files=[file_meta] if original_meta is None else [],
+                file_entries=(
+                    None
+                    if original_meta is None
+                    else [
+                        _fresh_upload_file_entry(
+                            original_meta,
+                            name=original_name,
+                            source="original",
+                            original_filename=filename,
+                        ),
+                        _fresh_upload_file_entry(
+                            file_meta,
+                            name=filename,
+                            source="docling",
+                            original_filename=filename,
+                            derived_from=original_name,
+                        ),
+                    ]
+                ),
             ),
             source_kind,
             batch=batch,
@@ -1663,7 +1739,10 @@ def test_invalid_primary_never_projects_first_file_and_commit_preserves_publishe
     )
 
     assert projected_handle.primary_file_uri is None
-    with pytest.raises(ValueError, match="primary_document 未精确命中 files"):
+    with pytest.raises(
+        ValueError,
+        match="filing source publication 不满足 complete canonical manifest contract",
+    ):
         batching_repository.commit_batch(invalid_batch)
     with pytest.raises(ValueError, match="未在当前 storage core 登记"):
         batching_repository.rollback_batch(invalid_batch)
@@ -1775,7 +1854,17 @@ def test_complete_filing_and_material_commit_share_one_source_truth(tmp_path: Pa
             source_kind,
             meta=meta,
         )
-        assert primary.uri == meta["files"][0]["uri"]
+        raw_files = meta["files"]
+        assert isinstance(raw_files, list)
+        primary_name = meta["primary_document"]
+        assert isinstance(primary_name, str)
+        primary_items = [
+            item
+            for item in raw_files
+            if isinstance(item, dict) and item.get("name") == primary_name
+        ]
+        assert len(primary_items) == 1
+        assert primary.uri == primary_items[0]["uri"]
         assert blob_repository.read_file_bytes(handle, f"{document_id}.txt") == document_id.encode()
         assert provenance.source_provider is FinsSourceProvider.USER_UPLOAD
         assert provenance.ingest_complete is True
@@ -1906,7 +1995,10 @@ def test_blob_only_commit_failure_keeps_new_source_absent(tmp_path: Path) -> Non
         batch=batch,
     )
 
-    with pytest.raises(ValueError, match="缺少 manifest"):
+    with pytest.raises(
+        ValueError,
+        match="filing source publication 不满足 complete canonical manifest contract",
+    ):
         batching_repository.commit_batch(batch)
     with pytest.raises(FileNotFoundError):
         source_repository.get_source_meta("AAPL", "blob_only", SourceKind.FILING)
@@ -4883,6 +4975,14 @@ async def _create_child_task_source(
         batch=batch,
         content_type="text/markdown",
     )
+    original_name = "original-aapl-child-task.md"
+    original_meta = blob_repository.store_file(
+        SourceHandle("AAPL", "aapl-child-task", SourceKind.FILING.value),
+        original_name,
+        io.BytesIO(b"original child task source"),
+        batch=batch,
+        content_type="text/markdown",
+    )
     source_repository.create_source_document(
         SourceDocumentUpsertRequest(
             ticker="AAPL",
@@ -4890,7 +4990,21 @@ async def _create_child_task_source(
             internal_document_id="aapl-child-task",
             form_type="10-K",
             primary_document="aapl-child-task.md",
-            files=[file_meta],
+            file_entries=[
+                _fresh_upload_file_entry(
+                    original_meta,
+                    name=original_name,
+                    source="original",
+                    original_filename="aapl-child-task.md",
+                ),
+                _fresh_upload_file_entry(
+                    file_meta,
+                    name="aapl-child-task.md",
+                    source="docling",
+                    original_filename="aapl-child-task.md",
+                    derived_from=original_name,
+                ),
+            ],
             meta={
                 "fiscal_year": 2024,
                 "fiscal_period": "FY",
@@ -4932,13 +5046,35 @@ def test_explicit_batch_allows_worker_thread_mutation_on_shared_core(tmp_path: P
         batch=token,
         content_type="text/markdown",
     )
+    original_name = "original-aapl-worker-thread.md"
+    original_meta = blob_repository.store_file(
+        SourceHandle("AAPL", "aapl-worker-thread", SourceKind.FILING.value),
+        original_name,
+        io.BytesIO(b"original worker thread source"),
+        batch=token,
+        content_type="text/markdown",
+    )
     request = SourceDocumentUpsertRequest(
         ticker="AAPL",
         document_id="aapl-worker-thread",
         internal_document_id="aapl-worker-thread",
         form_type="10-K",
         primary_document="aapl-worker-thread.md",
-        files=[file_meta],
+        file_entries=[
+            _fresh_upload_file_entry(
+                original_meta,
+                name=original_name,
+                source="original",
+                original_filename="aapl-worker-thread.md",
+            ),
+            _fresh_upload_file_entry(
+                file_meta,
+                name="aapl-worker-thread.md",
+                source="docling",
+                original_filename="aapl-worker-thread.md",
+                derived_from=original_name,
+            ),
+        ],
         meta={
             "ingest_method": "upload",
             "source_provider": FinsSourceProvider.USER_UPLOAD.to_storage_value(),
@@ -5069,6 +5205,14 @@ def _build_fins_workspace(tmp_path: Path) -> Path:
             batch=token,
             content_type="text/markdown",
         )
+        original_name = "original-aapl-2024-10k.md"
+        original_meta = blob_repository.store_file(
+            handle,
+            original_name,
+            io.BytesIO(b"original upload fixture"),
+            batch=token,
+            content_type="text/markdown",
+        )
         source_repository.update_source_document(
             SourceDocumentUpsertRequest(
                 ticker="AAPL",
@@ -5085,7 +5229,21 @@ def _build_fins_workspace(tmp_path: Path) -> Path:
                     "ingest_method": "upload",
                     "source_provider": "user_upload",
                 },
-                files=[file_meta],
+                file_entries=[
+                    _fresh_upload_file_entry(
+                        original_meta,
+                        name=original_name,
+                        source="original",
+                        original_filename="aapl-2024-10k.md",
+                    ),
+                    _fresh_upload_file_entry(
+                        file_meta,
+                        name="aapl-2024-10k.md",
+                        source="docling",
+                        original_filename="aapl-2024-10k.md",
+                        derived_from=original_name,
+                    ),
+                ],
             ),
             SourceKind.FILING,
             batch=token,
@@ -5258,15 +5416,82 @@ def _create_source_document_for_provenance(
         batch=batch,
         content_type="text/markdown" if processor_compatible else "text/plain",
     )
+    is_fresh_upload_filing = (
+        source_kind is SourceKind.FILING
+        and ingest_method == "upload"
+        and source_provider == FinsSourceProvider.USER_UPLOAD.to_storage_value()
+    )
+    docling_name = f"{filename}_docling.json"
+    docling_meta = (
+        blob_repository.store_file(
+            handle,
+            docling_name,
+            io.BytesIO(
+                json.dumps(
+                    {
+                        "schema_name": "DoclingDocument",
+                        "version": "1.10.0",
+                        "name": document_id,
+                        "furniture": {
+                            "self_ref": "#/furniture",
+                            "children": [],
+                            "content_layer": "furniture",
+                            "name": "_root_",
+                            "label": "unspecified",
+                        },
+                        "body": {
+                            "self_ref": "#/body",
+                            "children": [],
+                            "content_layer": "body",
+                            "name": "_root_",
+                            "label": "unspecified",
+                        },
+                        "groups": [],
+                        "texts": [],
+                        "pictures": [],
+                        "tables": [],
+                        "key_value_items": [],
+                        "form_items": [],
+                        "pages": {},
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ),
+            batch=batch,
+            content_type="application/json",
+        )
+        if is_fresh_upload_filing
+        else None
+    )
+    file_entries = (
+        [
+            _fresh_upload_file_entry(
+                file_meta,
+                name=filename,
+                source="original",
+                original_filename=filename,
+            ),
+            _fresh_upload_file_entry(
+                docling_meta,
+                name=docling_name,
+                source="docling",
+                original_filename=filename,
+                derived_from=filename,
+            ),
+        ]
+        if docling_meta is not None
+        else None
+    )
     source_repository.create_source_document(
         SourceDocumentUpsertRequest(
             ticker=ticker,
             document_id=document_id,
             internal_document_id=document_id,
             form_type="10-K",
-            primary_document=filename,
+            primary_document=docling_name if docling_meta is not None else filename,
             meta=meta,
-            files=[file_meta],
+            files=[] if file_entries is not None else [file_meta],
+            file_entries=file_entries,
         ),
         source_kind,
         batch=batch,
@@ -5525,6 +5750,14 @@ def _build_fins_financial_html_workspace(tmp_path: Path) -> Path:
             batch=token,
             content_type="text/html",
         )
+        original_name = f"original-{_FINANCIAL_HTML_PRIMARY_DOCUMENT}"
+        original_meta = blob_repository.store_file(
+            handle,
+            original_name,
+            io.BytesIO(b"original financial upload fixture"),
+            batch=token,
+            content_type="text/html",
+        )
         source_repository.create_source_document(
             SourceDocumentUpsertRequest(
                 ticker="AAPL",
@@ -5541,7 +5774,21 @@ def _build_fins_financial_html_workspace(tmp_path: Path) -> Path:
                     "ingest_method": "upload",
                     "source_provider": "user_upload",
                 },
-                files=[file_meta],
+                file_entries=[
+                    _fresh_upload_file_entry(
+                        original_meta,
+                        name=original_name,
+                        source="original",
+                        original_filename=_FINANCIAL_HTML_PRIMARY_DOCUMENT,
+                    ),
+                    _fresh_upload_file_entry(
+                        file_meta,
+                        name=_FINANCIAL_HTML_PRIMARY_DOCUMENT,
+                        source="docling",
+                        original_filename=_FINANCIAL_HTML_PRIMARY_DOCUMENT,
+                        derived_from=original_name,
+                    ),
+                ],
             ),
             SourceKind.FILING,
             batch=token,

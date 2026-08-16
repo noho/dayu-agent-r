@@ -212,8 +212,8 @@ class FilingUploadStateRepositoryProtocol(Protocol):
         Raises:
             CompanyTickerIdentityCorruptionError: published target、descriptor、meta
                 或 identity durable state 损坏时抛出。
-            ValueError: ticker/document identity 非法，或 published source directory、meta、
-                identity descriptor 结构损坏（含 required meta/descriptor 缺失）时抛出。
+            ValueError: ticker 或 document identity 非法时抛出；source directory、meta、
+                identity descriptor 等可归属 target 的结构损坏返回 ``UNSAFE`` typed state。
             RuntimeFileLockError: publication guard 获取或释放失败时抛出。
             OSError: identity descriptor、meta 或其它 published state operational 读取失败时
                 抛出 path-free 文件系统异常。
@@ -429,6 +429,8 @@ class BatchingRepositoryProtocol(Protocol):
 
         Raises:
             ValueError: token 不是当前活动 batch 时抛出。
+            SourceIntegrityPreflightError: whole-tree inspection 遇到无法归属到
+                单一 source target 的结构损坏时抛出。
             OSError: ``COMMITTED`` 前 physical swap、journal 或 restore 失败时抛出；
                 capability 仍由本方法终态消费，caller 不得再次 rollback。
             RuntimeFileLockError: 没有更早 operation error 且 publication/writer lock

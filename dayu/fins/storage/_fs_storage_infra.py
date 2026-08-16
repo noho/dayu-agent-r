@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import errno
 import os
 import stat
@@ -35,8 +34,6 @@ from dayu.fins.domain.document_models import (
     MaterialManifestItem,
     ProcessedHandle,
     ProcessedManifestItem,
-    SourceDocumentProvenance,
-    SourceDocumentRevision,
     SourceHandle,
     now_iso8601,
 )
@@ -64,6 +61,10 @@ from ._fs_identity import (
     _require_external_identity,
 )
 from .file_store import FileStore
+from ._fs_source_integrity import (
+    _SourcePublicationInspection,
+    _inspect_source_kind_unguarded,
+)
 from .local_file_store import LocalFileStore
 from .repository_protocols import (
     CompanyTickerAliasConflictError,
@@ -88,6 +89,7 @@ from ._fs_storage_utils import (
     _source_dir_name,
     _write_json,
 )
+from .source_integrity import SourceIntegrityStatus
 
 _DAYU_DIRNAME = ".dayu"
 _BATCH_ROOT_DIRNAME = "repo_batches"
@@ -105,7 +107,6 @@ _PHASE_ROLLED_BACK = "rolled_back"
 _BATCH_LIFECYCLE_OPEN = "open"
 _BATCH_LIFECYCLE_COMMIT_STARTED = "commit_started"
 _BATCH_LIFECYCLE_CLOSED = "closed"
-_SOURCE_REVISION_META_FIELD: Final[str] = "_published_source_revision"
 _JOURNAL_FIELDS: Final[frozenset[str]] = frozenset({"transaction_id", "ticker", "phase"})
 _RECOVERY_PHASES: Final[frozenset[str]] = frozenset(
     {
@@ -116,50 +117,6 @@ _RECOVERY_PHASES: Final[frozenset[str]] = frozenset(
         _PHASE_ROLLED_BACK,
     }
 )
-
-
-def _source_revision_from_meta(
-    meta: Mapping[str, JsonValue],
-) -> SourceDocumentRevision:
-    """从 persisted source meta 机械读取 opaque published revision。
-
-    Args:
-        meta: storage owner 已读取的 source meta。
-
-    Returns:
-        只承诺 exact equality 的 typed revision。
-
-    Raises:
-        KeyError: persisted revision 字段缺失时抛出。
-        ValueError: persisted revision 不是非空字符串时抛出。
-    """
-
-    if _SOURCE_REVISION_META_FIELD not in meta:
-        raise KeyError("source meta 缺少 persisted published revision")
-    raw_token = meta[_SOURCE_REVISION_META_FIELD]
-    if not isinstance(raw_token, str):
-        raise ValueError("persisted published revision 必须为字符串")
-    return SourceDocumentRevision(token=raw_token)
-
-
-def _source_meta_without_revision(
-    meta: Mapping[str, JsonValue],
-) -> dict[str, JsonValue]:
-    """投影不含 storage 私有 revision 字段的 source business meta。
-
-    Args:
-        meta: 包含 storage 私有 publication 字段的 persisted source meta。
-
-    Returns:
-        不携带 persisted revision 的独立浅层 JSON 对象。
-
-    Raises:
-        无。
-    """
-
-    return {
-        field_name: field_value for field_name, field_value in meta.items() if field_name != _SOURCE_REVISION_META_FIELD
-    }
 
 
 @dataclass(slots=True)
@@ -303,52 +260,6 @@ class _PublicationGuardedBinaryOpener:
             return _open_binary_file(path, action="打开 published source 文件")
         finally:
             _release_storage_lock_token(guard_token)
-
-
-def _hash_regular_file_sha256(path: Path) -> str:
-    """流式计算 physical regular file 的 SHA-256。
-
-    Args:
-        path: 已通过 containment 与 regular-file 校验的文件路径。
-
-    Returns:
-        64 位小写十六进制摘要。
-
-    Raises:
-        OSError: 文件打开或读取失败时抛出。
-    """
-
-    digest = hashlib.sha256()
-    try:
-        with _open_binary_file(path, action="打开 complete source 文件") as stream:
-            while chunk := stream.read(64 * 1024):
-                digest.update(chunk)
-    except OSError as exc:
-        _raise_path_free_error(_project_filesystem_error(exc, action="读取 complete source 文件"))
-    return digest.hexdigest()
-
-
-def _require_canonical_sha256(value: JsonValue, *, label: str) -> str:
-    """校验并返回 canonical SHA-256 摘要。
-
-    Args:
-        value: source meta 中的摘要值。
-        label: path-free 业务定位标签。
-
-    Returns:
-        64 位小写十六进制摘要。
-
-    Raises:
-        ValueError: 摘要不是 canonical SHA-256 字符串时抛出。
-    """
-
-    if not isinstance(value, str) or len(value) != 64 or value != value.lower():
-        raise ValueError(f"source file.sha256 必须为64位小写十六进制字符串: {label}")
-    try:
-        int(value, 16)
-    except ValueError as exc:
-        raise ValueError(f"source file.sha256 必须为64位小写十六进制字符串: {label}") from exc
-    return value
 
 
 def _parse_backup_directory_name(name: str) -> tuple[str, str] | None:
@@ -1189,267 +1100,101 @@ class _FsStorageInfra:
         """
 
         source_root = state.staging_ticker_dir / _source_dir_name(source_kind)
-        if not source_root.exists() and not source_root.is_symlink():
-            return {}
-        if source_root.is_symlink() or not source_root.is_dir():
-            raise ValueError(f"{source_kind.value} source root 必须为非 symlink 目录")
         self._require_contained_path(
             source_root,
             state.staging_ticker_dir,
             label=f"{source_kind.value} source root",
         )
-        manifest_name = "filing_manifest.json" if source_kind is SourceKind.FILING else "material_manifest.json"
-        manifest_path = source_root / manifest_name
-        source_directories: dict[str, Path] = {}
-        for child in _list_directory(source_root, action="枚举 complete source root"):
-            if child.is_symlink():
-                raise ValueError("source root 禁止 symlink 条目")
-            if child.name == manifest_name:
-                continue
-            if source_kind is SourceKind.FILING and child.name == _DOWNLOAD_REJECTIONS_FILENAME:
-                continue
-            if source_kind is SourceKind.FILING and child.name == _REJECTED_FILINGS_DIRNAME:
-                continue
-            if not child.is_dir():
-                raise ValueError("source root 存在非法非目录条目")
-            identity_namespace = (
-                _FILING_IDENTITY_NAMESPACE if source_kind is SourceKind.FILING else _MATERIAL_IDENTITY_NAMESPACE
-            )
-            document_id = _read_identity_descriptor(child, identity_namespace)
-            if document_id in source_directories:
-                raise ValueError("source namespace 存在重复 external document identity")
-            source_directories[document_id] = child
-
-        manifest_items = self._read_complete_source_manifest(
-            manifest_path,
-            state.token.ticker,
+        inspection = _inspect_source_kind_unguarded(
+            ticker=state.token.ticker,
+            source_kind=source_kind,
+            ticker_dir=state.staging_ticker_dir,
+            source_root=source_root,
+            requested_document_id=None,
         )
-        source_ids = set(source_directories)
-        manifest_ids = set(manifest_items)
-        missing_manifest_ids = sorted(source_ids - manifest_ids)
-        if missing_manifest_ids:
-            raise ValueError(f"source 缺少 manifest 项目: {','.join(missing_manifest_ids)}")
-        dangling_manifest_ids = sorted(manifest_ids - source_ids)
-        if dangling_manifest_ids:
-            raise ValueError(f"manifest 存在 dangling source: {','.join(dangling_manifest_ids)}")
-
+        if (
+            inspection.shared_manifest_reasons
+            or inspection.repair_blocked_reason is not None
+            or len(inspection.canonical_manifest_items) != len(inspection.inventory)
+        ):
+            raise ValueError(
+                f"{source_kind.value} source publication 不满足 complete canonical manifest contract"
+            )
         validated_meta: dict[str, dict[str, JsonValue]] = {}
-        for document_id, source_dir in source_directories.items():
-            meta = self._validate_complete_source_directory(
+        for source_inspection in inspection.inventory:
+            if (
+                source_inspection.content_classification.status
+                is not SourceIntegrityStatus.COMPLETE
+                or source_inspection.classification.status
+                is not SourceIntegrityStatus.COMPLETE
+                or source_inspection.persisted_meta is None
+                or source_inspection.canonical_manifest_item is None
+            ):
+                raise ValueError(
+                    f"{source_kind.value} source publication 只允许 COMPLETE source"
+                )
+            self._validate_staging_source_uri_and_containment(
                 state,
                 source_kind,
-                document_id,
-                source_dir,
+                source_inspection,
             )
-            expected_manifest_item = (
-                FilingManifestItem.from_source_meta(meta).to_dict()
-                if source_kind is SourceKind.FILING
-                else MaterialManifestItem.from_source_meta(meta).to_dict()
+            validated_meta[source_inspection.classification.document_id] = dict(
+                source_inspection.persisted_meta
             )
-            if manifest_items[document_id] != expected_manifest_item:
-                raise ValueError(
-                    "source 与 manifest 的 identity/provenance/completion 投影不一致: "
-                    f"{source_kind.value}/{document_id}"
-                )
-            validated_meta[document_id] = meta
         return validated_meta
 
-    def _read_complete_source_manifest(
-        self,
-        manifest_path: Path,
-        ticker: str,
-    ) -> dict[str, dict[str, JsonValue]]:
-        """读取并校验 commit validator 使用的 ticker manifest。
-
-        Args:
-            manifest_path: filing 或 material manifest 路径。
-            ticker: 当前 transaction ticker。
-
-        Returns:
-            以 canonical document ID 为键的 manifest 项目。
-
-        Raises:
-            ValueError: manifest 路径、ticker、documents 或条目非法时抛出。
-            OSError: manifest 读取失败时抛出。
-        """
-
-        if not manifest_path.exists():
-            return {}
-        if manifest_path.is_symlink() or not manifest_path.is_file():
-            raise ValueError("source manifest 必须为 regular file")
-        manifest = cast(dict[str, JsonValue], _read_json_object(manifest_path))
-        if manifest.get("ticker") != ticker:
-            raise ValueError("source manifest ticker 与 transaction ticker 不一致")
-        raw_documents = manifest.get("documents")
-        if not isinstance(raw_documents, list):
-            raise ValueError("source manifest documents 必须为数组")
-        items: dict[str, dict[str, JsonValue]] = {}
-        for raw_item in raw_documents:
-            if not isinstance(raw_item, Mapping):
-                raise ValueError("source manifest documents 条目必须为 object")
-            item = dict(raw_item)
-            raw_document_id = item.get("document_id")
-            if not isinstance(raw_document_id, str):
-                raise ValueError("source manifest document_id 必须为字符串")
-            document_id = _require_external_identity(
-                raw_document_id,
-                field_name="source manifest document_id",
-            )
-            if document_id in items:
-                raise ValueError(f"source manifest document_id 重复: {document_id}")
-            items[document_id] = cast(dict[str, JsonValue], item)
-        return items
-
-    def _validate_complete_source_directory(
+    def _validate_staging_source_uri_and_containment(
         self,
         state: _ActiveBatchState,
         source_kind: SourceKind,
-        document_id: str,
-        source_dir: Path,
-    ) -> dict[str, JsonValue]:
-        """校验单个 staged source 的 meta、provenance、files 与 primary。
+        inspection: _SourcePublicationInspection,
+    ) -> None:
+        """校验 inspector 之外由 commit owner 保留的 staging locator 资格。
 
         Args:
             state: 当前 commit 的内部 transaction state。
-            source_kind: source 目录类型。
-            document_id: 目录对应的 canonical document ID。
-            source_dir: staged source 目录。
+            source_kind: filing 或 material。
+            inspection: 同一次 whole-kind payload 中的 complete source inspection。
 
         Returns:
-            已解析且完成态为真的 source meta。
+            无。
 
         Raises:
-            ValueError: source 业务事实、物理文件或 containment 非法时抛出。
-            OSError: meta 或业务文件读取失败时抛出。
+            ValueError: staging URI 不等于 exact physical identity，或 locator 越出
+                staging ticker/source root 时抛出。
+            RuntimeError: inspector 的 complete payload 违反内部 files 不变量时抛出。
+            OSError: containment operational I/O 失败时抛出 path-free 异常。
         """
 
-        self._require_contained_path(
-            source_dir,
-            state.staging_ticker_dir,
-            label=f"{source_kind.value} source directory",
-        )
-        meta_path = source_dir / _SOURCE_META_FILENAME
-        if not meta_path.exists():
-            raise ValueError(f"complete source 缺少 meta.json: {source_kind.value}/{document_id}")
-        if meta_path.is_symlink() or not meta_path.is_file():
-            raise ValueError(f"complete source meta 必须为 regular file: {document_id}")
-        meta = cast(dict[str, JsonValue], _read_json_object(meta_path))
-        if meta.get("ticker") != state.token.ticker:
-            raise ValueError(f"source meta ticker 与目录不一致: {document_id}")
-        if meta.get("document_id") != document_id:
-            raise ValueError(f"source meta document_id 与目录不一致: {document_id}")
-        if meta.get("source_kind") != source_kind.value:
-            raise ValueError(f"source meta source_kind 与目录不一致: {document_id}")
-        provenance = SourceDocumentProvenance.from_meta(meta, source_kind)
-        if not provenance.ingest_complete:
-            raise ValueError(f"source meta 禁止 false completion: {document_id}")
-        _source_revision_from_meta(meta)
-        file_names = self._validate_complete_source_files(
-            state,
-            source_kind,
-            document_id,
-            source_dir,
-            meta,
-        )
-        primary_document = meta.get("primary_document")
-        if not isinstance(primary_document, str) or not primary_document.strip():
-            raise ValueError(f"complete source primary_document 不能为空: {document_id}")
-        normalized_primary = _normalize_filename(primary_document)
-        if normalized_primary != primary_document or normalized_primary not in file_names:
-            raise ValueError(f"primary_document 未精确命中 files: {document_id}")
-        return meta
-
-    def _validate_complete_source_files(
-        self,
-        state: _ActiveBatchState,
-        source_kind: SourceKind,
-        document_id: str,
-        source_dir: Path,
-        meta: Mapping[str, JsonValue],
-    ) -> set[str]:
-        """校验 source files manifest 与同目录 physical regular files 同源。
-
-        Args:
-            state: 当前 commit 的内部 transaction state。
-            source_kind: source 目录类型。
-            document_id: 当前 source 文档 ID。
-            source_dir: staged source 目录。
-            meta: 已解析 source meta。
-
-        Returns:
-            已校验且唯一的业务文件名集合。
-
-        Raises:
-            ValueError: files 为空、重复、dangling、越界或元数据不匹配时抛出。
-            OSError: 文件 stat 或摘要计算失败时抛出。
-        """
-
-        raw_files = meta.get("files")
-        if not isinstance(raw_files, list) or not raw_files:
-            raise ValueError(f"complete source files 必须为非空数组: {document_id}")
-        file_names: set[str] = set()
-        for raw_file in raw_files:
+        persisted_meta = inspection.persisted_meta
+        if persisted_meta is None:
+            raise RuntimeError("COMPLETE source inspection 缺少 persisted meta")
+        raw_files = persisted_meta.get("files")
+        if not isinstance(raw_files, list) or len(raw_files) != len(inspection.files):
+            raise RuntimeError("COMPLETE source inspection files payload 不一致")
+        source_root = state.staging_ticker_dir / _source_dir_name(source_kind)
+        for raw_file, inspected_file in zip(raw_files, inspection.files, strict=True):
             if not isinstance(raw_file, Mapping):
-                raise ValueError(f"source files 条目必须为 object: {document_id}")
-            raw_name = raw_file.get("name")
-            if not isinstance(raw_name, str):
-                raise ValueError(f"source file.name 必须为字符串: {document_id}")
-            name = _normalize_filename(raw_name)
-            if name != raw_name or name == _SOURCE_META_FILENAME:
-                raise ValueError(f"source file.name 非法: {document_id}/{raw_name}")
-            if name in file_names:
-                raise ValueError(f"source files 业务文件名重复: {document_id}/{name}")
-            file_names.add(name)
-            physical_path = source_dir / name
+                raise RuntimeError("COMPLETE source inspection file entry 非 object")
+            descriptor = inspected_file.descriptor
+            physical_path = inspected_file.physical_path
+            source_dir = physical_path.parent
+            self._require_contained_path(
+                source_dir,
+                source_root,
+                label=f"{source_kind.value} staging source directory",
+            )
             self._require_contained_regular_file(
                 physical_path,
-                source_dir,
-                label=f"source file {document_id}/{name}",
+                state.staging_ticker_dir,
+                label=f"{source_kind.value} staging source file",
             )
             expected_uri = (
-                f"local://{state.staging_ticker_dir.name}/{_source_dir_name(source_kind)}/{source_dir.name}/{name}"
+                f"local://{state.staging_ticker_dir.name}/"
+                f"{_source_dir_name(source_kind)}/{source_dir.name}/{descriptor.name}"
             )
             if raw_file.get("uri") != expected_uri:
-                raise ValueError(f"source file.uri 与 staged physical file 不一致: {document_id}/{name}")
-            raw_size = raw_file.get("size")
-            if raw_size is not None:
-                if isinstance(raw_size, bool) or not isinstance(raw_size, int) or raw_size < 0:
-                    raise ValueError(f"source file.size 必须为非负整数: {document_id}/{name}")
-                try:
-                    physical_size = physical_path.stat().st_size
-                except OSError as exc:
-                    _raise_path_free_error(
-                        _project_filesystem_error(
-                            exc,
-                            action="读取 complete source 文件属性",
-                        )
-                    )
-                if physical_size != raw_size:
-                    raise ValueError(f"source file.size 与 physical file 不一致: {document_id}/{name}")
-            raw_sha256 = raw_file.get("sha256")
-            if raw_sha256 is not None:
-                expected_sha256 = _require_canonical_sha256(
-                    raw_sha256,
-                    label=f"{document_id}/{name}",
-                )
-                if _hash_regular_file_sha256(physical_path) != expected_sha256:
-                    raise ValueError(f"source file.sha256 与 physical file 不一致: {document_id}/{name}")
-
-        physical_file_names: set[str] = set()
-        for child in _list_directory(source_dir, action="枚举 complete source directory"):
-            if child.name in {_SOURCE_META_FILENAME, _IDENTITY_DESCRIPTOR_FILENAME}:
-                continue
-            if child.is_symlink() or not child.is_file():
-                raise ValueError(f"source 目录只允许 manifest 声明的 regular file: {child.name}")
-            self._require_contained_path(
-                child,
-                state.staging_ticker_dir,
-                label=f"source physical file {document_id}/{child.name}",
-            )
-            physical_file_names.add(child.name)
-        if physical_file_names != file_names:
-            raise ValueError(f"source files 与 physical business files 不双向一致: {document_id}")
-        return file_names
+                raise ValueError("source file.uri 与 staged physical file 不一致")
 
     def _require_contained_regular_file(
         self,

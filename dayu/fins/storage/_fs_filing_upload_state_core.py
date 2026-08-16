@@ -65,36 +65,13 @@ class _FilingUploadStateCoreProtocol(Protocol):
 
         ...
 
-    def _source_meta_path_for_read(
-        self,
-        external_ticker: str,
-        external_document_id: str,
-        source_kind: SourceKind,
-    ) -> Path:
-        """返回 caller-held guard 下 exact source meta locator。
-
-        Args:
-            external_ticker: 已规范化 exact external ticker。
-            external_document_id: exact filing document ID。
-            source_kind: filing 来源类型。
-
-        Returns:
-            published source meta locator。
-
-        Raises:
-            ValueError: identity 或 source kind 非法时抛出。
-            OSError: identity descriptor 读取失败时抛出。
-        """
-
-        ...
-
     def _classify_source_integrity_unguarded(
         self,
         external_ticker: str,
         external_document_id: str,
         source_kind: SourceKind,
         *,
-        meta_path: Path,
+        ticker_dir: Path,
     ) -> SourceIntegrityClassification:
         """在 caller-held guard 下分类 exact source publication。
 
@@ -102,13 +79,13 @@ class _FilingUploadStateCoreProtocol(Protocol):
             external_ticker: 已规范化 exact external ticker。
             external_document_id: exact filing document ID。
             source_kind: filing 来源类型。
-            meta_path: storage owner 已解析的 source meta locator。
+            ticker_dir: caller-held guard 下的 published ticker 根。
 
         Returns:
             exact target 的 typed integrity classification。
 
         Raises:
-            ValueError: source identity、meta 或文件声明结构非法时抛出。
+            ValueError: caller identity 或 locator precondition 非法时抛出。
             OSError: published 文件系统读取失败时抛出。
         """
 
@@ -135,8 +112,8 @@ class _FsFilingUploadStateMixin(_FsStorageInfra):
         Raises:
             CompanyTickerIdentityCorruptionError: published target、descriptor、meta
                 或 identity durable state 损坏时抛出。
-            ValueError: ticker/document identity 非法，或 published source directory、meta、
-                identity descriptor 结构损坏（含 required meta/descriptor 缺失）时抛出。
+            ValueError: ticker 或 document identity 非法时抛出；source directory、meta、
+                identity descriptor 等可归属 target 的结构损坏返回 ``UNSAFE`` typed state。
             RuntimeFileLockError: publication guard 获取或释放失败时抛出。
             OSError: identity descriptor、meta 或其它 published state operational 读取失败时
                 抛出 path-free 文件系统异常。
@@ -174,11 +151,7 @@ class _FsFilingUploadStateMixin(_FsStorageInfra):
                 external_ticker,
                 document_id,
                 SourceKind.FILING,
-                meta_path=core._source_meta_path_for_read(
-                    external_ticker,
-                    document_id,
-                    SourceKind.FILING,
-                ),
+                ticker_dir=target_dir,
             )
             if source_integrity.status in {
                 SourceIntegrityStatus.MISSING,

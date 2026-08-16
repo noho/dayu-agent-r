@@ -61,7 +61,9 @@ class FsFilingUploadStateRepository(FilingUploadStateRepositoryProtocol):
             company/source 的同版 published state。
 
         Raises:
-            ValueError: ticker、identity descriptor 或元数据不合法时抛出。
+            CompanyTickerIdentityCorruptionError: published ticker durable identity 损坏时抛出。
+            ValueError: ticker 或 document identity 非法时抛出；可归属 filing target 的
+                source descriptor/meta 结构损坏返回 ``UNSAFE`` typed state。
             RuntimeFileLockError: publication guard 获取或释放失败时抛出。
             OSError: published state 读取失败时抛出。
         """
