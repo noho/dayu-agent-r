@@ -202,7 +202,7 @@ class FilingInitialSkipDisposition(str, Enum):
 
 @dataclass(frozen=True)
 class _PreparedFilingAssetMutation(_PreparedAssetMutation):
-    """尚未接线的 filing 专用 prepared publication candidate。
+    """filing 专用 prepared publication candidate。
 
     Attributes:
         initial_skip_disposition: preparation owner 与 ``_can_skip_upload`` 同源产生的
@@ -470,22 +470,28 @@ class DoclingUploadService:
             source_kind=source_kind,
             filing_primary=selection_preparation.filing_primary,
         )
+        initial_skip_disposition = FilingInitialSkipDisposition.NOT_ELIGIBLE
         if _can_skip_upload(
             normalized_previous_meta,
             source_fingerprint,
             overwrite,
             repair_disposition=repair_disposition,
         ):
-            Log.info(
-                f"文档已存在且未变更，跳过上传: ticker={normalized_ticker} document_id={document_id}",
-                module=self.MODULE,
-            )
-            skipped_events = _build_skipped_file_events(validated_files)
-            return _build_skipped_result(
-                document_id=document_id,
-                internal_document_id=internal_document_id,
-                file_events=skipped_events,
-            )
+            if source_kind is SourceKind.FILING:
+                initial_skip_disposition = (
+                    FilingInitialSkipDisposition.IDENTICAL_PUBLICATION
+                )
+            else:
+                Log.info(
+                    f"文档已存在且未变更，跳过上传: ticker={normalized_ticker} document_id={document_id}",
+                    module=self.MODULE,
+                )
+                skipped_events = _build_skipped_file_events(validated_files)
+                return _build_skipped_result(
+                    document_id=document_id,
+                    internal_document_id=internal_document_id,
+                    file_events=skipped_events,
+                )
 
         try:
             pending_assets, conversion_events, primary_document = await self._build_pending_assets(
@@ -508,6 +514,25 @@ class DoclingUploadService:
             document_version=current_version,
             base_meta=meta,
         )
+        if source_kind is SourceKind.FILING:
+            return _PreparedFilingAssetMutation(
+                ticker=normalized_ticker,
+                source_kind=source_kind,
+                action=normalized_action,
+                document_id=document_id,
+                internal_document_id=internal_document_id,
+                form_type=form_type,
+                overwrite=overwrite,
+                pending_assets=tuple(pending_assets),
+                conversion_events=tuple(conversion_events),
+                primary_document=primary_document,
+                previous_meta=normalized_previous_meta,
+                meta=staging_meta,
+                source_fingerprint=source_fingerprint.value,
+                document_version=current_version,
+                repair_disposition=repair_disposition,
+                initial_skip_disposition=initial_skip_disposition,
+            )
         return _PreparedAssetMutation(
             ticker=normalized_ticker,
             source_kind=source_kind,
@@ -1071,7 +1096,7 @@ class DoclingUploadService:
 def _require_prepared_filing_mutation(
     prepared: PreparedDoclingUpload,
 ) -> _PreparedFilingAssetMutation:
-    """收窄尚未接线的 filing prepared subtype。
+    """收窄 filing prepared subtype。
 
     Args:
         prepared: Docling preparation result 或 mutation。
@@ -1144,7 +1169,7 @@ def describe_prepared_filing_publication(
     """从已完成转换的 filing candidate 描述 exact publication identity。
 
     Args:
-        prepared: 尚未接线的 filing 专用 prepared candidate。
+        prepared: filing 专用 prepared candidate。
 
     Returns:
         与 durable storage inspector 共用的无路径 publication identity。
@@ -1236,7 +1261,7 @@ def read_prepared_filing_initial_skip_disposition(
     """读取 preparation owner 已产生的 closed filing skip disposition。
 
     Args:
-        prepared: 尚未接线的 filing 专用 prepared candidate。
+        prepared: filing 专用 prepared candidate。
 
     Returns:
         candidate 上的 required enum 值。
@@ -1318,7 +1343,7 @@ def build_prepared_filing_skip_result(
     """从 filing candidate 的 authoritative originals 构造 canonical skip 终态。
 
     Args:
-        prepared: 尚未接线的 filing 专用 prepared candidate。
+        prepared: filing 专用 prepared candidate。
 
     Returns:
         stored count 为零、只含 original ``file_skipped`` events 的跳过结果。

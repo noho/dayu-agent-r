@@ -15,7 +15,14 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import date, datetime, timezone
 from pathlib import Path, PurePosixPath
-from threading import Event, Lock as ThreadingLock, Thread, current_thread, enumerate as enumerate_threads
+from threading import (
+    Barrier as ThreadBarrier,
+    Event,
+    Lock as ThreadingLock,
+    Thread,
+    current_thread,
+    enumerate as enumerate_threads,
+)
 from typing import cast
 
 import pytest
@@ -122,6 +129,7 @@ from dayu.fins.upload_failure import (
     FinsUploadFailureReason,
     FinsUploadPrevalidationError,
     fins_upload_failure_from_exception,
+    fins_upload_source_publication_conflict_failure,
     fins_upload_source_integrity_unsafe_failure,
     upload_failure_reason_from_json,
 )
@@ -263,7 +271,8 @@ def _filing_upload_published_state(
         document_id=document_id,
         revision=(
             None
-            if status in {
+            if status
+            in {
                 SourceIntegrityStatus.MISSING,
                 SourceIntegrityStatus.UNSAFE,
             }
@@ -318,18 +327,24 @@ def test_filing_upload_published_state_requires_matching_integrity_and_meta() ->
         reasons=(),
     )
 
-    assert FilingUploadPublishedState(
-        company_meta=None,
-        source_integrity=missing,
-        source_meta=None,
-        publication_identity=None,
-    ).source_integrity is missing
-    assert FilingUploadPublishedState(
-        company_meta=None,
-        source_integrity=complete,
-        source_meta={"source_fingerprint": "published"},
-        publication_identity=None,
-    ).source_integrity is complete
+    assert (
+        FilingUploadPublishedState(
+            company_meta=None,
+            source_integrity=missing,
+            source_meta=None,
+            publication_identity=None,
+        ).source_integrity
+        is missing
+    )
+    assert (
+        FilingUploadPublishedState(
+            company_meta=None,
+            source_integrity=complete,
+            source_meta={"source_fingerprint": "published"},
+            publication_identity=None,
+        ).source_integrity
+        is complete
+    )
     with pytest.raises(ValueError, match="MISSING/UNSAFE"):
         FilingUploadPublishedState(
             company_meta=None,
@@ -1670,10 +1685,7 @@ def test_filing_validator_authorizes_only_complete_auto_repair_selection(
     assert validated.file_selection.primary == primary.resolve(strict=False)
     assert validated.file_selection.companions == (companion.resolve(strict=False),)
     assert isinstance(validated.repair_disposition, ExistingSourceAutoRepair)
-    assert (
-        validated.repair_disposition.expected_integrity
-        is published_state.source_integrity
-    )
+    assert validated.repair_disposition.expected_integrity is published_state.source_integrity
 
 
 @pytest.mark.parametrize("action", ("create", "update", "delete", "AUTO", " auto "))
@@ -1721,14 +1733,8 @@ def test_filing_validator_repair_required_non_exact_auto_precedes_company_decisi
     with pytest.raises(FinsUploadUsageError) as exc_info:
         validate_fins_upload_filing_request(request, published_state=published_state)
 
-    assert (
-        exc_info.value.failure.code
-        is FinsUploadUsageCode.EXISTING_SOURCE_REPAIR_REQUIRES_AUTO
-    )
-    assert (
-        exc_info.value.failure.message
-        == "目标 filing 不完整；请使用 auto 并提供完整文件重新上传"
-    )
+    assert exc_info.value.failure.code is FinsUploadUsageCode.EXISTING_SOURCE_REPAIR_REQUIRES_AUTO
+    assert exc_info.value.failure.message == "目标 filing 不完整；请使用 auto 并提供完整文件重新上传"
 
 
 @pytest.mark.parametrize("action", ("auto", "create", "update", "delete"))
@@ -1847,9 +1853,7 @@ def test_validated_filing_repair_contract_rejects_incomplete_selection_and_targe
     with pytest.raises(ValueError, match="expected target"):
         replace(
             validated,
-            repair_disposition=ExistingSourceAutoRepair(
-                expected_integrity=mismatched_integrity
-            ),
+            repair_disposition=ExistingSourceAutoRepair(expected_integrity=mismatched_integrity),
         )
 
 
@@ -2109,9 +2113,7 @@ def test_filing_validator_selects_explicit_primary_at_any_position(
     assert validated.request.files == files
     assert validated.request.primary_selectors == (primary,)
     assert validated.file_selection.primary == normalized_primary
-    assert validated.file_selection.companions == tuple(
-        path for path in normalized_files if path != normalized_primary
-    )
+    assert validated.file_selection.companions == tuple(path for path in normalized_files if path != normalized_primary)
 
 
 @pytest.mark.parametrize(
@@ -2164,11 +2166,7 @@ def test_filing_validator_rejects_invalid_primary_selector_contract(
     for path in files:
         path.write_text(path.name, encoding="utf-8")
     outside = tmp_path / "outside.txt"
-    selectors = (
-        (outside,)
-        if selectors_count == 1
-        else tuple(files[0] for _ in range(selectors_count))
-    )
+    selectors = (outside,) if selectors_count == 1 else tuple(files[0] for _ in range(selectors_count))
     request = FinsUploadFilingRequest(
         ticker="AAPL",
         files=files,
@@ -2326,9 +2324,7 @@ def test_filing_symlink_loop_is_typed_file_not_found_before_all_side_effects(
         company_name="Apple Inc.",
     )
     workspace_root = tmp_path / "guarded-workspace"
-    runtime, executor, state_repository, runner = _build_static_admission_guarded_runtime(
-        workspace_root
-    )
+    runtime, executor, state_repository, runner = _build_static_admission_guarded_runtime(workspace_root)
     before = _snapshot_runtime_workspace_tree(workspace_root)
 
     with pytest.raises(FinsUploadUsageError) as exc_info:
@@ -2423,9 +2419,7 @@ def test_new_filing_admission_failures_precede_state_jobs_runner_and_workspace_m
         ),
     )
     workspace_root = tmp_path / "guarded-workspace"
-    runtime, executor, state_repository, runner = _build_static_admission_guarded_runtime(
-        workspace_root
-    )
+    runtime, executor, state_repository, runner = _build_static_admission_guarded_runtime(workspace_root)
     before = _snapshot_runtime_workspace_tree(workspace_root)
 
     for request, expected_code in invalid_requests:
@@ -3765,6 +3759,30 @@ class _HoldingExecutor(FinsIngestionExecutor):
             operation()
 
 
+def _run_two_held_operations_concurrently(executor: _HoldingExecutor) -> None:
+    """在两个真实线程中执行恰好两条 held runtime operation 并有界等待完成。
+
+    Args:
+        executor: 已收集两条 runtime owner operation 的延迟执行器。
+
+    Returns:
+        两条 operation 都正常返回后返回 ``None``。
+
+    Raises:
+        AssertionError: held operation 数量不是两条时抛出。
+        BaseException: 任一 operation 抛出的异常或 future 超时时原样传播。
+    """
+
+    operations = tuple(executor.operations)
+    if len(operations) != 2:
+        raise AssertionError("并发 runtime 证据必须恰好持有两条 operation")
+    executor.operations.clear()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = tuple(pool.submit(operation) for operation in operations)
+        for future in futures:
+            future.result(timeout=20)
+
+
 class _FailingSubmitExecutor(FinsIngestionExecutor):
     """测试用提交失败执行器。"""
 
@@ -4461,6 +4479,53 @@ class _UploadRuntimeConverter:
                 None,
             ) from RuntimeError("private deterministic converter failure")
         data = ('{"name": "' + stream_name + '", "format": "docling"}').encode()
+        return DoclingConversionResult(data, len(data), hashlib.sha256(data).hexdigest())
+
+
+class _BarrierUploadRuntimeConverter:
+    """让两个 production runtime job 同时完成 Docling conversion。"""
+
+    def __init__(self) -> None:
+        """初始化双参与方线程 barrier。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self._barrier = ThreadBarrier(2)
+
+    async def convert_to_json_bytes(
+        self,
+        input_bytes: bytes,
+        stream_name: str,
+        *,
+        config: DoclingConversionConfig,
+        cancellation: CancellationToken | None,
+    ) -> DoclingConversionResult:
+        """在 conversion 线性化点同步两个 runtime worker。
+
+        Args:
+            input_bytes: 上传文件字节。
+            stream_name: 上传文件名。
+            config: 闭合转换配置。
+            cancellation: canonical token。
+
+        Returns:
+            相同输入产生的稳定 typed conversion result。
+
+        Raises:
+            threading.BrokenBarrierError: 另一 runtime worker 未按时到达时抛出。
+        """
+
+        del input_bytes, config, cancellation
+        data = ('{"name": "' + stream_name + '", "format": "docling"}').encode()
+        self._barrier.wait(timeout=10)
         return DoclingConversionResult(data, len(data), hashlib.sha256(data).hexdigest())
 
 
@@ -8580,6 +8645,134 @@ def test_default_runtime_start_upload_sec_filing_uses_production_runner(tmp_path
     assert progress_events[1].payload["upload_status"] == "ok"
 
 
+def test_durable_runtime_concurrent_identical_upload_persists_ok_and_skip_terminals(
+    tmp_path: Path,
+) -> None:
+    """runtime 必须原样持久化 shared owner 的 winner/loser 闭合终态。
+
+    Args:
+        tmp_path: 真实 filesystem workspace 根。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: job terminal、result JSON 或 durable source 漂移时抛出。
+    """
+
+    workspace_root = tmp_path / "fins-workspace"
+    default_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    ingestion = default_runtime.get_ingestion_runtime()
+    executor = _HoldingExecutor()
+    ingestion.executor = executor
+    _inject_upload_runtime_converter(
+        default_runtime,
+        ingestion,
+        converter=_BarrierUploadRuntimeConverter(),
+    )
+    filing_file = tmp_path / "aapl-concurrent-10q.pdf"
+    filing_file.write_bytes(b"runtime concurrent identical")
+    request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        action="auto",
+        files=(filing_file,),
+        fiscal_year=2025,
+        fiscal_period="Q1",
+        company_name="Apple Inc.",
+    )
+
+    first = ingestion.start_upload(request)
+    second = ingestion.start_upload(request)
+    _run_two_held_operations_concurrently(executor)
+    records = (
+        ingestion.read_job(first.job_id),
+        ingestion.read_job(second.job_id),
+    )
+
+    assert [record.status for record in records] == [
+        FinsIngestionJobStatus.SUCCEEDED,
+        FinsIngestionJobStatus.SUCCEEDED,
+    ]
+    assert sorted(str(record.result_summary["status"]) for record in records) == [
+        "ok",
+        "skipped",
+    ]
+    first_count = records[0].result_summary["stored_file_count"]
+    second_count = records[1].result_summary["stored_file_count"]
+    assert isinstance(first_count, int)
+    assert isinstance(second_count, int)
+    assert sorted((first_count, second_count)) == [0, 1]
+    assert all(record.failure_summary == {} for record in records)
+    assert all(record.result_summary["failure"] is None for record in records)
+    document_id = str(records[0].result_summary["document_id"])
+    source_meta = ingestion.source_repository.get_source_meta(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+    )
+    assert source_meta["document_version"] == "v1"
+
+
+def test_durable_runtime_concurrent_explicit_create_persists_exact_conflict_terminal(
+    tmp_path: Path,
+) -> None:
+    """runtime 必须持久化 explicit create loser 的精确 typed conflict 终态。
+
+    Args:
+        tmp_path: 真实 filesystem workspace 根。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: durable terminal、action 或 failure JSON 漂移时抛出。
+    """
+
+    workspace_root = tmp_path / "fins-workspace"
+    default_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    ingestion = default_runtime.get_ingestion_runtime()
+    executor = _HoldingExecutor()
+    ingestion.executor = executor
+    _inject_upload_runtime_converter(
+        default_runtime,
+        ingestion,
+        converter=_BarrierUploadRuntimeConverter(),
+    )
+    filing_file = tmp_path / "aapl-create-conflict-10q.pdf"
+    filing_file.write_bytes(b"runtime concurrent explicit create")
+    request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        action="create",
+        files=(filing_file,),
+        fiscal_year=2025,
+        fiscal_period="Q1",
+        company_name="Apple Inc.",
+        overwrite=False,
+    )
+
+    first = ingestion.start_upload(request)
+    second = ingestion.start_upload(request)
+    _run_two_held_operations_concurrently(executor)
+    records = (
+        ingestion.read_job(first.job_id),
+        ingestion.read_job(second.job_id),
+    )
+
+    assert sorted(record.status.value for record in records) == ["failed", "succeeded"]
+    failed = next(record for record in records if record.status is FinsIngestionJobStatus.FAILED)
+    succeeded = next(record for record in records if record.status is FinsIngestionJobStatus.SUCCEEDED)
+    expected_failure = fins_upload_source_publication_conflict_failure().to_json()
+    assert failed.request_summary["action"] == "create"
+    assert failed.failure_summary == expected_failure
+    assert failed.result_summary["failure"] == expected_failure
+    assert failed.result_summary["status"] == "failed"
+    assert failed.result_summary["stored_file_count"] == 0
+    assert succeeded.request_summary["action"] == "create"
+    assert succeeded.result_summary["status"] == "ok"
+    assert succeeded.result_summary["stored_file_count"] == 1
+    assert succeeded.failure_summary == {}
+
+
 def test_durable_upload_fresh_unsafe_persists_exact_typed_failure_reason(tmp_path: Path) -> None:
     """异步 job 必须原样持久化 workflow fresh validator 的 typed failure。
 
@@ -11408,13 +11601,7 @@ def _fixture_docling_json_bytes() -> bytes:
         OSError: fixture 文件读取失败时抛出。
     """
 
-    fixture_path = (
-        Path(__file__).parents[1]
-        / "tools"
-        / "fixtures"
-        / "documents"
-        / "sample_docling.json"
-    )
+    fixture_path = Path(__file__).parents[1] / "tools" / "fixtures" / "documents" / "sample_docling.json"
     return fixture_path.read_bytes()
 
 

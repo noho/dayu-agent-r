@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
@@ -35,7 +37,11 @@ from dayu.fins.pipelines.cn_download_models import (
     CnReportQuery,
     DownloadedReportAsset,
 )
-from dayu.fins.pipelines.cn_pipeline import CnPipeline, collect_cn_download_result_from_events
+from dayu.fins.pipelines.cn_pipeline import (
+    CnPipeline,
+    CnPipelineUploadResult,
+    collect_cn_download_result_from_events,
+)
 from dayu.fins.pipelines.docling_upload_service import _build_filing_original_asset_identity
 from dayu.fins.pipelines.docling_process_converter import (
     DoclingConversionCancelledError,
@@ -539,6 +545,55 @@ class _PipelineDownloadFakeConversionRunner:
             size=len(_DOCLING_BYTES),
             sha256=hashlib.sha256(_DOCLING_BYTES).hexdigest(),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _ConversionBarrier:
+    """把线程 barrier 适配为 conversion 完成回调。"""
+
+    barrier: Barrier
+
+    def __call__(self, call_count: int) -> None:
+        """等待另一 upload worker 完成 conversion。
+
+        Args:
+            call_count: converter 的当前调用次数，仅用于满足 callback contract。
+
+        Returns:
+            无。
+
+        Raises:
+            threading.BrokenBarrierError: 另一 worker 未在超时内到达时抛出。
+        """
+
+        del call_count
+        self.barrier.wait(timeout=10)
+
+
+def _run_two_cn_uploads(
+    *,
+    pipeline: CnPipeline,
+    first_request: ValidatedFinsUploadFilingRequest,
+    second_request: ValidatedFinsUploadFilingRequest,
+) -> tuple[CnPipelineUploadResult, CnPipelineUploadResult]:
+    """在两个真实 OS 线程中同时执行 CN/HK upload。
+
+    Args:
+        pipeline: 两个 worker 共用的真实 FS composition。
+        first_request: 第一条已验证请求。
+        second_request: 第二条已验证请求。
+
+    Returns:
+        与输入顺序一致的两个聚合终态。
+
+    Raises:
+        BaseException: 任一 worker 未被 workflow 封闭的异常或超时时抛出。
+    """
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(pipeline.upload_filing, first_request)
+        second_future = executor.submit(pipeline.upload_filing, second_request)
+        return first_future.result(timeout=20), second_future.result(timeout=20)
 
 
 class _FailingCnUploadConverter:
@@ -1557,7 +1612,9 @@ async def test_upload_filing_fresh_recheck_discards_stale_action_and_company_dec
     assert stale_result["filing_action"] == "update"
     assert stale_result["status"] == "skipped"
     assert pipeline._company_repository.get_company_meta("600519").company_name == "已发布公司名"
-    assert batching.begin_tokens == []
+    assert len(batching.begin_tokens) == 1
+    assert batching.commit_tokens == []
+    assert batching.rollback_tokens == batching.begin_tokens
     assert company.stage_tokens == []
     assert source.stage_tokens == []
     assert published_tree_sha256(tmp_path, "600519") == published_tree
@@ -2237,10 +2294,10 @@ async def test_cn_hk_upload_filing_fresh_unsafe_is_single_typed_failed_event(
 
 
 @pytest.mark.asyncio
-async def test_cn_upload_filing_phase_b_revision_conflict_is_typed_and_rolls_back(
+async def test_cn_upload_filing_phase_b_unsafe_state_is_typed_and_rolls_back(
     tmp_path: Path,
 ) -> None:
-    """CN repair 的 Phase B revision conflict 必须 typed fail 并回滚唯一 batch。
+    """CN repair fresh view 变为 UNSAFE 时必须 typed fail 并回滚唯一 batch。
 
     Args:
         tmp_path: 临时 workspace。
@@ -2249,7 +2306,7 @@ async def test_cn_upload_filing_phase_b_revision_conflict_is_typed_and_rolls_bac
         无。
 
     Raises:
-        AssertionError: stale reason、published tree 或 batch 原子性漂移时抛出。
+        AssertionError: unsafe reason、published tree 或 batch 原子性漂移时抛出。
         OSError: 真实 filesystem fixture 读写失败时抛出。
         ValueError: persisted source contract 非法时抛出。
     """
@@ -2328,7 +2385,7 @@ async def test_cn_upload_filing_phase_b_revision_conflict_is_typed_and_rolls_bac
     failure = result["failure"]
     assert isinstance(failure, dict)
     assert failure["kind"] == "storage"
-    assert failure["code"] == "source_revision_stale"
+    assert failure["code"] == "source_integrity_unsafe"
     assert "concurrent-undeclared.bin" not in str(result)
     assert "unexpected_runtime" not in str(result)
     assert converter.calls == 2
@@ -2409,3 +2466,79 @@ async def test_upload_material_stream_overwrite_resets_single_document(tmp_path:
     )
     file_names = sorted(meta.uri.split("/")[-1] for meta in pipeline._blob_repository.list_files(handle))
     assert file_names == ["deck_new.pdf", "deck_new_docling.json"]
+
+
+@pytest.mark.parametrize(
+    ("ticker", "company_name", "canonical_ticker"),
+    [
+        ("600519", "贵州茅台", "600519"),
+        ("0700.HK", "腾讯控股", "0700"),
+    ],
+)
+def test_cn_hk_concurrent_identical_auto_has_one_publish_and_one_skip(
+    tmp_path: Path,
+    ticker: str,
+    company_name: str,
+    canonical_ticker: str,
+) -> None:
+    """CN 与 HK workflow 都机械消费 shared publication owner。
+
+    Args:
+        tmp_path: 真实 filesystem workspace。
+        ticker: CN/HK 原始 ticker。
+        company_name: 对应公司名称。
+        canonical_ticker: storage owner 使用的 canonical ticker。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: CN/HK 竞争终态或 mutation 计数漂移时抛出。
+    """
+
+    converter = _PipelineDownloadFakeConversionRunner(
+        after_conversion=_ConversionBarrier(Barrier(2)),
+    )
+    pipeline, batching, company, source = _tracking_cn_pipeline(
+        tmp_path,
+        converter=converter,
+    )
+    filing_file = tmp_path / "annual.pdf"
+    filing_file.write_bytes(b"same-cn-hk-filing")
+    first_request = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action=None,
+        company_name=company_name,
+        ticker=ticker,
+    )
+    second_request = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action=None,
+        company_name=company_name,
+        ticker=ticker,
+    )
+
+    results = _run_two_cn_uploads(
+        pipeline=pipeline,
+        first_request=first_request,
+        second_request=second_request,
+    )
+
+    assert sorted(str(result["status"]) for result in results) == ["ok", "skipped"]
+    first_count = results[0]["stored_file_count"]
+    second_count = results[1]["stored_file_count"]
+    assert isinstance(first_count, int)
+    assert isinstance(second_count, int)
+    assert sorted((first_count, second_count)) == [0, 1]
+    assert len(batching.begin_tokens) == 2
+    assert len(batching.commit_tokens) == 1
+    assert len(batching.rollback_tokens) == 1
+    assert company.stage_tokens == batching.commit_tokens
+    assert source.stage_tokens == batching.commit_tokens
+    durable = pipeline._filing_upload_state_repository.read_filing_upload_state(
+        canonical_ticker,
+        first_request.document_id,
+    )
+    assert durable.source_integrity.status is SourceIntegrityStatus.COMPLETE

@@ -38,6 +38,7 @@ python -m pytest tests/fins/test_upload_format_contract.py \
   tests/cli/test_arg_parsing.py tests/cli/test_fins_commands.py \
   tests/fins/test_fins_ingestion_tools.py \
   tests/fins/test_docling_upload_service.py \
+  tests/fins/test_filing_upload_publication.py \
   tests/fins/test_docling_upload_service_integration.py \
   tests/fins/test_sec_pipeline_upload_filing_stream.py \
   tests/fins/test_sec_pipeline_upload_material_stream.py \
@@ -55,6 +56,7 @@ python -m pytest \
   tests/fins/test_fins_ingestion_runtime.py \
   tests/fins/test_fins_service_runtime.py \
   tests/fins/test_docling_upload_service.py \
+  tests/fins/test_filing_upload_publication.py \
   tests/fins/test_sec_pipeline_upload_filing_stream.py \
   tests/fins/test_cn_pipeline.py \
   tests/fins/test_sec_pipeline_download.py \
@@ -429,6 +431,8 @@ Web live smoke 位于 `utils/smoke_web_ci.py`，不在默认 pytest 中运行；
 Download owner coverage 还包括：ticker、市场化 forms 与包含边界日期窗口在 workspace/runtime 前静态校验；overwrite/rebuild 唯一互斥校验；CN bare `FY/H1/Q1/Q3`、HK bare `FY/H1` baseline 与六期 discovery 集合；HKEX Q1～Q4 共用一次全 results query；category-first report/results matrix、category/title 期间事实、同 source ID 冲突失败关闭、identity/coverage canonical contract，以及 Q2/H1、Q4/FY report/result 独立 identity；显式 start-window fact 贯穿 SEC SC13 collection/retry；普通下载不执行 ticker 级 stale prune；coverage 不满足 baseline missing；ordinary/skip/failed/rebuild required coverage 与 fresh meta 畸形 coverage 失败关闭；SEC 和 generic path 显式空 coverage；adapter/runtime/public JSON/wait/CLI 原样投影；SEC User-Agent prerequisite 与 provider failure 分类；overwrite 单目标非删除语义；仅从既有 source 重建本地 download meta/manifest 且 provider 零调用、missing 为空；typed terminal summary 的互斥计数、文档明细、独立缺失期间以及成功/失败/取消退出码；CN/HK Docling 子进程在正常、失败和取消路径的 terminate/kill/close、输出校验与临时目录清理，以及第三方 conversion callback/stdlib `lastResort` logger 真实写入 inherited FD2 后仍零公开泄漏并返回原 closed descriptor。退出 flush 次生异常覆盖原始 construction 失败的契约测试还断言分类不变、FD2 恢复与复制 FD 关闭。`tests/documents/test_docling_runtime.py` 覆盖 attempt-local stream identity、closed-first/success-second 与 auto 三档首因/末因 contract。
 
 Source integrity owner matrix 覆盖 published/staged 同源的 `MISSING`、`COMPLETE`、`REPAIR_REQUIRED`、`UNSAFE` 四态与 trusted revision 不变量；original/primary Docling/declared file 的 missing、size、digest，primary/derived projection 与 source-kind manifest repair reasons；identity/meta/revision/provenance/file declaration、undeclared/symlink/special entry 与 cross-source unsafe reasons；snapshot complete-only、commit validator、canonical manifest projection与 old-or-new publication。Upload matrix覆盖 validator-only auto repair authorization、identical fingerprint bypass、完整 originals/唯一 primary derived、Phase B status/revision recheck、stale/blocked typed failure、company/source同批 atomicity、rollback及 process_filing 只消费 new snapshot。Download matrix覆盖 SEC/CN Phase A/Phase B `UNSAFE` 在 meta/reset前失败、whole-tree `UNSAFE` 零 company/maintenance/rejection mutation、whole manifest 缺失的多 actual/多 selected/非 selected typed拒绝，以及唯一 accepted selected filing 的 reset、重新下载、canonical manifest rebuild与 `COMPLETE` 回归；既有 provider/retry/rejection语义由同一 focused suite保护。并发断言继续使用 Event/barrier 而非 sleep，覆盖同目标双 overwrite、不同目标 union、async generator 提前关闭与 Phase A prefetch 后 identity/revision churn。
+
+Filing shared publication matrix 使用真实 filesystem、线程 barrier、spawn 进程与 held runtime operation 的有界 future 完成通知，不使用 sleep、retry 或状态 polling。它覆盖 SEC 单文件/多文件 identical auto 的一 publish一 canonical skip、显式 create no-overwrite conflict 与 overwrite fresh rebase、derived/company identity mismatch、同 ticker 不同 filing 及 company aliases exact union、不同 ticker 在各自 writer-owned fresh read 内同时越过 barrier、CN/HK mechanical route、双 cancellation checkpoint、rollback failure，以及 durable runtime 的 canonical skip 与 explicit-create typed conflict terminal。skip 结果精确断言 `stored_file_count=0`，event stream 只包含 original 的 `file_skipped`，不把 preparation 已执行的 conversion event 当作已发布存储事实。
 
 Upload direct integration 还覆盖 success 正控、empty、corrupt PDF、corrupt DOCX 与 mixed fail-fast：成功后从 Fins 仓储读回 source meta、original blob 和 derived Docling asset，再检查 holding executor、legacy job 目录与 Host/runtime artifact 路径均为空；失败路径统一断言 requested count 保留、stored count 为 `0` 且 company/source/blob 无 partial publication。`tests/service/test_fins_direct.py` 同时锁定 Service 公开 direct API 不暴露 start/read/wait/cancel job handle。
 

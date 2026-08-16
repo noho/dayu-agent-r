@@ -1028,6 +1028,14 @@ def _execute_upload(
             cancellation=cancellation_checker,
         )
     )
+    if (
+        isinstance(prepared, _PreparedFilingAssetMutation)
+        and prepared.initial_skip_disposition
+        is FilingInitialSkipDisposition.IDENTICAL_PUBLICATION
+    ):
+        # 该 helper 只验证 Docling sequential 语义；真实 fresh equality/lifecycle 由
+        # filing publication 与 workflow tests 覆盖。
+        return build_prepared_filing_skip_result(prepared)
     return _publish_prepared_upload(
         service=service,
         batching_repository=batching_repository,
@@ -4127,7 +4135,7 @@ def test_distinguishable_filing_primary_flip_updates_v2_then_skips_replay(tmp_pa
     assert replayed.status == "skipped"
     assert replayed_meta["document_version"] == "v2"
     assert replayed_meta["source_fingerprint"] == flipped_meta["source_fingerprint"]
-    assert calls == [first.name, second.name]
+    assert calls == [first.name, second.name, second.name]
     with context.source_repository.read_source_snapshot(
         "AAPL",
         "primary_flip",
@@ -4319,7 +4327,7 @@ def test_ambiguous_filing_primary_forces_versions_then_recovers_safe_skip(tmp_pa
     assert recovered_meta["document_version"] == "v4"
     assert safe_replay.status == "skipped"
     assert safe_replay_meta["document_version"] == "v4"
-    assert calls == [first.name, first.name, second.name, second.name]
+    assert calls == [first.name, first.name, second.name, second.name, second.name]
 
 
 def test_safe_multifile_whole_set_move_keeps_v1_and_published_tree(tmp_path: Path) -> None:
@@ -4420,7 +4428,7 @@ def test_safe_multifile_whole_set_move_keeps_v1_and_published_tree(tmp_path: Pat
     assert moved.status == "skipped"
     assert meta["document_version"] == "v1"
     assert published_originals == old_identities
-    assert calls == [old_primary.name]
+    assert calls == [old_primary.name, new_primary.name]
 
 
 def test_old_v1_multifile_fingerprint_transitions_once_to_v2_and_then_skips(tmp_path: Path) -> None:
@@ -4503,10 +4511,13 @@ def test_old_v1_multifile_fingerprint_transitions_once_to_v2_and_then_skips(tmp_
             cancellation=None,
         )
     )
-    assert isinstance(replayed, UploadOperationResult)
-    assert replayed.status == "skipped"
+    assert isinstance(replayed, _PreparedFilingAssetMutation)
+    assert (
+        replayed.initial_skip_disposition
+        is FilingInitialSkipDisposition.IDENTICAL_PUBLICATION
+    )
     assert prepared.meta["document_version"] == "v2"
-    assert calls == [primary.name]
+    assert calls == [primary.name, primary.name]
 
     single_assets = [_build_filing_original_asset_for_test(primary)]
     old_single_digest = _build_old_filing_fingerprint_for_test(single_assets)
@@ -4636,7 +4647,7 @@ def test_filing_fingerprint_excludes_path_identity_but_tracks_filename_and_conte
     assert changed_result.status == "uploaded"
     assert changed_meta["document_version"] == "v3"
     assert changed_meta["source_fingerprint"] != renamed_meta["source_fingerprint"]
-    assert calls == ["report.pdf", "renamed.pdf", "renamed.pdf"]
+    assert calls == ["report.pdf", "report.pdf", "renamed.pdf", "renamed.pdf"]
 
 
 def test_filing_one_hundred_originals_publish_with_one_conversion(tmp_path: Path) -> None:

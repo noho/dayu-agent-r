@@ -29,6 +29,9 @@ from dayu.fins.pipelines.docling_upload_service import (
     rollback_prepared_upload_batch,
     validate_material_upload_ids,
 )
+from dayu.fins.pipelines.filing_upload_publication import (
+    execute_prepared_filing_publication,
+)
 from dayu.fins.pipelines.upload_company_meta import (
     build_upload_company_id,
     stage_company_meta_for_upload,
@@ -230,7 +233,8 @@ async def run_upload_filing_stream(
         )
         if isinstance(prepared_upload, UploadOperationResult):
             upload_result = prepared_upload
-        else:
+            completed_request = authoritative_request
+        elif normalized_action == "delete":
             publication_batch = host._batching_repository.begin_batch(normalized_ticker)
             try:
                 stage_upload_company_meta_decision(
@@ -252,6 +256,20 @@ async def run_upload_filing_stream(
                 prepared=prepared_upload,
                 cancellation=cancellation_checker,
             )
+            completed_request = authoritative_request
+        else:
+            publication_outcome = execute_prepared_filing_publication(
+                request=authoritative_request,
+                prepared=prepared_upload,
+                filing_state_repository=host._filing_upload_state_repository,
+                company_repository=host._company_repository,
+                batching_repository=host._batching_repository,
+                upload_service=host._upload_service,
+                cancellation=cancellation_checker,
+            )
+            completed_request = publication_outcome.authoritative_request
+            upload_result = publication_outcome.result
+        completed_action = completed_request.resolved_action
         for file_event in upload_result.file_events:
             yield UploadFilingEvent(
                 event_type=_map_upload_file_event_to_filing_event_type(file_event),
@@ -262,9 +280,9 @@ async def run_upload_filing_stream(
         result = host._build_result(
             action="upload_filing",
             ticker=normalized_ticker,
-            filing_action=normalized_action,
+            filing_action=completed_action,
             requested_action=requested_action,
-            resolved_action=normalized_action,
+            resolved_action=completed_action,
             files=_json_text_list([str(path) for path in raw_request.files]),
             fiscal_year=raw_request.fiscal_year,
             fiscal_period=normalized_period,

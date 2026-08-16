@@ -1,24 +1,56 @@
-"""filing batch publication 的无 I/O 封闭裁决 owner。
+"""filing batch publication 的封闭裁决与 shared lifecycle owner。
 
-S1 只定义 typed decision 与纯函数；本模块不打开 batch、不读仓储、不 stage、
-不 commit/rollback，也不被 SEC/CN/HK workflow 调用。
+纯裁决函数保持无 I/O；shared publication route 在 writer-owned batch view 上完成
+fresh validation、双取消 checkpoint、裁决、company stage 与既有 commit/rollback 交接。
 """
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from enum import Enum
+from typing import Final, NoReturn
 
-from dayu.fins.ingestion_runtime import ValidatedFinsUploadFilingRequest
-from dayu.fins.pipelines.docling_upload_service import FilingInitialSkipDisposition
+from dayu.contracts.cancellation import CancellationToken
+from dayu.fins.domain.document_models import BatchToken
+from dayu.fins.ingestion_runtime import (
+    FinsUploadUsageCode,
+    FinsUploadUsageError,
+    ValidatedFinsUploadFilingRequest,
+    validate_fins_upload_filing_request,
+)
+from dayu.fins.pipelines.docling_upload_service import (
+    DoclingUploadService,
+    FilingInitialSkipDisposition,
+    PreparedDoclingUpload,
+    UploadOperationResult,
+    _PreparedFilingAssetMutation,
+    _build_cancelled_result,
+    build_prepared_filing_skip_result,
+    commit_prepared_upload_batch,
+    describe_prepared_filing_publication,
+    read_prepared_filing_initial_skip_disposition,
+    rebase_prepared_filing_create_overwrite,
+    rollback_prepared_upload_batch,
+)
+from dayu.fins.pipelines.upload_company_meta import stage_upload_company_meta_decision
 from dayu.fins.storage import (
+    BatchingRepositoryProtocol,
+    CompanyMetaRepositoryProtocol,
+    CompanyTickerIdentityCorruptionError,
+    FilingUploadPublishedState,
+    FilingUploadStateRepositoryProtocol,
     FilingUploadPublicationIdentity,
     SourceIntegrityStatus,
     has_same_source_publication_identity,
 )
 from dayu.fins.upload_failure import (
     FinsUploadFailureCode,
+    FinsUploadFailureError,
     FinsUploadFailureReason,
+    FinsUploadPrevalidationError,
+    fins_upload_prevalidation_corruption_failure,
+    fins_upload_prevalidation_io_failure,
     fins_upload_source_publication_conflict_failure,
     fins_upload_source_revision_stale_failure,
 )
@@ -26,6 +58,17 @@ from dayu.fins.upload_repair_contract import (
     ExistingSourceAutoRepair,
     NoExistingSourceRepair,
 )
+from dayu.runtime.filelock import RuntimeFileLockError
+
+_STATE_DEPENDENT_USAGE_CODES: Final[frozenset[FinsUploadUsageCode]] = frozenset(
+    {
+        FinsUploadUsageCode.CREATE_TARGET_EXISTS,
+        FinsUploadUsageCode.UPDATE_TARGET_MISSING,
+        FinsUploadUsageCode.EXISTING_SOURCE_REPAIR_REQUIRES_AUTO,
+        FinsUploadUsageCode.COMPANY_NAME_REQUIRED,
+    }
+)
+_PUBLICATION_COMPLETION_STATUSES: Final[frozenset[str]] = frozenset({"uploaded", "skipped", "cancelled"})
 
 
 class FilingUploadPublicationDisposition(str, Enum):
@@ -41,6 +84,44 @@ class FilingUploadPublishMode(str, Enum):
 
     PREPARED = "prepared"
     REBASE_CREATE_OVERWRITE = "rebase_create_overwrite"
+
+
+@dataclass(frozen=True, slots=True)
+class FilingUploadPublicationOutcome:
+    """shared publication owner 返回的 authoritative request 与完成结果。
+
+    Attributes:
+        authoritative_request: writer-owned fresh view 验证产生的最终请求；batch 前取消时
+            使用 initial request。
+        result: uploaded、skipped 或 cancelled 完成结果。
+    """
+
+    authoritative_request: ValidatedFinsUploadFilingRequest
+    result: UploadOperationResult
+
+    def __post_init__(self) -> None:
+        """校验 outcome 只承载 closed typed completion。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            TypeError: request 或 result 不是精确 typed contract 时抛出。
+            ValueError: result 是失败之外的未知状态时抛出。
+        """
+
+        if not isinstance(
+            self.authoritative_request,
+            ValidatedFinsUploadFilingRequest,
+        ):
+            raise TypeError("publication outcome 必须携带 validated filing request")
+        if not isinstance(self.result, UploadOperationResult):
+            raise TypeError("publication outcome 必须携带 UploadOperationResult")
+        if self.result.status not in _PUBLICATION_COMPLETION_STATUSES:
+            raise ValueError("publication outcome 只允许 uploaded/skipped/cancelled")
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,19 +273,14 @@ def _require_same_request_and_target(
         initial_request.document_id,
         initial_request.internal_document_id,
     )
-    if (
-        expected_target
-        != (
-            fresh_request.normalized_ticker.canonical,
-            fresh_request.document_id,
-            fresh_request.internal_document_id,
-        )
-        or expected_target
-        != (
-            prepared_identity.ticker,
-            prepared_identity.document_id,
-            prepared_identity.internal_document_id,
-        )
+    if expected_target != (
+        fresh_request.normalized_ticker.canonical,
+        fresh_request.document_id,
+        fresh_request.internal_document_id,
+    ) or expected_target != (
+        prepared_identity.ticker,
+        prepared_identity.document_id,
+        prepared_identity.internal_document_id,
     ):
         raise ValueError("batch arbitration request/prepared target identity 不一致")
 
@@ -269,9 +345,8 @@ def _require_stable_action_contract(
             raise ValueError("stable MISSING observation 必须保持 create/no-repair")
         return
     if status is SourceIntegrityStatus.COMPLETE:
-        if (
-            not isinstance(initial_request.repair_disposition, NoExistingSourceRepair)
-            or not isinstance(fresh_request.repair_disposition, NoExistingSourceRepair)
+        if not isinstance(initial_request.repair_disposition, NoExistingSourceRepair) or not isinstance(
+            fresh_request.repair_disposition, NoExistingSourceRepair
         ):
             raise ValueError("stable COMPLETE observation 不得携带 repair authorization")
         return
@@ -280,8 +355,7 @@ def _require_stable_action_contract(
         or fresh_request.resolved_action != "update"
         or not isinstance(initial_request.repair_disposition, ExistingSourceAutoRepair)
         or not isinstance(fresh_request.repair_disposition, ExistingSourceAutoRepair)
-        or initial_request.repair_disposition.expected_integrity
-        != fresh_request.repair_disposition.expected_integrity
+        or initial_request.repair_disposition.expected_integrity != fresh_request.repair_disposition.expected_integrity
     ):
         raise ValueError("stable REPAIR_REQUIRED observation 必须保持同一 update repair authorization")
 
@@ -352,8 +426,7 @@ def arbitrate_filing_upload_publication(
         _require_stable_action_contract(initial_request, fresh_request)
         if (
             fresh_status is SourceIntegrityStatus.COMPLETE
-            and initial_skip_disposition
-            is FilingInitialSkipDisposition.IDENTICAL_PUBLICATION
+            and initial_skip_disposition is FilingInitialSkipDisposition.IDENTICAL_PUBLICATION
             and _canonical_skip_requirements_are_met(fresh_request, prepared_identity)
         ):
             return _skip_decision()
@@ -361,10 +434,7 @@ def arbitrate_filing_upload_publication(
 
     raw_action = initial_request.request.action.strip().lower()
     overwrite = initial_request.request.overwrite
-    if (
-        initial_status is SourceIntegrityStatus.MISSING
-        and fresh_status is SourceIntegrityStatus.COMPLETE
-    ):
+    if initial_status is SourceIntegrityStatus.MISSING and fresh_status is SourceIntegrityStatus.COMPLETE:
         if (
             raw_action == "auto"
             and overwrite is False
@@ -386,9 +456,316 @@ def arbitrate_filing_upload_publication(
     return _conflict_decision(fins_upload_source_publication_conflict_failure())
 
 
+def _is_cancelled(cancellation: CancellationToken | None) -> bool:
+    """读取 shared publication checkpoint 的协作式取消状态。
+
+    Args:
+        cancellation: 公共取消 token；``None`` 表示无取消源。
+
+    Returns:
+        已取消返回 ``True``。
+
+    Raises:
+        OSError: token 读取失败时原样传播。
+    """
+
+    return bool(cancellation is not None and cancellation.is_cancelled())
+
+
+def _rollback_without_business_terminal(
+    *,
+    batching_repository: BatchingRepositoryProtocol,
+    batch: BatchToken,
+) -> None:
+    """为 cancel/skip 回滚 batch，并把 rollback failure 投影为 typed storage failure。
+
+    Args:
+        batching_repository: batch 生命周期仓储。
+        batch: caller-owned batch capability。
+
+    Returns:
+        rollback 成功时返回 ``None``。
+
+    Raises:
+        FinsUploadFailureError: rollback 失败时抛出 path-free STORAGE_IO。
+        KeyboardInterrupt: rollback 收到中断信号时原样传播。
+        SystemExit: rollback 收到退出信号时原样传播。
+    """
+
+    try:
+        batching_repository.rollback_batch(batch)
+    except (OSError, RuntimeFileLockError, ValueError) as rollback_error:
+        raise FinsUploadFailureError(fins_upload_prevalidation_io_failure()) from rollback_error
+
+
+def _raise_failure_after_rollback(
+    *,
+    batching_repository: BatchingRepositoryProtocol,
+    batch: BatchToken,
+    failure_reason: FinsUploadFailureReason,
+) -> NoReturn:
+    """以 typed failure 为 primary 回滚 batch 后抛出。
+
+    Args:
+        batching_repository: batch 生命周期仓储。
+        batch: caller-owned batch capability。
+        failure_reason: 已封闭裁决的 public failure reason。
+
+    Returns:
+        不返回。
+
+    Raises:
+        FinsUploadFailureError: 始终抛出；rollback 失败时仍保留该 typed primary。
+    """
+
+    error = FinsUploadFailureError(failure_reason)
+    rollback_prepared_upload_batch(
+        batching_repository=batching_repository,
+        batch=batch,
+        operation_error=error,
+    )
+    raise error
+
+
+def _read_fresh_state_or_raise(
+    *,
+    repository: FilingUploadStateRepositoryProtocol,
+    batch: BatchToken,
+    document_id: str,
+) -> FilingUploadPublishedState:
+    """从 writer-owned batch 读取 fresh state并封闭映射读取异常。
+
+    Args:
+        repository: filing state 唯一仓储。
+        batch: caller-owned batch capability。
+        document_id: exact filing document ID。
+
+    Returns:
+        storage owner 产生的 typed filing state。
+
+    Raises:
+        FinsUploadFailureError: I/O/lock 或 corruption 读取失败时抛出 typed STORAGE_IO。
+    """
+
+    try:
+        return repository.read_filing_upload_state_in_batch(batch, document_id)
+    except CompanyTickerIdentityCorruptionError as error:
+        raise FinsUploadFailureError(fins_upload_prevalidation_corruption_failure()) from error
+    except ValueError as error:
+        raise FinsUploadFailureError(fins_upload_prevalidation_corruption_failure()) from error
+    except (OSError, RuntimeFileLockError, RuntimeError) as error:
+        raise FinsUploadFailureError(fins_upload_prevalidation_io_failure()) from error
+
+
+def _begin_publication_batch_or_raise(
+    *,
+    batching_repository: BatchingRepositoryProtocol,
+    ticker: str,
+) -> BatchToken:
+    """取得 ticker writer batch，并封闭映射 acquire operational failure。
+
+    Args:
+        batching_repository: batch 生命周期仓储。
+        ticker: canonical ticker。
+
+    Returns:
+        新取得的 caller-owned batch capability。
+
+    Raises:
+        FinsUploadFailureError: acquire 的 I/O/lock/corruption 失败时抛出 typed STORAGE_IO。
+    """
+
+    try:
+        return batching_repository.begin_batch(ticker)
+    except CompanyTickerIdentityCorruptionError as error:
+        raise FinsUploadFailureError(fins_upload_prevalidation_corruption_failure()) from error
+    except (OSError, RuntimeFileLockError, RuntimeError) as error:
+        raise FinsUploadFailureError(fins_upload_prevalidation_io_failure()) from error
+
+
+def execute_prepared_filing_publication(
+    *,
+    request: ValidatedFinsUploadFilingRequest,
+    prepared: PreparedDoclingUpload,
+    filing_state_repository: FilingUploadStateRepositoryProtocol,
+    company_repository: CompanyMetaRepositoryProtocol,
+    batching_repository: BatchingRepositoryProtocol,
+    upload_service: DoclingUploadService,
+    cancellation: CancellationToken | None,
+) -> FilingUploadPublicationOutcome:
+    """在 writer-owned fresh view 上执行 filing 的唯一 publication lifecycle。
+
+    Args:
+        request: preparation 使用的 initial authoritative request。
+        prepared: 已完成 filing conversion 的 typed candidate。
+        filing_state_repository: batch fresh state 仓储。
+        company_repository: fresh company decision 的 staging 仓储。
+        batching_repository: per-ticker batch lifecycle 仓储。
+        upload_service: staged source mutation 服务。
+        cancellation: 公共取消 token；``None`` 表示无取消源。
+
+    Returns:
+        携带 fresh authoritative request 的 uploaded/skipped outcome，或第一/第二 checkpoint
+        取消时始终携带 initial request 的 cancelled outcome。
+
+    Raises:
+        FinsUploadFailureError: conflict、unsafe、storage I/O/corruption 或 rollback failure。
+        FinsUploadUsageError: 非 state-dependent fresh usage invariant breach 原样传播。
+        TypeError: prepared candidate 或 closed contract 非法时抛出。
+        ValueError: arbitration 或 rebase programming invariant 违约时抛出。
+        BaseException: existing publish/commit owner 的 primary/secondary error 原样传播。
+    """
+
+    if not isinstance(request, ValidatedFinsUploadFilingRequest):
+        raise TypeError("request 必须是 validated filing request")
+    if not isinstance(prepared, _PreparedFilingAssetMutation):
+        raise TypeError("prepared 必须是 filing prepared mutation")
+    prepared_identity = describe_prepared_filing_publication(prepared)
+    initial_disposition = read_prepared_filing_initial_skip_disposition(prepared)
+    batch = _begin_publication_batch_or_raise(
+        batching_repository=batching_repository,
+        ticker=request.normalized_ticker.canonical,
+    )
+    batch_terminal_started = False
+    try:
+        if _is_cancelled(cancellation):
+            batch_terminal_started = True
+            _rollback_without_business_terminal(
+                batching_repository=batching_repository,
+                batch=batch,
+            )
+            return FilingUploadPublicationOutcome(
+                authoritative_request=request,
+                result=_build_cancelled_result(
+                    document_id=request.document_id,
+                    internal_document_id=request.internal_document_id,
+                ),
+            )
+
+        fresh_state = _read_fresh_state_or_raise(
+            repository=filing_state_repository,
+            batch=batch,
+            document_id=request.document_id,
+        )
+        validation_failure: FinsUploadFailureReason | None = None
+        try:
+            fresh_request = validate_fins_upload_filing_request(
+                request.request,
+                published_state=fresh_state,
+            )
+        except FinsUploadUsageError as error:
+            if error.failure.code not in _STATE_DEPENDENT_USAGE_CODES:
+                raise
+            validation_failure = fins_upload_source_publication_conflict_failure()
+            fresh_request = None
+        except FinsUploadPrevalidationError as error:
+            validation_failure = error.failure
+            fresh_request = None
+        except ValueError:
+            validation_failure = fins_upload_prevalidation_corruption_failure()
+            fresh_request = None
+
+        decision: FilingUploadPublicationDecision | None = None
+        if validation_failure is None:
+            if fresh_request is None:
+                raise AssertionError("fresh validation success 必须产生 validated request")
+            decision = arbitrate_filing_upload_publication(
+                initial_request=request,
+                fresh_request=fresh_request,
+                prepared_identity=prepared_identity,
+                initial_skip_disposition=initial_disposition,
+            )
+
+        if _is_cancelled(cancellation):
+            batch_terminal_started = True
+            _rollback_without_business_terminal(
+                batching_repository=batching_repository,
+                batch=batch,
+            )
+            return FilingUploadPublicationOutcome(
+                authoritative_request=request,
+                result=_build_cancelled_result(
+                    document_id=request.document_id,
+                    internal_document_id=request.internal_document_id,
+                ),
+            )
+
+        if validation_failure is not None:
+            batch_terminal_started = True
+            _raise_failure_after_rollback(
+                batching_repository=batching_repository,
+                batch=batch,
+                failure_reason=validation_failure,
+            )
+        if decision is None or fresh_request is None:
+            raise AssertionError("closed arbitration 必须产生 decision 与 fresh request")
+
+        if decision.disposition is FilingUploadPublicationDisposition.SKIP:
+            batch_terminal_started = True
+            _rollback_without_business_terminal(
+                batching_repository=batching_repository,
+                batch=batch,
+            )
+            return FilingUploadPublicationOutcome(
+                authoritative_request=fresh_request,
+                result=build_prepared_filing_skip_result(prepared),
+            )
+        if decision.disposition is FilingUploadPublicationDisposition.CONFLICT:
+            if decision.failure_reason is None:
+                raise AssertionError("CONFLICT decision 必须携带 failure")
+            batch_terminal_started = True
+            _raise_failure_after_rollback(
+                batching_repository=batching_repository,
+                batch=batch,
+                failure_reason=decision.failure_reason,
+            )
+
+        publication_candidate: _PreparedFilingAssetMutation = prepared
+        if decision.publish_mode is FilingUploadPublishMode.REBASE_CREATE_OVERWRITE:
+            if fresh_request.published_state.source_meta is None:
+                raise ValueError("fresh create-overwrite rebase 必须携带 source meta")
+            rebased_candidate = rebase_prepared_filing_create_overwrite(
+                prepared,
+                fresh_previous_meta=dict(fresh_request.published_state.source_meta),
+            )
+            if not isinstance(rebased_candidate, _PreparedFilingAssetMutation):
+                raise AssertionError("fresh rebase 必须保持 filing prepared subtype")
+            publication_candidate = rebased_candidate
+        elif decision.publish_mode is not FilingUploadPublishMode.PREPARED:
+            raise AssertionError("PUBLISH decision 必须携带 closed publish mode")
+
+        stage_upload_company_meta_decision(
+            repository=company_repository,
+            decision=fresh_request.company_meta_decision,
+            batch=batch,
+        )
+        # capability 转交 existing commit owner；从此由其负责 publish/cancel/rollback/commit。
+        batch_terminal_started = True
+        result = commit_prepared_upload_batch(
+            service=upload_service,
+            batching_repository=batching_repository,
+            batch=batch,
+            prepared=publication_candidate,
+            cancellation=cancellation,
+        )
+        return FilingUploadPublicationOutcome(
+            authoritative_request=fresh_request,
+            result=result,
+        )
+    finally:
+        if not batch_terminal_started:
+            rollback_prepared_upload_batch(
+                batching_repository=batching_repository,
+                batch=batch,
+                operation_error=sys.exception(),
+            )
+
+
 __all__ = [
     "FilingUploadPublicationDecision",
     "FilingUploadPublicationDisposition",
+    "FilingUploadPublicationOutcome",
     "FilingUploadPublishMode",
     "arbitrate_filing_upload_publication",
+    "execute_prepared_filing_publication",
 ]

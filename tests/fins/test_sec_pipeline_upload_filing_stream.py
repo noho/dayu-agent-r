@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
+from threading import Barrier as ThreadBarrier, Event
+from typing import Protocol, cast
 
 import pytest
 
@@ -25,7 +30,7 @@ from dayu.fins.ingestion_runtime import (
     FinsUploadUsageError,
     ValidatedFinsUploadFilingRequest,
 )
-from dayu.fins.pipelines.sec_pipeline import SecPipeline
+from dayu.fins.pipelines.sec_pipeline import SecPipeline, SecPipelineUploadResult
 from dayu.fins.pipelines.docling_upload_service import _build_filing_original_asset_identity
 from dayu.fins.pipelines.docling_process_converter import (
     DoclingConversionConfig,
@@ -33,6 +38,7 @@ from dayu.fins.pipelines.docling_process_converter import (
     DoclingConversionError,
     DoclingConversionFailureKind,
     DoclingConversionResult,
+    DoclingConverter,
 )
 from dayu.fins.pipelines.upload_filing_events import UploadFilingEventType
 from dayu.fins.pipelines.upload_company_meta import (
@@ -41,13 +47,15 @@ from dayu.fins.pipelines.upload_company_meta import (
 )
 from dayu.fins.processors.registry import build_fins_processor_registry
 from dayu.fins.service_runtime import prevalidate_fins_upload_filing_request_for_workspace
+from dayu.fins.upload_failure import fins_upload_source_publication_conflict_failure
 from dayu.fins.storage import (
+    FilingUploadStateRepositoryProtocol,
     FilingUploadPublishedState,
     FsDocumentBlobRepository,
     FsFilingUploadStateRepository,
     SourceIntegrityStatus,
 )
-from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
+from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
 from dayu.runtime.filelock import RuntimeFileLockError
 
 from .upload_filing_test_support import (
@@ -193,6 +201,242 @@ class _FakeDoclingConverter:
         return DoclingConversionResult(data, len(data), hashlib.sha256(data).hexdigest())
 
 
+class _BarrierPort(Protocol):
+    """线程/进程 barrier 的最小同步协议。"""
+
+    def wait(self, timeout: float | None = None) -> int:
+        """等待所有参与方到达。
+
+        Args:
+            timeout: 最长等待秒数。
+
+        Returns:
+            当前参与方的 barrier index。
+
+        Raises:
+            BaseException: barrier broken 或底层同步失败时抛出。
+        """
+
+        ...
+
+
+class _BatchReadBarrierFilingUploadStateRepository(FsFilingUploadStateRepository):
+    """在 writer-owned fresh read 边界证明不同 ticker batch 可同时进入。"""
+
+    def __init__(
+        self,
+        workspace_root: Path,
+        *,
+        repository_set: _FsRepositorySet,
+        barrier: _BarrierPort,
+        entered_events: dict[str, Event],
+    ) -> None:
+        """初始化 batch fresh-read 同步包装仓储。
+
+        Args:
+            workspace_root: 真实 filesystem workspace。
+            repository_set: 与 batch/company/source 共用的 storage core。
+            barrier: 两个不同 ticker fresh read 共用的会合点。
+            entered_events: 按 canonical ticker 记录进入 fresh read 的通知。
+
+        Returns:
+            无。
+
+        Raises:
+            OSError: 基类仓储初始化失败时抛出。
+        """
+
+        super().__init__(workspace_root, repository_set=repository_set)
+        self._barrier = barrier
+        self._entered_events = entered_events
+
+    def read_filing_upload_state_in_batch(
+        self,
+        batch: BatchToken,
+        document_id: str,
+    ) -> FilingUploadPublishedState:
+        """在已取得 ticker batch 后会合，再读取该 staging view 的 fresh state。
+
+        Args:
+            batch: 已取得的 ticker writer batch capability。
+            document_id: exact filing document ID。
+
+        Returns:
+            基类从 batch staging view 投影的 typed published state。
+
+        Raises:
+            AssertionError: 测试未登记当前 ticker 的 fresh-read 事件时抛出。
+            threading.BrokenBarrierError: 另一 ticker 未在期限内同时进入时抛出。
+            OSError: 基类读取失败时抛出。
+            RuntimeError: 基类无法投影可信 business state 时抛出。
+            ValueError: batch 或 document identity 非法时抛出。
+        """
+
+        entered = self._entered_events.get(batch.ticker)
+        if entered is None:
+            raise AssertionError(f"未登记 batch fresh-read ticker: {batch.ticker}")
+        entered.set()
+        self._barrier.wait(timeout=10)
+        return super().read_filing_upload_state_in_batch(batch, document_id)
+
+
+class _SpawnResultQueue(Protocol):
+    """spawn worker 与父进程交换闭合结果的最小协议。"""
+
+    def put(self, item: tuple[str, int]) -> None:
+        """写入 worker 终态。
+
+        Args:
+            item: status 与 stored file count。
+
+        Returns:
+            无。
+
+        Raises:
+            OSError: queue 写入失败时抛出。
+        """
+
+        ...
+
+    def get(self, *, timeout: float) -> tuple[str, int]:
+        """读取一个 worker 终态。
+
+        Args:
+            timeout: 最长等待秒数。
+
+        Returns:
+            status 与 stored file count。
+
+        Raises:
+            queue.Empty: 超时仍无结果时抛出。
+            OSError: queue 读取失败时抛出。
+        """
+
+        ...
+
+
+class _BarrierDoclingConverter:
+    """用真实线程 barrier 固定两个 publication candidate 均已完成转换。"""
+
+    def __init__(self, barrier: _BarrierPort, *, marker: str = "shared") -> None:
+        """初始化 barrier converter。
+
+        Args:
+            barrier: 两个 upload worker 共用的线程 barrier。
+            marker: 写入派生 JSON 的稳定内容标识。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self._barrier = barrier
+        self._marker = marker
+
+    async def convert_to_json_bytes(
+        self,
+        input_bytes: bytes,
+        stream_name: str,
+        *,
+        config: DoclingConversionConfig,
+        cancellation: CancellationToken | None,
+    ) -> DoclingConversionResult:
+        """在转换完成边界同步两个 worker 后返回 typed 结果。
+
+        Args:
+            input_bytes: 输入字节。
+            stream_name: 输入名称。
+            config: 闭合转换配置。
+            cancellation: canonical token。
+
+        Returns:
+            包含 marker 的 typed conversion result。
+
+        Raises:
+            threading.BrokenBarrierError: 另一 worker 未在超时内到达时抛出。
+        """
+
+        del input_bytes, config, cancellation
+        data = json.dumps(
+            {"format": "docling", "marker": self._marker, "name": stream_name},
+            sort_keys=True,
+        ).encode()
+        self._barrier.wait(timeout=10)
+        return DoclingConversionResult(data, len(data), hashlib.sha256(data).hexdigest())
+
+
+class _CheckpointCancellationToken(CancellationToken):
+    """在指定观察次数开始稳定返回 cancelled 的测试 token。"""
+
+    def __init__(self, cancel_at_observation: int) -> None:
+        """初始化计数型取消 token。
+
+        Args:
+            cancel_at_observation: 第几次 ``is_cancelled`` 观察开始返回真。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: 观察次数不是正整数时抛出。
+        """
+
+        if cancel_at_observation < 1:
+            raise ValueError("cancel_at_observation 必须为正整数")
+        self._cancel_at_observation = cancel_at_observation
+        self.observations = 0
+
+    def is_cancelled(self) -> bool:
+        """递增观察次数并返回稳定取消状态。
+
+        Args:
+            无。
+
+        Returns:
+            达到指定观察次数后返回 ``True``。
+
+        Raises:
+            无。
+        """
+
+        self.observations += 1
+        return self.observations >= self._cancel_at_observation
+
+    def cancel_reason(self) -> str | None:
+        """返回测试取消原因。
+
+        Args:
+            无。
+
+        Returns:
+            已取消时返回稳定原因，否则返回 ``None``。
+
+        Raises:
+            无。
+        """
+
+        if self.observations >= self._cancel_at_observation:
+            return "checkpoint-test"
+        return None
+
+    def requested_at(self) -> datetime | None:
+        """测试 token 不声明墙钟时间。
+
+        Args:
+            无。
+
+        Returns:
+            始终返回 ``None``。
+
+        Raises:
+            无。
+        """
+
+        return None
+
+
 class _FailingDoclingConverter:
     """抛出指定 typed/runtime exception 的 converter 测试替身。"""
 
@@ -265,6 +509,7 @@ def _validated_sec_filing_request(
     fiscal_period: str = "Q1",
     filing_date: str | None = None,
     report_date: str | None = None,
+    ticker: str = "AAPL",
     companion_files: tuple[Path, ...] = (),
 ) -> ValidatedFinsUploadFilingRequest:
     """使用 production validator 构造 SEC filing 测试请求。
@@ -280,6 +525,7 @@ def _validated_sec_filing_request(
         fiscal_period: 财期。
         filing_date: 可选披露日期。
         report_date: 可选报告日期。
+        ticker: SEC ticker。
         companion_files: 可选完整 authoritative companions。
 
     Returns:
@@ -293,7 +539,7 @@ def _validated_sec_filing_request(
 
     return prevalidate_fins_upload_filing_request_for_workspace(
         FinsUploadFilingRequest(
-            ticker="AAPL",
+            ticker=ticker,
             action=action or "auto",
             files=() if action == "delete" else (filing_file, *companion_files),
             primary_selectors=(filing_file,) if companion_files else (),
@@ -414,6 +660,9 @@ def _tracking_sec_pipeline(
     workspace_root: Path,
     *,
     converter_calls: list[str] | None = None,
+    converter: DoclingConverter | None = None,
+    batch_read_barrier: _BarrierPort | None = None,
+    batch_read_events: dict[str, Event] | None = None,
 ) -> tuple[
     SecPipeline,
     TrackingBatchingRepository,
@@ -425,12 +674,16 @@ def _tracking_sec_pipeline(
     Args:
         workspace_root: 测试工作区根目录。
         converter_calls: 可选转换调用记录。
+        converter: 可选 typed converter；未提供时构造默认 fake。
+        batch_read_barrier: 可选 writer-owned fresh read 会合点。
+        batch_read_events: 与会合点配套的 canonical ticker 进入通知。
 
     Returns:
         pipeline、batch、company 与 source tracking repositories。
 
     Raises:
         OSError: storage composition 初始化失败时抛出。
+        ValueError: fresh-read barrier 与事件未成对提供时抛出。
     """
 
     repository_set = build_fs_repository_set(
@@ -440,6 +693,21 @@ def _tracking_sec_pipeline(
     batching = TrackingBatchingRepository(workspace_root, repository_set=repository_set)
     company = TrackingCompanyMetaRepository(workspace_root, repository_set=repository_set)
     source = TrackingSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    if (batch_read_barrier is None) is not (batch_read_events is None):
+        raise ValueError("batch_read_barrier 与 batch_read_events 必须成对提供")
+    filing_state_repository: FilingUploadStateRepositoryProtocol
+    if batch_read_barrier is not None and batch_read_events is not None:
+        filing_state_repository = _BatchReadBarrierFilingUploadStateRepository(
+            workspace_root,
+            repository_set=repository_set,
+            barrier=batch_read_barrier,
+            entered_events=batch_read_events,
+        )
+    else:
+        filing_state_repository = FsFilingUploadStateRepository(
+            workspace_root,
+            repository_set=repository_set,
+        )
     pipeline = SecPipeline(
         workspace_root=workspace_root,
         processor_registry=build_fins_processor_registry(),
@@ -447,13 +715,80 @@ def _tracking_sec_pipeline(
         company_repository=company,
         source_repository=source,
         blob_repository=FsDocumentBlobRepository(workspace_root, repository_set=repository_set),
-        filing_upload_state_repository=FsFilingUploadStateRepository(
-            workspace_root,
-            repository_set=repository_set,
-        ),
-        docling_converter=_FakeDoclingConverter(converter_calls),
+        filing_upload_state_repository=filing_state_repository,
+        docling_converter=converter or _FakeDoclingConverter(converter_calls),
     )
     return pipeline, batching, company, source
+
+
+def _run_two_sec_uploads(
+    *,
+    first_pipeline: SecPipeline,
+    first_request: ValidatedFinsUploadFilingRequest,
+    second_pipeline: SecPipeline,
+    second_request: ValidatedFinsUploadFilingRequest,
+) -> tuple[SecPipelineUploadResult, SecPipelineUploadResult]:
+    """在两个真实 OS 线程中同时执行 SEC upload。
+
+    Args:
+        first_pipeline: 第一条 workflow composition。
+        first_request: 第一条已验证请求。
+        second_pipeline: 第二条 workflow composition。
+        second_request: 第二条已验证请求。
+
+    Returns:
+        与输入顺序一致的两个聚合终态。
+
+    Raises:
+        BaseException: 任一 worker 未被 workflow 封闭的异常或超时时抛出。
+    """
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(first_pipeline.upload_filing, first_request)
+        second_future = executor.submit(second_pipeline.upload_filing, second_request)
+        return first_future.result(timeout=20), second_future.result(timeout=20)
+
+
+def _spawn_identical_sec_upload_worker(
+    workspace_root_text: str,
+    filing_file_text: str,
+    barrier: _BarrierPort,
+    result_queue: _SpawnResultQueue,
+) -> None:
+    """在 spawn 子进程中执行一条 identical auto SEC upload。
+
+    Args:
+        workspace_root_text: 共享真实 filesystem workspace 路径。
+        filing_file_text: 共享 authoritative primary 路径。
+        barrier: 跨进程 conversion barrier。
+        result_queue: 返回闭合终态的跨进程 queue。
+
+    Returns:
+        无。
+
+    Raises:
+        BaseException: pipeline 初始化、prevalidation 或 workflow 异常时原样抛出。
+    """
+
+    workspace_root = Path(workspace_root_text)
+    filing_file = Path(filing_file_text)
+    pipeline = SecPipeline(
+        workspace_root=workspace_root,
+        processor_registry=build_fins_processor_registry(),
+        docling_converter=_BarrierDoclingConverter(barrier),
+    )
+    request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action=None,
+        company_name="Apple Inc.",
+    )
+    result = pipeline.upload_filing(request)
+    status = result["status"]
+    stored_file_count = result["stored_file_count"]
+    if not isinstance(status, str) or not isinstance(stored_file_count, int):
+        raise TypeError("spawn upload result 必须携带 string status 与 int stored_file_count")
+    result_queue.put((status, stored_file_count))
 
 
 def _seed_sec_upload_company_meta(
@@ -1082,7 +1417,9 @@ async def test_upload_filing_fresh_recheck_discards_stale_action_and_company_dec
     assert stale_result["status"] == "skipped"
     assert stale_result["stored_file_count"] == 0
     assert pipeline._company_repository.get_company_meta("AAPL").company_name == ("Published Company Name")
-    assert batching.begin_tokens == []
+    assert len(batching.begin_tokens) == 1
+    assert batching.commit_tokens == []
+    assert batching.rollback_tokens == batching.begin_tokens
     assert company.stage_tokens == []
     assert source.stage_tokens == []
     assert published_tree_sha256(tmp_path, "AAPL") == published_tree
@@ -1710,9 +2047,7 @@ async def test_upload_filing_repairs_real_filesystem_and_atomically_publishes_co
         action=None,
         company_name="Apple Repaired",
     )
-    assert repair_request.published_state.source_integrity.status is (
-        SourceIntegrityStatus.REPAIR_REQUIRED
-    )
+    assert repair_request.published_state.source_integrity.status is (SourceIntegrityStatus.REPAIR_REQUIRED)
 
     events = [event async for event in pipeline.upload_filing_stream(repair_request)]
 
@@ -1760,9 +2095,7 @@ async def test_upload_filing_repairs_real_filesystem_and_atomically_publishes_co
         assert snapshot.revision == repaired.revision
         assert snapshot.primary_filename == primary_document
         with snapshot.get_primary_source().open() as stream:
-            assert stream.read() == (
-                b'{"name": "repair-primary.pdf", "format": "docling"}'
-            )
+            assert stream.read() == (b'{"name": "repair-primary.pdf", "format": "docling"}')
     assert calls == [primary.name, primary.name]
     assert len(batching.begin_tokens) == 1
     assert batching.commit_tokens == batching.begin_tokens
@@ -1854,3 +2187,574 @@ async def test_upload_filing_fresh_read_failures_use_prevalidation_failure_owner
     assert company.stage_tokens == []
     assert source.stage_tokens == []
     assert published_tree_sha256(tmp_path, "AAPL") == {}
+
+
+@pytest.mark.parametrize("with_companion", [False, True])
+def test_concurrent_identical_auto_upload_has_one_publish_and_one_canonical_skip(
+    tmp_path: Path,
+    with_companion: bool,
+) -> None:
+    """同 ticker 同 filing 的真实线程竞争只允许一个 publish。
+
+    Args:
+        tmp_path: 真实 filesystem workspace。
+        with_companion: 是否覆盖多文件 authoritative set。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: winner/loser 终态、mutation 次数或 durable state 漂移时抛出。
+    """
+
+    barrier = ThreadBarrier(2)
+    pipeline, batching, company, source = _tracking_sec_pipeline(
+        tmp_path,
+        converter=_BarrierDoclingConverter(barrier),
+    )
+    primary = tmp_path / "q1.pdf"
+    companion = tmp_path / "q1.xlsx"
+    primary.write_bytes(b"same-primary")
+    companion.write_bytes(b"same-companion")
+    companions = (companion,) if with_companion else ()
+    first_request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=primary,
+        companion_files=companions,
+        action=None,
+        company_name="Apple Inc.",
+    )
+    second_request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=primary,
+        companion_files=companions,
+        action=None,
+        company_name="Apple Inc.",
+    )
+
+    results = _run_two_sec_uploads(
+        first_pipeline=pipeline,
+        first_request=first_request,
+        second_pipeline=pipeline,
+        second_request=second_request,
+    )
+
+    assert sorted(str(result["status"]) for result in results) == ["ok", "skipped"]
+    first_count = results[0]["stored_file_count"]
+    second_count = results[1]["stored_file_count"]
+    assert isinstance(first_count, int)
+    assert isinstance(second_count, int)
+    assert sorted((first_count, second_count)) == [0, 1 + len(companions)]
+    assert len(batching.begin_tokens) == 2
+    assert len(batching.commit_tokens) == 1
+    assert len(batching.rollback_tokens) == 1
+    assert company.stage_tokens == batching.commit_tokens
+    assert source.stage_tokens == batching.commit_tokens
+    durable = pipeline._filing_upload_state_repository.read_filing_upload_state(
+        "AAPL",
+        first_request.document_id,
+    )
+    assert durable.source_integrity.status is SourceIntegrityStatus.COMPLETE
+
+
+@pytest.mark.parametrize(
+    ("overwrite", "expected_statuses", "expected_commits", "expected_rollbacks"),
+    [
+        (False, ["failed", "ok"], 1, 1),
+        (True, ["ok", "ok"], 2, 0),
+    ],
+)
+def test_concurrent_explicit_create_obeys_overwrite_rebase_contract(
+    tmp_path: Path,
+    overwrite: bool,
+    expected_statuses: list[str],
+    expected_commits: int,
+    expected_rollbacks: int,
+) -> None:
+    """显式 create 竞争分别产生 no-overwrite conflict 或 overwrite rebase。
+
+    Args:
+        tmp_path: 真实 filesystem workspace。
+        overwrite: 显式 create overwrite 开关。
+        expected_statuses: 两个终态的稳定排序。
+        expected_commits: 预期 commit 数。
+        expected_rollbacks: 预期 rollback 数。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 显式 create 的 fresh arbitration 漂移时抛出。
+    """
+
+    pipeline, batching, _company, _source = _tracking_sec_pipeline(
+        tmp_path,
+        converter=_BarrierDoclingConverter(ThreadBarrier(2)),
+    )
+    primary = tmp_path / "q1.pdf"
+    primary.write_bytes(b"same-primary")
+    requests = tuple(
+        _validated_sec_filing_request(
+            pipeline=pipeline,
+            filing_file=primary,
+            action="create",
+            company_name="Apple Inc.",
+            overwrite=overwrite,
+        )
+        for _index in range(2)
+    )
+
+    results = _run_two_sec_uploads(
+        first_pipeline=pipeline,
+        first_request=requests[0],
+        second_pipeline=pipeline,
+        second_request=requests[1],
+    )
+
+    assert sorted(str(result["status"]) for result in results) == expected_statuses
+    assert len(batching.commit_tokens) == expected_commits
+    assert len(batching.rollback_tokens) == expected_rollbacks
+    if overwrite is False:
+        failed = next(result for result in results if result["status"] == "failed")
+        failure = failed["failure"]
+        assert isinstance(failure, dict)
+        assert failure == fins_upload_source_publication_conflict_failure().to_json()
+        assert failed["requested_action"] == "create"
+        assert failed["resolved_action"] == "create"
+        assert failed["filing_action"] == "create"
+        assert failed["stored_file_count"] == 0
+        assert failed["status"] != "skipped"
+        assert failure["code"] != "unexpected_runtime"
+
+
+@pytest.mark.parametrize("mismatch", ["derived", "company"])
+def test_concurrent_auto_rejects_nonidentical_candidate_or_company_intent(
+    tmp_path: Path,
+    mismatch: str,
+) -> None:
+    """auto loser 仅在 candidate 与 company 都 exact equal 时允许 skip。
+
+    Args:
+        tmp_path: 真实 filesystem workspace。
+        mismatch: 派生资产或 company intent 不一致。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非 identical loser 被错误跳过或覆盖时抛出。
+    """
+
+    barrier = ThreadBarrier(2)
+    first_pipeline, _first_batching, _first_company, _first_source = _tracking_sec_pipeline(
+        tmp_path,
+        converter=_BarrierDoclingConverter(barrier, marker="first"),
+    )
+    second_marker = "second" if mismatch == "derived" else "first"
+    second_pipeline, _second_batching, _second_company, _second_source = _tracking_sec_pipeline(
+        tmp_path,
+        converter=_BarrierDoclingConverter(barrier, marker=second_marker),
+    )
+    primary = tmp_path / "q1.pdf"
+    primary.write_bytes(b"same-primary")
+    first_request = _validated_sec_filing_request(
+        pipeline=first_pipeline,
+        filing_file=primary,
+        action=None,
+        company_name="Apple First",
+        ticker_aliases=("MSFT",) if mismatch == "company" else (),
+    )
+    second_request = _validated_sec_filing_request(
+        pipeline=second_pipeline,
+        filing_file=primary,
+        action=None,
+        company_name="Apple First",
+        ticker_aliases=("GOOG",) if mismatch == "company" else (),
+    )
+
+    results = _run_two_sec_uploads(
+        first_pipeline=first_pipeline,
+        first_request=first_request,
+        second_pipeline=second_pipeline,
+        second_request=second_request,
+    )
+
+    assert sorted(str(result["status"]) for result in results) == ["failed", "ok"]
+    failed = next(result for result in results if result["status"] == "failed")
+    failure = failed["failure"]
+    assert isinstance(failure, dict)
+    assert failure["code"] == "source_publication_conflict"
+
+
+@pytest.mark.parametrize("same_ticker", [True, False])
+def test_concurrent_distinct_targets_preserve_exact_union(
+    tmp_path: Path,
+    same_ticker: bool,
+) -> None:
+    """不同 filing 或不同 ticker 的竞争均保留两个独立 durable target。
+
+    Args:
+        tmp_path: 真实 filesystem workspace。
+        same_ticker: 为真时使用同 ticker 不同 fiscal period。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: per-target union 丢失或错误冲突时抛出。
+    """
+
+    batch_read_events = None if same_ticker else {"AAPL": Event(), "MSFT": Event()}
+    pipeline, batching, company, _source = _tracking_sec_pipeline(
+        tmp_path,
+        converter=_BarrierDoclingConverter(ThreadBarrier(2)),
+        batch_read_barrier=None if same_ticker else ThreadBarrier(2),
+        batch_read_events=batch_read_events,
+    )
+    first_file = tmp_path / "first.pdf"
+    second_file = tmp_path / "second.pdf"
+    first_file.write_bytes(b"first")
+    second_file.write_bytes(b"second")
+    first_request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=first_file,
+        action=None,
+        company_name="Apple Inc.",
+        fiscal_period="Q1",
+        ticker="AAPL",
+        ticker_aliases=("MSFT",) if same_ticker else (),
+    )
+    second_ticker = "AAPL" if same_ticker else "MSFT"
+    second_request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=second_file,
+        action=None,
+        company_name="Apple Inc." if same_ticker else "Microsoft Corp.",
+        fiscal_period="Q2" if same_ticker else "Q1",
+        ticker=second_ticker,
+        ticker_aliases=("GOOG",) if same_ticker else (),
+    )
+
+    results = _run_two_sec_uploads(
+        first_pipeline=pipeline,
+        first_request=first_request,
+        second_pipeline=pipeline,
+        second_request=second_request,
+    )
+
+    assert [result["status"] for result in results] == ["ok", "ok"]
+    assert len(batching.commit_tokens) == 2
+    first_state = pipeline._filing_upload_state_repository.read_filing_upload_state(
+        "AAPL",
+        first_request.document_id,
+    )
+    second_state = pipeline._filing_upload_state_repository.read_filing_upload_state(
+        second_ticker,
+        second_request.document_id,
+    )
+    assert first_state.source_integrity.status is SourceIntegrityStatus.COMPLETE
+    assert second_state.source_integrity.status is SourceIntegrityStatus.COMPLETE
+    if same_ticker:
+        company_meta = company.get_company_meta("AAPL")
+        aliases = company_meta.ticker_identity.accepted_aliases
+        assert len(aliases) == 2
+        assert frozenset(aliases) == frozenset({"MSFT", "GOOG"})
+    else:
+        assert batch_read_events is not None
+        assert all(entered.is_set() for entered in batch_read_events.values())
+
+
+@pytest.mark.asyncio
+async def test_explicit_update_identical_stable_retransmission_is_canonical_skip(
+    tmp_path: Path,
+) -> None:
+    """explicit update 的 stable identical 重传保持 revision/version/tree 不变。
+
+    Args:
+        tmp_path: 真实 filesystem workspace。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: explicit update 被发布、改版或泄露 conversion event 时抛出。
+    """
+
+    converter_calls: list[str] = []
+    pipeline, batching, company, source = _tracking_sec_pipeline(
+        tmp_path,
+        converter_calls=converter_calls,
+    )
+    primary = tmp_path / "q1.pdf"
+    primary.write_bytes(b"explicit-update-stable")
+    create_request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=primary,
+        action=None,
+        company_name="Apple Inc.",
+    )
+    create_events = [event async for event in pipeline.upload_filing_stream(create_request)]
+    created = create_events[-1].payload["result"]
+    assert isinstance(created, dict)
+    assert created["status"] == "ok"
+    initial_state = pipeline._filing_upload_state_repository.read_filing_upload_state(
+        "AAPL",
+        str(created["document_id"]),
+    )
+    initial_tree = published_tree_sha256(tmp_path, "AAPL")
+    batching.begin_tokens.clear()
+    batching.commit_tokens.clear()
+    batching.rollback_tokens.clear()
+    company.stage_tokens.clear()
+    source.stage_tokens.clear()
+    converter_calls.clear()
+    request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=primary,
+        action="update",
+        company_name="Apple Inc.",
+    )
+
+    events = [event async for event in pipeline.upload_filing_stream(request)]
+
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    assert result["status"] == "skipped"
+    assert result["requested_action"] == "update"
+    assert result["resolved_action"] == "update"
+    assert result["filing_action"] == "update"
+    assert result["stored_file_count"] == 0
+    assert [event.event_type for event in events] == [
+        UploadFilingEventType.UPLOAD_STARTED,
+        UploadFilingEventType.FILE_SKIPPED,
+        UploadFilingEventType.UPLOAD_COMPLETED,
+    ]
+    assert converter_calls == [primary.name]
+    final_state = pipeline._filing_upload_state_repository.read_filing_upload_state(
+        "AAPL",
+        request.document_id,
+    )
+    assert final_state.source_integrity.revision == initial_state.source_integrity.revision
+    assert final_state.source_meta == initial_state.source_meta
+    assert published_tree_sha256(tmp_path, "AAPL") == initial_tree
+    assert len(batching.begin_tokens) == 1
+    assert batching.commit_tokens == []
+    assert batching.rollback_tokens == batching.begin_tokens
+    assert company.stage_tokens == []
+    assert source.stage_tokens == []
+
+
+def test_concurrent_explicit_updates_conflict_after_source_observation_changes(
+    tmp_path: Path,
+) -> None:
+    """两个 explicit update 中后 writer 看到 revision 变化必须 typed conflict。
+
+    Args:
+        tmp_path: 真实 filesystem workspace。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: changed observation 被近似 skip、fallback publish 或丢失 action 时抛出。
+    """
+
+    seed_pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        processor_registry=build_fins_processor_registry(),
+        docling_converter=_FakeDoclingConverter(),
+    )
+    seed_file = tmp_path / "seed.pdf"
+    seed_file.write_bytes(b"seed")
+    seeded = seed_pipeline.upload_filing(
+        _validated_sec_filing_request(
+            pipeline=seed_pipeline,
+            filing_file=seed_file,
+            action=None,
+            company_name="Apple Inc.",
+        )
+    )
+    assert seeded["status"] == "ok"
+    pipeline, batching, _company, _source = _tracking_sec_pipeline(
+        tmp_path,
+        converter=_BarrierDoclingConverter(ThreadBarrier(2)),
+    )
+    first_file = tmp_path / "update-a.pdf"
+    second_file = tmp_path / "update-b.pdf"
+    first_file.write_bytes(b"update-a")
+    second_file.write_bytes(b"update-b")
+    first_request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=first_file,
+        action="update",
+        company_name="Apple Inc.",
+    )
+    second_request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=second_file,
+        action="update",
+        company_name="Apple Inc.",
+    )
+
+    results = _run_two_sec_uploads(
+        first_pipeline=pipeline,
+        first_request=first_request,
+        second_pipeline=pipeline,
+        second_request=second_request,
+    )
+
+    assert sorted(str(result["status"]) for result in results) == ["failed", "ok"]
+    failed = next(result for result in results if result["status"] == "failed")
+    failure = failed["failure"]
+    assert isinstance(failure, dict)
+    assert failure["code"] == "source_publication_conflict"
+    assert failed["requested_action"] == "update"
+    assert failed["resolved_action"] == "update"
+    assert failed["filing_action"] == "update"
+    assert failed["stored_file_count"] == 0
+    assert len(batching.commit_tokens) == 1
+    assert len(batching.rollback_tokens) == 1
+
+
+@pytest.mark.parametrize("cancel_at_observation", [5, 6])
+def test_shared_publication_cancellation_checkpoints_rollback_without_mutation(
+    tmp_path: Path,
+    cancel_at_observation: int,
+) -> None:
+    """shared owner 的 begin 后与 fresh arbitration 后 checkpoint 都原子回滚。
+
+    Args:
+        tmp_path: 真实 filesystem workspace。
+        cancel_at_observation: 覆盖第一或第二 publication checkpoint 的观察序号。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 取消终态、rollback 次数或 durable tree 漂移时抛出。
+    """
+
+    pipeline, batching, company, source = _tracking_sec_pipeline(tmp_path)
+    primary = tmp_path / "q1.pdf"
+    primary.write_bytes(b"cancel-candidate")
+    request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=primary,
+        action=None,
+        company_name="Apple Inc.",
+    )
+    token = _CheckpointCancellationToken(cancel_at_observation)
+
+    result = pipeline.upload_filing(request, cancellation_checker=token)
+
+    assert result["status"] == "cancelled"
+    assert result["stored_file_count"] == 0
+    assert len(batching.begin_tokens) == 1
+    assert batching.commit_tokens == []
+    assert batching.rollback_tokens == batching.begin_tokens
+    assert company.stage_tokens == []
+    assert source.stage_tokens == []
+    assert published_tree_sha256(tmp_path, "AAPL") == {}
+
+
+def test_shared_publication_cancel_rollback_failure_is_typed_storage_terminal(
+    tmp_path: Path,
+) -> None:
+    """取消 rollback 失败必须产生 path-free storage_io，而非假 cancelled。
+
+    Args:
+        tmp_path: 真实 filesystem workspace。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: rollback failure 分类、证据或 mutation 边界漂移时抛出。
+    """
+
+    pipeline, batching, company, source = _tracking_sec_pipeline(tmp_path)
+    batching.fail_rollback = True
+    primary = tmp_path / "q1.pdf"
+    primary.write_bytes(b"cancel-rollback-failure")
+    request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=primary,
+        action=None,
+        company_name="Apple Inc.",
+    )
+
+    result = pipeline.upload_filing(
+        request,
+        cancellation_checker=_CheckpointCancellationToken(5),
+    )
+
+    assert result["status"] == "failed"
+    assert result["stored_file_count"] == 0
+    failure = result["failure"]
+    assert isinstance(failure, dict)
+    assert failure["code"] == "storage_io"
+    assert len(batching.begin_tokens) == 1
+    assert batching.commit_tokens == []
+    assert batching.rollback_tokens == batching.begin_tokens
+    assert company.stage_tokens == []
+    assert source.stage_tokens == []
+
+
+def test_spawn_process_identical_auto_has_one_publish_and_one_skip(tmp_path: Path) -> None:
+    """spawn 进程竞争也由 filesystem per-ticker writer 线性化。
+
+    Args:
+        tmp_path: 父子进程共享的真实 filesystem workspace。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 子进程退出、终态或 durable state 漂移时抛出。
+        queue.Empty: 任一子进程未返回闭合结果时抛出。
+    """
+
+    # 父进程先完成 workspace 初始化，避免把目录创建竞争混入 publication 断言。
+    observer = SecPipeline(
+        workspace_root=tmp_path,
+        processor_registry=build_fins_processor_registry(),
+        docling_converter=_FakeDoclingConverter(),
+    )
+    primary = tmp_path / "spawn-q1.pdf"
+    primary.write_bytes(b"spawn-identical")
+    observed_request = _validated_sec_filing_request(
+        pipeline=observer,
+        filing_file=primary,
+        action=None,
+        company_name="Apple Inc.",
+    )
+    context = multiprocessing.get_context("spawn")
+    barrier = cast(_BarrierPort, context.Barrier(2))
+    result_queue = cast(_SpawnResultQueue, context.Queue(maxsize=2))
+    processes = tuple(
+        context.Process(
+            target=_spawn_identical_sec_upload_worker,
+            args=(str(tmp_path), str(primary), barrier, result_queue),
+        )
+        for _index in range(2)
+    )
+
+    try:
+        for process in processes:
+            process.start()
+        results = (result_queue.get(timeout=30), result_queue.get(timeout=30))
+        for process in processes:
+            process.join(timeout=30)
+        assert [process.exitcode for process in processes] == [0, 0]
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=10)
+
+    assert sorted(results) == [("ok", 1), ("skipped", 0)]
+    durable = observer._filing_upload_state_repository.read_filing_upload_state(
+        "AAPL",
+        observed_request.document_id,
+    )
+    assert durable.source_integrity.status is SourceIntegrityStatus.COMPLETE

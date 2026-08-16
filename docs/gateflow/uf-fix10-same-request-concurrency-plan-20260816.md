@@ -3,22 +3,26 @@
 ## 0. Gate 元数据
 
 - work unit：`UF-FIX10 same-request-concurrency`
-- gate：`S1 accepted slice`
-- 日期：2026-08-16
+- gate：`S2 acceptance`
+- 日期：2026-08-17
 - 当前分支：`codex/upload-filing-oracle`
-- 基线提交：`656b926c5d39a66f2b05af46e0f08f044f28bcb3`
+- 基线提交：`7e0941828c09d890ad04e3ff8f2c1cf5e28441ca`
 - preflight：用户已确认；分支非 protected trunk，工作树中本 work unit 的 plan/fix/review artifacts 均由 Controller 明确纳入本 gate，ownership 清晰，无 merge/rebase/cherry-pick
 - goal confirmation：用户已确认
-- completion status：`S1 ACCEPTED / READY TO COMMIT`
+- completion status：`S2 ACCEPTED / READY TO COMMIT`
 - artifact path：`docs/gateflow/uf-fix10-same-request-concurrency-plan-20260816.md`
-- blocking open questions：无；两路 S1 code-review re-review 均 pass，accepted F2–F5 与 C1 已修复，F1/Q1/Q2 rejected-with-reason 裁决成立；version policy 与 service 动态 monkeypatch fake均有未来 owner，属于非阻塞 residual
-- accepted commit：待创建；本 acceptance gate 只记录裁决，下一 gate 按用户要求在当前分支提交
-- 下一入口：`S1 accepted slice commit`，完成后进入 `S2 implementation`
+- blocking open questions：无；两路独立 re-review 均为 pass，全部 accepted findings 已根因关闭
+- accepted commit：S1 基线为 `7e0941828c09d890ad04e3ff8f2c1cf5e28441ca`；S2 未创建 commit
+- 下一入口：`S2 accepted slice commit`，完成后进入整分支 final deepreview
 
-S1 acceptance 由 `docs/gateflow/uf-fix10-s1-acceptance-20260817.md` 记录。两路 re-review
-确认 S1 behavior-preserving owner contracts、accepted fixes、验证与边界均通过，无 blocker。
-本 acceptance gate 只同步 durable gate state，不修改生产代码、测试、README、oracle、scenario、
-registry 或 frozen evidence，不创建 commit，也不授权跳过 S1 checkpoint 提前进入 S2。
+S1 acceptance 由 `docs/gateflow/uf-fix10-s1-acceptance-20260817.md` 记录。S2 implementation
+evidence 记录于 `docs/gateflow/uf-fix10-s2-implementation-20260817.md`；两路 review 的
+accepted findings 与修复边界由
+`docs/gateflow/uf-fix10-s2-code-review-adjudication-20260817.md` 冻结，本轮修复证据记录于
+`docs/gateflow/uf-fix10-s2-code-review-fix-20260817.md`；两路 re-review artifact 为
+`docs/reviews/code-review-20260817-031615.md` 与
+`docs/reviews/code-review-20260817-032141.md`。S2 已验收，下一 gate 按用户要求在当前分支
+创建 accepted slice commit；仍不进入 UF-PF10/UF-PF12。
 
 ## 1. 输入、真源与边界
 
