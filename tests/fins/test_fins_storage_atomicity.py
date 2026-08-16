@@ -427,6 +427,277 @@ def test_filing_upload_state_reads_company_and_source_from_one_published_version
     assert snapshot.source_meta["primary_document"] == "aapl-2024-fy.txt_docling.json"
 
 
+def test_filing_upload_state_batch_reader_uses_one_staging_view_and_durable_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """batch fresh read 必须只消费 writer staging 并复用同次 strict identity parser。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest 属性替换器。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: reader 读取 published locator、重复解析、产生 mutation 或 identity 漂移时抛出。
+        OSError: fixture staging、commit 或 strict read 失败时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    core = repository_set.core
+    batching = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    company = FsCompanyMetaRepository(workspace_root, repository_set=repository_set)
+    source = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    state_repository = FsFilingUploadStateRepository(
+        workspace_root,
+        repository_set=repository_set,
+    )
+    document_id = "filing-publication"
+    winner_batch = batching.begin_batch("AAPL")
+    stage_company_meta_fixture(
+        company,
+        CompanyMeta(
+            company_id="company-aapl",
+            company_name="Apple Inc.",
+            ticker_identity=build_company_ticker_identity("AAPL", ()),
+            resolver_version="market_resolver_v1.0.0",
+            updated_at="2025-01-01T00:00:00+00:00",
+        ),
+        batch=winner_batch,
+    )
+    _create_complete_source(
+        source,
+        blob,
+        batch=winner_batch,
+        document_id=document_id,
+        business_meta={
+            "company_id": "company-aapl",
+            "fiscal_year": 2024,
+            "fiscal_period": "FY",
+            "report_kind": "annual",
+            "filing_date": "2025-01-31",
+            "report_date": "2024-12-31",
+            "amended": False,
+            "document_version": "v1",
+            "source_fingerprint": "a" * 64,
+            "is_deleted": False,
+        },
+    )
+    staged_winner = state_repository.read_filing_upload_state_in_batch(
+        winner_batch,
+        document_id,
+    )
+    assert staged_winner.company_meta is None
+    assert staged_winner.source_integrity.status is SourceIntegrityStatus.COMPLETE
+    assert staged_winner.publication_identity is not None
+    batching.commit_batch(winner_batch)
+
+    published_winner = state_repository.read_filing_upload_state("AAPL", document_id)
+    assert published_winner.company_meta is not None
+    assert published_winner.publication_identity == staged_winner.publication_identity
+    assert published_winner.publication_identity is not None
+    assert published_winner.publication_identity.primary_original_asset_name == (
+        f"{document_id}.txt"
+    )
+    assert published_winner.publication_identity.companion_original_asset_names == ()
+
+    contender_batch = batching.begin_batch("AAPL")
+    contender_state = _only_active_batch_state(core)
+    before_read = _snapshot_workspace_tree(workspace_root)
+    company_reader_calls: list[Path] = []
+    strict_parser_calls: list[Path] = []
+    original_company_reader = core._read_company_meta_from_ticker_dir_unguarded
+    original_strict_parser = core._read_published_company_identity
+
+    def record_company_reader(external_ticker: str, ticker_dir: Path) -> CompanyMeta | None:
+        """记录 batch reader 交给 company owner 的 exact ticker root。
+
+        Args:
+            external_ticker: canonical ticker。
+            ticker_dir: caller-owned 稳定 ticker root。
+
+        Returns:
+            production strict company reader 结果。
+
+        Raises:
+            OSError: production strict reader 失败时抛出。
+            ValueError: identity contract 非法时抛出。
+        """
+
+        company_reader_calls.append(ticker_dir)
+        return original_company_reader(external_ticker, ticker_dir)
+
+    def record_strict_parser(
+        ticker_dir: Path,
+        *,
+        expected_storage_key: str,
+        known_directory_stat: os.stat_result,
+    ) -> storage_infra_module._PublishedCompanyIdentity:
+        """记录 company owner 的单次 strict descriptor/meta parse。
+
+        Args:
+            ticker_dir: exact ticker root。
+            expected_storage_key: caller 已知 storage key。
+            known_directory_stat: caller 已读取的 directory stat。
+
+        Returns:
+            production strict parser payload。
+
+        Raises:
+            OSError: production strict parser 失败时抛出。
+            ValueError: durable identity contract 非法时抛出。
+        """
+
+        strict_parser_calls.append(ticker_dir)
+        return original_strict_parser(
+            ticker_dir,
+            expected_storage_key=expected_storage_key,
+            known_directory_stat=known_directory_stat,
+        )
+
+    def reject_published_locator(external_ticker: str) -> NoReturn:
+        """拒绝 batch reader 重新定位 published ticker root。
+
+        Args:
+            external_ticker: 被错误请求的 ticker。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 始终抛出以暴露 published fallback。
+        """
+
+        raise AssertionError(f"batch fresh read 不得定位 published root: {external_ticker}")
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(core, "_read_company_meta_from_ticker_dir_unguarded", record_company_reader)
+        patcher.setattr(core, "_read_published_company_identity", record_strict_parser)
+        patcher.setattr(core, "_target_ticker_dir", reject_published_locator)
+        contender = state_repository.read_filing_upload_state_in_batch(
+            contender_batch,
+            document_id,
+        )
+
+    assert contender == published_winner
+    assert contender.publication_identity == published_winner.publication_identity
+    assert company_reader_calls == [contender_state.staging_ticker_dir]
+    assert strict_parser_calls == [contender_state.staging_ticker_dir]
+    assert _snapshot_workspace_tree(workspace_root) == before_read
+    batching.rollback_batch(contender_batch)
+
+
+def test_filing_upload_state_batch_reader_returns_missing_from_empty_staging_without_mutation(
+    tmp_path: Path,
+) -> None:
+    """空 staging 上合法 document fresh read 必须返回完整 MISSING 投影且零 mutation。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: missing 投影包含伪造 meta/identity 或读取改变 staging 时抛出。
+        OSError: batch lifecycle 失败时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    state_repository = FsFilingUploadStateRepository(
+        workspace_root,
+        repository_set=repository_set,
+    )
+    batch = batching.begin_batch("AAPL")
+    before_read = _snapshot_workspace_tree(workspace_root)
+
+    state = state_repository.read_filing_upload_state_in_batch(batch, "aapl-2024-fy")
+
+    assert state.company_meta is None
+    assert state.source_integrity.ticker == "AAPL"
+    assert state.source_integrity.document_id == "aapl-2024-fy"
+    assert state.source_integrity.status is SourceIntegrityStatus.MISSING
+    assert state.source_integrity.revision is None
+    assert state.source_integrity.reasons == ()
+    assert state.source_meta is None
+    assert state.publication_identity is None
+    assert _snapshot_workspace_tree(workspace_root) == before_read
+    batching.rollback_batch(batch)
+
+
+def test_filing_upload_state_published_reader_rejects_empty_document_before_mutation(
+    tmp_path: Path,
+) -> None:
+    """published read 必须对空 document_id fail fast 且不初始化 workspace。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: malformed document 被投影为 MISSING 或读路径产生 mutation 时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    state_repository = FsFilingUploadStateRepository(workspace_root)
+    before_read = _snapshot_workspace_tree(workspace_root)
+
+    with pytest.raises(ValueError, match="document_id"):
+        state_repository.read_filing_upload_state("AAPL", "")
+
+    assert _snapshot_workspace_tree(workspace_root) == before_read
+
+
+def test_filing_upload_state_batch_reader_rejects_invalid_capabilities_without_mutation(
+    tmp_path: Path,
+) -> None:
+    """foreign core、wrong ticker、closed token 与 malformed document 必须 fail fast。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: invalid input 被接受或读取产生 staging mutation 时抛出。
+        OSError: fixture batch lifecycle 失败时抛出。
+    """
+
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_set = build_fs_repository_set(workspace_root=first_root)
+    second_set = build_fs_repository_set(workspace_root=second_root)
+    first_batching = FsBatchingRepository(first_root, repository_set=first_set)
+    first_state = FsFilingUploadStateRepository(first_root, repository_set=first_set)
+    foreign_state = FsFilingUploadStateRepository(second_root, repository_set=second_set)
+    batch = first_batching.begin_batch("AAPL")
+    unchanged_tree = _snapshot_workspace_tree(first_root)
+
+    with pytest.raises(ValueError, match="当前 storage core"):
+        foreign_state.read_filing_upload_state_in_batch(batch, "filing-a")
+    wrong_ticker = BatchToken(transaction_id=batch.transaction_id, ticker="MSFT")
+    with pytest.raises(ValueError, match="canonical capability"):
+        first_state.read_filing_upload_state_in_batch(wrong_ticker, "filing-a")
+    with pytest.raises(ValueError, match="document_id"):
+        first_state.read_filing_upload_state_in_batch(batch, "")
+    assert _snapshot_workspace_tree(first_root) == unchanged_tree
+
+    first_batching.rollback_batch(batch)
+    closed_tree = _snapshot_workspace_tree(first_root)
+    with pytest.raises(ValueError, match="当前 storage core"):
+        first_state.read_filing_upload_state_in_batch(batch, "filing-a")
+    assert _snapshot_workspace_tree(first_root) == closed_tree
+
+
 def test_filing_upload_state_fails_closed_for_missing_source_meta_without_mutation(
     tmp_path: Path,
 ) -> None:
@@ -5849,6 +6120,7 @@ def _create_complete_source(
     source_kind: SourceKind = SourceKind.FILING,
     ticker: str = "AAPL",
     payload: bytes | None = None,
+    business_meta: dict[str, JsonValue] | None = None,
 ) -> SourceHandle:
     """通过 blob-first + 单次 final source mutation 构造完整 source。
 
@@ -5860,6 +6132,7 @@ def _create_complete_source(
         source_kind: filing 或 material。
         ticker: transaction ticker。
         payload: 可选测试文件内容。
+        business_meta: 可选额外 source business meta；不覆盖 provenance owner 字段。
 
     Returns:
         完整 source 的业务 handle。
@@ -5933,6 +6206,7 @@ def _create_complete_source(
             form_type="10-K" if source_kind is SourceKind.FILING else "EX-99",
             primary_document=primary_document,
             meta={
+                **(business_meta or {}),
                 "ingest_method": "upload",
                 "source_provider": "user_upload",
             },
@@ -7693,6 +7967,7 @@ def test_repair_manifest_collection_rejects_clean_owner_shape_violation() -> Non
         files=(),
         primary_document=None,
         canonical_manifest_item={"document_id": "wrong-identity"},
+        filing_upload_publication_identity=None,
     )
     inspection = _SourceKindPublicationInspection(
         target=None,

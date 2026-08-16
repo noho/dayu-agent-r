@@ -26,6 +26,7 @@ from dayu.contracts.tool_outcome import (
     ToolFailedOutcome,
 )
 from dayu.fins.download_contract import FinsDownloadRequest
+from dayu.fins.domain.document_models import BatchToken
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.ingestion_runtime import (
     FinsIngestionExecutor,
@@ -786,6 +787,7 @@ class _ForbiddenFilingUploadStateRepository:
         """
 
         self.calls: list[tuple[str, str]] = []
+        self.batch_calls: list[tuple[BatchToken, str]] = []
 
     def read_filing_upload_state(
         self,
@@ -807,6 +809,54 @@ class _ForbiddenFilingUploadStateRepository:
 
         self.calls.append((ticker, document_id))
         raise AssertionError("tool calendar/year admission 前禁止读取 filing state")
+
+    def read_filing_upload_state_in_batch(
+        self,
+        batch: BatchToken,
+        document_id: str,
+    ) -> FilingUploadPublishedState:
+        """记录越界 batch state read 并立即失败。
+
+        Args:
+            batch: 待读取的 batch capability。
+            document_id: 待读取的 filing 文档 ID。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 方法被调用时始终抛出。
+        """
+
+        self.batch_calls.append((batch, document_id))
+        raise AssertionError("tool static admission 前禁止读取 batch filing state")
+
+
+def test_tool_static_admission_state_fake_conforms_to_required_batch_read_contract() -> None:
+    """tool forbidden fake 必须 record-then-fail 且保持 published/batch 记录独立。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: required batch signature、记录或 fail-fast 语义漂移时抛出。
+    """
+
+    repository = _ForbiddenFilingUploadStateRepository()
+    batch = BatchToken(transaction_id="fixture-batch", ticker="AAPL")
+    document_id = "filing-a"
+
+    with pytest.raises(
+        AssertionError,
+        match="tool static admission 前禁止读取 batch filing state",
+    ):
+        repository.read_filing_upload_state_in_batch(batch, document_id)
+
+    assert repository.calls == []
+    assert repository.batch_calls == [(batch, document_id)]
 
 
 def test_tools_discovery_discovers_read_download_preprocess_and_upload_independently(
@@ -1253,6 +1303,7 @@ def test_upload_tool_filing_calendar_year_invalid_input_has_zero_side_effects(
     assert outcome.result.message == expected_message
     assert "--" not in outcome.result.message
     assert state_repository.calls == []
+    assert state_repository.batch_calls == []
     assert executor.submitted_job_ids == ()
     assert runtime._observations == {}
     assert not tuple(_job_store_root(workspace_root).glob("*.json"))
@@ -1374,6 +1425,7 @@ def test_upload_tool_filing_dates_preserve_raw_text_until_domain_admission(
     assert outcome.result.error == "invalid_argument"
     assert outcome.result.message == expected_message
     assert state_repository.calls == []
+    assert state_repository.batch_calls == []
     assert executor.submitted_job_ids == ()
     assert runtime._observations == {}
 
@@ -1713,6 +1765,7 @@ def test_upload_tool_invalid_primary_fails_before_state_or_observation_registrat
     assert outcome.result.error == "invalid_argument"
     assert outcome.result.message == expected_message
     assert state_repository.calls == []
+    assert state_repository.batch_calls == []
     assert executor.submitted_job_ids == ()
     assert runtime._observations == {}
     assert not tuple(_job_store_root(workspace_root).glob("*.json"))

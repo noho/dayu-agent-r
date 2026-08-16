@@ -48,6 +48,7 @@ class FinsUploadFailureCode(str, Enum):
     STORAGE_IO = "storage_io"
     TICKER_ALIAS_CONFLICT = "ticker_alias_conflict"
     SOURCE_INTEGRITY_UNSAFE = "source_integrity_unsafe"
+    SOURCE_PUBLICATION_CONFLICT = "source_publication_conflict"
     SOURCE_REVISION_STALE = "source_revision_stale"
     SOURCE_REPAIR_BLOCKED = "source_repair_blocked"
     UNEXPECTED_RUNTIME = "unexpected_runtime"
@@ -183,6 +184,7 @@ _STORAGE_FAILURE_CODES: Final[frozenset[FinsUploadFailureCode]] = frozenset(
         FinsUploadFailureCode.STORAGE_IO,
         FinsUploadFailureCode.TICKER_ALIAS_CONFLICT,
         FinsUploadFailureCode.SOURCE_INTEGRITY_UNSAFE,
+        FinsUploadFailureCode.SOURCE_PUBLICATION_CONFLICT,
         FinsUploadFailureCode.SOURCE_REVISION_STALE,
         FinsUploadFailureCode.SOURCE_REPAIR_BLOCKED,
     }
@@ -389,6 +391,28 @@ def fins_upload_source_revision_stale_failure() -> FinsUploadFailureReason:
         kind=FinsUploadFailureKind.STORAGE,
         code=FinsUploadFailureCode.SOURCE_REVISION_STALE,
         message="目标 filing 在上传准备期间已发生变化，本次上传未提交",
+        retry_hint="请基于最新目标状态重新发起上传",
+        file_label=None,
+    )
+
+
+def fins_upload_source_publication_conflict_failure() -> FinsUploadFailureReason:
+    """构造 preparation 期间其它请求已发布目标的 closed public reason。
+
+    Args:
+        无。
+
+    Returns:
+        不含路径、ticker、document、revision、fingerprint 或异常文本的 storage failure reason。
+
+    Raises:
+        无。
+    """
+
+    return FinsUploadFailureReason(
+        kind=FinsUploadFailureKind.STORAGE,
+        code=FinsUploadFailureCode.SOURCE_PUBLICATION_CONFLICT,
+        message="目标 filing 在上传准备期间已由另一请求发布，本次上传未提交",
         retry_hint="请基于最新目标状态重新发起上传",
         file_label=None,
     )

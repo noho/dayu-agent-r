@@ -760,6 +760,7 @@ async def test_upload_methods_build_union_requests(tmp_path: Path) -> None:
                 reasons=(),
             ),
             source_meta={"source_fingerprint": "old"},
+            publication_identity=None,
         ),
     )
     await _collect_events(service.upload_filing(validated_filing_request))

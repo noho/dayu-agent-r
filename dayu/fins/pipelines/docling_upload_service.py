@@ -13,7 +13,7 @@ import logging
 import mimetypes
 import sys
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from io import BytesIO
 from pathlib import Path
@@ -42,6 +42,11 @@ from dayu.fins.pipelines.docling_process_converter import (
 from dayu.fins.storage import (
     BatchingRepositoryProtocol,
     DocumentBlobRepositoryProtocol,
+    FILING_UPLOAD_ASSET_SOURCE_DOCLING,
+    FILING_UPLOAD_ASSET_SOURCE_ORIGINAL,
+    FilingUploadAssetDescriptor,
+    FilingUploadAssetSource,
+    FilingUploadPublicationIdentity,
     SourceIntegrityRepairBlockedError,
     SourceIntegrityRevisionConflictError,
     SourceDocumentRepositoryProtocol,
@@ -73,9 +78,6 @@ _FILING_ASSET_IDENTITY_NAMESPACE: Final[str] = "fins-upload-asset-v1"
 _FILING_ASSET_IDENTITY_SEPARATOR: Final[bytes] = b"\0"
 _FILING_ORIGINAL_ASSET_PREFIX: Final[str] = "original-"
 _FILING_PRIMARY_ROLE_FINGERPRINT_VERSION: Final[str] = "filing-primary-role-v2"
-_AssetSource: TypeAlias = Literal["original", "docling"]
-_ASSET_SOURCE_ORIGINAL: Final[_AssetSource] = "original"
-_ASSET_SOURCE_DOCLING: Final[_AssetSource] = "docling"
 _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
 UploadFileEventType = Literal[
@@ -144,7 +146,7 @@ class _PendingFileAsset:
     content_type: str | None
     sha256: str
     size: int
-    source: _AssetSource
+    source: FilingUploadAssetSource
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,6 +191,43 @@ class _PreparedAssetMutation:
     source_fingerprint: str
     document_version: str
     repair_disposition: ExistingSourceRepairDisposition
+
+
+class FilingInitialSkipDisposition(str, Enum):
+    """filing preparation owner 产生的 initial identical-skip 事实。"""
+
+    NOT_ELIGIBLE = "not_eligible"
+    IDENTICAL_PUBLICATION = "identical_publication"
+
+
+@dataclass(frozen=True)
+class _PreparedFilingAssetMutation(_PreparedAssetMutation):
+    """尚未接线的 filing 专用 prepared publication candidate。
+
+    Attributes:
+        initial_skip_disposition: preparation owner 与 ``_can_skip_upload`` 同源产生的
+            closed initial skip disposition。
+    """
+
+    initial_skip_disposition: FilingInitialSkipDisposition
+
+    def __post_init__(self) -> None:
+        """校验 filing subtype 与 closed disposition 的精确类型。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            TypeError: source kind 或 disposition 不属于 filing closed contract 时抛出。
+        """
+
+        if self.source_kind is not SourceKind.FILING:
+            raise TypeError("prepared filing mutation 必须使用 filing source kind")
+        if type(self.initial_skip_disposition) is not FilingInitialSkipDisposition:
+            raise TypeError("initial skip disposition 必须是 FilingInitialSkipDisposition")
 
 
 @dataclass(frozen=True)
@@ -239,6 +278,52 @@ def evaluate_upload_overwrite_precondition(
     if action == "update" and previous_meta is None:
         return UploadOverwritePrecondition.UPDATE_TARGET_MISSING
     return UploadOverwritePrecondition.ALLOWED
+
+
+def _build_upsert_meta(
+    *,
+    previous_meta: JsonObject | None,
+    source_fingerprint: str,
+    document_version: str,
+    base_meta: Mapping[str, JsonValue],
+) -> JsonObject:
+    """构建 Docling staging upsert 元数据的九字段唯一投影。
+
+    Args:
+        previous_meta: source state owner 提供的可选既有业务元数据。
+        source_fingerprint: 本次源指纹。
+        document_version: 本次文档版本。
+        base_meta: 业务层传入的基础元数据。
+
+    Returns:
+        覆盖九个 staging-owned 字段的待写入业务元数据。
+
+    Raises:
+        无。
+    """
+
+    now = now_iso8601()
+    previous_first_ingested_at = (
+        _text_meta(previous_meta, "first_ingested_at")
+        if previous_meta is not None
+        else None
+    )
+    previous_created_at = (
+        _text_meta(previous_meta, "created_at")
+        if previous_meta is not None
+        else None
+    )
+    merged = dict(base_meta)
+    merged["updated_at"] = now
+    merged["first_ingested_at"] = previous_first_ingested_at or now
+    merged["created_at"] = previous_created_at or now
+    merged["document_version"] = document_version
+    merged["source_fingerprint"] = source_fingerprint
+    merged["ingest_complete"] = True
+    merged["source_provider"] = FinsSourceProvider.USER_UPLOAD.to_storage_value()
+    merged["is_deleted"] = False
+    merged["deleted_at"] = None
+    return merged
 
 
 class DoclingUploadService:
@@ -396,17 +481,10 @@ class DoclingUploadService:
                 module=self.MODULE,
             )
             skipped_events = _build_skipped_file_events(validated_files)
-            return UploadOperationResult(
-                status="skipped",
+            return _build_skipped_result(
                 document_id=document_id,
                 internal_document_id=internal_document_id,
-                stored_file_count=0,
                 file_events=skipped_events,
-                payload={
-                    "document_id": document_id,
-                    "internal_document_id": internal_document_id,
-                    "skip_reason": "already_uploaded",
-                },
             )
 
         try:
@@ -424,7 +502,7 @@ class DoclingUploadService:
         if _is_cancelled(cancellation):
             return _build_cancelled_result(document_id=document_id, internal_document_id=internal_document_id)
         current_version = _resolve_document_version(normalized_previous_meta, source_fingerprint)
-        staging_meta = self._build_upsert_meta(
+        staging_meta = _build_upsert_meta(
             previous_meta=normalized_previous_meta,
             source_fingerprint=source_fingerprint.value,
             document_version=current_version,
@@ -623,7 +701,7 @@ class DoclingUploadService:
                 batch=batch,
                 content_type=asset.content_type,
             )
-            if asset.source == _ASSET_SOURCE_ORIGINAL:
+            if asset.source == FILING_UPLOAD_ASSET_SOURCE_ORIGINAL:
                 stored_original_count += 1
             stored_entries.append(
                 _build_stored_file_entry(
@@ -828,7 +906,7 @@ class DoclingUploadService:
                     content_type=raw_content_type,
                     sha256=raw_sha256,
                     size=len(raw_data),
-                    source=_ASSET_SOURCE_ORIGINAL,
+                    source=FILING_UPLOAD_ASSET_SOURCE_ORIGINAL,
                 )
             )
         if source_kind is SourceKind.FILING:
@@ -933,52 +1011,12 @@ class DoclingUploadService:
                     content_type="application/json",
                     sha256=docling_sha256,
                     size=len(docling_data),
-                    source=_ASSET_SOURCE_DOCLING,
+                    source=FILING_UPLOAD_ASSET_SOURCE_DOCLING,
                 )
             )
         if primary_document is None:
             raise RuntimeError("未生成 docling 主文件，无法写入 primary_document")
         return assets, conversion_events, primary_document
-
-    def _build_upsert_meta(
-        self,
-        *,
-        previous_meta: JsonObject | None,
-        source_fingerprint: str,
-        document_version: str,
-        base_meta: Mapping[str, JsonValue],
-    ) -> JsonObject:
-        """构建 upsert 元数据。
-
-        Args:
-            previous_meta: 旧元数据。
-            source_fingerprint: 本次源指纹。
-            document_version: 本次文档版本。
-            base_meta: 业务层传入的基础元数据。
-
-        Returns:
-            待写入元数据。
-
-        Raises:
-            无。
-        """
-
-        now = now_iso8601()
-        previous_first_ingested_at = (
-            _text_meta(previous_meta, "first_ingested_at") if previous_meta is not None else None
-        )
-        previous_created_at = _text_meta(previous_meta, "created_at") if previous_meta is not None else None
-        merged = dict(base_meta)
-        merged["updated_at"] = now
-        merged["first_ingested_at"] = previous_first_ingested_at or now
-        merged["created_at"] = previous_created_at or now
-        merged["document_version"] = document_version
-        merged["source_fingerprint"] = source_fingerprint
-        merged["ingest_complete"] = True
-        merged["source_provider"] = FinsSourceProvider.USER_UPLOAD.to_storage_value()
-        merged["is_deleted"] = False
-        merged["deleted_at"] = None
-        return merged
 
     def _create_source_document(
         self,
@@ -1028,6 +1066,287 @@ class DoclingUploadService:
             source_kind=source_kind,
             batch=batch,
         )
+
+
+def _require_prepared_filing_mutation(
+    prepared: PreparedDoclingUpload,
+) -> _PreparedFilingAssetMutation:
+    """收窄尚未接线的 filing prepared subtype。
+
+    Args:
+        prepared: Docling preparation result 或 mutation。
+
+    Returns:
+        filing 专用 prepared candidate。
+
+    Raises:
+        TypeError: 输入是 material/base mutation、delete mutation 或终态 result 时抛出。
+    """
+
+    if not isinstance(prepared, _PreparedFilingAssetMutation):
+        raise TypeError("prepared filing helper 只接受 _PreparedFilingAssetMutation")
+    return prepared
+
+
+def _require_prepared_filing_meta_text(
+    meta: Mapping[str, JsonValue],
+    field_name: str,
+) -> str:
+    """读取 prepared filing identity 的必填非空文本。
+
+    Args:
+        meta: preparation owner 产生的 staging business meta。
+        field_name: 待读取字段名。
+
+    Returns:
+        非空字符串。
+
+    Raises:
+        ValueError: 字段缺失、类型非法或为空时抛出。
+    """
+
+    value = meta.get(field_name)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"prepared filing meta {field_name} 必须是非空字符串")
+    return value
+
+
+def _require_prepared_filing_nullable_text(
+    meta: Mapping[str, JsonValue],
+    field_name: str,
+) -> str | None:
+    """读取 prepared filing identity 的 required nullable 文本。
+
+    Args:
+        meta: preparation owner 产生的 staging business meta。
+        field_name: 待读取字段名。
+
+    Returns:
+        非空字符串或显式 ``None``。
+
+    Raises:
+        ValueError: 字段缺失、类型非法或为空字符串时抛出。
+    """
+
+    if field_name not in meta:
+        raise ValueError(f"prepared filing meta 缺少 {field_name}")
+    value = meta[field_name]
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"prepared filing meta {field_name} 必须是非空字符串或 null")
+    return value
+
+
+def describe_prepared_filing_publication(
+    prepared: PreparedDoclingUpload,
+) -> FilingUploadPublicationIdentity:
+    """从已完成转换的 filing candidate 描述 exact publication identity。
+
+    Args:
+        prepared: 尚未接线的 filing 专用 prepared candidate。
+
+    Returns:
+        与 durable storage inspector 共用的无路径 publication identity。
+
+    Raises:
+        TypeError: 输入不是 filing prepared subtype，或 meta 布尔/整数类型非法时抛出。
+        ValueError: filing meta、资产 role、primary、摘要或 duplicated prepared 字段不一致时抛出。
+    """
+
+    candidate = _require_prepared_filing_mutation(prepared)
+    assets = tuple(
+        sorted(
+            (
+                FilingUploadAssetDescriptor(
+                    name=asset.name,
+                    original_filename=_require_filing_original_filename(asset),
+                    derived_from=asset.derived_from,
+                    sha256=asset.sha256,
+                    size=asset.size,
+                    content_type=asset.content_type,
+                    source=asset.source,
+                )
+                for asset in candidate.pending_assets
+            ),
+            key=lambda asset: asset.name,
+        )
+    )
+    primary_matches = tuple(asset for asset in assets if asset.name == candidate.primary_document)
+    if len(primary_matches) != 1:
+        raise ValueError("prepared primary_document 必须精确命中一个 asset")
+    primary_original_asset_name = primary_matches[0].derived_from
+    if primary_original_asset_name is None:
+        raise ValueError("prepared primary_document 必须携带 original storage identity")
+    original_names = tuple(
+        asset.name
+        for asset in assets
+        if asset.source == FILING_UPLOAD_ASSET_SOURCE_ORIGINAL
+    )
+    companions = tuple(
+        sorted(name for name in original_names if name != primary_original_asset_name)
+    )
+    fiscal_year = candidate.meta.get("fiscal_year")
+    amended = candidate.meta.get("amended")
+    is_deleted = candidate.meta.get("is_deleted")
+    if type(fiscal_year) is not int:
+        raise TypeError("prepared filing meta fiscal_year 必须是整数")
+    if type(amended) is not bool or type(is_deleted) is not bool:
+        raise TypeError("prepared filing meta amended/is_deleted 必须是布尔值")
+    meta_document_version = _require_prepared_filing_meta_text(
+        candidate.meta,
+        "document_version",
+    )
+    meta_source_fingerprint = _require_prepared_filing_meta_text(
+        candidate.meta,
+        "source_fingerprint",
+    )
+    if (
+        meta_document_version != candidate.document_version
+        or meta_source_fingerprint != candidate.source_fingerprint
+    ):
+        raise ValueError("prepared filing duplicated version/fingerprint facts 必须一致")
+    return FilingUploadPublicationIdentity(
+        ticker=candidate.ticker,
+        document_id=candidate.document_id,
+        internal_document_id=candidate.internal_document_id,
+        form_type=candidate.form_type,
+        company_id=_require_prepared_filing_meta_text(candidate.meta, "company_id"),
+        ingest_method=_require_prepared_filing_meta_text(candidate.meta, "ingest_method"),
+        fiscal_year=fiscal_year,
+        fiscal_period=_require_prepared_filing_meta_text(candidate.meta, "fiscal_period"),
+        report_kind=_require_prepared_filing_meta_text(candidate.meta, "report_kind"),
+        filing_date=_require_prepared_filing_nullable_text(candidate.meta, "filing_date"),
+        report_date=_require_prepared_filing_nullable_text(candidate.meta, "report_date"),
+        amended=amended,
+        source_provider=_require_prepared_filing_meta_text(candidate.meta, "source_provider"),
+        is_deleted=is_deleted,
+        document_version=candidate.document_version,
+        source_fingerprint=candidate.source_fingerprint,
+        primary_document=candidate.primary_document,
+        primary_original_asset_name=primary_original_asset_name,
+        companion_original_asset_names=companions,
+        assets=assets,
+    )
+
+
+def read_prepared_filing_initial_skip_disposition(
+    prepared: PreparedDoclingUpload,
+) -> FilingInitialSkipDisposition:
+    """读取 preparation owner 已产生的 closed filing skip disposition。
+
+    Args:
+        prepared: 尚未接线的 filing 专用 prepared candidate。
+
+    Returns:
+        candidate 上的 required enum 值。
+
+    Raises:
+        TypeError: 输入不是 filing subtype，或 disposition 类型违约时抛出。
+    """
+
+    candidate = _require_prepared_filing_mutation(prepared)
+    if type(candidate.initial_skip_disposition) is not FilingInitialSkipDisposition:
+        raise TypeError("initial skip disposition 必须是 FilingInitialSkipDisposition")
+    return candidate.initial_skip_disposition
+
+
+def rebase_prepared_filing_create_overwrite(
+    prepared: PreparedDoclingUpload,
+    *,
+    fresh_previous_meta: JsonObject,
+) -> PreparedDoclingUpload:
+    """按 fresh COMPLETE source meta 重绑 explicit create-overwrite candidate。
+
+    raw explicit-create 授权仍由 batch-time arbitration owner 依据不可变请求确认；本
+    helper 只接受可由 candidate 自身证明的 initial MISSING/create/overwrite 形态。
+
+    Args:
+        prepared: initial target 为 MISSING 的 filing prepared subtype。
+        fresh_previous_meta: batch fresh state owner 提供的 COMPLETE source business meta。
+
+    Returns:
+        复用原 bytes/conversion/disposition、按 fresh timestamps/version 重建 meta 的 candidate。
+
+    Raises:
+        KeyError: fresh meta 缺少 canonical ``is_deleted`` 时抛出。
+        TypeError: 输入不是 filing subtype 时抛出。
+        ValueError: candidate 不是 create-overwrite、initial state 非 MISSING、fresh target
+            被删除或缺少 version/timestamp/fingerprint contract 时抛出。
+    """
+
+    candidate = _require_prepared_filing_mutation(prepared)
+    if (
+        candidate.action != "create"
+        or not candidate.overwrite
+        or candidate.previous_meta is not None
+        or not isinstance(candidate.repair_disposition, NoExistingSourceRepair)
+    ):
+        raise ValueError("fresh rebase 只接受 initial MISSING create-overwrite candidate")
+    normalized_fresh_meta = dict(fresh_previous_meta)
+    if require_source_meta_is_deleted(normalized_fresh_meta):
+        raise ValueError("fresh rebase 要求未删除的 COMPLETE source")
+    _require_prepared_filing_meta_text(normalized_fresh_meta, "first_ingested_at")
+    _require_prepared_filing_meta_text(normalized_fresh_meta, "created_at")
+    _require_prepared_filing_meta_text(normalized_fresh_meta, "document_version")
+    _require_prepared_filing_meta_text(normalized_fresh_meta, "source_fingerprint")
+    source_fingerprint = _UploadSourceFingerprint(
+        value=candidate.source_fingerprint,
+        identical_skip_safe=True,
+    )
+    document_version = _resolve_document_version(
+        normalized_fresh_meta,
+        source_fingerprint,
+    )
+    rebased_meta = _build_upsert_meta(
+        previous_meta=normalized_fresh_meta,
+        source_fingerprint=candidate.source_fingerprint,
+        document_version=document_version,
+        base_meta=candidate.meta,
+    )
+    return replace(
+        candidate,
+        previous_meta=normalized_fresh_meta,
+        meta=rebased_meta,
+        document_version=document_version,
+    )
+
+
+def build_prepared_filing_skip_result(
+    prepared: PreparedDoclingUpload,
+) -> UploadOperationResult:
+    """从 filing candidate 的 authoritative originals 构造 canonical skip 终态。
+
+    Args:
+        prepared: 尚未接线的 filing 专用 prepared candidate。
+
+    Returns:
+        stored count 为零、只含 original ``file_skipped`` events 的跳过结果。
+
+    Raises:
+        TypeError: 输入不是 filing prepared subtype 时抛出。
+        ValueError: candidate 缺少 original basename 时抛出。
+    """
+
+    candidate = _require_prepared_filing_mutation(prepared)
+    file_events = [
+        UploadFileEventPayload(
+            event_type="file_skipped",
+            name=canonicalize_fins_public_file_label(
+                _require_filing_original_filename(asset)
+            ),
+            payload={"reason": "already_uploaded"},
+        )
+        for asset in candidate.pending_assets
+        if asset.source == FILING_UPLOAD_ASSET_SOURCE_ORIGINAL
+    ]
+    if not file_events:
+        raise ValueError("prepared filing skip result 必须至少包含一个 original")
+    return _build_skipped_result(
+        document_id=candidate.document_id,
+        internal_document_id=candidate.internal_document_id,
+        file_events=file_events,
+    )
 
 
 def commit_prepared_upload_batch(
@@ -1751,6 +2070,40 @@ def _build_stored_file_entry(
         if asset.derived_from is not None:
             entry["derived_from"] = asset.derived_from
     return entry
+
+
+def _build_skipped_result(
+    *,
+    document_id: str,
+    internal_document_id: str,
+    file_events: list[UploadFileEventPayload],
+) -> UploadOperationResult:
+    """构造既有 early skip 与 batch canonical skip 共用的终态投影。
+
+    Args:
+        document_id: 文档 ID。
+        internal_document_id: 内部文档 ID。
+        file_events: authoritative original selection 对应的 skipped events。
+
+    Returns:
+        stored count 为零且原因固定为 already uploaded 的跳过结果。
+
+    Raises:
+        无。
+    """
+
+    return UploadOperationResult(
+        status="skipped",
+        document_id=document_id,
+        internal_document_id=internal_document_id,
+        stored_file_count=0,
+        file_events=file_events,
+        payload={
+            "document_id": document_id,
+            "internal_document_id": internal_document_id,
+            "skip_reason": "already_uploaded",
+        },
+    )
 
 
 def _build_cancelled_result(*, document_id: str, internal_document_id: str) -> UploadOperationResult:

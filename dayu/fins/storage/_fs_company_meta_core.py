@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from dayu.fins.ticker_normalization import try_normalize_ticker
 
 from dayu.fins.domain.company_meta_contract import CompanyMetaCommitIntent
@@ -71,22 +73,52 @@ class _FsCompanyMetaMixin(_FsStorageInfra):
             OSError: descriptor 或元数据读取失败时抛出。
         """
 
-        ticker_dir = self._target_ticker_dir(external_ticker)
+        company_meta = self._read_company_meta_from_ticker_dir_unguarded(
+            external_ticker,
+            self._target_ticker_dir(external_ticker),
+        )
+        if company_meta is None:
+            raise FileNotFoundError(f"公司元数据不存在: ticker={external_ticker}")
+        return company_meta
+
+    def _read_company_meta_from_ticker_dir_unguarded(
+        self,
+        external_ticker: str,
+        ticker_dir: Path,
+    ) -> CompanyMeta | None:
+        """从 caller 指定的稳定 ticker root 读取 strict CompanyMeta。
+
+        该 helper 是 published 与 writer-owned staging view 共用的唯一 company
+        descriptor/meta/identity parser owner；caller 必须已经持有对应稳定视图。
+
+        Args:
+            external_ticker: exact canonical ticker。
+            ticker_dir: published 或真实 open batch 的 exact ticker root。
+
+        Returns:
+            strict CompanyMeta；ticker root 合法但未发布 company meta 时为 ``None``。
+
+        Raises:
+            CompanyTickerIdentityCorruptionError: ticker root、descriptor、meta 或 identity
+                不符合 strict contract 时抛出。
+            ValueError: ticker identity 或 ticker root 参数非法时抛出。
+            OSError: descriptor 或元数据 operational 读取失败时抛出。
+        """
+
+        normalized_ticker = _require_external_identity(external_ticker, field_name="ticker")
         directory_stat = self._lstat_optional_storage_path(
             ticker_dir,
-            action="检查 published CompanyMeta ticker directory",
+            action="检查 CompanyMeta ticker directory",
         )
         if directory_stat is None:
-            raise FileNotFoundError(f"公司元数据不存在: ticker={external_ticker}")
+            return None
         identity = self._read_published_company_identity(
             ticker_dir,
             expected_storage_key=ticker_dir.name,
             known_directory_stat=directory_stat,
         )
-        if identity.canonical_ticker != external_ticker:
+        if identity.canonical_ticker != normalized_ticker:
             raise CompanyTickerIdentityCorruptionError(kind="invalid_descriptor")
-        if identity.company_meta is None:
-            raise FileNotFoundError(f"公司元数据不存在: ticker={external_ticker}")
         return identity.company_meta
 
     def scan_company_meta_inventory(self) -> list[CompanyMetaInventoryEntry]:

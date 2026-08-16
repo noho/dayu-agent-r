@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
+from dayu.fins.domain.document_models import BatchToken
+
 from ._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
 from .file_store import FileStore
 from .repository_protocols import (
@@ -69,3 +71,29 @@ class FsFilingUploadStateRepository(FilingUploadStateRepositoryProtocol):
         """
 
         return self._repository_set.core.read_filing_upload_state(ticker, document_id)
+
+    def read_filing_upload_state_in_batch(
+        self,
+        batch: BatchToken,
+        document_id: str,
+    ) -> FilingUploadPublishedState:
+        """读取 open batch writer-owned staging 中的上传校验状态。
+
+        Args:
+            batch: 同一共享 core、ticker 且仍 open 的 batch capability。
+            document_id: 待校验的 exact filing 文档 ID。
+
+        Returns:
+            staging company/source 的同版 state。
+
+        Raises:
+            CompanyTickerIdentityCorruptionError: staging ticker durable identity 损坏时抛出。
+            ValueError: capability、ticker 或 document identity 非法时抛出。
+            OSError: staging state 读取失败时抛出。
+            RuntimeError: exact inspector payload 不完整时抛出。
+        """
+
+        return self._repository_set.core.read_filing_upload_state_in_batch(
+            batch,
+            document_id,
+        )

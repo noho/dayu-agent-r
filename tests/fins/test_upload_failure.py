@@ -15,6 +15,7 @@ from dayu.fins.upload_failure import (
     FinsUploadFailureReason,
     fins_upload_failure_from_exception,
     fins_upload_source_integrity_unsafe_failure,
+    fins_upload_source_publication_conflict_failure,
     fins_upload_source_repair_blocked_failure,
     fins_upload_source_revision_stale_failure,
     upload_failure_reason_from_json,
@@ -89,6 +90,12 @@ def test_unsupported_upload_format_reason_strict_json_round_trip() -> None:
             "请先修复工作区 source 状态后再重试",
         ),
         (
+            fins_upload_source_publication_conflict_failure,
+            FinsUploadFailureCode.SOURCE_PUBLICATION_CONFLICT,
+            "目标 filing 在上传准备期间已由另一请求发布，本次上传未提交",
+            "请基于最新目标状态重新发起上传",
+        ),
+        (
             fins_upload_source_revision_stale_failure,
             FinsUploadFailureCode.SOURCE_REVISION_STALE,
             "目标 filing 在上传准备期间已发生变化，本次上传未提交",
@@ -102,13 +109,13 @@ def test_unsupported_upload_format_reason_strict_json_round_trip() -> None:
         ),
     ),
 )
-def test_source_repair_storage_failure_factories_are_closed_path_free_and_actionable(
+def test_source_publication_storage_failure_factories_are_closed_path_free_and_actionable(
     factory: Callable[[], FinsUploadFailureReason],
     code: FinsUploadFailureCode,
     message: str,
     retry_hint: str,
 ) -> None:
-    """三个 source repair storage failure 必须由唯一 factory 产生固定安全文案。
+    """source publication/repair storage failure 必须由唯一 factory 产生固定安全文案。
 
     Args:
         factory: 当前无参 failure factory。
@@ -130,8 +137,13 @@ def test_source_repair_storage_failure_factories_are_closed_path_free_and_action
     assert reason.message == message
     assert reason.retry_hint == retry_hint
     assert reason.file_label is None
+    assert len(reason.message) <= 240
+    assert len(reason.retry_hint or "") <= 240
     assert "/" not in reason.message
     assert "\\" not in reason.message
+    for forbidden in ("AAPL", "document", "revision", "fingerprint", "FileExistsError"):
+        assert forbidden not in reason.message
+        assert forbidden not in (reason.retry_hint or "")
     assert upload_failure_reason_from_json(reason.to_json()) == reason
 
 

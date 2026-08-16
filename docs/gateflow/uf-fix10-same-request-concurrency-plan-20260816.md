@@ -3,18 +3,22 @@
 ## 0. Gate 元数据
 
 - work unit：`UF-FIX10 same-request-concurrency`
-- gate：`plan`
+- gate：`S1 accepted slice`
 - 日期：2026-08-16
 - 当前分支：`codex/upload-filing-oracle`
 - 基线提交：`656b926c5d39a66f2b05af46e0f08f044f28bcb3`
 - preflight：用户已确认；分支非 protected trunk，工作树中本 work unit 的 plan/fix/review artifacts 均由 Controller 明确纳入本 gate，ownership 清晰，无 merge/rebase/cherry-pick
 - goal confirmation：用户已确认
-- completion status：`SECOND AMENDMENT ACCEPTED / S1 RESUME AUTHORIZED`
+- completion status：`S1 ACCEPTED / READY TO COMMIT`
 - artifact path：`docs/gateflow/uf-fix10-same-request-concurrency-plan-20260816.md`
-- blocking open questions：无；两路 plan re-review 均 pass，Controller 已 pin 定 tools fake 只修改现有 filing static-admission cases 中已有 `calls == []` 的位置，material case不动；service 动态 monkeypatch fake无本 work unit batch-read可达路径，已分类为非阻塞 residual
-- 下一入口：`S1 implementation resume`
+- blocking open questions：无；两路 S1 code-review re-review 均 pass，accepted F2–F5 与 C1 已修复，F1/Q1/Q2 rejected-with-reason 裁决成立；version policy 与 service 动态 monkeypatch fake均有未来 owner，属于非阻塞 residual
+- accepted commit：待创建；本 acceptance gate 只记录裁决，下一 gate 按用户要求在当前分支提交
+- 下一入口：`S1 accepted slice commit`，完成后进入 `S2 implementation`
 
-本第二次 blocker plan acceptance gate 只允许更新本 plan 的 gate 状态/裁决、新增 `docs/gateflow/uf-fix10-s1-second-blocker-plan-acceptance-20260817.md`，并在既有 S1 implementation artifact 末尾追加 acceptance 历史。当前 S1 production/tests partial implementation 原样保留；本 gate 不修改任何生产代码、测试、README、oracle、scenario、registry 或 frozen evidence，不运行测试/pyright，也不创建 commit。acceptance 只恢复 amended §10.1 implementation，不授权提交或提前进入 S2。
+S1 acceptance 由 `docs/gateflow/uf-fix10-s1-acceptance-20260817.md` 记录。两路 re-review
+确认 S1 behavior-preserving owner contracts、accepted fixes、验证与边界均通过，无 blocker。
+本 acceptance gate 只同步 durable gate state，不修改生产代码、测试、README、oracle、scenario、
+registry 或 frozen evidence，不创建 commit，也不授权跳过 S1 checkpoint 提前进入 S2。
 
 ## 1. 输入、真源与边界
 

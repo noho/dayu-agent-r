@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +17,7 @@ import pytest
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
+import dayu.fins.pipelines.docling_upload_service as docling_upload_owner_module
 from dayu.fins.domain.document_models import (
     BatchToken,
     DocumentHandle,
@@ -28,22 +30,31 @@ from dayu.fins.domain.document_models import (
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.pipelines.docling_upload_service import (
     DoclingUploadService,
+    FilingInitialSkipDisposition,
+    JsonObject,
     PreparedDoclingUpload,
     UploadOperationResult,
     _PendingFileAsset,
     _PreparedAssetMutation,
+    _PreparedDeleteMutation,
+    _PreparedFilingAssetMutation,
     _UploadSourceFingerprint,
     _build_filing_original_asset_identity,
+    _build_upsert_meta,
     _build_upload_source_fingerprint,
     _can_skip_upload,
     _increment_document_version,
     _resolve_document_version,
+    build_prepared_filing_skip_result,
     build_cn_filing_ids,
     build_material_ids,
     build_sec_filing_ids,
     commit_prepared_upload_batch,
+    describe_prepared_filing_publication,
     derive_report_kind,
     normalize_cn_fiscal_period,
+    read_prepared_filing_initial_skip_disposition,
+    rebase_prepared_filing_create_overwrite,
     validate_material_upload_ids,
 )
 from dayu.fins.pipelines.docling_process_converter import (
@@ -54,8 +65,11 @@ from dayu.fins.pipelines.docling_process_converter import (
     DoclingConversionResult,
 )
 from dayu.fins.storage import (
+    FILING_UPLOAD_ASSET_SOURCE_DOCLING,
+    FILING_UPLOAD_ASSET_SOURCE_ORIGINAL,
     FsBatchingRepository,
     FsDocumentBlobRepository,
+    FsFilingUploadStateRepository,
     FsSourceDocumentRepository,
     SourceIntegrityClassification,
     SourceIntegrityPreflightError,
@@ -85,6 +99,106 @@ from .upload_filing_test_support import published_tree_sha256
 
 _INITIAL_CREATED_AT = "2020-01-01T00:00:00+00:00"
 _REPLACEMENT_CREATED_AT = "2020-01-02T00:00:00+00:00"
+
+
+def _as_prepared_filing_candidate(
+    prepared: _PreparedAssetMutation,
+    *,
+    disposition: FilingInitialSkipDisposition = FilingInitialSkipDisposition.NOT_ELIGIBLE,
+) -> _PreparedFilingAssetMutation:
+    """把测试中真实 preparation 结果显式收窄为尚未接线的 filing subtype。
+
+    Args:
+        prepared: 真实 ``prepare_upload`` 产生的 filing base mutation。
+        disposition: 测试声明的 initial skip owner fact。
+
+    Returns:
+        字段逐一保持、仅增加 required disposition 的 filing candidate。
+
+    Raises:
+        TypeError: base mutation 不是 filing 时由 subtype owner 抛出。
+    """
+
+    return _PreparedFilingAssetMutation(
+        ticker=prepared.ticker,
+        source_kind=prepared.source_kind,
+        action=prepared.action,
+        document_id=prepared.document_id,
+        internal_document_id=prepared.internal_document_id,
+        form_type=prepared.form_type,
+        overwrite=prepared.overwrite,
+        pending_assets=prepared.pending_assets,
+        conversion_events=prepared.conversion_events,
+        primary_document=prepared.primary_document,
+        previous_meta=prepared.previous_meta,
+        meta=prepared.meta,
+        source_fingerprint=prepared.source_fingerprint,
+        document_version=prepared.document_version,
+        repair_disposition=prepared.repair_disposition,
+        initial_skip_disposition=disposition,
+    )
+
+
+def _prepare_filing_candidate_for_test(
+    service: DoclingUploadService,
+    *,
+    primary: Path,
+    companions: tuple[Path, ...] = (),
+    document_id: str = "filing-candidate",
+    action: str = "create",
+    overwrite: bool = True,
+    previous_meta: Mapping[str, JsonValue] | None = None,
+) -> _PreparedFilingAssetMutation:
+    """通过真实 conversion/meta owner 构造 S1 helper 使用的 filing candidate。
+
+    Args:
+        service: Docling upload service。
+        primary: authoritative filing primary。
+        companions: 有序 companion originals。
+        document_id: external/internal 测试文档 ID。
+        action: prepared action。
+        overwrite: prepared overwrite 授权。
+        previous_meta: preparation 使用的 source business meta。
+
+    Returns:
+        保持真实 preparation 字段并增加 NOT_ELIGIBLE disposition 的 candidate。
+
+    Raises:
+        AssertionError: 现有 S1 preparation 未返回 base asset mutation 时抛出。
+        BaseException: 真实 preparation/conversion 失败时原样传播。
+    """
+
+    prepared = asyncio.run(
+        service.prepare_upload(
+            ticker="AAPL",
+            source_kind=SourceKind.FILING,
+            action=action,
+            document_id=document_id,
+            internal_document_id=document_id,
+            form_type="10-K",
+            selection=FinsUploadFilingFiles.for_upsert(
+                primary=primary,
+                companions=companions,
+            ),
+            overwrite=overwrite,
+            previous_meta=previous_meta,
+            meta={
+                "company_id": "company-aapl",
+                "ingest_method": "upload",
+                "fiscal_year": 2024,
+                "fiscal_period": "FY",
+                "report_kind": "annual",
+                "filing_date": "2025-01-31",
+                "report_date": "2024-12-31",
+                "amended": False,
+            },
+            repair_disposition=NoExistingSourceRepair(),
+            cancellation=None,
+        )
+    )
+    if not isinstance(prepared, _PreparedAssetMutation):
+        raise AssertionError("S1 filing candidate fixture 必须返回 base asset mutation")
+    return _as_prepared_filing_candidate(prepared)
 
 
 def _build_filing_original_asset_for_test(file_path: Path) -> _PendingFileAsset:
@@ -5103,3 +5217,397 @@ def test_execute_upload_counts_only_successful_original_stores(tmp_path: Path) -
 
     assert len(meta["files"]) == 3
     assert result.stored_file_count == 2
+
+
+def test_prepared_filing_helpers_describe_roles_and_build_authoritative_skip(
+    tmp_path: Path,
+) -> None:
+    """prepared helper 必须稳定描述多文件 roles 并只投影 original skip events。
+
+    Args:
+        tmp_path: original 文件与 workspace 目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: identity role、排序、disposition 或 skip terminal 漂移时抛出。
+    """
+
+    context = _build_service_context(tmp_path / "workspace")
+    primary = tmp_path / "main.pdf"
+    companion = tmp_path / "appendix.xlsx"
+    primary.write_bytes(b"main")
+    companion.write_bytes(b"appendix")
+    candidate = _prepare_filing_candidate_for_test(
+        context.service,
+        primary=primary,
+        companions=(companion,),
+    )
+
+    identity = describe_prepared_filing_publication(candidate)
+    primary_asset = next(
+        asset for asset in identity.assets if asset.name == identity.primary_document
+    )
+    original_names = tuple(
+        asset.name
+        for asset in identity.assets
+        if asset.source == FILING_UPLOAD_ASSET_SOURCE_ORIGINAL
+    )
+
+    assert tuple(asset.name for asset in identity.assets) == tuple(
+        sorted(asset.name for asset in identity.assets)
+    )
+    assert primary_asset.source == FILING_UPLOAD_ASSET_SOURCE_DOCLING
+    assert primary_asset.derived_from == identity.primary_original_asset_name
+    assert set(original_names) == {
+        _build_filing_original_asset_identity(primary),
+        _build_filing_original_asset_identity(companion),
+    }
+    assert identity.companion_original_asset_names == tuple(
+        sorted(name for name in original_names if name != identity.primary_original_asset_name)
+    )
+    assert (
+        read_prepared_filing_initial_skip_disposition(candidate)
+        is FilingInitialSkipDisposition.NOT_ELIGIBLE
+    )
+
+    skipped = build_prepared_filing_skip_result(candidate)
+    assert skipped.status == "skipped"
+    assert skipped.stored_file_count == 0
+    assert skipped.document_id == candidate.document_id
+    assert skipped.internal_document_id == candidate.internal_document_id
+    assert skipped.payload["skip_reason"] == "already_uploaded"
+    assert [(event.event_type, event.name) for event in skipped.file_events] == [
+        ("file_skipped", primary.name),
+        ("file_skipped", companion.name),
+    ]
+    assert all(event.event_type != "conversion_started" for event in skipped.file_events)
+
+
+def test_prepared_identity_exactly_matches_real_published_storage_projection(
+    tmp_path: Path,
+) -> None:
+    """真实多文件 prepare/publish/read 两侧必须产生完全相同的 publication identity。
+
+    Args:
+        tmp_path: original 文件与 workspace 目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: prepared/durable 任一 identity 字段、role 或 metadata 漂移时抛出。
+        OSError: 真实 preparation、publication 或 storage read 失败时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    context = _build_service_context(workspace_root)
+    primary = tmp_path / "main.pdf"
+    companion = tmp_path / "appendix.xlsx"
+    primary.write_bytes(b"main publication bytes")
+    companion.write_bytes(b"companion publication bytes")
+    document_id = "filing-identity-cross-owner"
+    candidate = _prepare_filing_candidate_for_test(
+        context.service,
+        primary=primary,
+        companions=(companion,),
+        document_id=document_id,
+    )
+    prepared_identity = describe_prepared_filing_publication(candidate)
+
+    result = _publish_prepared_upload(
+        service=context.service,
+        batching_repository=context.batching_repository,
+        ticker="AAPL",
+        prepared=candidate,
+    )
+    durable_state = FsFilingUploadStateRepository(workspace_root).read_filing_upload_state(
+        "AAPL",
+        document_id,
+    )
+
+    assert result.status == "uploaded"
+    assert durable_state.source_integrity.status is SourceIntegrityStatus.COMPLETE
+    assert durable_state.publication_identity == prepared_identity
+    assert durable_state.publication_identity is not None
+    durable_identity = durable_state.publication_identity
+    assert durable_identity.primary_original_asset_name == (
+        _build_filing_original_asset_identity(primary)
+    )
+    assert durable_identity.companion_original_asset_names == (
+        _build_filing_original_asset_identity(companion),
+    )
+    assert tuple(
+        (
+            asset.name,
+            asset.original_filename,
+            asset.derived_from,
+            asset.sha256,
+            asset.size,
+            asset.content_type,
+            asset.source,
+        )
+        for asset in durable_identity.assets
+    ) == tuple(
+        (
+            asset.name,
+            asset.original_filename,
+            asset.derived_from,
+            asset.sha256,
+            asset.size,
+            asset.content_type,
+            asset.source,
+        )
+        for asset in prepared_identity.assets
+    )
+    assert {
+        asset.source for asset in durable_identity.assets
+    } == {
+        FILING_UPLOAD_ASSET_SOURCE_ORIGINAL,
+        FILING_UPLOAD_ASSET_SOURCE_DOCLING,
+    }
+
+
+def test_prepared_filing_helpers_reject_base_delete_material_and_result(
+    tmp_path: Path,
+) -> None:
+    """filing helper 必须拒绝未接线 base、delete、material 与 terminal result。
+
+    Args:
+        tmp_path: original 文件与 workspace 目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 任一非 filing subtype 输入被 helper 接受时抛出。
+    """
+
+    context = _build_service_context(tmp_path / "workspace")
+    primary = tmp_path / "main.pdf"
+    primary.write_bytes(b"main")
+    candidate = _prepare_filing_candidate_for_test(context.service, primary=primary)
+    base_mutation = _PreparedAssetMutation(
+        ticker=candidate.ticker,
+        source_kind=SourceKind.MATERIAL,
+        action=candidate.action,
+        document_id=candidate.document_id,
+        internal_document_id=candidate.internal_document_id,
+        form_type="MATERIAL_OTHER",
+        overwrite=candidate.overwrite,
+        pending_assets=candidate.pending_assets,
+        conversion_events=candidate.conversion_events,
+        primary_document=candidate.primary_document,
+        previous_meta=candidate.previous_meta,
+        meta=candidate.meta,
+        source_fingerprint=candidate.source_fingerprint,
+        document_version=candidate.document_version,
+        repair_disposition=candidate.repair_disposition,
+    )
+    delete_mutation = _PreparedDeleteMutation(
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        document_id="filing-delete",
+        internal_document_id="filing-delete",
+    )
+    terminal_result = UploadOperationResult(
+        status="cancelled",
+        document_id="filing-result",
+        internal_document_id="filing-result",
+        stored_file_count=0,
+        file_events=[],
+        payload={},
+    )
+
+    for invalid in (base_mutation, delete_mutation, terminal_result):
+        with pytest.raises(TypeError, match="只接受 _PreparedFilingAssetMutation"):
+            describe_prepared_filing_publication(invalid)
+        with pytest.raises(TypeError, match="只接受 _PreparedFilingAssetMutation"):
+            read_prepared_filing_initial_skip_disposition(invalid)
+        with pytest.raises(TypeError, match="只接受 _PreparedFilingAssetMutation"):
+            build_prepared_filing_skip_result(invalid)
+        with pytest.raises(TypeError, match="只接受 _PreparedFilingAssetMutation"):
+            rebase_prepared_filing_create_overwrite(
+                invalid,
+                fresh_previous_meta={"is_deleted": False},
+            )
+
+
+def test_upsert_meta_owner_is_shared_by_prepare_and_fresh_rebase(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """prepare/rebase 必须共用唯一九字段 owner 并保持 fresh timestamps/version。
+
+    Args:
+        tmp_path: original 文件与 workspace 目录。
+        monkeypatch: pytest 属性替换器。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: meta owner 调用、fresh preservation 或 revision 边界漂移时抛出。
+    """
+
+    context = _build_service_context(tmp_path / "workspace")
+    primary = tmp_path / "main.pdf"
+    primary.write_bytes(b"main")
+    calls: list[tuple[JsonObject | None, str, str]] = []
+
+    def record_build_upsert_meta(
+        *,
+        previous_meta: JsonObject | None,
+        source_fingerprint: str,
+        document_version: str,
+        base_meta: Mapping[str, JsonValue],
+    ) -> JsonObject:
+        """记录唯一 meta owner 调用并委托 production helper。
+
+        Args:
+            previous_meta: owner 输入的 previous meta。
+            source_fingerprint: owner 输入的 fingerprint。
+            document_version: owner 输入的 version。
+            base_meta: owner 输入的业务 meta。
+
+        Returns:
+            production helper 结果。
+
+        Raises:
+            无。
+        """
+
+        calls.append((previous_meta, source_fingerprint, document_version))
+        return _build_upsert_meta(
+            previous_meta=previous_meta,
+            source_fingerprint=source_fingerprint,
+            document_version=document_version,
+            base_meta=base_meta,
+        )
+
+    monkeypatch.setattr(
+        docling_upload_owner_module,
+        "_build_upsert_meta",
+        record_build_upsert_meta,
+    )
+    candidate = _prepare_filing_candidate_for_test(context.service, primary=primary)
+    fresh_same: JsonObject = {
+        "is_deleted": False,
+        "first_ingested_at": "2020-01-01T00:00:00+00:00",
+        "created_at": "2020-01-02T00:00:00+00:00",
+        "document_version": "v7",
+        "source_fingerprint": candidate.source_fingerprint,
+        "_published_source_revision": "storage-owned-revision",
+    }
+    same = rebase_prepared_filing_create_overwrite(
+        candidate,
+        fresh_previous_meta=fresh_same,
+    )
+    fresh_different = dict(fresh_same)
+    fresh_different["source_fingerprint"] = "f" * 64
+    different = rebase_prepared_filing_create_overwrite(
+        candidate,
+        fresh_previous_meta=fresh_different,
+    )
+
+    assert isinstance(same, _PreparedFilingAssetMutation)
+    assert isinstance(different, _PreparedFilingAssetMutation)
+    assert len(calls) == 3
+    assert calls[0][0] is None
+    assert calls[1][0] == fresh_same
+    assert calls[2][0] == fresh_different
+    assert same.previous_meta == fresh_same
+    assert same.document_version == "v7"
+    assert same.meta["first_ingested_at"] == fresh_same["first_ingested_at"]
+    assert same.meta["created_at"] == fresh_same["created_at"]
+    assert different.document_version == "v8"
+    assert different.meta["first_ingested_at"] == fresh_same["first_ingested_at"]
+    assert different.meta["created_at"] == fresh_same["created_at"]
+    assert "_published_source_revision" not in same.meta
+    assert "_published_source_revision" not in different.meta
+    assert same.pending_assets is candidate.pending_assets
+    assert same.initial_skip_disposition is candidate.initial_skip_disposition
+
+
+def test_rebased_filing_publish_gets_new_storage_owned_revision(tmp_path: Path) -> None:
+    """rebase 不得生成 revision，真实 source publish 必须由 storage 写入新 revision。
+
+    Args:
+        tmp_path: original 文件与 workspace 目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: Docling/storage revision ownership 或 replace publish 漂移时抛出。
+        OSError: 真实 batch publication 失败时抛出。
+    """
+
+    context = _build_service_context(tmp_path / "workspace")
+    primary = tmp_path / "main.pdf"
+    primary.write_bytes(b"main")
+    document_id = "filing-rebase-revision"
+    loser = _prepare_filing_candidate_for_test(
+        context.service,
+        primary=primary,
+        document_id=document_id,
+    )
+    winner = _execute_upload(
+        service=context.service,
+        batching_repository=context.batching_repository,
+        ticker="AAPL",
+        source_kind=SourceKind.FILING,
+        action="create",
+        document_id=document_id,
+        internal_document_id=document_id,
+        form_type="10-K",
+        files=[primary],
+        filing_primary=primary,
+        overwrite=False,
+        meta={
+            "company_id": "company-aapl",
+            "ingest_method": "upload",
+            "fiscal_year": 2024,
+            "fiscal_period": "FY",
+            "report_kind": "annual",
+            "filing_date": "2025-01-31",
+            "report_date": "2024-12-31",
+            "amended": False,
+        },
+    )
+    assert winner.status == "uploaded"
+    fresh_meta = context.source_repository.get_source_meta(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+    )
+    fresh_integrity = context.source_repository.classify_source_integrity(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+    )
+    assert fresh_integrity.revision is not None
+
+    rebased = rebase_prepared_filing_create_overwrite(
+        loser,
+        fresh_previous_meta=fresh_meta,
+    )
+    assert isinstance(rebased, _PreparedFilingAssetMutation)
+    assert "_published_source_revision" not in rebased.meta
+    result = _publish_prepared_upload(
+        service=context.service,
+        batching_repository=context.batching_repository,
+        ticker="AAPL",
+        prepared=rebased,
+    )
+    published_integrity = context.source_repository.classify_source_integrity(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+    )
+
+    assert result.status == "uploaded"
+    assert published_integrity.status is SourceIntegrityStatus.COMPLETE
+    assert published_integrity.revision is not None
+    assert published_integrity.revision != fresh_integrity.revision

@@ -167,7 +167,6 @@ from dayu.fins.storage import (
     FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
     FilingUploadPublishedState,
-    FilingUploadStateRepositoryProtocol,
     SourceIntegrityClassification,
     SourceIntegrityReason,
     SourceIntegrityStatus,
@@ -277,6 +276,7 @@ def _filing_upload_published_state(
         company_meta=company_meta,
         source_integrity=source_integrity,
         source_meta=source_meta,
+        publication_identity=None,
     )
 
 
@@ -322,29 +322,34 @@ def test_filing_upload_published_state_requires_matching_integrity_and_meta() ->
         company_meta=None,
         source_integrity=missing,
         source_meta=None,
+        publication_identity=None,
     ).source_integrity is missing
     assert FilingUploadPublishedState(
         company_meta=None,
         source_integrity=complete,
         source_meta={"source_fingerprint": "published"},
+        publication_identity=None,
     ).source_integrity is complete
     with pytest.raises(ValueError, match="MISSING/UNSAFE"):
         FilingUploadPublishedState(
             company_meta=None,
             source_integrity=missing,
             source_meta={"source_fingerprint": "published"},
+            publication_identity=None,
         )
     with pytest.raises(ValueError, match="COMPLETE/REPAIR_REQUIRED"):
         FilingUploadPublishedState(
             company_meta=None,
             source_integrity=complete,
             source_meta=None,
+            publication_identity=None,
         )
     with pytest.raises(ValueError, match="filing integrity"):
         FilingUploadPublishedState(
             company_meta=None,
             source_integrity=material,
             source_meta={"source_fingerprint": "published"},
+            publication_identity=None,
         )
 
 
@@ -1943,12 +1948,55 @@ def test_raw_runtime_unsafe_prevalidation_creates_no_job_observation_or_mutation
         (unsafe_state.source_integrity.ticker, unsafe_state.source_integrity.document_id),
         (unsafe_state.source_integrity.ticker, unsafe_state.source_integrity.document_id),
     ]
+    assert state_repository.batch_calls == []
     assert executor.operations == []
     assert runner.requests == []
     assert runtime._observations == {}
     assert _snapshot_runtime_workspace_tree(workspace_root) == before
     jobs_root = workspace_root / ".dayu" / "fins_ingestion" / "jobs"
     assert not jobs_root.exists() or tuple(jobs_root.glob("*.json")) == ()
+
+
+def test_runtime_filing_state_fakes_conform_to_required_batch_read_contract() -> None:
+    """两个 runtime structural fake 必须精确实现 required batch read contract。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: fixed/forbidden fake 的返回、失败或独立记录语义漂移时抛出。
+    """
+
+    request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        action="delete",
+        fiscal_year=2024,
+        fiscal_period="FY",
+    )
+    state = _filing_upload_published_state(
+        request,
+        status=SourceIntegrityStatus.MISSING,
+        reasons=(),
+    )
+    batch = BatchToken(transaction_id="fixture-batch", ticker="AAPL")
+    document_id = state.source_integrity.document_id
+    fixed_repository = _FixedFilingUploadStateRepository(state)
+    forbidden_repository = _ForbiddenFilingUploadStateRepository()
+
+    assert fixed_repository.read_filing_upload_state_in_batch(batch, document_id) is state
+    assert fixed_repository.batch_calls == [(batch, document_id)]
+    assert fixed_repository.calls == []
+
+    with pytest.raises(
+        AssertionError,
+        match="static admission 前禁止读取 batch filing state",
+    ):
+        forbidden_repository.read_filing_upload_state_in_batch(batch, document_id)
+    assert forbidden_repository.batch_calls == [(batch, document_id)]
+    assert forbidden_repository.calls == []
 
 
 def test_filing_validator_builds_role_selection_and_typed_delete_empty(
@@ -2290,6 +2338,7 @@ def test_filing_symlink_loop_is_typed_file_not_found_before_all_side_effects(
     assert exc_info.value.failure.message == "上传文件不存在：loop.pdf"
     assert str(tmp_path) not in exc_info.value.failure.message
     assert state_repository.calls == []
+    assert state_repository.batch_calls == []
     assert executor.operations == []
     assert runner.requests == []
     assert runtime._observations == {}
@@ -2385,6 +2434,7 @@ def test_new_filing_admission_failures_precede_state_jobs_runner_and_workspace_m
         assert exc_info.value.failure.code is expected_code
 
     assert state_repository.calls == []
+    assert state_repository.batch_calls == []
     assert executor.operations == []
     assert runner.requests == []
     assert runtime._observations == {}
@@ -3158,6 +3208,7 @@ def test_filing_calendar_year_static_admission_precedes_all_side_effects(
     assert observation_exc.value.failure.code is expected_code
     assert observation_exc.value.failure.message == expected_message
     assert state_repository.calls == []
+    assert state_repository.batch_calls == []
     assert executor.operations == []
     assert runner.requests == []
     assert runtime._observations == {}
@@ -10649,6 +10700,7 @@ class _ForbiddenFilingUploadStateRepository:
         """
 
         self.calls: list[tuple[str, str]] = []
+        self.batch_calls: list[tuple[BatchToken, str]] = []
 
     def read_filing_upload_state(
         self,
@@ -10671,12 +10723,34 @@ class _ForbiddenFilingUploadStateRepository:
         self.calls.append((ticker, document_id))
         raise AssertionError("calendar/year static admission 前禁止读取 filing state")
 
+    def read_filing_upload_state_in_batch(
+        self,
+        batch: BatchToken,
+        document_id: str,
+    ) -> FilingUploadPublishedState:
+        """记录越界 batch 读取并立即失败。
+
+        Args:
+            batch: runtime 请求的 batch capability。
+            document_id: runtime 请求的 exact filing 文档 ID。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 方法被调用时始终抛出。
+        """
+
+        self.batch_calls.append((batch, document_id))
+        raise AssertionError("calendar/year static admission 前禁止读取 batch filing state")
+
 
 class _FixedFilingUploadStateRepository:
     """返回显式 typed published state 的 runtime prevalidation fixture。"""
 
     state: FilingUploadPublishedState
     calls: list[tuple[str, str]]
+    batch_calls: list[tuple[BatchToken, str]]
 
     def __init__(self, state: FilingUploadPublishedState) -> None:
         """初始化固定 state 与调用记录。
@@ -10693,6 +10767,7 @@ class _FixedFilingUploadStateRepository:
 
         self.state = state
         self.calls = []
+        self.batch_calls = []
 
     def read_filing_upload_state(
         self,
@@ -10713,6 +10788,27 @@ class _FixedFilingUploadStateRepository:
         """
 
         self.calls.append((ticker, document_id))
+        return self.state
+
+    def read_filing_upload_state_in_batch(
+        self,
+        batch: BatchToken,
+        document_id: str,
+    ) -> FilingUploadPublishedState:
+        """记录 batch 读取并返回同一个固定 state。
+
+        Args:
+            batch: runtime 请求的 batch capability。
+            document_id: runtime 请求的 exact filing document ID。
+
+        Returns:
+            初始化时传入的同一个 typed published state。
+
+        Raises:
+            无。
+        """
+
+        self.batch_calls.append((batch, document_id))
         return self.state
 
 
@@ -10812,10 +10908,7 @@ def _build_static_admission_guarded_runtime(
         source_repository=default_runtime.source_repository,
         blob_repository=default_runtime.blob_repository,
         filing_maintenance_repository=default_runtime.filing_maintenance_repository,
-        filing_upload_state_repository=cast(
-            FilingUploadStateRepositoryProtocol,
-            state_repository,
-        ),
+        filing_upload_state_repository=state_repository,
         processed_repository=default_runtime.processed_repository,
         processor_registry=default_runtime.processor_registry,
         job_store=default_runtime.ingestion_job_store,

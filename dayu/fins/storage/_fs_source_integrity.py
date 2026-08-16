@@ -46,7 +46,14 @@ from ._fs_storage_utils import (
     _raise_path_free_error,
     _read_json_object,
 )
-from .repository_protocols import SourceSnapshotFileDescriptor
+from .repository_protocols import (
+    FILING_UPLOAD_ASSET_SOURCE_DOCLING,
+    FILING_UPLOAD_ASSET_SOURCE_ORIGINAL,
+    FilingUploadAssetDescriptor,
+    FilingUploadAssetSource,
+    FilingUploadPublicationIdentity,
+    SourceSnapshotFileDescriptor,
+)
 from .source_integrity import (
     SourceIntegrityClassification,
     SourceIntegrityPreflightError,
@@ -60,8 +67,6 @@ from .source_integrity import (
 _SOURCE_REVISION_META_FIELD: Final[str] = "_published_source_revision"
 _FILING_MANIFEST_FILENAME: Final[str] = "filing_manifest.json"
 _MATERIAL_MANIFEST_FILENAME: Final[str] = "material_manifest.json"
-_FILE_SOURCE_ORIGINAL: Final[str] = "original"
-_FILE_SOURCE_DOCLING: Final[str] = "docling"
 _HASH_CHUNK_SIZE: Final[int] = 64 * 1024
 
 
@@ -93,6 +98,8 @@ class _SourcePublicationInspection:
         files: 同一次扫描验证的业务文件事实。
         primary_document: 同一次扫描验证的主文件名。
         canonical_manifest_item: 由 manifest item owner 从可信 meta 产生的投影。
+        filing_upload_publication_identity: COMPLETE user-upload filing 的精确
+            publication identity；其它 source/status 或字段不完整时为 ``None``。
     """
 
     classification: SourceIntegrityClassification
@@ -104,6 +111,7 @@ class _SourcePublicationInspection:
     files: tuple[_InspectedSourceFile, ...]
     primary_document: str | None
     canonical_manifest_item: Mapping[str, JsonValue] | None
+    filing_upload_publication_identity: FilingUploadPublicationIdentity | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,7 +147,7 @@ class _DeclaredSourceFile:
     """
 
     inspected: _InspectedSourceFile
-    source: str | None
+    source: FilingUploadAssetSource | None
     original_filename: str | None
     derived_from: str | None
 
@@ -591,6 +599,20 @@ def _inspect_source_directory(
         reasons=reasons,
     )
     business_meta = _source_meta_without_revision(persisted_meta)
+    primary_document = _trusted_primary_document(
+        persisted_meta=persisted_meta,
+        declared_files=declared_files,
+    )
+    filing_upload_publication_identity = _project_filing_upload_publication_identity(
+        ticker=ticker,
+        document_id=document_id,
+        source_kind=source_kind,
+        status=status,
+        business_meta=business_meta,
+        provenance=provenance,
+        declared_files=declared_files,
+        primary_document=primary_document,
+    )
     return _SourcePublicationInspection(
         classification=classification,
         content_classification=classification,
@@ -599,15 +621,13 @@ def _inspect_source_directory(
         provenance=provenance,
         revision=revision,
         files=tuple(item.inspected for item in declared_files),
-        primary_document=_trusted_primary_document(
-            persisted_meta=persisted_meta,
-            declared_files=declared_files,
-        ),
+        primary_document=primary_document,
         canonical_manifest_item=(
             canonical_manifest_item
             if status is SourceIntegrityStatus.COMPLETE
             else None
         ),
+        filing_upload_publication_identity=filing_upload_publication_identity,
     )
 
 
@@ -760,7 +780,7 @@ def _optional_text(value: JsonValue | None) -> str | None:
 def _optional_role_text(
     payload: Mapping[str, JsonValue],
     field_name: str,
-) -> tuple[bool, str | None]:
+) -> tuple[bool, FilingUploadAssetSource | None]:
     """收窄可选 source role 字段。
 
     Args:
@@ -778,10 +798,10 @@ def _optional_role_text(
         return True, None
     value = payload[field_name]
     if isinstance(value, str) and value in {
-        _FILE_SOURCE_ORIGINAL,
-        _FILE_SOURCE_DOCLING,
+        FILING_UPLOAD_ASSET_SOURCE_ORIGINAL,
+        FILING_UPLOAD_ASSET_SOURCE_DOCLING,
     }:
-        return True, value
+        return True, cast(FilingUploadAssetSource, value)
     return False, None
 
 
@@ -884,10 +904,14 @@ def _classify_role_projection(
         return _ordered_reasons(reasons)
 
     originals = tuple(
-        item for item in declared_files if item.source == _FILE_SOURCE_ORIGINAL
+        item
+        for item in declared_files
+        if item.source == FILING_UPLOAD_ASSET_SOURCE_ORIGINAL
     )
     docling_files = tuple(
-        item for item in declared_files if item.source == _FILE_SOURCE_DOCLING
+        item
+        for item in declared_files
+        if item.source == FILING_UPLOAD_ASSET_SOURCE_DOCLING
     )
     if len(originals) < 1 or len(docling_files) != 1:
         return None
@@ -962,6 +986,189 @@ def _trusted_primary_document(
     return primary
 
 
+def _required_publication_identity_text(
+    meta: Mapping[str, JsonValue],
+    field_name: str,
+) -> str | None:
+    """读取 durable publication identity 的必填非空文本。
+
+    Args:
+        meta: inspector 已验证的 source business meta。
+        field_name: 待读取字段名。
+
+    Returns:
+        非空字符串；字段缺失、类型非法或为空时为 ``None``。
+
+    Raises:
+        无。
+    """
+
+    value = meta.get(field_name)
+    return value if isinstance(value, str) and value else None
+
+
+def _optional_publication_identity_text(
+    meta: Mapping[str, JsonValue],
+    field_name: str,
+) -> tuple[bool, str | None]:
+    """读取 durable publication identity 的 required nullable 文本。
+
+    Args:
+        meta: inspector 已验证的 source business meta。
+        field_name: 待读取字段名。
+
+    Returns:
+        ``(字段结构是否合法, nullable 文本值)``；字段必须显式存在。
+
+    Raises:
+        无。
+    """
+
+    if field_name not in meta:
+        return False, None
+    value = meta[field_name]
+    if value is None:
+        return True, None
+    if isinstance(value, str) and value:
+        return True, value
+    return False, None
+
+
+def _project_filing_upload_publication_identity(
+    *,
+    ticker: str,
+    document_id: str,
+    source_kind: SourceKind,
+    status: SourceIntegrityStatus,
+    business_meta: Mapping[str, JsonValue],
+    provenance: SourceDocumentProvenance,
+    declared_files: tuple[_DeclaredSourceFile, ...],
+    primary_document: str | None,
+) -> FilingUploadPublicationIdentity | None:
+    """从同一次 trusted inspection 投影 exact user-upload filing identity。
+
+    Args:
+        ticker: inspector 已验证的 exact canonical ticker。
+        document_id: inspector 已验证的 exact document ID。
+        source_kind: 当前 source kind。
+        status: 当前 source 的公共完整性状态。
+        business_meta: 已移除 storage revision 的可信业务元数据。
+        provenance: inspector 已解析的 provenance。
+        declared_files: 同次 inspection 已验证的文件与 role 声明。
+        primary_document: 同次 inspection 已验证的主文件 storage name。
+
+    Returns:
+        完整 user-upload identity；非 filing、非 COMPLETE、非 user-upload 或任一
+        identity 字段不完整时为 ``None``。
+
+    Raises:
+        无。
+    """
+
+    if (
+        source_kind is not SourceKind.FILING
+        or status is not SourceIntegrityStatus.COMPLETE
+        or provenance.ingest_method is not FinsIngestMethod.UPLOAD
+        or provenance.source_provider is not FinsSourceProvider.USER_UPLOAD
+        or primary_document is None
+    ):
+        return None
+    required_text_fields = (
+        "internal_document_id",
+        "form_type",
+        "company_id",
+        "fiscal_period",
+        "report_kind",
+        "document_version",
+        "source_fingerprint",
+    )
+    required_text = {
+        field_name: _required_publication_identity_text(business_meta, field_name)
+        for field_name in required_text_fields
+    }
+    if any(value is None for value in required_text.values()):
+        return None
+    fiscal_year = business_meta.get("fiscal_year")
+    amended = business_meta.get("amended")
+    is_deleted = business_meta.get("is_deleted")
+    if type(fiscal_year) is not int or type(amended) is not bool or type(is_deleted) is not bool:
+        return None
+    filing_date_valid, filing_date = _optional_publication_identity_text(
+        business_meta,
+        "filing_date",
+    )
+    report_date_valid, report_date = _optional_publication_identity_text(
+        business_meta,
+        "report_date",
+    )
+    if not filing_date_valid or not report_date_valid:
+        return None
+    assets: list[FilingUploadAssetDescriptor] = []
+    for declared_file in declared_files:
+        descriptor = declared_file.inspected.descriptor
+        if (
+            declared_file.source is None
+            or declared_file.original_filename is None
+            or descriptor.sha256 is None
+            or descriptor.size is None
+            or descriptor.content_type == ""
+        ):
+            return None
+        try:
+            assets.append(
+                FilingUploadAssetDescriptor(
+                    name=descriptor.name,
+                    original_filename=declared_file.original_filename,
+                    derived_from=declared_file.derived_from,
+                    sha256=descriptor.sha256,
+                    size=descriptor.size,
+                    content_type=descriptor.content_type,
+                    source=declared_file.source,
+                )
+            )
+        except (TypeError, ValueError):
+            return None
+    primary_matches = tuple(asset for asset in assets if asset.name == primary_document)
+    if len(primary_matches) != 1:
+        return None
+    primary_original_asset_name = primary_matches[0].derived_from
+    if primary_original_asset_name is None:
+        return None
+    original_names = tuple(
+        asset.name
+        for asset in assets
+        if asset.source == FILING_UPLOAD_ASSET_SOURCE_ORIGINAL
+    )
+    companions = tuple(
+        sorted(name for name in original_names if name != primary_original_asset_name)
+    )
+    try:
+        return FilingUploadPublicationIdentity(
+            ticker=ticker,
+            document_id=document_id,
+            internal_document_id=cast(str, required_text["internal_document_id"]),
+            form_type=cast(str, required_text["form_type"]),
+            company_id=cast(str, required_text["company_id"]),
+            ingest_method=provenance.ingest_method.to_storage_value(),
+            fiscal_year=cast(int, fiscal_year),
+            fiscal_period=cast(str, required_text["fiscal_period"]),
+            report_kind=cast(str, required_text["report_kind"]),
+            filing_date=filing_date,
+            report_date=report_date,
+            amended=cast(bool, amended),
+            source_provider=provenance.source_provider.to_storage_value(),
+            is_deleted=cast(bool, is_deleted),
+            document_version=cast(str, required_text["document_version"]),
+            source_fingerprint=cast(str, required_text["source_fingerprint"]),
+            primary_document=primary_document,
+            primary_original_asset_name=primary_original_asset_name,
+            companion_original_asset_names=companions,
+            assets=tuple(sorted(assets, key=lambda asset: asset.name)),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
 def _classify_physical_file_facts(
     declared_files: tuple[_DeclaredSourceFile, ...],
 ) -> tuple[SourceIntegrityReason, ...]:
@@ -984,9 +1191,9 @@ def _classify_physical_file_facts(
             action="检查 source integrity declared file",
         )
         if path_state is None:
-            if item.source == _FILE_SOURCE_ORIGINAL:
+            if item.source == FILING_UPLOAD_ASSET_SOURCE_ORIGINAL:
                 reasons.append(SourceIntegrityReason.ORIGINAL_FILE_MISSING)
-            elif item.source == _FILE_SOURCE_DOCLING:
+            elif item.source == FILING_UPLOAD_ASSET_SOURCE_DOCLING:
                 reasons.append(SourceIntegrityReason.PRIMARY_DOCLING_FILE_MISSING)
             else:
                 reasons.append(SourceIntegrityReason.DECLARED_FILE_MISSING)
@@ -1378,7 +1585,11 @@ def _with_repairable_classification(
         status=SourceIntegrityStatus.REPAIR_REQUIRED,
         reasons=reasons,
     )
-    return replace(inspection, classification=classification)
+    return replace(
+        inspection,
+        classification=classification,
+        filing_upload_publication_identity=None,
+    )
 
 
 def _with_unsafe_classification(
@@ -1412,7 +1623,11 @@ def _with_unsafe_classification(
         status=SourceIntegrityStatus.UNSAFE,
         reasons=reasons,
     )
-    return replace(inspection, classification=classification)
+    return replace(
+        inspection,
+        classification=classification,
+        filing_upload_publication_identity=None,
+    )
 
 
 def _missing_source_inspection(
@@ -1453,6 +1668,7 @@ def _missing_source_inspection(
         files=(),
         primary_document=None,
         canonical_manifest_item=None,
+        filing_upload_publication_identity=None,
     )
 
 
@@ -1496,6 +1712,7 @@ def _unsafe_source_inspection(
         files=(),
         primary_document=None,
         canonical_manifest_item=None,
+        filing_upload_publication_identity=None,
     )
 
 

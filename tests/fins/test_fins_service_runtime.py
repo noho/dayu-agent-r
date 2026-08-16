@@ -87,6 +87,7 @@ class _UnsafeFilingUploadStateRepository:
                 reasons=(SourceIntegrityReason.META_UNTRUSTED,),
             ),
             source_meta=None,
+            publication_identity=None,
         )
 
 

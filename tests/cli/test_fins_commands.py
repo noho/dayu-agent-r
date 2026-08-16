@@ -3075,6 +3075,7 @@ def test_upload_terminal_summary_renderer_uses_typed_requested_and_stored_counts
             reasons=(),
         ),
         source_meta=None,
+        publication_identity=None,
     )
     request = validate_fins_upload_filing_request(
         raw_request,

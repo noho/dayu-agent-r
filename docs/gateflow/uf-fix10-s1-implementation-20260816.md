@@ -6,10 +6,10 @@
 - slice：`S1 — behavior-preserving owner contracts`
 - gate：`implementation`
 - 日期：2026-08-17（accepted plan 文件日期为 2026-08-16）
-- completion status：`BLOCKED / PLAN REVIEW REQUIRED`
+- completion status：`S1 ACCEPTED / READY TO COMMIT`
 - artifact path：`docs/gateflow/uf-fix10-s1-implementation-20260816.md`
 - accepted commit：无；用户明确禁止 commit
-- 下一入口：plan review，裁决 S1 fixture/protocol implementer 边界
+- 下一入口：`S1 accepted slice commit`，完成后进入 `S2 implementation`
 
 ## 动机与 owner 判断
 
@@ -123,3 +123,98 @@ FilingUploadStateRepositoryProtocol: read_filing_upload_state_in_batch is not pr
 `docs/reviews/plan-review-20260817-010842-mimo.md` 与 `docs/reviews/plan-review-20260817-010619-ds.md` 两路结论均为 `pass`。Controller 接受 second amendment，并 pin 定 tools fake 只在现有 filing static-admission cases 已有 `calls == []` 的位置补 `batch_calls == []`；material ticker-identity case不动。service runtime 的动态 monkeypatch fake在本 work unit 无 batch-read可达路径，分类为未来触发式、非阻塞 residual，不纳入 S1/S2。
 
 当前 implementation status 更新为：`SECOND AMENDMENT ACCEPTED / S1 RESUME AUTHORIZED`。acceptance artifact 为 `docs/gateflow/uf-fix10-s1-second-blocker-plan-acceptance-20260817.md`；下一入口恢复为 `S1 implementation resume`。本 acceptance gate 未修改 production/tests/README，未运行 pytest、pyright、coverage，未 commit，也未授权提前接通 S2 lifecycle。
+
+## Second amendment implementation closure（2026-08-17）
+
+Controller 接受 commit `d97d233b` 后恢复 S1，本轮只修改 `tests/fins/test_fins_ingestion_tools.py`：给既有 tool static-admission `_ForbiddenFilingUploadStateRepository` 增加 `BatchToken` import、独立 `batch_calls` 与 required `read_filing_upload_state_in_batch()` record-then-`AssertionError`；新增 direct exact conformance test；只在三个现有 filing static-admission cases 的 `state_repository.calls == []` 旁增加 `batch_calls == []`。两个 material cases均未修改，未新增 cast、default、optional method、`hasattr/getattr`、wrapper 或 fallback。
+
+验证结果：
+
+- amended focused pytest：`932 passed, 3 warnings`。
+- focused pyright（runtime/tools 两文件）：`0 errors, 0 warnings`。
+- full pyright（`dayu/ tests/ utils/`）：`0 errors, 0 warnings`；第二次 structural blocker 已闭合。
+- 完整 `pytest tests/fins -q`：`1872 passed, 1 skipped, 3 warnings`。
+- frozen coverage 的 pytest-cov 多 source 入口继续在 collection 阶段复现本机 NumPy 重复加载错误，未进入测试；按既有 accepted evidence 使用同一两测试集、同一四模块的 coverage.py 单次采集，`103 passed`，四模块合计 `82%`，满足 `--fail-under=80`。此前包含各 owner tests 的逐文件 coverage 仍为 arbitration `86%`、Docling `88%`、storage batch-state core `95%`、typed failure `84%`。
+- `git diff --check`：通过。
+
+README decision：不更新。second amendment 只修复测试 structural fake conformance，没有生产、用户可见行为或测试工作流变化；S1 frozen scope 也明确禁止修改 README。
+
+Residual risk：`test_fins_service_runtime.py` 的动态 monkeypatch fake 按 Controller acceptance 维持未来触发式、非阻塞 residual；本 work unit 无 batch-read路径经过该 fake，不纳入 S1/S2。未运行 UF-PF10/UF-PF12，未修改 SEC/CN/HK workflow、workflow tests、README、oracle、scenario、registry 或 evidence，未接通 S2 lifecycle。
+
+当前 implementation status：`S1 IMPLEMENTATION COMPLETE / READY FOR CODE REVIEW`。accepted commit仍无；用户明确禁止本轮提交。下一入口为 `S1 code review`。
+
+## S1 code-review fix closure（2026-08-17）
+
+已完整读取并裁决 `docs/reviews/code-review-20260817-012504.md` 与
+`docs/reviews/code-review-20260817-013652.md`。逐项裁决记录在
+`docs/gateflow/uf-fix10-s1-code-review-adjudication-20260817.md`。
+
+本 gate 接受并完成以下 owner-boundary 修复：
+
+- `FilingUploadAssetDescriptor` 与 `FilingUploadPublicationIdentity` 对 required text、
+  可选日期、asset name/sha256/derived_from 与非空 `content_type` 增加显式运行时字符串
+  类型校验；非法真值不再绕过 closed dataclass contract。
+- `_require_stable_action_contract()` 的 REPAIR_REQUIRED 分支改为直接检查 fresh
+  `resolved_action`，消除重复 initial 条件；前置 equality 与分支自身检查继续双重 fail closed。
+- 增加真实多文件 prepare → publish → storage read 交叉 owner 测试，证明 prepared 与
+  durable identity 对 primary、companion、Docling derived asset、hash、size、content type、
+  original filename 与 roles 完全相等。
+- 增加 §7.4 五格表驱动 conflict 测试，固定 typed
+  `SOURCE_PUBLICATION_CONFLICT` 且绝不 skip；增加 initial/fresh UNSAFE 入口拒绝与 stable
+  REPAIR_REQUIRED action invariant raise。
+- 增加空 staging 合法 document batch read 的 `MISSING`/空 meta/空 identity/零 mutation
+  测试，以及 published empty `document_id` fail-fast/零 mutation 测试。后者是 accepted plan
+  已授权的 intended public input-contract 收紧。
+
+review Finding 1 按 Controller 裁决拒绝：accepted plan §6.3 已冻结 rebase 同 fingerprint
+保留 fresh version、不同 fingerprint 递增；没有引入 sequential/rebase version 必须相等的新
+contract。多文件 role-ambiguous 输入的 sequential/rebase version 差异登记为 deferred
+residual，owner 为未来独立 document-version policy work unit。prepared identity 请求一致性
+与 `UploadCompanyMetaDecision.disposition` public contract 两个 open question 同样按理由拒绝，
+未在 S1 新增重复参数校验或改写 owner contract。
+
+验证结果：
+
+- affected focused pytest：`322 passed`。
+- amended focused pytest：`944 passed, 3 warnings`。
+- 完整 `pytest tests/fins -q`：`1884 passed, 1 skipped, 3 warnings`。
+- focused pyright：`0 errors, 0 warnings`。
+- full pyright（`dayu/ tests/ utils/`）：`0 errors, 0 warnings`。
+- frozen pytest-cov 多 `--cov` 入口继续在 collection 阶段复现本机 NumPy
+  `cannot load module more than once per process`，未进入测试；等价 coverage.py 单次采集
+  对同一两测试集为 `113 passed`、冻结四模块总 coverage `85%`。加入 storage/failure owner
+  tests 的单次采集为 `338 passed`，逐文件 arbitration `87%`、Docling `88%`、storage
+  batch-state core `95%`、typed failure `84%`，总计 `88%`，满足 `--fail-under=80`。
+- `git diff --check`：通过。
+
+README decision：不更新。Controller 明确裁决本 code-review fix 不更新 README；本轮只收紧
+S1 internal owner contract 与测试，未修改用户可见 workflow、CLI、安装、分层或排障职责。
+
+本 gate 未运行 UF-PF10/UF-PF12，未修改 SEC/CN/HK workflow、workflow tests、README、
+oracle、scenario、registry 或 evidence，未接通 S2 lifecycle，未 commit。
+
+当前 implementation status：`S1 CODE-REVIEW FIX COMPLETE / READY FOR RE-REVIEW`。
+
+## S1 acceptance（2026-08-17）
+
+两路 code-review re-review 均通过：
+
+- `docs/reviews/code-review-20260817-015152.md`：`Pass`；
+- `docs/reviews/code-review-20260817-020029.md`：`Pass`。
+
+两路 review 共同确认 F2–F5 与 C1 全部 `已修复`，F1/Q1/Q2 的
+`rejected-with-reason` 裁决符合 accepted plan，无 S2 接线、行为漂移、blocking open question
+或未分类 residual risk。accepted validation 为 amended focused `944 passed, 3 warnings`、完整
+Fins `1884 passed, 1 skipped, 3 warnings`、全仓 pyright `0 errors, 0 warnings`、owner-inclusive
+coverage `88%`、`git diff --check` 通过。
+
+README decision：不更新。S1 保持 behavior-preserving，且本 acceptance gate 明确禁止修改
+code/tests/README。document-version policy 差异交给未来独立 policy work unit；service dynamic
+monkeypatch fake 交给未来实际触发 batch-read 或 required protocol 变化的 work unit，均为
+non-blocking residual。
+
+acceptance artifact：`docs/gateflow/uf-fix10-s1-acceptance-20260817.md`。
+
+当前 implementation status：`S1 ACCEPTED / READY TO COMMIT`。accepted commit 尚未创建；
+本 acceptance gate 只记录裁决，下一入口按用户要求在当前分支执行 `S1 accepted slice commit`，完成后进入
+`S2 implementation`，不得提前接线。
