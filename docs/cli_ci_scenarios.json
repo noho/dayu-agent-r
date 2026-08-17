@@ -142707,7 +142707,7 @@
       "upload_filing": {
         "validation_result": "ready",
         "calibration_status": "oracle-and-scenarios-accepted",
-        "implementation_conformance_status": "fixes-required-before-second-round-pass",
+        "implementation_conformance_status": "fixes-complete-post-fix-reruns-required",
         "parser_inventory": {
           "inventory_id": "dayu.cli.arg_parsing.build_parser:upload_filing",
           "inventory_version": 4,
@@ -142757,117 +142757,139 @@
           {
             "finding_id": "UF-FIX01",
             "slug": "validation-atomic-boundary",
-            "status": "fix-required-not-started",
+            "status": "fix-complete-local-closeout",
+            "closeout_commit": "114430ce",
+            "closeout_artifact": "docs/gateflow/uf-fix01-validation-atomic-boundary-final-closeout-20260813.md",
             "oracle_predicate_refs": [
               "upload_filing.validation-side-effects",
               "upload_filing.error-classification"
             ],
             "accepted_requirement": "把全部可预判 usage validation 前移到 workspace mutation 前；company meta 与 source publication 同一原子业务边界。",
-            "implementation_authorization": "not-authorized-in-calibration-registration"
+            "implementation_authorization": "completed-by-user-authorized-gateflow-work-unit"
           },
           {
             "finding_id": "UF-FIX02",
             "slug": "action-and-update-identity",
-            "status": "fix-required-not-started",
+            "status": "fix-complete-local-closeout",
+            "closeout_commit": "31817dc5",
+            "closeout_artifact": "docs/gateflow/uf-fix02-action-and-update-identity-final-closeout-20260813.md",
             "oracle_predicate_refs": [
               "upload_filing.action-core",
               "upload_filing.renamed-update",
               "upload_filing.auto-after-delete"
             ],
             "accepted_requirement": "按 filing identity 实现 update；update missing 即使 overwrite 也失败；auto 对 deleted source 恢复；existing 冲突在转换前判断。",
-            "implementation_authorization": "not-authorized-in-calibration-registration"
+            "implementation_authorization": "completed-by-user-authorized-gateflow-work-unit"
           },
           {
             "finding_id": "UF-FIX03",
             "slug": "summary-and-bounded-errors",
-            "status": "fix-required-not-started",
+            "status": "fix-complete-local-closeout",
+            "closeout_commit": "9edd0a46",
+            "closeout_artifact": "docs/gateflow/uf-fix03-final-closeout-20260814.md",
             "oracle_predicate_refs": [
               "upload_filing.irrelevant-and-repeated-options",
               "upload_filing.direct-boundary-and-summary",
               "upload_filing.malformed-and-empty-input"
             ],
             "accepted_requirement": "区分 requested/stored files，投影有界 typed reason，普通 stderr 不输出第三方 traceback。",
-            "implementation_authorization": "not-authorized-in-calibration-registration"
+            "implementation_authorization": "completed-by-user-authorized-gateflow-work-unit"
           },
           {
             "finding_id": "UF-FIX04",
             "slug": "shared-calendar-year-validation",
-            "status": "fix-required-not-started",
+            "status": "fix-complete-local-closeout",
+            "closeout_commit": "4a825b75",
+            "closeout_artifact": "docs/reviews/wu-upload-filing-calendar-year-validation-final-closeout-controller.md",
             "oracle_predicate_refs": [
               "upload_filing.date-and-year-domain"
             ],
             "accepted_requirement": "upload 与 download 在相同 calendar/year 语义上复用一个公共校验 owner；保留 download 独有的部分日期边界展开。",
-            "implementation_authorization": "not-authorized-in-calibration-registration"
+            "implementation_authorization": "completed-by-user-authorized-gateflow-work-unit"
           },
           {
             "finding_id": "UF-FIX05",
             "slug": "alias-contract-alignment",
-            "status": "fix-required-not-started",
+            "status": "fix-complete-local-closeout",
+            "closeout_commit": "a3d584fc",
+            "closeout_artifact": "docs/reviews/wu-upload-filing-ticker-alias-contract-final-closeout-controller.md",
             "oracle_predicate_refs": [
               "upload_filing.ticker-and-alias"
             ],
             "accepted_requirement": "Company Identity/CompanyMeta 统一 alias grammar、归一化、持久化和 list_documents 路由；保留用户声明信任边界，不增加现实公司归属核验。",
-            "implementation_authorization": "not-authorized-in-calibration-registration"
+            "implementation_authorization": "completed-by-user-authorized-gateflow-work-unit"
           },
           {
             "finding_id": "UF-FIX06",
             "slug": "converter-capability-owner",
-            "status": "fix-required-not-started",
+            "status": "fix-complete-local-closeout",
+            "closeout_commit": "b7725096",
+            "closeout_artifact": "docs/gateflow/uf-fix06-final-closeout-20260815.md",
             "oracle_predicate_refs": [
               "upload_filing.format-owner"
             ],
             "accepted_requirement": "由真实 converter capability 单一 contract 驱动 help/CLI/Service；附件与必转换 primary 分离。",
-            "implementation_authorization": "not-authorized-in-calibration-registration"
+            "implementation_authorization": "completed-by-user-authorized-gateflow-work-unit"
           },
           {
             "finding_id": "UF-FIX07",
             "slug": "multi-file-primary-and-collision",
-            "status": "fix-required-not-started",
+            "status": "fix-complete-local-closeout",
+            "closeout_commit": "5859856e",
+            "closeout_artifact": "docs/gateflow/uf-fix07-final-closeout-20260815.md",
             "oracle_predicate_refs": [
               "upload_filing.multi-file-and-primary"
             ],
             "accepted_requirement": "前置拒绝重复路径，消除 basename/stem 输出碰撞并冻结显式 primary 规则。",
-            "implementation_authorization": "not-authorized-in-calibration-registration"
+            "implementation_authorization": "completed-by-user-authorized-gateflow-work-unit"
           },
           {
             "finding_id": "UF-FIX08",
             "slug": "existing-source-auto-repair",
-            "status": "fix-required-not-started",
+            "status": "fix-complete-local-closeout",
+            "closeout_commit": "656b926c",
+            "closeout_artifact": "docs/gateflow/uf-fix08-existing-source-auto-repair-final-closeout-20260816.md",
             "oracle_predicate_refs": [
               "upload_filing.existing-source-integrity"
             ],
             "accepted_requirement": "保持完整性 fail-closed；在完整本地输入可用时由 auto 原子重建可修复 source。",
-            "implementation_authorization": "not-authorized-in-calibration-registration"
+            "implementation_authorization": "completed-by-user-authorized-gateflow-work-unit"
           },
           {
             "finding_id": "UF-FIX09",
             "slug": "shared-interruptible-docling-converter",
-            "status": "fix-required-not-started",
+            "status": "fix-complete-local-closeout",
+            "closeout_commit": "b3cb1f1b",
+            "closeout_artifact": "docs/gateflow/uf-fix09-final-closeout-20260813.md",
             "oracle_predicate_refs": [
               "upload_filing.sigint-cancellation"
             ],
             "accepted_requirement": "把可中断 Docling converter 收敛为一个公共运行时能力，并让 download、upload 和后续调用方共享协作 terminate/kill/cleanup 语义。",
-            "implementation_authorization": "not-authorized-in-calibration-registration"
+            "implementation_authorization": "completed-by-user-authorized-gateflow-work-unit"
           },
           {
             "finding_id": "UF-FIX10",
             "slug": "same-request-concurrency",
-            "status": "fix-required-not-started",
+            "status": "fix-complete-local-closeout",
+            "closeout_commit": "94182a0c",
+            "closeout_artifact": "docs/gateflow/uf-fix10-final-closeout-20260817.md",
             "oracle_predicate_refs": [
               "upload_filing.concurrency"
             ],
             "accepted_requirement": "同一 auto 请求在 publication lock 内重读，竞争方收敛为 success/skip 而非 generic failure。",
-            "implementation_authorization": "not-authorized-in-calibration-registration"
+            "implementation_authorization": "completed-by-user-authorized-gateflow-work-unit"
           },
           {
             "finding_id": "UF-FIX11",
             "slug": "fresh-company-meta-warning",
-            "status": "fix-required-not-started",
+            "status": "fix-complete-local-closeout",
+            "closeout_commit": "6e838a63",
+            "closeout_artifact": "docs/gateflow/uf-fix11-final-closeout-20260817.md",
             "oracle_predicate_refs": [
               "upload_filing.company-meta-refresh"
             ],
             "accepted_requirement": "fresh canonical identity 忽略单次上传提供的新名称或 alias 时输出明确 warning。",
-            "implementation_authorization": "not-authorized-in-calibration-registration"
+            "implementation_authorization": "completed-by-user-authorized-gateflow-work-unit"
           }
         ],
         "required_post_fix_reruns": [
@@ -143057,7 +143079,7 @@
         "session",
         "tool_trace"
       ],
-      "reason": "五个命令的第一轮真实运行、逐项用户裁决与 accepted Oracle/scenarios 已闭合；upload_filing 的 implementation findings 和 post-fix reruns 已登记但未启动修复，不构成第一轮 calibration coverage gap。"
+      "reason": "五个命令的第一轮真实运行、逐项用户裁决与 accepted Oracle/scenarios 已闭合；upload_filing 的 implementation findings 已完成修复并登记 closeout，post-fix reruns 尚未全部完成，不构成第一轮 calibration coverage gap。"
     },
     "registry_digest_basis": "f17b6bccc66910fafa3b4a003284ed49ea27dd1a37f2dc08ee545e8e8d62c0e5",
     "accepted_oracle_registry_digest_basis": "73fc031eca26c30c79f089bce918362cbb397b8ff4aa1592d6831a1636b4a0ec"
