@@ -32,6 +32,11 @@ from dayu.cli.exit_codes import (
     EXIT_SUCCESS,
     EXIT_USAGE_ERROR,
 )
+from dayu.fins.company_metadata_warning import (
+    COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+    CompanyMetadataWarning,
+    CompanyMetadataWarningKind,
+)
 from dayu.fins.direct_events import (
     FinsDirectStreamProtocolError,
     FinsDirectStreamProtocolErrorKind,
@@ -768,6 +773,80 @@ def test_live_fins_commands_render_progress_and_terminal_summary(
     assert "Fins direct event received" not in captured.out
     assert "Fins direct event detail" not in captured.out
     assert captured.err == ""
+    assert fake_service.closed_streams == 1
+
+
+@pytest.mark.parametrize(
+    ("upload_status", "stored_file_count"),
+    (("ok", 1), ("skipped", 0)),
+)
+def test_upload_filing_command_loop_preserves_summary_and_routes_warning(
+    upload_status: str,
+    stored_file_count: int,
+    tmp_path: Path,
+    fake_service: _FakeFinsDirectService,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """mocked upload_filing 必须经过命令循环并保持摘要、warning 与退出码。
+
+    Args:
+        upload_status: mocked upload 终态，覆盖 uploaded 与 skipped。
+        stored_file_count: 原摘要中的已发布文件数。
+        tmp_path: CLI 上传文件使用的临时目录。
+        fake_service: 复用 production command seam 的 direct Service 替身。
+        capsys: 标准流捕获夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 命令循环改写退出码、stdout 摘要或 canonical warning 时抛出。
+    """
+
+    warning = CompanyMetadataWarning(
+        kind=CompanyMetadataWarningKind.COMPANY_NAME_IGNORED,
+        message=COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+    )
+    fake_service.events = (
+        FinsEvent(
+            event_type=FinsEventType.RESULT,
+            operation_kind=FinsOperationKind.UPLOAD_FILING,
+            message="操作完成",
+            emitted_at=_NOW,
+            ticker="AAPL",
+            filing_kind=SourceKind.FILING.value,
+            document_label=None,
+            progress=None,
+            result=FinsResultSummary(
+                status=FinsResultStatus.SUCCESS,
+                exit_code=FINS_DIRECT_EXIT_SUCCESS,
+                title="操作完成",
+                details=(
+                    FinsEventDetail(label="source kind", value=SourceKind.FILING.value),
+                    FinsEventDetail(label="status", value=upload_status),
+                    FinsEventDetail(label="requested files", value="1"),
+                    FinsEventDetail(label="stored files", value=str(stored_file_count)),
+                ),
+                error_kind=None,
+                error_message=None,
+                warnings=(warning,),
+            ),
+        ),
+    )
+
+    exit_code = cli_main.main(_live_command_argv("upload_filing", tmp_path))
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_SUCCESS
+    assert captured.out == (
+        'Fins succeeded: operation="upload_filing" ticker="AAPL" '
+        'filing_kind="filing" status="success" message="操作完成"\n'
+        f'Fins summary: source_kind="filing" status="{upload_status}" '
+        f'requested_files="1" stored_files="{stored_file_count}"\n'
+    )
+    assert captured.err == f"{COMPANY_NAME_IGNORED_WARNING_MESSAGE}\n"
+    assert fake_service.stream_calls == [FinsOperationKind.UPLOAD_FILING]
+    assert len(fake_service.upload_filing_requests) == 1
     assert fake_service.closed_streams == 1
 
 
@@ -2981,7 +3060,7 @@ def test_unknown_fins_direct_failure_logs_traceback_and_hides_exception_from_std
 
 
 @pytest.mark.parametrize(
-    ("summary", "expected_stream"),
+    ("summary", "expected_stream", "expected_other_stream"),
     (
         (
             FinsUploadResultSummary(
@@ -2991,6 +3070,7 @@ def test_unknown_fins_direct_failure_logs_traceback_and_hides_exception_from_std
                 stored_file_count=2,
             ),
             "stdout",
+            "",
         ),
         (
             FinsUploadResultSummary(
@@ -3000,6 +3080,7 @@ def test_unknown_fins_direct_failure_logs_traceback_and_hides_exception_from_std
                 stored_file_count=0,
             ),
             "stdout",
+            "",
         ),
         (
             FinsUploadResultSummary(
@@ -3009,6 +3090,7 @@ def test_unknown_fins_direct_failure_logs_traceback_and_hides_exception_from_std
                 stored_file_count=0,
             ),
             "stdout",
+            "",
         ),
         (
             FinsUploadResultSummary(
@@ -3022,12 +3104,46 @@ def test_unknown_fins_direct_failure_logs_traceback_and_hides_exception_from_std
                 ),
             ),
             "stderr",
+            "",
+        ),
+        (
+            FinsUploadResultSummary(
+                source_kind=SourceKind.FILING,
+                status="ok",
+                requested_file_count=1,
+                stored_file_count=1,
+                warnings=(
+                    CompanyMetadataWarning(
+                        kind=CompanyMetadataWarningKind.COMPANY_NAME_IGNORED,
+                        message=COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+                    ),
+                ),
+            ),
+            "stdout",
+            f"{COMPANY_NAME_IGNORED_WARNING_MESSAGE}\n",
+        ),
+        (
+            FinsUploadResultSummary(
+                source_kind=SourceKind.FILING,
+                status="skipped",
+                requested_file_count=1,
+                stored_file_count=0,
+                warnings=(
+                    CompanyMetadataWarning(
+                        kind=CompanyMetadataWarningKind.COMPANY_NAME_IGNORED,
+                        message=COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+                    ),
+                ),
+            ),
+            "stdout",
+            f"{COMPANY_NAME_IGNORED_WARNING_MESSAGE}\n",
         ),
     ),
 )
 def test_upload_terminal_summary_renderer_uses_typed_requested_and_stored_counts(
     summary: FinsUploadResultSummary,
     expected_stream: str,
+    expected_other_stream: str,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -3036,6 +3152,7 @@ def test_upload_terminal_summary_renderer_uses_typed_requested_and_stored_counts
     Args:
         summary: production upload summary owner 构造的当前终态。
         expected_stream: 当前终态应写入的标准流名称。
+        expected_other_stream: 另一标准流应包含的 exact warning 文本。
         tmp_path: filing validator 使用的临时输入目录。
         capsys: 标准流捕获夹具。
 
@@ -3106,12 +3223,15 @@ def test_upload_terminal_summary_renderer_uses_typed_requested_and_stored_counts
     cli_output.render_fins_direct_event(result_event)
 
     captured = capsys.readouterr()
+    assert result_event.result is not None
+    if expected_stream == "stdout":
+        assert result_event.result.exit_code == EXIT_SUCCESS
     rendered = captured.out if expected_stream == "stdout" else captured.err
     other_stream = captured.err if expected_stream == "stdout" else captured.out
     assert f'requested_files="{summary.requested_file_count}"' in rendered
     assert f'stored_files="{summary.stored_file_count}"' in rendered
     assert "uploaded_files" not in rendered
-    assert other_stream == ""
+    assert other_stream == expected_other_stream
 
 
 @pytest.mark.parametrize(

@@ -163,11 +163,15 @@ pytest tests/fins/test_upload_batch.py tests/cli/test_upload_filings_from_comman
 
 ```bash
 pytest -q tests/cli/test_fins_commands.py \
+  tests/cli/test_output.py \
   tests/fins/test_fins_ingestion_runtime.py \
-  tests/service/test_fins_direct.py
+  tests/fins/test_fins_service_runtime.py \
+  tests/fins/test_fins_direct_stream.py \
+  tests/service/test_fins_direct.py \
+  tests/service/test_fins_wait_adapter.py
 ```
 
-该集合覆盖 unknown exception 的 operator traceback 与提示使用 `--log-file PATH` 重试的固定 stderr 分离、typed failure 在 renderer 上限内同时展示 canonical 文件名与有界原因、真实 `FinsUploadResultSummary` 经 typed RESULT details 和既有 CLI renderer 展示 success/delete/skip/failure 的 requested/stored 且不出现旧 `uploaded_files`，以及 production upload direct stream 成功读回 original/Docling 资产后仍不创建 Host SQLite/artifact、runtime SQLite 或 legacy ingestion job record。
+该集合覆盖 unknown exception 的 operator traceback 与提示使用 `--log-file PATH` 重试的固定 stderr 分离、typed failure 在 renderer 上限内同时展示 canonical 文件名与有界原因、真实 `FinsUploadResultSummary` 经 typed RESULT details 和既有 CLI renderer 展示 success/delete/skip/failure 的 requested/stored 且不出现旧 `uploaded_files`，以及 production upload direct stream 成功读回 original/Docling 资产后仍不创建 Host SQLite/artifact、runtime SQLite 或 legacy ingestion job record。company metadata warning 的测试在 commit owner、runtime summary、durable JSON、direct public invariant、CLI stdout/stderr 与 completed wait projection逐层断言同一 typed 值；uploaded/skipped 可携带最多一个规范 warning，failure/cancel/delete 与 generic operation 保持空值，AST 回归锁定 direct builder 只有 upload 与 generic 两个显式 callsite。
 
 运行 upload converter capability / Fins role owner 与 typed workflow 的 focused 回归：
 

@@ -320,6 +320,7 @@ def _upload_summary_from_result(
         document_version=result.document_version,
         source_fingerprint=result.source_fingerprint,
         failure_reason=result.failure_reason,
+        warnings=result.warnings,
     )
 
 

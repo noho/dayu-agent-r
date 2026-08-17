@@ -18,6 +18,7 @@ from pathlib import PurePosixPath
 from typing import Final, NoReturn
 
 from dayu.contracts.json_value import JsonValue
+from dayu.fins.company_metadata_warning import CompanyMetadataWarning
 from dayu.fins.download_contract import (
     FinsDownloadDocumentDisposition,
     FinsDownloadEffectiveFilters,
@@ -597,6 +598,7 @@ class FinsResultSummary:
         error_message: 用户可读失败说明；成功时通常为 ``None``。
         download: download 操作的 bounded public 业务对象。
         failure: download 失败的 closed public failure。
+        warnings: publication-final typed 公司元数据警告，当前最多一个。
     """
 
     status: FinsResultStatus
@@ -607,6 +609,7 @@ class FinsResultSummary:
     error_message: str | None
     download: FinsDownloadPublicSummary | None = None
     failure: FinsPublicFailure | None = None
+    warnings: tuple[CompanyMetadataWarning, ...] = ()
 
     def __post_init__(self) -> None:
         """校验终态摘要字段。
@@ -618,7 +621,8 @@ class FinsResultSummary:
             无。
 
         Raises:
-            ValueError: exit code 映射错误、标题或详情包含禁止内容时抛出。
+            TypeError: warning 元素不是精确 typed contract 时抛出。
+            ValueError: exit code、标题、详情或 warning 组合不符合契约时抛出。
         """
 
         _validate_result_exit_code(self.status, self.exit_code)
@@ -630,6 +634,12 @@ class FinsResultSummary:
         )
         for detail in self.details:
             _validate_detail_instance(detail)
+        if len(self.warnings) > 1:
+            raise ValueError("Fins result 最多允许一个 warning")
+        if any(type(warning) is not CompanyMetadataWarning for warning in self.warnings):
+            raise TypeError("Fins result warning 必须是精确 typed contract")
+        if self.warnings and self.status is not FinsResultStatus.SUCCESS:
+            raise ValueError("只有 SUCCESS Fins result 可携带 warning")
         if self.error_message is not None:
             _validate_safe_text(
                 self.error_message,

@@ -33,6 +33,7 @@ from dayu.fins import ticker_normalization
 from dayu.fins.company_metadata_warning import (
     CompanyMetadataWarning,
     company_metadata_warnings_from_json,
+    company_metadata_warnings_to_json,
 )
 from dayu.fins.direct_events import (
     FINS_RESULT_EXIT_CANCELLED,
@@ -1803,6 +1804,7 @@ class FinsUploadResultSummary:
         skip_reason: 可选跳过原因。
         document_version: 可选文档版本。
         source_fingerprint: 可选来源指纹。
+        warnings: publication-final typed 公司元数据警告，当前最多一个。
     """
 
     source_kind: SourceKind
@@ -1817,6 +1819,7 @@ class FinsUploadResultSummary:
     document_version: str | None = None
     source_fingerprint: str | None = None
     failure_reason: FinsUploadFailureReason | None = None
+    warnings: tuple[CompanyMetadataWarning, ...] = ()
 
     def __post_init__(self) -> None:
         """校验 runtime upload summary 的 exact status。
@@ -1828,7 +1831,8 @@ class FinsUploadResultSummary:
             无。
 
         Raises:
-            ValueError: status 不在 production upload status 闭集时抛出。
+            TypeError: warning 元素不是精确 typed contract 时抛出。
+            ValueError: status、计数、failure 或 warning 组合不符合闭集时抛出。
         """
 
         disposition = _upload_terminal_disposition_from_status(self.status)
@@ -1856,6 +1860,15 @@ class FinsUploadResultSummary:
             raise ValueError("failed upload summary 必须包含 failure_reason")
         if disposition is not FinsUploadTerminalDisposition.FAILED and self.failure_reason is not None:
             raise ValueError("非 failed upload summary 禁止包含 failure_reason")
+        if len(self.warnings) > 1:
+            raise ValueError("upload summary 最多允许一个 warning")
+        if any(type(warning) is not CompanyMetadataWarning for warning in self.warnings):
+            raise TypeError("upload summary warning 必须是精确 typed contract")
+        if self.warnings and self.status not in {
+            _UPLOAD_RESULT_STATUS_OK,
+            _UPLOAD_RESULT_STATUS_SKIPPED,
+        }:
+            raise ValueError("只有 ok/skipped upload summary 可携带 warning")
 
     def terminal_disposition(self) -> FinsUploadTerminalDisposition:
         """返回 upload summary 已接受的闭集终态。
@@ -1918,6 +1931,7 @@ class FinsUploadResultSummary:
                 reject_path_separators=False,
             ),
             "failure": None if self.failure_reason is None else self.failure_reason.to_json(),
+            "warnings": company_metadata_warnings_to_json(self.warnings),
         }
 
 
@@ -6236,6 +6250,7 @@ class FinsIngestionRuntime:
             error_message=error_message,
             download=download,
             failure=failure,
+            warnings=(),
             emitted_at=datetime.now(timezone.utc),
         )
         _put_direct_queue(context, event)
@@ -6440,6 +6455,7 @@ def _direct_result_event(
     error_message: str | None,
     download: FinsDownloadPublicSummary | None,
     failure: FinsPublicFailure | None,
+    warnings: tuple[CompanyMetadataWarning, ...],
     emitted_at: datetime,
 ) -> FinsEvent:
     """纯构造一个通过 public contract 校验的 direct RESULT 事件。
@@ -6452,6 +6468,7 @@ def _direct_result_event(
         error_message: 可选失败说明。
         download: download 操作的 bounded public summary。
         failure: download 失败的 closed public failure。
+        warnings: 当前 direct producer 显式给出的 typed 公司元数据警告。
         emitted_at: 调用方提供的带时区事件构造时间。
 
     Returns:
@@ -6503,6 +6520,7 @@ def _direct_result_event(
             error_message=error_message,
             download=download,
             failure=failure,
+            warnings=warnings,
         ),
     )
 
@@ -6556,6 +6574,7 @@ def _direct_upload_terminal_events(
         ),
         download=None,
         failure=None,
+        warnings=summary.warnings,
         emitted_at=emitted_at,
     )
     return (progress_event, result_event)

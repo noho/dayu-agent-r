@@ -1261,6 +1261,25 @@ def test_production_upload_count_constructors_are_explicit_and_complete() -> Non
     ]
 
 
+def _company_name_ignored_warning() -> CompanyMetadataWarning:
+    """构造规范 company-name ignored warning。
+
+    Args:
+        无。
+
+    Returns:
+        使用 frozen public projection 的 typed warning。
+
+    Raises:
+        ValueError: 固定 fixture 与 warning 闭集不一致时抛出。
+    """
+
+    return CompanyMetadataWarning(
+        kind=CompanyMetadataWarningKind.COMPANY_NAME_IGNORED,
+        message=COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+    )
+
+
 def _valid_runtime_filing_request(*, ticker: str = "AAPL") -> FinsUploadFilingRequest:
     """构造不依赖本地文件的合法 filing delete 请求。
 
@@ -5801,6 +5820,7 @@ async def test_direct_download_stream_writes_storage_and_does_not_create_job_rec
     assert events[-1].result is not None
     assert events[-1].result.status is FinsResultStatus.SUCCESS
     assert events[-1].result.exit_code == 0
+    assert events[-1].result.warnings == ()
     assert source_meta["ingest_method"] == "download"
     assert content == b"# Fake 10-K\n\nRevenue increased."
     assert tuple(jobs_dir.glob("*.json")) == ()
@@ -6283,7 +6303,130 @@ async def test_direct_upload_projection_failure_before_claim_emits_single_failur
     assert len(results) == 1
     assert results[0].status is FinsResultStatus.FAILURE
     assert results[0].error_kind is FinsErrorKind.USER_INPUT
+    assert results[0].warnings == ()
     assert all(result.status is not FinsResultStatus.SUCCESS for result in results)
+
+
+@pytest.mark.parametrize(
+    ("status", "requested_file_count", "stored_file_count", "with_warning"),
+    (
+        ("ok", 1, 1, True),
+        ("skipped", 1, 0, True),
+        ("ok", 1, 1, False),
+        ("deleted", 0, 0, False),
+    ),
+)
+@pytest.mark.asyncio
+async def test_direct_upload_stream_copies_typed_warnings_exactly(
+    status: str,
+    requested_file_count: int,
+    stored_file_count: int,
+    with_warning: bool,
+    tmp_path: Path,
+) -> None:
+    """真实 direct runtime 应原样复制 uploaded/skipped warning 与自然空值。
+
+    Args:
+        status: fake runner 返回的 exact upload status。
+        requested_file_count: typed summary 的请求文件数。
+        stored_file_count: typed summary 的已发布文件数。
+        with_warning: 是否携带 publication-final warning。
+        tmp_path: pytest 临时目录夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: direct stream 丢失、重建或错误增加 warning 时抛出。
+    """
+
+    warnings = (_company_name_ignored_warning(),) if with_warning else ()
+    summary = FinsUploadResultSummary(
+        source_kind=SourceKind.FILING,
+        status=status,
+        requested_file_count=requested_file_count,
+        stored_file_count=stored_file_count,
+        warnings=warnings,
+    )
+    runtime = _build_ingestion_runtime(
+        tmp_path / "fins-workspace",
+        executor=_HoldingExecutor(),
+        upload_runner=_FakeUploadRunner(summary),
+    )
+    if status == "deleted":
+        request = _valid_runtime_filing_request()
+    else:
+        upload_file = tmp_path / "filing.pdf"
+        upload_file.write_bytes(b"typed filing")
+        request = FinsUploadFilingRequest(
+            ticker="AAPL",
+            action="create",
+            files=(upload_file,),
+            fiscal_year=2024,
+            fiscal_period="FY",
+            company_name="Apple Inc.",
+        )
+
+    events = await _collect_direct_events(runtime.upload(request))
+    result = events[-1].result
+
+    assert result is not None
+    assert result.status is FinsResultStatus.SUCCESS
+    assert result.warnings is summary.warnings
+    assert result.warnings == warnings
+
+
+def test_direct_result_builder_callsites_are_exact_and_never_rewrite_warnings() -> None:
+    """direct builder 必须只有 upload/generic 两个显式 warning producer。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: callsite 数量、实参或 helper 内 warning 重写发生漂移时抛出。
+        OSError: production 源码读取失败时抛出。
+        SyntaxError: production 源码无法解析时抛出。
+    """
+
+    source_path = Path(ingestion_runtime.__file__)
+    syntax_tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    calls = [
+        node
+        for node in ast.walk(syntax_tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_direct_result_event"
+    ]
+    assert len(calls) == 2
+    warning_expressions: list[str] = []
+    for call in calls:
+        warning_keyword = next(
+            (keyword for keyword in call.keywords if keyword.arg == "warnings"),
+            None,
+        )
+        assert warning_keyword is not None
+        warning_expressions.append(ast.unparse(warning_keyword.value))
+    assert set(warning_expressions) == {"summary.warnings", "()"}
+
+    builders = [
+        node
+        for node in syntax_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_direct_result_event"
+    ]
+    assert len(builders) == 1
+    keyword_names = [argument.arg for argument in builders[0].args.kwonlyargs]
+    warnings_index = keyword_names.index("warnings")
+    assert builders[0].args.kw_defaults[warnings_index] is None
+    warning_names = [
+        node
+        for node in ast.walk(builders[0])
+        if isinstance(node, ast.Name) and node.id == "warnings"
+    ]
+    assert warning_names
+    assert all(isinstance(node.ctx, ast.Load) for node in warning_names)
 
 
 @pytest.mark.asyncio
@@ -6333,6 +6476,7 @@ async def test_direct_upload_cancel_before_final_checkpoint_returns_only_cancell
     assert len(results) == 1
     assert results[0].status is FinsResultStatus.CANCELLED
     assert results[0].exit_code == 130
+    assert results[0].warnings == ()
 
 
 @pytest.mark.asyncio
@@ -8559,6 +8703,7 @@ def test_accepted_upload_terminal_store_rejects_mismatch_and_preserves_existing_
         status="ok",
         requested_file_count=1,
         stored_file_count=1,
+        warnings=(_company_name_ignored_warning(),),
     ).to_json_summary()
     failed_summary = FinsUploadResultSummary(
         source_kind=SourceKind.FILING,
@@ -8618,6 +8763,7 @@ def test_accepted_upload_terminal_store_rejects_mismatch_and_preserves_existing_
     )
 
     assert saved.status is FinsIngestionJobStatus.SUCCEEDED
+    assert saved.result_summary["warnings"] == [_company_name_ignored_warning().to_json()]
     assert preserved == saved
     assert runtime.read_job(start.job_id) == saved
 
@@ -9291,6 +9437,83 @@ def test_pipeline_warning_invariant_rejects_non_success_status(status: str) -> N
                 ),
             ),
         )
+
+
+def test_upload_summary_warning_contract_is_exact_bounded_and_success_only() -> None:
+    """runtime upload summary 应独占 exact、单元素与成功状态闭集。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: summary 接受非法 warning 或 JSON 投影不精确时抛出。
+    """
+
+    warning = _company_name_ignored_warning()
+    for status in ("ok", "skipped"):
+        summary = FinsUploadResultSummary(
+            source_kind=SourceKind.FILING,
+            status=status,
+            requested_file_count=1,
+            stored_file_count=1 if status == "ok" else 0,
+            warnings=(warning,),
+        )
+        assert summary.warnings == (warning,)
+        assert summary.to_json_summary()["warnings"] == [warning.to_json()]
+
+    with pytest.raises(TypeError, match="精确 typed contract"):
+        FinsUploadResultSummary(
+            source_kind=SourceKind.FILING,
+            status="ok",
+            requested_file_count=1,
+            stored_file_count=1,
+            warnings=(cast(CompanyMetadataWarning, "not-a-warning"),),
+        )
+    with pytest.raises(ValueError, match="最多允许一个"):
+        FinsUploadResultSummary(
+            source_kind=SourceKind.FILING,
+            status="ok",
+            requested_file_count=1,
+            stored_file_count=1,
+            warnings=(warning, warning),
+        )
+    for status in ("failed", "cancelled", "deleted"):
+        with pytest.raises(ValueError, match="ok/skipped"):
+            FinsUploadResultSummary(
+                source_kind=SourceKind.FILING,
+                status=status,
+                requested_file_count=0,
+                stored_file_count=0,
+                failure_reason=_runtime_failure_for_status(status),
+                warnings=(warning,),
+            )
+
+
+def test_upload_summary_json_always_contains_warnings_array() -> None:
+    """upload durable summary 无 warning 时也必须序列化显式空数组。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 空 warning 在 durable JSON 中缺失或类型漂移时抛出。
+    """
+
+    summary = FinsUploadResultSummary(
+        source_kind=SourceKind.FILING,
+        status="deleted",
+        requested_file_count=0,
+        stored_file_count=0,
+    )
+
+    assert summary.warnings == ()
+    assert summary.to_json_summary()["warnings"] == []
 
 
 @pytest.mark.parametrize(

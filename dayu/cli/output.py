@@ -239,6 +239,8 @@ def render_fins_direct_event(
             file=effective_stdout,
         )
         _print_terminal_business_summary(event.result, effective_stdout)
+        for warning in event.result.warnings:
+            print(warning.message, file=effective_stderr)
         return
     if event.result.status is FinsResultStatus.CANCELLED:
         print(

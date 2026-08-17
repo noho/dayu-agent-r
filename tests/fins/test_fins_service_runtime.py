@@ -6,19 +6,30 @@ import ast
 import errno
 from datetime import datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 import dayu.fins.service_runtime as service_runtime
+from dayu.contracts.cancellation import CancellationToken
+from dayu.fins.company_metadata_warning import (
+    COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+    CompanyMetadataWarning,
+    CompanyMetadataWarningKind,
+)
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.ingestion_runtime import (
     FinsJobCancellationChecker,
     FinsUploadFilingRequest,
     FinsUploadMaterialRequest,
     FinsUploadPipelineResult,
+    FinsUploadResultSummary,
     FinsUploadUsageCode,
     FinsUploadUsageError,
+    ValidatedFinsUploadFilingRequest,
 )
+from dayu.fins.pipelines.cn_pipeline import CnPipeline
+from dayu.fins.pipelines.sec_pipeline import SecPipeline, SecPipelineUploadResult
 from dayu.fins.service_runtime import (
     DefaultFinsRuntime,
     ProductionFinsUploadRunner,
@@ -154,6 +165,118 @@ class _AlwaysCancelledChecker(FinsJobCancellationChecker):
         """
 
         return None
+
+
+class _NeverCancelledChecker(FinsJobCancellationChecker):
+    """始终保持开放的 production runner 测试 checker。"""
+
+    def __call__(self) -> bool:
+        """返回 callable cancellation checkpoint 状态。
+
+        Args:
+            无。
+
+        Returns:
+            始终返回 ``False``。
+
+        Raises:
+            无。
+        """
+
+        return False
+
+    def is_cancelled(self) -> bool:
+        """返回 token cancellation 状态。
+
+        Args:
+            无。
+
+        Returns:
+            始终返回 ``False``。
+
+        Raises:
+            无。
+        """
+
+        return False
+
+    def cancel_reason(self) -> str | None:
+        """返回测试取消原因。
+
+        Args:
+            无。
+
+        Returns:
+            未取消，返回 ``None``。
+
+        Raises:
+            无。
+        """
+
+        return None
+
+    def requested_at(self) -> datetime | None:
+        """返回测试取消时间。
+
+        Args:
+            无。
+
+        Returns:
+            未取消，返回 ``None``。
+
+        Raises:
+            无。
+        """
+
+        return None
+
+
+class _WarningFilingPipelineFacade:
+    """为 production runner 返回 canonical warning JSON 的最小 pipeline facade。"""
+
+    def __init__(self, warning: CompanyMetadataWarning) -> None:
+        """初始化 warning 与调用记录。
+
+        Args:
+            warning: pipeline terminal result 应投影的 typed warning。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.warning = warning
+        self.requests: list[ValidatedFinsUploadFilingRequest] = []
+        self.cancellation_checkers: list[CancellationToken | None] = []
+
+    def upload_filing(
+        self,
+        request: ValidatedFinsUploadFilingRequest,
+        *,
+        cancellation_checker: CancellationToken | None = None,
+    ) -> SecPipelineUploadResult:
+        """返回 skipped filing 的 canonical pipeline terminal JSON。
+
+        Args:
+            request: runner 传入的 validated filing request。
+            cancellation_checker: runner 原样传入的取消观察器。
+
+        Returns:
+            含一个 canonical company metadata warning 的合法 skipped result。
+
+        Raises:
+            无。
+        """
+
+        self.requests.append(request)
+        self.cancellation_checkers.append(cancellation_checker)
+        return {
+            "status": "skipped",
+            "stored_file_count": 0,
+            "warnings": [self.warning.to_json()],
+        }
 
 
 def test_production_runner_parser_callsites_use_explicit_source_kind() -> None:
@@ -435,6 +558,99 @@ def test_upload_summary_joins_validated_request_and_pipeline_counts(
 
     assert summary.requested_file_count == requested_file_count
     assert summary.stored_file_count == stored_file_count
+
+
+def test_upload_summary_from_result_explicitly_copies_typed_warnings() -> None:
+    """service 汇合点必须机械复制 pipeline typed warning tuple。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: service 丢失、重建或依赖 summary 默认值时抛出。
+    """
+
+    warnings = (
+        CompanyMetadataWarning(
+            kind=CompanyMetadataWarningKind.COMPANY_NAME_IGNORED,
+            message=COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+        ),
+    )
+    result = FinsUploadPipelineResult(
+        status="skipped",
+        stored_file_count=0,
+        warnings=warnings,
+    )
+
+    summary = _upload_summary_from_result(
+        request=FinsUploadFilingRequest(
+            ticker="AAPL",
+            files=(Path("filing.pdf"),),
+            fiscal_year=2024,
+            fiscal_period="FY",
+            company_name="Apple Inc.",
+        ),
+        result=result,
+    )
+
+    assert summary.warnings is result.warnings
+    assert summary.warnings == warnings
+
+
+def test_production_upload_runner_preserves_pipeline_warning_in_summary_and_json(
+    tmp_path: Path,
+) -> None:
+    """真实 production runner 必须保留 pipeline warning 到 summary 与 durable JSON。
+
+    Args:
+        tmp_path: validated filing request 与只读 workspace 使用的临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: runner handoff、typed warning 或 durable 投影发生丢失时抛出。
+        OSError: 临时输入或只读 workspace 状态读取失败时抛出。
+    """
+
+    input_file = tmp_path / "filing.pdf"
+    input_file.write_bytes(b"typed filing")
+    request = prevalidate_fins_upload_filing_request_for_workspace(
+        FinsUploadFilingRequest(
+            ticker="AAPL",
+            action="create",
+            files=(input_file,),
+            fiscal_year=2024,
+            fiscal_period="FY",
+            company_name="Apple Inc.",
+        ),
+        workspace_root=tmp_path / "workspace",
+    )
+    warning = CompanyMetadataWarning(
+        kind=CompanyMetadataWarningKind.COMPANY_NAME_IGNORED,
+        message=COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+    )
+    pipeline = _WarningFilingPipelineFacade(warning)
+    cancellation_checker = _NeverCancelledChecker()
+    runner = ProductionFinsUploadRunner(
+        sec_pipeline=cast(SecPipeline, pipeline),
+        cn_pipeline=cast(CnPipeline, pipeline),
+    )
+
+    summary = runner.run_upload(
+        request,
+        cancellation_checker=cancellation_checker,
+    )
+
+    assert isinstance(summary, FinsUploadResultSummary)
+    assert pipeline.requests == [request]
+    assert pipeline.cancellation_checkers == [cancellation_checker]
+    assert summary.status == "skipped"
+    assert summary.warnings == (warning,)
+    assert summary.to_json_summary()["warnings"] == [warning.to_json()]
 
 
 def test_production_upload_runner_early_cancel_uses_request_count(
