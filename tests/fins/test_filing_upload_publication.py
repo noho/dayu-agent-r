@@ -48,13 +48,16 @@ from dayu.fins.pipelines.docling_process_converter import (
     DoclingConversionConfig,
     DoclingConversionResult,
 )
+from dayu.fins.pipelines import filing_upload_publication as publication_module
 from dayu.fins.pipelines.filing_upload_publication import (
+    FilingUploadPublicationDecision,
     FilingUploadPublicationOutcome,
     FilingUploadPublicationDisposition,
     FilingUploadPublishMode,
     arbitrate_filing_upload_publication,
     execute_prepared_filing_publication,
 )
+from dayu.fins.pipelines.upload_company_meta import UploadCompanyMetaDecision
 from dayu.fins.storage import (
     FILING_UPLOAD_ASSET_SOURCE_DOCLING,
     FILING_UPLOAD_ASSET_SOURCE_ORIGINAL,
@@ -84,6 +87,66 @@ _ORIGINAL_PRIMARY_SHA = "c" * 64
 _ORIGINAL_COMPANION_SHA = "d" * 64
 _DOCLING_SHA = "e" * 64
 _RESOLVER_VERSION = "market_resolver_v1.0.0"
+
+
+def _validate_with_incompatible_company_decision(
+    request: FinsUploadFilingRequest,
+    *,
+    published_state: FilingUploadPublishedState,
+) -> ValidatedFinsUploadFilingRequest:
+    """复用真实 validator 并返回 canonical skip 闭集外 company decision。
+
+    Args:
+        request: executor 重新验证的原始 filing request。
+        published_state: writer-owned batch view 中的 fresh published state。
+
+    Returns:
+        经 frozen dataclass owner 重新构造、company decision 为 skip/no-intent 的 request。
+
+    Raises:
+        FinsUploadUsageError: 真实 validator 的 usage failure 原样传播。
+        FinsUploadPrevalidationError: 真实 validator 的 prevalidation failure 原样传播。
+        ValueError: 真实 validator 或 dataclass owner 拒绝输入时原样传播。
+    """
+
+    fresh_request = validate_fins_upload_filing_request(
+        request,
+        published_state=published_state,
+    )
+    return replace(
+        fresh_request,
+        company_meta_decision=UploadCompanyMetaDecision("skip", None),
+    )
+
+
+def _force_skip_publication_decision(
+    *,
+    initial_request: ValidatedFinsUploadFilingRequest,
+    fresh_request: ValidatedFinsUploadFilingRequest,
+    prepared_identity: FilingUploadPublicationIdentity,
+    initial_skip_disposition: FilingInitialSkipDisposition,
+) -> FilingUploadPublicationDecision:
+    """模拟 arbitration 漂移并强制返回 canonical SKIP decision。
+
+    Args:
+        initial_request: preparation 使用的 initial request。
+        fresh_request: validator 产生的 fresh request。
+        prepared_identity: prepared candidate identity。
+        initial_skip_disposition: preparation 产生的 skip disposition。
+
+    Returns:
+        强制进入 SKIP 的 closed publication decision。
+
+    Raises:
+        无。
+    """
+
+    del initial_request, fresh_request, prepared_identity, initial_skip_disposition
+    return FilingUploadPublicationDecision(
+        disposition=FilingUploadPublicationDisposition.SKIP,
+        publish_mode=None,
+        failure_reason=None,
+    )
 
 
 class _PublicationBatchRecorder:
@@ -2006,6 +2069,158 @@ def _execute_metadata_only_skip_fixture(
         upload_service=upload_service,
         cancellation=None,
     )
+
+
+def test_canonical_skip_company_compatibility_accepts_keep_and_preserve(
+    tmp_path: Path,
+) -> None:
+    """canonical skip 的两个合法 company 模式必须由同一 predicate 接受。
+
+    Args:
+        tmp_path: 构造真实 validator 决策的临时文件根。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: keep/no-intent 或 stage/preserve-published 不再被接受时抛出。
+    """
+
+    primary = tmp_path / "canonical-skip.pdf"
+    primary.write_bytes(b"canonical skip")
+    identity = _build_publication_identity()
+    durable_company = _fresh_company_meta()
+    keep_request = _build_validated_request(
+        _build_request(primary, action="update"),
+        status=SourceIntegrityStatus.COMPLETE,
+        revision="stable",
+        publication_identity=identity,
+        company_meta=durable_company,
+    )
+    preserve_request = _build_validated_request(
+        _build_request(
+            primary,
+            action="update",
+            company_name="Apple Holdings",
+        ),
+        status=SourceIntegrityStatus.COMPLETE,
+        revision="stable",
+        publication_identity=identity,
+        company_meta=durable_company,
+    )
+
+    assert keep_request.company_meta_decision.disposition == "keep"
+    assert keep_request.company_meta_decision.company_meta_intent is None
+    assert publication_module._company_decision_allows_canonical_skip(
+        keep_request.company_meta_decision
+    )
+    assert preserve_request.company_meta_decision.disposition == "stage"
+    assert preserve_request.company_meta_decision.company_meta_intent is not None
+    assert preserve_request.company_meta_decision.company_meta_intent.merge_mode == "preserve_published"
+    assert publication_module._company_decision_allows_canonical_skip(
+        preserve_request.company_meta_decision
+    )
+
+
+def test_canonical_keep_skip_rolls_back_without_stage_or_commit(
+    tmp_path: Path,
+) -> None:
+    """合法 keep/no-intent SKIP 必须回滚空 batch 且不提交 durable mutation。
+
+    Args:
+        tmp_path: 构造最小 publication composition 的临时文件根。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: keep skip 的 predicate、结果或 batch lifecycle 漂移时抛出。
+    """
+
+    primary = tmp_path / "keep-skip.pdf"
+    primary.write_bytes(b"keep skip")
+    identity = _build_publication_identity()
+    initial = _build_validated_request(
+        _build_request(primary, action="update"),
+        status=SourceIntegrityStatus.COMPLETE,
+        revision="stable",
+        publication_identity=identity,
+        company_meta=_fresh_company_meta(),
+    )
+    assert publication_module._company_decision_allows_canonical_skip(
+        initial.company_meta_decision
+    )
+    batching = _PublicationBatchRecorder()
+
+    outcome, _state_repository = _execute_publication_test_candidate(
+        workspace_root=tmp_path,
+        request=initial,
+        fresh_state=initial.published_state,
+        batching=batching,
+        disposition=FilingInitialSkipDisposition.IDENTICAL_PUBLICATION,
+    )
+
+    assert outcome.result.status == "skipped"
+    assert batching.commit_tokens == []
+    assert batching.rollback_tokens == batching.begin_tokens
+
+
+def test_incompatible_company_decision_fails_before_canonical_skip_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """闭集外 company decision 必须在 stage/commit 前失败并恰好回滚一次。
+
+    Args:
+        tmp_path: 构造最小 publication composition 的临时文件根。
+        monkeypatch: 注入 arbitration 漂移的 pytest fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法 decision 触发 stage、commit、durable side effect 或错误 rollback 次数时抛出。
+    """
+
+    events: list[str] = []
+    batching = _PublicationBatchRecorder(
+        commit_outcome=CompanyMetaCommitOutcome(
+            company_meta=_fresh_company_meta(),
+            ignored_company_name=None,
+        ),
+        events=events,
+    )
+    company = _MetadataStageRecorder(events=events)
+    monkeypatch.setattr(
+        publication_module,
+        "validate_fins_upload_filing_request",
+        _validate_with_incompatible_company_decision,
+    )
+    monkeypatch.setattr(
+        publication_module,
+        "arbitrate_filing_upload_publication",
+        _force_skip_publication_decision,
+    )
+
+    with pytest.raises(ValueError, match="canonical SKIP company decision"):
+        _execute_metadata_only_skip_fixture(
+            workspace_root=tmp_path,
+            requested_company_name="Apple Holdings",
+            ticker_aliases=(),
+            batching=batching,
+            company_repository=company,
+        )
+
+    assert events == ["rollback"]
+    assert company.intents == []
+    assert company.stage_tokens == []
+    assert batching.commit_tokens == []
+    assert len(batching.begin_tokens) == 1
+    assert batching.rollback_tokens == batching.begin_tokens
+    assert tuple(
+        sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("*"))
+    ) == ("metadata-skip.pdf",)
+    assert (tmp_path / "metadata-skip.pdf").read_bytes() == b"metadata-only skip"
 
 
 def test_publication_outcome_rejects_cancelled_warning(tmp_path: Path) -> None:

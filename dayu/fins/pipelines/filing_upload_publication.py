@@ -38,7 +38,10 @@ from dayu.fins.pipelines.docling_upload_service import (
     rebase_prepared_filing_create_overwrite,
     rollback_prepared_upload_batch,
 )
-from dayu.fins.pipelines.upload_company_meta import stage_upload_company_meta_decision
+from dayu.fins.pipelines.upload_company_meta import (
+    UploadCompanyMetaDecision,
+    stage_upload_company_meta_decision,
+)
 from dayu.fins.storage import (
     BatchingRepositoryProtocol,
     CompanyMetaRepositoryProtocol,
@@ -423,6 +426,31 @@ def _require_stable_action_contract(
         raise ValueError("stable REPAIR_REQUIRED observation 必须保持同一 update repair authorization")
 
 
+def _company_decision_allows_canonical_skip(
+    decision: UploadCompanyMetaDecision,
+) -> bool:
+    """判断 company decision 是否属于 canonical skip 的封闭兼容集合。
+
+    Args:
+        decision: fresh validator 产生的 company meta 决策。
+
+    Returns:
+        keep/no-intent 或 stage/preserve-published intent 时返回 ``True``。
+
+    Raises:
+        无。
+    """
+
+    intent = decision.company_meta_intent
+    if decision.disposition == "keep":
+        return intent is None
+    return (
+        decision.disposition == "stage"
+        and intent is not None
+        and intent.merge_mode == "preserve_published"
+    )
+
+
 def _canonical_skip_requirements_are_met(
     fresh_request: ValidatedFinsUploadFilingRequest,
     prepared_identity: FilingUploadPublicationIdentity,
@@ -448,11 +476,7 @@ def _canonical_skip_requirements_are_met(
         return False
     if fresh_state.publication_identity is None or fresh_state.publication_identity != prepared_identity:
         return False
-    if decision.disposition == "keep":
-        return decision.company_meta_intent is None
-    if decision.disposition != "stage" or decision.company_meta_intent is None:
-        return False
-    return decision.company_meta_intent.merge_mode == "preserve_published"
+    return _company_decision_allows_canonical_skip(decision)
 
 
 def arbitrate_filing_upload_publication(
@@ -768,6 +792,11 @@ def execute_prepared_filing_publication(
 
         if decision.disposition is FilingUploadPublicationDisposition.SKIP:
             company_decision = fresh_request.company_meta_decision
+            if not _company_decision_allows_canonical_skip(company_decision):
+                raise ValueError(
+                    "canonical SKIP company decision 必须是 keep/no-intent 或 "
+                    "stage/preserve-published intent"
+                )
             if company_decision.disposition == "keep":
                 batch_terminal_started = True
                 _rollback_without_business_terminal(
