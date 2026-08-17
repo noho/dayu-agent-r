@@ -252,7 +252,10 @@ def _upload_parameters_schema() -> ToolParametersSchema:
         },
         "fiscal_period": {
             "type": "string",
-            "description": "财报期间，例如 FY、Q1、Q2、Q3 或 Q4。上传 filing 时必填；上传 material 时可选。",
+            "description": (
+                "财报期间。上传 filing 时必填且只支持 FY、H1、Q1、Q2、Q3、Q4；"
+                "上传 material 时可选。"
+            ),
         },
         "form_type": {
             "type": "string",

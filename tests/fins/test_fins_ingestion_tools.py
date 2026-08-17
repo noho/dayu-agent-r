@@ -34,9 +34,12 @@ from dayu.fins.ingestion_runtime import (
     FinsJobCancellationChecker,
     FinsPreprocessRequest,
     FinsUploadFilingRequest,
+    FinsUploadRunner,
+    FinsUploadResultSummary,
     FinsUploadRequest,
     FinsUploadUsageCode,
     FinsUploadMaterialRequest,
+    ValidatedFinsUploadFilingRequest,
     fins_upload_usage_failure,
 )
 from dayu.fins.ingestion import (
@@ -770,6 +773,117 @@ class _NoOpExecutor:
         self.submitted_job_ids = self.submitted_job_ids + (job_id,)
 
 
+class _HoldingExecutor:
+    """测试用可控执行器，保存后台任务并由测试显式执行。"""
+
+    submitted_job_ids: tuple[str, ...]
+    operations: tuple[Callable[[], None], ...]
+
+    def __init__(self) -> None:
+        """初始化提交记录与待执行任务。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.submitted_job_ids = ()
+        self.operations = ()
+
+    def submit(self, job_id: str, operation: Callable[[], None]) -> None:
+        """记录后台任务但不立即执行。
+
+        Args:
+            job_id: opaque operation id。
+            operation: 待测试显式执行的后台任务。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.submitted_job_ids = self.submitted_job_ids + (job_id,)
+        self.operations = self.operations + (operation,)
+
+    def run_next(self) -> None:
+        """执行最早提交的后台任务。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 当前没有且只有一个待执行任务时抛出。
+            Exception: 后台任务抛出的异常原样传播。
+        """
+
+        assert len(self.operations) == 1
+        operation = self.operations[0]
+        self.operations = ()
+        operation()
+
+
+class _RecordingFinsUploadRunner(FinsUploadRunner):
+    """记录 runtime 交付的 typed 上传请求并返回删除摘要。"""
+
+    calls: tuple[ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest, ...]
+
+    def __init__(self) -> None:
+        """初始化 runner 调用记录。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.calls = ()
+
+    def run_upload(
+        self,
+        request: ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest,
+        *,
+        cancellation_checker: FinsJobCancellationChecker,
+    ) -> FinsUploadResultSummary:
+        """记录 validated 请求并返回稳定的 filing 删除结果。
+
+        Args:
+            request: runtime owner 校验后的上传请求。
+            cancellation_checker: runtime 注入的协作式取消检查器。
+
+        Returns:
+            不触发真实上传的稳定删除摘要。
+
+        Raises:
+            AssertionError: 测试意外把 material 请求交给该 runner 时抛出。
+            ValueError: 返回摘要违反 typed contract 时抛出。
+        """
+
+        del cancellation_checker
+        assert isinstance(request, ValidatedFinsUploadFilingRequest)
+        self.calls = self.calls + (request,)
+        return FinsUploadResultSummary(
+            source_kind=SourceKind.FILING,
+            status="deleted",
+            requested_file_count=0,
+            stored_file_count=0,
+            deleted=True,
+        )
+
+
 class _ForbiddenFilingUploadStateRepository:
     """tool static admission 测试中禁止读取的 filing state 仓储。"""
 
@@ -1241,6 +1355,18 @@ def test_upload_tool_projects_real_workspace_identity_corruption(
 @pytest.mark.parametrize(
     ("argument_overrides", "expected_message"),
     (
+        (
+            {"ticker": "AAPL", "fiscal_period": "BANANA"},
+            "--fiscal-period 仅支持 FY、H1、Q1、Q2、Q3、Q4",
+        ),
+        (
+            {"ticker": "600519", "fiscal_period": "9M"},
+            "--fiscal-period 仅支持 FY、H1、Q1、Q2、Q3、Q4",
+        ),
+        (
+            {"ticker": "0700.HK", "fiscal_period": "BANANA"},
+            "--fiscal-period 仅支持 FY、H1、Q1、Q2、Q3、Q4",
+        ),
         ({"fiscal_year": 999}, "财年（fiscal_year）必须是 1000..9999 的整数"),
         ({"fiscal_year": 10000}, "财年（fiscal_year）必须是 1000..9999 的整数"),
         *tuple(
@@ -1259,12 +1385,12 @@ def test_upload_tool_projects_real_workspace_identity_corruption(
         ),
     ),
 )
-def test_upload_tool_filing_calendar_year_invalid_input_has_zero_side_effects(
+def test_upload_tool_filing_static_invalid_input_has_zero_side_effects(
     tmp_path: Path,
     argument_overrides: Mapping[str, JsonValue],
     expected_message: str,
 ) -> None:
-    """filing calendar/year 非法参数必须精确失败且不产生任何副作用。
+    """filing 静态非法参数必须精确失败且不产生任何副作用。
 
     Args:
         tmp_path: pytest 临时目录。
@@ -1301,13 +1427,87 @@ def test_upload_tool_filing_calendar_year_invalid_input_has_zero_side_effects(
     assert isinstance(outcome, ToolFailedOutcome)
     assert outcome.result.error == "invalid_argument"
     assert outcome.result.message == expected_message
-    assert "--" not in outcome.result.message
+    assert outcome.result.hint == (
+        "请检查 ticker、upload_kind、action、files、primary、会计期间和材料字段后重试。"
+    )
     assert state_repository.calls == []
     assert state_repository.batch_calls == []
     assert executor.submitted_job_ids == ()
+    upload_runner = runtime.upload_runner
+    assert isinstance(upload_runner, _RecordingFinsUploadRunner)
+    assert upload_runner.calls == ()
     assert runtime._observations == {}
     assert not tuple(_job_store_root(workspace_root).glob("*.json"))
     assert _snapshot_tool_workspace_tree(workspace_root) == before_tree
+
+
+@pytest.mark.parametrize(
+    ("ticker", "raw_period", "expected_period"),
+    (
+        ("AAPL", " fy ", "FY"),
+        ("600519", " q2 ", "Q2"),
+        ("0700.HK", " h1 ", "H1"),
+    ),
+)
+def test_upload_tool_raw_period_is_canonical_at_runner_contract_boundary(
+    tmp_path: Path,
+    ticker: str,
+    raw_period: str,
+    expected_period: str,
+) -> None:
+    """tool raw 财期应由 runtime owner 规范化后交给上传 runner。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        ticker: 覆盖 US、CN 与 HK 的公司代码。
+        raw_period: 携带小写与首尾空白的 raw tool 参数。
+        expected_period: 期望的 canonical 财期。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: runner 未收到 typed canonical 财期或 observation 未被清理时抛出。
+    """
+
+    workspace_root = _build_workspace(tmp_path)
+    executor = _HoldingExecutor()
+    upload_runner = _RecordingFinsUploadRunner()
+    runtime = _runtime_with_executor(
+        workspace_root=workspace_root,
+        executor=executor,
+        upload_runner=upload_runner,
+    )
+
+    outcome = asyncio.run(
+        FinsUploadToolCallable(runtime=runtime)(
+            _call(
+                UPLOAD_TOOL_NAME,
+                {
+                    "ticker": ticker,
+                    "upload_kind": "filing",
+                    "action": "delete",
+                    "fiscal_year": 2024,
+                    "fiscal_period": raw_period,
+                },
+            ),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolAwaitingOutcome)
+    assert len(runtime._observations) == 1
+    record = next(iter(runtime._observations.values()))
+    try:
+        runtime.activate_observation(record.handle)
+        executor.run_next()
+        assert len(upload_runner.calls) == 1
+        validated_request = upload_runner.calls[0]
+        assert isinstance(validated_request, ValidatedFinsUploadFilingRequest)
+        assert validated_request.normalized_fiscal_period == expected_period
+    finally:
+        asyncio.run(runtime.abandon_observation(record.handle))
+    assert runtime._observations == {}
 
 
 @pytest.mark.parametrize(
@@ -1448,6 +1648,7 @@ def test_upload_tool_calendar_year_schema_and_usage_messages_are_business_neutra
     runtime = DefaultFinsRuntime.create(workspace_root=_build_workspace(tmp_path)).get_ingestion_runtime()
     properties = build_fins_upload_tool(runtime).schema.function.parameters.properties
     fiscal_year_schema = properties["fiscal_year"]
+    fiscal_period_schema = properties["fiscal_period"]
     filing_date_schema = properties["filing_date"]
     report_date_schema = properties["report_date"]
     ticker_schema = properties["ticker"]
@@ -1456,6 +1657,7 @@ def test_upload_tool_calendar_year_schema_and_usage_messages_are_business_neutra
     primary_schema = properties["primary"]
 
     assert isinstance(fiscal_year_schema, dict)
+    assert isinstance(fiscal_period_schema, dict)
     assert isinstance(filing_date_schema, dict)
     assert isinstance(report_date_schema, dict)
     assert isinstance(ticker_schema, dict)
@@ -1515,6 +1717,9 @@ def test_upload_tool_calendar_year_schema_and_usage_messages_are_business_neutra
         assert forbidden_fragment not in str(primary_schema["description"])
     assert fiscal_year_schema["description"] == (
         "财年。上传 filing 时必填，且只接受 1000..9999 的整数；上传 material 时可选。"
+    )
+    assert fiscal_period_schema["description"] == (
+        "财报期间。上传 filing 时必填且只支持 FY、H1、Q1、Q2、Q3、Q4；上传 material 时可选。"
     )
     assert filing_date_schema["description"] == (
         "可选披露日期。上传 filing 时若填写，必须是实际存在的 YYYY-MM-DD 日期；"
@@ -2518,6 +2723,7 @@ def _runtime_with_static_admission_guard(
 
     base_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
     executor = _NoOpExecutor()
+    upload_runner = _RecordingFinsUploadRunner()
     state_repository = _ForbiddenFilingUploadStateRepository()
     runtime = FinsIngestionRuntime.create(
         batching_repository=base_runtime.batching_repository,
@@ -2529,6 +2735,7 @@ def _runtime_with_static_admission_guard(
         processor_registry=base_runtime.processor_registry,
         job_store=base_runtime.ingestion_job_store,
         executor=executor,
+        upload_runner=upload_runner,
     )
     return runtime, executor, state_repository
 
@@ -2537,12 +2744,14 @@ def _runtime_with_executor(
     *,
     workspace_root: Path,
     executor: FinsIngestionExecutor,
+    upload_runner: FinsUploadRunner | None = None,
 ) -> FinsIngestionRuntime:
     """使用指定后台执行器构造 ingestion runtime。
 
     Args:
         workspace_root: Fins workspace root。
         executor: 测试注入的后台执行器。
+        upload_runner: 可选测试上传 runner。
 
     Returns:
         Fins ingestion 运行时。
@@ -2562,6 +2771,7 @@ def _runtime_with_executor(
         processor_registry=base_runtime.processor_registry,
         job_store=base_runtime.ingestion_job_store,
         executor=executor,
+        upload_runner=upload_runner,
     )
 
 

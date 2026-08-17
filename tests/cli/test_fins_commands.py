@@ -1623,8 +1623,18 @@ def test_download_static_usage_error_precedes_workspace_and_service_factory(
             "--fiscal-period 长度不能超过 240 个字符",
         ),
         (
+            "UF-FIX01-US-invalid-period-fresh",
+            ("--ticker", "AAPL", "--fiscal-year", "2024", "--fiscal-period", "BANANA"),
+            "--fiscal-period 仅支持 FY、H1、Q1、Q2、Q3、Q4",
+        ),
+        (
             "UF-024",
             ("--ticker", "600519", "--fiscal-year", "2024", "--fiscal-period", "9M"),
+            "--fiscal-period 仅支持 FY、H1、Q1、Q2、Q3、Q4",
+        ),
+        (
+            "UF-FIX01-HK-invalid-period-fresh",
+            ("--ticker", "0700.HK", "--fiscal-year", "2024", "--fiscal-period", "BANANA"),
             "--fiscal-period 仅支持 FY、H1、Q1、Q2、Q3、Q4",
         ),
         (
@@ -1787,7 +1797,10 @@ def test_upload_filing_usage_matrix_precedes_service_factory_and_workspace_mutat
     """
 
     workspace_root = tmp_path / f"workspace-{case_id}"
-    seed_workspace = case_id == "UF-S2-seeded-invalid-report-date"
+    seed_workspace = case_id in {
+        "UF-S2-seeded-invalid-report-date",
+        "UF-024",
+    }
     if seed_workspace:
         workspace_root.mkdir(parents=True)
         (workspace_root / "sentinel.txt").write_text("unchanged", encoding="utf-8")
@@ -1819,11 +1832,67 @@ def test_upload_filing_usage_matrix_precedes_service_factory_and_workspace_mutat
     assert exit_code == EXIT_USAGE_ERROR
     assert captured.out == ""
     assert captured.err == f"dayu-cli upload_filing: {expected_reason}\n"
+    assert "Traceback" not in captured.err
     assert factory_calls == []
     assert service.upload_filing_requests == []
     assert service.stream_calls == []
     assert _snapshot_cli_workspace_tree(workspace_root) == before_tree
     assert workspace_root.exists() is seed_workspace
+
+
+@pytest.mark.parametrize(
+    ("ticker", "raw_period", "expected_period"),
+    (
+        ("AAPL", " fy ", "FY"),
+        ("600519", " q2 ", "Q2"),
+        ("0700.HK", " h1 ", "H1"),
+    ),
+)
+def test_upload_filing_canonicalizes_period_before_validated_service_handoff(
+    tmp_path: Path,
+    fake_service: _FakeFinsDirectService,
+    ticker: str,
+    raw_period: str,
+    expected_period: str,
+) -> None:
+    """CLI 合法财期应由共享 owner 规范化后交给 Service。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        fake_service: 记录 validated request 的 direct Service 替身。
+        ticker: 覆盖 US、CN 与 HK 的公司代码。
+        raw_period: 携带小写与首尾空白的原始财期。
+        expected_period: 期望的 canonical 财期。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: CLI 入口未把 owner 产出的 canonical 财期交给 Service 时抛出。
+    """
+
+    workspace_root = tmp_path / f"workspace-{ticker.replace('.', '-')}"
+
+    exit_code = cli_main.main(
+        (
+            "upload_filing",
+            "--base",
+            str(workspace_root),
+            "--ticker",
+            ticker,
+            "--action",
+            "delete",
+            "--fiscal-year",
+            "2024",
+            "--fiscal-period",
+            raw_period,
+        )
+    )
+
+    assert exit_code == EXIT_SUCCESS
+    assert len(fake_service.upload_filing_requests) == 1
+    assert fake_service.upload_filing_requests[0].fiscal_period == expected_period
+    assert fake_service.stream_calls == [FinsOperationKind.UPLOAD_FILING]
 
 
 @pytest.mark.parametrize(
