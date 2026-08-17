@@ -13,6 +13,7 @@ from typing import Final, Literal
 from dayu.fins.domain.company_meta_contract import (
     CompanyMetaCommitIntent,
     build_company_meta_commit_intent,
+    company_names_are_equivalent,
 )
 from dayu.fins.domain.document_models import BatchToken, CompanyMeta
 from dayu.fins.storage import CompanyMetaRepositoryProtocol
@@ -71,6 +72,7 @@ def resolve_upload_company_meta_decision(
     if action not in UPLOAD_ACTIONS_REQUIRING_COMPANY_META:
         return UploadCompanyMetaDecision(disposition="skip", company_meta_intent=None)
     proposed_identity = build_company_ticker_identity(ticker, ticker_aliases)
+    requested_company_name = _optional_upload_company_name(company_name)
     if existing_meta is not None:
         existing_identity = existing_meta.ticker_identity
         if (
@@ -90,7 +92,11 @@ def resolve_upload_company_meta_decision(
             existing_meta=existing_meta,
             resolver_version=RESOLVER_VERSION,
         ):
-            if merged_identity == existing_identity:
+            name_change_requested = requested_company_name is not None and not company_names_are_equivalent(
+                requested_company_name,
+                existing_meta.company_name,
+            )
+            if merged_identity == existing_identity and not name_change_requested:
                 return UploadCompanyMetaDecision(disposition="keep", company_meta_intent=None)
             return UploadCompanyMetaDecision(
                 disposition="stage",
@@ -101,8 +107,10 @@ def resolve_upload_company_meta_decision(
                     proposed_company_id=None,
                     proposed_company_name=None,
                     resolver_version=RESOLVER_VERSION,
+                    requested_company_name=requested_company_name,
                 ),
             )
+    required_company_name = _require_upload_company_name(company_name)
     return UploadCompanyMetaDecision(
         disposition="stage",
         company_meta_intent=build_company_meta_commit_intent(
@@ -110,8 +118,9 @@ def resolve_upload_company_meta_decision(
             merge_mode="refresh_if_stale",
             observed_meta=existing_meta,
             proposed_company_id=ticker_to_company_id(normalize_ticker(proposed_identity.canonical_ticker)),
-            proposed_company_name=_require_upload_company_name(company_name),
+            proposed_company_name=required_company_name,
             resolver_version=RESOLVER_VERSION,
+            requested_company_name=required_company_name,
         ),
     )
 
@@ -220,6 +229,23 @@ def _require_upload_company_name(value: str | None) -> str:
     if not normalized_value:
         raise UploadCompanyNameRequiredError("create/update 时必须提供 --company-name")
     return normalized_value
+
+
+def _optional_upload_company_name(value: str | None) -> str | None:
+    """规范 fresh metadata 场景可选的 upload 公司名称。
+
+    Args:
+        value: 原始可选公司名称。
+
+    Returns:
+        去除首尾空白后的非空名称；缺失或仅空白时返回 ``None``。
+
+    Raises:
+        无。
+    """
+
+    normalized_value = str(value or "").strip()
+    return normalized_value or None
 
 
 def _load_existing_company_meta(

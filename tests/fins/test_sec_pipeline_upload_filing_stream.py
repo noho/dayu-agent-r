@@ -22,7 +22,10 @@ import dayu.fins.pipelines.sec_upload_workflow as sec_upload_workflow
 import dayu.fins.pipelines._filing_upload_fresh_validation as fresh_validation_module
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
-from dayu.fins.domain.company_meta_contract import CompanyMetaCommitIntent
+from dayu.fins.domain.company_meta_contract import (
+    CompanyMetaCommitIntent,
+    CompanyMetaCommitOutcome,
+)
 from dayu.fins.domain.document_models import (
     BatchToken,
     CompanyMeta,
@@ -34,6 +37,7 @@ from dayu.fins.ticker_normalization import build_company_ticker_identity
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.ingestion_runtime import (
     FinsUploadFilingRequest,
+    FinsUploadPipelineResult,
     FinsUploadUsageCode,
     FinsUploadUsageError,
     ValidatedFinsUploadFilingRequest,
@@ -454,14 +458,15 @@ class _CommitSnapshotTrackingBatchingRepository(TrackingBatchingRepository):
             raise TimeoutError("first commit source snapshot 未产生")
         return super().begin_batch(ticker)
 
-    def commit_batch(self, batch: BatchToken) -> None:
+    def commit_batch(self, batch: BatchToken) -> CompanyMetaCommitOutcome | None:
         """执行真实 commit 后从公开仓储读取同版 meta 与 opaque revision。
 
         Args:
             batch: caller 转交的真实 batch capability。
 
         Returns:
-            commit 与 snapshot 记录成功后返回 ``None``。
+            commit 与 snapshot 记录成功后返回真实 publication-final
+            company-meta outcome；无 intent 时返回 ``None``。
 
         Raises:
             AssertionError: 当前测试 ticker 不只包含一个 filing target 时抛出。
@@ -470,7 +475,7 @@ class _CommitSnapshotTrackingBatchingRepository(TrackingBatchingRepository):
             RuntimeError: publication/snapshot owner 失败时抛出。
         """
 
-        super().commit_batch(batch)
+        outcome = super().commit_batch(batch)
         document_ids = self._source_repository.list_source_document_ids(
             batch.ticker,
             SourceKind.FILING,
@@ -493,6 +498,7 @@ class _CommitSnapshotTrackingBatchingRepository(TrackingBatchingRepository):
             )
         if len(self._snapshots) == 1:
             self._first_snapshot_recorded.set()
+        return outcome
 
 
 class _SpawnResultQueue(Protocol):
@@ -1746,6 +1752,17 @@ async def test_upload_filing_fresh_recheck_discards_stale_action_and_company_dec
     batching.rollback_tokens.clear()
     company.stage_tokens.clear()
     source.stage_tokens.clear()
+    before_company_meta = pipeline._company_repository.get_company_meta("AAPL")
+    before_company_meta_bytes = json.dumps(
+        before_company_meta.to_dict(),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    before_source_state = pipeline._filing_upload_state_repository.read_filing_upload_state(
+        "AAPL",
+        stale_preflight.document_id,
+    )
     published_tree = published_tree_sha256(tmp_path, "AAPL")
 
     stale_events = [event async for event in pipeline.upload_filing_stream(stale_preflight)]
@@ -1755,13 +1772,342 @@ async def test_upload_filing_fresh_recheck_discards_stale_action_and_company_dec
     assert stale_result["filing_action"] == "update"
     assert stale_result["status"] == "skipped"
     assert stale_result["stored_file_count"] == 0
-    assert pipeline._company_repository.get_company_meta("AAPL").company_name == ("Published Company Name")
+    assert stale_result["warnings"] == [
+        {
+            "kind": "company_name_ignored",
+            "message": "本次提交的公司名称未生效；已保留现有公司名称。请核对上传目标公司是否正确。",
+        }
+    ]
+    after_company_meta = pipeline._company_repository.get_company_meta("AAPL")
+    after_company_meta_bytes = json.dumps(
+        after_company_meta.to_dict(),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    after_source_state = pipeline._filing_upload_state_repository.read_filing_upload_state(
+        "AAPL",
+        stale_preflight.document_id,
+    )
+    assert after_company_meta.company_name == "Published Company Name"
+    assert after_company_meta.updated_at == before_company_meta.updated_at
+    assert after_company_meta_bytes == before_company_meta_bytes
+    assert after_source_state == before_source_state
     assert len(batching.begin_tokens) == 1
-    assert batching.commit_tokens == []
-    assert batching.rollback_tokens == batching.begin_tokens
-    assert company.stage_tokens == []
+    assert batching.commit_tokens == batching.begin_tokens
+    assert batching.rollback_tokens == []
+    assert company.stage_tokens == batching.begin_tokens
     assert source.stage_tokens == []
     assert published_tree_sha256(tmp_path, "AAPL") == published_tree
+
+
+@pytest.mark.asyncio
+async def test_fresh_different_company_name_uploads_changed_filing_with_warning(
+    tmp_path: Path,
+) -> None:
+    """fresh canonical name 在 filing 真更新成功时保持不变并产生 final warning。
+
+    Args:
+        tmp_path: 临时 workspace。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: uploaded warning 或 canonical company identity 漂移时抛出。
+    """
+
+    pipeline, _batching, _company, _source = _tracking_sec_pipeline(tmp_path)
+    filing_file = tmp_path / "fresh-name-update.pdf"
+    filing_file.write_bytes(b"filing-v1")
+    create_request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action="create",
+        company_name="Apple Inc.",
+    )
+    create_events = [event async for event in pipeline.upload_filing_stream(create_request)]
+    assert create_events[-1].event_type is UploadFilingEventType.UPLOAD_COMPLETED
+    filing_file.write_bytes(b"filing-v2")
+    update_request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action="update",
+        company_name="Apple Holdings",
+    )
+
+    events = [event async for event in pipeline.upload_filing_stream(update_request)]
+
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    assert result["status"] == "ok"
+    assert result["warnings"] == [
+        {
+            "kind": "company_name_ignored",
+            "message": "本次提交的公司名称未生效；已保留现有公司名称。请核对上传目标公司是否正确。",
+        }
+    ]
+    assert pipeline._company_repository.get_company_meta("AAPL").company_name == "Apple Inc."
+
+
+@pytest.mark.asyncio
+async def test_upload_filing_identical_skip_atomically_commits_new_alias_only(
+    tmp_path: Path,
+) -> None:
+    """SEC identical skip 应只提交合法 alias，且 source publication exact 不变。
+
+    Args:
+        tmp_path: 临时 workspace。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: alias durable、warning、batch 或 source tree contract 漂移时抛出。
+    """
+
+    pipeline, batching, company, source = _tracking_sec_pipeline(tmp_path)
+    filing_file = tmp_path / "alias-skip.pdf"
+    filing_file.write_bytes(b"identical alias skip")
+    first_request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action=None,
+        company_name="Apple Inc.",
+    )
+    first_events = [event async for event in pipeline.upload_filing_stream(first_request)]
+    assert first_events[-1].event_type is UploadFilingEventType.UPLOAD_COMPLETED
+    second_request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action=None,
+        company_name="  ＡＰＰＬＥ　ＩＮＣ.  ",
+        ticker_aliases=("APPL",),
+    )
+    before_state = pipeline._filing_upload_state_repository.read_filing_upload_state(
+        "AAPL",
+        second_request.document_id,
+    )
+    before_tree = published_tree_sha256(tmp_path, "AAPL")
+    batching.begin_tokens.clear()
+    batching.commit_tokens.clear()
+    batching.rollback_tokens.clear()
+    company.stage_tokens.clear()
+    source.stage_tokens.clear()
+
+    events = [event async for event in pipeline.upload_filing_stream(second_request)]
+
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    assert result["status"] == "skipped"
+    assert result["warnings"] == []
+    assert batching.commit_tokens == batching.begin_tokens
+    assert batching.rollback_tokens == []
+    assert company.stage_tokens == batching.begin_tokens
+    assert source.stage_tokens == []
+    final_meta = pipeline._company_repository.get_company_meta("AAPL")
+    assert final_meta.ticker_identity.accepted_aliases == ("APPL",)
+    after_state = pipeline._filing_upload_state_repository.read_filing_upload_state(
+        "AAPL",
+        second_request.document_id,
+    )
+    assert after_state.source_integrity == before_state.source_integrity
+    assert after_state.source_meta == before_state.source_meta
+    assert after_state.publication_identity == before_state.publication_identity
+    assert published_tree_sha256(tmp_path, "AAPL") != before_tree
+    before_source_tree = {
+        path: digest
+        for path, digest in before_tree.items()
+        if path != "portfolio/AAPL/meta.json"
+    }
+    after_source_tree = {
+        path: digest
+        for path, digest in published_tree_sha256(tmp_path, "AAPL").items()
+        if path != "portfolio/AAPL/meta.json"
+    }
+    assert after_source_tree == before_source_tree
+
+
+@pytest.mark.asyncio
+async def test_metadata_only_skip_fails_closed_for_unrelated_incomplete_source_tree(
+    tmp_path: Path,
+) -> None:
+    """同 ticker 无关 source 非 COMPLETE 时 metadata-only commit 必须整体失败。
+
+    Args:
+        tmp_path: 临时 workspace。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: whole-tree validation、warning 或原子性 contract 漂移时抛出。
+    """
+
+    pipeline, batching, company, source = _tracking_sec_pipeline(tmp_path)
+    filing_file = tmp_path / "degraded-tree.pdf"
+    filing_file.write_bytes(b"degraded tree metadata skip")
+    published_request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action=None,
+        company_name="Apple Inc.",
+    )
+    published_events = [event async for event in pipeline.upload_filing_stream(published_request)]
+    assert published_events[-1].event_type is UploadFilingEventType.UPLOAD_COMPLETED
+    unrelated_source = tmp_path / "portfolio" / "AAPL" / "materials" / "unrelated-repair"
+    unrelated_source.mkdir(parents=True)
+    (unrelated_source / "undeclared.bin").write_bytes(b"repair required")
+    request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action=None,
+        company_name="Apple Holdings",
+    )
+    before_meta = pipeline._company_repository.get_company_meta("AAPL")
+    before_tree = published_tree_sha256(tmp_path, "AAPL")
+    batching.begin_tokens.clear()
+    batching.commit_tokens.clear()
+    batching.rollback_tokens.clear()
+    company.stage_tokens.clear()
+    source.stage_tokens.clear()
+
+    events = [event async for event in pipeline.upload_filing_stream(request)]
+
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    assert events[-1].event_type is UploadFilingEventType.UPLOAD_FAILED
+    assert result["status"] == "failed"
+    assert result["warnings"] == []
+    assert batching.commit_tokens == batching.begin_tokens
+    assert batching.rollback_tokens == []
+    assert company.stage_tokens == batching.begin_tokens
+    assert source.stage_tokens == []
+    assert pipeline._company_repository.get_company_meta("AAPL") == before_meta
+    assert published_tree_sha256(tmp_path, "AAPL") == before_tree
+
+
+@pytest.mark.asyncio
+async def test_skip_alias_collision_after_capability_transfer_is_typed_and_atomic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """skip alias 在另一 ticker 抢占后必须 typed fail，且不泄漏 warning/partial mutation。
+
+    Args:
+        tmp_path: 临时 workspace。
+        monkeypatch: 事件控制的 commit 入口替换夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: barrier 顺序、唯一 winner 或原子性 contract 漂移时抛出。
+    """
+
+    pipeline, batching, company, source = _tracking_sec_pipeline(tmp_path)
+    filing_file = tmp_path / "skip-alias-collision.pdf"
+    filing_file.write_bytes(b"skip alias collision")
+    published_request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action=None,
+        company_name="Apple Inc.",
+    )
+    published_events = [event async for event in pipeline.upload_filing_stream(published_request)]
+    assert published_events[-1].event_type is UploadFilingEventType.UPLOAD_COMPLETED
+    colliding_request = _validated_sec_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action=None,
+        company_name="Apple Holdings",
+        ticker_aliases=("SHARED",),
+    )
+    before_meta = pipeline._company_repository.get_company_meta("AAPL")
+    before_source_state = pipeline._filing_upload_state_repository.read_filing_upload_state(
+        "AAPL",
+        colliding_request.document_id,
+    )
+    before_tree = published_tree_sha256(tmp_path, "AAPL")
+    batching.begin_tokens.clear()
+    batching.commit_tokens.clear()
+    batching.rollback_tokens.clear()
+    company.stage_tokens.clear()
+    source.stage_tokens.clear()
+    entered = Event()
+    release = Event()
+    original_commit = batching.commit_batch
+
+    def commit_after_alias_winner(
+        batch: BatchToken,
+    ) -> CompanyMetaCommitOutcome | None:
+        """等待另一 ticker 抢占 alias 后再进入真实 storage commit。
+
+        Args:
+            batch: AAPL metadata-only batch capability。
+
+        Returns:
+            真实 commit outcome；本测试预期不正常返回。
+
+        Raises:
+            TimeoutError: 测试未释放 commit 时抛出。
+            BaseException: 真实 storage commit failure 原样传播。
+        """
+
+        entered.set()
+        if not release.wait(timeout=10):
+            raise TimeoutError("alias winner 未释放 metadata commit")
+        return original_commit(batch)
+
+    monkeypatch.setattr(batching, "commit_batch", commit_after_alias_winner)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(pipeline.upload_filing, colliding_request)
+        assert entered.wait(timeout=10)
+        winner_set = build_fs_repository_set(
+            workspace_root=tmp_path,
+            create_directories=False,
+        )
+        winner_batching = TrackingBatchingRepository(
+            tmp_path,
+            repository_set=winner_set,
+        )
+        winner_company = TrackingCompanyMetaRepository(
+            tmp_path,
+            repository_set=winner_set,
+        )
+        winner_batch = winner_batching.begin_batch("MSFT")
+        stage_company_meta_fixture(
+            winner_company,
+            CompanyMeta(
+                company_id="company-msft",
+                company_name="Microsoft Corp.",
+                ticker_identity=build_company_ticker_identity("MSFT", ("SHARED",)),
+                resolver_version=RESOLVER_VERSION,
+                updated_at="winner",
+            ),
+            batch=winner_batch,
+        )
+        winner_batching.commit_batch(winner_batch)
+        release.set()
+        result = future.result(timeout=10)
+
+    assert result["status"] == "failed"
+    assert result["warnings"] == []
+    failure = result["failure"]
+    assert isinstance(failure, dict)
+    assert failure["code"] == "ticker_alias_conflict"
+    assert batching.commit_tokens == batching.begin_tokens
+    assert batching.rollback_tokens == []
+    assert company.stage_tokens == batching.begin_tokens
+    assert source.stage_tokens == []
+    assert pipeline._company_repository.get_company_meta("AAPL") == before_meta
+    after_source_state = pipeline._filing_upload_state_repository.read_filing_upload_state(
+        "AAPL",
+        colliding_request.document_id,
+    )
+    assert after_source_state == before_source_state
+    assert published_tree_sha256(tmp_path, "AAPL") == before_tree
+    assert winner_company.resolve_company_ticker("SHARED") == "MSFT"
 
 
 @pytest.mark.asyncio
@@ -1957,6 +2303,7 @@ async def test_upload_filing_observably_classifies_cancelled_docling_storage_and
     assert isinstance(result, dict)
     assert result["status"] == expected_status
     assert result["stored_file_count"] == 0
+    assert result["warnings"] == []
     if expected_code is None:
         assert events[-1].event_type is UploadFilingEventType.UPLOAD_COMPLETED
         assert "failure" not in result
@@ -1974,7 +2321,7 @@ async def test_upload_filing_observably_classifies_cancelled_docling_storage_and
 
 
 @pytest.mark.asyncio
-async def test_upload_filing_empty_fails_before_batch_with_typed_label(
+async def test_sec_filing_failure_event_roundtrips_typed_reason_with_empty_warnings(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -2011,6 +2358,7 @@ async def test_upload_filing_empty_fails_before_batch_with_typed_label(
     assert isinstance(failure, dict)
     assert result["status"] == "failed"
     assert result["stored_file_count"] == 0
+    assert result["warnings"] == []
     assert failure == {
         "kind": "content",
         "code": "empty_input_file",
@@ -2018,6 +2366,13 @@ async def test_upload_filing_empty_fails_before_batch_with_typed_label(
         "retry_hint": "请提供非空文件后重试",
         "file_label": "empty.pdf",
     }
+    parsed = FinsUploadPipelineResult.from_pipeline_json(
+        result,
+        source_kind=SourceKind.FILING,
+    )
+    assert parsed.failure_reason is not None
+    assert parsed.failure_reason.to_json() == failure
+    assert parsed.warnings == ()
     assert "typed content admission failed" in caplog.text
     assert calls == []
     assert batching.begin_tokens == []
@@ -2114,6 +2469,7 @@ async def test_upload_filing_corrupt_primary_with_valid_companions_fails_atomica
     assert isinstance(result, dict)
     failure = result["failure"]
     assert isinstance(failure, dict)
+    assert result["warnings"] == []
     assert result["stored_file_count"] == 0
     assert failure["code"] == "docling_converter_execution"
     assert failure["file_label"] == "corrupt.pdf"
@@ -2235,6 +2591,7 @@ async def test_upload_filing_alias_conflict_projects_exact_typed_terminal(tmp_pa
     assert isinstance(result, dict)
     assert events[-1].event_type is UploadFilingEventType.UPLOAD_FAILED
     assert result["stored_file_count"] == 0
+    assert result["warnings"] == []
     assert result["failure"] == {
         "kind": "storage",
         "code": "ticker_alias_conflict",
@@ -2520,6 +2877,13 @@ async def test_upload_filing_fresh_read_failures_use_prevalidation_failure_owner
     assert failure["kind"] == "storage"
     assert failure["code"] == "storage_io"
     assert failure["message"] == expected_message
+    parsed = FinsUploadPipelineResult.from_pipeline_json(
+        result,
+        source_kind=SourceKind.FILING,
+    )
+    assert parsed.failure_reason is not None
+    assert parsed.failure_reason.to_json() == failure
+    assert parsed.warnings == ()
     assert str(read_error) not in str(result)
     assert converter_calls == []
     assert batching.begin_tokens == []
@@ -2713,11 +3077,11 @@ def test_concurrent_explicit_create_obeys_overwrite_rebase_contract(
 
 
 @pytest.mark.parametrize("mismatch", ["derived", "company"])
-def test_concurrent_auto_rejects_nonidentical_candidate_or_company_intent(
+def test_concurrent_auto_rejects_nonidentical_candidate_but_commits_valid_alias_intent(
     tmp_path: Path,
     mismatch: str,
 ) -> None:
-    """auto loser 仅在 candidate 与 company 都 exact equal 时允许 skip。
+    """auto loser 拒绝不同 candidate，但合法 preserve alias 通过 skip 原子提交。
 
     Args:
         tmp_path: 真实 filesystem workspace。
@@ -2727,7 +3091,7 @@ def test_concurrent_auto_rejects_nonidentical_candidate_or_company_intent(
         无。
 
     Raises:
-        AssertionError: 非 identical loser 被错误跳过或覆盖时抛出。
+        AssertionError: candidate conflict 或合法 alias-on-skip 语义漂移时抛出。
     """
 
     barrier = ThreadBarrier(2)
@@ -2764,11 +3128,82 @@ def test_concurrent_auto_rejects_nonidentical_candidate_or_company_intent(
         second_request=second_request,
     )
 
-    assert sorted(str(result["status"]) for result in results) == ["failed", "ok"]
-    failed = next(result for result in results if result["status"] == "failed")
-    failure = failed["failure"]
-    assert isinstance(failure, dict)
-    assert failure["code"] == "source_publication_conflict"
+    if mismatch == "derived":
+        assert sorted(str(result["status"]) for result in results) == ["failed", "ok"]
+        failed = next(result for result in results if result["status"] == "failed")
+        failure = failed["failure"]
+        assert isinstance(failure, dict)
+        assert failure["code"] == "source_publication_conflict"
+        assert failed["warnings"] == []
+        return
+
+    assert sorted(str(result["status"]) for result in results) == ["ok", "skipped"]
+    assert all(result["warnings"] == [] for result in results)
+    final_meta = first_pipeline._company_repository.get_company_meta("AAPL")
+    assert frozenset(final_meta.ticker_identity.accepted_aliases) == frozenset(
+        {"MSFT", "GOOG"}
+    )
+
+
+def test_concurrent_auto_name_warning_uses_publication_final_company_truth(
+    tmp_path: Path,
+) -> None:
+    """并发 publish/skip 的 loser warning 必须与 publication-lock 最终名称同源。
+
+    Args:
+        tmp_path: 真实 filesystem workspace。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: barrier、terminal、warning 或 final company truth 漂移时抛出。
+    """
+
+    barrier = ThreadBarrier(2)
+    first_pipeline, _first_batching, _first_company, _first_source = _tracking_sec_pipeline(
+        tmp_path,
+        converter=_BarrierDoclingConverter(barrier, marker="same"),
+    )
+    second_pipeline, _second_batching, _second_company, _second_source = _tracking_sec_pipeline(
+        tmp_path,
+        converter=_BarrierDoclingConverter(barrier, marker="same"),
+    )
+    primary = tmp_path / "concurrent-final-name.pdf"
+    primary.write_bytes(b"same concurrent filing")
+    first_request = _validated_sec_filing_request(
+        pipeline=first_pipeline,
+        filing_file=primary,
+        action=None,
+        company_name="Apple Winner A",
+    )
+    second_request = _validated_sec_filing_request(
+        pipeline=second_pipeline,
+        filing_file=primary,
+        action=None,
+        company_name="Apple Winner B",
+    )
+
+    results = _run_two_sec_uploads(
+        first_pipeline=first_pipeline,
+        first_request=first_request,
+        second_pipeline=second_pipeline,
+        second_request=second_request,
+    )
+
+    assert sorted(str(result["status"]) for result in results) == ["ok", "skipped"]
+    winner = next(result for result in results if result["status"] == "ok")
+    loser = next(result for result in results if result["status"] == "skipped")
+    assert winner["warnings"] == []
+    assert loser["warnings"] == [
+        {
+            "kind": "company_name_ignored",
+            "message": "本次提交的公司名称未生效；已保留现有公司名称。请核对上传目标公司是否正确。",
+        }
+    ]
+    final_meta = first_pipeline._company_repository.get_company_meta("AAPL")
+    assert final_meta.company_name == winner["company_name"]
+    assert loser["company_name"] != final_meta.company_name
 
 
 @pytest.mark.parametrize("same_ticker", [True, False])

@@ -19,7 +19,10 @@ from typing import BinaryIO, Final, Literal, Optional, Protocol
 
 from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.source import Source
-from dayu.fins.domain.company_meta_contract import CompanyMetaCommitIntent
+from dayu.fins.domain.company_meta_contract import (
+    CompanyMetaCommitIntent,
+    CompanyMetaCommitOutcome,
+)
 from dayu.fins.domain.document_models import (
     BatchToken,
     CompanyMeta,
@@ -695,14 +698,15 @@ class BatchingRepositoryProtocol(Protocol):
         """
         ...
 
-    def commit_batch(self, batch: BatchToken) -> None:
+    def commit_batch(self, batch: BatchToken) -> CompanyMetaCommitOutcome | None:
         """提交批处理事务并消费 token。
 
         Args:
             batch: 当前 storage core 登记的活动 batch capability。
 
         Returns:
-            无；返回即表示 ``COMMITTED`` journal 已成为唯一提交事实。
+            batch 含 company-meta intent 时返回 publication-final typed outcome；
+            否则返回 ``None``。正常返回表示 ``COMMITTED`` journal 已成为唯一提交事实。
 
         Raises:
             ValueError: token 不是当前活动 batch 时抛出。

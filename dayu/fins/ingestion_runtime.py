@@ -30,6 +30,10 @@ from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.base import DocumentProcessor
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.fins import ticker_normalization
+from dayu.fins.company_metadata_warning import (
+    CompanyMetadataWarning,
+    company_metadata_warnings_from_json,
+)
 from dayu.fins.direct_events import (
     FINS_RESULT_EXIT_CANCELLED,
     FINS_RESULT_EXIT_FAILURE,
@@ -1684,6 +1688,7 @@ class FinsUploadPipelineResult:
         skip_reason: 可选跳过原因。
         document_version: 可选文档版本。
         source_fingerprint: 可选来源指纹。
+        warnings: filing terminal producer 显式给出的零或一个 typed 公司元数据警告。
     """
 
     status: str
@@ -1696,6 +1701,7 @@ class FinsUploadPipelineResult:
     document_version: str | None = None
     source_fingerprint: str | None = None
     failure_reason: FinsUploadFailureReason | None = None
+    warnings: tuple[CompanyMetadataWarning, ...] = ()
 
     def __post_init__(self) -> None:
         """校验 pipeline terminal count 与 failure 的完整状态矩阵。
@@ -1724,24 +1730,48 @@ class FinsUploadPipelineResult:
             raise ValueError("failed upload pipeline result 必须包含 failure")
         if self.status != _UPLOAD_RESULT_STATUS_FAILED and self.failure_reason is not None:
             raise ValueError("非 failed upload pipeline result 禁止包含 failure")
+        if len(self.warnings) > 1:
+            raise ValueError("upload pipeline result 最多允许一个 warning")
+        if any(type(warning) is not CompanyMetadataWarning for warning in self.warnings):
+            raise TypeError("upload pipeline result warning 必须是精确 typed contract")
+        if self.warnings and self.status not in {
+            _UPLOAD_RESULT_STATUS_OK,
+            _UPLOAD_RESULT_STATUS_SKIPPED,
+        }:
+            raise ValueError("只有 ok/skipped upload pipeline result 可携带 warning")
 
     @classmethod
-    def from_pipeline_json(cls, result: Mapping[str, JsonValue]) -> "FinsUploadPipelineResult":
+    def from_pipeline_json(
+        cls,
+        result: Mapping[str, JsonValue],
+        *,
+        source_kind: SourceKind,
+    ) -> "FinsUploadPipelineResult":
         """从 pipeline JSON 结果构造 typed upload result。
 
         Args:
             result: pipeline 上传完成事件中的 JSON result。
+            source_kind: 调用方已知的 filing/material 业务类型；不得从 payload 推断。
 
         Returns:
             已校验的 typed upload result。
 
         Raises:
             ValueError: 必填字段缺失、字段类型非法或文本字段为空时抛出。
+            TypeError: warning collection 含非精确 typed 元素时抛出。
         """
 
         status = _required_upload_result_status(result)
         raw_failure = result.get("failure")
         failure_reason = upload_failure_reason_from_json(raw_failure)
+        if "warnings" not in result:
+            if source_kind is SourceKind.FILING:
+                raise ValueError("filing terminal result 必须显式包含 warnings")
+            warnings: tuple[CompanyMetadataWarning, ...] = ()
+        else:
+            warnings = company_metadata_warnings_from_json(result["warnings"])
+            if source_kind is SourceKind.MATERIAL and warnings:
+                raise ValueError("material terminal result 禁止携带 company metadata warning")
         return cls(
             status=status,
             stored_file_count=_required_upload_result_int(result, _KEY_STORED_FILE_COUNT),
@@ -1753,6 +1783,7 @@ class FinsUploadPipelineResult:
             document_version=_optional_upload_result_text(result, "document_version"),
             source_fingerprint=_optional_upload_result_text(result, "source_fingerprint"),
             failure_reason=failure_reason,
+            warnings=warnings,
         )
 
 

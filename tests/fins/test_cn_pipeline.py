@@ -26,6 +26,7 @@ from dayu.fins.domain.enums import SourceKind
 from dayu.fins.ingestion_runtime import (
     FinsDownloadProgressEvent,
     FinsUploadFilingRequest,
+    FinsUploadPipelineResult,
     FinsUploadUsageCode,
     FinsUploadUsageError,
     ValidatedFinsUploadFilingRequest,
@@ -1603,6 +1604,17 @@ async def test_upload_filing_fresh_recheck_discards_stale_action_and_company_dec
     batching.rollback_tokens.clear()
     company.stage_tokens.clear()
     source.stage_tokens.clear()
+    before_company_meta = pipeline._company_repository.get_company_meta("600519")
+    before_company_meta_bytes = json.dumps(
+        before_company_meta.to_dict(),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    before_source_state = pipeline._filing_upload_state_repository.read_filing_upload_state(
+        "600519",
+        stale_preflight.document_id,
+    )
     published_tree = published_tree_sha256(tmp_path, "600519")
 
     stale_events = [event async for event in pipeline.upload_filing_stream(stale_preflight)]
@@ -1611,13 +1623,159 @@ async def test_upload_filing_fresh_recheck_discards_stale_action_and_company_dec
     assert isinstance(stale_result, dict)
     assert stale_result["filing_action"] == "update"
     assert stale_result["status"] == "skipped"
-    assert pipeline._company_repository.get_company_meta("600519").company_name == "已发布公司名"
+    assert stale_result["warnings"] == [
+        {
+            "kind": "company_name_ignored",
+            "message": "本次提交的公司名称未生效；已保留现有公司名称。请核对上传目标公司是否正确。",
+        }
+    ]
+    after_company_meta = pipeline._company_repository.get_company_meta("600519")
+    after_company_meta_bytes = json.dumps(
+        after_company_meta.to_dict(),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    after_source_state = pipeline._filing_upload_state_repository.read_filing_upload_state(
+        "600519",
+        stale_preflight.document_id,
+    )
+    assert after_company_meta.company_name == "已发布公司名"
+    assert after_company_meta.updated_at == before_company_meta.updated_at
+    assert after_company_meta_bytes == before_company_meta_bytes
+    assert after_source_state == before_source_state
     assert len(batching.begin_tokens) == 1
-    assert batching.commit_tokens == []
-    assert batching.rollback_tokens == batching.begin_tokens
-    assert company.stage_tokens == []
+    assert batching.commit_tokens == batching.begin_tokens
+    assert batching.rollback_tokens == []
+    assert company.stage_tokens == batching.begin_tokens
     assert source.stage_tokens == []
     assert published_tree_sha256(tmp_path, "600519") == published_tree
+
+
+@pytest.mark.asyncio
+async def test_cn_fresh_different_company_name_uploads_changed_filing_with_warning(
+    tmp_path: Path,
+) -> None:
+    """CN fresh canonical name 在 filing 真更新成功时保持不变并产生 final warning。
+
+    Args:
+        tmp_path: 临时 workspace。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: uploaded warning 或 canonical company identity 漂移时抛出。
+    """
+
+    pipeline, _batching, _company, _source = _tracking_cn_pipeline(tmp_path)
+    filing_file = tmp_path / "fresh-name-update.pdf"
+    filing_file.write_bytes(b"cn-filing-v1")
+    create_request = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action="create",
+        company_name="贵州茅台",
+    )
+    create_events = [event async for event in pipeline.upload_filing_stream(create_request)]
+    assert create_events[-1].event_type is UploadFilingEventType.UPLOAD_COMPLETED
+    filing_file.write_bytes(b"cn-filing-v2")
+    update_request = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action="update",
+        company_name="贵州茅台集团",
+    )
+
+    events = [event async for event in pipeline.upload_filing_stream(update_request)]
+
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    assert result["status"] == "ok"
+    assert result["warnings"] == [
+        {
+            "kind": "company_name_ignored",
+            "message": "本次提交的公司名称未生效；已保留现有公司名称。请核对上传目标公司是否正确。",
+        }
+    ]
+    assert pipeline._company_repository.get_company_meta("600519").company_name == "贵州茅台"
+
+
+@pytest.mark.asyncio
+async def test_cn_upload_filing_identical_skip_atomically_commits_new_alias_only(
+    tmp_path: Path,
+) -> None:
+    """CN identical skip 应只提交合法 alias，且 source publication exact 不变。
+
+    Args:
+        tmp_path: 临时 workspace。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: alias durable、warning、batch 或 source tree contract 漂移时抛出。
+    """
+
+    pipeline, batching, company, source = _tracking_cn_pipeline(tmp_path)
+    filing_file = tmp_path / "alias-skip.pdf"
+    filing_file.write_bytes(b"identical CN alias skip")
+    first_request = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action=None,
+        company_name="贵州茅台",
+    )
+    first_events = [event async for event in pipeline.upload_filing_stream(first_request)]
+    assert first_events[-1].event_type is UploadFilingEventType.UPLOAD_COMPLETED
+    second_request = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action=None,
+        company_name="  贵州茅台  ",
+        ticker_aliases=("MOUTAI",),
+    )
+    before_state = pipeline._filing_upload_state_repository.read_filing_upload_state(
+        "600519",
+        second_request.document_id,
+    )
+    before_tree = published_tree_sha256(tmp_path, "600519")
+    batching.begin_tokens.clear()
+    batching.commit_tokens.clear()
+    batching.rollback_tokens.clear()
+    company.stage_tokens.clear()
+    source.stage_tokens.clear()
+
+    events = [event async for event in pipeline.upload_filing_stream(second_request)]
+
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    assert result["status"] == "skipped"
+    assert result["warnings"] == []
+    assert batching.commit_tokens == batching.begin_tokens
+    assert batching.rollback_tokens == []
+    assert company.stage_tokens == batching.begin_tokens
+    assert source.stage_tokens == []
+    final_meta = pipeline._company_repository.get_company_meta("600519")
+    assert final_meta.ticker_identity.accepted_aliases == ("MOUTAI",)
+    after_state = pipeline._filing_upload_state_repository.read_filing_upload_state(
+        "600519",
+        second_request.document_id,
+    )
+    assert after_state.source_integrity == before_state.source_integrity
+    assert after_state.source_meta == before_state.source_meta
+    assert after_state.publication_identity == before_state.publication_identity
+    before_source_tree = {
+        path: digest
+        for path, digest in before_tree.items()
+        if path != "portfolio/600519/meta.json"
+    }
+    after_source_tree = {
+        path: digest
+        for path, digest in published_tree_sha256(tmp_path, "600519").items()
+        if path != "portfolio/600519/meta.json"
+    }
+    assert after_source_tree == before_source_tree
 
 
 @pytest.mark.asyncio
@@ -1760,7 +1918,9 @@ async def test_upload_filing_storage_and_generic_failures_use_distinct_typed_cat
 
 
 @pytest.mark.asyncio
-async def test_upload_filing_alias_conflict_projects_exact_typed_terminal(tmp_path: Path) -> None:
+async def test_cn_filing_failure_event_roundtrips_typed_reason_with_empty_warnings(
+    tmp_path: Path,
+) -> None:
     """CN filing alias conflict 必须原子拒绝并投影 exact failure JSON。
 
     Args:
@@ -1792,6 +1952,7 @@ async def test_upload_filing_alias_conflict_projects_exact_typed_terminal(tmp_pa
     assert isinstance(result, dict)
     assert events[-1].event_type is UploadFilingEventType.UPLOAD_FAILED
     assert result["stored_file_count"] == 0
+    assert result["warnings"] == []
     assert result["failure"] == {
         "kind": "storage",
         "code": "ticker_alias_conflict",
@@ -1799,6 +1960,13 @@ async def test_upload_filing_alias_conflict_projects_exact_typed_terminal(tmp_pa
         "retry_hint": "请确认公司的主代码与别名声明后重新上传",
         "file_label": None,
     }
+    parsed = FinsUploadPipelineResult.from_pipeline_json(
+        result,
+        source_kind=SourceKind.FILING,
+    )
+    assert parsed.failure_reason is not None
+    assert parsed.failure_reason.to_json() == result["failure"]
+    assert parsed.warnings == ()
     assert not (tmp_path / "portfolio" / "600519").exists()
 
 
@@ -1888,6 +2056,7 @@ async def test_upload_filing_corrupt_primary_with_valid_companions_fails_atomica
     assert isinstance(result, dict)
     failure = result["failure"]
     assert isinstance(failure, dict)
+    assert result["warnings"] == []
     assert result["stored_file_count"] == 0
     assert failure["kind"] == "content"
     assert failure["code"] == "docling_converter_execution"
@@ -2283,6 +2452,13 @@ async def test_cn_hk_upload_filing_fresh_unsafe_is_single_typed_failed_event(
     assert isinstance(failure, dict)
     assert failure["kind"] == "storage"
     assert failure["code"] == "source_integrity_unsafe"
+    parsed = FinsUploadPipelineResult.from_pipeline_json(
+        result,
+        source_kind=SourceKind.FILING,
+    )
+    assert parsed.failure_reason is not None
+    assert parsed.failure_reason.to_json() == failure
+    assert parsed.warnings == ()
     assert "undeclared.bin" not in str(result)
     assert "unexpected_runtime" not in str(result)
     assert converter.calls == 1

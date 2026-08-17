@@ -39,6 +39,7 @@ from dayu.fins.domain.document_models import (
 )
 from dayu.fins.domain.company_meta_contract import (
     CompanyMetaCommitIntent,
+    CompanyMetaCommitOutcome,
     merge_company_meta_for_commit,
 )
 from dayu.fins.domain.enums import SourceKind
@@ -529,14 +530,15 @@ class _FsStorageInfra:
             if not registered:
                 self._release_batch_ticker_reservation(external_ticker)
 
-    def commit_batch(self, batch: BatchToken) -> None:
+    def commit_batch(self, batch: BatchToken) -> CompanyMetaCommitOutcome | None:
         """提交批处理事务，并在任一 terminal 路径消费 capability。
 
         Args:
             batch: 显式批处理 capability。
 
         Returns:
-            无。
+            batch 含 company-meta intent 且完整提交成功时返回 publication-final
+            typed outcome；否则返回 ``None``。
 
         Raises:
             ValueError: token 非当前活动事务时抛出。
@@ -551,11 +553,12 @@ class _FsStorageInfra:
         state.lifecycle = _BATCH_LIFECYCLE_COMMIT_STARTED
         commit_error: Exception | None = None
         rollback_error: Exception | None = None
+        company_meta_outcome: CompanyMetaCommitOutcome | None = None
         try:
             # 复杂逻辑说明：完整性校验只读 transaction staging，必须先于 publication guard。
             self._validate_complete_source_tree(state)
             if state.company_meta_intent is not None or state.publishes_new_corpus:
-                self._commit_batch_with_identity_guards(state)
+                company_meta_outcome = self._commit_batch_with_identity_guards(state)
             else:
                 self._commit_batch_with_publication_guard(state)
         except Exception as exc:
@@ -605,15 +608,20 @@ class _FsStorageInfra:
         self._close_active_batch(state, primary_error=terminal_error)
         if terminal_error is not None:
             raise terminal_error
+        return company_meta_outcome
 
-    def _commit_batch_with_identity_guards(self, state: _ActiveBatchState) -> None:
+    def _commit_batch_with_identity_guards(
+        self,
+        state: _ActiveBatchState,
+    ) -> CompanyMetaCommitOutcome | None:
         """按固定全局锁序准备 identity 并提交 batch。
 
         Args:
             state: 已进入 commit-started 的活动 batch state。
 
         Returns:
-            无。
+            batch 含 company-meta intent 时返回用于物理发布的 exact outcome；
+            仅发布新 corpus descriptor 时返回 ``None``。
 
         Raises:
             CompanyTickerAliasConflictError: incoming lookup ticker 已被其它 corpus 占用时抛出。
@@ -631,8 +639,9 @@ class _FsStorageInfra:
             identity_token = self._acquire_company_identity_guard()
             identity_error: Exception | None = None
             try:
-                self._prepare_company_identity_commit(state)
+                company_meta_outcome = self._prepare_company_identity_commit(state)
                 self._commit_batch_with_publication_guard(state)
+                return company_meta_outcome
             except Exception as exc:
                 identity_error = exc
                 raise
@@ -725,14 +734,18 @@ class _FsStorageInfra:
                         )
                     raise
 
-    def _prepare_company_identity_commit(self, state: _ActiveBatchState) -> None:
+    def _prepare_company_identity_commit(
+        self,
+        state: _ActiveBatchState,
+    ) -> CompanyMetaCommitOutcome | None:
         """权威合并 CompanyMeta 并在 physical publication 前校验唯一性。
 
         Args:
             state: 已持 writer、recovery 与 company identity guards 的 batch state。
 
         Returns:
-            无。
+            有 company-meta intent 时返回与 staging 写入值完全相同的 typed
+            outcome；仅 descriptor publication 时返回 ``None``。
 
         Raises:
             CompanyTickerAliasConflictError: incoming lookup ticker 属于另一 corpus 时抛出。
@@ -749,13 +762,15 @@ class _FsStorageInfra:
             expected_external_identity=state.token.ticker,
         )
         final_meta: CompanyMeta | None = None
+        company_meta_outcome: CompanyMetaCommitOutcome | None = None
         if state.company_meta_intent is not None:
             current_published = self._read_current_company_meta_for_commit(state)
-            final_meta = merge_company_meta_for_commit(
+            company_meta_outcome = merge_company_meta_for_commit(
                 current_published=current_published,
                 intent=state.company_meta_intent,
                 committed_at=now_iso8601(),
             )
+            final_meta = company_meta_outcome.company_meta
             _write_json(
                 state.staging_ticker_dir / _SOURCE_META_FILENAME,
                 final_meta.to_dict(),
@@ -774,6 +789,7 @@ class _FsStorageInfra:
                 existing_canonical_ticker=existing_owner,
                 incoming_canonical_ticker=staged_canonical,
             )
+        return company_meta_outcome
 
     def _read_current_company_meta_for_commit(
         self,

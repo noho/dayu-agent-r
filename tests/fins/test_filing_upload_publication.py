@@ -7,11 +7,29 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
+from typing import cast
 
 import pytest
 
 from dayu.contracts.cancellation import CancellationToken
-from dayu.fins.domain.document_models import BatchToken, CompanyMeta, SourceDocumentRevision
+from dayu.fins.company_metadata_warning import (
+    COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+    CompanyMetadataWarning,
+    CompanyMetadataWarningKind,
+    company_metadata_warnings_to_json,
+    project_company_name_ignored_warning,
+)
+from dayu.fins.domain.company_meta_contract import (
+    CompanyMetaCommitIntent,
+    CompanyMetaCommitOutcome,
+    CompanyNameIgnoredChange,
+)
+from dayu.fins.domain.document_models import (
+    BatchToken,
+    CompanyMeta,
+    CompanyMetaInventoryEntry,
+    SourceDocumentRevision,
+)
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.ingestion_runtime import (
     FinsUploadFilingRequest,
@@ -21,6 +39,7 @@ from dayu.fins.ingestion_runtime import (
 from dayu.fins.pipelines.docling_upload_service import (
     DoclingUploadService,
     FilingInitialSkipDisposition,
+    UploadOperationResult,
     _PendingFileAsset,
     _PreparedFilingAssetMutation,
     build_sec_filing_ids,
@@ -70,11 +89,21 @@ _RESOLVER_VERSION = "market_resolver_v1.0.0"
 class _PublicationBatchRecorder:
     """记录 shared owner batch lifecycle 的无 I/O 测试仓储。"""
 
-    def __init__(self) -> None:
-        """初始化空 lifecycle 记录。
+    def __init__(
+        self,
+        *,
+        commit_outcome: CompanyMetaCommitOutcome | None = None,
+        commit_error: OSError | None = None,
+        events: list[str] | None = None,
+        forbid_rollback_after_commit: bool = False,
+    ) -> None:
+        """初始化 lifecycle 记录与可选 metadata commit 行为。
 
         Args:
-            无。
+            commit_outcome: commit 正常返回的可选 exact typed outcome。
+            commit_error: commit 消费 capability 后需要抛出的可选异常。
+            events: 可选共享顺序记录。
+            forbid_rollback_after_commit: 是否直接拒绝 commit 后 caller rollback。
 
         Returns:
             无。
@@ -86,6 +115,10 @@ class _PublicationBatchRecorder:
         self.begin_tokens: list[BatchToken] = []
         self.commit_tokens: list[BatchToken] = []
         self.rollback_tokens: list[BatchToken] = []
+        self.commit_outcome = commit_outcome
+        self.commit_error = commit_error
+        self.events = events if events is not None else []
+        self.forbid_rollback_after_commit = forbid_rollback_after_commit
 
     def begin_batch(self, ticker: str) -> BatchToken:
         """产生并记录测试 batch capability。
@@ -104,20 +137,24 @@ class _PublicationBatchRecorder:
         self.begin_tokens.append(token)
         return token
 
-    def commit_batch(self, batch: BatchToken) -> None:
-        """记录意外 commit。
+    def commit_batch(self, batch: BatchToken) -> CompanyMetaCommitOutcome | None:
+        """记录 capability transfer，并返回配置 outcome 或抛配置异常。
 
         Args:
             batch: caller-owned batch capability。
 
         Returns:
-            无。
+            配置的 company-meta outcome；structural 场景默认返回 ``None``。
 
         Raises:
-            无。
+            OSError: 配置 commit failure 时在消费 capability 后抛出。
         """
 
         self.commit_tokens.append(batch)
+        self.events.append("commit")
+        if self.commit_error is not None:
+            raise self.commit_error
+        return self.commit_outcome
 
     def rollback_batch(self, batch: BatchToken) -> None:
         """记录 owner rollback。
@@ -129,10 +166,13 @@ class _PublicationBatchRecorder:
             无。
 
         Raises:
-            无。
+            AssertionError: 配置禁止 commit 后 rollback 且发生该调用时抛出。
         """
 
         self.rollback_tokens.append(batch)
+        self.events.append("rollback")
+        if self.forbid_rollback_after_commit and self.commit_tokens:
+            raise AssertionError("commit 已消费 capability 后禁止 caller rollback")
 
     def recover_orphan_batches(self, *, dry_run: bool = False) -> tuple[str, ...]:
         """返回空 recovery action。
@@ -149,6 +189,106 @@ class _PublicationBatchRecorder:
 
         del dry_run
         return ()
+
+
+class _MetadataStageRecorder:
+    """记录 metadata-only skip 的唯一 company intent stage。"""
+
+    def __init__(
+        self,
+        *,
+        stage_error: OSError | None = None,
+        events: list[str] | None = None,
+    ) -> None:
+        """初始化空 stage 记录与可选 stage failure。
+
+        Args:
+            stage_error: commit 前 stage 应抛出的可选异常。
+            events: 可选共享顺序记录。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.stage_error = stage_error
+        self.intents: list[CompanyMetaCommitIntent] = []
+        self.stage_tokens: list[BatchToken] = []
+        self.events = events if events is not None else []
+
+    def scan_company_meta_inventory(self) -> list[CompanyMetaInventoryEntry]:
+        """返回空盘点结果。
+
+        Args:
+            无。
+
+        Returns:
+            空 inventory。
+
+        Raises:
+            无。
+        """
+
+        return []
+
+    def get_company_meta(self, ticker: str) -> CompanyMeta:
+        """返回固定 fresh company meta。
+
+        Args:
+            ticker: 预期 canonical ticker。
+
+        Returns:
+            AAPL fresh company meta。
+
+        Raises:
+            ValueError: ticker 不是 AAPL 时抛出。
+        """
+
+        if ticker != "AAPL":
+            raise ValueError("fixture 仅支持 AAPL")
+        return _fresh_company_meta()
+
+    def stage_company_meta_intent(
+        self,
+        intent: CompanyMetaCommitIntent,
+        *,
+        batch: BatchToken,
+    ) -> None:
+        """记录 intent，并在配置时于 capability transfer 前失败。
+
+        Args:
+            intent: fresh validator 产生的 preserve intent。
+            batch: caller-owned batch capability。
+
+        Returns:
+            无。
+
+        Raises:
+            OSError: 配置 stage failure 时抛出。
+        """
+
+        self.intents.append(intent)
+        self.stage_tokens.append(batch)
+        self.events.append("stage")
+        if self.stage_error is not None:
+            raise self.stage_error
+
+    def resolve_company_ticker(self, ticker: str) -> str | None:
+        """按 fixture identity 解析 AAPL。
+
+        Args:
+            ticker: 待解析 ticker。
+
+        Returns:
+            AAPL 命中时返回 AAPL，否则返回 ``None``。
+
+        Raises:
+            无。
+        """
+
+        return "AAPL" if ticker == "AAPL" else None
 
 
 class _WaitingPublicationBatchRecorder(_PublicationBatchRecorder):
@@ -737,6 +877,8 @@ def _build_request(
     *,
     action: str = "auto",
     overwrite: bool = False,
+    company_name: str = "Apple Inc.",
+    ticker_aliases: tuple[str, ...] = (),
 ) -> FinsUploadFilingRequest:
     """构造同一 arbitration 前后可重复验证的 filing raw request。
 
@@ -744,6 +886,8 @@ def _build_request(
         file_path: 已存在的 authoritative primary 文件。
         action: raw upload action。
         overwrite: raw overwrite 开关。
+        company_name: 用户显式提交的公司名称。
+        ticker_aliases: 用户显式提交的 ticker aliases。
 
     Returns:
         AAPL FY2024 filing request。
@@ -761,7 +905,8 @@ def _build_request(
         fiscal_period="FY",
         filing_date="2025-01-31",
         report_date="2024-12-31",
-        company_name="Apple Inc.",
+        company_name=company_name,
+        ticker_aliases=ticker_aliases,
         overwrite=overwrite,
     )
 
@@ -1790,3 +1935,420 @@ def test_writer_wait_cancellation_stops_before_fresh_read_for_all_candidate_clas
     assert batching.commit_tokens == []
     assert batching.rollback_tokens == batching.begin_tokens
     assert state_repository.batch_reads == []
+
+
+def _execute_metadata_only_skip_fixture(
+    *,
+    workspace_root: Path,
+    requested_company_name: str,
+    ticker_aliases: tuple[str, ...],
+    batching: _PublicationBatchRecorder,
+    company_repository: _MetadataStageRecorder,
+) -> FilingUploadPublicationOutcome:
+    """执行一条 fresh preserve intent 的 canonical metadata-only skip。
+
+    Args:
+        workspace_root: 临时 filesystem 根。
+        requested_company_name: fresh request 显式公司名称。
+        ticker_aliases: fresh request 显式 alias。
+        batching: terminal-aware metadata commit recorder。
+        company_repository: company intent stage recorder。
+
+    Returns:
+        shared publication owner 的 typed outcome。
+
+    Raises:
+        BaseException: stage、commit 或 shared owner invariant 失败时原样传播。
+    """
+
+    primary = workspace_root / "metadata-skip.pdf"
+    primary.write_bytes(b"metadata-only skip")
+    raw_request = _build_request(
+        primary,
+        company_name=requested_company_name,
+        ticker_aliases=ticker_aliases,
+    )
+    initial = _build_validated_request(
+        raw_request,
+        status=SourceIntegrityStatus.MISSING,
+    )
+    identity = _build_publication_identity()
+    fresh = _build_validated_request(
+        raw_request,
+        status=SourceIntegrityStatus.COMPLETE,
+        revision="winner",
+        publication_identity=identity,
+        company_meta=_fresh_company_meta(),
+    )
+    assert fresh.company_meta_decision.disposition == "stage"
+    assert fresh.company_meta_decision.company_meta_intent is not None
+    assert fresh.company_meta_decision.company_meta_intent.merge_mode == "preserve_published"
+    prepared = _build_prepared_candidate(
+        request=initial,
+        identity=identity,
+        disposition=FilingInitialSkipDisposition.NOT_ELIGIBLE,
+    )
+    repository_set = build_fs_repository_set(
+        workspace_root=workspace_root,
+        create_directories=False,
+    )
+    upload_service = DoclingUploadService(
+        FsSourceDocumentRepository(workspace_root, repository_set=repository_set),
+        FsDocumentBlobRepository(workspace_root, repository_set=repository_set),
+        docling_converter=_ForbiddenPublicationConverter(),
+    )
+    return execute_prepared_filing_publication(
+        request=initial,
+        prepared=prepared,
+        filing_state_repository=_FixedBatchStateRepository(fresh.published_state),
+        company_repository=company_repository,
+        batching_repository=batching,
+        upload_service=upload_service,
+        cancellation=None,
+    )
+
+
+def test_publication_outcome_rejects_cancelled_warning(tmp_path: Path) -> None:
+    """cancelled publication outcome 必须在 owner boundary 拒绝非空 warning。
+
+    Args:
+        tmp_path: 构造 validated request 的临时文件根。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: cancelled outcome 接受 warning 时抛出。
+    """
+
+    primary = tmp_path / "cancelled-warning.pdf"
+    primary.write_bytes(b"cancelled warning")
+    request = _build_validated_request(
+        _build_request(primary),
+        status=SourceIntegrityStatus.MISSING,
+    )
+    result = UploadOperationResult(
+        status="cancelled",
+        document_id=request.document_id,
+        internal_document_id=request.internal_document_id,
+        stored_file_count=0,
+        file_events=[],
+        payload={"skip_reason": "cancelled"},
+    )
+    warning = CompanyMetadataWarning(
+        kind=CompanyMetadataWarningKind.COMPANY_NAME_IGNORED,
+        message=COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+    )
+
+    with pytest.raises(ValueError, match="cancelled publication outcome"):
+        FilingUploadPublicationOutcome(
+            authoritative_request=request,
+            result=result,
+            warnings=(warning,),
+        )
+
+
+def test_publication_outcome_rejects_warning_commit_outcome_mismatch(
+    tmp_path: Path,
+) -> None:
+    """publication warnings 必须与内部 commit outcome 的 exact 投影一致。
+
+    Args:
+        tmp_path: 构造 validated request 的临时文件根。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: outcome 接受不同源 warnings 时抛出。
+    """
+
+    primary = tmp_path / "warning-mismatch.pdf"
+    primary.write_bytes(b"warning mismatch")
+    request = _build_validated_request(
+        _build_request(primary),
+        status=SourceIntegrityStatus.MISSING,
+    )
+    commit_outcome = CompanyMetaCommitOutcome(
+        company_meta=_fresh_company_meta(),
+        ignored_company_name=CompanyNameIgnoredChange(
+            requested_company_name="Apple Holdings",
+            published_company_name="Apple Inc.",
+        ),
+    )
+    result = UploadOperationResult(
+        status="skipped",
+        document_id=request.document_id,
+        internal_document_id=request.internal_document_id,
+        stored_file_count=0,
+        file_events=[],
+        payload={"skip_reason": "already_uploaded"},
+        company_meta_commit_outcome=commit_outcome,
+    )
+
+    with pytest.raises(ValueError, match="必须与内部 commit outcome 同源"):
+        FilingUploadPublicationOutcome(
+            authoritative_request=request,
+            result=result,
+            warnings=(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("kind", "message", "expected_error"),
+    (
+        (
+            cast(CompanyMetadataWarningKind, "company_name_ignored"),
+            COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+            TypeError,
+        ),
+        (
+            CompanyMetadataWarningKind.COMPANY_NAME_IGNORED,
+            "非规范文案",
+            ValueError,
+        ),
+    ),
+)
+def test_company_metadata_warning_rejects_noncanonical_constructor_values(
+    kind: CompanyMetadataWarningKind,
+    message: str,
+    expected_error: type[Exception],
+) -> None:
+    """typed warning constructor 必须拒绝非精确 kind 与非规范文案。
+
+    Args:
+        kind: 待验证的 runtime kind。
+        message: 待验证的 warning 文案。
+        expected_error: owner contract 应抛出的异常类型。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: constructor 接受非法 closed value 时抛出。
+    """
+
+    with pytest.raises(expected_error):
+        CompanyMetadataWarning(kind=kind, message=message)
+
+
+@pytest.mark.parametrize(
+    ("warnings", "expected_error"),
+    (
+        (
+            (
+                CompanyMetadataWarning(
+                    kind=CompanyMetadataWarningKind.COMPANY_NAME_IGNORED,
+                    message=COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+                ),
+                CompanyMetadataWarning(
+                    kind=CompanyMetadataWarningKind.COMPANY_NAME_IGNORED,
+                    message=COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+                ),
+            ),
+            ValueError,
+        ),
+        ((cast(CompanyMetadataWarning, "invalid warning"),), TypeError),
+    ),
+)
+def test_company_metadata_warning_json_projection_rejects_invalid_collections(
+    warnings: tuple[CompanyMetadataWarning, ...],
+    expected_error: type[Exception],
+) -> None:
+    """warning JSON projection 必须拒绝超限 collection 与非精确元素。
+
+    Args:
+        warnings: 待序列化的 runtime warning collection。
+        expected_error: owner contract 应抛出的异常类型。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: serializer 接受非法 collection 时抛出。
+    """
+
+    with pytest.raises(expected_error):
+        company_metadata_warnings_to_json(warnings)
+
+
+@pytest.mark.parametrize(
+    "ignored_change",
+    (cast(CompanyNameIgnoredChange, {"requested": "Apple Holdings"}),),
+)
+def test_company_name_ignored_warning_projection_rejects_nonexact_domain_fact(
+    ignored_change: CompanyNameIgnoredChange,
+) -> None:
+    """公开 warning projection 必须拒绝非精确 domain fact。
+
+    Args:
+        ignored_change: 待投影的 runtime domain fact。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: projection 接受非精确 owner fact 时抛出。
+    """
+
+    with pytest.raises(TypeError, match="CompanyNameIgnoredChange"):
+        project_company_name_ignored_warning(ignored_change)
+
+
+@pytest.mark.parametrize(
+    ("requested_company_name", "aliases", "ignored_change", "expected_warning"),
+    (
+        (
+            "Apple Holdings",
+            (),
+            CompanyNameIgnoredChange(
+                requested_company_name="Apple Holdings",
+                published_company_name="Apple Inc.",
+            ),
+            (
+                CompanyMetadataWarning(
+                    kind=CompanyMetadataWarningKind.COMPANY_NAME_IGNORED,
+                    message=COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+                ),
+            ),
+        ),
+        (" apple inc. ", ("APPL",), None, ()),
+    ),
+)
+def test_metadata_only_skip_transfers_capability_and_projects_exact_outcome(
+    tmp_path: Path,
+    requested_company_name: str,
+    aliases: tuple[str, ...],
+    ignored_change: CompanyNameIgnoredChange | None,
+    expected_warning: tuple[CompanyMetadataWarning, ...],
+) -> None:
+    """name-only 与 alias-only skip 均应 stage→commit，且只投影 final fact。
+
+    Args:
+        tmp_path: 临时 filesystem 根。
+        requested_company_name: 当前 fresh request 名称。
+        aliases: 当前 fresh request aliases。
+        ignored_change: storage final outcome 携带的名称未采用事实。
+        expected_warning: shared owner 应返回的规范 warning tuple。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: capability、outcome 或 warning 同源 contract 漂移时抛出。
+    """
+
+    final_meta = replace(
+        _fresh_company_meta(),
+        ticker_identity=build_company_ticker_identity("AAPL", aliases),
+    )
+    commit_outcome = CompanyMetaCommitOutcome(
+        company_meta=final_meta,
+        ignored_company_name=ignored_change,
+    )
+    events: list[str] = []
+    batching = _PublicationBatchRecorder(
+        commit_outcome=commit_outcome,
+        events=events,
+        forbid_rollback_after_commit=True,
+    )
+    company = _MetadataStageRecorder(events=events)
+
+    outcome = _execute_metadata_only_skip_fixture(
+        workspace_root=tmp_path,
+        requested_company_name=requested_company_name,
+        ticker_aliases=aliases,
+        batching=batching,
+        company_repository=company,
+    )
+
+    assert events == ["stage", "commit"]
+    assert batching.commit_tokens == batching.begin_tokens
+    assert batching.rollback_tokens == []
+    assert company.stage_tokens == batching.begin_tokens
+    assert outcome.result.status == "skipped"
+    assert outcome.result.company_meta_commit_outcome is commit_outcome
+    assert outcome.warnings == expected_warning
+
+
+def test_metadata_only_skip_commit_failure_never_rolls_back_consumed_capability(
+    tmp_path: Path,
+) -> None:
+    """metadata commit 消费 capability 后失败时不得由 outer finally 二次 rollback。
+
+    Args:
+        tmp_path: 临时 filesystem 根。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 主异常、顺序或 rollback count 漂移时抛出。
+    """
+
+    events: list[str] = []
+    batching = _PublicationBatchRecorder(
+        commit_outcome=CompanyMetaCommitOutcome(
+            company_meta=_fresh_company_meta(),
+            ignored_company_name=None,
+        ),
+        commit_error=OSError("metadata commit failed"),
+        events=events,
+        forbid_rollback_after_commit=True,
+    )
+    company = _MetadataStageRecorder(events=events)
+
+    with pytest.raises(OSError, match="metadata commit failed"):
+        _execute_metadata_only_skip_fixture(
+            workspace_root=tmp_path,
+            requested_company_name="Apple Holdings",
+            ticker_aliases=(),
+            batching=batching,
+            company_repository=company,
+        )
+
+    assert events == ["stage", "commit"]
+    assert batching.commit_tokens == batching.begin_tokens
+    assert batching.rollback_tokens == []
+
+
+def test_metadata_only_skip_stage_failure_rolls_back_once_before_capability_transfer(
+    tmp_path: Path,
+) -> None:
+    """metadata stage 在 capability transfer 前失败时 caller 必须恰好回滚一次。
+
+    Args:
+        tmp_path: 临时 filesystem 根。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: stage failure、commit 或 rollback boundary 漂移时抛出。
+    """
+
+    events: list[str] = []
+    batching = _PublicationBatchRecorder(
+        commit_outcome=CompanyMetaCommitOutcome(
+            company_meta=_fresh_company_meta(),
+            ignored_company_name=None,
+        ),
+        events=events,
+    )
+    company = _MetadataStageRecorder(
+        stage_error=OSError("metadata stage failed"),
+        events=events,
+    )
+
+    with pytest.raises(OSError, match="metadata stage failed"):
+        _execute_metadata_only_skip_fixture(
+            workspace_root=tmp_path,
+            requested_company_name="Apple Holdings",
+            ticker_aliases=(),
+            batching=batching,
+            company_repository=company,
+        )
+
+    assert events == ["stage", "rollback"]
+    assert batching.commit_tokens == []
+    assert batching.rollback_tokens == batching.begin_tokens

@@ -17,7 +17,10 @@ import pytest
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
-from dayu.fins.domain.company_meta_contract import CompanyMetaCommitIntent
+from dayu.fins.domain.company_meta_contract import (
+    CompanyMetaCommitIntent,
+    CompanyMetaCommitOutcome,
+)
 from dayu.fins.domain.document_models import (
     BatchToken,
     DocumentHandle,
@@ -187,8 +190,19 @@ class _BatchIdentityCnBatchingRepository(FsBatchingRepository):
         self.phases.append(("begin", token.transaction_id))
         return token
 
-    def commit_batch(self, batch: BatchToken) -> None:
-        """记录 caller 唯一 commit，并模拟 storage owner 消费 token 的失败。"""
+    def commit_batch(self, batch: BatchToken) -> CompanyMetaCommitOutcome | None:
+        """记录 caller 唯一 commit，并模拟 storage owner 消费 token 的失败。
+
+        Args:
+            batch: caller 转交的 batch capability。
+
+        Returns:
+            download batch 的真实 typed company-meta outcome；无 intent 时返回 ``None``。
+
+        Raises:
+            OSError: 启用 commit failure injection 或真实提交失败时抛出。
+            ValueError: capability 非法时抛出。
+        """
 
         self.record_phase("commit", batch)
         self.commit_calls += 1
@@ -196,8 +210,9 @@ class _BatchIdentityCnBatchingRepository(FsBatchingRepository):
             FsBatchingRepository.rollback_batch(self, batch)
             self.active_token = None
             raise OSError("forced CN storage commit failure")
-        super().commit_batch(batch)
+        outcome = super().commit_batch(batch)
         self.active_token = None
+        return outcome
 
     def rollback_batch(self, batch: BatchToken) -> None:
         """记录 caller operation rollback 并转发。"""

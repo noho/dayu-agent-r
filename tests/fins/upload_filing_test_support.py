@@ -5,7 +5,10 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from dayu.fins.domain.company_meta_contract import CompanyMetaCommitIntent
+from dayu.fins.domain.company_meta_contract import (
+    CompanyMetaCommitIntent,
+    CompanyMetaCommitOutcome,
+)
 from dayu.fins.domain.document_models import (
     BatchToken,
     DocumentHandle,
@@ -63,14 +66,15 @@ class TrackingBatchingRepository(FsBatchingRepository):
         self.begin_tokens.append(token)
         return token
 
-    def commit_batch(self, batch: BatchToken) -> None:
+    def commit_batch(self, batch: BatchToken) -> CompanyMetaCommitOutcome | None:
         """记录并提交 batch。
 
         Args:
             batch: caller 转交的 batch capability。
 
         Returns:
-            无。
+            batch 含 company-meta intent 时返回真实 publication-final outcome；
+            否则返回 ``None``。
 
         Raises:
             OSError: commit 失败时抛出。
@@ -78,7 +82,7 @@ class TrackingBatchingRepository(FsBatchingRepository):
         """
 
         self.commit_tokens.append(batch)
-        super().commit_batch(batch)
+        return super().commit_batch(batch)
 
     def rollback_batch(self, batch: BatchToken) -> None:
         """记录并回滚 batch，或在调用真实 rollback 前注入失败。

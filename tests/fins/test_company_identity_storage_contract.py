@@ -19,6 +19,7 @@ import pytest
 import dayu.fins.storage._fs_storage_infra as storage_infra_module
 from dayu.fins.domain.company_meta_contract import (
     CompanyMetaConcurrentUpdateError,
+    CompanyNameIgnoredChange,
     build_company_meta_commit_intent,
 )
 from dayu.fins.domain.document_models import BatchToken, CompanyMeta
@@ -746,6 +747,7 @@ def test_commit_authoritative_reload_preserves_same_version_concurrent_update(
         proposed_company_id="delayed-id",
         proposed_company_name="Delayed Name",
         resolver_version="resolver-v2",
+        requested_company_name="Delayed Name",
     )
     concurrent_batch = batching.begin_batch("DELTA")
     stage_company_meta_fixture(
@@ -763,9 +765,15 @@ def test_commit_authoritative_reload_preserves_same_version_concurrent_update(
 
     delayed_batch = batching.begin_batch("DELTA")
     company.stage_company_meta_intent(delayed_intent, batch=delayed_batch)
-    batching.commit_batch(delayed_batch)
+    outcome = batching.commit_batch(delayed_batch)
     final_meta = company.get_company_meta("DELTA")
 
+    assert outcome is not None
+    assert outcome.company_meta == final_meta
+    assert outcome.ignored_company_name == CompanyNameIgnoredChange(
+        requested_company_name="Delayed Name",
+        published_company_name="Authoritative Name",
+    )
     assert final_meta.company_id == "authoritative-id"
     assert final_meta.company_name == "Authoritative Name"
     assert final_meta.ticker_identity.accepted_aliases == ("OLD", "NEWER", "DELAYED")

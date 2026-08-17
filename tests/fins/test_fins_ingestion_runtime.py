@@ -35,8 +35,14 @@ from dayu.documents.processors.source import Source
 from dayu.documents.processors.base import DocumentProcessor
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.fins import ticker_normalization
+from dayu.fins.company_metadata_warning import (
+    COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+    CompanyMetadataWarning,
+    CompanyMetadataWarningKind,
+)
 import dayu.fins.download_contract as download_contract
 from dayu.fins.downloaders.sec_downloader import SEC_USER_AGENT_ENV
+from dayu.fins.domain.company_meta_contract import CompanyMetaCommitOutcome
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins import ingestion_runtime
 from dayu.fins.direct_events import (
@@ -382,7 +388,10 @@ def test_failed_pipeline_result_requires_closed_typed_failure_reason() -> None:
     """
 
     with pytest.raises(ValueError):
-        FinsUploadPipelineResult.from_pipeline_json({"status": "failed", "stored_file_count": 0})
+        FinsUploadPipelineResult.from_pipeline_json(
+            {"status": "failed", "stored_file_count": 0},
+            source_kind=SourceKind.MATERIAL,
+        )
     with pytest.raises(ValueError):
         FinsUploadPipelineResult.from_pipeline_json(
             {
@@ -395,7 +404,8 @@ def test_failed_pipeline_result_requires_closed_typed_failure_reason() -> None:
                     "retry_hint": None,
                     "file_label": None,
                 },
-            }
+            },
+            source_kind=SourceKind.MATERIAL,
         )
     result = FinsUploadPipelineResult.from_pipeline_json(
         {
@@ -408,7 +418,8 @@ def test_failed_pipeline_result_requires_closed_typed_failure_reason() -> None:
                 "retry_hint": "请确认文件可正常打开并重新上传",
                 "file_label": "report.pdf",
             },
-        }
+        },
+        source_kind=SourceKind.MATERIAL,
     )
     assert result.failure_reason is not None
     assert result.failure_reason.kind is FinsUploadFailureKind.CONTENT
@@ -543,7 +554,10 @@ def test_failed_pipeline_result_rejects_unsafe_or_open_failure_json(
     """
 
     with pytest.raises(ValueError):
-        FinsUploadPipelineResult.from_pipeline_json({"status": "failed", "stored_file_count": 0, "failure": failure})
+        FinsUploadPipelineResult.from_pipeline_json(
+            {"status": "failed", "stored_file_count": 0, "failure": failure},
+            source_kind=SourceKind.MATERIAL,
+        )
 
 
 @pytest.mark.parametrize(
@@ -841,7 +855,10 @@ def test_upload_pipeline_count_owner_accepts_complete_status_matrix(
     }
     if failure_reason is not None:
         payload["failure"] = failure_reason.to_json()
-    parsed = FinsUploadPipelineResult.from_pipeline_json(payload)
+    parsed = FinsUploadPipelineResult.from_pipeline_json(
+        payload,
+        source_kind=SourceKind.MATERIAL,
+    )
 
     assert direct.stored_file_count == stored_file_count
     assert parsed.stored_file_count == stored_file_count
@@ -888,7 +905,10 @@ def test_upload_pipeline_count_owner_rejects_invalid_status_matrix(
     if failure_reason is not None:
         payload["failure"] = failure_reason.to_json()
     with pytest.raises(ValueError, match="stored_file_count"):
-        FinsUploadPipelineResult.from_pipeline_json(payload)
+        FinsUploadPipelineResult.from_pipeline_json(
+            payload,
+            source_kind=SourceKind.MATERIAL,
+        )
 
 
 @pytest.mark.parametrize("stored_file_count", (True, -1, 1.5, "1", None))
@@ -911,7 +931,10 @@ def test_upload_pipeline_count_owner_rejects_missing_bool_negative_and_non_int(
     if stored_file_count is not None:
         payload["stored_file_count"] = stored_file_count
     with pytest.raises(ValueError, match="stored_file_count"):
-        FinsUploadPipelineResult.from_pipeline_json(payload)
+        FinsUploadPipelineResult.from_pipeline_json(
+            payload,
+            source_kind=SourceKind.MATERIAL,
+        )
 
 
 @pytest.mark.parametrize("stored_file_count", (True, -1))
@@ -1230,9 +1253,10 @@ def test_production_upload_count_constructors_are_explicit_and_complete() -> Non
                 "deleted",
                 "skip_reason",
                 "document_version",
-                "source_fingerprint",
-                "failure_reason",
-            }
+                    "source_fingerprint",
+                    "failure_reason",
+                    "warnings",
+                }
         )
     ]
 
@@ -3499,8 +3523,18 @@ class _CommitFailingDownloadBatchingRepository(FsBatchingRepository):
         super().__init__(workspace_root, repository_set=repository_set)
         self.caller_rollback_calls = 0
 
-    def commit_batch(self, batch: BatchToken) -> None:
-        """由 storage owner 回滚并消费 token 后抛出 commit 主异常。"""
+    def commit_batch(self, batch: BatchToken) -> CompanyMetaCommitOutcome | None:
+        """由 storage owner 回滚并消费 token 后抛出 commit 主异常。
+
+        Args:
+            batch: caller 转交的 batch capability。
+
+        Returns:
+            本 failure fake 不正常返回。
+
+        Raises:
+            OSError: 始终在 storage owner 消费 capability 后抛出。
+        """
 
         FsBatchingRepository.rollback_batch(self, batch)
         raise OSError("forced generic commit failure")
@@ -9083,7 +9117,180 @@ def test_upload_pipeline_result_requires_status() -> None:
     """upload pipeline typed result 不得用 unknown 伪造缺失状态。"""
 
     with pytest.raises(ValueError, match="status"):
-        FinsUploadPipelineResult.from_pipeline_json({"document_id": "aapl-2024-10k"})
+        FinsUploadPipelineResult.from_pipeline_json(
+            {"document_id": "aapl-2024-10k"},
+            source_kind=SourceKind.MATERIAL,
+        )
+
+
+def test_filing_pipeline_warning_parser_accepts_only_exact_closed_values() -> None:
+    """filing parser 应接受显式空数组与唯一规范 warning。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: typed warning 未按 exact JSON 闭集解析时抛出。
+    """
+
+    empty = FinsUploadPipelineResult.from_pipeline_json(
+        {"status": "skipped", "stored_file_count": 0, "warnings": []},
+        source_kind=SourceKind.FILING,
+    )
+    warned = FinsUploadPipelineResult.from_pipeline_json(
+        {
+            "status": "skipped",
+            "stored_file_count": 0,
+            "warnings": [
+                {
+                    "kind": "company_name_ignored",
+                    "message": COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+                }
+            ],
+        },
+        source_kind=SourceKind.FILING,
+    )
+
+    assert empty.warnings == ()
+    assert warned.warnings == (
+        CompanyMetadataWarning(
+            kind=CompanyMetadataWarningKind.COMPANY_NAME_IGNORED,
+            message=COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "warnings",
+    (
+        None,
+        {},
+        [{"kind": "company_name_ignored"}],
+        [
+            {
+                "kind": "unknown",
+                "message": COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+            }
+        ],
+        [{"kind": "company_name_ignored", "message": "非规范文案"}],
+        [
+            {
+                "kind": "company_name_ignored",
+                "message": COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+                "extra": "forbidden",
+            }
+        ],
+        [
+            {
+                "kind": "company_name_ignored",
+                "message": COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+            },
+            {
+                "kind": "company_name_ignored",
+                "message": COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+            },
+        ],
+    ),
+)
+def test_filing_pipeline_warning_parser_fails_closed(warnings: JsonValue) -> None:
+    """filing parser 必须拒绝 null、错 shape、未知值、重复与超限 warning。
+
+    Args:
+        warnings: 非法 warnings JSON fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: parser 接受非法 warning 时抛出。
+    """
+
+    with pytest.raises(ValueError):
+        FinsUploadPipelineResult.from_pipeline_json(
+            {"status": "skipped", "stored_file_count": 0, "warnings": warnings},
+            source_kind=SourceKind.FILING,
+        )
+
+
+def test_pipeline_warning_parser_requires_filing_field_but_allows_material_missing() -> None:
+    """只有 material 可缺失或显式携带空 warnings，非空与 null 均非法。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: source-kind schema 边界被 loose parsing 弱化时抛出。
+    """
+
+    material = FinsUploadPipelineResult.from_pipeline_json(
+        {"status": "skipped", "stored_file_count": 0},
+        source_kind=SourceKind.MATERIAL,
+    )
+    assert material.warnings == ()
+    explicit_empty_material = FinsUploadPipelineResult.from_pipeline_json(
+        {"status": "skipped", "stored_file_count": 0, "warnings": []},
+        source_kind=SourceKind.MATERIAL,
+    )
+    assert explicit_empty_material.warnings == ()
+    with pytest.raises(ValueError, match="material terminal result"):
+        FinsUploadPipelineResult.from_pipeline_json(
+            {
+                "status": "skipped",
+                "stored_file_count": 0,
+                "warnings": [
+                    {
+                        "kind": "company_name_ignored",
+                        "message": COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+                    }
+                ],
+            },
+            source_kind=SourceKind.MATERIAL,
+        )
+    with pytest.raises(ValueError, match="必须显式包含 warnings"):
+        FinsUploadPipelineResult.from_pipeline_json(
+            {"status": "skipped", "stored_file_count": 0},
+            source_kind=SourceKind.FILING,
+        )
+    with pytest.raises(ValueError, match="JSON array"):
+        FinsUploadPipelineResult.from_pipeline_json(
+            {"status": "skipped", "stored_file_count": 0, "warnings": None},
+            source_kind=SourceKind.MATERIAL,
+        )
+
+
+@pytest.mark.parametrize("status", ("failed", "cancelled", "deleted"))
+def test_pipeline_warning_invariant_rejects_non_success_status(status: str) -> None:
+    """failed/cancelled/deleted typed result 均不得携带 warning。
+
+    Args:
+        status: 当前不允许 warning 的 terminal status。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: success-only warning invariant 漂移时抛出。
+    """
+
+    failure_reason = _runtime_failure_for_status(status)
+    with pytest.raises(ValueError, match="ok/skipped"):
+        FinsUploadPipelineResult(
+            status=status,
+            stored_file_count=0,
+            failure_reason=failure_reason,
+            warnings=(
+                CompanyMetadataWarning(
+                    kind=CompanyMetadataWarningKind.COMPANY_NAME_IGNORED,
+                    message=COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+                ),
+            ),
+        )
 
 
 @pytest.mark.parametrize(
@@ -9127,7 +9334,10 @@ def test_upload_status_owner_maps_only_exact_production_statuses(
             "retry_hint": None,
             "file_label": None,
         }
-    pipeline_result = FinsUploadPipelineResult.from_pipeline_json(pipeline_json)
+    pipeline_result = FinsUploadPipelineResult.from_pipeline_json(
+        pipeline_json,
+        source_kind=SourceKind.MATERIAL,
+    )
     summary = FinsUploadResultSummary(
         source_kind=SourceKind.FILING,
         status=status,
@@ -9158,7 +9368,10 @@ def test_upload_status_owner_rejects_unknown_case_and_whitespace_variants(status
     """
 
     with pytest.raises(ValueError, match="upload status"):
-        FinsUploadPipelineResult.from_pipeline_json({"status": status, "stored_file_count": 0})
+        FinsUploadPipelineResult.from_pipeline_json(
+            {"status": status, "stored_file_count": 0},
+            source_kind=SourceKind.MATERIAL,
+        )
     with pytest.raises(ValueError, match="upload status"):
         FinsUploadResultSummary(
             source_kind=SourceKind.FILING,

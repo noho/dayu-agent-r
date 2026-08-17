@@ -23,6 +23,7 @@ from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.fins._log import Log
 from dayu.fins.direct_events import canonicalize_fins_public_file_label
+from dayu.fins.domain.company_meta_contract import CompanyMetaCommitOutcome
 from dayu.fins.domain.document_models import (
     BatchToken,
     FinsSourceProvider,
@@ -114,6 +115,8 @@ class UploadOperationResult:
         stored_file_count: 成功写入 staging 的用户输入 original 数；仅在 commit 成功后对外消费。
         file_events: 文件级事件。
         payload: 结果负载。
+        company_meta_commit_outcome: storage commit owner 返回的内部最终结果；
+            仅 shared filing publication 可消费。
     """
 
     status: str
@@ -122,6 +125,7 @@ class UploadOperationResult:
     stored_file_count: int
     file_events: list[UploadFileEventPayload]
     payload: JsonObject
+    company_meta_commit_outcome: CompanyMetaCommitOutcome | None = None
 
 
 @dataclass(frozen=True)
@@ -1419,8 +1423,11 @@ def commit_prepared_upload_batch(
             )
         # 先转移 capability 所有权，再进入 storage commit；从此不再读取取消或回滚。
         batch_terminal_started = True
-        batching_repository.commit_batch(batch)
-        return result
+        company_meta_commit_outcome = batching_repository.commit_batch(batch)
+        return replace(
+            result,
+            company_meta_commit_outcome=company_meta_commit_outcome,
+        )
     finally:
         if not batch_terminal_started:
             rollback_prepared_upload_batch(

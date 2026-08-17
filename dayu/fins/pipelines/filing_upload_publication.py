@@ -7,11 +7,16 @@ fresh validation、双取消 checkpoint、裁决、company stage 与既有 commi
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Final, NoReturn
 
 from dayu.contracts.cancellation import CancellationToken
+from dayu.fins.company_metadata_warning import (
+    CompanyMetadataWarning,
+    project_company_name_ignored_warning,
+)
+from dayu.fins.domain.company_meta_contract import CompanyMetaCommitOutcome
 from dayu.fins.domain.document_models import BatchToken
 from dayu.fins.ingestion_runtime import (
     FinsUploadUsageCode,
@@ -86,6 +91,51 @@ class FilingUploadPublishMode(str, Enum):
     REBASE_CREATE_OVERWRITE = "rebase_create_overwrite"
 
 
+def _warnings_from_commit_outcome(
+    outcome: CompanyMetaCommitOutcome | None,
+) -> tuple[CompanyMetadataWarning, ...]:
+    """从 storage final outcome 机械投影 publication warning。
+
+    Args:
+        outcome: commit 成功后返回的 publication-final company-meta outcome。
+
+    Returns:
+        无 ignored fact 时为空；否则返回唯一规范 warning。
+
+    Raises:
+        TypeError: outcome 不是精确 typed contract 时抛出。
+    """
+
+    if outcome is None:
+        return ()
+    if type(outcome) is not CompanyMetaCommitOutcome:
+        raise TypeError("company meta commit outcome 必须是精确 typed contract")
+    ignored_change = outcome.ignored_company_name
+    if ignored_change is None:
+        return ()
+    return (project_company_name_ignored_warning(ignored_change),)
+
+
+def _require_skip_company_meta_outcome(
+    outcome: CompanyMetaCommitOutcome | None,
+) -> CompanyMetaCommitOutcome:
+    """校验 metadata-only skip commit 必须返回 exact company outcome。
+
+    Args:
+        outcome: storage commit 返回值。
+
+    Returns:
+        已确认存在的 exact typed outcome。
+
+    Raises:
+        TypeError: storage 未返回 exact outcome 时抛出。
+    """
+
+    if type(outcome) is not CompanyMetaCommitOutcome:
+        raise TypeError("metadata-only skip commit 必须返回 CompanyMetaCommitOutcome")
+    return outcome
+
+
 @dataclass(frozen=True, slots=True)
 class FilingUploadPublicationOutcome:
     """shared publication owner 返回的 authoritative request 与完成结果。
@@ -94,10 +144,12 @@ class FilingUploadPublicationOutcome:
         authoritative_request: writer-owned fresh view 验证产生的最终请求；batch 前取消时
             使用 initial request。
         result: uploaded、skipped 或 cancelled 完成结果。
+        warnings: 仅由成功 commit outcome 投影的零或一个公司元数据警告。
     """
 
     authoritative_request: ValidatedFinsUploadFilingRequest
     result: UploadOperationResult
+    warnings: tuple[CompanyMetadataWarning, ...] = ()
 
     def __post_init__(self) -> None:
         """校验 outcome 只承载 closed typed completion。
@@ -122,6 +174,17 @@ class FilingUploadPublicationOutcome:
             raise TypeError("publication outcome 必须携带 UploadOperationResult")
         if self.result.status not in _PUBLICATION_COMPLETION_STATUSES:
             raise ValueError("publication outcome 只允许 uploaded/skipped/cancelled")
+        if len(self.warnings) > 1:
+            raise ValueError("publication outcome 最多允许一个 warning")
+        if any(type(warning) is not CompanyMetadataWarning for warning in self.warnings):
+            raise TypeError("publication outcome warning 必须是精确 typed contract")
+        if self.result.status == "cancelled" and self.warnings:
+            raise ValueError("cancelled publication outcome 禁止携带 warning")
+        expected_warnings = _warnings_from_commit_outcome(
+            self.result.company_meta_commit_outcome
+        )
+        if self.warnings != expected_warnings:
+            raise ValueError("publication warnings 必须与内部 commit outcome 同源")
 
 
 @dataclass(frozen=True, slots=True)
@@ -371,8 +434,9 @@ def _canonical_skip_requirements_are_met(
         prepared_identity: preparation owner 产生的 candidate identity。
 
     Returns:
-        fresh COMPLETE、company keep/no-intent 且 durable/prepared identity exact equal时
-        返回 ``True``。
+        fresh COMPLETE、company decision 为 keep/no-intent 或
+        stage/preserve-published intent，且 durable/prepared identity exact equal时返回
+        ``True``。
 
     Raises:
         无。
@@ -380,13 +444,15 @@ def _canonical_skip_requirements_are_met(
 
     fresh_state = fresh_request.published_state
     decision = fresh_request.company_meta_decision
-    return (
-        fresh_state.source_integrity.status is SourceIntegrityStatus.COMPLETE
-        and decision.disposition == "keep"
-        and decision.company_meta_intent is None
-        and fresh_state.publication_identity is not None
-        and fresh_state.publication_identity == prepared_identity
-    )
+    if fresh_state.source_integrity.status is not SourceIntegrityStatus.COMPLETE:
+        return False
+    if fresh_state.publication_identity is None or fresh_state.publication_identity != prepared_identity:
+        return False
+    if decision.disposition == "keep":
+        return decision.company_meta_intent is None
+    if decision.disposition != "stage" or decision.company_meta_intent is None:
+        return False
+    return decision.company_meta_intent.merge_mode == "preserve_published"
 
 
 def arbitrate_filing_upload_publication(
@@ -701,14 +767,35 @@ def execute_prepared_filing_publication(
             raise AssertionError("closed arbitration 必须产生 decision 与 fresh request")
 
         if decision.disposition is FilingUploadPublicationDisposition.SKIP:
-            batch_terminal_started = True
-            _rollback_without_business_terminal(
-                batching_repository=batching_repository,
+            company_decision = fresh_request.company_meta_decision
+            if company_decision.disposition == "keep":
+                batch_terminal_started = True
+                _rollback_without_business_terminal(
+                    batching_repository=batching_repository,
+                    batch=batch,
+                )
+                return FilingUploadPublicationOutcome(
+                    authoritative_request=fresh_request,
+                    result=build_prepared_filing_skip_result(prepared),
+                )
+            stage_upload_company_meta_decision(
+                repository=company_repository,
+                decision=company_decision,
                 batch=batch,
+            )
+            # capability 在 commit 调用前转交 storage owner；成功或异常都禁止 caller rollback。
+            batch_terminal_started = True
+            company_meta_commit_outcome = _require_skip_company_meta_outcome(
+                batching_repository.commit_batch(batch)
+            )
+            result = replace(
+                build_prepared_filing_skip_result(prepared),
+                company_meta_commit_outcome=company_meta_commit_outcome,
             )
             return FilingUploadPublicationOutcome(
                 authoritative_request=fresh_request,
-                result=build_prepared_filing_skip_result(prepared),
+                result=result,
+                warnings=_warnings_from_commit_outcome(company_meta_commit_outcome),
             )
         if decision.disposition is FilingUploadPublicationDisposition.CONFLICT:
             if decision.failure_reason is None:
@@ -751,6 +838,9 @@ def execute_prepared_filing_publication(
         return FilingUploadPublicationOutcome(
             authoritative_request=fresh_request,
             result=result,
+            warnings=_warnings_from_commit_outcome(
+                result.company_meta_commit_outcome
+            ),
         )
     finally:
         if not batch_terminal_started:

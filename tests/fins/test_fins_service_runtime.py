@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import errno
 from datetime import datetime
 from pathlib import Path
@@ -153,6 +154,70 @@ class _AlwaysCancelledChecker(FinsJobCancellationChecker):
         """
 
         return None
+
+
+def test_production_runner_parser_callsites_use_explicit_source_kind() -> None:
+    """四个 parser callsite 必须按所属 runner 方法绑定正确 SourceKind。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: callsite 数量、所属方法、关键字或 SourceKind 漂移时抛出。
+        OSError: production 模块源码读取失败时抛出。
+        SyntaxError: production 模块源码无法解析时抛出。
+    """
+
+    source_path = Path(service_runtime.__file__)
+    syntax_tree = ast.parse(
+        source_path.read_text(encoding="utf-8"),
+        filename=str(source_path),
+    )
+    runner_classes = [
+        node
+        for node in syntax_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "ProductionFinsUploadRunner"
+    ]
+    assert len(runner_classes) == 1
+    runner_class = runner_classes[0]
+    source_kinds_by_method: dict[str, list[str]] = {}
+    for method in runner_class.body:
+        if not isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        calls = [
+            node
+            for node in ast.walk(method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "from_pipeline_json"
+        ]
+        if not calls:
+            continue
+        method_source_kinds: list[str] = []
+        for call in calls:
+            keyword = next(
+                (item for item in call.keywords if item.arg == "source_kind"),
+                None,
+            )
+            assert keyword is not None
+            assert isinstance(keyword.value, ast.Attribute)
+            assert isinstance(keyword.value.value, ast.Name)
+            assert keyword.value.value.id == "SourceKind"
+            method_source_kinds.append(keyword.value.attr)
+        source_kinds_by_method[method.name] = method_source_kinds
+
+    assert set(source_kinds_by_method) == {
+        "_run_filing_upload",
+        "_run_material_upload",
+    }
+    assert len(source_kinds_by_method["_run_filing_upload"]) == 2
+    assert set(source_kinds_by_method["_run_filing_upload"]) == {"FILING"}
+    assert len(source_kinds_by_method["_run_material_upload"]) == 2
+    assert set(source_kinds_by_method["_run_material_upload"]) == {"MATERIAL"}
+    assert sum(len(kinds) for kinds in source_kinds_by_method.values()) == 4
 
 
 def test_delete_contract_rejects_before_workspace_repository_bootstrap(

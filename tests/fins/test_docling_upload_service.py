@@ -18,6 +18,7 @@ import pytest
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 import dayu.fins.pipelines.docling_upload_service as docling_upload_owner_module
+from dayu.fins.domain.company_meta_contract import CompanyMetaCommitOutcome
 from dayu.fins.domain.document_models import (
     BatchToken,
     DocumentHandle,
@@ -364,13 +365,26 @@ class _BatchIdentityUploadBatchingRepository(FsBatchingRepository):
         self.phase_batch_ids.append(("begin", token.transaction_id))
         return token
 
-    def commit_batch(self, batch: BatchToken) -> None:
-        """记录 caller 的唯一 commit 并转发 storage commit。"""
+    def commit_batch(self, batch: BatchToken) -> CompanyMetaCommitOutcome | None:
+        """记录 caller 的唯一 commit 并转发 storage commit。
+
+        Args:
+            batch: caller 转交的 batch capability。
+
+        Returns:
+            真实 storage 产生的 publication-final company-meta outcome；无 intent
+            时返回 ``None``。
+
+        Raises:
+            OSError: storage commit 失败时抛出。
+            ValueError: capability 非法时抛出。
+        """
 
         self.record_phase("commit", batch)
         self.commit_calls += 1
-        super().commit_batch(batch)
+        outcome = super().commit_batch(batch)
         self.active_token = None
+        return outcome
 
     def rollback_batch(self, batch: BatchToken) -> None:
         """记录 caller rollback 并转发 storage rollback。"""
@@ -462,8 +476,18 @@ class _CommitFailingUploadBatchingRepository(FsBatchingRepository):
         self._events = events
         self.caller_rollback_calls = 0
 
-    def commit_batch(self, batch: BatchToken) -> None:
-        """由 storage owner 回滚并消费 token，再抛出 commit 主异常。"""
+    def commit_batch(self, batch: BatchToken) -> CompanyMetaCommitOutcome | None:
+        """由 storage owner 回滚并消费 token，再抛出 commit 主异常。
+
+        Args:
+            batch: caller 转交的 batch capability。
+
+        Returns:
+            本 failure fake 不正常返回。
+
+        Raises:
+            OSError: 始终在 storage owner 消费 capability 后抛出。
+        """
 
         FsBatchingRepository.rollback_batch(self, batch)
         raise OSError("forced storage commit failure")
@@ -504,14 +528,15 @@ class _CommitBarrierBatchingRepository(FsBatchingRepository):
         self.allow_commit_return = Event()
         self.rollback_calls = 0
 
-    def commit_batch(self, batch: BatchToken) -> None:
+    def commit_batch(self, batch: BatchToken) -> CompanyMetaCommitOutcome | None:
         """在真实 commit 前等待测试释放。
 
         Args:
             batch: 已转交 storage owner 的 capability。
 
         Returns:
-            无。
+            barrier 释放后返回真实 publication-final company-meta outcome；无
+            intent 时返回 ``None``。
 
         Raises:
             TimeoutError: 测试未释放 barrier 时抛出。
@@ -521,7 +546,7 @@ class _CommitBarrierBatchingRepository(FsBatchingRepository):
         self.commit_entered.set()
         if not self.allow_commit_return.wait(timeout=1.0):
             raise TimeoutError("commit barrier was not released")
-        super().commit_batch(batch)
+        return super().commit_batch(batch)
 
     def rollback_batch(self, batch: BatchToken) -> None:
         """记录 caller rollback。

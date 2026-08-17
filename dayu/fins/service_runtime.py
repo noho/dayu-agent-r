@@ -26,6 +26,7 @@ from dayu.fins.ingestion_runtime import (
     _filing_upload_request_identity,
     validate_fins_upload_filing_request,
 )
+from dayu.fins.domain.enums import SourceKind
 from dayu.fins.processors.registry import build_fins_processor_registry
 from dayu.fins.storage import (
     BatchingRepositoryProtocol,
@@ -181,14 +182,16 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
                 self.sec_pipeline.upload_filing(
                     request,
                     cancellation_checker=cancellation_checker,
-                )
+                ),
+                source_kind=SourceKind.FILING,
             )
         if market in {"CN", "HK"}:
             return FinsUploadPipelineResult.from_pipeline_json(
                 self.cn_pipeline.upload_filing(
                     request,
                     cancellation_checker=cancellation_checker,
-                )
+                ),
+                source_kind=SourceKind.FILING,
             )
         raise ValueError(f"不支持的上传市场: {market}")
 
@@ -240,7 +243,8 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
                     ticker_aliases=list(request.ticker_aliases),
                     overwrite=request.overwrite,
                     cancellation_checker=cancellation_checker,
-                )
+                ),
+                source_kind=SourceKind.MATERIAL,
             )
         if market in {"CN", "HK"}:
             return FinsUploadPipelineResult.from_pipeline_json(
@@ -260,7 +264,8 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
                     ticker_aliases=list(request.ticker_aliases),
                     overwrite=request.overwrite,
                     cancellation_checker=cancellation_checker,
-                )
+                ),
+                source_kind=SourceKind.MATERIAL,
             )
         raise ValueError(f"不支持的上传市场: {market}")
 

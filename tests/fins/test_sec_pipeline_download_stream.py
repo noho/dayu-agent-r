@@ -13,6 +13,7 @@ from typing import BinaryIO, Optional, cast
 
 import pytest
 
+from dayu.fins.domain.company_meta_contract import CompanyMetaCommitOutcome
 from dayu.fins.domain.document_models import (
     BatchToken,
     DocumentHandle,
@@ -97,14 +98,14 @@ class _BatchIdentitySecBatchingRepository(FsBatchingRepository):
         self.commit_calls = 0
         self.rollback_calls = 0
 
-    def commit_batch(self, batch: BatchToken) -> None:
+    def commit_batch(self, batch: BatchToken) -> CompanyMetaCommitOutcome | None:
         """记录并提交 batch。
 
         Args:
             batch: 待提交 batch capability。
 
         Returns:
-            无。
+            download batch 的真实 typed company-meta outcome；无 intent 时返回 ``None``。
 
         Raises:
             OSError: storage commit 失败时抛出。
@@ -112,7 +113,7 @@ class _BatchIdentitySecBatchingRepository(FsBatchingRepository):
         """
 
         self.commit_calls += 1
-        super().commit_batch(batch)
+        return super().commit_batch(batch)
 
     def rollback_batch(self, batch: BatchToken) -> None:
         """记录并回滚 batch。

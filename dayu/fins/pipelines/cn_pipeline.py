@@ -16,6 +16,7 @@ from typing import Final, Optional, TypeAlias, cast
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
+from dayu.fins.company_metadata_warning import company_metadata_warnings_to_json
 from dayu.fins.downloaders.cninfo_downloader import (
     DEFAULT_MAX_RETRIES as CNINFO_DEFAULT_MAX_RETRIES,
     DEFAULT_SLEEP_SECONDS as CNINFO_DEFAULT_SLEEP_SECONDS,
@@ -865,6 +866,7 @@ class CnPipeline:
             if isinstance(prepared_upload, UploadOperationResult):
                 upload_result = prepared_upload
                 completed_request = authoritative_request
+                completed_warnings = ()
             elif resolved_action == "delete":
                 publication_batch = self._batching_repository.begin_batch(normalized_ticker)
                 try:
@@ -888,6 +890,7 @@ class CnPipeline:
                     cancellation=cancellation_checker,
                 )
                 completed_request = authoritative_request
+                completed_warnings = ()
             else:
                 publication_outcome = execute_prepared_filing_publication(
                     request=authoritative_request,
@@ -900,6 +903,7 @@ class CnPipeline:
                 )
                 completed_request = publication_outcome.authoritative_request
                 upload_result = publication_outcome.result
+                completed_warnings = publication_outcome.warnings
             completed_action = completed_request.resolved_action
             for file_event in upload_result.file_events:
                 yield UploadFilingEvent(
@@ -927,6 +931,7 @@ class CnPipeline:
                 **upload_result.payload,
                 stored_file_count=upload_result.stored_file_count,
                 status=_resolve_upload_status(upload_result.status),
+                warnings=company_metadata_warnings_to_json(completed_warnings),
             )
             yield UploadFilingEvent(
                 event_type=UploadFilingEventType.UPLOAD_COMPLETED,
@@ -1867,6 +1872,7 @@ def _build_cn_filing_failure_event(
         status="failed",
         message=failure_reason.message,
         failure=failure_reason.to_json(),
+        warnings=[],
     )
     return UploadFilingEvent(
         event_type=UploadFilingEventType.UPLOAD_FAILED,
