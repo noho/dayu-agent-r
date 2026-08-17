@@ -142497,7 +142497,7 @@
   },
   "readiness_proof": {
     "proof_version": 5,
-    "generated_at": "2026-08-12T00:00:00Z",
+    "generated_at": "2026-08-17T00:00:00Z",
     "target_commit": "256786b255021ee429a20f22aad726b1ad33916c",
     "registry_scope": [
       "init",
@@ -142707,7 +142707,7 @@
       "upload_filing": {
         "validation_result": "ready",
         "calibration_status": "oracle-and-scenarios-accepted",
-        "implementation_conformance_status": "fixes-complete-post-fix-reruns-required",
+        "implementation_conformance_status": "residual-fix-required-before-second-round-pass",
         "parser_inventory": {
           "inventory_id": "dayu.cli.arg_parsing.build_parser:upload_filing",
           "inventory_version": 4,
@@ -142730,8 +142730,8 @@
           "cross_command_assertion_ids": 1
         },
         "coverage_inventory_sha256": "afa68a50ec9253cb806edaecf6dc26869f1df6af85d4a1412997ccb70c469be1",
-        "frozen_report_digest_entry_count": 2,
-        "frozen_report_digest_set_sha256": "e77849cb5f3b75e6ae3781937b12531be47386398deac7ab17adfeeb21d752e7",
+        "frozen_report_digest_entry_count": 3,
+        "frozen_report_digest_set_sha256": "a853bfff5f72f4e7599a3b57b2830de9c5d936a7c6ffc90d5103acfe717a5b98",
         "user_adjudication_identity_count": 1,
         "user_adjudication_identity_set_sha256": "b2ba42ad0913dac97362ba3229cf95a524027ab1bcda04bcdf5758d3d0ef8622",
         "accepted_oracle_refs": [
@@ -142757,7 +142757,7 @@
           {
             "finding_id": "UF-FIX01",
             "slug": "validation-atomic-boundary",
-            "status": "fix-complete-local-closeout",
+            "status": "reopened-after-post-fix-residual",
             "closeout_commit": "114430ce",
             "closeout_artifact": "docs/gateflow/uf-fix01-validation-atomic-boundary-final-closeout-20260813.md",
             "oracle_predicate_refs": [
@@ -142765,7 +142765,18 @@
               "upload_filing.error-classification"
             ],
             "accepted_requirement": "把全部可预判 usage validation 前移到 workspace mutation 前；company meta 与 source publication 同一原子业务边界。",
-            "implementation_authorization": "completed-by-user-authorized-gateflow-work-unit"
+            "implementation_authorization": "completed-by-user-authorized-gateflow-work-unit",
+            "residual_id": "UF-FIX01-R1",
+            "residual_status": "fix-required",
+            "residual_requirement": "由 upload/download 可复用的 fiscal-period 单一 owner 在 operation/workspace mutation 前执行 strip、uppercase 与 FY/H1/Q1/Q2/Q3/Q4 闭集校验；US/CN/HK 的非法值统一投影为可行动的 usage failure（exit 2），不得进入 runtime unexpected failure。",
+            "residual_evidence": {
+              "run_id": "upload-filing-postfix-all-20260817-p26wBp",
+              "report_sha256": "c5212306d27af50ac78a8b559c9c4b7348f154a1ec149f105712fabe652d4ddb",
+              "case_ref": "cases/UF-A21-us-invalid-period",
+              "observed_exit_code": 1,
+              "observed_failure_kind": "runtime",
+              "observed_failure_code": "unexpected_runtime"
+            }
           },
           {
             "finding_id": "UF-FIX02",
@@ -142895,115 +142906,295 @@
         "required_post_fix_reruns": [
           {
             "rerun_id": "UF-PF01",
-            "status": "pending-after-fix",
+            "status": "residual-found-fix-and-rerun-required",
             "blocked_by_finding_ids": [
               "UF-FIX01"
             ],
-            "required_observation": "无效/缺失参数矩阵，断言 exit 2、具体 reason 且 workspace 零业务 mutation。",
-            "evidence_policy": "real-cli-frozen-report-no-mock-no-fake"
+            "required_observation": "修复 UF-FIX01-R1 后补跑 fiscal-period invalid slice，覆盖 US/CN/HK 共用闭集校验 owner，断言 exit 2、具体 reason、operation 未开始且 workspace 零业务 mutation。",
+            "evidence_policy": "real-cli-frozen-report-no-mock-no-fake",
+            "adjudication": "not-accepted-as-complete-2026-08-17",
+            "observed_evidence": {
+              "run_id": "upload-filing-postfix-all-20260817-p26wBp",
+              "report_sha256": "c5212306d27af50ac78a8b559c9c4b7348f154a1ec149f105712fabe652d4ddb",
+              "residual_case_ref": "cases/UF-A21-us-invalid-period"
+            }
           },
           {
             "rerun_id": "UF-PF02",
-            "status": "pending-after-fix",
+            "status": "accepted-post-fix-observation",
             "blocked_by_finding_ids": [
               "UF-FIX02"
             ],
             "required_observation": "同名/改名 update、update missing±overwrite、deleted 后 auto、existing pre-conversion conflict。",
-            "evidence_policy": "real-cli-frozen-report-no-mock-no-fake"
+            "evidence_policy": "real-cli-frozen-report-no-mock-no-fake",
+            "adjudication": "accepted-2026-08-17",
+            "observed_evidence": {
+              "run_id": "upload-filing-postfix-all-20260817-p26wBp",
+              "report_sha256": "c5212306d27af50ac78a8b559c9c4b7348f154a1ec149f105712fabe652d4ddb",
+              "case_refs": [
+                "cases/R-PF02-01-auto-fresh",
+                "cases/R-PF02-02-update-same-name",
+                "cases/R-PF02-03-update-renamed",
+                "cases/R-PF02-04-update-missing",
+                "cases/R-PF02-05-update-missing-overwrite",
+                "cases/R-PF02-06-create-existing-corrupt-preconversion",
+                "cases/R-PF02-07-delete-existing",
+                "cases/R-PF02-08-delete-repeated",
+                "cases/R-PF02-09-auto-after-delete"
+              ]
+            }
           },
           {
             "rerun_id": "UF-PF03",
-            "status": "pending-after-fix",
+            "status": "accepted-post-fix-observation",
             "blocked_by_finding_ids": [
               "UF-FIX03"
             ],
             "required_observation": "delete+files、损坏 PDF/DOCX、混合批次与 generic failure 场景，核对 requested/stored 和 bounded stderr/log。",
-            "evidence_policy": "real-cli-frozen-report-no-mock-no-fake"
+            "evidence_policy": "real-cli-frozen-report-no-mock-no-fake",
+            "adjudication": "accepted-2026-08-17",
+            "observed_evidence": {
+              "run_id": "upload-filing-postfix-all-20260817-p26wBp",
+              "report_sha256": "c5212306d27af50ac78a8b559c9c4b7348f154a1ec149f105712fabe652d4ddb",
+              "case_refs": [
+                "cases/R-PF03-mixed-corrupt-primary",
+                "cases/UF-I11-corrupt-pdf",
+                "cases/UF-I13-corrupt-docx"
+              ],
+              "prior_focused_report_sha256": "1645834dff04c863d7a5d5414bffc95cadbc14995fd86720070e9667eba31cdb"
+            }
           },
           {
             "rerun_id": "UF-PF04",
-            "status": "pending-after-fix",
+            "status": "accepted-post-fix-observation",
             "blocked_by_finding_ids": [
               "UF-FIX04"
             ],
             "required_observation": "非法/有效 filing-date、report-date、0/负数/超四位/四位 fiscal year，并回归 download 共享校验与部分日期展开。",
-            "evidence_policy": "real-cli-frozen-report-no-mock-no-fake"
+            "evidence_policy": "real-cli-frozen-report-no-mock-no-fake",
+            "adjudication": "accepted-2026-08-17",
+            "observed_evidence": {
+              "run_id": "upload-filing-postfix-all-20260817-p26wBp",
+              "report_sha256": "c5212306d27af50ac78a8b559c9c4b7348f154a1ec149f105712fabe652d4ddb",
+              "case_refs": [
+                "cases/R-PF04-valid-min",
+                "cases/R-PF04-valid-max",
+                "cases/R-PF04-valid-leap",
+                "cases/R-PF04-download-year",
+                "cases/R-PF04-download-month",
+                "cases/R-PF04-download-day",
+                "cases/R-PF04-download-invalid-calendar"
+              ],
+              "prior_focused_report_sha256": "46c8213032b43ee9b5b50118802216c0697c04313e1c2560d370907f66e9bd61"
+            }
           },
           {
             "rerun_id": "UF-PF05",
-            "status": "pending-after-fix",
+            "status": "accepted-post-fix-observation",
             "blocked_by_finding_ids": [
               "UF-FIX05"
             ],
             "required_observation": "canonical 与用户声明 alias 调用 list_documents 返回同一 corpus；DELTA,MSFT 按用户声明接受；语法变体、跨市场 alias、resolver 生成的 V.BA 类 alias 端到端可消费。",
-            "evidence_policy": "real-cli-frozen-report-no-mock-no-fake"
+            "evidence_policy": "real-cli-frozen-report-no-mock-no-fake",
+            "adjudication": "accepted-2026-08-17",
+            "observed_evidence": {
+              "run_id": "upload-filing-postfix-all-20260817-p26wBp",
+              "report_sha256": "c5212306d27af50ac78a8b559c9c4b7348f154a1ec149f105712fabe652d4ddb",
+              "case_refs": [
+                "cases/R-PF05-list-cross-market-alias",
+                "cases/R2-PF05-list-v-ba"
+              ]
+            }
           },
           {
             "rerun_id": "UF-PF06",
-            "status": "pending-after-fix",
+            "status": "accepted-post-fix-observation",
             "blocked_by_finding_ids": [
               "UF-FIX06"
             ],
             "required_observation": "真实格式 capability 全矩阵及 XBRL primary+companion，逐项核对 help/CLI/Service/converter 同源。",
-            "evidence_policy": "real-cli-frozen-report-no-mock-no-fake"
+            "evidence_policy": "real-cli-frozen-report-no-mock-no-fake",
+            "adjudication": "accepted-2026-08-17",
+            "observed_evidence": {
+              "run_id": "upload-filing-postfix-all-20260817-p26wBp",
+              "report_sha256": "c5212306d27af50ac78a8b559c9c4b7348f154a1ec149f105712fabe652d4ddb",
+              "case_refs": [
+                "cases/PF06-xbrl-primary-companion",
+                "cases/R-PF06-real-msft-multi-primary",
+                "cases/R-PF06-real-msft-multi-process"
+              ]
+            }
           },
           {
             "rerun_id": "UF-PF07",
-            "status": "pending-after-fix",
+            "status": "accepted-post-fix-observation",
             "blocked_by_finding_ids": [
               "UF-FIX07"
             ],
             "required_observation": "不同 stem、重复路径、重复 basename、同 stem 不同后缀、100 文件边界与显式 primary downstream 消费。",
-            "evidence_policy": "real-cli-frozen-report-no-mock-no-fake"
+            "evidence_policy": "real-cli-frozen-report-no-mock-no-fake",
+            "adjudication": "accepted-2026-08-17",
+            "observed_evidence": {
+              "run_id": "upload-filing-postfix-all-20260817-p26wBp",
+              "report_sha256": "c5212306d27af50ac78a8b559c9c4b7348f154a1ec149f105712fabe652d4ddb",
+              "case_refs": [
+                "cases/R-PF07-distinct-stems",
+                "cases/R-PF07-same-stem",
+                "cases/R-PF07-duplicate-basename",
+                "cases/PF07-one-hundred-explicit-primary"
+              ]
+            }
           },
           {
             "rerun_id": "UF-PF08",
-            "status": "pending-after-fix",
+            "status": "accepted-post-fix-observation",
             "blocked_by_finding_ids": [
               "UF-FIX08"
             ],
             "required_observation": "original/Docling/meta/manifest 四类损坏，以完整本地输入执行 auto 原子恢复并由 public repository 重读。",
-            "evidence_policy": "real-cli-frozen-report-no-mock-no-fake"
+            "evidence_policy": "real-cli-frozen-report-no-mock-no-fake",
+            "adjudication": "accepted-2026-08-17",
+            "observed_evidence": {
+              "run_id": "upload-filing-postfix-all-20260817-p26wBp",
+              "report_sha256": "c5212306d27af50ac78a8b559c9c4b7348f154a1ec149f105712fabe652d4ddb",
+              "case_refs": [
+                "cases/UF-I02-auto-with-original-missing",
+                "cases/UF-I04-auto-with-original-digest-changed",
+                "cases/UF-I06-auto-with-docling-missing",
+                "cases/UF-I08-auto-with-meta-size-digest-mismatch",
+                "cases/UF-I10-auto-with-manifest-missing"
+              ]
+            }
           },
           {
             "rerun_id": "UF-PF09",
-            "status": "pending-after-fix",
+            "status": "accepted-post-fix-observation",
             "blocked_by_finding_ids": [
               "UF-FIX09"
             ],
             "required_observation": "HK PDF 与 US DOCX Docling 中途 SIGINT，验证快速 exit 130、无 completed、无子孙进程/半发布、原样重试；同时回归 download Docling cancel。",
-            "evidence_policy": "real-cli-frozen-report-no-mock-no-fake"
+            "evidence_policy": "real-cli-frozen-report-no-mock-no-fake",
+            "adjudication": "accepted-2026-08-17",
+            "observed_evidence": {
+              "run_id": "upload-filing-postfix-all-20260817-p26wBp",
+              "report_sha256": "c5212306d27af50ac78a8b559c9c4b7348f154a1ec149f105712fabe652d4ddb",
+              "case_refs": [
+                "cases/UF-L01-very-early-sigint",
+                "cases/UF-L02-cn-docling-sigint",
+                "cases/UF-L03-cn-retry-after-sigint",
+                "cases/UF-L04-us-docling-sigint",
+                "cases/UF-L05-us-retry-after-sigint"
+              ],
+              "prior_shared_converter_report_sha256": "4af8f01e94d99ca936fa25b4a63c24dd9df5ca8766f4abc5dabe8b5403aabe16"
+            }
           },
           {
             "rerun_id": "UF-PF10",
-            "status": "pending-after-fix",
+            "status": "accepted-post-fix-observation",
             "blocked_by_finding_ids": [
               "UF-FIX10"
             ],
             "required_observation": "同一 auto、同 ticker 不同 filing、不同 ticker 三组真实并发，核对终态与 publication 完整性。",
-            "evidence_policy": "real-cli-frozen-report-no-mock-no-fake"
+            "evidence_policy": "real-cli-frozen-report-no-mock-no-fake",
+            "adjudication": "accepted-2026-08-17",
+            "observed_evidence": {
+              "run_id": "upload-filing-postfix-all-20260817-p26wBp",
+              "report_sha256": "c5212306d27af50ac78a8b559c9c4b7348f154a1ec149f105712fabe652d4ddb",
+              "case_refs": [
+                "cases/UF-L08-concurrent-same-document",
+                "cases/UF-L09-concurrent-different-documents-same-ticker",
+                "cases/UF-L11-concurrent-valid-different-tickers"
+              ]
+            }
           },
           {
             "rerun_id": "UF-PF11",
-            "status": "pending-after-fix",
+            "status": "accepted-post-fix-observation",
             "blocked_by_finding_ids": [
               "UF-FIX11"
             ],
-            "required_observation": "stale refresh、stale missing name、fresh name/alias ignored warning 与 company meta/source 原子性。",
-            "evidence_policy": "real-cli-frozen-report-no-mock-no-fake"
+            "required_observation": "stale refresh、stale missing name、fresh name ignored warning、fresh alias stable-union 接受与 company meta/source 原子性。",
+            "evidence_policy": "real-cli-frozen-report-no-mock-no-fake",
+            "adjudication": "accepted-2026-08-17",
+            "observed_evidence": {
+              "run_id": "upload-filing-postfix-all-20260817-p26wBp",
+              "report_sha256": "c5212306d27af50ac78a8b559c9c4b7348f154a1ec149f105712fabe652d4ddb",
+              "case_refs": [
+                "cases/R-PF11-stale-explicit-refresh",
+                "cases/R-PF11-stale-missing-name",
+                "cases/PF11-fresh-name-alias-change"
+              ]
+            }
           },
           {
             "rerun_id": "UF-PF12",
-            "status": "pending-after-fix",
+            "status": "full-matrix-executed-conformance-blocked",
             "blocked_by_finding_ids": [
-              "UF-FIX01",
-              "UF-FIX03",
-              "UF-FIX06",
-              "UF-FIX07",
-              "UF-FIX09"
+              "UF-FIX01"
             ],
             "required_observation": "修复汇总后重新执行 upload_filing 137 条 full-real mandatory matrix并重算 conformance；第一轮 evidence 不重写。",
-            "evidence_policy": "real-cli-frozen-report-no-mock-no-fake"
+            "evidence_policy": "real-cli-frozen-report-no-mock-no-fake",
+            "adjudication": "not-accepted-as-second-round-pass-2026-08-17",
+            "observed_evidence": {
+              "run_id": "upload-filing-postfix-all-20260817-p26wBp",
+              "report_sha256": "c5212306d27af50ac78a8b559c9c4b7348f154a1ec149f105712fabe652d4ddb",
+              "executed_scenario_count": 137,
+              "accepted_scenario_obligation_count": 137,
+              "blocking_residual_ref": "UF-FIX01-R1"
+            }
+          }
+        ],
+        "accepted_scenario_refreshes": [
+          {
+            "refresh_id": "UF-SR01",
+            "status": "accepted-2026-08-17",
+            "scope": "action-precondition-chain",
+            "requirement": "UF-A08 的 update missing + overwrite 必须保持 usage failure 且不得创建 BETA；UF-A09 delete existing 与 UF-A10 repeated delete 必须各自建立独立、可复现的 existing/deleted 前置，不再依赖 UF-A08 的旧副作用。",
+            "observed_case_refs": [
+              "cases/UF-A08-update-missing-overwrite-creates",
+              "cases/R-PF02-07-delete-existing",
+              "cases/R-PF02-08-delete-repeated"
+            ]
+          },
+          {
+            "refresh_id": "UF-SR02",
+            "status": "accepted-2026-08-17",
+            "scope": "multi-file-primary",
+            "requirement": "所有多文件正向场景显式传入属于 --files 的 --primary；重复解析路径继续作为前置 usage failure；显式 primary 下覆盖不同 stem、同 stem、重复 basename、真实多附件与 100 文件边界。",
+            "observed_case_refs": [
+              "cases/R-PF06-real-msft-multi-primary",
+              "cases/PF06-xbrl-primary-companion",
+              "cases/R-PF07-distinct-stems",
+              "cases/R-PF07-same-stem",
+              "cases/R-PF07-duplicate-basename",
+              "cases/PF07-one-hundred-explicit-primary",
+              "cases/R-PF03-mixed-corrupt-primary"
+            ]
+          },
+          {
+            "refresh_id": "UF-SR03",
+            "status": "accepted-2026-08-17",
+            "scope": "converter-capability-case-names",
+            "requirement": "刷新 UF-030～UF-038 与 UF-F06 中携带旧 owner-drift 判断的场景名称，使名称只描述当前 capability/输入类别与期望边界；通过 supersedes/superseded_by 保留原 source scenario lineage，不改写第一轮冻结 evidence。",
+            "observed_case_refs": [
+              "cases/UF-030-owner-allows-cli-rejects-doc",
+              "cases/UF-031-owner-allows-cli-rejects-ppt",
+              "cases/UF-032-owner-allows-cli-rejects-pptx",
+              "cases/UF-033-cli-allows-owner-rejects-csv",
+              "cases/UF-034-cli-allows-owner-rejects-json",
+              "cases/UF-035-cli-allows-owner-rejects-xbrl",
+              "cases/UF-036-cli-allows-owner-rejects-xhtml",
+              "cases/UF-037-cli-allows-owner-rejects-xml",
+              "cases/UF-038-cli-allows-owner-rejects-zip",
+              "cases/UF-F06-xls-ooxml-bytes"
+            ]
+          },
+          {
+            "refresh_id": "UF-SR04",
+            "status": "accepted-2026-08-17",
+            "scope": "evidence-lineage",
+            "requirement": "本轮 replacement/focused case 登记为新的 observed evidence；第一轮 calibration/supplement report 与既有 scenario evidence 保持冻结，不覆盖、不重写。",
+            "registry_materialization": "在 UF-FIX01-R1 closeout 后、UF-PF12 重跑前生成 versioned successor scenarios；只有已有精确 replacement evidence 的定义可直接物化，仍需精确 argv 的定义并入 UF-PF12 真实运行。"
           }
         ],
         "frozen_report_digests": [
@@ -143014,6 +143205,10 @@
           {
             "run_id": "upload-filing-supplement-20260811-GHEcbh",
             "sha256": "3d37640009753d72955f44e62fd772ff37ff984b386fe65bb1ca708476a23276"
+          },
+          {
+            "run_id": "upload-filing-postfix-all-20260817-p26wBp",
+            "sha256": "c5212306d27af50ac78a8b559c9c4b7348f154a1ec149f105712fabe652d4ddb"
           }
         ],
         "adjudication_artifact_digests": [
@@ -143028,6 +143223,18 @@
           {
             "artifact": "secret-scan.json",
             "sha256": "e6a1d67d3d8c98b1e2609d1c8d9b1e06bc1f6cf91e3f96d67cef87870f01d086"
+          },
+          {
+            "artifact": "upload-filing-postfix-all-20260817-p26wBp/observed-behavior.json",
+            "sha256": "3312a30bc722d8c610f824cc54804f098c098cde944bc03b4f1af5382d53aeb1"
+          },
+          {
+            "artifact": "upload-filing-postfix-all-20260817-p26wBp/secret-scan.json",
+            "sha256": "8a3083a2b54ed7d164278350a0af3c8120213db840a923f1c10bee346d252d42"
+          },
+          {
+            "artifact": "upload-filing-postfix-all-20260817-p26wBp/manifest-sha256.json",
+            "sha256": "3696696b145b84152fdec3bb97a55a84e7f6bb3ffcceff1c4aeaa478dcba5b6e"
           }
         ]
       }
@@ -143043,9 +143250,8 @@
       "local_report_digest_mismatches": 0
     },
     "post_fix_conformance_refresh": {
-      "status": "required",
-      "remaining_required_refreshes": [
-        "UF-PF01",
+      "status": "residual-fix-and-rerun-required",
+      "accepted_post_fix_observations": [
         "UF-PF02",
         "UF-PF03",
         "UF-PF04",
@@ -143055,11 +143261,17 @@
         "UF-PF08",
         "UF-PF09",
         "UF-PF10",
-        "UF-PF11",
+        "UF-PF11"
+      ],
+      "remaining_required_refreshes": [
+        "UF-PF01",
         "UF-PF12"
       ],
-      "last_user_adjudication_date": "2026-08-12",
-      "boundary": "implementation findings 与 post-fix rerun 不构成 oracle/scenario coverage gap；完成前不得宣称 upload_filing 第二轮 conformance pass。"
+      "blocking_residual_refs": [
+        "UF-FIX01-R1"
+      ],
+      "last_user_adjudication_date": "2026-08-17",
+      "boundary": "UF-PF02～UF-PF11 已按真实 CLI evidence 接受；US 非法 fiscal-period 残余修复并完成 UF-PF01 与全量 UF-PF12 前，不得宣称 upload_filing 第二轮 conformance pass。第一轮 oracle/scenario coverage 与冻结 evidence 不受影响。"
     },
     "global": {
       "validation_result": "ready",
@@ -143079,7 +143291,7 @@
         "session",
         "tool_trace"
       ],
-      "reason": "五个命令的第一轮真实运行、逐项用户裁决与 accepted Oracle/scenarios 已闭合；upload_filing 的 implementation findings 已完成修复并登记 closeout，post-fix reruns 尚未全部完成，不构成第一轮 calibration coverage gap。"
+    "reason": "五个命令的第一轮真实运行、逐项用户裁决与 accepted Oracle/scenarios 已闭合；upload_filing 的 UF-PF02～UF-PF11 post-fix observation 已接受，UF-FIX01 因 US 非法 fiscal-period 仍落入 runtime failure 而重开，UF-PF01 与 UF-PF12 必须在残余修复后补跑；该残余不回写第一轮冻结 evidence，也不构成第一轮 calibration coverage gap。"
     },
     "registry_digest_basis": "f17b6bccc66910fafa3b4a003284ed49ea27dd1a37f2dc08ee545e8e8d62c0e5",
     "accepted_oracle_registry_digest_basis": "73fc031eca26c30c79f089bce918362cbb397b8ff4aa1592d6831a1636b4a0ec"
