@@ -3,7 +3,7 @@
 ## 0. Gate 元数据
 
 - Work unit：`UF-FIX11 company-metadata-ignored-change-warning`
-- 当前 gate：implementation
+- 当前 gate：原子 S1+S2 implementation
 - 日期：2026-08-17
 - 分支：`codex/upload-filing-oracle`
 - Goal 状态：用户已确认；本计划不重新打开 goal confirmation
@@ -19,8 +19,11 @@
   - `docs/reviews/plan-rereview-final-mimo-20260817.md`
 - re-review fix2 artifact：`docs/gateflow/uf-fix11-plan-rereview-fix2-20260817.md`
 - controller acceptance：`docs/gateflow/uf-fix11-plan-acceptance-20260817.md`
-- 本 gate 产物：经 A1-A10 与 DS re-review accepted finding 1/2 修订的 code-generation-ready plan
-- 下一入口：implementation Slice 1
+- slice-boundary blocker：`docs/gateflow/uf-fix11-s1-slice-boundary-blocker-20260817.md`
+- plan amendment：`docs/gateflow/uf-fix11-slice-boundary-amendment-20260817.md`
+- 本 gate 产物：把原 Slice 1/2 合并为可独立变绿的原子 S1+S2，并按 DS findings/OQ-1 收紧测试、符号、validation 与 commit 边界
+- 已有实现状态：原 Slice 1 dirty diff 保留为 S1+S2 partial implementation；当前红色中间态不可接受、不可提交
+- 下一入口：原子 S1+S2 implementation
 - Implementation 禁止事项：不运行真实 CLI evidence，不创建 PR，不修改 Host/Engine/material/oracle/scenario/frozen evidence
 
 ## 1. Goal、motivation 与 success
@@ -317,14 +320,23 @@ warnings: tuple[CompanyMetadataWarning, ...] = ()
 
 ### 6.6 Pipeline/direct/service public contracts
 
+#### 6.6.1 原子 S1+S2：terminal producer 与 strict parser contract
+
 - SEC/CN `upload_filing` 的所有 terminal JSON（`ok`/`skipped`/failed/cancelled/delete）必须显式包含 `warnings` 数组，元素为上述 closed warning object；无 warning时为 `[]`。failed/cancelled/delete 分支只能是 `[]`，不得从内部 outcome 补算。
-- `FinsUploadPipelineResult`、`FinsUploadResultSummary` 增加 `tuple[CompanyMetadataWarning, ...]`，parser 对字段和状态 invariant fail-closed。`FinsUploadPipelineResult.from_pipeline_json` 新增无默认值的 keyword-only 显式参数 `source_kind: SourceKind`；filing caller 必须传 `SourceKind.FILING`，material caller 必须传 `SourceKind.MATERIAL`，不得从 payload 字段猜类型。同一个 fresh parser 也服务 out-of-scope material payload，material payload 结构性地不含 `warnings`，所以“字段缺失 -> 空 tuple”只允许 `source_kind is SourceKind.MATERIAL`；这不是旧 schema compatibility。`SourceKind.FILING` 的 terminal payload 缺失 `warnings` 是 schema violation，必须 fail closed。
+- `dayu/fins/company_metadata_warning.py` 独占 `CompanyMetadataWarning` 的 closed JSON codec；缺字段、多字段、未知 kind、非字符串或非规范 message 均 fail closed。
+- S1+S2 在 `dayu/fins/ingestion_runtime.py` 只允许修改 `FinsUploadPipelineResult.warnings`、该类型的 warnings/status invariant、`FinsUploadPipelineResult.from_pipeline_json(result, *, source_kind: SourceKind)` 的无默认值签名，以及该 parser 对 `CompanyMetadataWarning` 闭集的调用/校验。不得在本 slice 修改 `FinsUploadResultSummary`、`FinsUploadResultSummary.to_json_summary()` 或 durable/direct projection。
+- `FinsUploadPipelineResult.from_pipeline_json` 的 filing caller 必须传 `SourceKind.FILING`，material caller 必须传 `SourceKind.MATERIAL`，不得从 payload 字段猜类型。同一个 fresh parser 也服务 out-of-scope material payload，material payload 结构性地不含 `warnings`，所以“字段缺失 -> 空 tuple”只允许 `source_kind is SourceKind.MATERIAL`；这不是旧 schema compatibility。`SourceKind.FILING` 的 terminal payload 缺失 `warnings` 是 schema violation，必须 fail closed。
 - `warnings: null`、非数组、未知 kind、message 不匹配、重复 kind、超过 1 个对象都必须 fail closed；只有显式 `[]` 表示 filing terminal result 无 warning。
-- `FinsUploadResultSummary.to_json_summary()` 必须写入 `warnings`，空值也序列化为 `[]`；durable job record 的 `result_summary`、direct/CLI/tool 必须保存/传播同一个 typed tuple。既有 durable re-read 路径只消费 `status`/`document_id`，允许保留新增字段，但不得在 re-read 时重新推断 warning。
-- `FinsResultSummary` 增加同类型 warnings；仅 `FinsResultStatus.SUCCESS` 允许非空。
-- direct terminal event 从 typed upload summary 复制 warnings。
-- CLI：先按现有逻辑向 stdout 输出成功摘要，再逐条向 stderr 输出规范 warning message；exit code 保持 `0`。
-- wait adapter：仅 completed result 增加 `warnings` 数组；failed/cancelled mapping 不增加该字段，也不从 exception/message 推断。
+- S1+S2 在 `dayu/fins/service_runtime.py` 只允许修改调用 `FinsUploadPipelineResult.from_pipeline_json` 的四个生产 callsite：SEC/CN filing 两处显式传 `SourceKind.FILING`，US/CN material 两处显式传 `SourceKind.MATERIAL`。不得在本 slice 修改 `_upload_summary_from_result` 或任何 durable/direct projection。
+
+#### 6.6.2 后续 S3：summary、durable、direct、CLI/tool projection
+
+- `FinsUploadResultSummary` 在 S3 才增加 `tuple[CompanyMetadataWarning, ...]` 及 success-only invariant；`FinsUploadResultSummary.to_json_summary()` 在 S3 才写入 `warnings`，空值也序列化为 `[]`。
+- `dayu/fins/service_runtime.py::_upload_summary_from_result` 在 S3 才从已冻结的 `FinsUploadPipelineResult.warnings` 机械复制到 `FinsUploadResultSummary.warnings`；不得重新 parse JSON、比较名称或生成 warning。
+- durable job record 的 `result_summary`、direct/CLI/tool 必须保存/传播同一个 typed tuple。既有 durable re-read 路径只消费 `status`/`document_id`，允许保留新增字段，但不得在 re-read 时重新推断 warning。
+- `FinsResultSummary` 在 S3 增加同类型 warnings；仅 `FinsResultStatus.SUCCESS` 允许非空。direct terminal event 从 typed upload summary 复制 warnings。
+- CLI 在 S3 按现有逻辑先向 stdout 输出成功摘要，再逐条向 stderr 输出规范 warning message；exit code 保持 `0`。
+- wait adapter 在 S3 仅为 completed result 增加 `warnings` 数组；failed/cancelled mapping 不增加、不从 exception/message 推断。
 
 ## 7. Data flow 与 public projections
 
@@ -553,7 +565,7 @@ pyright 对 `-> None` 协变 override 不会报错，因此“pyright 通过”�
 
 ### 9.3 文档：允许修改
 
-文档 allowed files 只在 Slice 3 的 `Allowed files -> 文档` 中列一次；该清单同时构成本节的精确全局文档范围，避免重复条目漂移。
+文档 allowed files 只在后续 S3 projection slice 的 `Allowed files -> 文档` 中列一次；该清单同时构成本节的精确全局文档范围，避免重复条目漂移。
 
 ### 9.4 明确禁止修改
 
@@ -568,9 +580,36 @@ pyright 对 `-> None` 协变 override 不会报错，因此“pyright 通过”�
 
 ## 10. Small implementation slices
 
-所有 slice 严格顺序执行。前一 slice 的 stop condition 未满足时不得进入下一 slice；每个 slice 只允许修改列出的文件。
+修订后只有两个 implementation slices：原 Slice 1/2 合并为一个不可拆分的原子 S1+S2，原 Slice 3 保留为后续 S3 projection slice。S1+S2 在完整绿色 validation 与同一 review loop 通过前不得形成 implementation artifact acceptance 或 commit；S3 只能在 S1+S2 accepted slice commit 后开始。每个 slice 只允许修改列出的文件。
 
-### Slice 1：冻结 company-meta owner 与 storage return contract
+### 原子 Slice S1+S2：company-meta owner 到 filing terminal parser 的完整闭环
+
+#### Objective / expected outcome
+
+在一个可独立变绿的 implementation/review/commit 单元内同时完成 domain intent/outcome、storage exact return、shared publication arbitration 与 metadata-only skip、warning codec、SEC/CN terminal producers，以及 strict parser/显式 `SourceKind`。成功信号是原 blocker 红测与本 slice 全部 focused tests 同时通过，且 warning 只能从 publication-final commit outcome 投影。
+
+#### Prerequisites
+
+- 本 amendment 经 `plan amendment review -> fix -> re-review` 接受，并形成 amendment acceptance checkpoint 后才能恢复 implementation。
+- `docs/gateflow/uf-fix11-s1-slice-boundary-blocker-20260817.md` 的 `639 passed, 1 failed` 是 slice-boundary 直接证据，不是允许递延的测试债务。
+- 当前原 Slice 1 dirty diff 原样保留为本原子 slice 的 partial implementation；它没有独立 acceptance，不得单独 stage/commit，也不得用旧 Slice 1 review 边界关闭。
+- 原 accepted plan 的 §1-§9 typed contract、owner、state machine、non-goals 与 A1-A10/DS-RR1/DS-RR2 裁决保持不变；本 amendment 只修复 implementation slicing。
+
+#### Plan-amendment gate commit boundary
+
+amendment review/fix/re-review 接受后，必须先创建一个独立 plan-gate commit；该 commit 与后续 S1+S2 code commit 严格分离。plan-gate commit 只允许 stage 以下 amendment 文档，不得 stage 当前任何 production/test partial diff：
+
+- `docs/gateflow/uf-fix11-company-meta-warning-plan-20260817.md`
+- `docs/gateflow/uf-fix11-s1-slice-boundary-blocker-20260817.md`
+- `docs/gateflow/uf-fix11-slice-boundary-amendment-20260817.md`
+- `docs/gateflow/uf-fix11-slice-amendment-review-fix-20260817.md`
+- `docs/gateflow/uf-fix11-slice-amendment-acceptance-20260817.md`（re-review 通过后创建）
+- `docs/reviews/uf-fix11-slice-amendment-review-ds-20260817.md`
+- `docs/reviews/uf-fix11-slice-amendment-review-mimo-20260817.md`
+- `docs/reviews/uf-fix11-slice-amendment-rereview-ds-20260817.md`（如该 reviewer re-review 产生）
+- `docs/reviews/uf-fix11-slice-amendment-rereview-mimo-20260817.md`（如该 reviewer re-review 产生）
+
+建议 commit message 为 `gateflow: accept UF-FIX11 slice-boundary amendment`。commit 前必须逐个显式 stage 已存在的上述文件并用 cached diff 证明零 production/test path；禁止使用目录级 glob。plan-gate commit 完成后，现有 production/test partial diff 仍留在工作区，继续作为未接受的 S1+S2 implementation，不得被误判为已提交红色中间态。
 
 #### Allowed files
 
@@ -581,6 +620,13 @@ pyright 对 `-> None` 协变 override 不会报错，因此“pyright 通过”�
 - `dayu/fins/storage/repository_protocols.py`
 - `dayu/fins/storage/_fs_storage_infra.py`
 - `dayu/fins/storage/fs_batching_repository.py`
+- `dayu/fins/company_metadata_warning.py`（新增）
+- `dayu/fins/pipelines/docling_upload_service.py`
+- `dayu/fins/pipelines/filing_upload_publication.py`
+- `dayu/fins/pipelines/sec_upload_workflow.py`
+- `dayu/fins/pipelines/cn_pipeline.py`
+- `dayu/fins/ingestion_runtime.py`（仅 `FinsUploadPipelineResult.warnings`、其 invariant、`from_pipeline_json(..., source_kind)` 与 `CompanyMetadataWarning` 闭集解析；禁止触碰 `FinsUploadResultSummary`/`to_json_summary`）
+- `dayu/fins/service_runtime.py`（仅四个 `FinsUploadPipelineResult.from_pipeline_json` callsite 的显式 `SourceKind`；禁止触碰 `_upload_summary_from_result`）
 
 测试：
 
@@ -589,12 +635,14 @@ pyright 对 `-> None` 协变 override 不会报错，因此“pyright 通过”�
 - `tests/fins/upload_filing_test_support.py`
 - `tests/fins/test_cn_download_workflow.py`
 - `tests/fins/test_sec_pipeline_download_stream.py`
-- `tests/fins/test_filing_upload_publication.py`（Slice 1 仅做 fake 签名/返回契约收敛）
-- `tests/fins/test_fins_ingestion_runtime.py`（Slice 1 仅做 fake 签名/返回契约收敛）
-- `tests/fins/test_docling_upload_service.py`（Slice 1 仅做 3 个 fake 签名/返回契约收敛）
-- `tests/fins/test_sec_pipeline_upload_filing_stream.py`（Slice 1 仅做 fake 签名/返回契约收敛）
+- `tests/fins/test_filing_upload_publication.py`
+- `tests/fins/test_fins_ingestion_runtime.py`（fake、`FinsUploadPipelineResult` parser/invariant contract 与真实 failure roundtrip；禁止增加 summary/durable projection 断言）
+- `tests/fins/test_docling_upload_service.py`
+- `tests/fins/test_sec_pipeline_upload_filing_stream.py`
+- `tests/fins/test_cn_pipeline.py`
+- `tests/fins/test_fins_service_runtime.py`（仅四个 parser callsite 的显式 `SourceKind` regression；禁止修改 `_upload_summary_from_result` projection 断言）
 
-#### Exact changes
+#### Exact changes：domain/storage contract
 
 1. 实现 §6.2 已冻结的唯一 company-name equivalence helper，并覆盖 Unicode/whitespace/case 与标点/后缀不等价反例；本 Slice 不重复列举规范化步骤。
 2. 为 `CompanyMetaCommitIntent`/builder 增加显式 optional `requested_company_name`，校验非空，download callers 默认 `None`。
@@ -605,7 +653,7 @@ pyright 对 `-> None` 协变 override 不会报错，因此“pyright 通过”�
 7. 按 §9.2 `commit_batch` 全量收敛清单同步 protocol、repository 与全部 7 个 fake 文件（其中 `test_docling_upload_service.py` 有 3 个定义）；不能依赖 pyright 捕获 `-> None` 协变漏改。
 8. 为需要模拟 metadata commit success 的 fake 返回 exact `CompanyMetaCommitOutcome`；no-intent download fake 可按真实契约返回 `None`，但注解仍必须是 exact union。
 
-#### Tests
+#### Tests：domain/storage/fake contract
 
 - domain：fresh name preserved、different/equivalent name predicate、refresh adopted/no warning、final newer truth ignored warning。
 - storage：returned outcome 与 durable final meta 完全相同；alias union/collision/rollback 保持原 contract。
@@ -613,46 +661,7 @@ pyright 对 `-> None` 协变 override 不会报错，因此“pyright 通过”�
 - download regression：默认 `requested_company_name=None`，无 upload warning 语义，既有 commit 行为不变。
 - fake contract：逐项断言需要 outcome 的成功路径返回 exact outcome；`rg -n "def commit_batch" dayu tests` 与 §9.2 全集一一对应。
 
-#### Stop condition
-
-若出现以下任一情况立即停止：
-
-- final warning 判断需要离开 company-meta merge owner；
-- 必须在 publication lock 外二次读取 storage；
-- alias uniqueness/grammar 需要复制到 domain/workflow；
-- commit 返回值无法严格类型化而需要 `Any`/`object`/`getattr`；
-- 任一现有 atomicity/collision test 回归。
-
-### Slice 2：共享 filing publication 的 skip commit 与 typed warning
-
-#### Prerequisite
-
-Slice 1 owner/storage tests 全部通过，commit outcome 已冻结。
-
-#### Allowed files
-
-生产：
-
-- `dayu/fins/company_metadata_warning.py`（新增）
-- `dayu/fins/pipelines/docling_upload_service.py`
-- `dayu/fins/pipelines/filing_upload_publication.py`
-- `dayu/fins/pipelines/sec_upload_workflow.py`
-- `dayu/fins/pipelines/cn_pipeline.py`
-- `dayu/fins/ingestion_runtime.py`（仅落地 filing/material warnings parser contract，供真实 producer roundtrip）
-- `dayu/fins/service_runtime.py`（仅同步全部 parser callsite 的显式 `SourceKind`）
-
-测试：
-
-- `tests/fins/test_docling_upload_service.py`
-- `tests/fins/test_filing_upload_publication.py`
-- `tests/fins/test_sec_pipeline_upload_filing_stream.py`
-- `tests/fins/test_cn_pipeline.py`
-- `tests/fins/upload_filing_test_support.py`
-- `tests/fins/test_company_identity_storage_contract.py`（whole-tree COMPLETE fail-closed owner test）
-- `tests/fins/test_fins_ingestion_runtime.py`（仅 parser contract/真实 failure roundtrip）
-- `tests/fins/test_fins_service_runtime.py`（仅显式 `SourceKind` callsite regression）
-
-#### Exact changes
+#### Exact changes：publication/warning/producer/parser
 
 1. 新增窄 public warning type、固定文案、closed codec 与 commit-fact projection helper。
 2. `commit_prepared_upload_batch` 成功后把 storage outcome 放回不可变 `UploadOperationResult`；异常路径不构造 warning。
@@ -664,13 +673,15 @@ Slice 1 owner/storage tests 全部通过，commit outcome 已冻结。
 8. SEC/CN 只从 shared outcome 序列化成功/skip warnings；枚举并收敛所有 filing terminal producer：normal `ok`/`skipped` 使用 shared warnings，early cancelled/delete 显式 `warnings=[]`，`_build_sec_filing_failure_event(...)` 与 `_build_cn_filing_failure_event(...)` 构造的每个 failed result 都必须把 `warnings=[]` 传入各自 result builder。禁止 failure builder 省略字段，也禁止从 exception/message 推断 warning；不触碰 material/download semantics。
 9. 更新 UF-FIX10 中“不同 alias intent 必为 conflict”的测试：当 source identity exact、intent 是合法 preserve 时走 metadata commit；真正 identity mismatch/refresh intent 仍 conflict。
 10. metadata-only commit 继续服从 `_validate_complete_source_tree`；whole tree 有无关非 `COMPLETE` source 时 typed failure、无 warning、无 partial mutation，不新增 bypass。
-11. 为让 producer/schema 在同一 slice 可验收，把 A4 的 parser boundary 提前在本 Slice 完成：`FinsUploadPipelineResult.from_pipeline_json(result, *, source_kind: SourceKind)` 增加无默认值显式参数与 typed warnings parse；`service_runtime` 的 filing/material callsite 分别显式传 `SourceKind.FILING`/`SourceKind.MATERIAL`。Slice 3 只继续 summary/durable/direct/UI 投影，不重新决定 parser schema。
+11. 为让 producer/schema 在同一 slice 可验收，把 A4 的 parser boundary 提前在本 Slice 完成；修改范围严格等于 §6.6.1 的符号清单：`FinsUploadPipelineResult.warnings`/invariant、`from_pipeline_json(result, *, source_kind: SourceKind)` 与 `CompanyMetadataWarning` 闭集解析，以及 `service_runtime` 四个 parser callsite 的显式 filing/material `SourceKind`。`FinsUploadResultSummary.warnings`、`to_json_summary()`、`_upload_summary_from_result` 与 direct/durable projection 全部归 S3，S1+S2 禁止提前实现。
+12. 改写 blocker 测试 `test_upload_filing_fresh_recheck_discards_stale_action_and_company_decision` 的旧 lifecycle 断言，但保留其原始回归语义：publication-lock 内 fresh re-read 必须丢弃 stale preflight 的 `create` action 与 stale company decision，以 fresh published truth 重新得到 `update + preserve_published`，不得复用旧 decision 或改写 canonical company name。
 
-#### Tests
+#### Tests：publication/warning/producer/parser
 
 - shared owner 状态矩阵：uploaded/skipped × same/different name × no/new alias。
 - skip alias 原子性：成功后 alias 存在；collision/commit failure 后不产生成功 result/warning。成功与失败都断言 source stage token 为空，source version/assets/meta/manifest 与 `published_tree_sha256` exact unchanged。
 - name-only metadata commit：final `CompanyMeta` 逐字段和序列化 bytes 与 published meta 相同（包括 `updated_at`），source tree/content hash exact unchanged；只产生 publication-final warning。
+- blocker 测试 `test_upload_filing_fresh_recheck_discards_stale_action_and_company_decision` 的新 exact contract：terminal result 保持 `filing_action == "update"` 且最终 `status == "skipped"`；metadata-only batch `begin` 恰一次、`commit` 恰一次且 `commit_tokens == begin_tokens`，caller `rollback_tokens == []`；`company.stage_tokens == begin_tokens` 且 source stage token 为空；raw terminal `warnings` 必须精确等于 `[{"kind": "company_name_ignored", "message": "本次提交的公司名称未生效；已保留现有公司名称。请核对上传目标公司是否正确。"}]`。提交前后 final `CompanyMeta` 的 canonical JSON 序列化 bytes 必须完全相同（显式覆盖 `company_name` 与 `updated_at`），`published_tree_sha256`、既有 source revision/version/meta/manifest/assets 必须完全不变。测试仍必须证明 publication-lock fresh re-read 丢弃 stale preflight 的 `create` action/旧 company decision，依据已发布事实重新得到 `update + preserve_published`；不得把测试弱化为只断言 warning 或 skip。
 - whole-tree COMPLETE fail-closed：构造同 ticker 无关 `REPAIR_REQUIRED` source，SKIP+preserve 必须 typed failure、无 warning，company identity 与完整 published tree 都不变。
 - cancellation：两个 checkpoint 均 rollback、无 warning；commit 开始后的既有 linearization 不变。
 - SEC/CN 对称测试：同一请求一 publish 一 skip；name-only skip warning；alias-on-skip durable；early cancelled/delete 显式空 warnings，且 workflow 不读取内部 commit outcome。
@@ -687,6 +698,12 @@ Slice 1 owner/storage tests 全部通过，commit outcome 已冻结。
 
 若出现以下任一情况立即停止：
 
+- final warning 判断需要离开 company-meta merge owner；
+- 必须在 publication lock 外二次读取 storage；
+- alias uniqueness/grammar 需要复制到 domain/workflow；
+- commit 返回值无法严格类型化而需要 `Any`/`object`/`getattr`；
+- 任一现有 atomicity/collision test 回归；
+- 原 blocker 测试或任一本 slice focused test 仍为红色；不得把确定性红测递延到 S3、review 或 commit 后；
 - 需要修改 Host/Engine 或建立第二套 publication lifecycle；
 - alias 需要独立于 batch 写入；
 - SKIP 分支调用 `publish_prepared_upload`、`commit_prepared_upload_batch` 或 stage 任一 filing/source asset；
@@ -695,30 +712,40 @@ Slice 1 owner/storage tests 全部通过，commit outcome 已冻结。
 - material flow 或其 schema 被改变；
 - failure/cancel/rollback 能观察到非空 warning；
 - 任一 SEC/CN filing terminal producer（尤其 `_build_sec_filing_failure_event`/`_build_cn_filing_failure_event`）省略 `warnings`，或 failure roundtrip 退化为 generic exception failure；
+- S1+S2 修改 `FinsUploadResultSummary.warnings`、`FinsUploadResultSummary.to_json_summary()`、`service_runtime._upload_summary_from_result` 或任何 direct/durable/CLI/tool projection；
 - 为 metadata-only commit 绕过 `_validate_complete_source_tree`；
 - 并发测试依赖 `sleep`/polling 而非 barrier/event；
 - 为保旧测试需要兼容分支。
 
-### Slice 3：typed public projections、README 与全量回归
+#### Completion / review / commit boundary
+
+- 只有本原子 slice 全部 exact changes 完成、完整 focused suite 绿色、§12.2 combined regression 全绿、相关逐文件 coverage 达标、全仓 pyright 通过、static boundary checks 通过后，才能写 S1+S2 implementation artifact 并进入一次完整 implementation review。combined regression 是 review/commit acceptance 的硬前置，不得只在 completion report 中补记。
+- code review target 必须包含保留的原 Slice 1 partial diff 与新增 publication/warning/producer/parser diff；不得只 review 后半段，也不得沿用 blocker 前的局部验证作为 acceptance。
+- review/fix/re-review 必须作为同一个原子 loop 裁决全部 findings；review fix 修改代码/测试后必须重新运行受影响 focused tests，并在 accepted commit 前重跑 §12.2 combined regression，最终一次必须全绿。只有 loop 通过、全部硬前置仍有效且 residual risks 全部分类后，才允许创建一个 `gateflow: accept UF-FIX11 company metadata warning S1+S2` protected local commit。
+- 禁止为原 Slice 1 domain/storage partial diff、原 Slice 2 publication diff或任一红色/未验证中间态分别 stage/commit。当前 dirty diff 在 amendment review 与后续实现完成前始终是未接受工作区状态。
+- accepted S1+S2 code commit 只允许包含本 slice 的 production/test implementation、按 accepted scope 确属本 slice 必要的 README（当前计划把 README 放在 S3，因此正常应为零）及本 slice implementation/review/fix/re-review/acceptance closeout artifacts；不得混入 blocker、amendment、plan review/fix/re-review/acceptance 或完整 plan 等 plan-gate docs。若实现期确认 S1+S2 必须修改 README，必须先修订本 slice allowed files，不能临时越界 stage。
+- S1+S2 accepted slice commit 是后续 S3 的唯一 implementation prerequisite；缺少绿色 evidence、review artifacts 或 accepted commit 时不得进入 S3。
+
+### Slice S3：typed public/durable/CLI/tool projections、README 与全量回归
 
 #### Prerequisite
 
-Slice 2 SEC/CN/shared publication tests 全部通过，public warning codec 已冻结。
+原子 S1+S2 的 SEC/CN/shared publication/parser tests、coverage、全仓 pyright 与 implementation review 全部通过，public warning codec 已冻结，且 accepted S1+S2 slice commit 已创建。
 
 #### Allowed files
 
 生产：
 
-- `dayu/fins/ingestion_runtime.py`
-- `dayu/fins/service_runtime.py`
+- `dayu/fins/ingestion_runtime.py`（仅 `FinsUploadResultSummary.warnings`、其 invariant 与 `to_json_summary()`；不得改写 S1+S2 已冻结的 pipeline parser）
+- `dayu/fins/service_runtime.py`（仅 `_upload_summary_from_result` 的 warnings 机械透传；不得改写四个 parser callsite 的 `SourceKind`）
 - `dayu/fins/direct_events.py`
 - `dayu/cli/output.py`
 - `dayu/service/fins_wait_adapter.py`
 
 测试：
 
-- `tests/fins/test_fins_ingestion_runtime.py`
-- `tests/fins/test_fins_service_runtime.py`
+- `tests/fins/test_fins_ingestion_runtime.py`（仅 summary/durable projection 与 parser non-regression）
+- `tests/fins/test_fins_service_runtime.py`（仅 `_upload_summary_from_result` projection 与 parser callsite non-regression）
 - `tests/fins/test_fins_direct_stream.py`
 - `tests/cli/test_output.py`
 - `tests/cli/test_fins_commands.py`
@@ -732,8 +759,8 @@ Slice 2 SEC/CN/shared publication tests 全部通过，public warning codec 已�
 
 #### Exact changes
 
-1. 复用 Slice 2 已冻结的 `FinsUploadPipelineResult.from_pipeline_json(result, *, source_kind: SourceKind)` 与 typed warnings；本 Slice 不重新决定 missing/null/closed-shape schema，只做 summary/durable/direct/service 投影并保留 parser regression。
-2. upload/service/direct summary 机械复制 typed tuple，并验证只有 success 可非空；`FinsUploadResultSummary.to_json_summary()` 必须把 warnings（空为 `[]`）写入 durable job `result_summary`，save/re-read 不丢失、不重算。
+1. 复用原子 S1+S2 已冻结的 `FinsUploadPipelineResult.from_pipeline_json(result, *, source_kind: SourceKind)` 与 typed warnings；本 Slice 不重新决定 missing/null/closed-shape schema，也不修改四个 service parser callsite，只做 summary/durable/direct/service 投影并保留 parser regression。
+2. 严格按 §6.6.2 修改共享文件：`FinsUploadResultSummary.warnings`/success-only invariant 与 `to_json_summary()` 归 `ingestion_runtime.py`；`_upload_summary_from_result` 只在 `service_runtime.py` 机械复制 pipeline warnings。随后 upload/service/direct summary 继续复制同一 typed tuple，durable job `result_summary` 的 warnings 空值也必须为 `[]`，save/re-read 不丢失、不重算。
 3. direct event 保持现有 status/exit code/title/details；只附加同源 warnings。
 4. CLI success summary 继续 stdout；每个 typed warning 的规范 message 输出 stderr；exit code `0`。
 5. wait adapter completed result 增加同一 warnings JSON；failed/cancelled result 不增加、不推断。
@@ -756,6 +783,7 @@ Slice 2 SEC/CN/shared publication tests 全部通过，public warning codec 已�
 - 需要修改 Host/Engine message contract；
 - public warning 泄漏路径、raw names、batch/token/digest/cursor 或内部治理术语；
 - warning 改变 success exit code/status；
+- S3 改写 `FinsUploadPipelineResult.from_pipeline_json` 的 `source_kind`/warnings schema、pipeline warnings invariant、`CompanyMetadataWarning` closed codec 或四个 service parser callsite；
 - README 需要描述未实现或非稳定行为。
 
 ## 11. README 决策
@@ -802,7 +830,7 @@ source .venv/bin/activate
 
 ### 12.1 Slice-focused tests
 
-Slice 1：
+原子 S1+S2（一个命令、一个绿色门槛，不允许先跑 domain/storage 子集并形成 acceptance）：
 
 ```bash
 pytest -q \
@@ -813,23 +841,15 @@ pytest -q \
   tests/fins/test_filing_upload_publication.py \
   tests/fins/test_fins_ingestion_runtime.py \
   tests/fins/test_docling_upload_service.py \
-  tests/fins/test_sec_pipeline_upload_filing_stream.py
-```
-
-Slice 2：
-
-```bash
-pytest -q \
-  tests/fins/test_company_identity_storage_contract.py \
-  tests/fins/test_docling_upload_service.py \
-  tests/fins/test_filing_upload_publication.py \
   tests/fins/test_sec_pipeline_upload_filing_stream.py \
   tests/fins/test_cn_pipeline.py \
-  tests/fins/test_fins_ingestion_runtime.py \
   tests/fins/test_fins_service_runtime.py
 ```
 
-Slice 3：
+该命令必须包含并关闭 blocker 中的
+`test_upload_filing_fresh_recheck_discards_stale_action_and_company_decision`；不得 `--deselect`、`-k` 排除或把失败分类到 S3。
+
+后续 S3：
 
 ```bash
 pytest -q \
@@ -843,6 +863,8 @@ pytest -q \
 
 ### 12.2 Combined regression
 
+本命令是原子 S1+S2 implementation review 与 accepted code commit 的强制 acceptance 前置：focused suite 通过后、进入 review 前必须全绿；review fix 改动代码/测试后，accepted commit 前必须再次全绿。任何失败都使 S1+S2 保持未接受状态，禁止写 acceptance、stage 或 commit，也不得递延给 S3。
+
 ```bash
 pytest -q \
   tests/fins \
@@ -851,9 +873,21 @@ pytest -q \
   tests/service/test_fins_wait_adapter.py
 ```
 
-不得以真实 CLI、真实 SEC/CN 网络下载或 frozen evidence 代替上述确定性测试；本 work unit 也不运行这些 evidence。
+S3 closeout 仍需按其 own gate 重跑该 combined regression；后一次运行不能补认 S1+S2 的红色或缺失 evidence。不得以真实 CLI、真实 SEC/CN 网络下载或 frozen evidence 代替上述确定性测试；本 work unit 也不运行这些 evidence。
 
 ### 12.3 Coverage
+
+#### 12.3.1 原子 S1+S2 coverage gate
+
+focused tests 全绿后运行完整 Fins deterministic suite，以覆盖 shared storage core 的既有分支；不得用 blocker 前 partial coverage 作为 acceptance：
+
+```bash
+coverage erase
+coverage run --branch -m pytest tests/fins
+coverage report -m --include='dayu/fins/domain/company_meta_contract.py,dayu/fins/company_metadata_warning.py,dayu/fins/pipelines/upload_company_meta.py,dayu/fins/pipelines/docling_upload_service.py,dayu/fins/pipelines/filing_upload_publication.py,dayu/fins/pipelines/sec_upload_workflow.py,dayu/fins/pipelines/cn_pipeline.py,dayu/fins/ingestion_runtime.py,dayu/fins/service_runtime.py,dayu/fins/storage/repository_protocols.py,dayu/fins/storage/_fs_storage_infra.py,dayu/fins/storage/fs_batching_repository.py'
+```
+
+#### 12.3.2 S3 coverage gate
 
 ```bash
 coverage erase
@@ -862,10 +896,10 @@ coverage run --branch -m pytest \
   tests/cli/test_output.py \
   tests/cli/test_fins_commands.py \
   tests/service/test_fins_wait_adapter.py
-coverage report -m
+coverage report -m --include='dayu/fins/ingestion_runtime.py,dayu/fins/service_runtime.py,dayu/fins/direct_events.py,dayu/cli/output.py,dayu/service/fins_wait_adapter.py'
 ```
 
-Gate 条件：每个新增/修改生产文件的 statement coverage 均 `>= 80%`，并检查 branch misses；不能只用 aggregate coverage 掩盖单文件不足。若某个低层协议文件因纯 Protocol/转发导致覆盖不足，仍应增加直接 contract test，不加 pragma/ignore 绕过。
+每个 slice 的 gate 条件：该 slice 每个新增/修改生产文件的 statement coverage 均 `>= 80%`，并检查 branch misses；不能只用 aggregate coverage 掩盖单文件不足。若某个低层协议文件因纯 Protocol/转发导致覆盖不足，仍应增加直接 contract test，不加 pragma/ignore 绕过。S1+S2 coverage 未达标时不得进入 implementation review 或提交；S3 不得用自己的 coverage 补认前一 slice。
 
 ### 12.4 Pyright
 
@@ -873,7 +907,7 @@ Gate 条件：每个新增/修改生产文件的 statement coverage 均 `>= 80%`
 python -m pyright dayu tests utils
 ```
 
-Gate 条件：不得新增、扩散或掩盖类型错误。注意 pyright 允许 `-> None` 协变 override，不能单独证明 `commit_batch` fake 已收敛；必须同时执行下一节的全量 `rg` 与行为断言。
+原子 S1+S2 与后续 S3 各自在进入其 implementation review 前都必须运行一次全仓命令。Gate 条件：不得新增、扩散或掩盖类型错误。注意 pyright 允许 `-> None` 协变 override，不能单独证明 `commit_batch` fake 已收敛；S1+S2 必须同时执行下一节的全量 `rg` 与行为断言。任何 pyright 失败都禁止 review acceptance/commit，不得递延到后一 slice。
 
 ### 12.5 Static boundary checks
 
@@ -917,7 +951,7 @@ rg -n "hasattr|getattr|Any|object" \
 | --- | --- | --- | --- |
 | A1 | `rejected-with-reason` | 证据保留 | 等价名称本就 keep+rollback；不等价 name-only 必须进入 commit owner。identity 不变时 final meta/`updated_at` 不变；禁止提交前 snapshot 推断 warning。锁/physical swap 成本另行分类。 |
 | A2 | `rejected-with-reason` | 证据保留 | UF-FIX10 零 mutation 约束继续覆盖 filing/source；合法 company identity metadata commit 是用户明确授权的唯一例外。必须验证 source stage 为零、source tree hash exact unchanged。 |
-| A3 | `accepted` | 已修复 | §9.2 列全 dayu 3 个定义（Protocol + 2 implementations）及 test 7 文件/9 定义，Slice 1 覆盖全部 fake 文件，§12.5 加 `rg` 与行为验收。 |
+| A3 | `accepted` | 已修复 | §9.2 列全 dayu 3 个定义（Protocol + 2 implementations）及 test 7 文件/9 定义，原子 S1+S2 覆盖全部 fake 文件，§12.5 加 `rg` 与行为验收。 |
 | A4 | `accepted` | 已修复 | parser 新增无默认值显式 `SourceKind`；missing 仅允许 material；filing 必须显式数组；`null` 等 fail closed。 |
 | A5 | `accepted` | 已修复 | 固定 message 改为 controller 指定精确文案。 |
 | A6 | `accepted` | 已修复 | `UploadOperationResult` 仅作内部载体；shared outcome 是唯一消费/投影点；early/delete 显式空 warnings。 |
@@ -930,7 +964,7 @@ rg -n "hasattr|getattr|Any|object" \
 
 | ID | Controller decision | Plan fix 状态 | 结论 |
 | --- | --- | --- | --- |
-| DS-RR1 | `accepted` | 已修复 | Slice 2 点名 `_build_sec_filing_failure_event`/`_build_cn_filing_failure_event` 的显式 `warnings=[]` producer contract，把 parser/source-kind boundary 提前到同一 slice，并增加真实 workflow failure event -> typed parser roundtrip tests，防止 typed reason 退化为 generic failure。 |
+| DS-RR1 | `accepted` | 已修复 | 原子 S1+S2 点名 `_build_sec_filing_failure_event`/`_build_cn_filing_failure_event` 的显式 `warnings=[]` producer contract，把 parser/source-kind boundary 与 domain/storage/publication 放在同一绿色 slice，并增加真实 workflow failure event -> typed parser roundtrip tests，防止 typed reason 退化。 |
 | DS-RR2 | `accepted` | 已修复 | SKIP metadata commit 在 `commit_batch` 前必须设置 `batch_terminal_started=True` 转交 capability；成功/失败后 caller rollback 都为 0，commit 前 stage error 才 rollback 1 次，并以 terminal-aware spy 验收。 |
 
 ### 13.3 本 work unit 内必须关闭
@@ -945,6 +979,7 @@ rg -n "hasattr|getattr|Any|object" \
 8. **durable/UI/tool 漂移**：`to_json_summary()`、saved job record、direct/CLI/tool 使用同一 typed tuple，以 exact durable record test 关闭。
 9. **filing failure producer/schema 漂移**：SEC/CN 两个真实 failure builder 必须显式输出 `warnings=[]`，并经 `SourceKind.FILING` parser roundtrip 保留 exact typed failure reason；以 producer/roundtrip tests 关闭。
 10. **commit capability 二次 rollback**：SKIP metadata commit 必须在调用 storage 前转交 capability；以成功/失败 rollback-count 和 terminal-token spy tests 关闭。
+11. **slice-boundary 红色中间态**：domain producer 产生 `stage/preserve` intent 后，必须在同一原子 S1+S2 完成 canonical skip predicate 与 metadata-only commit；blocker 红测必须在同一 focused gate 关闭，禁止拆分 acceptance/commit。
 
 ### 13.4 接受的设计权衡，不是 blocker
 
@@ -952,7 +987,7 @@ rg -n "hasattr|getattr|Any|object" \
 2. **public warning 不回显两个公司名**：降低路径/敏感信息/长度风险，用户可回看请求和 canonical metadata；固定文案已给出可操作动作。
 3. **warning collection 当前最多一个**：使用 typed tuple 便于结果层稳定序列化，但 module 仍只支持 company-name-ignored 单一业务语义，不演化通用 warning registry。
 4. **degraded unrelated source 使 metadata-only commit fail closed**：行为已在本 slice 明确并以测试覆盖；正确性风险分类为 `fixed in current slice`，因为不再存在未声明分支或 bypass 空间。
-5. **failure producer 与 parser 同 Slice 收敛**：为避免 producer 先变而 strict parser 后变（或反向）造成中间断裂，Slice 2 同时修改两个 failure builders、pipeline parser 与 `service_runtime` 显式 callsite；这是一个原子 schema slice，不是 material scope 扩张。
+5. **failure producer 与 parser 同 Slice 收敛**：为避免 producer 先变而 strict parser 后变（或反向）造成中间断裂，原子 S1+S2 同时修改两个 failure builders、pipeline parser 与 `service_runtime` 显式 callsite；这是一个原子 schema slice，不是 material scope 扩张。
 
 ### 13.5 Residual：分配给后续 work unit
 
@@ -967,7 +1002,7 @@ DS-RR1 与 DS-RR2 均分类为 `fixed in current slice`：前者由真实 SEC/CN
 
 ### 13.6 Blocker classification
 
-当前无 blocker。若 implementation 发现 warning 无法在现有 publication-lock commit boundary 内返回、或必须修改 Host/Engine/material/oracle 才能实现，则视为 plan invalidation blocker，停止并回到用户/plan review，不擅自扩大 scope。
+已识别的 slice-boundary blocker 由本 amendment 合并 S1+S2 解决；在 amendment review 接受前 implementation 保持 blocked，现有 partial diff 不可提交。若恢复 implementation 后发现 warning 无法在现有 publication-lock commit boundary 内返回、必须修改 Host/Engine/material/oracle、或原 blocker 红测无法在原子 allowed files 内关闭，则视为新的 plan invalidation blocker，停止并回到 plan amendment，不擅自扩大 scope。
 
 ## 14. 为什么不过度设计
 
@@ -992,22 +1027,27 @@ Implementation gate 完成时，交付说明必须按以下格式：
 4. **边界确认**：明确 Host/Engine/material/oracle/scenario/frozen evidence 未改，真实 CLI evidence 未运行，PR 未创建。
 5. **下一 gate**：implementation review；未通过前不得进入 deepreview/PR。
 
-## 16. Plan-rereview fix2 gate closeout
+## 16. Plan amendment gate closeout
 
 - Goal/motivation/success：已冻结。
 - Non-goals/scope：已冻结。
 - 语义 owner 与 publication-lock final truth：已冻结。
 - typed contracts/data flow/state machine/public projections：已冻结。
 - company-name normalization 与 skip alias atomicity：已冻结。
-- slices、allowed files、tests、stop conditions：已冻结。
-- README/validation/coverage/pyright/risk/completion format：已冻结。
+- 原 accepted plan 的业务契约、owner、state machine、non-goals、README decision 与 completion format：保持冻结。
+- slices、allowed files、prerequisites、focused/combined tests、coverage/pyright、stop conditions、review/commit boundary：已按 blocker 与 DS Finding-001/002/003、OQ-1 修订，待 plan amendment re-review。
 - A1/A2：保留 `rejected-with-reason`，未采用 commit 前 warning 或取消 skip metadata commit 的建议。
 - A3-A10：上一轮 controller accepted findings 已落实并由两路 re-review 确认关闭。
 - DS-RR1/DS-RR2：controller accepted 的新 findings 已落实，并由最终双路定向 re-review 以 `pass` 确认关闭。
-- 重复条目：Slice 1 不再重复列举大小写折叠步骤；全局 docs 范围改为引用 Slice 3 唯一清单，Fins README 不再以重复 allowed-file bullet 出现。
-- 生产代码或测试改动：无。
+- 原 Slice 1/2：合并为不可拆分的原子 S1+S2；domain/storage partial diff 保留但无独立 acceptance，必须与 publication/warning/producer/parser 一起变绿、review、commit。
+- 原 Slice 3：保留为后续 S3 public/durable/CLI/tool projection slice，只能在 S1+S2 accepted slice commit 后进入。
+- DS Finding-001：已修复；blocker 测试的新 skipped/metadata-only lifecycle、warning、byte/tree 不变量与 stale fresh-recheck 原回归语义均已冻结。
+- DS Finding-002：已修复；§12.2 combined regression 已成为 S1+S2 review/commit acceptance 强制前置。
+- DS Finding-003：已修复；`ingestion_runtime.py`/`service_runtime.py` 已按 S1+S2 parser symbols 与 S3 summary/durable symbols 精确拆分。
+- DS OQ-1：已关闭；amendment docs 先形成独立 plan-gate commit，production/test partial diff 零 stage；后续 S1+S2 code commit 排除 plan docs。
+- 本 amendment 对生产代码或测试的新增修改：无；已有 UF-FIX11 S1 dirty diff 内容保持不变。
 - 真实 CLI evidence：未运行，且本 work unit 禁止运行。
 - PR：未创建，且本 gate 禁止创建。
-- 当前 blocker：无。
-- 当前 gate：implementation。
-- 下一入口：implementation Slice 1。
+- 当前 blocker：无；slice-boundary amendment 已由两路 final re-review `pass` 并被 controller 接受。
+- 当前 gate：原子 S1+S2 implementation。
+- 下一入口：完成原子 S1+S2 implementation、验证并进入 implementation review。
