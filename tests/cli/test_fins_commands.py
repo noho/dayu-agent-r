@@ -1625,7 +1625,7 @@ def test_download_static_usage_error_precedes_workspace_and_service_factory(
         (
             "UF-024",
             ("--ticker", "600519", "--fiscal-year", "2024", "--fiscal-period", "9M"),
-            "CN/HK --fiscal-period 仅支持 Q1、Q2、Q3、Q4、H1、FY",
+            "--fiscal-period 仅支持 FY、H1、Q1、Q2、Q3、Q4",
         ),
         (
             "UF-026",

@@ -1416,7 +1416,7 @@ def test_fins_upload_usage_failure_mapping_is_closed_bounded_and_path_free() -> 
         "invalid_fiscal_year",
         "missing_fiscal_period",
         "fiscal_period_too_long",
-        "unsupported_cn_fiscal_period",
+        "unsupported_fiscal_period",
         "invalid_filing_date",
         "invalid_report_date",
         "company_name_too_long",
@@ -1449,7 +1449,7 @@ def test_fins_upload_usage_failure_mapping_is_closed_bounded_and_path_free() -> 
         FinsUploadUsageCode.INVALID_FILING_DATE: "披露日期（filing_date）必须是实际存在的 YYYY-MM-DD 日期",
         FinsUploadUsageCode.INVALID_REPORT_DATE: "报告期日期（report_date）必须是实际存在的 YYYY-MM-DD 日期",
         FinsUploadUsageCode.FISCAL_PERIOD_TOO_LONG: "--fiscal-period 长度不能超过 240 个字符",
-        FinsUploadUsageCode.UNSUPPORTED_CN_FISCAL_PERIOD: "CN/HK --fiscal-period 仅支持 Q1、Q2、Q3、Q4、H1、FY",
+        FinsUploadUsageCode.UNSUPPORTED_FISCAL_PERIOD: "--fiscal-period 仅支持 FY、H1、Q1、Q2、Q3、Q4",
         FinsUploadUsageCode.EXISTING_SOURCE_REPAIR_REQUIRES_AUTO: (
             "目标 filing 不完整；请使用 auto 并提供完整文件重新上传"
         ),
@@ -1517,6 +1517,84 @@ def test_upload_usage_failure_fact_rejects_open_code_and_unbounded_message() -> 
             code=FinsUploadFormatFailureKind.PRIMARY_SUFFIX_UNSUPPORTED,
             message="x" * 241,
         )
+
+
+@pytest.mark.parametrize("ticker", ("AAPL", "600519", "0700.HK"))
+@pytest.mark.parametrize(
+    ("raw_period", "expected_period"),
+    (
+        ("FY", "FY"),
+        ("H1", "H1"),
+        ("Q1", "Q1"),
+        ("Q2", "Q2"),
+        ("Q3", "Q3"),
+        ("Q4", "Q4"),
+        (" fy ", "FY"),
+        (" q2 ", "Q2"),
+    ),
+)
+def test_filing_fiscal_period_static_admission_is_market_neutral_and_canonical(
+    ticker: str,
+    raw_period: str,
+    expected_period: str,
+) -> None:
+    """US/CN/HK static admission 应共享 owner 并只产出 canonical 财期。
+
+    Args:
+        ticker: 覆盖 US、CN 与 HK 的公司代码。
+        raw_period: 原始财期输入。
+        expected_period: 期望 canonical 财期。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 市场分支、canonical 投影或 ID admission 漂移时抛出。
+    """
+
+    static = ingestion_runtime._validate_fins_upload_filing_static(
+        FinsUploadFilingRequest(
+            ticker=ticker,
+            action="delete",
+            fiscal_year=2024,
+            fiscal_period=raw_period,
+        )
+    )
+
+    assert static.normalized_fiscal_period == expected_period
+
+
+@pytest.mark.parametrize("ticker", ("AAPL", "600519", "0700.HK"))
+@pytest.mark.parametrize("raw_period", ("BANANA", "9M", "Q5"))
+def test_filing_fiscal_period_static_admission_rejects_every_market_before_state_read(
+    ticker: str,
+    raw_period: str,
+) -> None:
+    """US/CN/HK 非法财期应在 published-state read 所需 identity 产出前失败。
+
+    Args:
+        ticker: 覆盖 US、CN 与 HK 的公司代码。
+        raw_period: 非法财期输入。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法值未在 static identity boundary 以统一 usage failure 拒绝时抛出。
+    """
+
+    request = FinsUploadFilingRequest(
+        ticker=ticker,
+        action="delete",
+        fiscal_year=2024,
+        fiscal_period=raw_period,
+    )
+
+    with pytest.raises(FinsUploadUsageError) as exc_info:
+        ingestion_runtime._filing_upload_request_identity(request)
+
+    assert exc_info.value.failure.code is FinsUploadUsageCode.UNSUPPORTED_FISCAL_PERIOD
+    assert exc_info.value.failure.message == "--fiscal-period 仅支持 FY、H1、Q1、Q2、Q3、Q4"
 
 
 def test_filing_static_admission_rejects_pathful_basename_before_filesystem_probes(

@@ -90,7 +90,12 @@ from dayu.fins.domain.document_models import (
     SourceHandle,
 )
 from dayu.fins.domain.enums import SourceKind
-from dayu.fins.domain.filing_semantics import parse_calendar_year, parse_iso_calendar_date
+from dayu.fins.domain.filing_semantics import (
+    FiscalPeriod,
+    normalize_fiscal_period,
+    parse_calendar_year,
+    parse_iso_calendar_date,
+)
 from dayu.fins.ingestion_events import (
     FinsIngestionJobEventAppend,
     FinsIngestionJobEventRecord,
@@ -118,7 +123,6 @@ from dayu.fins.pipelines.docling_upload_service import (
     build_cn_filing_ids,
     build_sec_filing_ids,
     evaluate_upload_overwrite_precondition,
-    normalize_cn_fiscal_period,
     resolve_upload_action,
 )
 from dayu.fins.pipelines.upload_company_meta import (
@@ -685,7 +689,7 @@ class FinsUploadUsageCode(str, Enum):
     INVALID_FISCAL_YEAR = "invalid_fiscal_year"
     MISSING_FISCAL_PERIOD = "missing_fiscal_period"
     FISCAL_PERIOD_TOO_LONG = "fiscal_period_too_long"
-    UNSUPPORTED_CN_FISCAL_PERIOD = "unsupported_cn_fiscal_period"
+    UNSUPPORTED_FISCAL_PERIOD = "unsupported_fiscal_period"
     INVALID_FILING_DATE = "invalid_filing_date"
     INVALID_REPORT_DATE = "invalid_report_date"
     COMPANY_NAME_TOO_LONG = "company_name_too_long"
@@ -777,7 +781,7 @@ class ValidatedFinsUploadFilingRequest:
 
     request: FinsUploadFilingRequest
     normalized_ticker: NormalizedTicker
-    normalized_fiscal_period: str
+    normalized_fiscal_period: FiscalPeriod
     document_id: str
     internal_document_id: str
     resolved_action: Literal["create", "update", "delete"]
@@ -832,7 +836,7 @@ class _StaticFinsUploadFilingValidation:
     """workspace read 前已验证的 filing request 派生事实。"""
 
     normalized_ticker: NormalizedTicker
-    normalized_fiscal_period: str
+    normalized_fiscal_period: FiscalPeriod
     document_id: str
     internal_document_id: str
     file_selection: FinsUploadFilingFiles
@@ -1037,7 +1041,7 @@ _USAGE_MESSAGES: Final[Mapping[FinsUploadUsageCode, str]] = {
     FinsUploadUsageCode.INVALID_FISCAL_YEAR: "财年（fiscal_year）必须是 1000..9999 的整数",
     FinsUploadUsageCode.MISSING_FISCAL_PERIOD: "--fiscal-period 不能为空",
     FinsUploadUsageCode.FISCAL_PERIOD_TOO_LONG: "--fiscal-period 长度不能超过 240 个字符",
-    FinsUploadUsageCode.UNSUPPORTED_CN_FISCAL_PERIOD: "CN/HK --fiscal-period 仅支持 Q1、Q2、Q3、Q4、H1、FY",
+    FinsUploadUsageCode.UNSUPPORTED_FISCAL_PERIOD: "--fiscal-period 仅支持 FY、H1、Q1、Q2、Q3、Q4",
     FinsUploadUsageCode.INVALID_FILING_DATE: "披露日期（filing_date）必须是实际存在的 YYYY-MM-DD 日期",
     FinsUploadUsageCode.INVALID_REPORT_DATE: "报告期日期（report_date）必须是实际存在的 YYYY-MM-DD 日期",
     FinsUploadUsageCode.COMPANY_NAME_TOO_LONG: "--company-name 长度不能超过 240 个字符",
@@ -1269,16 +1273,18 @@ def _validate_fins_upload_filing_static(
         _raise_upload_usage(FinsUploadUsageCode.INVALID_FISCAL_YEAR)
     if request.fiscal_period is None or request.fiscal_period.strip() == "":
         _raise_upload_usage(FinsUploadUsageCode.MISSING_FISCAL_PERIOD)
-    period_text = request.fiscal_period.strip().upper()
+    period_text = request.fiscal_period.strip()
     if len(period_text) > _MAX_TEXT_CHARS:
         _raise_upload_usage(FinsUploadUsageCode.FISCAL_PERIOD_TOO_LONG)
-    if normalized_ticker.market in {"CN", "HK"}:
-        try:
-            normalized_period = normalize_cn_fiscal_period(period_text)
-        except ValueError:
-            _raise_upload_usage(FinsUploadUsageCode.UNSUPPORTED_CN_FISCAL_PERIOD)
-    else:
-        normalized_period = period_text
+    try:
+        normalized_period = normalize_fiscal_period(
+            request.fiscal_period,
+            field_name="--fiscal-period",
+        )
+    except ValueError:
+        _raise_upload_usage(FinsUploadUsageCode.UNSUPPORTED_FISCAL_PERIOD)
+    if normalized_period is None:
+        raise AssertionError("required fiscal_period owner 返回缺失值")
     _validate_optional_upload_iso_date(request.filing_date, FinsUploadUsageCode.INVALID_FILING_DATE)
     _validate_optional_upload_iso_date(request.report_date, FinsUploadUsageCode.INVALID_REPORT_DATE)
     _validate_optional_upload_text(request.company_name, FinsUploadUsageCode.COMPANY_NAME_TOO_LONG)

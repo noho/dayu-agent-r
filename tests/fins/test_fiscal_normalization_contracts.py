@@ -11,7 +11,9 @@ import pytest
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain import filing_semantics as filing_semantics_module
 from dayu.fins.domain.filing_semantics import (
+    FiscalPeriod,
     fiscal_period_recency_rank,
+    normalize_fiscal_period,
     normalize_fiscal_year,
     parse_calendar_year,
     parse_iso_calendar_date,
@@ -26,6 +28,91 @@ from dayu.fins.tools.read_runtime import (
     _parse_source_document_meta,
     _source_document_recency_sort_key,
 )
+
+
+@pytest.mark.parametrize("value", ("FY", "H1", "Q1", "Q2", "Q3", "Q4"))
+def test_normalize_fiscal_period_preserves_canonical_values(value: FiscalPeriod) -> None:
+    """fiscal-period owner 应原样返回六个 canonical 值。
+
+    Args:
+        value: canonical 财期。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: owner 改写合法 canonical 值时抛出。
+    """
+
+    assert normalize_fiscal_period(value) == value
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    (
+        (" fy ", "FY"),
+        ("h1", "H1"),
+        (" q1", "Q1"),
+        ("Q2 ", "Q2"),
+        (" q3 ", "Q3"),
+        ("q4", "Q4"),
+    ),
+)
+def test_normalize_fiscal_period_canonicalizes_case_and_outer_whitespace(
+    value: str,
+    expected: FiscalPeriod,
+) -> None:
+    """fiscal-period owner 应统一处理大小写与首尾空白。
+
+    Args:
+        value: 待规范化的原始财期。
+        expected: 期望 canonical 财期。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: owner 未返回期望 canonical 值时抛出。
+    """
+
+    assert normalize_fiscal_period(value) == expected
+
+
+@pytest.mark.parametrize("value", (None, "", " ", "\t\n"))
+def test_normalize_fiscal_period_preserves_optional_missing_semantics(value: str | None) -> None:
+    """fiscal-period owner 应将缺失与纯空白投影为 ``None``。
+
+    Args:
+        value: 缺失或纯空白财期。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: optional owner 语义漂移时抛出。
+    """
+
+    assert normalize_fiscal_period(value) is None
+
+
+@pytest.mark.parametrize("value", ("BANANA", "9M", "Q5", "H2", "F Y"))
+def test_normalize_fiscal_period_rejects_nearby_or_unknown_values_with_field_name(value: str) -> None:
+    """fiscal-period owner 应拒绝未知与相近非法值并绑定字段名。
+
+    Args:
+        value: 非法财期。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: owner 接受非法值或错误文案丢失字段名时抛出。
+    """
+
+    with pytest.raises(ValueError) as exc_info:
+        normalize_fiscal_period(value, field_name="--fiscal-period")
+
+    assert str(exc_info.value) == f"--fiscal-period 非法: {value}"
 
 
 def test_fiscal_period_recency_rank_uses_fixed_business_order() -> None:

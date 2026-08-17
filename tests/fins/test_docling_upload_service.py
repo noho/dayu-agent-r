@@ -53,7 +53,6 @@ from dayu.fins.pipelines.docling_upload_service import (
     commit_prepared_upload_batch,
     describe_prepared_filing_publication,
     derive_report_kind,
-    normalize_cn_fiscal_period,
     read_prepared_filing_initial_skip_disposition,
     rebase_prepared_filing_create_overwrite,
     validate_material_upload_ids,
@@ -5014,6 +5013,13 @@ def test_upload_helper_id_and_version_rules() -> None:
         fiscal_period="FY",
         amended=True,
     )
+    cn_ids_from_normalized_form = build_cn_filing_ids(
+        ticker="600519",
+        form_type=" fy ",
+        fiscal_year=2024,
+        fiscal_period="FY",
+        amended=False,
+    )
     material_id, material_internal_id = build_material_ids(
         form_type="MATERIAL_OTHER",
         material_name="Deck",
@@ -5021,14 +5027,19 @@ def test_upload_helper_id_and_version_rules() -> None:
         fiscal_period="FY",
     )
 
-    assert cn_document_id.startswith("fil_cn_")
-    assert cn_internal_id.startswith("cn_")
-    assert sec_document_id.startswith("fil_sec_")
-    assert sec_internal_id.startswith("sec_")
+    assert cn_document_id == "fil_cn_d43d69ac06b7d39719b474b2a5f5a46404103b3a"
+    assert cn_internal_id == "cn_d43d69ac06b7d39719b474b2a5f5a46404103b3a"
+    assert cn_ids_from_normalized_form == (cn_document_id, cn_internal_id)
+    assert sec_document_id == "fil_sec_6aa496469a42491a41bcbfbe5dd2833e86b39e7b"
+    assert sec_internal_id == "sec_6aa496469a42491a41bcbfbe5dd2833e86b39e7b"
     assert material_id == material_internal_id
     assert material_id.startswith("mat_")
-    assert normalize_cn_fiscal_period("h1") == "H1"
     assert derive_report_kind("FY") == "annual"
+    assert derive_report_kind("H1") == "semi_annual"
+    assert derive_report_kind("Q1") == "quarterly"
+    assert derive_report_kind("Q2") == "quarterly"
+    assert derive_report_kind("Q3") == "quarterly"
+    assert derive_report_kind("Q4") == "quarterly"
     assert _increment_document_version("v2") == "v3"
     safe_fingerprint = _UploadSourceFingerprint(value="new", identical_skip_safe=True)
     unsafe_fingerprint = _UploadSourceFingerprint(value="same", identical_skip_safe=False)

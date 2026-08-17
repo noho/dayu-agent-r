@@ -34,6 +34,7 @@ from dayu.fins.domain.document_models import (
     now_iso8601,
 )
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.domain.filing_semantics import FiscalPeriod
 from dayu.fins.pipelines.docling_process_converter import (
     DEFAULT_FINS_DOCLING_CONVERSION_CONFIG,
     DoclingConversionCancelledError,
@@ -1918,7 +1919,7 @@ def build_cn_filing_ids(
     ticker: str,
     form_type: str,
     fiscal_year: int,
-    fiscal_period: str,
+    fiscal_period: FiscalPeriod,
     amended: bool,
 ) -> tuple[str, str]:
     """生成港 A 股 filing 文档 ID 对。
@@ -1941,10 +1942,9 @@ def build_cn_filing_ids(
     if not normalized_ticker:
         raise ValueError("ticker 不能为空")
     normalized_form = form_type.strip().upper()
-    normalized_period = fiscal_period.strip().upper()
     if not normalized_form:
         raise ValueError("form_type 不能为空")
-    seed = f"{normalized_ticker}|{normalized_form}|{fiscal_year}|{normalized_period}|{int(amended)}"
+    seed = f"{normalized_ticker}|{normalized_form}|{fiscal_year}|{fiscal_period}|{int(amended)}"
     digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()
     internal_document_id = f"cn_{digest}"
     document_id = f"fil_{internal_document_id}"
@@ -1955,7 +1955,7 @@ def build_sec_filing_ids(
     *,
     ticker: str,
     fiscal_year: int,
-    fiscal_period: str,
+    fiscal_period: FiscalPeriod,
     amended: bool,
 ) -> tuple[str, str]:
     """生成美股 filing 文档 ID 对。
@@ -1976,36 +1976,14 @@ def build_sec_filing_ids(
     normalized_ticker = ticker.strip()
     if not normalized_ticker:
         raise ValueError("ticker 不能为空")
-    normalized_period = fiscal_period.strip().upper()
-    if not normalized_period:
-        raise ValueError("fiscal_period 不能为空")
-    seed = f"{normalized_ticker}|{fiscal_year}|{normalized_period}|{int(amended)}"
+    seed = f"{normalized_ticker}|{fiscal_year}|{fiscal_period}|{int(amended)}"
     digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()
     internal_document_id = f"sec_{digest}"
     document_id = f"fil_{internal_document_id}"
     return document_id, internal_document_id
 
 
-def normalize_cn_fiscal_period(fiscal_period: str) -> str:
-    """标准化港 A 股财期。
-
-    Args:
-        fiscal_period: 原始财期。
-
-    Returns:
-        标准化财期字符串。
-
-    Raises:
-        ValueError: 财期非法时抛出。
-    """
-
-    normalized = fiscal_period.strip().upper()
-    if normalized not in {"Q1", "Q2", "Q3", "Q4", "FY", "H1"}:
-        raise ValueError(f"不支持的 fiscal_period: {fiscal_period}")
-    return normalized
-
-
-def derive_report_kind(fiscal_period: str) -> str:
+def derive_report_kind(fiscal_period: FiscalPeriod) -> str:
     """由财期推断报告类型。
 
     Args:
@@ -2015,13 +1993,12 @@ def derive_report_kind(fiscal_period: str) -> str:
         报告类型。
 
     Raises:
-        ValueError: 财期非法时抛出。
+        无。
     """
 
-    normalized = normalize_cn_fiscal_period(fiscal_period)
-    if normalized == "FY":
+    if fiscal_period == "FY":
         return "annual"
-    if normalized == "H1":
+    if fiscal_period == "H1":
         return "semi_annual"
     return "quarterly"
 
@@ -2214,7 +2191,6 @@ __all__ = [
     "build_sec_filing_ids",
     "commit_prepared_upload_batch",
     "derive_report_kind",
-    "normalize_cn_fiscal_period",
     "resolve_upload_action",
     "rollback_prepared_upload_batch",
     "validate_material_upload_ids",
