@@ -3,7 +3,7 @@
 ## 0. Gate 元数据
 
 - Work unit：`UF-FIX11 company-metadata-ignored-change-warning`
-- 当前 gate：原子 S1+S2 implementation
+- 当前 gate：S3 projection boundary plan review-fix
 - 日期：2026-08-17
 - 分支：`codex/upload-filing-oracle`
 - Goal 状态：用户已确认；本计划不重新打开 goal confirmation
@@ -21,9 +21,13 @@
 - controller acceptance：`docs/gateflow/uf-fix11-plan-acceptance-20260817.md`
 - slice-boundary blocker：`docs/gateflow/uf-fix11-s1-slice-boundary-blocker-20260817.md`
 - plan amendment：`docs/gateflow/uf-fix11-slice-boundary-amendment-20260817.md`
-- 本 gate 产物：把原 Slice 1/2 合并为可独立变绿的原子 S1+S2，并按 DS findings/OQ-1 收紧测试、符号、validation 与 commit 边界
-- 已有实现状态：原 Slice 1 dirty diff 保留为 S1+S2 partial implementation；当前红色中间态不可接受、不可提交
-- 下一入口：原子 S1+S2 implementation
+- S3 前置 accepted slice：`5bb122d3`
+- S3 projection blocker：`docs/gateflow/uf-fix11-s3-projection-boundary-blocker-20260817.md`
+- S3 projection amendment：`docs/gateflow/uf-fix11-s3-projection-boundary-amendment-20260817.md`
+- S3 projection 双路 review：`docs/reviews/uf-fix11-s3-projection-boundary-review-mimo-20260817.md`、`docs/reviews/uf-fix11-s3-projection-boundary-review-ds-20260817.md`
+- 本 gate 产物：按 Controller 裁决修复 S3 direct projection symbol-boundary amendment，只收紧 plan contract，不实现
+- 实现状态：S3 implementation 暂停；当前 gate 禁止 production/test/README diff
+- 下一入口：S3 projection boundary 双路 re-review；不预判 re-review、acceptance 或 plan-gate commit
 - Implementation 禁止事项：不运行真实 CLI evidence，不创建 PR，不修改 Host/Engine/material/oracle/scenario/frozen evidence
 
 ## 1. Goal、motivation 与 success
@@ -331,10 +335,12 @@ warnings: tuple[CompanyMetadataWarning, ...] = ()
 
 #### 6.6.2 后续 S3：summary、durable、direct、CLI/tool projection
 
-- `FinsUploadResultSummary` 在 S3 才增加 `tuple[CompanyMetadataWarning, ...]` 及 success-only invariant；`FinsUploadResultSummary.to_json_summary()` 在 S3 才写入 `warnings`，空值也序列化为 `[]`。
-- `dayu/fins/service_runtime.py::_upload_summary_from_result` 在 S3 才从已冻结的 `FinsUploadPipelineResult.warnings` 机械复制到 `FinsUploadResultSummary.warnings`；不得重新 parse JSON、比较名称或生成 warning。
+- `FinsUploadResultSummary` 在 S3 增加 `warnings: tuple[CompanyMetadataWarning, ...] = ()`；该默认值是 failed/cancelled/deleted 及无 warning 成功结果的自然空状态。构造器必须 exact 校验每个元素类型、最多一个 warning，且仅 exact status `ok`/`skipped` 允许非空；`failed`/`cancelled`/`deleted` 必须为空。`FinsUploadResultSummary.to_json_summary()` 在 S3 写入 `warnings`，空值也序列化为 `[]`。
+- `dayu/fins/service_runtime.py::_upload_summary_from_result` 在 S3 仍必须显式从已冻结的 `FinsUploadPipelineResult.warnings` 机械复制到 `FinsUploadResultSummary.warnings`；不得依赖默认值，也不得重新 parse JSON、比较名称或生成 warning。
 - durable job record 的 `result_summary`、direct/CLI/tool 必须保存/传播同一个 typed tuple。既有 durable re-read 路径只消费 `status`/`document_id`，允许保留新增字段，但不得在 re-read 时重新推断 warning。
-- `FinsResultSummary` 在 S3 增加同类型 warnings；仅 `FinsResultStatus.SUCCESS` 允许非空。direct terminal event 从 typed upload summary 复制 warnings。
+- `FinsResultSummary` 在 S3 增加 `warnings: tuple[CompanyMetadataWarning, ...] = ()`；仅 `FinsResultStatus.SUCCESS` 允许非空。该跨 operation public summary 使用语义自然的空 tuple 默认值，构造器必须 exact 校验元素类型、最多一个 warning 与 success-only invariant；非 SUCCESS + 非空是非法 typed 组合，必须 fail closed。此默认值表达合法的“无 warning”业务状态，不是从旧字段或下游数据补偿的 compatibility fallback。
+- direct terminal event 从 typed upload summary 复制 warnings。真实 copy owner 是 `dayu/fins/ingestion_runtime.py::_direct_upload_terminal_events`；它把 `summary.warnings` 传入无默认值的 `_direct_result_event(..., warnings=...)`。唯一 generic/non-upload helper callsite `_emit_claimed_direct_result` 必须显式传 `warnings=()`，禁止给 `_direct_result_event` 增加默认值而掩盖漏传。
+- `_direct_result_event` 不得在 CANCELLED 归一化分支静默把非空 warnings 置为 `()`；CANCELLED + 非空必须由 `FinsResultSummary` constructor invariant 拒绝，以保留非法 producer 组合的可见失败。
 - CLI 在 S3 按现有逻辑先向 stdout 输出成功摘要，再逐条向 stderr 输出规范 warning message；exit code 保持 `0`。
 - wait adapter 在 S3 仅为 completed result 增加 `warnings` 数组；failed/cancelled mapping 不增加、不从 exception/message 推断。
 
@@ -736,7 +742,7 @@ amendment review/fix/re-review 接受后，必须先创建一个独立 plan-gate
 
 生产：
 
-- `dayu/fins/ingestion_runtime.py`（仅 `FinsUploadResultSummary.warnings`、其 invariant 与 `to_json_summary()`；不得改写 S1+S2 已冻结的 pipeline parser）
+- `dayu/fins/ingestion_runtime.py`（仅 `FinsUploadResultSummary.warnings`、其 invariant 与 `to_json_summary()`，以及 direct typed copy 必需的 `_direct_upload_terminal_events`、`_direct_result_event` 与唯一 generic/non-upload callsite `_emit_claimed_direct_result`；不得改写 S1+S2 已冻结的 pipeline parser）
 - `dayu/fins/service_runtime.py`（仅 `_upload_summary_from_result` 的 warnings 机械透传；不得改写四个 parser callsite 的 `SourceKind`）
 - `dayu/fins/direct_events.py`
 - `dayu/cli/output.py`
@@ -760,8 +766,8 @@ amendment review/fix/re-review 接受后，必须先创建一个独立 plan-gate
 #### Exact changes
 
 1. 复用原子 S1+S2 已冻结的 `FinsUploadPipelineResult.from_pipeline_json(result, *, source_kind: SourceKind)` 与 typed warnings；本 Slice 不重新决定 missing/null/closed-shape schema，也不修改四个 service parser callsite，只做 summary/durable/direct/service 投影并保留 parser regression。
-2. 严格按 §6.6.2 修改共享文件：`FinsUploadResultSummary.warnings`/success-only invariant 与 `to_json_summary()` 归 `ingestion_runtime.py`；`_upload_summary_from_result` 只在 `service_runtime.py` 机械复制 pipeline warnings。随后 upload/service/direct summary 继续复制同一 typed tuple，durable job `result_summary` 的 warnings 空值也必须为 `[]`，save/re-read 不丢失、不重算。
-3. direct event 保持现有 status/exit code/title/details；只附加同源 warnings。
+2. 严格按 §6.6.2 修改共享文件：`FinsUploadResultSummary.warnings: tuple[CompanyMetadataWarning, ...] = ()`/exact-element/at-most-one/`ok|skipped`-only invariant 与 `to_json_summary()` 归 `ingestion_runtime.py`；`failed`/`cancelled`/`deleted` 必须为空。`_upload_summary_from_result` 只在 `service_runtime.py` 显式机械复制 `result.warnings`，不得依赖 summary 默认值。随后 upload/service/direct summary 继续复制同一 typed tuple，durable job `result_summary` 的 warnings 空值也必须为 `[]`，save/re-read 不丢失、不重算。
+3. direct event 保持现有 status/exit code/title/details；`_direct_upload_terminal_events` 只把同一个 `summary.warnings` 传给 `_direct_result_event`。`_direct_result_event` 的 typed warnings 参数无默认值，upload 与 `_emit_claimed_direct_result` 两个 production callsites都必须显式传值；后者只能传 `()`。`FinsResultSummary.warnings: tuple[CompanyMetadataWarning, ...] = ()` 的空 tuple 默认值只表达跨 operation 的合法空状态，不授权 producer 漏传或下游推断。CANCELLED + 非空 warnings 必须在 `FinsResultSummary` constructor fail closed，`_direct_result_event` 禁止静默归零。
 4. CLI success summary 继续 stdout；每个 typed warning 的规范 message 输出 stderr；exit code `0`。
 5. wait adapter completed result 增加同一 warnings JSON；failed/cancelled result 不增加、不推断。
 6. README 只更新职责内稳定事实，不记录 gate/迁移历史。
@@ -770,7 +776,9 @@ amendment review/fix/re-review 接受后，必须先创建一个独立 plan-gate
 
 - ingestion parser：所有 direct test/callsite 显式传 `SourceKind`；filing valid/empty；filing missing/null/malformed/unknown-message/unknown-kind/duplicate/超限全部 fail closed；仅 `SourceKind.MATERIAL` + missing 映射 empty，material `null` 仍 fail closed。
 - durable summary：`to_json_summary()["warnings"]` 与 typed tuple exact 相同（空为 `[]`），saved job record 的 `result_summary["warnings"]` 与 direct/CLI/tool 同源；既有 re-read 的 status/document_id 读取不受新增字段影响。
-- direct/service：同一 warning object/value 贯穿；failed/cancelled invariant。
+- `tests/fins/test_fins_ingestion_runtime.py`：覆盖 `FinsUploadResultSummary` exact-element、at-most-one 与 success-status 闭集 contract；非精确元素、超过一个 warning、`failed`/`cancelled`/`deleted` + 非空均拒绝，且成功集合精确为 `ok`/`skipped`。该文件同时独占 direct helper/AST 测试：上传 `uploaded` + 无 warning 必须 exact copy 为 `()`，`deleted` direct result 必须为空，CANCELLED + 非空直接构造必须由 `FinsResultSummary` 拒绝，不得被 helper 静默归零。AST 必须穷举 `ingestion_runtime.py` 内 `_direct_result_event` 的全部 `Call` 节点，断言数量恰为两个，`warnings` 实参分别 exact 为 `summary.warnings` 与 `()`；新增任何 callsite 必须立即红。
+- `tests/fins/test_fins_direct_stream.py`：只测试 `FinsResultSummary` public contract/invariant 与 `ValidatedFinsEventStream` stream contract；对 warnings 覆盖非精确元素、超过一个、FAILURE/CANCELLED + 非空拒绝及 SUCCESS 合法正例。该文件禁止 import `ingestion_runtime` private helper。
+- service/direct 跨路径：`tests/fins/test_fins_service_runtime.py` 断言 `_upload_summary_from_result` 显式 exact copy；`tests/fins/test_fins_ingestion_runtime.py` 断言 uploaded/skipped 携带同一 warning object/value，failed/cancelled、deleted 与 generic non-upload result 为空。
 - CLI：stdout 成功摘要不变、stderr 逐字输出 `本次提交的公司名称未生效；已保留现有公司名称。请核对上传目标公司是否正确。`、exit `0`、无 warning 时 stderr 不新增内容。
 - wait adapter：completed warnings exact JSON；failed/cancelled 无 warning；LLM-facing 文本自足、无内部术语。
 - end-to-end mocked CLI command：uploaded 与 skipped 都覆盖，且不运行真实外部 CLI evidence。
@@ -784,6 +792,9 @@ amendment review/fix/re-review 接受后，必须先创建一个独立 plan-gate
 - public warning 泄漏路径、raw names、batch/token/digest/cursor 或内部治理术语；
 - warning 改变 success exit code/status；
 - S3 改写 `FinsUploadPipelineResult.from_pipeline_json` 的 `source_kind`/warnings schema、pipeline warnings invariant、`CompanyMetadataWarning` closed codec 或四个 service parser callsite；
+- direct projection 需要修改上述三个 `ingestion_runtime.py` symbols 之外的 producer，或需要从 details、raw request、durable JSON、日志或 storage 反推 warning；
+- `_observation_failure_result`、`_observation_cancelled_result` 或 `_mark_observation_failed` 出现任何 diff；它们是非 direct projection 构造点，必须保持自然默认空状态且不纳入 S3 修改白名单；
+- `_direct_result_event` 在 CANCELLED 分支静默丢弃非空 warnings，而不是让非法 typed 组合由 `FinsResultSummary` fail closed；
 - README 需要描述未实现或非稳定行为。
 
 ## 11. README 决策
@@ -922,6 +933,9 @@ rg -n "_build_(sec|cn)_filing_failure_event|warnings" \
 rg -n "batch_terminal_started|commit_batch|rollback_prepared_upload_batch" \
   dayu/fins/pipelines/filing_upload_publication.py \
   tests/fins/test_filing_upload_publication.py
+rg -n "_direct_result_event|_observation_failure_result|_observation_cancelled_result|_mark_observation_failed" \
+  dayu/fins/ingestion_runtime.py \
+  tests/fins/test_fins_ingestion_runtime.py
 rg -n "hasattr|getattr|Any|object" \
   dayu/fins/domain/company_meta_contract.py \
   dayu/fins/company_metadata_warning.py \
@@ -940,6 +954,8 @@ rg -n "hasattr|getattr|Any|object" \
 - `_build_sec_filing_failure_event` 与 `_build_cn_filing_failure_event` 的 result builder 参数都显式包含 `warnings=[]`；真实 workflow producer roundtrip tests 断言 raw empty list、parsed empty tuple 与 exact typed failure reason；
 - SKIP metadata branch 的 `batch_terminal_started=True` 文本顺序严格早于 `commit_batch`；success/commit-failure tests 都断言 caller rollback 0，commit 前 stage failure 对照断言 rollback 1；
 - durable job `result_summary["warnings"]` 与 typed/direct/CLI/tool 投影一致；
+- `_direct_result_event` 的 warnings 参数无默认值；AST test 穷举 `ingestion_runtime.py` 中全部 `_direct_result_event` `Call` 节点，数量 exact 为两个，`_direct_upload_terminal_events` 传 `summary.warnings`、`_emit_claimed_direct_result` 传 `()`；任何第三个 production callsite 使测试变红。
+- `_observation_failure_result`、`_observation_cancelled_result`、`_mark_observation_failed` 函数体无 diff，仍由 `FinsResultSummary.warnings=()` 表达自然空状态；`_direct_result_event` 的 CANCELLED 分支不得静默归零 warnings。
 - 每个新增/修改模块、类、函数具有符合项目约束的中文 docstring，包含参数、返回、异常；
 - 没有 compatibility re-export、wrapper/facade、默认值补偿或 loose parsing。
 
@@ -1051,3 +1067,12 @@ Implementation gate 完成时，交付说明必须按以下格式：
 - 当前 blocker：无；slice-boundary amendment 已由两路 final re-review `pass` 并被 controller 接受。
 - 当前 gate：原子 S1+S2 implementation。
 - 下一入口：完成原子 S1+S2 implementation、验证并进入 implementation review。
+
+## 17. S3 direct projection symbol-boundary amendment
+
+- blocker：`docs/gateflow/uf-fix11-s3-projection-boundary-blocker-20260817.md` 证明 `FinsUploadResultSummary -> FinsResultSummary` 的唯一 typed copy 必经 `ingestion_runtime.py::_direct_upload_terminal_events/_direct_result_event`，而原 S3 symbol 白名单漏列这两个 helper。
+- 修订范围：production/test/document allowed 文件全集、业务目标、warning owner、S1+S2 parser/codec 与 Host/Engine non-goals全部不变；只扩大 `ingestion_runtime.py` 的 S3 symbol 白名单并精确规定两个 production callsites。
+- 参数策略：`_direct_result_event` 的 warnings 参数必填且无默认值；upload callsite 传 `summary.warnings`，唯一 generic/non-upload callsite `_emit_claimed_direct_result` 显式传 `()`。`FinsResultSummary.warnings=()` 是跨 operation public contract 的合法空状态，不是 producer fallback。
+- gate：本修订必须独立经过 MiMo/DS plan review、controller fix/re-review 与 acceptance，并形成独立 plan-gate commit；在此之前 S3 implementation 保持暂停。
+- plan-gate commit 只允许包含本 plan、blocker、amendment、双路 review/fix/re-review 与 acceptance artifacts，禁止 production/test/README diff。建议 commit message：`gateflow: accept UF-FIX11 S3 projection boundary amendment`。
+- acceptance：MiMo 与 DS 定向 re-review 均为 PASS；initial findings 已全部 fixed 或 rejected-with-reason，未分类 residual risk 为零。独立 plan-gate commit 创建后恢复 S3 implementation。
