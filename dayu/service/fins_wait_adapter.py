@@ -23,6 +23,7 @@ from dayu.contracts.tool_outcome import (
 )
 from dayu.contracts.tool_result import ToolResultFailure, ToolResultMeta, ToolResultSuccess
 from dayu.fins.direct_events import FinsEventDetail, FinsOperationKind, FinsResultSummary
+from dayu.fins.company_metadata_warning import company_metadata_warnings_to_json
 from dayu.fins.direct_event_text import (
     wait_cancelled_hint,
     wait_cancelled_message,
@@ -570,7 +571,8 @@ def _completed_result_value(
 
     :param snapshot: terminal observation snapshot。
     :param result: 同一 observation 的 terminal result。
-    :returns: download 使用 nested 自解释对象；其它 operation 保持业务 details。
+    :returns: completed value 恒包含 ``warnings`` 数组，非 upload 自然为空 ``[]``；
+        download 使用 nested 自解释对象，其它 operation 保持业务 details。
     :raises Exception: 不主动抛出异常。
     """
 
@@ -578,6 +580,7 @@ def _completed_result_value(
         "operation": snapshot.handle.operation_kind.value,
         "status": result.status.value,
         "title": result.title,
+        "warnings": company_metadata_warnings_to_json(result.warnings),
     }
     if result.download is not None:
         value["download"] = result.download.to_json_value()

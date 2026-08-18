@@ -16,6 +16,11 @@ from dayu.cli.output import (
     render_interactive_terminal_result,
     render_prompt_terminal_result,
 )
+from dayu.fins.company_metadata_warning import (
+    COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+    CompanyMetadataWarning,
+    CompanyMetadataWarningKind,
+)
 from dayu.fins.direct_events import (
     FINS_RESULT_EXIT_CANCELLED,
     FINS_RESULT_EXIT_FAILURE,
@@ -28,6 +33,8 @@ from dayu.fins.direct_events import (
     FinsOperationKind,
     FinsProgress,
     FinsErrorKind,
+    FinsPublicFailure,
+    FinsPublicFailureKind,
     FinsResultStatus,
     FinsResultSummary,
 )
@@ -189,6 +196,92 @@ def test_fins_download_cli_mechanically_projects_typed_public_summary() -> None:
     assert stderr.getvalue() == ""
 
 
+def test_fins_download_failure_projects_typed_rows_missing_periods_and_recovery() -> None:
+    """CLI 下载失败应机械展示 typed 行、缺失期间与恢复建议。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: failure public object 被省略或进入错误输出通道时抛出。
+    """
+
+    download = FinsDownloadPublicSummary(
+        source=FinsDownloadSource.SEC,
+        canonical_ticker="AAPL",
+        effective_filters=FinsDownloadEffectiveFilters(
+            form_types=("10-K",),
+            start_date=None,
+            end_date=None,
+            overwrite_existing=False,
+            rebuild_local_artifacts=False,
+        ),
+        discovered_count=1,
+        downloaded_count=0,
+        skipped_count=0,
+        rejected_count=0,
+        failed_count=1,
+        document_rows=(
+            FinsDownloadPublicDocument(
+                document_id="fil-failed",
+                form_or_period="10-K",
+                filing_date=None,
+                report_date=None,
+                covered_fiscal_periods=(),
+                disposition=FinsDownloadDocumentDisposition.FAILED,
+                reason_category="provider",
+                reason_message="来源暂时不可用",
+                artifact_locator=None,
+            ),
+        ),
+        missing_periods=("FY2024",),
+        omitted_count=0,
+        terminal_disposition=FinsDownloadTerminalDisposition.FAILED,
+    )
+    failure = FinsPublicFailure(
+        kind=FinsPublicFailureKind.EXECUTION,
+        source=FinsDownloadSource.SEC,
+        transport_category=None,
+        safe_message="下载执行失败",
+        retry_hint="请稍后重试",
+    )
+    event = FinsEvent(
+        event_type=FinsEventType.RESULT,
+        operation_kind=FinsOperationKind.DOWNLOAD,
+        message="下载失败",
+        emitted_at=datetime.now(timezone.utc),
+        ticker="AAPL",
+        filing_kind=None,
+        document_label=None,
+        progress=None,
+        result=FinsResultSummary(
+            status=FinsResultStatus.FAILURE,
+            exit_code=FINS_RESULT_EXIT_FAILURE,
+            title="下载失败",
+            details=(),
+            error_kind=FinsErrorKind.EXECUTION,
+            error_message=failure.safe_message,
+            download=download,
+            failure=failure,
+        ),
+    )
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+
+    render_fins_direct_event(event, stdout=stdout, stderr=stderr)
+
+    output = stderr.getvalue()
+    assert stdout.getvalue() == ""
+    assert 'reason_category="provider"' in output
+    assert 'reason="来源暂时不可用"' in output
+    assert 'Fins missing periods: "FY2024"' in output
+    assert 'classification="execution"' in output
+    assert 'retry_hint="请稍后重试"' in output
+
+
 def test_prompt_and_interactive_render_non_cancelled_terminal_matrix() -> None:
     """prompt/interactive 对成功、缺回答、失败与 lost 使用固定公共投影。
 
@@ -237,6 +330,66 @@ def test_prompt_and_interactive_render_non_cancelled_terminal_matrix() -> None:
     assert render_interactive_terminal_result(missing_answer, stdout=stdout, stderr=stderr) == EXIT_FAILURE
     assert render_interactive_terminal_result(failed, stdout=stdout, stderr=stderr) == EXIT_SUCCESS
     assert render_interactive_terminal_result(lost, stdout=stdout, stderr=stderr) == EXIT_FAILURE
+
+
+def test_fins_success_warning_preserves_stdout_and_writes_each_message_to_stderr() -> None:
+    """CLI 成功摘要应保持 stdout 不变，并把 typed warning 逐条写 stderr。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: warning 改写摘要、通道或规范文案时抛出。
+    """
+
+    summary = FinsResultSummary(
+        status=FinsResultStatus.SUCCESS,
+        exit_code=FINS_RESULT_EXIT_SUCCESS,
+        title="上传完成",
+        details=(FinsEventDetail(label="stored files", value="1"),),
+        error_kind=None,
+        error_message=None,
+    )
+    event = FinsEvent(
+        event_type=FinsEventType.RESULT,
+        operation_kind=FinsOperationKind.UPLOAD_FILING,
+        message="上传完成",
+        emitted_at=datetime.now(timezone.utc),
+        ticker="AAPL",
+        filing_kind="10-K",
+        document_label=None,
+        progress=None,
+        result=summary,
+    )
+    baseline_stdout = io.StringIO()
+    baseline_stderr = io.StringIO()
+    warned_stdout = io.StringIO()
+    warned_stderr = io.StringIO()
+
+    render_fins_direct_event(event, stdout=baseline_stdout, stderr=baseline_stderr)
+    render_fins_direct_event(
+        replace(
+            event,
+            result=replace(
+                summary,
+                warnings=(
+                    CompanyMetadataWarning(
+                        kind=CompanyMetadataWarningKind.COMPANY_NAME_IGNORED,
+                        message=COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+                    ),
+                ),
+            ),
+        ),
+        stdout=warned_stdout,
+        stderr=warned_stderr,
+    )
+
+    assert warned_stdout.getvalue() == baseline_stdout.getvalue()
+    assert baseline_stderr.getvalue() == ""
+    assert warned_stderr.getvalue() == f"{COMPANY_NAME_IGNORED_WARNING_MESSAGE}\n"
 
 
 def test_fins_renderer_covers_progress_failure_cancel_and_error_helpers() -> None:

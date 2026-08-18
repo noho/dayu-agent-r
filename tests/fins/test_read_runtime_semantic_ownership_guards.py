@@ -10,6 +10,8 @@ from typing import TypeGuard
 
 import pytest
 
+from tests.fins.company_meta_test_support import stage_company_meta_fixture
+
 from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.base import (
     DocumentProcessor,
@@ -21,6 +23,7 @@ from dayu.documents.processors.base import (
 )
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.documents.processors.source import Source
+from dayu.fins.ticker_normalization import build_company_ticker_identity
 from dayu.fins.domain.document_models import (
     BatchToken,
     CompanyMeta,
@@ -851,9 +854,7 @@ class _CountingSourceRepository(FsSourceDocumentRepository):
             materialize_files=materialize_files,
         )
         if materialize_files:
-            self.full_snapshot_roots.append(
-                snapshot.get_primary_source().materialize().parent
-            )
+            self.full_snapshot_roots.append(snapshot.get_primary_source().materialize().parent)
         return snapshot
 
     def get_source_meta(
@@ -952,6 +953,45 @@ def test_parse_source_document_meta_preserves_bool_and_defaults() -> None:
     assert meta["amended"] is True
     assert meta["is_deleted"] is False
     assert meta["ingest_complete"] is True
+
+
+@pytest.mark.parametrize("value", [1000, 2025, 9999])
+def test_parse_source_document_meta_preserves_valid_four_digit_fiscal_year(value: int) -> None:
+    """read runtime 应保留 owner 已验证的合法四位财年。
+
+    Args:
+        value: 合法四位 fiscal year。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: read runtime 未原样保留合法年份时抛出。
+    """
+
+    meta = _parse_source_document_meta({"fiscal_year": value})
+
+    assert meta["fiscal_year"] == value
+
+
+@pytest.mark.parametrize("value", [999, 10000, True, False, "2025"])
+def test_parse_source_document_meta_fails_closed_for_invalid_historical_fiscal_year(
+    value: JsonValue,
+) -> None:
+    """read runtime 对历史非法财年必须按 domain owner 失败关闭。
+
+    Args:
+        value: 仓储中非法的历史 fiscal year 值。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法历史值被忽略、默认化或未触发 ``ValueError`` 时抛出。
+    """
+
+    with pytest.raises(ValueError, match=r"fiscal_year 必须是 1000\.\.9999 的整数"):
+        _parse_source_document_meta({"fiscal_year": value})
 
 
 @pytest.mark.parametrize(
@@ -1141,19 +1181,19 @@ def test_get_financial_statement_accepts_list_rows(tmp_path: Path) -> None:
     processor = _FinancialStatementPayloadProcessor(_FakeSource())
     processor.set_financial_statement_payload(
         {
-                "statement_type": "income_statement",
-                "periods": [
-                    {
-                        "period_end": "2025-12-31",
-                        "fiscal_year": 2025,
-                        "fiscal_period": "FY",
-                    }
-                ],
-                "currency": "USD",
-                "units": "USD",
-                "scale": "millions",
-                "rows": [{"concept": "Revenue", "label": "Revenue", "values": [100]}],
-                "data_quality": "xbrl",
+            "statement_type": "income_statement",
+            "periods": [
+                {
+                    "period_end": "2025-12-31",
+                    "fiscal_year": 2025,
+                    "fiscal_period": "FY",
+                }
+            ],
+            "currency": "USD",
+            "units": "USD",
+            "scale": "millions",
+            "rows": [{"concept": "Revenue", "label": "Revenue", "values": [100]}],
+            "data_quality": "xbrl",
         }
     )
     runtime, _source_repository = _build_runtime_with_source_documents(
@@ -1241,9 +1281,7 @@ def test_public_result_builders_copy_inputs_and_preserve_optional_reason() -> No
     }
 
     query_params = XbrlQueryParams(concepts=["Revenue"], min_value=1)
-    returned_facts: list[dict[str, JsonValue]] = [
-        {"concept": "Revenue", "numeric_value": 100.0}
-    ]
+    returned_facts: list[dict[str, JsonValue]] = [{"concept": "Revenue", "numeric_value": 100.0}]
     xbrl_result: PublicXbrlQueryResult = project_xbrl_query_result(
         ticker="AAPL",
         document_id="doc-1",
@@ -1281,9 +1319,7 @@ def test_public_projection_ast_has_new_types_and_single_count_assignment() -> No
 
     result_types_path = Path("dayu/fins/tools/result_types.py")
     result_types_tree = _parse_module(result_types_path)
-    class_names = {
-        node.name for node in result_types_tree.body if isinstance(node, ast.ClassDef)
-    }
+    class_names = {node.name for node in result_types_tree.body if isinstance(node, ast.ClassDef)}
     assert "PublicFinancialStatementResult" in class_names
     assert "PublicXbrlQueryResult" in class_names
     assert "FinancialStatementResult" not in class_names
@@ -1294,16 +1330,11 @@ def test_public_projection_ast_has_new_types_and_single_count_assignment() -> No
         "project_xbrl_query_result",
     }
     builders = [
-        node
-        for node in result_types_tree.body
-        if isinstance(node, ast.FunctionDef) and node.name in builder_names
+        node for node in result_types_tree.body if isinstance(node, ast.FunctionDef) and node.name in builder_names
     ]
     assert {builder.name for builder in builders} == builder_names
     for builder in builders:
-        annotations = [
-            _annotation_text(argument.annotation)
-            for argument in builder.args.kwonlyargs
-        ]
+        annotations = [_annotation_text(argument.annotation) for argument in builder.args.kwonlyargs]
         assert all("Any" not in annotation for annotation in annotations)
 
     count_owners = [
@@ -1322,10 +1353,7 @@ def test_public_projection_ast_has_new_types_and_single_count_assignment() -> No
         Path("dayu/fins/tools/fins_tools.py"),
     ):
         tree = _parse_module(path)
-        assert not any(
-            isinstance(node, ast.keyword) and node.arg == "fact_count"
-            for node in ast.walk(tree)
-        )
+        assert not any(isinstance(node, ast.keyword) and node.arg == "fact_count" for node in ast.walk(tree))
 
 
 def test_query_xbrl_facts_maps_all_failed_to_typed_business_failure(tmp_path: Path) -> None:
@@ -1358,7 +1386,6 @@ def test_query_xbrl_facts_maps_all_failed_to_typed_business_failure(tmp_path: Pa
     assert error_info.value.code == "xbrl_query_failed"
     assert "零命中" in error_info.value.message
     assert isinstance(error_info.value.__cause__, XbrlQueryExecutionError)
-
 
 
 def test_fins_read_runtime_weak_typing_guards_lock_owner_boundaries() -> None:
@@ -1426,9 +1453,7 @@ def test_read_runtime_has_no_revision_hash_double_read_or_source_kind_probe() ->
         "revision_" + "before",
         "revision_" + "after",
     }
-    assert forbidden_names.isdisjoint(
-        node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
-    )
+    assert forbidden_names.isdisjoint(node.id for node in ast.walk(tree) if isinstance(node, ast.Name))
     forbidden_repository_calls = (
         "get_source_" + "revision",
         "get_document_provenance",
@@ -1512,8 +1537,7 @@ def test_list_documents_projects_stable_document_type_and_filter_contract(
 
     unfiltered_result = runtime.list_documents(ticker="AAPL")
     document_types_by_id = {
-        document["document_id"]: document["document_type"]
-        for document in unfiltered_result["documents"]
+        document["document_id"]: document["document_type"] for document in unfiltered_result["documents"]
     }
     assert document_types_by_id == {
         "doc-1": "annual_report",
@@ -1536,10 +1560,9 @@ def test_list_documents_projects_stable_document_type_and_filter_contract(
         "fiscal_years": None,
         "fiscal_periods": ["FY"],
     }
-    assert {
-        document["document_id"]: document["document_type"]
-        for document in filtered_result["documents"]
-    } == {"material-earnings-call": "earnings_call"}
+    assert {document["document_id"]: document["document_type"] for document in filtered_result["documents"]} == {
+        "material-earnings-call": "earnings_call"
+    }
     assert filtered_result["matched"] == 1
     assert filtered_result["match_status"] == "ok"
     assert "suggestion" not in filtered_result
@@ -1702,10 +1725,7 @@ def test_get_table_projects_self_describing_data_shapes_and_rejects_unknown_ref(
     }
     assert text_result["table_type"] is None
 
-    results_by_ref = {
-        result["table_ref"]: result
-        for result in (records_result, markdown_result, text_result)
-    }
+    results_by_ref = {result["table_ref"]: result for result in (records_result, markdown_result, text_result)}
     assert set(results_by_ref) == {
         "records-table",
         "markdown-table",
@@ -2044,15 +2064,14 @@ def _build_runtime_with_source_documents(
     processed_repository = FsProcessedDocumentRepository(workspace_root, repository_set=repository_set)
     batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
     batch = batching_repository.begin_batch("AAPL")
-    company_repository.upsert_company_meta(
+    stage_company_meta_fixture(
+        company_repository,
         CompanyMeta(
             company_id="0000320193",
             company_name="Apple Inc.",
-            ticker="AAPL",
-            market="US",
+            ticker_identity=build_company_ticker_identity("AAPL", ()),
             resolver_version="test",
             updated_at=now_iso8601(),
-            ticker_aliases=[],
         ),
         batch=batch,
     )

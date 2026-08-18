@@ -29,28 +29,29 @@ from dayu.fins.domain.document_models import (
 from dayu.fins.domain.enums import SourceKind
 
 from ._fs_identity import _IDENTITY_DESCRIPTOR_FILENAME, _require_external_identity
-from ._fs_storage_infra import (
-    _source_meta_without_revision,
+from ._fs_source_integrity import (
+    _SourcePublicationInspection,
+    _inspect_source_kind_unguarded,
+    _require_complete_source_for_snapshot_unguarded,
     _source_revision_from_meta,
 )
 from ._fs_storage_utils import (
     _append_secondary_error_note,
-    _file_object_meta_from_dict,
     _guess_media_type,
-    _list_directory,
-    _local_path_from_uri,
-    _normalize_filename,
     _normalize_source_kind,
     _open_binary_file,
     _project_filesystem_error,
     _raise_path_free_error,
     _read_file_bytes,
+    _source_dir_name,
 )
 from .repository_protocols import (
     SourceSnapshotConsistencyError,
     SourceSnapshotFileDescriptor,
     SourceSnapshotProtocol,
 )
+from .source_meta_contract import require_source_meta_is_deleted
+from .source_integrity import SourceIntegrityStatus
 
 if TYPE_CHECKING:
     from ._fs_source_document_core import _FsSourceDocumentMixin
@@ -735,44 +736,39 @@ def _acquire_snapshot_attempt_unguarded(
         OSError: descriptor、meta 或业务文件读取失败时抛出。
     """
 
-    resolved_source_kind = _resolve_snapshot_source_kind_unguarded(
+    resolved_source_kind, inspection = _inspect_snapshot_source_unguarded(
         core,
         ticker,
         document_id,
         source_kind,
     )
-    meta_path = core._source_meta_path_for_read(
-        ticker,
-        document_id,
-        resolved_source_kind,
-    )
-    document_dir = meta_path.parent
-    if meta_path.is_symlink() or not meta_path.is_file():
-        raise ValueError("source snapshot meta 必须为 non-symlink regular file")
-    persisted_meta = core._get_persisted_source_meta_unguarded(
-        ticker,
-        document_id,
-        resolved_source_kind,
-    )
-    revision = _source_revision_from_meta(persisted_meta)
-    provenance = SourceDocumentProvenance.from_meta(
-        persisted_meta,
-        resolved_source_kind,
-    )
-    if not provenance.ingest_complete:
-        raise ValueError("source snapshot 只读取完成态 source")
-    is_deleted = _require_deleted_flag(persisted_meta)
+    try:
+        complete = _require_complete_source_for_snapshot_unguarded(inspection)
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            f"document_id={document_id} 的 {resolved_source_kind.value} source 不存在"
+        ) from None
+    except ValueError:
+        raise ValueError("source snapshot 只允许读取完整 source") from None
+    persisted_meta = complete.persisted_meta
+    business_meta = complete.business_meta
+    provenance = complete.provenance
+    revision = complete.revision
+    primary_filename = complete.primary_document
+    if (
+        persisted_meta is None
+        or business_meta is None
+        or provenance is None
+        or revision is None
+        or primary_filename is None
+    ):
+        raise RuntimeError("COMPLETE source inspection 缺少 snapshot 必需事实")
+    is_deleted = require_source_meta_is_deleted(persisted_meta)
     if is_deleted:
         raise FileNotFoundError(
             f"document_id={document_id} 的 {resolved_source_kind.value} source 已删除"
         )
-    files, primary_filename = _parse_snapshot_files(
-        core,
-        ticker,
-        resolved_source_kind,
-        document_dir,
-        persisted_meta,
-    )
+    files = tuple(item.descriptor for item in complete.files)
     marker = _build_published_marker(
         core,
         ticker,
@@ -783,11 +779,12 @@ def _acquire_snapshot_attempt_unguarded(
     )
     open_files: list[_OpenSnapshotFile] = []
     try:
-        for descriptor in files:
-            physical_path = document_dir / descriptor.name
+        for inspected_file in complete.files:
+            descriptor = inspected_file.descriptor
+            physical_path = inspected_file.physical_path
             core._require_contained_regular_file(
                 physical_path,
-                document_dir,
+                physical_path.parent,
                 label=f"source snapshot file {descriptor.name}",
             )
             stream = _open_binary_file(
@@ -827,7 +824,7 @@ def _acquire_snapshot_attempt_unguarded(
         ticker=ticker,
         document_id=document_id,
         source_kind=resolved_source_kind,
-        source_meta=_source_meta_without_revision(persisted_meta),
+        source_meta=dict(business_meta),
         provenance=provenance,
         revision=revision,
         files=files,
@@ -837,13 +834,13 @@ def _acquire_snapshot_attempt_unguarded(
     )
 
 
-def _resolve_snapshot_source_kind_unguarded(
+def _inspect_snapshot_source_unguarded(
     core: _FsSourceDocumentMixin,
     ticker: str,
     document_id: str,
     source_kind: Optional[SourceKind],
-) -> SourceKind:
-    """在同一 publication guard 内解析 snapshot source kind。
+) -> tuple[SourceKind, _SourcePublicationInspection]:
+    """在同一 publication guard 内选择并返回 exact source inspection。
 
     Args:
         core: 当前 filesystem storage core。
@@ -852,164 +849,51 @@ def _resolve_snapshot_source_kind_unguarded(
         source_kind: 可选显式 source kind。
 
     Returns:
-        唯一存在的 source kind，或显式 source kind。
+        唯一存在的 source kind 及其同版 exact-target inspection。
 
     Raises:
         FileNotFoundError: 没有匹配 source 时抛出。
         ValueError: source kind 缺省且 filing/material 同时存在时抛出。
-        OSError: descriptor 或 meta locator 校验失败时抛出。
+        OSError: inspector operational I/O 失败时抛出 path-free 异常。
     """
 
+    ticker_dir = core._target_ticker_dir(ticker)
     if source_kind is not None:
-        meta_path = core._source_meta_path_for_read(ticker, document_id, source_kind)
-        if not meta_path.exists() and not meta_path.is_symlink():
+        inspection = _inspect_source_kind_unguarded(
+            ticker=ticker,
+            source_kind=source_kind,
+            ticker_dir=ticker_dir,
+            source_root=ticker_dir / _source_dir_name(source_kind),
+            requested_document_id=document_id,
+        )
+        target = inspection.target
+        if target is None:
+            raise RuntimeError("exact-target inspection 缺少 target")
+        if target.classification.status is SourceIntegrityStatus.MISSING:
             raise FileNotFoundError(
                 f"document_id={document_id} 的 {source_kind.value} source 不存在"
             )
-        return source_kind
-    existing_kinds = _existing_snapshot_source_kinds_unguarded(
-        core,
-        ticker,
-        document_id,
-    )
-    if not existing_kinds:
+        return source_kind, target
+
+    candidates: list[tuple[SourceKind, _SourcePublicationInspection]] = []
+    for candidate_kind in (SourceKind.FILING, SourceKind.MATERIAL):
+        candidate_inspection = _inspect_source_kind_unguarded(
+            ticker=ticker,
+            source_kind=candidate_kind,
+            ticker_dir=ticker_dir,
+            source_root=ticker_dir / _source_dir_name(candidate_kind),
+            requested_document_id=document_id,
+        )
+        candidate_target = candidate_inspection.target
+        if candidate_target is None:
+            raise RuntimeError("exact-target inspection 缺少 target")
+        if candidate_target.classification.status is not SourceIntegrityStatus.MISSING:
+            candidates.append((candidate_kind, candidate_target))
+    if not candidates:
         raise FileNotFoundError(f"document_id={document_id} 的 source 不存在")
-    if len(existing_kinds) != 1:
+    if len(candidates) != 1:
         raise ValueError("source kind 不明确：filing 与 material 同时存在")
-    return existing_kinds[0]
-
-
-def _existing_snapshot_source_kinds_unguarded(
-    core: _FsSourceDocumentMixin,
-    ticker: str,
-    document_id: str,
-) -> tuple[SourceKind, ...]:
-    """在 caller 已持 guard 时枚举 exact identity 对应的 source kinds。
-
-    Args:
-        core: 当前 filesystem storage core。
-        ticker: exact external ticker。
-        document_id: exact external document ID。
-
-    Returns:
-        具有 meta locator 的 source kind 元组。
-
-    Raises:
-        ValueError: descriptor 或 meta locator 非法时抛出。
-        OSError: descriptor 读取失败时抛出。
-    """
-
-    result: list[SourceKind] = []
-    for candidate in (SourceKind.FILING, SourceKind.MATERIAL):
-        meta_path = core._source_meta_path_for_read(ticker, document_id, candidate)
-        if meta_path.exists() or meta_path.is_symlink():
-            result.append(candidate)
-    return tuple(result)
-
-
-def _parse_snapshot_files(
-    core: _FsSourceDocumentMixin,
-    ticker: str,
-    source_kind: SourceKind,
-    document_dir: Path,
-    persisted_meta: Mapping[str, JsonValue],
-) -> tuple[tuple[SourceSnapshotFileDescriptor, ...], str]:
-    """解析 typed 文件描述符并验证 physical/meta 双向一致。
-
-    Args:
-        core: 当前 filesystem storage core。
-        ticker: exact external ticker。
-        source_kind: 已解析 source kind。
-        document_dir: 已验证 identity directory。
-        persisted_meta: 同版 persisted source meta。
-
-    Returns:
-        meta 顺序下的完整文件描述符与 exact primary filename。
-
-    Raises:
-        FileNotFoundError: primary 未命中 files 时抛出。
-        ValueError: files、filename、URI、字段类型或 physical 集合非法时抛出。
-        OSError: physical directory 枚举或 containment 校验失败时抛出。
-    """
-
-    raw_files = persisted_meta.get("files")
-    if not isinstance(raw_files, list) or not raw_files:
-        raise ValueError("source snapshot files 必须为非空数组")
-    descriptors: list[SourceSnapshotFileDescriptor] = []
-    file_names: set[str] = set()
-    ticker_dir = core._ticker_dir_for_read(ticker)
-    for raw_file in raw_files:
-        if not isinstance(raw_file, Mapping):
-            raise ValueError("source snapshot files 条目必须为 object")
-        file_payload: dict[str, JsonValue] = dict(raw_file)
-        raw_name = file_payload.get("name")
-        if not isinstance(raw_name, str):
-            raise ValueError("source snapshot file.name 必须为字符串")
-        name = _normalize_filename(raw_name)
-        if name != raw_name or name in file_names:
-            raise ValueError("source snapshot file.name 非法或重复")
-        file_names.add(name)
-        file_meta = _file_object_meta_from_dict(file_payload)
-        expected_path = document_dir / name
-        resolved_uri_path = _local_path_from_uri(core.portfolio_root, file_meta.uri)
-        if resolved_uri_path != expected_path:
-            raise ValueError("source snapshot file URI 与 physical identity 不一致")
-        core._require_contained_regular_file(
-            expected_path,
-            ticker_dir,
-            label=f"source snapshot file {name}",
-        )
-        descriptors.append(
-            SourceSnapshotFileDescriptor(
-                name=name,
-                etag=file_meta.etag,
-                last_modified=file_meta.last_modified,
-                size=file_meta.size,
-                content_type=file_meta.content_type,
-                sha256=file_meta.sha256,
-            )
-        )
-    physical_names: set[str] = set()
-    for child in _list_directory(
-        document_dir,
-        action="枚举 source snapshot published directory",
-    ):
-        if child.name in {"meta.json", _IDENTITY_DESCRIPTOR_FILENAME}:
-            continue
-        if child.is_symlink() or not child.is_file():
-            raise ValueError("source snapshot 目录只允许已声明 regular file")
-        physical_names.add(child.name)
-    if physical_names != file_names:
-        raise ValueError("source snapshot files 与 physical business files 不双向一致")
-    raw_primary = persisted_meta.get("primary_document")
-    if not isinstance(raw_primary, str) or not raw_primary:
-        raise ValueError("source snapshot primary_document 必须为非空字符串")
-    primary_filename = _normalize_filename(raw_primary)
-    if primary_filename != raw_primary or primary_filename not in file_names:
-        raise FileNotFoundError("source snapshot primary_document 未精确命中 files")
-    return tuple(descriptors), primary_filename
-
-
-def _require_deleted_flag(meta: Mapping[str, JsonValue]) -> bool:
-    """读取 source deleted 状态并拒绝 loose truthiness。
-
-    Args:
-        meta: persisted source meta。
-
-    Returns:
-        typed deletion flag。
-
-    Raises:
-        KeyError: meta 缺少 ``is_deleted`` 时抛出。
-        ValueError: ``is_deleted`` 不是布尔值时抛出。
-    """
-
-    if "is_deleted" not in meta:
-        raise KeyError("source meta 缺少 is_deleted")
-    value = meta["is_deleted"]
-    if not isinstance(value, bool):
-        raise ValueError("source meta is_deleted 必须为布尔值")
-    return value
+    return candidates[0]
 
 
 def _build_published_marker(
@@ -1107,7 +991,7 @@ def _read_published_marker(
                 document_id,
                 source_kind,
                 revision,
-                _require_deleted_flag(persisted_meta),
+                require_source_meta_is_deleted(persisted_meta),
             )
     except BaseException as exc:
         marker_error = exc

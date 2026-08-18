@@ -15,7 +15,6 @@ from typing import Any, BinaryIO, NoReturn, Optional
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.document_models import FileObjectMeta, now_iso8601
 from dayu.fins.domain.enums import SourceKind
-from dayu.fins.ticker_normalization import try_normalize_ticker
 
 # -- 文件名常量 --
 _SOURCE_META_FILENAME = "meta.json"
@@ -51,54 +50,6 @@ def _normalize_path_component(value: str, *, field_name: str) -> str:
     if Path(normalized).is_absolute() or PureWindowsPath(normalized).drive:
         raise ValueError(f"{field_name} 不能是绝对路径或盘符表达")
     return normalized
-
-
-def _canonicalize_ticker_alias(ticker: str) -> str:
-    """把公司检索 alias 规范化为公共 ticker alias。
-
-    优先走 ``try_normalize_ticker`` 真源；识别失败时回退到
-    ``strip().upper()``。canonical 与 fallback 最终都通过同一个单路径组件校验。
-
-    Args:
-        ticker: 原始公司检索 alias。
-
-    Returns:
-        标准化后的 ticker alias。
-
-    Raises:
-        ValueError: ticker 为空、包含路径分隔符或表达绝对路径/盘符时抛出。
-    """
-
-    normalized_source = try_normalize_ticker(ticker)
-    candidate = normalized_source.canonical if normalized_source is not None else ticker.strip().upper()
-    return _normalize_path_component(candidate, field_name="ticker")
-
-
-def _normalize_company_ticker_aliases(
-    *,
-    canonical_ticker: str,
-    ticker_aliases: Optional[list[str]],
-) -> list[str]:
-    """标准化公司级 ticker alias 列表。
-
-    Args:
-        canonical_ticker: 规范 ticker。
-        ticker_aliases: 原始 alias 列表。
-
-    Returns:
-        去重后的 alias 列表，且首项始终为规范 ticker。
-
-    Raises:
-        ValueError: alias 中存在空白 ticker 时抛出。
-    """
-
-    normalized_aliases: list[str] = [canonical_ticker]
-    for raw_alias in ticker_aliases or []:
-        normalized_alias = _canonicalize_ticker_alias(raw_alias)
-        if normalized_alias in normalized_aliases:
-            continue
-        normalized_aliases.append(normalized_alias)
-    return normalized_aliases
 
 
 def _normalize_entry_name(name: str) -> str:

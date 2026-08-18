@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import errno
+import hashlib
+import io
+import logging
+import subprocess
+import sys
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from functools import partial
 from pathlib import Path
 from typing import NoReturn, TextIO, cast
@@ -16,6 +22,8 @@ import pytest
 import dayu.cli.commands.fins as fins_command
 import dayu.cli.main as cli_main
 import dayu.cli.output as cli_output
+import dayu.fins.download_contract as download_contract
+import dayu.fins.ingestion_runtime as ingestion_runtime
 from dayu.cli.agent_entrypoint import CliSigintMonitor
 from dayu.cli.arg_parsing import parse_cli_args
 from dayu.cli.exit_codes import (
@@ -23,6 +31,11 @@ from dayu.cli.exit_codes import (
     EXIT_KEYBOARD_INTERRUPT,
     EXIT_SUCCESS,
     EXIT_USAGE_ERROR,
+)
+from dayu.fins.company_metadata_warning import (
+    COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+    CompanyMetadataWarning,
+    CompanyMetadataWarningKind,
 )
 from dayu.fins.direct_events import (
     FinsDirectStreamProtocolError,
@@ -38,10 +51,31 @@ from dayu.fins.direct_events import (
 )
 from dayu.fins.direct_events import ValidatedFinsEventStream
 from dayu.fins.download_contract import (
+    FinsDownloadEffectiveFilters,
     FinsDownloadRequest,
     build_fins_download_request,
 )
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.domain.document_models import SourceDocumentUpsertRequest, SourceHandle
+from dayu.fins.ingestion_runtime import (
+    FinsJobCancellationChecker,
+    FinsIngestionOperationKind,
+    FinsUploadFilingRequest,
+    FinsUploadResultSummary,
+    validate_fins_upload_filing_request,
+)
+from dayu.fins.pipelines.docling_upload_service import build_sec_filing_ids
+from dayu.fins.storage import (
+    FilingUploadPublishedState,
+    FsBatchingRepository,
+    FsDocumentBlobRepository,
+    FsFilingUploadStateRepository,
+    FsSourceDocumentRepository,
+    SourceIntegrityClassification,
+    SourceIntegrityStatus,
+)
+from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
+from dayu.fins.upload_failure import fins_upload_failure_from_exception
 from dayu.service.fins_direct import (
     FINS_DIRECT_EXIT_FAILURE,
     FINS_DIRECT_EXIT_KEYBOARD_INTERRUPT,
@@ -49,6 +83,79 @@ from dayu.service.fins_direct import (
 )
 
 _NOW: datetime = datetime(2026, 6, 16, tzinfo=timezone.utc)
+_UNPARSABLE_PDF_BYTES = b"not a PDF"
+_UNPARSABLE_DOCX_BYTES = b"not a DOCX"
+_TYPED_CONTENT_FAILURE_REASON = "文件无法解析或已损坏，请检查文件后重试"
+_MAX_PUBLIC_CONTENT_FAILURE_STDERR_CHARS = 1024
+_UNKNOWN_DIRECT_FAILURE_MARKER = "private /absolute/path traceback marker"
+_UNKNOWN_DIRECT_FAILURE_STDERR = "dayu-cli download: 命令执行失败，请使用 --log-file PATH 重试并查看日志\n"
+
+
+class _NeverCancelledJobChecker(FinsJobCancellationChecker):
+    """CLI terminal projection 测试用未取消 checker。"""
+
+    def __call__(self) -> bool:
+        """返回未取消状态。
+
+        Args:
+            无。
+
+        Returns:
+            恒为 ``False``。
+
+        Raises:
+            无。
+        """
+
+        return False
+
+    def is_cancelled(self) -> bool:
+        """返回未取消状态。
+
+        Args:
+            无。
+
+        Returns:
+            恒为 ``False``。
+
+        Raises:
+            无。
+        """
+
+        return False
+
+    def cancel_reason(self) -> str | None:
+        """返回取消原因。
+
+        Args:
+            无。
+
+        Returns:
+            未取消，恒为 ``None``。
+
+        Raises:
+            无。
+        """
+
+        return None
+
+    def requested_at(self) -> datetime | None:
+        """返回取消请求时间。
+
+        Args:
+            无。
+
+        Returns:
+            未取消，恒为 ``None``。
+
+        Raises:
+            无。
+        """
+
+        return None
+
+
+_NEVER_CANCELLED_JOB_CHECKER = _NeverCancelledJobChecker()
 
 
 def _raise_cli_consumer_error(
@@ -65,6 +172,22 @@ def _raise_cli_consumer_error(
     """
 
     raise error
+
+
+async def _raise_unknown_fins_direct_error(_args: fins_command.ParsedCliArgs) -> int:
+    """注入携带内部路径 marker 的未知 direct 异常。
+
+    Args:
+        _args: 已解析命令参数。
+
+    Returns:
+        不返回。
+
+    Raises:
+        RuntimeError: 始终抛出包含内部 marker 的异常。
+    """
+
+    raise RuntimeError(_UNKNOWN_DIRECT_FAILURE_MARKER)
 
 
 class _FakeFinsDirectService:
@@ -250,51 +373,34 @@ class _FakeFinsDirectService:
 
     def upload_filing(
         self,
+        request: fins_command.ValidatedFinsUploadFilingRequest,
         *,
-        ticker: str,
-        action: str,
-        files: tuple[Path, ...],
-        fiscal_year: int | None = None,
-        fiscal_period: str | None = None,
-        amended: bool = False,
-        filing_date: str | None = None,
-        report_date: str | None = None,
-        company_name: str | None = None,
-        ticker_aliases: tuple[str, ...] = (),
-        overwrite: bool = False,
         cancellation_token: fins_command._CliFinsCancellationToken | None = None,
     ) -> ValidatedFinsEventStream:
         """记录 upload_filing 参数并返回 fake stream。
 
-        :param ticker: canonical ticker。
-        :param action: 上传动作。
-        :param files: 上传文件路径。
-        :param fiscal_year: 可选会计年度。
-        :param fiscal_period: 可选会计期间。
-        :param amended: 是否为修订 filing。
-        :param filing_date: 可选披露日期。
-        :param report_date: 可选报告期日期。
-        :param company_name: 可选公司名称。
-        :param ticker_aliases: ticker aliases。
-        :param overwrite: 是否覆盖已有文档。
+        :param request: Fins owner 已验证的 filing request。
         :param cancellation_token: CLI operation 取消 token。
         :returns: Fins direct event stream。
         :raises Exception: 不主动抛出异常。
         """
 
+        raw_request = request.request
         self.upload_filing_requests.append(
             _UploadFilingCall(
-                ticker=ticker,
-                action=action,
-                files=files,
-                fiscal_year=fiscal_year,
-                fiscal_period=fiscal_period,
-                amended=amended,
-                filing_date=filing_date,
-                report_date=report_date,
-                company_name=company_name,
-                ticker_aliases=ticker_aliases,
-                overwrite=overwrite,
+                ticker=request.normalized_ticker.canonical,
+                action=raw_request.action,
+                files=raw_request.files,
+                primary_selectors=raw_request.primary_selectors,
+                selected_primary=request.file_selection.primary,
+                fiscal_year=raw_request.fiscal_year,
+                fiscal_period=request.normalized_fiscal_period,
+                amended=raw_request.amended,
+                filing_date=raw_request.filing_date,
+                report_date=raw_request.report_date,
+                company_name=raw_request.company_name,
+                ticker_aliases=raw_request.ticker_aliases,
+                overwrite=raw_request.overwrite,
             )
         )
         return self._stream(
@@ -525,6 +631,117 @@ def _recording_direct_service_factory(
     return cast(fins_command.FinsDirectCommandService, service)
 
 
+def _snapshot_cli_workspace_tree(workspace_root: Path) -> tuple[tuple[str, str], ...]:
+    """读取 CLI workspace 的相对业务树与文件内容摘要。
+
+    Args:
+        workspace_root: 待观测 workspace 根目录。
+
+    Returns:
+        按相对路径排序的目录标记或文件 SHA-256 元组。
+
+    Raises:
+        OSError: 遍历或读取 workspace 失败时抛出。
+    """
+
+    if not workspace_root.exists():
+        return ()
+    entries: list[tuple[str, str]] = []
+    for path in sorted(workspace_root.rglob("*")):
+        relative_path = path.relative_to(workspace_root).as_posix()
+        if path.is_dir():
+            entries.append((relative_path, "directory"))
+        elif path.is_file():
+            entries.append((relative_path, hashlib.sha256(path.read_bytes()).hexdigest()))
+    return tuple(entries)
+
+
+def _seed_cli_filing_source(workspace_root: Path) -> None:
+    """通过真实 storage owner 发布 CLI create-existing 测试目标。
+
+    Args:
+        workspace_root: 待发布 filing 的 workspace 根目录。
+
+    Returns:
+        无。
+
+    Raises:
+        OSError: batch、blob 或 source publication 失败时抛出。
+        ValueError: storage owner 拒绝测试 filing 元数据时抛出。
+    """
+
+    document_id, internal_document_id = build_sec_filing_ids(
+        ticker="AAPL",
+        fiscal_year=2024,
+        fiscal_period="FY",
+        amended=False,
+    )
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    batch = batching_repository.begin_batch("AAPL")
+    handle = SourceHandle(
+        ticker="AAPL",
+        document_id=document_id,
+        source_kind=SourceKind.FILING.value,
+    )
+    original_name = "published.txt"
+    docling_name = "published_docling.json"
+    original_meta = blob_repository.store_file(
+        handle,
+        original_name,
+        io.BytesIO(b"published"),
+        batch=batch,
+        content_type="text/plain",
+    )
+    docling_meta = blob_repository.store_file(
+        handle,
+        docling_name,
+        io.BytesIO(b'{"schema_name":"DoclingDocument"}'),
+        batch=batch,
+        content_type="application/json",
+    )
+    source_repository.create_source_document(
+        SourceDocumentUpsertRequest(
+            ticker="AAPL",
+            document_id=document_id,
+            internal_document_id=internal_document_id,
+            form_type="10-K",
+            primary_document=docling_name,
+            meta={"ingest_method": "upload", "source_provider": "user_upload"},
+            file_entries=[
+                {
+                    "name": original_name,
+                    "uri": original_meta.uri,
+                    "etag": original_meta.etag,
+                    "last_modified": original_meta.last_modified,
+                    "size": original_meta.size,
+                    "content_type": original_meta.content_type,
+                    "sha256": original_meta.sha256,
+                    "source": "original",
+                    "original_filename": original_name,
+                },
+                {
+                    "name": docling_name,
+                    "uri": docling_meta.uri,
+                    "etag": docling_meta.etag,
+                    "last_modified": docling_meta.last_modified,
+                    "size": docling_meta.size,
+                    "content_type": docling_meta.content_type,
+                    "sha256": docling_meta.sha256,
+                    "source": "docling",
+                    "original_filename": original_name,
+                    "derived_from": original_name,
+                },
+            ],
+        ),
+        SourceKind.FILING,
+        batch=batch,
+    )
+    batching_repository.commit_batch(batch)
+
+
 @pytest.mark.parametrize(
     "command_name",
     (
@@ -556,6 +773,80 @@ def test_live_fins_commands_render_progress_and_terminal_summary(
     assert "Fins direct event received" not in captured.out
     assert "Fins direct event detail" not in captured.out
     assert captured.err == ""
+    assert fake_service.closed_streams == 1
+
+
+@pytest.mark.parametrize(
+    ("upload_status", "stored_file_count"),
+    (("ok", 1), ("skipped", 0)),
+)
+def test_upload_filing_command_loop_preserves_summary_and_routes_warning(
+    upload_status: str,
+    stored_file_count: int,
+    tmp_path: Path,
+    fake_service: _FakeFinsDirectService,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """mocked upload_filing 必须经过命令循环并保持摘要、warning 与退出码。
+
+    Args:
+        upload_status: mocked upload 终态，覆盖 uploaded 与 skipped。
+        stored_file_count: 原摘要中的已发布文件数。
+        tmp_path: CLI 上传文件使用的临时目录。
+        fake_service: 复用 production command seam 的 direct Service 替身。
+        capsys: 标准流捕获夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 命令循环改写退出码、stdout 摘要或 canonical warning 时抛出。
+    """
+
+    warning = CompanyMetadataWarning(
+        kind=CompanyMetadataWarningKind.COMPANY_NAME_IGNORED,
+        message=COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+    )
+    fake_service.events = (
+        FinsEvent(
+            event_type=FinsEventType.RESULT,
+            operation_kind=FinsOperationKind.UPLOAD_FILING,
+            message="操作完成",
+            emitted_at=_NOW,
+            ticker="AAPL",
+            filing_kind=SourceKind.FILING.value,
+            document_label=None,
+            progress=None,
+            result=FinsResultSummary(
+                status=FinsResultStatus.SUCCESS,
+                exit_code=FINS_DIRECT_EXIT_SUCCESS,
+                title="操作完成",
+                details=(
+                    FinsEventDetail(label="source kind", value=SourceKind.FILING.value),
+                    FinsEventDetail(label="status", value=upload_status),
+                    FinsEventDetail(label="requested files", value="1"),
+                    FinsEventDetail(label="stored files", value=str(stored_file_count)),
+                ),
+                error_kind=None,
+                error_message=None,
+                warnings=(warning,),
+            ),
+        ),
+    )
+
+    exit_code = cli_main.main(_live_command_argv("upload_filing", tmp_path))
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_SUCCESS
+    assert captured.out == (
+        'Fins succeeded: operation="upload_filing" ticker="AAPL" '
+        'filing_kind="filing" status="success" message="操作完成"\n'
+        f'Fins summary: source_kind="filing" status="{upload_status}" '
+        f'requested_files="1" stored_files="{stored_file_count}"\n'
+    )
+    assert captured.err == f"{COMPANY_NAME_IGNORED_WARNING_MESSAGE}\n"
+    assert fake_service.stream_calls == [FinsOperationKind.UPLOAD_FILING]
+    assert len(fake_service.upload_filing_requests) == 1
     assert fake_service.closed_streams == 1
 
 
@@ -863,6 +1154,263 @@ def test_download_command_maps_single_mutation_mode_to_service(
 
 
 @pytest.mark.parametrize(
+    ("start", "end", "expected_start", "expected_end"),
+    (
+        ("1000", "9999", "1000-01-01", "9999-12-31"),
+        ("2024-2", "2024-2", "2024-02-01", "2024-02-29"),
+        ("0001-1-1", "0999-12-31", "0001-01-01", "0999-12-31"),
+        (" 2024-2-9 ", " 2024-2-9 ", "2024-02-09", "2024-02-09"),
+    ),
+)
+def test_download_date_bounds_preserve_shape_canonicalization_and_inclusive_expansion(
+    start: str,
+    end: str,
+    expected_start: str,
+    expected_end: str,
+) -> None:
+    """下载日期应保留三种 shape、外围空白与 inclusive 展开契约。
+
+    Args:
+        start: 原始起始边界。
+        end: 原始结束边界。
+        expected_start: 预期 canonical inclusive 起始日期。
+        expected_end: 预期 canonical inclusive 结束日期。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: canonicalization 或 inclusive 展开不符合契约时抛出。
+    """
+
+    request = build_fins_download_request(ticker="AAPL", start=start, end=end)
+
+    assert request.date_range.start_text == expected_start
+    assert request.date_range.end_text == expected_end
+
+
+@pytest.mark.parametrize(
+    "partial_bound",
+    ("0999", "0000", "0999-12", "0000-1"),
+)
+def test_download_partial_year_rejects_values_outside_shared_year_domain(
+    partial_bound: str,
+) -> None:
+    """year 与 year-month 应共同拒绝 ``1000..9999`` 之外的 partial year。
+
+    Args:
+        partial_bound: 当前非法 year 或 year-month 边界。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法 partial year 未按 download usage contract 拒绝时抛出。
+    """
+
+    with pytest.raises(download_contract.FinsDownloadUsageError) as exc_info:
+        build_fins_download_request(ticker="AAPL", start=partial_bound)
+
+    assert str(exc_info.value) == ("--start 不是有效日期，请使用 YYYY、YYYY-MM 或 YYYY-MM-DD")
+
+
+@pytest.mark.parametrize(
+    "full_date_bound",
+    ("0000-12-31", "2023-2-29", "2024-13-1", "2024-4-31"),
+)
+def test_download_full_date_rejects_nonexistent_calendar_dates(
+    full_date_bound: str,
+) -> None:
+    """full-date 应拒绝公历年零、非闰日和非法月日。
+
+    Args:
+        full_date_bound: 当前不存在的 full-date 边界。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 不存在的公历日期未被拒绝时抛出。
+    """
+
+    with pytest.raises(download_contract.FinsDownloadUsageError) as exc_info:
+        build_fins_download_request(ticker="AAPL", start=full_date_bound)
+
+    assert str(exc_info.value) == ("--start 不是有效日期，请使用 YYYY、YYYY-MM 或 YYYY-MM-DD")
+
+
+def test_download_date_bound_delegates_shared_year_and_full_date_owners(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """download wrapper 应只把共同年份与 full-date 合法性委托 domain owner。
+
+    Args:
+        monkeypatch: owner 调用记录替换夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: wrapper 未调用 shared owner 或错误耦合两类年份时抛出。
+    """
+
+    year_calls: list[tuple[int, str]] = []
+    date_calls: list[tuple[str, str]] = []
+    real_parse_calendar_year = download_contract.parse_calendar_year
+    real_parse_iso_calendar_date = download_contract.parse_iso_calendar_date
+
+    def record_year(value: int, *, field_name: str = "year") -> int:
+        """记录并调用真实 partial-year owner。
+
+        Args:
+            value: 待校验年份。
+            field_name: download wrapper 字段名。
+
+        Returns:
+            真实 owner 返回的年份。
+
+        Raises:
+            ValueError: 真实 owner 拒绝年份时抛出。
+        """
+
+        year_calls.append((value, field_name))
+        return real_parse_calendar_year(value, field_name=field_name)
+
+    def record_date(value: str, *, field_name: str = "date") -> date:
+        """记录并调用真实 canonical full-date owner。
+
+        Args:
+            value: 已由 download wrapper 补零的 full-date 文本。
+            field_name: download wrapper 字段名。
+
+        Returns:
+            真实 owner 返回的公历日期。
+
+        Raises:
+            ValueError: 真实 owner 拒绝日期时抛出。
+        """
+
+        date_calls.append((value, field_name))
+        return real_parse_iso_calendar_date(value, field_name=field_name)
+
+    monkeypatch.setattr(download_contract, "parse_calendar_year", record_year)
+    monkeypatch.setattr(download_contract, "parse_iso_calendar_date", record_date)
+
+    partial_request = build_fins_download_request(
+        ticker="AAPL",
+        start="1000",
+        end="2024-2",
+    )
+    assert partial_request.date_range.start_text == "1000-01-01"
+    assert partial_request.date_range.end_text == "2024-02-29"
+    assert year_calls == [(1000, "--start"), (2024, "--end")]
+    assert date_calls == []
+
+    full_date_request = build_fins_download_request(
+        ticker="AAPL",
+        start="0001-1-1",
+        end="0999-12-31",
+    )
+    assert full_date_request.date_range.start_text == "0001-01-01"
+    assert full_date_request.date_range.end_text == "0999-12-31"
+    assert year_calls == [(1000, "--start"), (2024, "--end")]
+    assert date_calls == [
+        ("0001-01-01", "--start"),
+        ("0999-12-31", "--end"),
+    ]
+
+
+def test_download_public_iso_dates_delegate_shared_full_date_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """download public DTO 的 calendar validity 应委托 shared full-date owner。
+
+    Args:
+        monkeypatch: owner 调用记录替换夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: public DTO 未委托 owner 或接受非法日期时抛出。
+    """
+
+    date_calls: list[tuple[str, str]] = []
+    real_parse_iso_calendar_date = download_contract.parse_iso_calendar_date
+
+    def record_date(value: str, *, field_name: str = "date") -> date:
+        """记录并调用真实 canonical full-date owner。
+
+        Args:
+            value: public DTO 日期文本。
+            field_name: public DTO 字段名。
+
+        Returns:
+            真实 owner 返回的公历日期。
+
+        Raises:
+            ValueError: 真实 owner 拒绝日期时抛出。
+        """
+
+        date_calls.append((value, field_name))
+        return real_parse_iso_calendar_date(value, field_name=field_name)
+
+    monkeypatch.setattr(download_contract, "parse_iso_calendar_date", record_date)
+
+    filters = FinsDownloadEffectiveFilters(
+        form_types=(),
+        start_date="0001-01-01",
+        end_date="2024-02-29",
+        overwrite_existing=False,
+        rebuild_local_artifacts=False,
+    )
+    assert filters.start_date == "0001-01-01"
+    assert filters.end_date == "2024-02-29"
+    assert date_calls == [
+        ("0001-01-01", "start_date"),
+        ("2024-02-29", "end_date"),
+    ]
+
+    with pytest.raises(ValueError, match="start_date must be an ISO date"):
+        FinsDownloadEffectiveFilters(
+            form_types=(),
+            start_date="2023-02-29",
+            end_date=None,
+            overwrite_existing=False,
+            rebuild_local_artifacts=False,
+        )
+
+    with pytest.raises(ValueError) as basic_format_exc:
+        FinsDownloadEffectiveFilters(
+            form_types=(),
+            start_date="20240229",
+            end_date=None,
+            overwrite_existing=False,
+            rebuild_local_artifacts=False,
+        )
+    assert str(basic_format_exc.value) == "start_date must be an ISO date"
+
+
+def test_download_date_range_ordering_remains_owned_by_range_contract() -> None:
+    """展开后的 start/end ordering 应继续由 ``FinsDownloadDateRange`` 拒绝。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: ordering error 类型或 message 发生漂移时抛出。
+    """
+
+    with pytest.raises(download_contract.FinsDownloadUsageError) as exc_info:
+        build_fins_download_request(ticker="AAPL", start="2025", end="2024-12")
+
+    assert str(exc_info.value) == "--start 不能晚于 --end，请检查下载日期范围"
+
+
+@pytest.mark.parametrize(
     ("download_args", "expected_message"),
     (
         ((), "--ticker 不能为空，请提供一个公司代码"),
@@ -931,6 +1479,901 @@ def test_download_static_usage_error_precedes_workspace_and_service_factory(
 
 
 @pytest.mark.parametrize(
+    ("case_id", "argv_suffix", "expected_reason"),
+    (
+        ("UF-003", ("--ticker", ""), "--ticker 不能为空，请提供公司代码"),
+        ("UF-004", ("--ticker", "../../etc/passwd"), "--ticker 无法识别，请提供有效公司代码"),
+        ("UF-005", ("--ticker", "ABCDEFGHI"), "--ticker 无法识别，请提供有效公司代码"),
+        ("UF-006", ("--ticker", "AAPL,"), "--ticker 不能为空，请提供公司代码"),
+        ("UF-015", ("--ticker", "AAPL", "--fiscal-period", "FY"), "--fiscal-year 不能为空"),
+        ("UF-016", ("--ticker", "AAPL", "--fiscal-year", "2024"), "--fiscal-period 不能为空"),
+        (
+            "UF-017",
+            (
+                "--ticker",
+                "AAPL",
+                "--fiscal-year",
+                "2024",
+                "--fiscal-period",
+                "FY",
+                "--company-name",
+                "Apple Inc.",
+            ),
+            "create/update 上传必须提供 --files",
+        ),
+        (
+            "UF-018",
+            (
+                "--ticker",
+                "AAPL",
+                "--files",
+                "{input}/probe.txt",
+                "--fiscal-year",
+                "2024",
+                "--fiscal-period",
+                "FY",
+            ),
+            "当前公司缺少有效元数据；create/update 必须提供 --company-name",
+        ),
+        (
+            "UF-019",
+            (
+                "--ticker",
+                "AAPL",
+                "--fiscal-year",
+                "2024",
+                "--fiscal-period",
+                "FY",
+                "--company-name",
+                "",
+            ),
+            "create/update 上传必须提供 --files",
+        ),
+        (
+            "UF-021",
+            ("--ticker", "AAPL", "--fiscal-year", "-1", "--fiscal-period", "FY"),
+            "财年（fiscal_year）必须是 1000..9999 的整数",
+        ),
+        *tuple(
+            (
+                f"UF-S2-year-{raw_year}",
+                ("--ticker", "AAPL", "--fiscal-year", raw_year, "--fiscal-period", "FY"),
+                "财年（fiscal_year）必须是 1000..9999 的整数",
+            )
+            for raw_year in ("0", "999", "10000")
+        ),
+        *tuple(
+            (
+                f"UF-S2-filing-date-{case_id}",
+                (
+                    "--ticker",
+                    "AAPL",
+                    "--action",
+                    "delete",
+                    "--fiscal-year",
+                    "2024",
+                    "--fiscal-period",
+                    "FY",
+                    "--filing-date",
+                    raw_date,
+                ),
+                "披露日期（filing_date）必须是实际存在的 YYYY-MM-DD 日期",
+            )
+            for case_id, raw_date in (
+                ("empty", ""),
+                ("blank", " "),
+                ("padded", " 2024-02-29 "),
+                ("non-padded", "2024-2-29"),
+                ("non-leap", "2023-02-29"),
+                ("month", "2024-13-01"),
+                ("separator", "2024/02/29"),
+            )
+        ),
+        *tuple(
+            (
+                f"UF-S2-report-date-{case_id}",
+                (
+                    "--ticker",
+                    "AAPL",
+                    "--action",
+                    "delete",
+                    "--fiscal-year",
+                    "2024",
+                    "--fiscal-period",
+                    "FY",
+                    "--report-date",
+                    raw_date,
+                ),
+                "报告期日期（report_date）必须是实际存在的 YYYY-MM-DD 日期",
+            )
+            for case_id, raw_date in (
+                ("empty", ""),
+                ("blank", "\t"),
+                ("padded", "2024-02-29 "),
+                ("non-padded", "2024-2-29"),
+                ("non-leap", "2023-02-29"),
+                ("month", "2024-00-01"),
+                ("separator", "2024.02.29"),
+            )
+        ),
+        (
+            "UF-S2-seeded-invalid-report-date",
+            (
+                "--ticker",
+                "AAPL",
+                "--action",
+                "delete",
+                "--fiscal-year",
+                "2024",
+                "--fiscal-period",
+                "FY",
+                "--report-date",
+                "2024-04-31",
+            ),
+            "报告期日期（report_date）必须是实际存在的 YYYY-MM-DD 日期",
+        ),
+        (
+            "UF-022",
+            ("--ticker", "AAPL", "--fiscal-year", "2024", "--fiscal-period", ""),
+            "--fiscal-period 不能为空",
+        ),
+        (
+            "UF-023",
+            ("--ticker", "AAPL", "--fiscal-year", "2024", "--fiscal-period", "X" * 300),
+            "--fiscal-period 长度不能超过 240 个字符",
+        ),
+        (
+            "UF-FIX01-US-invalid-period-fresh",
+            ("--ticker", "AAPL", "--fiscal-year", "2024", "--fiscal-period", "BANANA"),
+            "--fiscal-period 仅支持 FY、H1、Q1、Q2、Q3、Q4",
+        ),
+        (
+            "UF-024",
+            ("--ticker", "600519", "--fiscal-year", "2024", "--fiscal-period", "9M"),
+            "--fiscal-period 仅支持 FY、H1、Q1、Q2、Q3、Q4",
+        ),
+        (
+            "UF-FIX01-HK-invalid-period-fresh",
+            ("--ticker", "0700.HK", "--fiscal-year", "2024", "--fiscal-period", "BANANA"),
+            "--fiscal-period 仅支持 FY、H1、Q1、Q2、Q3、Q4",
+        ),
+        (
+            "UF-026",
+            (
+                "--ticker",
+                "AAPL",
+                "--fiscal-year",
+                "2024",
+                "--fiscal-period",
+                "FY",
+                "--company-name",
+                "Apple Inc.",
+                "--files",
+                "{input}/missing.pdf",
+            ),
+            "上传文件不存在：missing.pdf",
+        ),
+        (
+            "UF-027",
+            (
+                "--ticker",
+                "AAPL",
+                "--fiscal-year",
+                "2024",
+                "--fiscal-period",
+                "FY",
+                "--company-name",
+                "Apple Inc.",
+                "--files",
+                "{input}",
+            ),
+            "上传路径不是普通文件：input",
+        ),
+        (
+            "UF-FIX07-repeated-primary",
+            (
+                "--ticker",
+                "AAPL",
+                "--fiscal-year",
+                "2024",
+                "--fiscal-period",
+                "FY",
+                "--company-name",
+                "Apple Inc.",
+                "--files",
+                "{input}/probe.txt",
+                "--primary",
+                "{input}/probe.txt",
+                "--primary",
+                "{input}/probe.xsd",
+            ),
+            "--primary 只能指定一次",
+        ),
+        (
+            "UF-FIX07-missing-multi-primary",
+            (
+                "--ticker",
+                "AAPL",
+                "--fiscal-year",
+                "2024",
+                "--fiscal-period",
+                "FY",
+                "--company-name",
+                "Apple Inc.",
+                "--files",
+                "{input}/probe.txt",
+                "{input}/probe.xsd",
+            ),
+            "多文件 filing 必须使用 --primary 明确指定主文件",
+        ),
+        (
+            "UF-FIX07-primary-outside-files",
+            (
+                "--ticker",
+                "AAPL",
+                "--fiscal-year",
+                "2024",
+                "--fiscal-period",
+                "FY",
+                "--company-name",
+                "Apple Inc.",
+                "--files",
+                "{input}/probe.txt",
+                "--primary",
+                "{input}/outside.txt",
+            ),
+            "--primary 必须精确匹配 --files 中的一个文件",
+        ),
+        (
+            "UF-FIX07-duplicate-files",
+            (
+                "--ticker",
+                "AAPL",
+                "--fiscal-year",
+                "2024",
+                "--fiscal-period",
+                "FY",
+                "--company-name",
+                "Apple Inc.",
+                "--files",
+                "{input}/probe.txt",
+                "{input}/probe.txt",
+                "--primary",
+                "{input}/probe.txt",
+            ),
+            "--files 不能包含解析后相同的重复路径",
+        ),
+        *tuple(
+            (
+                case_id,
+                (
+                    "--ticker",
+                    "AAPL",
+                    "--fiscal-year",
+                    "2024",
+                    "--fiscal-period",
+                    "FY",
+                    "--company-name",
+                    "Apple Inc.",
+                    "--files",
+                    f"{{input}}/probe.{suffix}",
+                ),
+                expected_reason,
+            )
+            for case_id, suffix, expected_reason in (
+                ("UF-028", "bin", "财报主文件格式不受支持：probe.bin"),
+                ("UF-030", "doc", "财报主文件格式不受支持：probe.doc"),
+                ("UF-031", "ppt", "财报主文件格式不受支持：probe.ppt"),
+                ("UF-FIX06-XLS", "xls", "财报主文件格式不受支持：probe.xls"),
+                ("UF-038", "zip", "财报主文件格式不受支持：probe.zip"),
+                ("UF-FIX06-XSD", "xsd", "财报主文件格式不受支持：probe.xsd"),
+            )
+        ),
+    ),
+)
+def test_upload_filing_usage_matrix_precedes_service_factory_and_workspace_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    case_id: str,
+    argv_suffix: tuple[str, ...],
+    expected_reason: str,
+) -> None:
+    """冻结 filing usage case 必须在 Service factory 前 exact 映射为 exit 2。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: factory 替换夹具。
+        capsys: 标准流捕获夹具。
+        case_id: frozen usage case 标识。
+        argv_suffix: ``upload_filing --base`` 后的冻结参数。
+        expected_reason: usage owner 的精确可行动文案。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: factory/service 被调用、workspace 变化或标准流不精确时抛出。
+    """
+
+    workspace_root = tmp_path / f"workspace-{case_id}"
+    seed_workspace = case_id in {
+        "UF-S2-seeded-invalid-report-date",
+        "UF-024",
+    }
+    if seed_workspace:
+        workspace_root.mkdir(parents=True)
+        (workspace_root / "sentinel.txt").write_text("unchanged", encoding="utf-8")
+    before_tree = _snapshot_cli_workspace_tree(workspace_root)
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    for suffix in ("txt", "bin", "doc", "ppt", "xls", "zip", "xsd"):
+        (input_root / f"probe.{suffix}").write_text("fixture", encoding="utf-8")
+    resolved_argv = tuple(token.format(input=str(input_root)) for token in argv_suffix)
+    service = _FakeFinsDirectService()
+    factory_calls: list[Path] = []
+    recording_factory = partial(
+        _recording_direct_service_factory,
+        service=service,
+        factory_calls=factory_calls,
+    )
+    monkeypatch.setattr(fins_command, "FINS_DIRECT_SERVICE_FACTORY", recording_factory)
+
+    exit_code = cli_main.main(
+        (
+            "upload_filing",
+            "--base",
+            str(workspace_root),
+            *resolved_argv,
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_USAGE_ERROR
+    assert captured.out == ""
+    assert captured.err == f"dayu-cli upload_filing: {expected_reason}\n"
+    assert "Traceback" not in captured.err
+    assert factory_calls == []
+    assert service.upload_filing_requests == []
+    assert service.stream_calls == []
+    assert _snapshot_cli_workspace_tree(workspace_root) == before_tree
+    assert workspace_root.exists() is seed_workspace
+
+
+@pytest.mark.parametrize(
+    ("ticker", "raw_period", "expected_period"),
+    (
+        ("AAPL", " fy ", "FY"),
+        ("600519", " q2 ", "Q2"),
+        ("0700.HK", " h1 ", "H1"),
+    ),
+)
+def test_upload_filing_canonicalizes_period_before_validated_service_handoff(
+    tmp_path: Path,
+    fake_service: _FakeFinsDirectService,
+    ticker: str,
+    raw_period: str,
+    expected_period: str,
+) -> None:
+    """CLI 合法财期应由共享 owner 规范化后交给 Service。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        fake_service: 记录 validated request 的 direct Service 替身。
+        ticker: 覆盖 US、CN 与 HK 的公司代码。
+        raw_period: 携带小写与首尾空白的原始财期。
+        expected_period: 期望的 canonical 财期。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: CLI 入口未把 owner 产出的 canonical 财期交给 Service 时抛出。
+    """
+
+    workspace_root = tmp_path / f"workspace-{ticker.replace('.', '-')}"
+
+    exit_code = cli_main.main(
+        (
+            "upload_filing",
+            "--base",
+            str(workspace_root),
+            "--ticker",
+            ticker,
+            "--action",
+            "delete",
+            "--fiscal-year",
+            "2024",
+            "--fiscal-period",
+            raw_period,
+        )
+    )
+
+    assert exit_code == EXIT_SUCCESS
+    assert len(fake_service.upload_filing_requests) == 1
+    assert fake_service.upload_filing_requests[0].fiscal_period == expected_period
+    assert fake_service.stream_calls == [FinsOperationKind.UPLOAD_FILING]
+
+
+@pytest.mark.parametrize(
+    ("case_id", "action", "overwrite", "seed_existing", "expected_reason"),
+    (
+        (
+            "update-missing",
+            "update",
+            False,
+            False,
+            "update 目标不存在；请改用 create",
+        ),
+        (
+            "update-missing-overwrite",
+            "update",
+            True,
+            False,
+            "update 目标不存在；请改用 create",
+        ),
+        (
+            "create-existing",
+            "create",
+            False,
+            True,
+            "create 目标已存在；请改用 update 或允许覆盖",
+        ),
+    ),
+)
+def test_upload_filing_state_conflict_exits_before_service_factory_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    case_id: str,
+    action: str,
+    overwrite: bool,
+    seed_existing: bool,
+    expected_reason: str,
+) -> None:
+    """真实 published state 冲突必须在 Service factory 前精确失败且零 mutation。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: factory 替换夹具。
+        capsys: 标准流捕获夹具。
+        case_id: 当前 admission 场景标识。
+        action: 显式上传动作。
+        overwrite: 是否传入 ``--overwrite``。
+        seed_existing: 是否先通过真实 storage 发布目标。
+        expected_reason: 精确单行 stderr 原因。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: exit、标准流、factory 或 workspace contract 漂移时抛出。
+    """
+
+    workspace_root = tmp_path / f"workspace-{case_id}"
+    if seed_existing:
+        _seed_cli_filing_source(workspace_root)
+    before_tree = _snapshot_cli_workspace_tree(workspace_root)
+    input_file = tmp_path / f"{case_id}.txt"
+    input_file.write_text("input", encoding="utf-8")
+    service = _FakeFinsDirectService()
+    factory_calls: list[Path] = []
+    recording_factory = partial(
+        _recording_direct_service_factory,
+        service=service,
+        factory_calls=factory_calls,
+    )
+    monkeypatch.setattr(fins_command, "FINS_DIRECT_SERVICE_FACTORY", recording_factory)
+    overwrite_args = ("--overwrite",) if overwrite else ()
+
+    exit_code = cli_main.main(
+        (
+            "upload_filing",
+            "--base",
+            str(workspace_root),
+            "--ticker",
+            "AAPL",
+            "--action",
+            action,
+            "--files",
+            str(input_file),
+            "--fiscal-year",
+            "2024",
+            "--fiscal-period",
+            "FY",
+            "--company-name",
+            "Apple Inc.",
+            *overwrite_args,
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_USAGE_ERROR
+    assert captured.out == ""
+    assert captured.err == f"dayu-cli upload_filing: {expected_reason}\n"
+    assert captured.err.count("\n") == 1
+    assert len(captured.err) <= _MAX_PUBLIC_CONTENT_FAILURE_STDERR_CHARS
+    assert factory_calls == []
+    assert service.upload_filing_requests == []
+    assert service.stream_calls == []
+    assert _snapshot_cli_workspace_tree(workspace_root) == before_tree
+    assert workspace_root.exists() is seed_existing
+
+
+@pytest.mark.parametrize("overwrite", (False, True))
+def test_upload_filing_existing_update_projects_typed_request_to_service(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    overwrite: bool,
+) -> None:
+    """existing filing 的 update 必须把 action/overwrite 精确投影给 Service。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: factory 替换夹具。
+        overwrite: 是否传入 ``--overwrite``。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: CLI admission 或 typed Service handoff 漂移时抛出。
+    """
+
+    workspace_root = tmp_path / f"workspace-update-{overwrite}"
+    _seed_cli_filing_source(workspace_root)
+    input_file = tmp_path / f"update-{overwrite}.txt"
+    input_file.write_text("updated input", encoding="utf-8")
+    service = _FakeFinsDirectService()
+    factory_calls: list[Path] = []
+    recording_factory = partial(
+        _recording_direct_service_factory,
+        service=service,
+        factory_calls=factory_calls,
+    )
+    monkeypatch.setattr(fins_command, "FINS_DIRECT_SERVICE_FACTORY", recording_factory)
+    overwrite_args = ("--overwrite",) if overwrite else ()
+
+    exit_code = cli_main.main(
+        (
+            "upload_filing",
+            "--base",
+            str(workspace_root),
+            "--ticker",
+            "AAPL",
+            "--action",
+            "update",
+            "--files",
+            str(input_file),
+            "--fiscal-year",
+            "2024",
+            "--fiscal-period",
+            "FY",
+            "--company-name",
+            "Apple Inc.",
+            *overwrite_args,
+        )
+    )
+
+    assert exit_code == EXIT_SUCCESS
+    assert factory_calls == [workspace_root]
+    assert service.upload_filing_requests == [
+        _UploadFilingCall(
+            ticker="AAPL",
+            action="update",
+            files=(input_file.resolve(),),
+            primary_selectors=(),
+            selected_primary=input_file.resolve(),
+            fiscal_year=2024,
+            fiscal_period="FY",
+            amended=False,
+            filing_date=None,
+            report_date=None,
+            company_name="Apple Inc.",
+            ticker_aliases=(),
+            overwrite=overwrite,
+        )
+    ]
+    assert service.stream_calls == [FinsOperationKind.UPLOAD_FILING]
+
+
+def test_upload_filing_non_first_primary_is_preserved_into_validated_service_request(
+    tmp_path: Path,
+    fake_service: _FakeFinsDirectService,
+) -> None:
+    """CLI 必须保留非首位 primary，并由 Fins owner 产生 authoritative selection。
+
+    Args:
+        tmp_path: 用于创建两个 filing 输入文件。
+        fake_service: 记录 validated request 的 direct Service 替身。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: raw selector 或 validated primary 被改成首文件时抛出。
+    """
+
+    companion = tmp_path / "schema.xsd"
+    primary = tmp_path / "report.pdf"
+    companion.write_text("schema", encoding="utf-8")
+    primary.write_text("filing", encoding="utf-8")
+
+    exit_code = cli_main.main(
+        (
+            "upload_filing",
+            "--ticker",
+            "AAPL",
+            "--action",
+            "create",
+            "--files",
+            str(companion),
+            str(primary),
+            "--primary",
+            str(primary),
+            "--fiscal-year",
+            "2024",
+            "--fiscal-period",
+            "FY",
+            "--company-name",
+            "Apple Inc.",
+        )
+    )
+
+    assert exit_code == EXIT_SUCCESS
+    assert len(fake_service.upload_filing_requests) == 1
+    call = fake_service.upload_filing_requests[0]
+    assert call.files == (companion.resolve(), primary.resolve())
+    assert call.primary_selectors == (primary.resolve(),)
+    assert call.selected_primary == primary.resolve()
+
+
+def test_upload_filing_prevalidation_io_failure_is_typed_bounded_and_path_free(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """prevalidation I/O failure 必须 exit 1 且 public stderr 不泄漏路径。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: storage read failure 注入夹具。
+        capsys: 标准流捕获夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: failure 未经 typed owner 投影或泄漏内部路径时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    input_file = tmp_path / "filing.pdf"
+    input_file.write_text("filing", encoding="utf-8")
+
+    def fail_read(
+        _repository: FsFilingUploadStateRepository,
+        ticker: str,
+        document_id: str,
+    ) -> NoReturn:
+        """注入包含绝对路径的 permission failure。
+
+        Args:
+            _repository: production state repository。
+            ticker: canonical ticker。
+            document_id: filing document identity。
+
+        Returns:
+            不返回。
+
+        Raises:
+            PermissionError: 始终抛出包含内部路径的异常。
+        """
+
+        del ticker, document_id
+        raise PermissionError(f"permission denied: {workspace_root / 'portfolio' / 'AAPL'}")
+
+    monkeypatch.setattr(FsFilingUploadStateRepository, "read_filing_upload_state", fail_read)
+
+    exit_code = cli_main.main(
+        (
+            "upload_filing",
+            "--base",
+            str(workspace_root),
+            "--ticker",
+            "AAPL",
+            "--files",
+            str(input_file),
+            "--fiscal-year",
+            "2024",
+            "--fiscal-period",
+            "FY",
+            "--company-name",
+            "Apple Inc.",
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_FAILURE
+    assert captured.out == ""
+    assert captured.err == ("dayu-cli upload_filing: 上传状态读取失败，请检查工作区存储状态\n")
+    assert str(tmp_path) not in captured.err
+    assert "Traceback" not in captured.err
+    assert "PermissionError" not in captured.err
+
+
+def test_upload_filing_repository_resolve_failure_preserves_cli_boundary_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """构造期 resolve failure 必须 exit 1、stderr 脱敏、日志留因且零 mutation。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: 第二次 workspace resolve failure 注入夹具。
+        capsys: 标准流捕获夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: CLI public/operator boundary 或零 mutation contract 漂移时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    input_file = tmp_path / "filing.pdf"
+    input_file.write_text("filing", encoding="utf-8")
+    operator_log = tmp_path / "operator.log"
+    real_resolve = Path.resolve
+    workspace_resolve_count = 0
+
+    def fail_repository_workspace_resolve(path: Path, strict: bool = False) -> Path:
+        """允许 CLI 解析 workspace，但在 repository 再次 resolve 时注入失败。
+
+        Args:
+            path: 当前待解析路径。
+            strict: 是否要求路径已经存在。
+
+        Returns:
+            CLI 首次 workspace resolve 与其它路径的真实解析结果。
+
+        Raises:
+            PermissionError: repository 构造期再次解析 workspace 时抛出。
+        """
+
+        nonlocal workspace_resolve_count
+        if path == workspace_root:
+            workspace_resolve_count += 1
+            if workspace_resolve_count == 2:
+                raise PermissionError(errno.EACCES, "resolve denied", str(workspace_root))
+        return real_resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", fail_repository_workspace_resolve)
+
+    exit_code = cli_main.main(
+        (
+            "upload_filing",
+            "--base",
+            str(workspace_root),
+            "--log-file",
+            str(operator_log),
+            "--ticker",
+            "AAPL",
+            "--files",
+            str(input_file),
+            "--fiscal-year",
+            "2024",
+            "--fiscal-period",
+            "FY",
+            "--company-name",
+            "Apple Inc.",
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_FAILURE
+    assert captured.out == ""
+    assert captured.err == "dayu-cli upload_filing: 上传状态读取失败，请检查工作区存储状态\n"
+    assert str(tmp_path) not in captured.err
+    operator_diagnostic = operator_log.read_text(encoding="utf-8")
+    assert "upload_filing prevalidation operational failure" in operator_diagnostic
+    assert "PermissionError" in operator_diagnostic
+    assert "解析 storage workspace底层文件系统失败" in operator_diagnostic
+    assert workspace_resolve_count == 2
+    assert not workspace_root.exists()
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "descriptor_malformed",
+        "meta_malformed",
+        "meta_symlink",
+        "meta_directory",
+        "target_symlink",
+        "target_regular_file",
+    ),
+)
+def test_upload_filing_prevalidation_identity_corruption_is_typed_and_path_free(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    corruption: str,
+) -> None:
+    """真实 descriptor/meta/target corruption 必须只输出 closed bounded reason。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        capsys: 标准流捕获夹具。
+        corruption: 待注入的 durable corruption 形态。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: corruption 被当 usage/generic pathful failure 时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    portfolio_root = workspace_root / "portfolio"
+    portfolio_root.mkdir(parents=True)
+    ticker_root = portfolio_root / "AAPL"
+    if corruption == "target_symlink":
+        outside_root = tmp_path / "outside-company"
+        outside_root.mkdir()
+        ticker_root.symlink_to(outside_root, target_is_directory=True)
+    elif corruption == "target_regular_file":
+        ticker_root.write_bytes(b"foreign locator")
+    else:
+        ticker_root.mkdir()
+        descriptor_path = ticker_root / ".identity.json"
+        if corruption == "descriptor_malformed":
+            descriptor_path.write_text("{}", encoding="utf-8")
+        else:
+            descriptor_path.write_text(
+                '{"namespace":"ticker","external_identity":"AAPL"}',
+                encoding="utf-8",
+            )
+            meta_path = ticker_root / "meta.json"
+            if corruption == "meta_malformed":
+                meta_path.write_text("{}", encoding="utf-8")
+            elif corruption == "meta_symlink":
+                outside_meta = tmp_path / "outside-meta.json"
+                outside_meta.write_text("{}", encoding="utf-8")
+                meta_path.symlink_to(outside_meta)
+            else:
+                meta_path.mkdir()
+    input_file = tmp_path / "filing.pdf"
+    input_file.write_text("filing", encoding="utf-8")
+
+    exit_code = cli_main.main(
+        (
+            "upload_filing",
+            "--base",
+            str(workspace_root),
+            "--ticker",
+            "AAPL",
+            "--files",
+            str(input_file),
+            "--fiscal-year",
+            "2024",
+            "--fiscal-period",
+            "FY",
+            "--company-name",
+            "Apple Inc.",
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_FAILURE
+    assert captured.out == ""
+    assert captured.err == ("dayu-cli upload_filing: 上传状态已损坏，请检查工作区存储状态\n")
+    assert str(tmp_path) not in captured.err
+    assert "Traceback" not in captured.err
+    assert "ValueError" not in captured.err
+
+
+@pytest.mark.parametrize(
     "mutation_flags",
     (
         ("--overwrite", "--rebuild"),
@@ -989,6 +2432,92 @@ def test_download_mutation_mode_conflict_precedes_all_side_effects(
     assert not workspace_root.exists()
 
 
+@pytest.mark.parametrize(
+    ("file_name", "payload", "expected_reason", "expected_failure_code"),
+    (
+        ("empty.pdf", b"", "文件为空，无法上传", "empty_input_file"),
+        (
+            "corrupt.pdf",
+            _UNPARSABLE_PDF_BYTES,
+            _TYPED_CONTENT_FAILURE_REASON,
+            "docling_converter_execution",
+        ),
+        (
+            "corrupt.docx",
+            _UNPARSABLE_DOCX_BYTES,
+            _TYPED_CONTENT_FAILURE_REASON,
+            "docling_converter_execution",
+        ),
+    ),
+)
+def test_real_cli_content_failure_has_bounded_stderr_and_zero_fresh_workspace_mutation(
+    tmp_path: Path,
+    file_name: str,
+    payload: bytes,
+    expected_reason: str,
+    expected_failure_code: str,
+) -> None:
+    """真实 CLI empty/corrupt PDF/DOCX failure 必须安全投影且零 mutation。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        file_name: 当前失败输入的安全 basename。
+        payload: 当前失败输入 bytes。
+        expected_reason: 当前 closed content reason。
+        expected_failure_code: 当前 closed content failure code。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: CLI contract 漂移、stderr 泄漏或 workspace 变化时抛出。
+        subprocess.TimeoutExpired: 真实 conversion 未在期限内结束时抛出。
+    """
+
+    corrupt_file = tmp_path / file_name
+    corrupt_file.write_bytes(payload)
+    workspace_root = tmp_path / "fresh-workspace"
+    cli_executable = Path(sys.executable).with_name("dayu-cli")
+    repository_root = Path(__file__).resolve().parents[2]
+
+    completed = subprocess.run(
+        (
+            str(cli_executable),
+            "upload_filing",
+            "--base",
+            str(workspace_root),
+            "--ticker",
+            "ICPD",
+            "--files",
+            str(corrupt_file),
+            "--fiscal-year",
+            "2024",
+            "--fiscal-period",
+            "FY",
+            "--company-name",
+            "ICPD Corp.",
+        ),
+        cwd=repository_root,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60.0,
+    )
+
+    assert completed.returncode == EXIT_FAILURE
+    assert expected_reason in completed.stderr
+    assert 'failure_kind="content"' in completed.stderr
+    assert f'failure_code="{expected_failure_code}"' in completed.stderr
+    assert 'requested_files="1"' in completed.stderr
+    assert 'stored_files="0"' in completed.stderr
+    assert f'file="{file_name}"' in completed.stderr
+    assert len(completed.stderr) <= _MAX_PUBLIC_CONTENT_FAILURE_STDERR_CHARS
+    assert "Traceback" not in completed.stderr
+    assert str(repository_root) not in completed.stderr
+    assert str(corrupt_file) not in completed.stderr
+    assert not workspace_root.exists()
+
+
 def test_download_repeated_ticker_is_last_wins(
     fake_service: _FakeFinsDirectService,
 ) -> None:
@@ -1038,7 +2567,11 @@ def test_download_path_does_not_reuse_upload_ticker_csv_parser() -> None:
 
     assert "_parse_ticker_csv" not in calls_by_function["_prevalidate_download_request"]
     assert "_parse_ticker_csv" not in calls_by_function["_download_stream"]
-    assert "_parse_ticker_csv" in calls_by_function["_upload_filing_stream"]
+    assert "_parse_ticker_csv" not in calls_by_function["_upload_filing_stream"]
+    assert (
+        "prevalidate_fins_upload_filing_request_for_workspace"
+        in calls_by_function["_prevalidate_upload_filing_request"]
+    )
     assert "_parse_ticker_csv" in calls_by_function["_run_upload_filings_from"]
 
 
@@ -1046,7 +2579,18 @@ def test_upload_commands_map_args_and_validate_files(
     tmp_path: Path,
     fake_service: _FakeFinsDirectService,
 ) -> None:
-    """upload_filing/material CLI 必须调用 Service direct stream 方法。"""
+    """upload_filing/material CLI 必须调用 Service direct stream 方法。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        fake_service: 记录 CLI 参数投影的 direct Service 替身。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 参数校验、动作映射或 Service 调用漂移时抛出。
+    """
 
     filing_file = tmp_path / "filing.pdf"
     material_file = tmp_path / "material.html"
@@ -1060,7 +2604,7 @@ def test_upload_commands_map_args_and_validate_files(
                 "--ticker",
                 "AAPL,MSFT",
                 "--action",
-                "update",
+                "create",
                 "--files",
                 str(filing_file),
                 "--fiscal-year",
@@ -1084,7 +2628,7 @@ def test_upload_commands_map_args_and_validate_files(
             (
                 "upload_material",
                 "--ticker",
-                "MSFT,GOOG",
+                "DELTA,MSFT",
                 "--forms",
                 "8-K",
                 "--material-name",
@@ -1103,8 +2647,10 @@ def test_upload_commands_map_args_and_validate_files(
     assert fake_service.upload_filing_requests == [
         _UploadFilingCall(
             ticker="AAPL",
-            action="update",
+            action="create",
             files=(filing_file.resolve(),),
+            primary_selectors=(),
+            selected_primary=filing_file.resolve(),
             fiscal_year=2024,
             fiscal_period="FY",
             amended=True,
@@ -1117,7 +2663,7 @@ def test_upload_commands_map_args_and_validate_files(
     ]
     assert fake_service.upload_material_requests == [
         _UploadMaterialCall(
-            ticker="MSFT",
+            ticker="DELTA",
             action="auto",
             files=(material_file.resolve(),),
             form_type="8-K",
@@ -1130,10 +2676,105 @@ def test_upload_commands_map_args_and_validate_files(
             filing_date=None,
             report_date=None,
             company_name=None,
-            ticker_aliases=("GOOG",),
+            ticker_aliases=("MSFT",),
             overwrite=False,
         )
     ]
+
+
+@pytest.mark.parametrize(
+    ("basename", "expected_message"),
+    (
+        ("schema.xsd", "补充材料文件格式不受支持：schema.xsd"),
+        (f"{'a' * 226}.doc", "补充材料文件格式不受支持"),
+    ),
+)
+def test_upload_material_cli_uses_bounded_converter_required_format_owner(
+    tmp_path: Path,
+    fake_service: _FakeFinsDirectService,
+    capsys: pytest.CaptureFixture[str],
+    basename: str,
+    expected_message: str,
+) -> None:
+    """material CLI 必须用 Fins owner 把普通及长文件名投影为 bounded usage error。
+
+    Args:
+        tmp_path: 用于创建非法 material 文件的临时目录。
+        fake_service: 记录 direct Service 调用的替身。
+        capsys: 标准输出与错误输出捕获夹具。
+        basename: 当前非法 material 文件的 canonical basename。
+        expected_message: 预期有界格式错误文案。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: failure kind 的 CLI 投影或零调用边界漂移时抛出。
+    """
+
+    material_file = tmp_path / basename
+    material_file.write_text("<schema></schema>", encoding="utf-8")
+
+    exit_code = cli_main.main(
+        (
+            "upload_material",
+            "--ticker",
+            "AAPL",
+            "--forms",
+            "MATERIAL_OTHER",
+            "--material-name",
+            "Schema",
+            "--files",
+            str(material_file),
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_USAGE_ERROR
+    assert captured.out == ""
+    assert captured.err == f"dayu-cli upload_material: {expected_message}\n"
+    assert fake_service.upload_material_requests == []
+    assert fake_service.stream_calls == []
+
+
+def test_upload_material_alias_count_uses_typed_upload_admission(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """material 超量 aliases 必须由共享 upload usage owner 有界拒绝。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        capsys: 标准流捕获夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: material 绕过数量准入、错误命令名前缀或启动 stream 时抛出。
+    """
+
+    ticker_csv = ",".join(("AAPL", *(f"A-{index}" for index in range(101))))
+    exit_code = cli_main.main(
+        (
+            "upload_material",
+            "--base",
+            str(tmp_path / "workspace"),
+            "--ticker",
+            ticker_csv,
+            "--action",
+            "delete",
+            "--forms",
+            "MATERIAL_OTHER",
+            "--material-name",
+            "Deck",
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_USAGE_ERROR
+    assert captured.out == ""
+    assert captured.err == ("dayu-cli upload_material: --ticker 别名数量不能超过 100 个\n")
 
 
 def test_process_commands_map_to_service(
@@ -1439,9 +3080,227 @@ def test_stream_failure_propagates_to_cli_error(
     assert cli_main.main(("download", "--ticker", "AAPL")) == EXIT_FAILURE
 
     captured = capsys.readouterr()
-    assert "stream boom" in captured.err
+    assert captured.err == _UNKNOWN_DIRECT_FAILURE_STDERR
+    assert "stream boom" not in captured.err
     assert "job_id" not in captured.err
     assert service.closed_streams == 1
+
+
+def test_unknown_fins_direct_failure_logs_traceback_and_hides_exception_from_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """未知 direct 异常只进入 operator traceback，普通 stderr 使用固定文案。
+
+    Args:
+        monkeypatch: direct async 主流程异常注入夹具。
+        caplog: operator 日志捕获夹具。
+        capsys: 标准流捕获夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: stderr 泄漏异常或 operator 日志缺少 traceback 时抛出。
+    """
+
+    monkeypatch.setattr(
+        fins_command,
+        "_run_fins_direct_command_async",
+        _raise_unknown_fins_direct_error,
+    )
+    caplog.set_level(logging.ERROR, logger=fins_command.__name__)
+
+    exit_code = fins_command.run_fins_direct_command(parse_cli_args(("download", "--ticker", "AAPL")))
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_FAILURE
+    assert captured.out == ""
+    assert captured.err == _UNKNOWN_DIRECT_FAILURE_STDERR
+    assert _UNKNOWN_DIRECT_FAILURE_MARKER not in captured.err
+    assert "/absolute/path" not in captured.err
+    assert "Traceback" not in captured.err
+    assert "RuntimeError" not in captured.err
+    assert "Fins direct command failed; command=download" in caplog.text
+    assert _UNKNOWN_DIRECT_FAILURE_MARKER in caplog.text
+    assert "Traceback" in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("summary", "expected_stream", "expected_other_stream"),
+    (
+        (
+            FinsUploadResultSummary(
+                source_kind=SourceKind.FILING,
+                status="ok",
+                requested_file_count=2,
+                stored_file_count=2,
+            ),
+            "stdout",
+            "",
+        ),
+        (
+            FinsUploadResultSummary(
+                source_kind=SourceKind.FILING,
+                status="deleted",
+                requested_file_count=0,
+                stored_file_count=0,
+            ),
+            "stdout",
+            "",
+        ),
+        (
+            FinsUploadResultSummary(
+                source_kind=SourceKind.FILING,
+                status="skipped",
+                requested_file_count=2,
+                stored_file_count=0,
+            ),
+            "stdout",
+            "",
+        ),
+        (
+            FinsUploadResultSummary(
+                source_kind=SourceKind.FILING,
+                status="failed",
+                requested_file_count=2,
+                stored_file_count=0,
+                failure_reason=fins_upload_failure_from_exception(
+                    RuntimeError(),
+                    file_label=None,
+                ),
+            ),
+            "stderr",
+            "",
+        ),
+        (
+            FinsUploadResultSummary(
+                source_kind=SourceKind.FILING,
+                status="ok",
+                requested_file_count=1,
+                stored_file_count=1,
+                warnings=(
+                    CompanyMetadataWarning(
+                        kind=CompanyMetadataWarningKind.COMPANY_NAME_IGNORED,
+                        message=COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+                    ),
+                ),
+            ),
+            "stdout",
+            f"{COMPANY_NAME_IGNORED_WARNING_MESSAGE}\n",
+        ),
+        (
+            FinsUploadResultSummary(
+                source_kind=SourceKind.FILING,
+                status="skipped",
+                requested_file_count=1,
+                stored_file_count=0,
+                warnings=(
+                    CompanyMetadataWarning(
+                        kind=CompanyMetadataWarningKind.COMPANY_NAME_IGNORED,
+                        message=COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+                    ),
+                ),
+            ),
+            "stdout",
+            f"{COMPANY_NAME_IGNORED_WARNING_MESSAGE}\n",
+        ),
+    ),
+)
+def test_upload_terminal_summary_renderer_uses_typed_requested_and_stored_counts(
+    summary: FinsUploadResultSummary,
+    expected_stream: str,
+    expected_other_stream: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """CLI renderer 必须展示 typed upload summary 的 requested/stored 真源。
+
+    Args:
+        summary: production upload summary owner 构造的当前终态。
+        expected_stream: 当前终态应写入的标准流名称。
+        expected_other_stream: 另一标准流应包含的 exact warning 文本。
+        tmp_path: filing validator 使用的临时输入目录。
+        capsys: 标准流捕获夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: typed RESULT 到 CLI 摘要的计数或字段名投影漂移时抛出。
+    """
+
+    input_files = tuple(tmp_path / f"input-{index}.pdf" for index in range(summary.requested_file_count))
+    for input_file in input_files:
+        input_file.write_bytes(b"typed filing input")
+    raw_request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        action="delete" if summary.status == "deleted" else "create",
+        files=input_files,
+        primary_selectors=(input_files[0],) if len(input_files) > 1 else (),
+        fiscal_year=2024,
+        fiscal_period="FY",
+        company_name=None if summary.status == "deleted" else "Apple Inc.",
+    )
+    document_id, _internal_document_id = build_sec_filing_ids(
+        ticker="AAPL",
+        fiscal_year=2024,
+        fiscal_period="FY",
+        amended=False,
+    )
+    published_state = FilingUploadPublishedState(
+        company_meta=None,
+        source_integrity=SourceIntegrityClassification(
+            ticker="AAPL",
+            source_kind=SourceKind.FILING,
+            document_id=document_id,
+            revision=None,
+            status=SourceIntegrityStatus.MISSING,
+            reasons=(),
+        ),
+        source_meta=None,
+        publication_identity=None,
+    )
+    request = validate_fins_upload_filing_request(
+        raw_request,
+        published_state=published_state,
+    )
+    context = ingestion_runtime._FinsIngestionExecutionContext(
+        operation_kind=FinsIngestionOperationKind.UPLOAD,
+        direct_operation_kind=FinsOperationKind.UPLOAD_FILING,
+        normalized_ticker=request.normalized_ticker.canonical,
+        market=request.normalized_ticker.market,
+        exchange=request.normalized_ticker.exchange,
+        source=None,
+        source_kind=request.request.source_kind,
+        download_request=None,
+        cancellation_checker=_NEVER_CANCELLED_JOB_CHECKER,
+        job_record=None,
+        direct_queue=None,
+        cancellation_state=None,
+    )
+    _progress_event_value, result_event = ingestion_runtime._direct_upload_terminal_events(
+        context=context,
+        request=request,
+        summary=summary,
+        disposition=summary.terminal_disposition(),
+        emitted_at=_NOW,
+    )
+
+    cli_output.render_fins_direct_event(result_event)
+
+    captured = capsys.readouterr()
+    assert result_event.result is not None
+    if expected_stream == "stdout":
+        assert result_event.result.exit_code == EXIT_SUCCESS
+    rendered = captured.out if expected_stream == "stdout" else captured.err
+    other_stream = captured.err if expected_stream == "stdout" else captured.out
+    assert f'requested_files="{summary.requested_file_count}"' in rendered
+    assert f'stored_files="{summary.stored_file_count}"' in rendered
+    assert "uploaded_files" not in rendered
+    assert other_stream == expected_other_stream
 
 
 @pytest.mark.parametrize(
@@ -1592,10 +3451,12 @@ async def test_cli_event_task_drain_deduplicates_same_primary_close_cause() -> N
 @pytest.mark.asyncio
 async def test_cli_stream_owner_sigint_waits_for_canonical_cancelled_terminal(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """SIGINT 只请求 token，退出码必须来自 canonical cancelled terminal。
 
     :param monkeypatch: pytest monkeypatch 夹具。
+    :param capsys: pytest 标准输出捕获夹具。
     :returns: ``None``。
     :raises AssertionError: canonical 退出码、取消或关闭次数不符合契约时抛出。
     """
@@ -1625,14 +3486,23 @@ async def test_cli_stream_owner_sigint_waits_for_canonical_cancelled_terminal(
     await service.first_event_yielded.wait()
 
     monitor.notify()
+    assert await asyncio.wait_for(monitor.observed_counts.get(), timeout=1.0) == 1
     await asyncio.wait_for(token.requested.wait(), timeout=1.0)
+    assert token.request_count == 1
+    assert not command_task.done()
+    monitor.notify()
+    assert await asyncio.wait_for(monitor.observed_counts.get(), timeout=1.0) == 2
+    assert token.request_count == 1
     service.release_stream.set()
     exit_code = await command_task
+    captured = capsys.readouterr()
 
     assert exit_code == EXIT_KEYBOARD_INTERRUPT
     assert service.cancellation_tokens[0] is not None
     assert service.cancellation_tokens[0].is_cancelled()
     assert service.closed_streams == 1
+    assert "download live progress" in captured.out
+    assert "Fins cancelled" in captured.err
 
 
 @pytest.mark.asyncio
@@ -1821,8 +3691,21 @@ def test_keyboard_interrupt_before_stream_exits_130(
 def test_upload_file_allowlist_fail_fast(
     tmp_path: Path,
     fake_service: _FakeFinsDirectService,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """upload 文件路径只做存在性与 allowlist 前置校验。"""
+    """upload_filing 必须按 primary 角色在 Service 前拒绝非法格式。
+
+    Args:
+        tmp_path: 用于创建非法 primary 文件的临时目录。
+        fake_service: 记录 direct Service 调用的替身。
+        capsys: 标准输出与错误输出捕获夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 角色错误投影或 fail-fast 边界漂移时抛出。
+    """
 
     disallowed = tmp_path / "filing.exe"
     disallowed.write_text("bad", encoding="utf-8")
@@ -1832,25 +3715,66 @@ def test_upload_file_allowlist_fail_fast(
             "upload_filing",
             "--ticker",
             "AAPL",
+            "--fiscal-year",
+            "2024",
+            "--fiscal-period",
+            "FY",
+            "--company-name",
+            "Apple Inc.",
             "--files",
             str(disallowed),
         )
     )
 
+    captured = capsys.readouterr()
     assert exit_code == EXIT_USAGE_ERROR
+    assert captured.err == "dayu-cli upload_filing: 财报主文件格式不受支持：filing.exe\n"
     assert fake_service.upload_filing_requests == []
 
 
+@pytest.mark.parametrize(
+    "suffix",
+    (
+        ".pdf",
+        ".docx",
+        ".pptx",
+        ".htm",
+        ".html",
+        ".xhtml",
+        ".md",
+        ".txt",
+        ".csv",
+        ".xlsx",
+        ".xbrl",
+        ".xml",
+        ".json",
+    ),
+)
 def test_upload_filings_from_does_not_start_live_stream(
     tmp_path: Path,
     fake_service: _FakeFinsDirectService,
     capsys: pytest.CaptureFixture[str],
+    suffix: str,
 ) -> None:
-    """upload_filings_from 只生成可执行脚本，不启动 direct stream。"""
+    """13 个冻结 primary suffix 必须各自产生 standalone filing 命令。
+
+    Args:
+        tmp_path: 用于创建单格式 source 与 workspace 的临时目录。
+        fake_service: 记录 direct Service 调用的替身。
+        capsys: 标准输出与错误输出捕获夹具。
+        suffix: 当前冻结 primary 扩展名。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: batch admission、命令生成或零 live-stream 边界漂移时抛出。
+    """
 
     source_dir = tmp_path / "source"
     source_dir.mkdir()
-    (source_dir / "2024FY AAPL Annual Report.pdf").write_text("filing", encoding="utf-8")
+    source_file = source_dir / f"2024FY AAPL Annual Report{suffix}"
+    source_file.write_text("filing", encoding="utf-8")
 
     assert (
         cli_main.main(
@@ -1871,8 +3795,10 @@ def test_upload_filings_from_does_not_start_live_stream(
     script = tmp_path / "workspace" / "upload_filings_AAPL.sh"
     assert "Generated upload script:" in captured.out
     assert "Recognized filings: 1" in captured.out
-    assert "upload_filing" in script.read_text(encoding="utf-8")
-    assert "schema_version" not in script.read_text(encoding="utf-8")
+    script_text = script.read_text(encoding="utf-8")
+    assert "upload_filing" in script_text
+    assert str(source_file.resolve()) in script_text
+    assert "schema_version" not in script_text
     assert "Fins progress" not in captured.out
     assert fake_service.stream_calls == []
 
@@ -1927,6 +3853,8 @@ class _UploadFilingCall:
     ticker: str
     action: str
     files: tuple[Path, ...]
+    primary_selectors: tuple[Path, ...]
+    selected_primary: Path | None
     fiscal_year: int | None
     fiscal_period: str | None
     amended: bool
@@ -1978,7 +3906,19 @@ def _live_command_argv(command_name: str, tmp_path: Path) -> tuple[str, ...]:
     if command_name == "upload_filing":
         upload_file = tmp_path / "filing.pdf"
         upload_file.write_text("filing", encoding="utf-8")
-        return ("upload_filing", "--ticker", "AAPL", "--files", str(upload_file))
+        return (
+            "upload_filing",
+            "--ticker",
+            "AAPL",
+            "--files",
+            str(upload_file),
+            "--fiscal-year",
+            "2024",
+            "--fiscal-period",
+            "FY",
+            "--company-name",
+            "Apple Inc.",
+        )
     if command_name == "upload_material":
         upload_file = tmp_path / "material.pdf"
         upload_file.write_text("material", encoding="utf-8")

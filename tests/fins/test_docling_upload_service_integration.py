@@ -11,10 +11,13 @@ from dayu.fins.domain.enums import SourceKind
 from dayu.fins.pipelines.docling_upload_service import (
     DoclingUploadService,
     UploadOperationResult,
-    _convert_bytes_with_docling,
+    commit_prepared_upload_batch,
 )
+from dayu.fins.pipelines.docling_process_converter import ProcessDoclingConverter
 from dayu.fins.storage import FsBatchingRepository, FsDocumentBlobRepository, FsSourceDocumentRepository
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
+from dayu.fins.upload_format_contract import FinsUploadMaterialFiles
+from dayu.fins.upload_repair_contract import NoExistingSourceRepair
 
 _RUN_DOCLING_UPLOAD_INTEGRATION = "DAYU_RUN_DOCLING_UPLOAD_INTEGRATION"
 _MINIMAL_PDF = (
@@ -26,7 +29,8 @@ _MINIMAL_PDF = (
 )
 
 
-def test_real_docling_upload_service_conversion_when_enabled(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_real_docling_upload_service_conversion_when_enabled(tmp_path: Path) -> None:
     """显式启用时用真实 Docling conversion 跑完整上传。
 
     Args:
@@ -50,30 +54,33 @@ def test_real_docling_upload_service_conversion_when_enabled(tmp_path: Path) -> 
     service = DoclingUploadService(
         source_repository=source_repository,
         blob_repository=blob_repository,
-        convert_with_docling=_convert_bytes_with_docling,
+        docling_converter=ProcessDoclingConverter(),
     )
     sample_file = tmp_path / "minimal.pdf"
     sample_file.write_bytes(_MINIMAL_PDF)
 
-    prepared = service.prepare_upload(
+    prepared = await service.prepare_upload(
         ticker="AAPL",
         source_kind=SourceKind.MATERIAL,
         action="create",
         document_id="mat_docling_integration",
         internal_document_id="mat_docling_integration",
         form_type="MATERIAL_OTHER",
-        files=[sample_file],
+        selection=FinsUploadMaterialFiles.from_upsert_paths((sample_file,)),
         overwrite=False,
+        previous_meta=None,
         meta={"material_name": "Docling Fixture", "ingest_method": "upload"},
+        repair_disposition=NoExistingSourceRepair(),
+        cancellation=None,
     )
     assert not isinstance(prepared, UploadOperationResult)
-    batch = batching_repository.begin_batch("AAPL")
-    try:
-        result = service.publish_prepared_upload(prepared, batch=batch)
-    except BaseException:
-        batching_repository.rollback_batch(batch)
-        raise
-    batching_repository.commit_batch(batch)
+    result = commit_prepared_upload_batch(
+        service=service,
+        batching_repository=batching_repository,
+        batch=batching_repository.begin_batch("AAPL"),
+        prepared=prepared,
+        cancellation=None,
+    )
 
     assert result.status == "uploaded"
     assert result.payload["primary_document"] == "minimal_docling.json"

@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
+from dayu.fins.domain.company_meta_contract import CompanyMetaCommitOutcome
 from dayu.fins.domain.document_models import BatchToken
 
 from ._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
@@ -60,17 +61,20 @@ class FsBatchingRepository(BatchingRepositoryProtocol):
 
         return self._repository_set.core.begin_batch(ticker)
 
-    def commit_batch(self, batch: BatchToken) -> None:
+    def commit_batch(self, batch: BatchToken) -> CompanyMetaCommitOutcome | None:
         """提交事务并在成功或失败后终态消费 capability。
 
         Args:
             batch: 当前 shared storage core 登记且仍为 open 的 batch capability。
 
         Returns:
-            无；正常返回表示 ``COMMITTED`` 已成为 durable 提交事实。
+            batch 含 company-meta intent 时返回 publication-final typed outcome；
+            否则返回 ``None``。正常返回表示 ``COMMITTED`` 已成为 durable 提交事实。
 
         Raises:
             ValueError: capability 未登记、已终态或 ticker/core 不匹配时抛出。
+            SourceIntegrityPreflightError: whole-tree inspection 遇到无法归属到
+                单一 source target 的结构损坏时抛出。
             OSError: physical swap、journal 或 pre-commit restore 失败时抛出。
             RuntimeFileLockError: 没有更早 operation error 且 publication/writer lock
                 获取或释放失败时抛出；``COMMITTED`` 后 publication release failure
@@ -78,7 +82,7 @@ class FsBatchingRepository(BatchingRepositoryProtocol):
                 release failure 仅附着为诊断。
         """
 
-        self._repository_set.core.commit_batch(batch)
+        return self._repository_set.core.commit_batch(batch)
 
     def rollback_batch(self, batch: BatchToken) -> None:
         """回滚 open 事务并终态消费 capability。

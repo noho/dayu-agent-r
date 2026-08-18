@@ -27,6 +27,10 @@ from dayu.fins.domain.filing_semantics import (
     normalize_fiscal_period,
     parse_sec_form_type,
 )
+from dayu.fins.ticker_normalization import (
+    CompanyTickerIdentity,
+    build_company_ticker_identity,
+)
 
 
 DocumentMeta = dict[str, Any]
@@ -420,17 +424,20 @@ class BatchToken:
 
 @dataclass(frozen=True)
 class CompanyMeta:
-    """公司级元数据模型。"""
+    """公司级元数据模型。
+
+    ``ticker_identity`` 是 ticker canonicalization、accepted aliases 与市场投影的
+    唯一结构化真源；持久化仍使用 flat JSON，由 ``to_dict`` / ``from_dict`` 在
+    owner boundary 显式投影和严格校验。
+    """
 
     company_id: str
     company_name: str
-    ticker: str
-    market: str
+    ticker_identity: CompanyTickerIdentity
     resolver_version: str
     updated_at: str
-    ticker_aliases: list[str] = field(default_factory=list)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, JsonValue]:
         """将对象转换为字典。
 
         Args:
@@ -443,10 +450,18 @@ class CompanyMeta:
             无。
         """
 
-        return asdict(self)
+        return {
+            "company_id": self.company_id,
+            "company_name": self.company_name,
+            "ticker": self.ticker_identity.canonical_ticker,
+            "market": self.ticker_identity.market,
+            "resolver_version": self.resolver_version,
+            "updated_at": self.updated_at,
+            "ticker_aliases": list(self.ticker_identity.accepted_aliases),
+        }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "CompanyMeta":
+    def from_dict(cls, data: Mapping[str, JsonValue]) -> "CompanyMeta":
         """从字典构建 `CompanyMeta`。
 
         Args:
@@ -457,23 +472,60 @@ class CompanyMeta:
 
         Raises:
             KeyError: 缺少必填字段时抛出。
+            ValueError: 字段类型、ticker grammar 或持久化 market 不符合契约时抛出。
         """
 
-        raw_ticker_aliases = data.get("ticker_aliases")
-        ticker_aliases = raw_ticker_aliases if isinstance(raw_ticker_aliases, list) else []
-        return cls(
-            company_id=str(data["company_id"]),
-            company_name=str(data["company_name"]),
-            ticker=str(data["ticker"]),
-            ticker_aliases=[
-                str(item).strip()
-                for item in ticker_aliases
-                if str(item).strip()
-            ],
-            market=str(data["market"]),
-            resolver_version=str(data["resolver_version"]),
-            updated_at=str(data["updated_at"]),
+        company_id = _require_company_meta_text(data, "company_id")
+        company_name = _require_company_meta_text(data, "company_name")
+        ticker = _require_company_meta_text(data, "ticker")
+        market = _require_company_meta_text(data, "market")
+        resolver_version = _require_company_meta_text(data, "resolver_version")
+        updated_at = _require_company_meta_text(data, "updated_at")
+        raw_ticker_aliases = data["ticker_aliases"]
+        if not isinstance(raw_ticker_aliases, list):
+            raise ValueError("CompanyMeta.ticker_aliases 必须是字符串数组")
+        ticker_aliases: list[str] = []
+        for raw_alias in raw_ticker_aliases:
+            if not isinstance(raw_alias, str):
+                raise ValueError("CompanyMeta.ticker_aliases 必须是字符串数组")
+            ticker_aliases.append(raw_alias)
+        ticker_identity = build_company_ticker_identity(
+            ticker,
+            ticker_aliases,
         )
+        if market != ticker_identity.market:
+            raise ValueError("CompanyMeta.market 与 ticker identity 不一致")
+        return cls(
+            company_id=company_id,
+            company_name=company_name,
+            ticker_identity=ticker_identity,
+            resolver_version=resolver_version,
+            updated_at=updated_at,
+        )
+
+
+def _require_company_meta_text(
+    data: Mapping[str, JsonValue],
+    field_name: str,
+) -> str:
+    """读取 CompanyMeta flat JSON 的必填字符串字段。
+
+    Args:
+        data: CompanyMeta flat JSON object。
+        field_name: 需要读取的字段名。
+
+    Returns:
+        原始字符串值。
+
+    Raises:
+        KeyError: 字段缺失时抛出。
+        ValueError: 字段不是字符串时抛出。
+    """
+
+    value = data[field_name]
+    if not isinstance(value, str):
+        raise ValueError(f"CompanyMeta.{field_name} 必须是字符串")
+    return value
 
 
 CompanyMetaInventoryStatus = Literal[

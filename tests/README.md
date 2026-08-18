@@ -29,6 +29,43 @@ pytest tests/contracts tests/cli tests/documents tests/fins tests/tools tests/ho
 python -m pyright dayu/ tests/ utils/
 ```
 
+运行 filing 多文件 primary、碰撞隔离与原子发布的 focused 回归：
+
+```bash
+python -m pytest tests/fins/test_upload_format_contract.py \
+  tests/fins/test_fins_ingestion_runtime.py \
+  tests/fins/test_fins_service_runtime.py \
+  tests/cli/test_arg_parsing.py tests/cli/test_fins_commands.py \
+  tests/fins/test_fins_ingestion_tools.py \
+  tests/fins/test_docling_upload_service.py \
+  tests/fins/test_filing_upload_publication.py \
+  tests/fins/test_docling_upload_service_integration.py \
+  tests/fins/test_sec_pipeline_upload_filing_stream.py \
+  tests/fins/test_sec_pipeline_upload_material_stream.py \
+  tests/fins/test_cn_pipeline.py \
+  tests/fins/test_fins_storage_atomicity.py \
+  tests/fins/test_processor_read_consistency.py -q
+```
+
+运行 source integrity、existing-source auto repair、staged recheck 与 downstream 的 focused owner 回归：
+
+```bash
+python -m pytest \
+  tests/fins/test_fins_storage_atomicity.py \
+  tests/fins/test_fins_storage_provider.py \
+  tests/fins/test_fins_ingestion_runtime.py \
+  tests/fins/test_fins_service_runtime.py \
+  tests/fins/test_docling_upload_service.py \
+  tests/fins/test_filing_upload_publication.py \
+  tests/fins/test_sec_pipeline_upload_filing_stream.py \
+  tests/fins/test_cn_pipeline.py \
+  tests/fins/test_sec_pipeline_download.py \
+  tests/fins/test_cn_download_workflow.py \
+  tests/fins/test_processor_read_consistency.py \
+  tests/service/test_fins_direct.py \
+  tests/cli/test_fins_commands.py -q
+```
+
 运行 workspace 初始化、模型家族、Service 装配与 provider matrix harness 的完整
 focused 回归：
 
@@ -121,6 +158,46 @@ pytest tests/fins/test_upload_batch.py tests/cli/test_upload_filings_from_comman
   tests/cli/test_fins_commands.py tests/cli/test_arg_parsing.py \
   tests/cli/test_public_package_entrypoints.py -q
 ```
+
+运行 Fins direct upload 的 CLI/runtime/Service boundary focused 回归：
+
+```bash
+pytest -q tests/cli/test_fins_commands.py \
+  tests/cli/test_output.py \
+  tests/fins/test_fins_ingestion_runtime.py \
+  tests/fins/test_fins_service_runtime.py \
+  tests/fins/test_fins_direct_stream.py \
+  tests/service/test_fins_direct.py \
+  tests/service/test_fins_wait_adapter.py
+```
+
+该集合覆盖 unknown exception 的 operator traceback 与提示使用 `--log-file PATH` 重试的固定 stderr 分离、typed failure 在 renderer 上限内同时展示 canonical 文件名与有界原因、真实 `FinsUploadResultSummary` 经 typed RESULT details 和既有 CLI renderer 展示 success/delete/skip/failure 的 requested/stored 且不出现旧 `uploaded_files`，以及 production upload direct stream 成功读回 original/Docling 资产后仍不创建 Host SQLite/artifact、runtime SQLite 或 legacy ingestion job record。company metadata warning 的测试在 commit owner、runtime summary、durable JSON、direct public invariant、CLI stdout/stderr 与 completed wait projection逐层断言同一 typed 值；uploaded/skipped 可携带最多一个规范 warning，failure/cancel/delete 与 generic operation 保持空值，AST 回归锁定 direct builder 只有 upload 与 generic 两个显式 callsite。
+
+运行 upload converter capability / Fins role owner 与 typed workflow 的 focused 回归：
+
+```bash
+pytest tests/documents/test_docling_runtime.py \
+  tests/fins/test_upload_format_contract.py \
+  tests/fins/test_fins_ingestion_runtime.py \
+  tests/fins/test_upload_batch.py \
+  tests/cli/test_arg_parsing.py \
+  tests/cli/test_fins_commands.py \
+  tests/fins/test_fins_ingestion_tools.py \
+  tests/fins/test_docling_upload_service.py \
+  tests/fins/test_docling_upload_service_integration.py \
+  tests/fins/test_sec_pipeline_upload_filing_stream.py \
+  tests/fins/test_sec_pipeline_upload_material_stream.py \
+  tests/fins/test_cn_pipeline.py \
+  tests/fins/test_upload_failure.py \
+  tests/fins/test_docling_process_converter.py -q
+```
+
+该集合在 owner boundary 断言：Documents 产品 capability 与实际 converter allowed formats 同源；
+Fins raw request 保留 selector 声明次数，validated selection 显式产生唯一 primary 与保序
+companions，并保持 material 全转换；CLI help、LLM-facing tool schema 与 batch admission 复用同一
+投影；filing 只转换 authoritative primary，全部 originals 原子发布，任一读取、转换、取消或存储失败不产生部分 publication；
+requested/stored 只计算 original 输入。这是 deterministic owner-level 回归，不替代真实全格式
+fixture 矩阵或全量 CLI scenario evidence。
 
 运行 Tool Trace Analyzer、Service publication 与 CLI focused 回归：
 
@@ -266,7 +343,7 @@ Session command 测试覆盖 shared labeled slot 与 anonymous/other display、�
 `FinsDirectCommandService` 显式方法参数转换、Service event stream 消费、progress / terminal summary
 stdout/stderr 投影、CLI 输出中绝对路径可见但受长度控制、upload file 存在性 / 普通文件 / 非空前置校验、已删除 `--infer` / `--ci` 由 argparse 拒绝、
 默认日志不污染 progress 输出、`--verbose` 执行骨架日志与 `--debug` event detail 诊断写入默认临时日志文件，`--log-file` 只迁移诊断日志且 stdout/stderr 用户 UI 保持原通道、
-Fins owner stream / cancel failure 向上传播且 CLI 不重复记录同一 ERROR、stream 创建者在 success / protocol error / log-render error / 外部取消 / SIGINT 本地退出全部路径确定性关闭 raw source、既存 consumer primary 与 cleanup cause 保持、
+Fins owner stream / cancel failure 向上传播且 CLI 不重复记录同一 ERROR、stream 创建者在 success / protocol error / log-render error / 外部取消 / SIGINT 本地退出全部路径确定性关闭 raw source、既存 consumer primary 与 cleanup cause 保持、首次 SIGINT 只请求一次 operation token 并继续渲染 progress、等待 canonical cancelled terminal 后退出 130，
 `upload_filings_from` 的 typed 本地目录扫描、filing / material / skipped 三分、POSIX `.sh` 与 Windows `.cmd` renderer、default / explicit output、
 ticker CSV、single FMP infer、human summary、调用者追加参数、atomic publisher、真实 POSIX recorder 与真实 CLI/temp-storage smoke、Windows 对抗参数与真实 CLI nodes、错误码、扫描期
 SIGINT 130、确认生成阶段不启动 live event stream、terminal exit mapping、Fins-owned missing / duplicate protocol error 保持既有 CLI prefix/message/exit 1、typed error object 与 runtime `PREPROCESS` provenance 经 Service/CLI identity 传播、SIGINT 到 operation-scoped async cancellation、
@@ -335,6 +412,7 @@ Service composition 测试，覆盖 `dayu.service` 在 Host 外部把 runtime ty
 共享文档基础测试，覆盖 `dayu.documents` 的层中立边界与轻量处理器 fixture：
 
 - import boundary：阻止 `dayu.documents` 反向依赖 Engine、Host、Service、UI、Fins 或具体工具实现，并确认 Docling runtime、processors 子包与完整 source snapshot helper 被边界扫描覆盖。
+- Docling converter capability：精确锁定受控格式标识、有序产品扩展名投影、构造期第三方元数据子集校验、converter `allowed_formats` 同源、第三方新增扩展名不自动扩面，以及格式或已承诺扩展名缺失时 fail closed。
 - processors：使用确定性 fixture 覆盖 Markdown、HTML 与 Docling JSON 处理器的章节提取、表格读取与搜索片段输出；完整 source snapshot 测试覆盖声明长度不参与拒绝、实际来源复制到 EOF、独立 cursor、processor snapshot 接入、正常/异常/取消/resource failure cleanup、系统临时物化文件清理、单 snapshot 单物化路径复用和关闭状态约束。
 
 ### `tests/tools/`
@@ -354,7 +432,13 @@ Web live smoke 位于 `utils/smoke_web_ci.py`，不在默认 pytest 中运行；
 
 财报仓储、Fins read tools provider、Fins ingestion awaiting providers、ingestion runtime 与 SEC / CN / HK download/upload pipeline 测试，覆盖 `dayu.fins.storage` 文件系统仓储协议实现、canonical ticker 的 `portfolio/<ticker>` 布局与非 canonical ticker 拒绝、opaque document ID 在 source/processed/blob/rejected/registry namespace 的 private mapping round-trip 与 descriptor fail-closed、SEC 路径形态 `primaryDocument` 到安全 basename 的严格投影、filename/primary/object key/local URI 的单路径组件及 containment/symlink 安全边界、显式 `BatchToken` authority、batching-only lifecycle、全部 mutation required `batch=`、跨 task/thread 显式 token 与跨 core/关闭 token 拒绝、同 ticker writer reservation 与跨进程 blocking lock、recovery nonblocking try-lock、统一 release/notify、source/blob/processed/company/maintenance shared core、blob-first 且 published source 在 commit 前缺席、一次 complete-source commit 后 meta/files/blob/primary/provenance/manifest 与 persisted opaque revision 同时可见、source mutation 换 token而 rollback/non-source batch 保留 token、light/full snapshot 的 identity/meta/provenance/revision/files/primary 同版、显式 source kind 与另一 namespace 同 document ID 共存、真实双文件 A/B publication、transient recovery、持续变化耗尽 storage 内部预算后的 typed failure、symlink/meta mismatch/silent inode mutation 分类、full snapshot 临时资源和 FD cleanup、processor cache 初始 miss 并发单构建、replacement/eviction/clear/runtime close 的 borrow-retire cleanup、processor/result/citation 同 snapshot provenance、acquire/release/copy/marker/cleanup 双失败的 primary preservation 与完整 path-free exception graph、commit validator 对不完整 source/false completion/symlink/escape 的拒绝、commit 前失败或取消 exactly-once rollback、commit 开始后 caller 不二次 rollback、在线长 staging/validator 不阻塞 published reader、两次 rename 窗口 publication guard 只允许完整 old/new、fresh filesystem 各 crash phase recovery 与未提交 staging 清理、download/upload overwrite 失败/取消/空结果保留旧文档、source document provenance 投影与 citation `source_type` / `source_provider` 输出、确定性财报 fixture 的 list/read、`dayu.fins.tools.provider` 通过当前 `ToolsDiscovery` 暴露带 `fins` tag 的九个 read tools、九个 definition 共用同一 ticker 语义，其中八个文档读取 definition 共用“只接受同 ticker 的 `list_documents.documents[].document_id`、切换 ticker 后重新选择”约束、四个 Fins provider 启用时要求 effective absolute workspace root、read provider 只暴露 read tools、九个 read tools 的 process-backed execution 声明、process target factory / target pickle round-trip、process target 子进程内通过 `DefaultFinsRuntime` 重建只读 runtime并在成功/失败后关闭、九个工具 completed/failed/cancelled nested 输出允许 canonical ticker 业务值且不暴露 revision/document private key/local URI/temp path、fast / processor / table path、failed JSON 信封和 ToolRuntime 取消真实 Fins process target 后不接受 late result、显式 limits 到各工具截断声明的投影、`list_documents` 与 `search_document` 通过当前 ToolRuntime accept path 执行、数组 / 标量参数投影、current success / failure outcome 投影、current `ToolTruncateSpec` 暴露、workspace overlay 独立启用 read / download / preprocess / upload providers、download / preprocess / upload 独立 provider discovery、upload provider 启用时默认注册上传工具、awaiting callable 的 `EXTERNAL_JOB` outcome、awaiting callable 启动前观察 cancellation token 并返回 cancelled outcome、upload 缺失文件、目录、空文件与 delete 带 files 在 observation start 前失败、workspace 外本地文件可启动 upload observation 且启动记录仍落在 Fins workspace、Fins lightweight observation handle / snapshot / runtime contract、参数错误到 current failure outcome、SEC downloader 的无网络 HTTP/解析/限流 helper、SEC pipeline 的 skip / overwrite / cache / 6-K / SC13 / rejection artifact / stream 语义、download typed request 的静态 canonicalization 与 local-only rebuild、CNInfo / HKEXNews downloader 的无网络 HTTP/解析/PDF 校验语义、HKEXNews 官方 `hasNextRow/rowRange/loadedRecord/recordCnt/result` exact 类型、initial-100 cumulative 续取、latest-count 扩容、final snapshot replacement、矛盾/无进展 typed provider failure、HKEX GET 与 CNInfo 财期 POST 前后 checkpoint 顺序及取消后 partial 零发布、CN/HK report selection helper 的候选筛选 / 语言过滤 / 财期推断 / 去重语义、CN/HK pipeline 的 blob-first complete-source commit、PDF gate、fast skip、独立季度缺失 skipped、runtime CN/HK auto adapter 语义、DoclingUploadService 的 create/update/delete/skip/overwrite、SEC/CN upload stream 的 filing/material id 与 source/blob 写入、DefaultFinsRuntime production upload runner 的 SEC/CN direct runtime stream 终态，以及基于 AST import 解析的 Fins / Engine / runtime import boundary。
 
-Download owner coverage 还包括：ticker、市场化 forms 与包含边界日期窗口在 workspace/runtime 前静态校验；overwrite/rebuild 唯一互斥校验；CN bare `FY/H1/Q1/Q3`、HK bare `FY/H1` baseline 与六期 discovery 集合；HKEX Q1～Q4 共用一次全 results query；category-first report/results matrix、category/title 期间事实、同 source ID 冲突失败关闭、identity/coverage canonical contract，以及 Q2/H1、Q4/FY report/result 独立 identity；显式 start-window fact 贯穿 SEC SC13 collection/retry；普通下载不执行 ticker 级 stale prune；coverage 不满足 baseline missing；ordinary/skip/failed/rebuild required coverage 与 fresh meta 畸形 coverage 失败关闭；SEC 和 generic path 显式空 coverage；adapter/runtime/public JSON/wait/CLI 原样投影；SEC User-Agent prerequisite 与 provider failure 分类；overwrite 单目标非删除语义；仅从既有 source 重建本地 download meta/manifest 且 provider 零调用、missing 为空；typed terminal summary 的互斥计数、文档明细、独立缺失期间以及成功/失败/取消退出码；CN/HK Docling 子进程在正常、失败和取消路径的 terminate/kill/close、输出校验与临时目录清理。`tests/documents/test_docling_runtime.py` 覆盖 attempt-local stream identity、closed-first/success-second 与 auto 三档首因/末因 contract。并发与完整性矩阵以 Event/barrier 而非 sleep 控制时序，覆盖同目标双 overwrite 的 last-writer、不同目标 union、async generator 提前关闭、Phase A prefetch 后 identity/revision churn、repair unconditional transport、published/staged 的 `MISSING` / `COMPLETE` / `REPAIR_REQUIRED` 分类、缺文件/size/digest corruption、malformed SHA-256 strict failure、whole-tree repair-first revalidation，以及 multiple/unselected corruption 在 company、maintenance 或 rejected artifact mutation 前 fail closed。
+Download owner coverage 还包括：ticker、市场化 forms 与包含边界日期窗口在 workspace/runtime 前静态校验；overwrite/rebuild 唯一互斥校验；CN bare `FY/H1/Q1/Q3`、HK bare `FY/H1` baseline 与六期 discovery 集合；HKEX Q1～Q4 共用一次全 results query；category-first report/results matrix、category/title 期间事实、同 source ID 冲突失败关闭、identity/coverage canonical contract，以及 Q2/H1、Q4/FY report/result 独立 identity；显式 start-window fact 贯穿 SEC SC13 collection/retry；普通下载不执行 ticker 级 stale prune；coverage 不满足 baseline missing；ordinary/skip/failed/rebuild required coverage 与 fresh meta 畸形 coverage 失败关闭；SEC 和 generic path 显式空 coverage；adapter/runtime/public JSON/wait/CLI 原样投影；SEC User-Agent prerequisite 与 provider failure 分类；overwrite 单目标非删除语义；仅从既有 source 重建本地 download meta/manifest 且 provider 零调用、missing 为空；typed terminal summary 的互斥计数、文档明细、独立缺失期间以及成功/失败/取消退出码；CN/HK Docling 子进程在正常、失败和取消路径的 terminate/kill/close、输出校验与临时目录清理，以及第三方 conversion callback/stdlib `lastResort` logger 真实写入 inherited FD2 后仍零公开泄漏并返回原 closed descriptor。退出 flush 次生异常覆盖原始 construction 失败的契约测试还断言分类不变、FD2 恢复与复制 FD 关闭。`tests/documents/test_docling_runtime.py` 覆盖 attempt-local stream identity、closed-first/success-second 与 auto 三档首因/末因 contract。
+
+Source integrity owner matrix 覆盖 published/staged 同源的 `MISSING`、`COMPLETE`、`REPAIR_REQUIRED`、`UNSAFE` 四态与 trusted revision 不变量；original/primary Docling/declared file 的 missing、size、digest，primary/derived projection 与 source-kind manifest repair reasons；identity/meta/revision/provenance/file declaration、undeclared/symlink/special entry 与 cross-source unsafe reasons；snapshot complete-only、commit validator、canonical manifest projection与 old-or-new publication。Upload matrix覆盖 validator-only auto repair authorization、identical fingerprint bypass、完整 originals/唯一 primary derived、Phase B status/revision recheck、stale/blocked typed failure、company/source同批 atomicity、rollback及 process_filing 只消费 new snapshot。Download matrix覆盖 SEC/CN Phase A/Phase B `UNSAFE` 在 meta/reset前失败、whole-tree `UNSAFE` 零 company/maintenance/rejection mutation、whole manifest 缺失的多 actual/多 selected/非 selected typed拒绝，以及唯一 accepted selected filing 的 reset、重新下载、canonical manifest rebuild与 `COMPLETE` 回归；既有 provider/retry/rejection语义由同一 focused suite保护。并发断言继续使用 Event/barrier 而非 sleep，覆盖同目标双 overwrite、不同目标 union、async generator 提前关闭与 Phase A prefetch 后 identity/revision churn。
+
+Filing shared publication matrix 使用真实 filesystem、线程 barrier、spawn 进程与 held runtime operation 的有界 future 完成通知，不使用 sleep、retry 或状态 polling。它覆盖 SEC 单文件/多文件 identical auto 的一 publish一 canonical skip、显式 create no-overwrite conflict 与 overwrite fresh rebase、derived/company identity mismatch、同 ticker 不同 filing 及 company aliases exact union、不同 ticker 在各自 writer-owned fresh read 内同时越过 barrier、CN/HK mechanical route、双 cancellation checkpoint、rollback failure，以及 durable runtime 的 canonical skip 与 explicit-create typed conflict terminal。skip 结果精确断言 `stored_file_count=0`，event stream 只包含 original 的 `file_skipped`，不把 preparation 已执行的 conversion event 当作已发布存储事实。
+
+Upload direct integration 还覆盖 success 正控、empty、corrupt PDF、corrupt DOCX 与 mixed fail-fast：成功后从 Fins 仓储读回 source meta、original blob 和 derived Docling asset，再检查 holding executor、legacy job 目录与 Host/runtime artifact 路径均为空；失败路径统一断言 requested count 保留、stored count 为 `0` 且 company/source/blob 无 partial publication。`tests/service/test_fins_direct.py` 同时锁定 Service 公开 direct API 不暴露 start/read/wait/cancel job handle。
 
 Financial/XBRL contract 测试还覆盖 producer exact keys 与可选 reason 矩阵、原始 payload/list/fact 深层不变、扁平 query params、稳定去重和唯一 `fact_count=len(facts)` 公共投影；真实 AAPL XBRL、HTML 财务表、无目标报表与截断续读场景同时验证 process-backed 输出，以及 processor 结果与 citation 始终来自同一 borrowed snapshot。
 
@@ -364,7 +448,31 @@ SEC pipeline 测试还覆盖取消检查器贯穿 submissions history、Browse E
 
 `tests/fins/test_fins_ingestion_tools.py` 覆盖 `dayu.fins.tools.download_provider`、`dayu.fins.tools.preprocess_provider` 与 `dayu.fins.tools.upload_provider` 的独立 ToolsDiscovery provider report、独立 provider id / spec id / tool name、唯一 `poll/callback/manual` enum/parser 的精确值，以及缺失/null/错类型/空串/大小写/空白/未知 mode 拒绝；三个 direct provider 都在创建 runtime 前校验 mode。文件同时覆盖 download / preprocess / upload 工具 schema 不暴露 Host 内部治理字段、工具调用注册 lightweight observation handle 后返回 `ToolAwaitingOutcome(EXTERNAL_JOB)`、启动前 cancellation token 已取消时返回 `ToolCancelledOutcome` 且不注册 observation、upload provider 启用时注册上传工具、upload 缺失文件、目录、空文件与 delete 带 files 在 observation start 前返回失败、workspace 外本地文件可启动 upload observation 且启动记录仍落在 Fins workspace，以及 provider 创建的不同 runtime 实例通过同一 workspace 派生 runtime 能力。本文件还覆盖 lightweight observation handle contract：resume token 只承载 opaque handle id、corrupt token / missing process-local observation source 分类为 LOST、observation status 到 wait resolution 的中立映射固定、snapshot terminal / retry-after 字段组合校验，以及禁止 handle / message 暴露 job、sequence、cursor 或 storage path。
 
-`tests/fins/test_fins_direct_stream.py` 以真实 `async def` generator 和独立 typed observation state 覆盖唯一 Fins validator owner：progress 顺序、RESULT 缓存至 clean exhaustion、missing / duplicate / event-after-result typed reason、result-then-error 不泄漏 success、upstream exception/cancellation object identity、`GeneratorExit` / `finally`、primary 与 cleanup close failure chaining、显式/repeated close 至多一次，以及 `terminal_result` 在 OPEN / RESULT_BUFFERED / abortive / clean 四类状态的 availability 与同一结果实例。`tests/fins/test_fins_ingestion_runtime.py` 覆盖 workspace-scoped ingestion runtime：cross-runtime shared workspace job store、legacy download / preprocess / upload queued job persistence、ticker normalization、DefaultFinsRuntime 为 US 的 `sec` / `auto`、CN 的 `cninfo` / `auto`、HK 的 `hkexnews` / `auto` 装配 production download adapter，并为 SEC/CN direct runtime upload stream 装配 production upload runner、legacy download / preprocess / upload 在 durable create 后、executor submit 前观察 cancellation token 并标记 job cancelled 且不提交后台操作、direct download / upload stream 产出 `PROGRESS` 与唯一 `RESULT`、consumer abort 经真实 raw bridge `finally` 请求 operation cancellation 且 late progress 不再可见、download adapter progress sink 到 direct event 的投影、download summary 展示避免 skipped/rejected 重复表达同一批拒绝项、direct stream 不创建 durable job record 或 sidecar、direct stream 使用 operation-scoped cancellation token/checker、direct 用户事件不暴露路径、job id、raw provider payload 或正文、runtime raw bridge 只转发 producer 事件并由 public plain-def API 接入唯一 validator、upload `SourceKind` filing/material 分流、upload 默认缺 runner 时的 unsupported terminal failure、upload request / result bounded summary、upload pipeline typed result 必须显式提供状态、无网络 fake download adapter 写入 source/blob 仓储、unsupported source failed terminal、重复下载按 storage 语义跳过、rejected filing artifact 通过 maintenance 仓储保存、preprocess source -> processed pipeline、已有 processed 跳过 / 重建、missing document failed terminal、preprocess typed status helper、unsupported processor not_supported summary 与 skipped 计数分离、cancel transition、prepared observation cancel 后 abandon 不提交后台操作且释放 handle、submitted observation abandon 触发协作取消并保留已写入仓储产物、record leakage boundary、legacy job store 原子写入失败清理、legacy ingestion job event sidecar 的 queued/running/terminal/status observation 序列、download / upload 同步调用边界与 preprocess 文档处理路径的粗粒度 `PROGRESS` event、`read_job_events(...)` 游标读取、bounded payload 与敏感内容不落 sidecar、并发 sequence 分配、非法 payload 拒绝、non-terminal、terminal 与 progress event append failure 的 WARN-and-continue 行为，以及新增 ingestion runtime 不破坏 read provider / `FinsReadRuntime` 懒加载行为，并验证 DefaultFinsRuntime close 幂等、不会为清理触发 read runtime 惰性创建且关闭后拒绝新 read runtime。
+`tests/fins/test_fins_direct_stream.py` 以真实 `async def` generator 和独立 typed observation state 覆盖唯一 Fins validator owner：progress 顺序、RESULT 缓存至 clean exhaustion、missing / duplicate / event-after-result typed reason、result-then-error 不泄漏 success、upstream exception/cancellation object identity、`GeneratorExit` / `finally`、primary 与 cleanup close failure chaining、显式/repeated close 至多一次，以及 `terminal_result` 在 OPEN / RESULT_BUFFERED / abortive / clean 四类状态的 availability 与同一结果实例。`tests/fins/test_fins_ingestion_runtime.py` 覆盖 workspace-scoped ingestion runtime：cross-runtime shared workspace job store、legacy download / preprocess / upload queued job persistence、ticker normalization、DefaultFinsRuntime 为 US 的 `sec` / `auto`、CN 的 `cninfo` / `auto`、HK 的 `hkexnews` / `auto` 装配 production download adapter，并为 SEC/CN direct runtime upload stream 装配 production upload runner、legacy download / preprocess / upload 在 durable create 后、executor submit 前观察 cancellation token 并标记 job cancelled 且不提交后台操作、direct download / upload stream 产出 `PROGRESS` 与唯一 `RESULT`、consumer abort 经真实 raw bridge `finally` 请求 operation cancellation 且 late progress 不再可见、download adapter progress sink 到 direct event 的投影、download summary 展示避免 skipped/rejected 重复表达同一批拒绝项、direct stream 不创建 durable job record 或 sidecar、direct stream 使用 operation-scoped cancellation token/checker、direct 用户事件不暴露路径、job id、raw provider payload 或正文、runtime raw bridge 只转发 producer 事件并由 public plain-def API 接入唯一 validator、upload `SourceKind` filing/material 分流、upload 默认缺 runner 时的 unsupported terminal failure、upload request / result bounded summary、upload pipeline/result summary 共用 `ok/skipped/deleted/failed/cancelled` exact status owner、direct claim 与 durable atomic save 前后的 Event/barrier 四时点、cancelled 无 completed、failed/completed progress/result/record/event 同源且单终态、已有 durable terminal 不覆盖、upload pipeline typed result 必须显式提供状态、无网络 fake download adapter 写入 source/blob 仓储、unsupported source failed terminal、重复下载按 storage 语义跳过、rejected filing artifact 通过 maintenance 仓储保存、preprocess source -> processed pipeline、已有 processed 跳过 / 重建、missing document failed terminal、preprocess typed status helper、unsupported processor not_supported summary 与 skipped 计数分离、cancel transition、prepared observation cancel 后 abandon 不提交后台操作且释放 handle、submitted observation abandon 触发协作取消并保留已写入仓储产物、record leakage boundary、legacy job store 原子写入失败清理、legacy ingestion job event sidecar 的 queued/running/terminal/status observation 序列、download / upload 同步调用边界与 preprocess 文档处理路径的粗粒度 `PROGRESS` event、`read_job_events(...)` 游标读取、bounded payload 与敏感内容不落 sidecar、并发 sequence 分配、非法 payload 拒绝、non-terminal、terminal 与 progress event append failure 的 WARN-and-continue 行为，以及新增 ingestion runtime 不破坏 read provider / `FinsReadRuntime` 懒加载行为，并验证 DefaultFinsRuntime close 幂等、不会为清理触发 read runtime 惰性创建且关闭后拒绝新 read runtime。
+
+UF-FIX01 owner coverage 进一步固定：全部 frozen filing usage argv 在 CLI factory 前由同一 typed validator 精确 exit `2`、factory/service 零调用且 fresh workspace tree 不变；US/CN/HK 非法财期共享具体 reason、stdout 空、无 traceback，fresh/seeded workspace 均保持不变，合法小写与首尾空白输入以 canonical 财期进入 validated Service request。tool raw 参数经同一 runtime validator 对三市场归一或失败，非法值保持具体 usage failure envelope，并在 observation/job/executor/storage 以及已装配 runner/converter 前零副作用；合法值激活 observation 后以 `ValidatedFinsUploadFilingRequest.normalized_fiscal_period` 交给 runner contract。upload tool schema 自足声明上传 filing 时财期必填且只接受 `FY/H1/Q1/Q2/Q3/Q4`，上传 material 时财期可选。prevalidation storage I/O 与 descriptor corruption 以 path-free typed reason exit `1`。Service、runtime runner 与 SEC/CN/HK facade 原样传递 validated request；workflow fresh recheck 核对 identity并丢弃旧 action/company decision，只把 authoritative source meta 交给 `prepare_upload`、把 authoritative company decision 交给同一 batch stage。SEC/CN 真实 FS tests 逐项断言 company/source 使用同一 `BatchToken`、begin/commit/rollback 次数、fresh/existing published tree 与逐文件 SHA，以及 company/source stage failure 与 rollback failure 的 primary/recovery evidence；cancelled、Docling、storage 与 generic failure 有可观察的 typed 分类顺序和 operator cause，material 继续保持原有状态 owner与用户可见 failure 语义。shared interruptible converter 与 cancellation token 保持 identity；closed typed failure 在 pipeline result、runtime summary、direct RESULT 与 durable failure summary 同源，并拒绝未知、pathful、control 或过长字段。测试在自有临时目录构造不可解析 `corrupt.pdf`，再经真实 subprocess / `dayu-cli` / converter 固定 exit `1`、bounded typed reason、stderr 无 traceback/repo/input 绝对路径且 fresh workspace 零 mutation，不依赖仓库外 calibration 路径。
+
+UF-FIX02 S2 owner/workflow coverage 固定 shared Docling publication contract：同名 changed update、改名且未 overwrite 的 update、existing create-overwrite 都以 exact reset、blob-first、final create 发布完整新文件集合，并保持 reset 前 version / `first_ingested_at` 真源；filing 的 deleted equal/changed input 与 material 的最小 deleted-equal parity 均恢复为 active、完整 source。reset 后任一 blob/final create 失败，以及 final checkpoint/precommit 取消，都断言整棵 published ticker tree SHA 不变。SEC tests 覆盖 renamed update、fresh create-existing conversion/batch 零调用、delete 后 equal/changed auto 恢复及非目标 filing/company 不变；CN/HK shared facade tests 覆盖 fresh update-missing 在 overwrite 两种取值下 conversion/batch 零调用，以及 changed update 的完整替换。
+
+Upload format owner coverage 进一步锁定 Documents converter capability 到 Fins role overlay 的单向依赖：
+raw request 保留 primary selector cardinality，static admission 在 workspace read 前覆盖单文件隐式选择、
+多文件显式选择、重复规范路径、多个 selector、集合外 selector、100/101 文件边界以及 delete 携带
+files/primary 的精确 failure precedence；validated typed contract 显式产生唯一 primary 与保序 companions。
+`.xsd` 只能作为 filing companion；legacy 与未选择格式不进入 primary 或 material conversion。CLI parser/help
+覆盖 append 型 `--primary` 及重复 occurrence 不丢失，direct command 覆盖 usage failure 在 Service factory
+前 exit `2` 且 workspace 零 mutation；upload tool schema/adapter 覆盖可选单值 primary、`files.maxItems=100`、
+material/delete 禁止 primary 与 observation start 前失败。batch scanner、SEC/CN workflow 与
+`DoclingUploadService` 均消费同一 owner projection。
+
+`DoclingUploadService` tests 进一步覆盖 filing 的 path-derived collision-free original identity、
+`original_filename` 与 `derived_from` 精确 metadata、不同目录同 basename 与同 stem 不同后缀共存、
+authoritative primary 非首项时只转换一次、companions 仅原样保存、100 originals + 1 derived 的发布守恒，
+以及 fingerprint 排除 path identity 后的跨目录 identical-skip、basename 改名 update 和内容改变 update。
+storage atomicity 与 processor/read consistency tests 覆盖 `primary_document` 精确命中 derived identity、
+snapshot `get_primary_source()` 到 `process_filing` / read runtime 的单一路径，以及 primary conversion、
+original 读取、blob/final source/commit 失败时 `stored_file_count=0`、fresh 零发布与 existing tree 不变。
+material regressions继续固定全部文件逐项转换、既有 basename/stem-derived name、metadata、fingerprint、
+事件和 failure 边界不变。
 
 Fins fixture 由测试通过仓储 public API 写入临时 workspace，不依赖隐式 cwd、环境变量或手工拼生产路径。
 

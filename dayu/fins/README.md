@@ -64,6 +64,7 @@ Fins 与其它层的稳定边界如下：
 - `dayu.contracts` 是 Dayu Agent 公共契约包，承载 UI / Service / Host / Engine / ToolRuntime / tools 可共同使用的层中立数据与协议，例如 JSON 值、取消 token、工具声明、工具 schema、工具调用请求、工具执行 outcome、工具等待 outcome 和 `ToolExecutor`；它不承载 Host / Engine 状态机，也不承载财报业务事实。
 - `dayu.runtime` 是层中立运行期基础设施包，提供工具发现 provider contract、取消等待、日志级别、诊断文本脱敏、截断、filelock、lane 等可复用 helper；它不得依赖 `dayu.engine` / `dayu.host` / `dayu.service` / `dayu.ui` / `dayu.fins`，也不承载任何层的状态机或业务语义。
 - `dayu.documents` 提供文档处理器公共协议、ProcessorRegistry 和通用 Docling / Markdown / BeautifulSoup 处理器；Fins 在其上注册财报业务增强处理器和 SEC 表单专项处理器。
+- `dayu.documents.docling_runtime` 的 immutable converter capability 是产品选定 Docling 格式、有序扩展名投影与实际 converter `allowed_formats` 的唯一 owner；构造 converter 时才延迟校验已安装 Docling 的格式元数据，第三方新增扩展名不会自动扩大产品承诺。
 - 工具声明契约属于 `dayu.contracts`；具体 Fins read / download / preprocess / upload 工具实现属于 `dayu.fins.tools`，工具发现装配属于 runtime discovery / Service assembly，工具运行时治理属于 Host / ToolRuntime。
 
 ## 接口
@@ -93,24 +94,39 @@ Fins 与其它层的稳定边界如下：
 - `BatchingRepositoryProtocol`
 - 对应 `Fs*Repository` 文件系统实现
 - `FileStore` / `LocalFileStore`
+- `require_source_meta_is_deleted(...)` canonical source-meta 严格读取契约
 
 source document meta 中的 `source_provider` 是来源提供方真源，当前支持 SEC EDGAR、巨潮资讯、港交所披露易与用户上传。storage snapshot 负责把同版 source meta 投影为 typed provenance；read runtime 的 citation 只消费当前 processor borrow 所持 snapshot 的 provenance 来生成 LLM-facing `source_type` 与 `source_provider`，不重新读取仓储或猜测来源。
 
+source document meta 中的 `is_deleted` 由 storage publication owner 产生；storage snapshot 与上传 skip 判定统一通过 `require_source_meta_is_deleted(...)` 读取精确布尔值。字段缺失或非布尔值均视为损坏并 fail closed，不使用默认值或 loose truthiness。
+
 source published revision 由 complete-source mutation owner 在每次 source create、update、replace、delete 或 restore 的最终 meta 中自动生成并持久化，随同一个 batch commit 与 source 内容原子发布。`SourceDocumentRevision.token` 只承诺非空字符串的 exact opaque equality，不承诺 prefix、长度、字符集、hash 算法或其它 grammar；producer 不能传入 token，processed / company / maintenance-only batch 与 rollback 不改变已发布 token。consumer 只通过 storage snapshot 取得同版 opaque revision，不按 meta、文件字段、时间或内容 hash 重建它。
 
-`SourceDocumentRepositoryProtocol.read_source_snapshot(...)` 是 storage-owned 单文档一致读取边界。light snapshot 在同一 publication guard 下返回 exact identity、typed source kind、完整 source meta、provenance、persisted revision、完整有序文件描述符与 primary filename，不暴露 published path 或 local URI；full snapshot 从同一次 guard 内打开的全部 regular file descriptors 复制到 snapshot 私有临时树，并在复制后核对同一 source kind 的 persisted revision、identity descriptor 与 deletion state。真实 publication 变化可由 storage 内部有界重取，持续变化抛出不携带 path/key/revision 的 typed consistency error；静态 inode/content/meta corruption 保持原有 corruption / I/O failure，不伪装为 publication change。snapshot 必须显式关闭且 close 幂等，关闭后其 `Source` 不可再读，full snapshot 的 `materialize()` 只返回临时树路径。
+`SourceDocumentRepositoryProtocol.read_source_snapshot(...)` 是 storage-owned 单文档一致读取边界。snapshot 只接受 storage 已分类为 `COMPLETE` 的 source；`REPAIR_REQUIRED` 或 `UNSAFE` 统一以固定、无路径的异常拒绝，不由 read runtime 重判原因。light snapshot 在同一 publication guard 下返回 exact identity、typed source kind、完整 source meta、provenance、persisted revision、完整有序文件描述符与 primary filename，不暴露 published path 或 local URI；full snapshot 从同一次 inspection 与 guard 内打开的全部 regular file descriptors 复制到 snapshot 私有临时树，并在复制后核对同一 source kind 的 persisted revision、identity descriptor 与 deletion state。真实 publication 变化可由 storage 内部有界重取，持续变化抛出不携带 path/key/revision 的 typed consistency error。snapshot 必须显式关闭且 close 幂等，关闭后其 `Source` 不可再读，full snapshot 的 `materialize()` 只返回临时树路径。
 
 read runtime 的每个 processor cache entry 独占一份 full snapshot，并从中取得 processor、source meta、provenance 与 citation 所需事实。单次 read 在同一 active borrow 内完成 processor 调用、结果与 citation 构造；replacement、LRU eviction、clear 与 runtime close 只 retire entry，若仍有 active borrow 则延迟到最后一次 release 后关闭 snapshot。相同文档的并发 cache miss 在 creation lock 内按 full snapshot 再次核对，只有一个 matching entry 被构建和发布，竞争失败的 snapshot 会立即关闭。storage typed consistency exhaustion 只在 read runtime 映射为既有 `source_changed_during_read` 业务错误。
 
 storage mutation authority 由显式 `BatchToken(transaction_id, ticker)` 承载。只有 `BatchingRepositoryProtocol` 提供 `begin_batch(...)`、`commit_batch(...)` 与 `rollback_batch(...)` lifecycle；source、blob、processed、company 与 filing maintenance 的所有 mutation 都要求 keyword-only `batch=`，并由 shared repository set 的同一 storage core 校验 token 仍开放且 ticker 匹配。异步 task、线程或 callback 不从上下文推断 authority；需要回调写文件时，每次 invocation 都显式接收并传递同一个 token。
 
-source publication 使用 blob-first、complete-source commit：producer 可以先在 caller-owned batch 中按 identity handle 写入全部 blob，published read 在 commit 前仍看不到该 source；随后 producer 只执行一次 final source create/update，完整提供 meta、files、primary、provenance 与 manifest 所需事实。commit validator 是完整 source 的资格 owner，拒绝缺失、悬空、重复、false completion、非法 provenance、symlink 或 containment escape；不存在 acknowledgement、半完成 source 或 stable re-entry 契约。
+Company ticker identity 的 durable owner 分为两项：每个 published corpus 的 identity descriptor 持有 exact canonical ticker；存在且严格合法的 `CompanyMeta` 只额外持有 accepted aliases。descriptor 合法但 `meta.json` 缺失是 canonical-only 的合法状态，不是 corruption，也不允许从文档、请求或目录名反推 alias。`CompanyMetaRepositoryProtocol.resolve_company_ticker(...)` 是 canonical/alias 到 canonical corpus 的唯一公开路由：在 workspace identity guard 内扫描 descriptor 与可选 CompanyMeta，构造单值唯一 index；canonical 与任一 accepted alias 因而路由同一 corpus。descriptor/meta 损坏、二者 identity mismatch 或 durable duplicate owner 产生 closed typed corruption；incoming canonical/alias 被另一 corpus 占用则产生独立 typed conflict。
 
-文件系统实现对同 ticker writer 使用覆盖整个 transaction 的 reservation：同进程调用方通过 per-ticker condition 等待，跨进程调用方通过 blocking writer lock 串行化，不使用 timeout 猜测写者完成。commit 与 recovery 的物理目录切换另由短时 publication guard 保护，published read 不读取 staging，也不被长 staging / validator 阶段阻塞；published meta、manifest、blob、processed 与 `LocalFileSource.open()` 在在线 rename 窗口只能观察完整 old 或完整 new。所有 writer 退出路径统一释放 reservation 并通知等待者；recovery 只做 nonblocking try-lock，活动 writer 存在时立即跳过。journal 只保存可校验的最小相对事实；进程崩溃后 fresh repository 会在相同锁序下恢复到完整 old/new，并清理未提交 staging。
+source publication 使用 blob-first、complete-source commit：producer 可以先在 caller-owned batch 中按 identity handle 写入全部 blob，published read 在 commit 前仍看不到该 source；随后 producer 只执行一次 final source mutation，完整提供 meta、files、primary、provenance 与 manifest 所需事实。完整输入替换既有 source 时，shared Docling owner 先在同一 batch reset exact identity，再以 create 发布唯一 final source meta；reset 前读取的 source meta 继续作为 version、`first_ingested_at` 与 `created_at` 真源。commit validator 是完整 source 的资格 owner，拒绝缺失、悬空、重复、false completion、非法 provenance、symlink 或 containment escape；不存在 acknowledgement、半完成 source 或 stable re-entry 契约。
 
-source repository 以 typed integrity contract 分类 published 或 staged source：`MISSING` 表示目标不存在，`COMPLETE` 表示完整树通过结构、文件大小与 SHA-256 校验，`REPAIR_REQUIRED` 表示已发布目标缺文件、大小不符或 digest 不符；malformed SHA-256 属于结构损坏并直接失败，不降级为可修复状态。下载 workflow 在任何 company、maintenance 或 rejected artifact publication 前执行 whole-tree preflight；恰有一个本轮已选中的损坏目标时先完成 repair 并重新校验完整树，多处损坏或未选中目标损坏则在业务副作用前 fail closed。repair transport 始终重新取得目标内容，Phase B 仍按原请求的 overwrite policy 与同版 identity 决定 publication；provider、PDF 与 Docling I/O 均不在 writer reservation 内执行。
+文件系统实现对同 ticker writer 使用覆盖整个 transaction 的 reservation：同进程调用方通过 per-ticker condition 等待，跨进程调用方通过 blocking writer lock 串行化，不使用 timeout 猜测写者完成。普通既有 corpus 的 document-only commit 保持 ticker writer 到 publication guard 的局部路径；带 CompanyMeta intent 或首次发布 descriptor 的 commit 固定使用 `writer -> recovery -> workspace identity -> publication`，在 backup/swap 前重读 authoritative CompanyMeta、合并 aliases、严格扫描全部 published identities 并验证唯一性。recovery 的物理恢复同样在 nonblocking ticker writer 后取得 workspace identity 与 publication guards，避免 crash 恢复与新 identity publication 交错。published read 不读取 staging，也不被长 staging / validator 阶段阻塞；published meta、manifest、blob、processed 与 `LocalFileSource.open()` 在在线 rename 窗口只能观察完整 old 或完整 new。所有 writer 退出路径统一释放 reservation并通知等待者；journal 只保存可校验的最小相对事实；进程崩溃后 fresh repository 会在相同锁序下恢复到完整 old/new，并清理未提交 staging。
 
-download / upload overwrite 是单目标替换语义，不是 ticker 级清空语义。下载路径不得在发现本轮有效目标 document_id 之前清空 ticker 的全部 filings；空结果、失败或取消不得删除非目标旧文档。上传覆盖路径先完成文件校验、Docling 转换和取消检查，再由顶层 caller 开启短 batch，在其中 reset 目标文档、blob-first 写入文件并发布一次完整 source；commit 前失败或取消只 rollback 一次并保留旧文档，commit 开始后 caller 不再二次 rollback。
+source repository 以同一个 typed integrity contract 分类 published 或 staged source：`MISSING` 表示 exact target 不存在且不承诺 revision；`COMPLETE` 表示结构、provenance、文件声明、physical set、大小、SHA-256、primary/derived projection 与 source-kind manifest 全部一致，并携带可信 opaque revision；`REPAIR_REQUIRED` 携带同一可信 revision，只表达本次完整输入可唯一重建的文件或 manifest 损坏事实；`UNSAFE` 表示 identity、meta、revision、provenance、文件声明、filesystem entry 或跨 source 关系无法建立可信事实，固定不暴露可比较 revision。consumer 只能消费该分类，不从 raw meta、文件存在性、目录内容或异常文本重判。
+
+下载 workflow 在任何 company、maintenance 或 rejected artifact publication 前执行 whole-tree preflight；恰有一个实际 filing 且它是本轮唯一已接受的 repair target 时先重新下载并通过 canonical upsert 重建 source 与 manifest，多处实际 source、多个待修复目标或未选中目标损坏则以 typed preflight error 在业务副作用前 fail closed。单 filing Phase A 在读取旧 meta 前拒绝 `UNSAFE`；Phase B 在 identity 比较和 reset 前重新分类 staged target，`UNSAFE` 同样失败关闭。既有 provider、retry、overwrite 与 rejection policy 不变，provider、PDF 与 Docling I/O 均不在 writer reservation 内执行。
+
+download / upload overwrite 是单目标替换语义，不是 ticker 级清空语义。下载路径不得在发现本轮有效目标 document_id 之前清空 ticker 的全部 filings；空结果、失败或取消不得删除非目标旧文档。上传的 existing full-input update 与允许的 create-overwrite 都先完成文件校验、Docling 转换和取消检查，再由顶层 caller 开启短 batch，在其中 reset exact 目标文档、blob-first 写入完整新集合并 final create；旧文件不会与新集合并存，非目标 filing/material 与 company tree 保持不变。commit 前失败或取消只 rollback 一次并保留旧文档，commit 开始后 caller 不再二次 rollback。
+
+filing 上传的 raw 参数与 published-state 判定由统一 typed validator 持有。财期由 domain fiscal-period owner 统一去除首尾空白、转为大写并限制为 `FY/H1/Q1/Q2/Q3/Q4`；该 static admission 对 US/CN/HK 一致，并在任何 workspace read、producer、observation、job、runner 或 converter 之前拒绝非法值。`FinsUploadFilingRequest.primary_selectors` 只保留调用方声明的 selector 次数，不提前选择角色；static admission 在任何 workspace read 前统一规范文件与 selector 路径，校验 100 个文件上限、delete/files/selector 组合、重复规范路径、selector cardinality 与 membership，再产生唯一 authoritative primary 和保序 companions。单文件没有 selector 时唯一文件自然成为 primary；多文件必须显式且只选择一个 primary。`FinsUploadFilingFiles` 是 validated role selection owner，只保存已经验证的 primary/companions，不从 index、basename 或 stem 推断。CLI 在 Service factory 前完成首次校验，非 CLI runtime 入口也在 producer、observation 或 job 创建前复用同一 validator；Service、runtime runner 与 SEC/CN/HK facade 只透传同一个 validated request，不把它还原为散参。`update` 必须命中已发布 identity，`overwrite` 只允许 create 覆盖或强制重建既有目标，不提供 upsert；`auto` 对 logical deleted source 解析为 update，并在完整输入相同的情况下仍恢复 active source。只有 fresh target 为 `REPAIR_REQUIRED`、raw action 为 `auto` 且 static validator 已产生完整非空 filing selection 时，validator 才产生 existing-source repair authorization；显式 action 与 `UNSAFE` 均失败关闭。
+
+workflow 在 prepare 前通过注入的同一个 `FilingUploadStateRepositoryProtocol` 重读 fresh company/source classification、调用同一 validator 并核对 canonical ticker/document identity；只有 fresh result 的 action、repair authorization、source meta 与 company decision 可以驱动 preparation，旧派生值会被丢弃。filing preparation 全部在 writer batch 外完成：repair 即使 fingerprint 相同也会全量准备，identical filing 也继续转换 primary 并形成 exact publication identity；material 的 identical early skip 保持不变。
+
+全部 upsert filing candidate 随后进入同一个 shared publication owner。owner 取得 per-ticker writer batch，先做取消 checkpoint，再从 batch view 读取 fresh company/source state 并调用同一 validator，按 closed state table 裁决 publish、skip 或 typed conflict，第二个取消 checkpoint 成功后才允许任何 company/source mutation。stable identical retransmission 与 initial `MISSING`、fresh `COMPLETE` 的 exact auto convergence 返回 canonical skip：没有 company intent 时回滚空 batch；存在合法 preserve intent 时只 stage company meta，并通过同一 batch、同一 alias uniqueness guard 提交，不 stage filing/source 内容。显式 create-overwrite 在 fresh source meta 上 rebase 后发布。derived asset identity、完整 original set 或 fresh company decision 任一不 exact equal 均不得近似 skip；initial 已为 `COMPLETE` 后发生 publication 变化也失败关闭。fresh `UNSAFE`、revision 漂移、state-dependent usage conflict 与 storage I/O/corruption 保持各自 closed failure reason。skip/cancel 的 `stored_file_count` 固定为 `0`；cancel 不 stage company/source，skip 只有上述 preserve intent 可以修改 company meta，且 source tree 保持不变。rollback 或 metadata commit 失败不得谎报 skip。不同 ticker 使用独立 writer reservation，同 ticker 不同 filing 在串行 fresh view 上保留完整 union。最终 publish 仍由既有 commit owner 执行：storage 在任何 reset 前以真实 staged tree 重检 exact target 的 status 与 trusted revision，target reset、全部 assets、new revision、canonical manifest 与 fresh company decision 由同一 batch 一次 commit，published reader只观察完整 old或完整 new。fresh workspace 的只读校验不创建 identity、ticker、lock或 job目录，实际写入 owner在首次 mutation时惰性建立基础设施；状态读取损坏或 I/O失败通过 closed path-free operational reason投影，原始 cause只进入 operator log。
+
+filing 的 company meta 与 source/blob 共享一个 caller-owned publication batch：转换失败不打开 batch；cancel 与无 company intent 的 skip 回滚空 batch；带 preserve intent 的 skip 只提交 company meta，publish 则一次 commit 同时发布 company 与 source。company stage、source stage 或 commit 任一失败都不产生部分可见结果。上传失败通过 `dayu.fins.upload_failure` 的 closed kind/code 与固定安全文案贯穿 pipeline result、runtime summary、direct RESULT 详情和 durable failure summary；原始异常只进入 operator log，不进入用户事件或持久化 public summary。
 
 `FilingMaintenanceRepositoryProtocol` 持有 SEC 下载拒绝注册表。注册表条目使用 `DownloadRejectionEntry` typed contract，包含 document id、拒绝原因、分类、SEC form、filing date 和下载版本；文件系统仓储读取非法 registry 时失败关闭，保存时只通过 typed entry 序列化，SEC 下载、SC13 过滤和下载诊断只消费该 typed registry。
 
@@ -120,7 +136,7 @@ financial statement result contract 由 `dayu.fins.domain.financial_result_contr
 
 XBRL facts processor result contract 由 `dayu.fins.domain.xbrl_result_contract` 持有：`query_xbrl_facts` 必须包含扁平 `query_params`、`facts` 与 `data_quality`，可选过滤条件只在实际提供时出现；`reason` 仅在 `partial` 时出现。正常执行但零命中是 `xbrl` 结果；部分 concept 失败是带 reason 的 `partial`；全部 concept 失败抛 typed execution error。read runtime 先校验并独立复制输入，再规范化和稳定去重而不修改 producer 数据；唯一公共 projection 输出最终 `facts`，并只用 `fact_count=len(facts)` 表达同一结果实际返回的事实数量。
 
-上传链路的 company meta freshness 由 `dayu.fins.pipelines.upload_company_meta` 持有：只有既有 meta 的 `resolver_version` 等于当前 upload resolver 版本时才可保留；版本不一致时必须用本次上传字段重新校验并写入。`updated_at` 仅是审计时间，不是 freshness TTL。SEC/CN/HK 下载链路仍由各自 producer 写入公司元数据，不经上传 freshness 逻辑；read runtime 只读取仓储中的 company meta，不刷新或推断 freshness。
+上传链路的 company meta freshness 与 intent construction 由 `dayu.fins.pipelines.upload_company_meta` 持有：只有既有 meta 的 `resolver_version` 等于当前 upload resolver 版本时才可保留；版本不一致时必须用本次上传字段重新校验。producer 只 stage `CompanyMetaCommitIntent`，storage 在 publication lock 内重读 authoritative CompanyMeta，并通过 `dayu.fins.domain.company_meta_contract` 的唯一 pure merge contract 选择非身份字段、stable-union aliases 与 `updated_at`，同时返回与实际写入值相同的 `CompanyMetaCommitOutcome`；prevalidation snapshot 不可覆盖并发更新。shared filing publication 是该 outcome 的唯一业务消费者，只在 commit 成功后的 uploaded/skipped 终态把“提交名称未被采用”投影为最多一个 typed warning；runtime durable summary、direct result、CLI 与 completed wait result 只机械传播同一 warning，失败与取消不推断。SEC/CN/HK 下载 producer 也提交同一 intent contract，但不获得 upload warning 语义。read runtime 只消费 storage 的唯一 ticker route 与已发布 company meta，不刷新或推断 freshness。
 
 ### Resolver
 
@@ -128,7 +144,7 @@ XBRL facts processor result contract 由 `dayu.fins.domain.xbrl_result_contract`
 
 当前已实现 FMP 公司信息 resolver：
 
-- `FmpCompanyInfo(canonical_ticker, company_name, ticker_aliases)`：不可变解析结果，`ticker_aliases` 是 tuple，首项恒为 canonical ticker。
+- `FmpCompanyInfo(ticker_identity, company_name)`：不可变解析结果；`ticker_identity` 同时携带 canonical ticker、市场信息与严格同名搜索得到的 accepted aliases，aliases 不重复 canonical-equivalent 写法。
 - `FmpCompanyInfoResolver(api_key=..., http_client=..., timeout_seconds=...)`：显式接收 FMP API key 和 timeout，不读取环境变量。
 - `resolve_company_info(canonical_ticker)`：先用 `search-symbol` 精确匹配 canonical ticker 后定位公司名，再用 `search-name` 搜索严格同名证券，alias 去重后返回；HTTP、JSON、空结果、无精确 ticker 命中、非法 payload 或第二跳失败都会收口为 `FmpCompanyInfoResolutionError`。
 
@@ -189,8 +205,10 @@ parser，并把 typed mode 保存到独立私有 metadata，而不是改写 raw 
 `dayu.fins.upload_batch` 是本地批量上传领域事实的唯一 owner。它接收不可变的
 `UploadBatchPlanRequest`，在 lexical / resolved containment 与内部 symlink fail-closed 边界内扫描调用方显式传入的
 源目录，并返回由 `UploadBatchFilingEntry`、`UploadBatchMaterialEntry` 和 `UploadBatchSkippedEntry` 组成的
-`UploadBatchPlan`。公开常量 `FINS_UPLOAD_FILE_SUFFIXES` 是 upload 输入后缀真源；默认只扫描直属文件，显式
-recursive 或直接存在 `20YY` / `20YYQn` / `20YYH1` 结构目录时才递归。
+`UploadBatchPlan`。候选文件能否作为 standalone filing 由 `dayu.fins.upload_format_contract`
+投影的 primary capability 决定，batch scanner 不维护独立扩展名集合。默认只扫描直属文件，显式
+recursive 或直接存在 `20YY` / `20YYQn` / `20YYH1` 结构目录时才递归。companion-only 文件不作为 standalone
+candidate，batch 也不从目录位置猜测 primary/companion 关联。
 
 Fins 根据文件名与直接结构父目录产生财年、财期、material routing/name、同期优先级、去重、数量限制和业务可读
 skip reason。年度 filing 最多保留 5 份；周期 filing 只保留最新财年并最多 6 份；presentation 最多 6 份；
@@ -363,6 +381,7 @@ Fins 公共契约分为 Fins 专属契约、Dayu Agent 公共契约和文档处�
 
 - `dayu.fins.domain`：财报领域模型、枚举与共享业务值 parser，包括 `Market`、`SourceKind`、公司元数据、源文档、processed 文档、文件对象、批处理 token、rejected filing artifact、SEC form parser / alias expansion、财期、文档质量与财务数据质量等数据对象和封闭值。
 - `dayu.fins.ticker_normalization`：ticker 标准化结果与 market / exchange 推导。
+- `dayu.fins.upload_format_contract`：在 Documents converter capability 之上叠加 Fins 文件角色，持有 filing primary/companion 与 material 的 immutable typed selection，并为 CLI help 和 LLM-facing upload tool schema 产生同源业务文案。filing 的 validated selection 显式持有必须转换的唯一 primary 与只原样保存的 companions；material 每项都是 converter-required。
 - `dayu.fins.storage.repository_protocols`：公司、源文档、processed、blob、filing maintenance 与批处理事务仓储协议。
 - `FinsDownloadRequest` / `FinsPreprocessRequest` / `FinsUploadFilingRequest` / `FinsUploadMaterialRequest`：下载、预处理与上传请求。
 - `FinsSourceDownloadAdapter` / `FinsSourceDownloadAdapterRequest` / `FinsSourceDownloadAdapterResult`：下载来源 adapter 协议。
@@ -456,6 +475,7 @@ dayu.fins
 ├── ingestion_runtime.py      # download/preprocess/upload direct stream、observation 与 legacy job runtime
 ├── ingestion                 # awaiting resolution、legacy job helper 与 lightweight observation contract
 ├── service_runtime.py        # DefaultFinsRuntime shared assembly root
+├── upload_format_contract.py # converter capability 上的 filing/material 角色与 typed selection owner
 └── ticker_normalization.py   # ticker 标准化
 ```
 
@@ -514,7 +534,7 @@ Processors 在 `dayu.documents.processors` 通用能力上增加财报语义：
 
 虚拟章节 mixin 是表单专项 section / table 发布语义的唯一 owner。刷新时先校验原始表格标记、章节树和同一份候选双向映射，再一次性发布结果：完整映射（包括零表格）发布虚拟章节；没有矛盾但映射缺失或不完整时整体发布基础处理器结果；悬空、重复或双向不一致等矛盾直接失败关闭。已发布模式是终态，重复刷新保持幂等；章节列表、章节读取、搜索、表格列表和表格读取五个公共消费者只读取同一已发布模式与映射，不按可用性静默过滤，也不按位置猜测归属。
 
-`dayu.fins.domain.filing_semantics` 是 fiscal year、fiscal period 与财期 recency rank 的 domain 真源；processor 和 pipeline 负责产生直接 fiscal 事实，read runtime 只校验、排序和投影。`dayu.fins.processors.value_normalization.normalize_optional_dataframe_string(...)` 是 dataframe 可选字符串真源：`None`、空白、NaN、`pd.NA` 与 `pd.NaT` 表示缺失，数字 `0` 与 bool `False` 保留为文本。SEC section、table 与 XBRL processor 直接消费该 helper，不维护本地 wrapper。
+`dayu.fins.domain.filing_semantics` 是 fiscal year、partial calendar year、canonical Gregorian full-date、fiscal period 与财期 recency rank 的 domain 真源。财年和 partial year 只接受非 bool 的 `1000..9999` 整数；canonical full-date 只接受实际存在、月日补零且无首尾空白的 `YYYY-MM-DD`，公历年份域为 `0001..9999`，不继承财年的 `1000` 下界。processor 和 pipeline 负责产生直接 fiscal 事实，read runtime 只校验、排序和投影。`dayu.fins.processors.value_normalization.normalize_optional_dataframe_string(...)` 是 dataframe 可选字符串真源：`None`、空白、NaN、`pd.NA` 与 `pd.NaT` 表示缺失，数字 `0` 与 bool `False` 保留为文本。SEC section、table 与 XBRL processor 直接消费该 helper，不维护本地 wrapper。
 
 ### FinsReadRuntime
 
@@ -535,6 +555,8 @@ Read、download、preprocess、upload 是四个独立 provider：
 
 `FinsIngestionRuntime` 负责 download / preprocess / upload 的业务执行、direct event stream、awaiting observation 和 legacy job-store helper。下载入口只消费 `FinsDownloadRequest` 的 canonical ticker、市场化表单、包含边界的日期窗口、overwrite policy 与 `rebuild_local_artifacts`；下载 pipeline 通过 `FinsSourceDownloadAdapter` 返回待持久化文档，或在 adapter 内通过仓储完成 source / blob / rejected filing artifact 写入并返回有界已持久化摘要。预处理 pipeline 从 source repository 读取文档，经 processor registry 生成 sections / tables，再写入 processed repository；upload 通过 `FinsUploadRunner` 边界执行上传业务。runtime 的业务真源是仓储产物与有界 result summary，不是 Host EventLog，也不是 CLI-facing job id。
 
+Download request wrapper 保留原始日期的首尾空白清理、`YYYY` / `YYYY-M[M]` / `YYYY-M[M]-D[D]` shape、partial inclusive 展开和 `FinsDownloadDateRange` ordering。year 与 year-month 把年份合法性委托给 domain 的 `1000..9999` year owner；full-date 先把一至两位月日补零，再只委托 canonical full-date owner，因此实际公历 `0001..9999` 均可作为完整日期。partial period 的结束边界仍由 wrapper 使用真实月末展开，闰年二月包含 29 日。
+
 Preprocess result summary 使用同一个 typed status helper 判定业务成功或失败。`skipped_count` 只表示已支持但因已有 processed 产物等原因跳过的文档；无可用 processor 的文档单独计入 `not_supported_count` 与 `not_supported_document_ids`，不会混入 skipped。
 
 Direct stream 入口 `download(...)` / `preprocess(...)` / `upload(...)` 是 plain `def`，立即返回 `ValidatedFinsEventStream`。raw bridge 只转发 producer 事件；validator 是“恰好一个且最后一个 `RESULT`”的唯一 Fins owner：它缓存首个 `RESULT`，直到 raw source 正常耗尽后才发布，并在 clean exhaustion 后通过 `terminal_result` 返回同一个 `FinsResultSummary` 实例。缺少 `RESULT`、重复 `RESULT` 或 `RESULT` 后仍出现事件分别抛出同一 typed `FinsDirectStreamProtocolError` contract，Service 与 CLI 只机械消费，不再次扫描或重建错误。成功、失败和取消的合法业务 `RESULT` 仍保持明确终态，不会被改写成 protocol error。Download direct stream 的用户可见进度来自 source-specific downloader / pipeline 事件，再由 adapter 按业务对象粒度通过 runtime progress sink 投影为 direct progress；SEC 当前按 filing 输出，CN/HK 当前按报告下载与转换流程输出。CLI / Service 只展示 direct event 给出的 `stage`、`message` 和 `document_label`，不得从 summary、文件名或日志推断下载进度。Download terminal summary 的 `downloaded`、`skipped`、`rejected` 与 `failed` 是同一批候选 filing 的互斥分类；`total` / `discovered` 必须等于这些分类之和，除非后续 schema 显式增加非互斥指标并在 LLM-facing 文本中说明。Direct event 不包含 job id、sequence、cursor、resume token、sidecar path、绝对路径、provider raw payload 或财报正文。
@@ -549,9 +571,19 @@ production download overwrite 只替换本轮实际写入的目标文档。SEC �
 
 Download terminal 由同一个 typed `FinsResultSummary` 收口：成功、失败与取消具有固定 status/exit code，downloaded、skipped、rejected 与 failed 对同一候选集合互斥且守恒，并携带有界文档明细和缺失期间。每个 `FinsDownloadDocumentResult` 与 public document row 都必填 `covered_fiscal_periods`；CN/HK 原样投影 workflow coverage，SEC 与不适用来源显式投影空 tuple/JSON array。CLI、Service、awaiting observation 与 legacy job projection 只消费该 terminal truth，不从日志、文件树或 provider payload 重建结果。SEC transport 在首个 HTTP 请求前要求显式 User-Agent 或 `SEC_USER_AGENT`；缺失身份、provider failure、取消与完整性失败均按封闭类型进入 download terminal，不用隐式 provider fallback 伪造成功。
 
-当前 `DefaultFinsRuntime` 内置 production upload runner：US filing/material 上传走 SEC upload workflow，CN/HK filing/material 上传走 CN/HK upload facade，通用文件校验、Docling 转换、source document create/update/delete/skip/overwrite 与 blob 写入由 `DoclingUploadService` 通过仓储协议完成。production upload runner 把 pipeline JSON result 收敛为 Fins-local typed upload result，`status` 必须由 pipeline 显式提供，runtime 不用缺省值伪造上传状态。直接调用 `FinsIngestionRuntime.create(...)` 且不装配 `FinsUploadRunner` 时，upload job 仍会进入明确的 failed 终态，不执行真实上传、文件读取或仓储写入。
+当前 `DefaultFinsRuntime` 内置 production upload runner：US filing/material 上传走 SEC upload workflow，CN/HK filing/material 上传走 CN/HK upload facade。两类 workflow 在任何文件读取、converter 调用或发布前产生与 source kind 一致的 typed selection；filing 直接消费 fresh validation 产生的 authoritative selection，material 用同一 Fins owner 将全部输入建模为 converter-required selection。通用文件校验、Docling 转换、source document create/update/delete/skip/overwrite 与 blob 写入由 `DoclingUploadService` 通过仓储协议完成。production upload runner 把 pipeline JSON result 收敛为 Fins-local typed upload result，`status` 必须由 pipeline 显式提供，且只接受 exact lowercase `ok`、`skipped`、`deleted`、`failed`、`cancelled`；前三者映射 completed，后两者分别映射 failed 与 cancelled，大小写、空白变体和未知值都失败关闭。direct stream 与 legacy upload job 共用这一 typed terminal disposition 真源，不从 UI、日志或取消时间重建上传终态。直接调用 `FinsIngestionRuntime.create(...)` 且不装配 `FinsUploadRunner` 时，upload job 仍会进入明确的 failed 终态，不执行真实上传、文件读取或仓储写入。
 
-production upload overwrite 的删除/替换动作由 `DoclingUploadService` 在 storage batch 内执行。SEC/CN/HK upload facade 只解析动作、写 company meta 并调用 upload service；它们不得在 Docling 转换、取消检查或新材料构建前删除旧 source document。
+上传结果中的 `requested_file_count` 来自已校验请求，`stored_file_count` 只统计成功 commit 的 original 文件；Docling 派生资产不增加 stored count。`skipped`、`deleted`、`failed` 与 `cancelled` 的 stored count 固定为 `0`，direct RESULT 与 legacy durable summary 都只消费同一个 `FinsUploadResultSummary`，不从目录、basename 或派生资产数量重算。
+
+filing selection 的全部 originals 会在 publication batch 开始前按角色顺序读取：authoritative primary 在前，companions 保持原请求相对顺序；converter inputs 只包含 authoritative primary，companions 不产生 `conversion_started` 事实或 Docling 派生资产。即使 preparation 已识别出 identical filing，primary conversion 仍会完成，以便 shared owner 比较完整 candidate identity；最终 skip result 只投影每个 original 的 `file_skipped`，不把已完成但未发布的 conversion event 伪装成存储事实。`DoclingUploadService` 为每个不同的规范输入路径产生稳定且无路径明文的 filing asset identity；basename 只通过 `original_filename` 保存为业务可读文件名，因此不同目录同 basename、同 stem 不同后缀都能共存。primary 的 Docling identity 直接从对应 original identity 派生，derived entry 的 `derived_from` 精确回指该 original；同一事实同时成为 storage `primary_document`，并精确命中本次发布的 `files[].name`。storage snapshot 的 `get_primary_source()` 是后续消费真源，`process_filing` 与 read runtime 只处理这条 exact primary derived path，不扫描 originals 或 companions 重新选主文件。
+
+filing source fingerprint 的单文件公式继续只由 filename/content descriptor 决定；多文件公式显式编码 authoritative primary 与按 descriptor 稳定排序的 companions。path-derived asset identity、绝对路径和输入顺序都不进入 fingerprint。可区分文件集合只翻转 primary 会触发 update/version increment，并同步切换 storage 与 downstream primary；primary 与 companion 的 filename、内容校验值、大小和来源完全相同时，无 path/order 标识不足以区分角色，auto 会保守 update 而不做 identical-skip。同 basename、同内容的普通单文件从另一目录重传仍是 identical-skip；basename 改名即使内容不变也会触发 update/version increment；内容改变同样触发 update。material 继续使用既有 name-based asset、derived name、fingerprint、storage metadata、事件与 failure 行为，filing 的 `original_filename` / `derived_from` 投影不会扩展到 material。
+
+全部 raw originals 与 filing 唯一 derived asset 在同一 storage batch 原子发布；material selection 则保持全部文件逐个转换。空文件或 Docling closed conversion failure 由 upload failure owner 产生带 canonical public file label 的 typed content reason；typed terminal detail 投影先排列 requested/stored、closed kind/code、canonical file label 与 bounded message，再排列 retry hint、document 等辅助信息，使有界前缀消费者仍从同一个 reason/count 真源取得可行动失败事实。mixed input 在首个失败处 fail-fast，先转换成功的内存产物不形成 company/source/blob publication，`stored_file_count` 保持 `0`。第三方异常文本、异常链和本地绝对路径只保留在 operator 日志，不进入 direct event 或 durable summary。
+
+material workflow 在 prepare 前以独立 company batch 提交 company meta；后续转换或存储失败不会回滚已提交的 company meta，但 source/blob 仍由后续单一 publication batch 保持零部分发布。filing 的 company meta 则与 source/blob 保持同一 publication batch 的原子边界。
+
+production upload 的 existing full-input update 与 create-overwrite 完整替换由 `DoclingUploadService` 在同一个 storage batch 内执行。filing upsert 的 lifecycle 与 fresh arbitration 由 shared filing publication owner 持有；SEC/CN/HK facade 只机械传入 prepared candidate，并用 owner 返回的 fresh authoritative request 投影 completed action。material 与 filing delete 保持各自既有 workflow，不进入 filing identity arbitration。所有 facade 都不得在 Docling 转换、取消检查或新材料构建前删除旧 source document。
 
 ### Awaiting observation 与 Service wait adapter
 
@@ -627,12 +659,19 @@ direct caller
   -> ticker_normalization.normalize_ticker(...)
   -> validate SourceKind filing/material discrimination
   -> direct stream producer delegates to FinsUploadRunner
-  -> SEC/CN upload workflow
-  -> DoclingUploadService writes through storage repositories
+  -> SEC/CN upload workflow fresh validation
+  -> Fins role overlay produces typed filing/material selection
+  -> DoclingUploadService reads all originals
+  -> filing: convert primary once; material: convert every file
+  -> publish originals and derived assets through one storage batch
   -> emit PROGRESS events and terminal RESULT
 ```
 
 当前 upload 同时具备 direct stream runtime contract、production runner、`start_fins_upload` awaiting tool provider 与 Service wait adapter binding。`FinsUploadFilingRequest` 与 `FinsUploadMaterialRequest` 使用已有 `SourceKind.FILING` / `SourceKind.MATERIAL` 区分 filing 与 material；direct result 只暴露有界业务字段和文件数量，不保存或输出本地文件路径。未装配 `FinsUploadRunner` 时，upload stream 产出 unsupported upload runtime 的 failed RESULT。
+
+直接 `upload_filing` 与 `start_fins_upload` 的 filing 分支在 workspace state read、operation / observation / job 创建和 converter / storage mutation 前执行同一静态 admission：required `fiscal_year` 必须是 `1000..9999` 整数，可选 `filing_date` / `report_date` 若提供则必须是 canonical Gregorian full-date。两个入口都把日期 raw text 原样交给 admission，不 trim，也不把空串或纯空白折叠为缺失；material 分支保持自身既有 normalization。`upload_filings_from` 的扫描与脚本生成元数据处理不属于这两个直接入口的 strict raw-admission contract。
+
+Upload workflow 返回的 summary 表示 publication/no-op/cancellation 已完成 first-commit 仲裁。Direct stream 在同一把 operation lock 上 claim 一次 summary，再从该 claim 投影 progress 与唯一 RESULT；cancelled 不发 completed progress，failed 只发 completed-with-failures，completed 只发 completed。Legacy upload job 使用 upload 专属 atomic save：completed/failed summary 不会被 runner 返回后的迟到取消改写，cancelled summary 走 cancelled save；terminal record 保存后，progress 与 terminal event 才从最终 record 投影。Download 与 preprocess 原有 success-or-cancelled / failed-or-cancelled 终态语义不受 upload 规则影响。
 
 ## 状态机
 
@@ -795,7 +834,9 @@ Direct stream 不创建 durable job record；调用方关闭 async iterator、�
 
 Runtime producer 在进入 download / preprocess / upload 业务执行前检查取消，避免已取消 observation 再启动后续长事务。SEC 下载在公司解析、submissions / history 拉取、filing 选择、Browse EDGAR 补选、index / headers / candidate 文件收集、单 filing 文件列表、HTTP 限流 / 退避、HEAD / GET、文件循环和落盘前后检查取消；取消命中后停止后续 SEC 请求和文件处理，不把用户取消记为 failed file / failed filing。CN/HK 下载在 discovery、候选选择、目标完整性判断、单 filing asset 下载、PDF bytes 读取、Docling convert、batch 内 blob-first 写入和完整 source 最终发布前后检查取消；取消命中后产出 cancelled summary，已经完成的原子落盘保持一致，不再启动后续耗时步骤。
 
-CN/HK Docling convert 在独立子进程中执行；父进程持续观察 operation cancellation，取消时按 terminate、必要时 kill、close 的顺序回收子进程，并清理系统临时目录。正常结果在进入 storage batch 前完成输出存在性、大小与 SHA-256 校验；转换失败、取消或输出损坏都不会发布半成品 source。
+Upload 取消以 workflow publication 与 terminal summary 的 first-committer 为准：publication 前观察到取消时返回 cancelled，publication/no-op 或 failed summary 已接受后到达的取消只保留为请求事实，不回滚产物，也不改写 terminal。CLI 与其它消费者只展示 runtime 产出的 canonical progress/result，不删除或替换迟到事件。
+
+CN/HK Docling convert 在独立子进程中执行；child adapter 只在第三方 conversion 调用期间隔离继承的公开 stderr，第三方 logger、traceback 与本地路径不会绕过 closed failure descriptor 直接进入 CLI stderr。隔离退出时恢复并关闭 descriptor，且 flush 清理失败不会改写已有的 conversion 失败分类。父进程持续观察 operation cancellation，取消时按 terminate、必要时 kill、close 的顺序回收子进程，并清理系统临时目录。正常结果在进入 storage batch 前完成输出存在性、大小与 SHA-256 校验；转换失败、取消或输出损坏都不会发布半成品 source。
 
 ### Service wait adapter 与 Host resume
 
@@ -803,7 +844,7 @@ Fins awaiting tools 不直接恢复 Host Run。Service assembly 根据 active ty
 
 ### Ticker normalization
 
-Fins read 与 ingestion 都通过 `ticker_normalization.normalize_ticker(...)` 收口 ticker 输入，生成 canonical ticker、market 和 exchange。工具 schema 允许模型传自然 ticker 写法；业务路由以 canonical ticker 为准。upload company meta 的每个非空 `ticker_aliases` 输入都通过 `try_normalize_ticker(...)` 生成 canonical alias，主 ticker 始终位于首项且相同 canonical 只保存一次；无法识别的 alias 在仓储写入前失败关闭。
+Fins ticker grammar、canonicalization 与 stable dedupe 统一由 `CompanyTickerIdentity` builder 持有，并生成 canonical ticker、market、exchange 与 accepted aliases。upload company meta 的每个非空 alias 都必须通过同一 builder；canonical-equivalent 写法只形成 canonical，不进入 aliases，distinct aliases 保持首次出现顺序，无法识别的 alias 在仓储写入前失败关闭。Read runtime 不再构造候选、转大写或 loose fallback，只把原始单个查询 token 交给 storage 的 `resolve_company_ticker(...)`；storage 机械消费 descriptor canonical + valid CompanyMeta aliases 的唯一 index。
 
 ## 扩展点
 

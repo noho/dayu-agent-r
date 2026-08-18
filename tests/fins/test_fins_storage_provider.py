@@ -24,6 +24,8 @@ from typing import Final, Literal, cast
 
 import pytest
 
+from tests.fins.company_meta_test_support import stage_company_meta_fixture
+
 import dayu.fins.storage._fs_source_snapshot as source_snapshot_module
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
@@ -63,12 +65,14 @@ from dayu.documents.processors.base import (
 )
 from dayu.runtime.filelock import RuntimeFileLockToken
 from dayu.documents.processors.source import Source
+from dayu.fins.ticker_normalization import build_company_ticker_identity
 from dayu.fins.domain.document_models import (
     BatchToken,
     CompanyMeta,
     DocumentMeta,
     DocumentSummary,
     DownloadRejectionEntry,
+    FileObjectMeta,
     FinsSourceProvider,
     ProcessedCreateRequest,
     RejectedFilingArtifactUpsertRequest,
@@ -84,6 +88,7 @@ from dayu.fins.domain.filing_semantics import FISCAL_PERIODS
 from dayu.fins.domain.xbrl_result_contract import XbrlQueryExecutionError
 from dayu.fins.domain.tool_models import Citation
 from dayu.fins.storage import (
+    CompanyTickerIdentityCorruptionError,
     FsBatchingRepository,
     FsCompanyMetaRepository,
     FsDocumentBlobRepository,
@@ -197,6 +202,50 @@ _CompleteSourceFailureCase = Literal[
     "duplicate_manifest_identity",
     "manifest_ticker_mismatch",
 ]
+
+
+def _fresh_upload_file_entry(
+    file_meta: FileObjectMeta,
+    *,
+    name: str,
+    source: Literal["original", "docling"],
+    original_filename: str,
+    derived_from: str | None = None,
+) -> dict[str, JsonValue]:
+    """把已 staged blob 投影为 UF-FIX07 fresh filing file entry。
+
+    Args:
+        file_meta: blob repository 返回的 physical file meta。
+        name: storage-owned exact asset identity。
+        source: original 或 Docling role。
+        original_filename: 用户输入 basename。
+        derived_from: Docling 对应的 exact original identity。
+
+    Returns:
+        可直接写入 ``SourceDocumentUpsertRequest.file_entries`` 的严格条目。
+
+    Raises:
+        ValueError: Docling 缺少 derived identity，或 original 错带 derived identity 时抛出。
+    """
+
+    if source == "docling" and derived_from is None:
+        raise ValueError("Docling fixture 必须携带 derived_from")
+    if source == "original" and derived_from is not None:
+        raise ValueError("original fixture 不得携带 derived_from")
+    entry: dict[str, JsonValue] = {
+        "name": name,
+        "uri": file_meta.uri,
+        "etag": file_meta.etag,
+        "last_modified": file_meta.last_modified,
+        "size": file_meta.size,
+        "content_type": file_meta.content_type,
+        "sha256": file_meta.sha256,
+        "source": source,
+        "original_filename": original_filename,
+    }
+    if derived_from is not None:
+        entry["derived_from"] = derived_from
+    return entry
 
 
 class _OpenCancellationToken:
@@ -1089,12 +1138,12 @@ def test_rollback_and_non_source_batch_preserve_published_revision(tmp_path: Pat
     )
 
     company_batch = batching.begin_batch("AAPL")
-    company_repository.upsert_company_meta(
+    stage_company_meta_fixture(
+        company_repository,
         CompanyMeta(
             company_id="0000320193",
             company_name="Apple Inc.",
-            ticker="AAPL",
-            market="US",
+            ticker_identity=build_company_ticker_identity("AAPL", ()),
             resolver_version="snapshot-test",
             updated_at=now_iso8601(),
         ),
@@ -1282,6 +1331,18 @@ def test_snapshot_explicit_source_kind_ignores_other_kind_with_same_document_id(
             batch=batch,
             content_type="text/html",
         )
+        original_name = f"original-{filename}"
+        original_meta = (
+            blob_repository.store_file(
+                handle,
+                original_name,
+                io.BytesIO(b"original filing version"),
+                batch=batch,
+                content_type="text/html",
+            )
+            if source_kind is SourceKind.FILING
+            else None
+        )
         repository.create_source_document(
             SourceDocumentUpsertRequest(
                 ticker="AAPL",
@@ -1293,7 +1354,26 @@ def test_snapshot_explicit_source_kind_ignores_other_kind_with_same_document_id(
                     "ingest_method": "upload",
                     "source_provider": "user_upload",
                 },
-                files=[file_meta],
+                files=[file_meta] if original_meta is None else [],
+                file_entries=(
+                    None
+                    if original_meta is None
+                    else [
+                        _fresh_upload_file_entry(
+                            original_meta,
+                            name=original_name,
+                            source="original",
+                            original_filename=filename,
+                        ),
+                        _fresh_upload_file_entry(
+                            file_meta,
+                            name=filename,
+                            source="docling",
+                            original_filename=filename,
+                            derived_from=original_name,
+                        ),
+                    ]
+                ),
             ),
             source_kind,
             batch=batch,
@@ -1659,7 +1739,10 @@ def test_invalid_primary_never_projects_first_file_and_commit_preserves_publishe
     )
 
     assert projected_handle.primary_file_uri is None
-    with pytest.raises(ValueError, match="primary_document 未精确命中 files"):
+    with pytest.raises(
+        ValueError,
+        match="filing source publication 不满足 complete canonical manifest contract",
+    ):
         batching_repository.commit_batch(invalid_batch)
     with pytest.raises(ValueError, match="未在当前 storage core 登记"):
         batching_repository.rollback_batch(invalid_batch)
@@ -1771,7 +1854,17 @@ def test_complete_filing_and_material_commit_share_one_source_truth(tmp_path: Pa
             source_kind,
             meta=meta,
         )
-        assert primary.uri == meta["files"][0]["uri"]
+        raw_files = meta["files"]
+        assert isinstance(raw_files, list)
+        primary_name = meta["primary_document"]
+        assert isinstance(primary_name, str)
+        primary_items = [
+            item
+            for item in raw_files
+            if isinstance(item, dict) and item.get("name") == primary_name
+        ]
+        assert len(primary_items) == 1
+        assert primary.uri == primary_items[0]["uri"]
         assert blob_repository.read_file_bytes(handle, f"{document_id}.txt") == document_id.encode()
         assert provenance.source_provider is FinsSourceProvider.USER_UPLOAD
         assert provenance.ingest_complete is True
@@ -1902,7 +1995,10 @@ def test_blob_only_commit_failure_keeps_new_source_absent(tmp_path: Path) -> Non
         batch=batch,
     )
 
-    with pytest.raises(ValueError, match="缺少 manifest"):
+    with pytest.raises(
+        ValueError,
+        match="filing source publication 不满足 complete canonical manifest contract",
+    ):
         batching_repository.commit_batch(batch)
     with pytest.raises(FileNotFoundError):
         source_repository.get_source_meta("AAPL", "blob_only", SourceKind.FILING)
@@ -2245,8 +2341,9 @@ def test_identity_mapping_detects_collision_corruption_and_business_meta_mismatc
     original_dir = collision_set.core._target_ticker_dir("AAPL")
     collision_dir = collision_set.core._target_ticker_dir("MSFT")
     original_dir.rename(collision_dir)
-    with pytest.raises(ValueError, match="identity descriptor"):
+    with pytest.raises(CompanyTickerIdentityCorruptionError) as collision_error:
         collision_batches.begin_batch("MSFT")
+    assert collision_error.value.kind == "invalid_descriptor"
 
     corrupt_root = tmp_path / "corrupt"
     corrupt_set = build_fs_repository_set(workspace_root=corrupt_root)
@@ -2258,20 +2355,21 @@ def test_identity_mapping_detects_collision_corruption_and_business_meta_mismatc
         path for path in corrupt_dir.iterdir() if path.name.startswith(".") and path.suffix == ".json"
     )
     descriptor_path.write_text("{}", encoding="utf-8")
-    with pytest.raises(ValueError, match="descriptor"):
+    with pytest.raises(CompanyTickerIdentityCorruptionError) as descriptor_error:
         corrupt_batches.begin_batch("AAPL")
+    assert descriptor_error.value.kind == "invalid_descriptor"
 
     mismatch_root = tmp_path / "business-mismatch"
     mismatch_set = build_fs_repository_set(workspace_root=mismatch_root)
     mismatch_batches = FsBatchingRepository(mismatch_root, repository_set=mismatch_set)
     company = FsCompanyMetaRepository(mismatch_root, repository_set=mismatch_set)
     mismatch_batch = mismatch_batches.begin_batch("AAPL")
-    company.upsert_company_meta(
+    stage_company_meta_fixture(
+        company,
         CompanyMeta(
             company_id="company-aapl",
             company_name="Apple Inc.",
-            ticker="AAPL",
-            market="US",
+            ticker_identity=build_company_ticker_identity("AAPL", ()),
             resolver_version="test",
             updated_at=now_iso8601(),
         ),
@@ -2283,8 +2381,9 @@ def test_identity_mapping_detects_collision_corruption_and_business_meta_mismatc
     assert isinstance(meta_payload, dict)
     meta_payload["ticker"] = "MSFT"
     meta_path.write_text(json.dumps(meta_payload), encoding="utf-8")
-    with pytest.raises(ValueError, match="identity descriptor"):
+    with pytest.raises(CompanyTickerIdentityCorruptionError) as mismatch_error:
         company.get_company_meta("AAPL")
+    assert mismatch_error.value.kind == "identity_mismatch"
 
 
 def test_company_inventory_projects_canonical_ticker_and_hides_invalid_candidate(
@@ -2383,12 +2482,12 @@ def test_public_storage_errors_never_expose_internal_locator_or_workspace_path(
     ticker = "AAPL"
     document_id = "fil_缺失/错误\\.."
     batch = batching.begin_batch(ticker)
-    company.upsert_company_meta(
+    stage_company_meta_fixture(
+        company,
         CompanyMeta(
             company_id="opaque-company",
             company_name="Opaque Company",
-            ticker=ticker,
-            market="US",
+            ticker_identity=build_company_ticker_identity(ticker, ()),
             resolver_version="test",
             updated_at=now_iso8601(),
         ),
@@ -2419,8 +2518,9 @@ def test_public_storage_errors_never_expose_internal_locator_or_workspace_path(
         )
     company_meta_path = repository_set.core._company_meta_path_for_read(ticker)
     company_meta_path.write_text("{", encoding="utf-8")
-    with pytest.raises(ValueError, match="JSON 解析失败") as company_error:
+    with pytest.raises(CompanyTickerIdentityCorruptionError) as company_error:
         company.get_company_meta(ticker)
+    assert company_error.value.kind == "invalid_meta"
 
     errors = (
         source_error.value,
@@ -2475,12 +2575,12 @@ def test_public_storage_os_errors_are_path_free_across_read_and_inventory_bounda
         source_kind=SourceKind.FILING.value,
     )
     batch = batching.begin_batch(ticker)
-    company.upsert_company_meta(
+    stage_company_meta_fixture(
+        company,
         CompanyMeta(
             company_id="permission-company",
             company_name="Permission Company",
-            ticker=ticker,
-            market="US",
+            ticker_identity=build_company_ticker_identity(ticker, ()),
             resolver_version="test",
             updated_at=now_iso8601(),
         ),
@@ -2942,15 +3042,14 @@ def test_read_runtime_citation_reuses_same_snapshot_provenance(tmp_path: Path) -
     blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
     processed_repository = FsProcessedDocumentRepository(workspace_root, repository_set=repository_set)
     batch = batching_repository.begin_batch("AAPL")
-    company_repository.upsert_company_meta(
+    stage_company_meta_fixture(
+        company_repository,
         CompanyMeta(
             company_id="0000320193",
             company_name="Apple Inc.",
-            ticker="AAPL",
-            market="US",
+            ticker_identity=build_company_ticker_identity("AAPL", ()),
             resolver_version="test",
             updated_at=now_iso8601(),
-            ticker_aliases=[],
         ),
         batch=batch,
     )
@@ -3074,7 +3173,8 @@ def test_fins_read_tool_schemas_do_not_expose_execution_context(tmp_path: Path) 
     ticker_schema: Mapping[str, JsonValue] = {
         "type": "string",
         "description": (
-            "股票代码。直接使用自然的股票代码写法，例如 AAPL、600519 或 0700；不要传公司名称，也不要手工穷举代码变体。"
+            "公司财报代码。可传工作区已接收的主代码或该公司的任一已接收别名；"
+            "两者会查询同一家公司归档。不要传公司名称，也不要手工穷举代码变体。"
         ),
     }
     document_id_schema: Mapping[str, JsonValue] = {
@@ -3168,6 +3268,161 @@ def test_fins_read_process_target_fast_path_uses_default_runtime(tmp_path: Path)
     value = _completed_envelope_value(envelope)
     assert isinstance(value, Mapping)
     assert value.get("matched") == 1
+
+
+def test_list_documents_canonical_and_accepted_alias_route_same_corpus(
+    tmp_path: Path,
+) -> None:
+    """canonical 与 accepted alias 应通过唯一 storage contract 返回同一 corpus。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: alias 被下游猜测、未命中或路由到不同 corpus 时抛出。
+    """
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    canonical_value = _completed_envelope_value(
+        _build_process_target(
+            workspace_root,
+            "list_documents",
+            {"ticker": "AAPL"},
+        )()
+    )
+    alias_value = _completed_envelope_value(
+        _build_process_target(
+            workspace_root,
+            "list_documents",
+            {"ticker": "apple"},
+        )()
+    )
+
+    assert alias_value == canonical_value
+    assert isinstance(alias_value, Mapping)
+    assert alias_value.get("matched") == 1
+
+
+def test_list_documents_meta_less_corpus_coexists_with_healthy_alias_corpus(
+    tmp_path: Path,
+) -> None:
+    """meta-less corpus 应 canonical-only，且不影响 healthy corpus 的 alias e2e 路由。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: meta-less 被视为损坏、获得隐式 alias 或污染其它 corpus 时抛出。
+    """
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    repository_set = build_fs_repository_set(workspace_root=workspace_root)
+    batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
+    company_repository = FsCompanyMetaRepository(workspace_root, repository_set=repository_set)
+    source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
+    batch = batching_repository.begin_batch("DELTA")
+    request = SourceDocumentUpsertRequest(
+        ticker="DELTA",
+        document_id="delta-material",
+        internal_document_id="delta-material",
+        form_type="material",
+        primary_document="delta.md",
+        meta={
+            "fiscal_year": 2025,
+            "fiscal_period": "FY",
+            "ingest_method": "upload",
+            "source_provider": "user_upload",
+        },
+    )
+    source_repository.create_source_document(request, SourceKind.MATERIAL, batch=batch)
+    handle = SourceHandle(
+        ticker="DELTA",
+        document_id="delta-material",
+        source_kind=SourceKind.MATERIAL.value,
+    )
+    file_meta = blob_repository.store_file(
+        handle,
+        "delta.md",
+        io.BytesIO(b"# Delta material\n"),
+        batch=batch,
+        content_type="text/markdown",
+    )
+    source_repository.update_source_document(
+        SourceDocumentUpsertRequest(
+            ticker=request.ticker,
+            document_id=request.document_id,
+            internal_document_id=request.internal_document_id,
+            form_type=request.form_type,
+            primary_document=request.primary_document,
+            meta=request.meta,
+            files=[file_meta],
+        ),
+        SourceKind.MATERIAL,
+        batch=batch,
+    )
+    batching_repository.commit_batch(batch)
+
+    delta_value = _completed_envelope_value(
+        _build_process_target(workspace_root, "list_documents", {"ticker": "DELTA"})()
+    )
+    delta_variant_value = _completed_envelope_value(
+        _build_process_target(workspace_root, "list_documents", {"ticker": "delta.us"})()
+    )
+    aapl_value = _completed_envelope_value(
+        _build_process_target(workspace_root, "list_documents", {"ticker": "AAPL"})()
+    )
+    apple_value = _completed_envelope_value(
+        _build_process_target(workspace_root, "list_documents", {"ticker": "APPLE"})()
+    )
+
+    assert delta_variant_value == delta_value
+    assert isinstance(delta_value, Mapping)
+    assert delta_value.get("matched") == 1
+    assert apple_value == aapl_value
+    assert company_repository.resolve_company_ticker("DLTA") is None
+    assert not (workspace_root / "portfolio" / "DELTA" / "meta.json").exists()
+
+
+def test_list_documents_projects_descriptor_corruption_as_actionable_business_error(
+    tmp_path: Path,
+) -> None:
+    """read owner 应把 typed descriptor corruption 投影为固定可行动错误。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: corruption 泄露路径、落入 NOT_FOUND 或 execution error 时抛出。
+    """
+
+    workspace_root = _build_fins_workspace(tmp_path)
+    descriptor_candidates = tuple(
+        path
+        for path in (workspace_root / "portfolio" / "AAPL").iterdir()
+        if path.name.startswith(".") and path.suffix == ".json"
+    )
+    assert len(descriptor_candidates) == 1
+    descriptor_path = descriptor_candidates[0]
+    descriptor_path.write_text("{}", encoding="utf-8")
+    read_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_read_runtime()
+
+    with pytest.raises(FinsReadBusinessError) as exc_info:
+        read_runtime.list_documents(ticker="AAPL")
+
+    assert exc_info.value.code is ErrorCode.WORKSPACE_IDENTITY_CORRUPTED
+    assert exc_info.value.message == "工作区中的公司代码身份数据不一致，当前无法安全解析该公司"
+    assert exc_info.value.hint == "请修复该工作区的公司元数据后重试"
+    assert str(workspace_root) not in str(exc_info.value)
 
 
 def test_fins_read_process_target_processor_and_table_paths(tmp_path: Path) -> None:
@@ -4720,6 +4975,14 @@ async def _create_child_task_source(
         batch=batch,
         content_type="text/markdown",
     )
+    original_name = "original-aapl-child-task.md"
+    original_meta = blob_repository.store_file(
+        SourceHandle("AAPL", "aapl-child-task", SourceKind.FILING.value),
+        original_name,
+        io.BytesIO(b"original child task source"),
+        batch=batch,
+        content_type="text/markdown",
+    )
     source_repository.create_source_document(
         SourceDocumentUpsertRequest(
             ticker="AAPL",
@@ -4727,7 +4990,21 @@ async def _create_child_task_source(
             internal_document_id="aapl-child-task",
             form_type="10-K",
             primary_document="aapl-child-task.md",
-            files=[file_meta],
+            file_entries=[
+                _fresh_upload_file_entry(
+                    original_meta,
+                    name=original_name,
+                    source="original",
+                    original_filename="aapl-child-task.md",
+                ),
+                _fresh_upload_file_entry(
+                    file_meta,
+                    name="aapl-child-task.md",
+                    source="docling",
+                    original_filename="aapl-child-task.md",
+                    derived_from=original_name,
+                ),
+            ],
             meta={
                 "fiscal_year": 2024,
                 "fiscal_period": "FY",
@@ -4769,13 +5046,35 @@ def test_explicit_batch_allows_worker_thread_mutation_on_shared_core(tmp_path: P
         batch=token,
         content_type="text/markdown",
     )
+    original_name = "original-aapl-worker-thread.md"
+    original_meta = blob_repository.store_file(
+        SourceHandle("AAPL", "aapl-worker-thread", SourceKind.FILING.value),
+        original_name,
+        io.BytesIO(b"original worker thread source"),
+        batch=token,
+        content_type="text/markdown",
+    )
     request = SourceDocumentUpsertRequest(
         ticker="AAPL",
         document_id="aapl-worker-thread",
         internal_document_id="aapl-worker-thread",
         form_type="10-K",
         primary_document="aapl-worker-thread.md",
-        files=[file_meta],
+        file_entries=[
+            _fresh_upload_file_entry(
+                original_meta,
+                name=original_name,
+                source="original",
+                original_filename="aapl-worker-thread.md",
+            ),
+            _fresh_upload_file_entry(
+                file_meta,
+                name="aapl-worker-thread.md",
+                source="docling",
+                original_filename="aapl-worker-thread.md",
+                derived_from=original_name,
+            ),
+        ],
         meta={
             "ingest_method": "upload",
             "source_provider": FinsSourceProvider.USER_UPLOAD.to_storage_value(),
@@ -4863,15 +5162,14 @@ def _build_fins_workspace(tmp_path: Path) -> Path:
     blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
     token = batching_repository.begin_batch("AAPL")
     try:
-        company_repository.upsert_company_meta(
+        stage_company_meta_fixture(
+            company_repository,
             CompanyMeta(
                 company_id="0000320193",
                 company_name="Apple Inc.",
-                ticker="AAPL",
-                market="US",
+                ticker_identity=build_company_ticker_identity("AAPL", ("APPLE",)),
                 resolver_version="test",
                 updated_at=now_iso8601(),
-                ticker_aliases=["APPLE"],
             ),
             batch=token,
         )
@@ -4907,6 +5205,14 @@ def _build_fins_workspace(tmp_path: Path) -> Path:
             batch=token,
             content_type="text/markdown",
         )
+        original_name = "original-aapl-2024-10k.md"
+        original_meta = blob_repository.store_file(
+            handle,
+            original_name,
+            io.BytesIO(b"original upload fixture"),
+            batch=token,
+            content_type="text/markdown",
+        )
         source_repository.update_source_document(
             SourceDocumentUpsertRequest(
                 ticker="AAPL",
@@ -4923,7 +5229,21 @@ def _build_fins_workspace(tmp_path: Path) -> Path:
                     "ingest_method": "upload",
                     "source_provider": "user_upload",
                 },
-                files=[file_meta],
+                file_entries=[
+                    _fresh_upload_file_entry(
+                        original_meta,
+                        name=original_name,
+                        source="original",
+                        original_filename="aapl-2024-10k.md",
+                    ),
+                    _fresh_upload_file_entry(
+                        file_meta,
+                        name="aapl-2024-10k.md",
+                        source="docling",
+                        original_filename="aapl-2024-10k.md",
+                        derived_from=original_name,
+                    ),
+                ],
             ),
             SourceKind.FILING,
             batch=token,
@@ -5096,15 +5416,82 @@ def _create_source_document_for_provenance(
         batch=batch,
         content_type="text/markdown" if processor_compatible else "text/plain",
     )
+    is_fresh_upload_filing = (
+        source_kind is SourceKind.FILING
+        and ingest_method == "upload"
+        and source_provider == FinsSourceProvider.USER_UPLOAD.to_storage_value()
+    )
+    docling_name = f"{filename}_docling.json"
+    docling_meta = (
+        blob_repository.store_file(
+            handle,
+            docling_name,
+            io.BytesIO(
+                json.dumps(
+                    {
+                        "schema_name": "DoclingDocument",
+                        "version": "1.10.0",
+                        "name": document_id,
+                        "furniture": {
+                            "self_ref": "#/furniture",
+                            "children": [],
+                            "content_layer": "furniture",
+                            "name": "_root_",
+                            "label": "unspecified",
+                        },
+                        "body": {
+                            "self_ref": "#/body",
+                            "children": [],
+                            "content_layer": "body",
+                            "name": "_root_",
+                            "label": "unspecified",
+                        },
+                        "groups": [],
+                        "texts": [],
+                        "pictures": [],
+                        "tables": [],
+                        "key_value_items": [],
+                        "form_items": [],
+                        "pages": {},
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ),
+            batch=batch,
+            content_type="application/json",
+        )
+        if is_fresh_upload_filing
+        else None
+    )
+    file_entries = (
+        [
+            _fresh_upload_file_entry(
+                file_meta,
+                name=filename,
+                source="original",
+                original_filename=filename,
+            ),
+            _fresh_upload_file_entry(
+                docling_meta,
+                name=docling_name,
+                source="docling",
+                original_filename=filename,
+                derived_from=filename,
+            ),
+        ]
+        if docling_meta is not None
+        else None
+    )
     source_repository.create_source_document(
         SourceDocumentUpsertRequest(
             ticker=ticker,
             document_id=document_id,
             internal_document_id=document_id,
             form_type="10-K",
-            primary_document=filename,
+            primary_document=docling_name if docling_meta is not None else filename,
             meta=meta,
-            files=[file_meta],
+            files=[] if file_entries is not None else [file_meta],
+            file_entries=file_entries,
         ),
         source_kind,
         batch=batch,
@@ -5242,15 +5629,14 @@ def _build_read_runtime_with_provenance_documents(tmp_path: Path) -> FinsReadRun
         ("600519", "600519_CNINFO", "CN"),
         ("0700", "0700_HKEX", "HK"),
     ):
-        company_repository.upsert_company_meta(
+        stage_company_meta_fixture(
+            company_repository,
             CompanyMeta(
                 company_id=company_id,
                 company_name=f"{ticker} Test Company",
-                ticker=ticker,
-                market=market,
+                ticker_identity=build_company_ticker_identity(ticker, ()),
                 resolver_version="test",
                 updated_at=now_iso8601(),
-                ticker_aliases=[],
             ),
             batch=batches[ticker],
         )
@@ -5341,15 +5727,14 @@ def _build_fins_financial_html_workspace(tmp_path: Path) -> Path:
     blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
     token = batching_repository.begin_batch("AAPL")
     try:
-        company_repository.upsert_company_meta(
+        stage_company_meta_fixture(
+            company_repository,
             CompanyMeta(
                 company_id="0000320193",
                 company_name="Apple Inc.",
-                ticker="AAPL",
-                market="US",
+                ticker_identity=build_company_ticker_identity("AAPL", ()),
                 resolver_version="test",
                 updated_at=now_iso8601(),
-                ticker_aliases=[],
             ),
             batch=token,
         )
@@ -5362,6 +5747,14 @@ def _build_fins_financial_html_workspace(tmp_path: Path) -> Path:
             handle,
             _FINANCIAL_HTML_PRIMARY_DOCUMENT,
             io.BytesIO(_fixture_financial_html().encode("utf-8")),
+            batch=token,
+            content_type="text/html",
+        )
+        original_name = f"original-{_FINANCIAL_HTML_PRIMARY_DOCUMENT}"
+        original_meta = blob_repository.store_file(
+            handle,
+            original_name,
+            io.BytesIO(b"original financial upload fixture"),
             batch=token,
             content_type="text/html",
         )
@@ -5381,7 +5774,21 @@ def _build_fins_financial_html_workspace(tmp_path: Path) -> Path:
                     "ingest_method": "upload",
                     "source_provider": "user_upload",
                 },
-                files=[file_meta],
+                file_entries=[
+                    _fresh_upload_file_entry(
+                        original_meta,
+                        name=original_name,
+                        source="original",
+                        original_filename=_FINANCIAL_HTML_PRIMARY_DOCUMENT,
+                    ),
+                    _fresh_upload_file_entry(
+                        file_meta,
+                        name=_FINANCIAL_HTML_PRIMARY_DOCUMENT,
+                        source="docling",
+                        original_filename=_FINANCIAL_HTML_PRIMARY_DOCUMENT,
+                        derived_from=original_name,
+                    ),
+                ],
             ),
             SourceKind.FILING,
             batch=token,
@@ -5427,15 +5834,14 @@ def _build_fins_aapl_xbrl_workspace(
     source_meta = _source_meta_without_files(meta)
     token = batching_repository.begin_batch("AAPL")
     try:
-        company_repository.upsert_company_meta(
+        stage_company_meta_fixture(
+            company_repository,
             CompanyMeta(
                 company_id="0000320193",
                 company_name="Apple Inc.",
-                ticker="AAPL",
-                market="US",
+                ticker_identity=build_company_ticker_identity("AAPL", ("APPLE",)),
                 resolver_version="test",
                 updated_at=now_iso8601(),
-                ticker_aliases=["APPLE"],
             ),
             batch=token,
         )

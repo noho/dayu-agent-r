@@ -14,9 +14,11 @@ from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from threading import Event
-from typing import Literal, Optional, cast
+from typing import BinaryIO, Literal, Optional, cast
 
 import pytest
+
+from tests.fins.company_meta_test_support import stage_company_meta_fixture
 
 from dayu.fins.downloaders.sec_downloader import (
     BrowseEdgarFiling,
@@ -35,6 +37,7 @@ from dayu.fins.downloaders.sec_downloader import (
 )
 from dayu.fins.domain.document_models import (
     BatchToken,
+    CompanyMeta,
     DownloadRejectionEntry,
     FileObjectMeta,
     FilingUpdateRequest,
@@ -80,18 +83,23 @@ from dayu.fins.pipelines.sec_pipeline import (
 from dayu.fins.pipelines.sec_sc13_filtering import SC13_FORMS as _SC13_FORMS, SC13_RETRY_MAX as _SC13_RETRY_MAX
 from dayu.fins.storage import (
     FsBatchingRepository,
+    FsCompanyMetaRepository,
     FsDocumentBlobRepository,
     FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
+    SourceIntegrityClassification,
     SourceIntegrityPreflightError,
     SourceIntegrityPreflightReason,
+    SourceIntegrityReason,
+    SourceIntegrityStatus,
 )
 from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
 from dayu.fins.storage.repository_protocols import (
+    ProcessedDocumentRepositoryProtocol,
     SourceDocumentRepositoryProtocol,
     SourceSnapshotProtocol,
 )
-from dayu.fins.ticker_normalization import normalize_ticker
+from dayu.fins.ticker_normalization import build_company_ticker_identity, normalize_ticker
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 
 
@@ -271,6 +279,18 @@ class _RollbackOutcomeBatchingRepository(FsBatchingRepository):
         super().rollback_batch(batch)
         if self.rollback_error is not None:
             raise self.rollback_error
+
+
+@dataclass(slots=True)
+class _SecPhaseBMutationCalls:
+    """记录 SEC Phase B UNSAFE gate 前后的 mutation 调用次数。"""
+
+    begin: int = 0
+    staged_classify: int = 0
+    reset: int = 0
+    blob: int = 0
+    commit: int = 0
+    rollback: int = 0
 
 
 class _RebuildUpdateFailure:
@@ -760,24 +780,6 @@ class StubDownloader:
         """
 
         return None
-
-    def normalize_ticker(self, ticker: str) -> str:
-        """标准化 ticker。
-
-        Args:
-            ticker: 股票代码。
-
-        Returns:
-            标准化 ticker。
-
-        Raises:
-            ValueError: ticker 为空时抛出。
-        """
-
-        normalized = ticker.strip().upper()
-        if not normalized:
-            raise ValueError("ticker 不能为空")
-        return normalized
 
     def resolve_company(
         self,
@@ -1368,24 +1370,6 @@ class RebuildOnlyDownloader:
 
         del user_agent, sleep_seconds, max_retries
         self.configure_called = True
-
-    def normalize_ticker(self, ticker: str) -> str:
-        """标准化 ticker。
-
-        Args:
-            ticker: 股票代码。
-
-        Returns:
-            大写 ticker。
-
-        Raises:
-            ValueError: ticker 为空时抛出。
-        """
-
-        normalized = ticker.strip().upper()
-        if not normalized:
-            raise ValueError("ticker 不能为空")
-        return normalized
 
     def resolve_company(
         self,
@@ -2256,7 +2240,7 @@ def test_sec_pipeline_download_writes_meta_and_manifest(tmp_path: Path) -> None:
     company_meta = json.loads(company_meta_path.read_text(encoding="utf-8"))
     assert company_meta["ticker"] == "AAPL"
     assert company_meta["market"] == "US"
-    assert company_meta["ticker_aliases"] == ["AAPL", "APC"]
+    assert company_meta["ticker_aliases"] == ["APC"]
 
 
 def test_sec_pipeline_download_merges_cli_aliases_with_sec_aliases(tmp_path: Path) -> None:
@@ -2292,7 +2276,7 @@ def test_sec_pipeline_download_merges_cli_aliases_with_sec_aliases(tmp_path: Pat
 
     company_meta_path = _company_meta_path(tmp_path, "AAPL")
     company_meta = json.loads(company_meta_path.read_text(encoding="utf-8"))
-    assert company_meta["ticker_aliases"] == ["AAPL", "APC", "AAPL.SW"]
+    assert company_meta["ticker_aliases"] == ["APC", "AAPL-SW"]
 
 
 def test_sec_pipeline_rebuild_local_meta_manifest_without_redownload(tmp_path: Path) -> None:
@@ -4225,6 +4209,28 @@ def test_standalone_6k_reconcile_publishes_source_and_processed_together(
         ticker=ticker,
         document_id=document_id,
     )
+    discovery_repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    discovery_batching = FsBatchingRepository(
+        tmp_path,
+        repository_set=discovery_repository_set,
+    )
+    discovery_company = FsCompanyMetaRepository(
+        tmp_path,
+        repository_set=discovery_repository_set,
+    )
+    discovery_batch = discovery_batching.begin_batch(ticker)
+    stage_company_meta_fixture(
+        discovery_company,
+        CompanyMeta(
+            company_id="0000000000",
+            company_name="Test Company",
+            ticker_identity=build_company_ticker_identity(ticker, ()),
+            resolver_version="test",
+            updated_at="2026-08-14T00:00:00+00:00",
+        ),
+        batch=discovery_batch,
+    )
+    discovery_batching.commit_batch(discovery_batch)
     assessments = {
         "form6-k.htm": _sec_6k_primary_repair.SixKPrimaryCandidateAssessment(
             filename="form6-k.htm",
@@ -4259,7 +4265,7 @@ def test_standalone_6k_reconcile_publishes_source_and_processed_together(
 
     report = _sec_6k_primary_repair.reconcile_active_6k_primary_documents(
         workspace_root=tmp_path,
-        target_tickers=[ticker, ticker.lower()],
+        target_tickers=None,
         target_document_ids=[document_id],
     )
 
@@ -4272,6 +4278,172 @@ def test_standalone_6k_reconcile_publishes_source_and_processed_together(
     assert report.updated[0].selected_primary_document == "ex99-1.htm"
     assert published_meta["primary_document"] == "ex99-1.htm"
     assert processed_meta["reprocess_required"] is True
+
+
+def test_prepared_6k_reconcile_handles_non_candidates_and_invalid_files() -> None:
+    """publication 前 6-K owner 应跳过非候选并拒绝非法 files contract。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: public owner 的早退或校验边界漂移时抛出。
+    """
+
+    assert (
+        _sec_6k_primary_repair.select_prepared_6k_primary_document(
+            ticker="TCOM",
+            document_id="fil-non-6k",
+            meta={"form_type": "20-F", "primary_document": "form.htm", "files": []},
+            candidate_payloads={},
+        )
+        is None
+    )
+    assert (
+        _sec_6k_primary_repair.select_prepared_6k_primary_document(
+            ticker="TCOM",
+            document_id="fil-no-html",
+            meta={
+                "form_type": "6-K",
+                "primary_document": "form.htm",
+                "files": [None, {}, {"name": "notes.txt"}],
+            },
+            candidate_payloads={},
+        )
+        is None
+    )
+    assert (
+        _sec_6k_primary_repair.select_prepared_6k_primary_document(
+            ticker="TCOM",
+            document_id="fil-missing-payload",
+            meta={
+                "form_type": "6-K",
+                "primary_document": "form.htm",
+                "files": [{"name": "missing.htm"}],
+            },
+            candidate_payloads={},
+        )
+        is None
+    )
+    with pytest.raises(ValueError, match="meta.files 必须为 list"):
+        _sec_6k_primary_repair.select_prepared_6k_primary_document(
+            ticker="TCOM",
+            document_id="fil-invalid-files",
+            meta={"form_type": "6-K", "primary_document": "form.htm"},
+            candidate_payloads={},
+        )
+
+
+def test_standalone_6k_reconcile_normalizes_public_filters(tmp_path: Path) -> None:
+    """standalone public path 应稳定去重 ticker 并拒绝清洗后的空过滤器。
+
+    Args:
+        tmp_path: pytest 临时工作区。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: public filter owner 的规范化或空值合同漂移时抛出。
+    """
+
+    report = _sec_6k_primary_repair.reconcile_active_6k_primary_documents(
+        workspace_root=tmp_path,
+        target_tickers=[" aapl ", "AAPL", "", " msft "],
+        target_document_ids=None,
+    )
+
+    assert report.updated == ()
+    with pytest.raises(ValueError, match="target_tickers 不能为空"):
+        _sec_6k_primary_repair.reconcile_active_6k_primary_documents(
+            workspace_root=tmp_path,
+            target_tickers=[" ", ""],
+        )
+    with pytest.raises(ValueError, match="target_document_ids 不能为空"):
+        _sec_6k_primary_repair.reconcile_active_6k_primary_documents(
+            workspace_root=tmp_path,
+            target_tickers=["AAPL"],
+            target_document_ids=[" ", ""],
+        )
+
+
+def test_standalone_6k_reconcile_rolls_back_failed_document(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """单文档 reconcile 异常时 public owner 必须 rollback 且保留 published meta。
+
+    Args:
+        tmp_path: pytest 临时工作区。
+        monkeypatch: pytest monkeypatch。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: rollback 后 published state 发生变化时抛出。
+    """
+
+    ticker = "TCOM"
+    document_id = "fil_0000000000-25-000101"
+    _seed_complete_6k_source_and_processed(
+        workspace_root=tmp_path,
+        ticker=ticker,
+        document_id=document_id,
+    )
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    source_repository = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    before_meta = source_repository.get_source_meta(ticker, document_id, SourceKind.FILING)
+
+    def _raise_reconcile_failure(
+        *,
+        source_repository: SourceDocumentRepositoryProtocol,
+        processed_repository: ProcessedDocumentRepositoryProtocol,
+        ticker: str,
+        document_id: str,
+        batch: BatchToken,
+    ) -> _sec_6k_primary_repair.SixKPrimaryReconcileOutcome | None:
+        """模拟单文档 owner 在 batch 内失败。
+
+        Args:
+            source_repository: source 仓储协议。
+            processed_repository: processed 仓储协议。
+            ticker: 当前 ticker。
+            document_id: 当前文档 ID。
+            batch: caller-owned batch。
+
+        Returns:
+            不返回。
+
+        Raises:
+            RuntimeError: 始终抛出以验证 rollback。
+        """
+
+        del source_repository, processed_repository, ticker, document_id, batch
+        raise RuntimeError("forced 6-K reconcile failure")
+
+    monkeypatch.setattr(
+        _sec_6k_primary_repair,
+        "reconcile_active_6k_primary_document",
+        _raise_reconcile_failure,
+    )
+
+    with pytest.raises(RuntimeError, match="forced 6-K reconcile failure"):
+        _sec_6k_primary_repair.reconcile_active_6k_primary_documents(
+            workspace_root=tmp_path,
+            target_tickers=[ticker],
+            target_document_ids=[document_id],
+        )
+
+    after_repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    after_repository = FsSourceDocumentRepository(
+        tmp_path,
+        repository_set=after_repository_set,
+    )
+    assert after_repository.get_source_meta(ticker, document_id, SourceKind.FILING) == before_meta
 
 
 def test_active_6k_candidate_assessment_consumes_one_storage_snapshot(
@@ -5089,7 +5261,7 @@ def test_sc13_retry_warns_after_max_retries(tmp_path: Path) -> None:
     assert any("SC 13D/G" in w for w in warnings)
 
 
-@pytest.mark.parametrize("corruption", ["size", "digest", "missing"])
+@pytest.mark.parametrize("corruption", ["size", "digest", "missing", "manifest"])
 def test_sec_top_level_repairs_selected_corruption_before_company_mutation(
     tmp_path: Path,
     corruption: str,
@@ -5103,8 +5275,10 @@ def test_sec_top_level_repairs_selected_corruption_before_company_mutation(
         payload_path.write_bytes(old_payload + b"-corrupt")
     elif corruption == "digest":
         payload_path.write_bytes(b"X" * len(old_payload))
-    else:
+    elif corruption == "missing":
         payload_path.unlink()
+    else:
+        _filing_manifest_path(tmp_path, "AAPL").unlink()
     replacement = b"<html>repaired</html>"
     downloader = StubDownloader(
         submissions=_build_submissions(),
@@ -5132,6 +5306,12 @@ def test_sec_top_level_repairs_selected_corruption_before_company_mutation(
     )
 
     assert result["summary"]["downloaded"] == 1
+    assert pipeline._source_repository.classify_source_integrity(
+        "AAPL",
+        "fil_0000000000-25-000001",
+        SourceKind.FILING,
+    ).status is SourceIntegrityStatus.COMPLETE
+    assert _filing_manifest_path(tmp_path, "AAPL").is_file()
     with pipeline._source_repository.read_source_snapshot(
         "AAPL",
         "fil_0000000000-25-000001",
@@ -5142,16 +5322,32 @@ def test_sec_top_level_repairs_selected_corruption_before_company_mutation(
             assert stream.read() == replacement
 
 
+@pytest.mark.parametrize("corruption", ["missing_file", "manifest_missing"])
 def test_sec_top_level_unselected_corruption_fails_before_company_batch(
     tmp_path: Path,
+    corruption: str,
 ) -> None:
-    """未选中 corruption 必须在任何 company/source/rejection mutation 前 typed fail closed。"""
+    """未选中 corruption 必须在任何 company/source/rejection mutation 前 typed fail closed。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        corruption: 未选中 source 的 physical 或 whole-manifest 损坏类型。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: typed reason 或零副作用 contract 漂移时抛出。
+    """
 
     meta_path = _seed_complete_sec_source(
         workspace_root=tmp_path,
         document_id="fil_unselected",
     )
-    (meta_path.parent / "sample-10k.htm").unlink()
+    if corruption == "missing_file":
+        (meta_path.parent / "sample-10k.htm").unlink()
+    else:
+        _filing_manifest_path(tmp_path, "AAPL").unlink()
     pipeline = SecPipeline(
         workspace_root=tmp_path,
         downloader=StubDownloader(
@@ -5172,6 +5368,486 @@ def test_sec_top_level_unselected_corruption_fails_before_company_batch(
     assert exc_info.value.reason is SourceIntegrityPreflightReason.UNSELECTED_REPAIR_REQUIRED
     with pytest.raises(FileNotFoundError):
         pipeline._company_repository.get_company_meta("AAPL")
+
+
+def test_sec_unsafe_phase_a_and_whole_tree_preflight_have_zero_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SEC single-filing Phase A 与 whole-tree 都必须在 UNSAFE 后零副作用拒绝。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest monkeypatch fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: UNSAFE 后仍读取 provider filing、开启 batch 或发布 durable fact 时抛出。
+    """
+
+    document_id = "fil_0000000000-25-000001"
+    meta_path = _seed_complete_sec_source(workspace_root=tmp_path, document_id=document_id)
+    payload_path = meta_path.parent / "sample-10k.htm"
+    manifest_path = _filing_manifest_path(tmp_path, "AAPL")
+    unsafe_path = meta_path.parent / "undeclared.bin"
+    unsafe_path.write_bytes(b"unsafe")
+    old_bytes = {
+        "meta": meta_path.read_bytes(),
+        "payload": payload_path.read_bytes(),
+        "manifest": manifest_path.read_bytes(),
+        "unsafe": unsafe_path.read_bytes(),
+    }
+    downloader = StubDownloader(
+        submissions=_build_submissions(),
+        remote_files=[_make_descriptor("etag")],
+        download_results=[],
+    )
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=downloader,
+        processor_registry=build_fins_processor_registry(),
+    )
+    begin_calls = 0
+
+    def reject_begin(ticker: str) -> BatchToken:
+        """任何越过 UNSAFE gate 的 batch 都使测试立即失败。
+
+        Args:
+            ticker: 待开启事务的 ticker。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 本 helper 被调用时始终抛出。
+        """
+
+        del ticker
+        nonlocal begin_calls
+        begin_calls += 1
+        raise AssertionError("UNSAFE preflight 后不得 begin_batch")
+
+    monkeypatch.setattr(pipeline._batching_repository, "begin_batch", reject_begin)
+    filing = _sec_filing_collection.FilingRecord(
+        form_type="10-K",
+        filing_date="2025-02-01",
+        report_date="2024-12-31",
+        accession_number="0000000000-25-000001",
+        primary_document="sample-10k.htm",
+    )
+
+    async def collect_single() -> list[DownloadEvent]:
+        """消费真实 single-filing owner 直到 typed preflight 失败。
+
+        Args:
+            无。
+
+        Returns:
+            异常未抛出时返回已产生事件。
+
+        Raises:
+            SourceIntegrityPreflightError: Phase A 分类为 UNSAFE 时抛出。
+        """
+
+        return [
+            event
+            async for event in pipeline._download_single_filing_stream(
+                ticker="AAPL",
+                cik="320193",
+                filing=filing,
+                overwrite=False,
+                rejection_registry={},
+            )
+        ]
+
+    with pytest.raises(SourceIntegrityPreflightError) as phase_a_error:
+        asyncio.run(collect_single())
+    with pytest.raises(SourceIntegrityPreflightError) as whole_tree_error:
+        pipeline.download(ticker="AAPL", overwrite=False, start_is_explicit=False)
+
+    assert phase_a_error.value.reason is SourceIntegrityPreflightReason.UNSAFE_PUBLICATION
+    assert whole_tree_error.value.reason is SourceIntegrityPreflightReason.UNSAFE_PUBLICATION
+    assert begin_calls == 0
+    assert downloader.list_filing_files_call_count == 0
+    assert meta_path.read_bytes() == old_bytes["meta"]
+    assert payload_path.read_bytes() == old_bytes["payload"]
+    assert manifest_path.read_bytes() == old_bytes["manifest"]
+    assert unsafe_path.read_bytes() == old_bytes["unsafe"]
+    assert not _company_meta_path(tmp_path, "AAPL").exists()
+    assert not _download_rejections_path(tmp_path, "AAPL").exists()
+
+
+@pytest.mark.parametrize(
+    "manifest_corruption",
+    ("trusted_dangling", "untrusted"),
+)
+def test_sec_empty_inventory_manifest_preflight_has_zero_mutation(
+    tmp_path: Path,
+    manifest_corruption: Literal["trusted_dangling", "untrusted"],
+) -> None:
+    """真实 SEC whole-tree 对空 inventory 的 unsafe manifest 必须零副作用拒绝。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        manifest_corruption: trusted 悬空声明或无法信任的 manifest。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: preflight 未投影 typed UNSAFE，或 company/provider 副作用已发生时抛出。
+        OSError: fixture publication 或目录移动失败时抛出。
+    """
+
+    document_id = "fil_0000000000-25-000001"
+    meta_path = _seed_complete_sec_source(
+        workspace_root=tmp_path,
+        document_id=document_id,
+    )
+    source_dir = meta_path.parent
+    payload_path = source_dir / "sample-10k.htm"
+    manifest_path = _filing_manifest_path(tmp_path, "AAPL")
+    old_meta = meta_path.read_bytes()
+    old_payload = payload_path.read_bytes()
+    detached_dir = tmp_path / "detached-sec-source"
+    source_dir.rename(detached_dir)
+    if manifest_corruption == "untrusted":
+        manifest_path.write_text("{", encoding="utf-8")
+    old_manifest = manifest_path.read_bytes()
+    downloader = StubDownloader(
+        submissions=_build_submissions(),
+        remote_files=[_make_descriptor("etag")],
+        download_results=[],
+    )
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=downloader,
+        processor_registry=build_fins_processor_registry(),
+    )
+
+    with pytest.raises(SourceIntegrityPreflightError) as exc_info:
+        pipeline.download(
+            ticker="AAPL",
+            overwrite=False,
+            start_is_explicit=False,
+        )
+
+    assert exc_info.value.reason is SourceIntegrityPreflightReason.UNSAFE_PUBLICATION
+    assert downloader.list_filing_files_call_count == 0
+    assert downloader.download_files_called is False
+    assert (detached_dir / "meta.json").read_bytes() == old_meta
+    assert (detached_dir / "sample-10k.htm").read_bytes() == old_payload
+    assert manifest_path.read_bytes() == old_manifest
+    assert not _company_meta_path(tmp_path, "AAPL").exists()
+    assert not _download_rejections_path(tmp_path, "AAPL").exists()
+
+
+def test_sec_unsafe_phase_b_rolls_back_without_reset_blob_or_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SEC Phase B typed UNSAFE 必须回滚一次且保持 published source 完全不变。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest monkeypatch fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: Phase B 未返回 exact typed error，或发生 reset/blob/commit 副作用时抛出。
+    """
+
+    document_id = "fil_0000000000-25-000001"
+    meta_path = _seed_complete_sec_source(workspace_root=tmp_path, document_id=document_id)
+    payload_path = meta_path.parent / "sample-10k.htm"
+    manifest_path = _filing_manifest_path(tmp_path, "AAPL")
+    old_meta = meta_path.read_bytes()
+    old_payload = payload_path.read_bytes()
+    old_manifest = manifest_path.read_bytes()
+    downloader = StubDownloader(
+        submissions=_build_submissions(),
+        remote_files=[_make_descriptor("etag-phase-b")],
+        download_results=[
+            {
+                "name": "sample-10k.htm",
+                "status": "downloaded",
+                "source_url": "https://example.com/sample-10k.htm",
+                "http_etag": "etag-phase-b",
+            }
+        ],
+        content_by_name={"sample-10k.htm": b"phase-b-prefetched"},
+    )
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=downloader,
+        processor_registry=build_fins_processor_registry(),
+    )
+    calls = _SecPhaseBMutationCalls()
+    original_begin = pipeline._batching_repository.begin_batch
+    original_rollback = pipeline._batching_repository.rollback_batch
+
+    def observe_begin(ticker: str) -> BatchToken:
+        """记录并执行真实 batch begin。
+
+        Args:
+            ticker: 当前事务 ticker。
+
+        Returns:
+            真实 batching owner 生成的 token。
+
+        Raises:
+            OSError: 真实 batch begin 失败时抛出。
+        """
+
+        calls.begin += 1
+        return original_begin(ticker)
+
+    def classify_staged_unsafe(
+        ticker: str,
+        staged_document_id: str,
+        source_kind: SourceKind,
+        *,
+        batch: BatchToken,
+    ) -> SourceIntegrityClassification:
+        """返回 invariant-valid 的 staged UNSAFE typed fact。
+
+        Args:
+            ticker: exact ticker。
+            staged_document_id: exact document ID。
+            source_kind: exact source kind。
+            batch: 已打开的 batch capability。
+
+        Returns:
+            storage boundary 已分类的 staged UNSAFE fact。
+
+        Raises:
+            无。
+        """
+
+        del batch
+        calls.staged_classify += 1
+        return SourceIntegrityClassification(
+            ticker=ticker,
+            source_kind=source_kind,
+            document_id=staged_document_id,
+            revision=None,
+            status=SourceIntegrityStatus.UNSAFE,
+            reasons=(SourceIntegrityReason.META_UNTRUSTED,),
+        )
+
+    def reject_reset(
+        ticker: str,
+        staged_document_id: str,
+        source_kind: SourceKind,
+        *,
+        batch: BatchToken,
+    ) -> None:
+        """记录任何越过 UNSAFE gate 的 source reset 并立即失败。
+
+        Args:
+            ticker: exact ticker。
+            staged_document_id: exact document ID。
+            source_kind: exact source kind。
+            batch: 已打开的 batch capability。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 本 helper 被调用时始终抛出。
+        """
+
+        del ticker, staged_document_id, source_kind, batch
+        calls.reset += 1
+        raise AssertionError("Phase B UNSAFE 后不得 reset source")
+
+    def reject_blob(
+        handle: SourceHandle,
+        filename: str,
+        data: BinaryIO,
+        *,
+        batch: BatchToken,
+        content_type: Optional[str] = None,
+        metadata: Optional[dict[str, str]] = None,
+    ) -> FileObjectMeta:
+        """记录任何越过 UNSAFE gate 的 blob mutation 并立即失败。
+
+        Args:
+            handle: source handle。
+            filename: blob 文件名。
+            data: 待写入字节流。
+            batch: 已打开的 batch capability。
+            content_type: 可选内容类型。
+            metadata: 可选 blob 元数据。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 本 helper 被调用时始终抛出。
+        """
+
+        del handle, filename, data, batch, content_type, metadata
+        calls.blob += 1
+        raise AssertionError("Phase B UNSAFE 后不得写 blob")
+
+    def reject_commit(batch: BatchToken) -> None:
+        """记录任何越过 UNSAFE gate 的 commit 并立即失败。
+
+        Args:
+            batch: 已打开的 batch capability。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 本 helper 被调用时始终抛出。
+        """
+
+        del batch
+        calls.commit += 1
+        raise AssertionError("Phase B UNSAFE 后不得 commit")
+
+    def observe_rollback(batch: BatchToken) -> None:
+        """记录并执行真实 batch rollback。
+
+        Args:
+            batch: 已打开的 batch capability。
+
+        Returns:
+            无。
+
+        Raises:
+            OSError: 真实 rollback 失败时抛出。
+            ValueError: batch capability 非法时抛出。
+        """
+
+        calls.rollback += 1
+        original_rollback(batch)
+
+    monkeypatch.setattr(pipeline._batching_repository, "begin_batch", observe_begin)
+    monkeypatch.setattr(pipeline._batching_repository, "commit_batch", reject_commit)
+    monkeypatch.setattr(pipeline._batching_repository, "rollback_batch", observe_rollback)
+    monkeypatch.setattr(
+        pipeline._source_repository,
+        "classify_staged_source_integrity",
+        classify_staged_unsafe,
+    )
+    monkeypatch.setattr(pipeline._source_repository, "reset_source_document", reject_reset)
+    monkeypatch.setattr(pipeline._blob_repository, "store_file", reject_blob)
+    filing = _sec_filing_collection.FilingRecord(
+        form_type="10-K",
+        filing_date="2025-02-01",
+        report_date="2024-12-31",
+        accession_number="0000000000-25-000001",
+        primary_document="sample-10k.htm",
+    )
+
+    async def collect_single() -> list[DownloadEvent]:
+        """消费真实 SEC single-filing owner 直到 Phase B typed failure。
+
+        Args:
+            无。
+
+        Returns:
+            异常未抛出时返回已产生事件。
+
+        Raises:
+            SourceIntegrityPreflightError: staged classification 为 UNSAFE 时抛出。
+        """
+
+        return [
+            event
+            async for event in pipeline._download_single_filing_stream(
+                ticker="AAPL",
+                cik="320193",
+                filing=filing,
+                overwrite=True,
+                rejection_registry={},
+            )
+        ]
+
+    with pytest.raises(SourceIntegrityPreflightError) as exc_info:
+        asyncio.run(collect_single())
+
+    assert exc_info.value.reason is SourceIntegrityPreflightReason.UNSAFE_PUBLICATION
+    assert calls == _SecPhaseBMutationCalls(
+        begin=1,
+        staged_classify=1,
+        reset=0,
+        blob=0,
+        commit=0,
+        rollback=1,
+    )
+    assert downloader.download_files_called is True
+    assert meta_path.read_bytes() == old_meta
+    assert payload_path.read_bytes() == old_payload
+    assert manifest_path.read_bytes() == old_manifest
+    assert pipeline._source_repository.classify_source_integrity(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+    ).status is SourceIntegrityStatus.COMPLETE
+
+
+def test_sec_whole_manifest_missing_with_multiple_actual_sources_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """whole manifest 缺失且存在多个 actual source 时不得选择局部 repair。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: typed MULTIPLE reason、零 mutation 或 shared reason 漂移时抛出。
+    """
+
+    document_ids = (
+        "fil_0000000000-25-000001",
+        "fil_0000000000-24-000002",
+    )
+    meta_paths = tuple(
+        _seed_complete_sec_source(workspace_root=tmp_path, document_id=document_id)
+        for document_id in document_ids
+    )
+    manifest_path = _filing_manifest_path(tmp_path, "AAPL")
+    manifest_path.unlink()
+    old_meta = tuple(path.read_bytes() for path in meta_paths)
+    downloader = StubDownloader(
+        submissions=_build_submissions(),
+        remote_files=[_make_descriptor("etag")],
+        download_results=[],
+    )
+    pipeline = SecPipeline(
+        workspace_root=tmp_path,
+        downloader=downloader,
+        processor_registry=build_fins_processor_registry(),
+    )
+
+    with pytest.raises(SourceIntegrityPreflightError) as exc_info:
+        pipeline.download(ticker="AAPL", overwrite=False, start_is_explicit=False)
+
+    assert exc_info.value.reason is SourceIntegrityPreflightReason.MULTIPLE_REPAIR_REQUIRED
+    assert downloader.list_filing_files_call_count == 0
+    assert tuple(path.read_bytes() for path in meta_paths) == old_meta
+    assert manifest_path.exists() is False
+    assert not _company_meta_path(tmp_path, "AAPL").exists()
+    assert not _download_rejections_path(tmp_path, "AAPL").exists()
+    for document_id in document_ids:
+        classification = pipeline._source_repository.classify_source_integrity(
+            "AAPL",
+            document_id,
+            SourceKind.FILING,
+        )
+        assert classification.status is SourceIntegrityStatus.REPAIR_REQUIRED
+        assert classification.reasons == (SourceIntegrityReason.SOURCE_MANIFEST_MISSING,)
 
 
 def test_sec_same_target_overwrite_discards_stale_prefetch_and_last_writer_wins(

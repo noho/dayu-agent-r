@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import hashlib
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -25,11 +26,21 @@ from dayu.contracts.tool_outcome import (
     ToolFailedOutcome,
 )
 from dayu.fins.download_contract import FinsDownloadRequest
+from dayu.fins.domain.document_models import BatchToken
+from dayu.fins.domain.enums import SourceKind
 from dayu.fins.ingestion_runtime import (
     FinsIngestionExecutor,
     FinsIngestionRuntime,
+    FinsJobCancellationChecker,
     FinsPreprocessRequest,
+    FinsUploadFilingRequest,
+    FinsUploadRunner,
+    FinsUploadResultSummary,
     FinsUploadRequest,
+    FinsUploadUsageCode,
+    FinsUploadMaterialRequest,
+    ValidatedFinsUploadFilingRequest,
+    fins_upload_usage_failure,
 )
 from dayu.fins.ingestion import (
     FINS_OBSERVATION_HANDLE_ID_PREFIX,
@@ -59,12 +70,18 @@ from dayu.fins.direct_events import (
     FinsResultStatus,
     FinsResultSummary,
 )
-from dayu.fins.service_runtime import DefaultFinsRuntime
+from dayu.fins.service_runtime import DefaultFinsRuntime, ProductionFinsUploadRunner
+from dayu.fins.storage import FilingUploadPublishedState
+from dayu.fins.upload_format_contract import FINS_UPLOAD_FORMAT_TEXT
 from dayu.fins.tools import download_provider, preprocess_provider, provider as read_provider
 from dayu.fins.tools.download_tools import DOWNLOAD_TOOL_NAME, FinsDownloadToolCallable
 from dayu.fins.tools.preprocess_tools import PREPROCESS_TOOL_NAME, FinsPreprocessToolCallable
-from dayu.fins.tools import upload_provider
-from dayu.fins.tools.upload_tools import UPLOAD_TOOL_NAME, FinsUploadToolCallable
+from dayu.fins.tools import upload_provider, upload_tools
+from dayu.fins.tools.upload_tools import (
+    UPLOAD_TOOL_NAME,
+    FinsUploadToolCallable,
+    build_fins_upload_tool,
+)
 from dayu.runtime.config_loader import ConfigLoader, RuntimeConfig
 from dayu.runtime.tools_discovery import (
     PythonImportPathProvider,
@@ -429,6 +446,21 @@ def _observation_result(status: FinsResultStatus) -> FinsResultSummary:
 class _OpenCancellationToken:
     """测试用未取消 token。"""
 
+    def __call__(self) -> bool:
+        """返回未取消状态以满足 job checker 协议。
+
+        Args:
+            无。
+
+        Returns:
+            始终返回 ``False``。
+
+        Raises:
+            无。
+        """
+
+        return False
+
     def is_cancelled(self) -> bool:
         """返回是否已取消。
 
@@ -741,6 +773,206 @@ class _NoOpExecutor:
         self.submitted_job_ids = self.submitted_job_ids + (job_id,)
 
 
+class _HoldingExecutor:
+    """测试用可控执行器，保存后台任务并由测试显式执行。"""
+
+    submitted_job_ids: tuple[str, ...]
+    operations: tuple[Callable[[], None], ...]
+
+    def __init__(self) -> None:
+        """初始化提交记录与待执行任务。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.submitted_job_ids = ()
+        self.operations = ()
+
+    def submit(self, job_id: str, operation: Callable[[], None]) -> None:
+        """记录后台任务但不立即执行。
+
+        Args:
+            job_id: opaque operation id。
+            operation: 待测试显式执行的后台任务。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.submitted_job_ids = self.submitted_job_ids + (job_id,)
+        self.operations = self.operations + (operation,)
+
+    def run_next(self) -> None:
+        """执行最早提交的后台任务。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            AssertionError: 当前没有且只有一个待执行任务时抛出。
+            Exception: 后台任务抛出的异常原样传播。
+        """
+
+        assert len(self.operations) == 1
+        operation = self.operations[0]
+        self.operations = ()
+        operation()
+
+
+class _RecordingFinsUploadRunner(FinsUploadRunner):
+    """记录 runtime 交付的 typed 上传请求并返回删除摘要。"""
+
+    calls: tuple[ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest, ...]
+
+    def __init__(self) -> None:
+        """初始化 runner 调用记录。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.calls = ()
+
+    def run_upload(
+        self,
+        request: ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest,
+        *,
+        cancellation_checker: FinsJobCancellationChecker,
+    ) -> FinsUploadResultSummary:
+        """记录 validated 请求并返回稳定的 filing 删除结果。
+
+        Args:
+            request: runtime owner 校验后的上传请求。
+            cancellation_checker: runtime 注入的协作式取消检查器。
+
+        Returns:
+            不触发真实上传的稳定删除摘要。
+
+        Raises:
+            AssertionError: 测试意外把 material 请求交给该 runner 时抛出。
+            ValueError: 返回摘要违反 typed contract 时抛出。
+        """
+
+        del cancellation_checker
+        assert isinstance(request, ValidatedFinsUploadFilingRequest)
+        self.calls = self.calls + (request,)
+        return FinsUploadResultSummary(
+            source_kind=SourceKind.FILING,
+            status="deleted",
+            requested_file_count=0,
+            stored_file_count=0,
+            deleted=True,
+        )
+
+
+class _ForbiddenFilingUploadStateRepository:
+    """tool static admission 测试中禁止读取的 filing state 仓储。"""
+
+    def __init__(self) -> None:
+        """初始化读取记录。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.calls: list[tuple[str, str]] = []
+        self.batch_calls: list[tuple[BatchToken, str]] = []
+
+    def read_filing_upload_state(
+        self,
+        ticker: str,
+        document_id: str,
+    ) -> FilingUploadPublishedState:
+        """记录越界 state read 并立即失败。
+
+        Args:
+            ticker: 待读取的 canonical ticker。
+            document_id: 待读取的 filing 文档 ID。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 方法被调用时始终抛出。
+        """
+
+        self.calls.append((ticker, document_id))
+        raise AssertionError("tool calendar/year admission 前禁止读取 filing state")
+
+    def read_filing_upload_state_in_batch(
+        self,
+        batch: BatchToken,
+        document_id: str,
+    ) -> FilingUploadPublishedState:
+        """记录越界 batch state read 并立即失败。
+
+        Args:
+            batch: 待读取的 batch capability。
+            document_id: 待读取的 filing 文档 ID。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 方法被调用时始终抛出。
+        """
+
+        self.batch_calls.append((batch, document_id))
+        raise AssertionError("tool static admission 前禁止读取 batch filing state")
+
+
+def test_tool_static_admission_state_fake_conforms_to_required_batch_read_contract() -> None:
+    """tool forbidden fake 必须 record-then-fail 且保持 published/batch 记录独立。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: required batch signature、记录或 fail-fast 语义漂移时抛出。
+    """
+
+    repository = _ForbiddenFilingUploadStateRepository()
+    batch = BatchToken(transaction_id="fixture-batch", ticker="AAPL")
+    document_id = "filing-a"
+
+    with pytest.raises(
+        AssertionError,
+        match="tool static admission 前禁止读取 batch filing state",
+    ):
+        repository.read_filing_upload_state_in_batch(batch, document_id)
+
+    assert repository.calls == []
+    assert repository.batch_calls == [(batch, document_id)]
+
+
 def test_tools_discovery_discovers_read_download_preprocess_and_upload_independently(
     tmp_path: Path,
 ) -> None:
@@ -1040,6 +1272,710 @@ def test_upload_tool_returns_external_job_awaiting_outcome(tmp_path: Path) -> No
     assert "finsjob_" not in outcome.snapshot.snapshot_id
 
 
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "malformed_meta",
+        "meta_symlink",
+        "meta_directory",
+        "target_symlink",
+        "target_regular_file",
+    ),
+)
+def test_upload_tool_projects_real_workspace_identity_corruption(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    """真实 meta/target corruption 必须投影为安全 typed 启动失败。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        corruption: 待注入的 durable corruption 形态。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: corruption 被投影为 invalid_argument、泄露内部 schema
+            原文或创建 job 时抛出。
+        OSError: 测试环境无法创建 symlink 时抛出。
+    """
+
+    workspace_root = _build_workspace(tmp_path)
+    portfolio_root = workspace_root / "portfolio"
+    portfolio_root.mkdir()
+    ticker_dir = portfolio_root / "AAPL"
+    if corruption == "target_symlink":
+        outside_dir = tmp_path / "outside-company"
+        outside_dir.mkdir()
+        ticker_dir.symlink_to(outside_dir, target_is_directory=True)
+    elif corruption == "target_regular_file":
+        ticker_dir.write_bytes(b"foreign locator")
+    else:
+        ticker_dir.mkdir()
+        (ticker_dir / ".identity.json").write_text(
+            json.dumps({"namespace": "ticker", "external_identity": "AAPL"}),
+            encoding="utf-8",
+        )
+        meta_path = ticker_dir / "meta.json"
+        if corruption == "malformed_meta":
+            meta_path.write_text("{}", encoding="utf-8")
+        elif corruption == "meta_symlink":
+            outside_meta = tmp_path / "outside-meta.json"
+            outside_meta.write_text("{}", encoding="utf-8")
+            meta_path.symlink_to(outside_meta)
+        else:
+            meta_path.mkdir()
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+    outcome = asyncio.run(
+        FinsUploadToolCallable(runtime=runtime)(
+            _call(
+                UPLOAD_TOOL_NAME,
+                {
+                    "ticker": "AAPL",
+                    "upload_kind": "filing",
+                    "action": "delete",
+                    "fiscal_year": 2024,
+                    "fiscal_period": "FY",
+                },
+            ),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "fins_upload_start_failed"
+    assert outcome.result.message == "工作区公司代码身份数据损坏，上传任务未启动。"
+    assert outcome.result.hint == "请修复工作区公司元数据后重试。"
+    assert "CompanyMeta" not in outcome.result.message
+    assert "ticker_aliases" not in outcome.result.message
+    assert not tuple(_job_store_root(workspace_root).glob("*.json"))
+
+
+@pytest.mark.parametrize(
+    ("argument_overrides", "expected_message"),
+    (
+        (
+            {"ticker": "AAPL", "fiscal_period": "BANANA"},
+            "--fiscal-period 仅支持 FY、H1、Q1、Q2、Q3、Q4",
+        ),
+        (
+            {"ticker": "600519", "fiscal_period": "9M"},
+            "--fiscal-period 仅支持 FY、H1、Q1、Q2、Q3、Q4",
+        ),
+        (
+            {"ticker": "0700.HK", "fiscal_period": "BANANA"},
+            "--fiscal-period 仅支持 FY、H1、Q1、Q2、Q3、Q4",
+        ),
+        ({"fiscal_year": 999}, "财年（fiscal_year）必须是 1000..9999 的整数"),
+        ({"fiscal_year": 10000}, "财年（fiscal_year）必须是 1000..9999 的整数"),
+        *tuple(
+            (
+                {"filing_date": raw_date},
+                "披露日期（filing_date）必须是实际存在的 YYYY-MM-DD 日期",
+            )
+            for raw_date in ("", " ", " 2024-02-29 ", "2024-2-29", "2023-02-29", "2024-13-01", "2024/02/29")
+        ),
+        *tuple(
+            (
+                {"report_date": raw_date},
+                "报告期日期（report_date）必须是实际存在的 YYYY-MM-DD 日期",
+            )
+            for raw_date in ("", "\t", "2024-02-29 ", "2024-2-29", "2023-02-29", "2024-00-01", "2024.02.29")
+        ),
+    ),
+)
+def test_upload_tool_filing_static_invalid_input_has_zero_side_effects(
+    tmp_path: Path,
+    argument_overrides: Mapping[str, JsonValue],
+    expected_message: str,
+) -> None:
+    """filing 静态非法参数必须精确失败且不产生任何副作用。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        argument_overrides: 覆盖合法基础请求的当前非法参数。
+        expected_message: typed usage owner 产生的精确业务文案。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: outcome、state/observation/job 边界或 workspace 快照漂移时抛出。
+    """
+
+    workspace_root = _build_workspace(tmp_path)
+    (workspace_root / "sentinel.txt").write_text("unchanged", encoding="utf-8")
+    runtime, executor, state_repository = _runtime_with_static_admission_guard(workspace_root=workspace_root)
+    before_tree = _snapshot_tool_workspace_tree(workspace_root)
+    arguments: dict[str, JsonValue] = {
+        "ticker": "AAPL",
+        "upload_kind": "filing",
+        "action": "delete",
+        "fiscal_year": 2024,
+        "fiscal_period": "FY",
+    }
+    arguments.update(argument_overrides)
+
+    outcome = asyncio.run(
+        FinsUploadToolCallable(runtime=runtime)(
+            _call(UPLOAD_TOOL_NAME, arguments),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "invalid_argument"
+    assert outcome.result.message == expected_message
+    assert outcome.result.hint == (
+        "请检查 ticker、upload_kind、action、files、primary、会计期间和材料字段后重试。"
+    )
+    assert state_repository.calls == []
+    assert state_repository.batch_calls == []
+    assert executor.submitted_job_ids == ()
+    upload_runner = runtime.upload_runner
+    assert isinstance(upload_runner, _RecordingFinsUploadRunner)
+    assert upload_runner.calls == ()
+    assert runtime._observations == {}
+    assert not tuple(_job_store_root(workspace_root).glob("*.json"))
+    assert _snapshot_tool_workspace_tree(workspace_root) == before_tree
+
+
+@pytest.mark.parametrize(
+    ("ticker", "raw_period", "expected_period"),
+    (
+        ("AAPL", " fy ", "FY"),
+        ("600519", " q2 ", "Q2"),
+        ("0700.HK", " h1 ", "H1"),
+    ),
+)
+def test_upload_tool_raw_period_is_canonical_at_runner_contract_boundary(
+    tmp_path: Path,
+    ticker: str,
+    raw_period: str,
+    expected_period: str,
+) -> None:
+    """tool raw 财期应由 runtime owner 规范化后交给上传 runner。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        ticker: 覆盖 US、CN 与 HK 的公司代码。
+        raw_period: 携带小写与首尾空白的 raw tool 参数。
+        expected_period: 期望的 canonical 财期。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: runner 未收到 typed canonical 财期或 observation 未被清理时抛出。
+    """
+
+    workspace_root = _build_workspace(tmp_path)
+    executor = _HoldingExecutor()
+    upload_runner = _RecordingFinsUploadRunner()
+    runtime = _runtime_with_executor(
+        workspace_root=workspace_root,
+        executor=executor,
+        upload_runner=upload_runner,
+    )
+
+    outcome = asyncio.run(
+        FinsUploadToolCallable(runtime=runtime)(
+            _call(
+                UPLOAD_TOOL_NAME,
+                {
+                    "ticker": ticker,
+                    "upload_kind": "filing",
+                    "action": "delete",
+                    "fiscal_year": 2024,
+                    "fiscal_period": raw_period,
+                },
+            ),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolAwaitingOutcome)
+    assert len(runtime._observations) == 1
+    record = next(iter(runtime._observations.values()))
+    try:
+        runtime.activate_observation(record.handle)
+        executor.run_next()
+        assert len(upload_runner.calls) == 1
+        validated_request = upload_runner.calls[0]
+        assert isinstance(validated_request, ValidatedFinsUploadFilingRequest)
+        assert validated_request.normalized_fiscal_period == expected_period
+    finally:
+        asyncio.run(runtime.abandon_observation(record.handle))
+    assert runtime._observations == {}
+
+
+@pytest.mark.parametrize(
+    ("argument_overrides", "expected_message"),
+    (
+        ({"ticker": "Apple Inc."}, "--ticker 无法识别，请提供有效公司代码"),
+        (
+            {"ticker_aliases": ["a apl"]},
+            "--ticker 别名无法识别，请提供有效公司代码",
+        ),
+        (
+            {"ticker_aliases": [f"A{index}" for index in range(101)]},
+            "--ticker 别名数量不能超过 100 个",
+        ),
+    ),
+)
+def test_upload_tool_material_ticker_identity_usage_is_bounded_and_typed(
+    tmp_path: Path,
+    argument_overrides: Mapping[str, JsonValue],
+    expected_message: str,
+) -> None:
+    """material ticker/alias grammar 与数量必须在 observation 前 typed 拒绝。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        argument_overrides: 当前非法 ticker identity 参数。
+        expected_message: usage owner 产生的精确业务文案。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: material 绕过共享准入或创建 observation/job 时抛出。
+    """
+
+    workspace_root = _build_workspace(tmp_path)
+    runtime, executor, _ = _runtime_with_static_admission_guard(workspace_root=workspace_root)
+    arguments: dict[str, JsonValue] = {
+        "ticker": "AAPL",
+        "upload_kind": "material",
+        "action": "delete",
+        "form_type": "MATERIAL_OTHER",
+        "material_name": "Deck",
+    }
+    arguments.update(argument_overrides)
+
+    outcome = asyncio.run(
+        FinsUploadToolCallable(runtime=runtime)(
+            _call(UPLOAD_TOOL_NAME, arguments),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "invalid_argument"
+    assert outcome.result.message == expected_message
+    assert executor.submitted_job_ids == ()
+    assert runtime._observations == {}
+    assert not tuple(_job_store_root(workspace_root).glob("*.json"))
+
+
+@pytest.mark.parametrize(
+    ("field_name", "raw_value", "expected_message"),
+    (
+        ("filing_date", "", "披露日期（filing_date）必须是实际存在的 YYYY-MM-DD 日期"),
+        ("filing_date", " ", "披露日期（filing_date）必须是实际存在的 YYYY-MM-DD 日期"),
+        ("filing_date", " 2024-02-29 ", "披露日期（filing_date）必须是实际存在的 YYYY-MM-DD 日期"),
+        ("report_date", "", "报告期日期（report_date）必须是实际存在的 YYYY-MM-DD 日期"),
+        ("report_date", "\t", "报告期日期（report_date）必须是实际存在的 YYYY-MM-DD 日期"),
+        ("report_date", "2024-02-29 ", "报告期日期（report_date）必须是实际存在的 YYYY-MM-DD 日期"),
+        ("filing_date", 0, "filing_date must be a string or null"),
+        ("report_date", False, "report_date must be a string or null"),
+    ),
+)
+def test_upload_tool_filing_dates_preserve_raw_text_until_domain_admission(
+    tmp_path: Path,
+    field_name: str,
+    raw_value: JsonValue,
+    expected_message: str,
+) -> None:
+    """filing date adapter 必须保留原文，且只在类型错误时自身拒绝。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        field_name: 当前 filing 日期字段名。
+        raw_value: 未经 strip 或 blank folding 的原始 JSON 值。
+        expected_message: admission 边界的精确失败文案。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: adapter 改写原文或非法参数越过 observation 边界时抛出。
+    """
+
+    workspace_root = _build_workspace(tmp_path)
+    runtime, executor, state_repository = _runtime_with_static_admission_guard(workspace_root=workspace_root)
+    arguments: dict[str, JsonValue] = {
+        "ticker": "AAPL",
+        "upload_kind": "filing",
+        "action": "delete",
+        "fiscal_year": 2024,
+        "fiscal_period": "FY",
+        field_name: raw_value,
+    }
+
+    outcome = asyncio.run(
+        FinsUploadToolCallable(runtime=runtime)(
+            _call(UPLOAD_TOOL_NAME, arguments),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "invalid_argument"
+    assert outcome.result.message == expected_message
+    assert state_repository.calls == []
+    assert state_repository.batch_calls == []
+    assert executor.submitted_job_ids == ()
+    assert runtime._observations == {}
+
+
+def test_upload_tool_calendar_year_schema_and_usage_messages_are_business_neutral(
+    tmp_path: Path,
+) -> None:
+    """filing schema 必须自足说明 strict contract，三个 usage message 必须业务中立。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: schema 扩大 material contract 或 usage 文案出现 channel 语法时抛出。
+    """
+
+    runtime = DefaultFinsRuntime.create(workspace_root=_build_workspace(tmp_path)).get_ingestion_runtime()
+    properties = build_fins_upload_tool(runtime).schema.function.parameters.properties
+    fiscal_year_schema = properties["fiscal_year"]
+    fiscal_period_schema = properties["fiscal_period"]
+    filing_date_schema = properties["filing_date"]
+    report_date_schema = properties["report_date"]
+    ticker_schema = properties["ticker"]
+    aliases_schema = properties["ticker_aliases"]
+    files_schema = properties["files"]
+    primary_schema = properties["primary"]
+
+    assert isinstance(fiscal_year_schema, dict)
+    assert isinstance(fiscal_period_schema, dict)
+    assert isinstance(filing_date_schema, dict)
+    assert isinstance(report_date_schema, dict)
+    assert isinstance(ticker_schema, dict)
+    assert isinstance(aliases_schema, dict)
+    assert isinstance(files_schema, dict)
+    assert isinstance(primary_schema, dict)
+    assert "canonical ticker" in str(ticker_schema["description"])
+    assert "不要填写 CSV" in str(ticker_schema["description"])
+    assert "filing 与 material 上传都适用" in str(aliases_schema["description"])
+    assert "系统信任声明且不联网核验" in str(aliases_schema["description"])
+    assert "查询同一财报归档" in str(aliases_schema["description"])
+    assert files_schema["description"] == FINS_UPLOAD_FORMAT_TEXT.upload_tool_files
+    assert files_schema["maxItems"] == 100
+    assert primary_schema == {
+        "type": "string",
+        "description": FINS_UPLOAD_FORMAT_TEXT.upload_tool_primary,
+    }
+    assert "primary" not in build_fins_upload_tool(runtime).schema.function.parameters.required
+    for expected_fragment in (
+        "auto/create/update 必须至少提供一个文件",
+        "必须实际转换成功",
+        "仅原样保存、不转换",
+        ".xsd 只能作为随附文件",
+        ".xml 仅是 XBRL XML 候选",
+        "不代表任意 XML",
+        ".json 仅是 Docling JSON 候选",
+        "不代表任意 JSON 内容可转换",
+        "主文件后缀通过只表示具备转换资格",
+        "不保证文件内容转换成功",
+        "随附文件只校验可随批保存的后缀，不执行转换",
+        "upload_kind=material",
+        "upload_kind=material 时，auto/create/update 必须至少提供一个文件",
+        "每个文件",
+        "逐个实际转换",
+        "delete 不得提供文件",
+    ):
+        assert expected_fragment in str(files_schema["description"])
+    for expected_fragment in (
+        "单文件 filing 可省略 primary",
+        "多文件 filing 必须恰好指定一个 primary",
+        "primary 必须精确匹配 files 中的一个路径",
+        "files 的顺序不决定主文件角色",
+        "delete 必须省略 files 和 primary",
+        FINS_UPLOAD_FORMAT_TEXT.upload_tool_material_primary_failure,
+        "不能根据质量、重要性或转换是否成功推断",
+    ):
+        assert expected_fragment in str(primary_schema["description"])
+    for forbidden_fragment in (
+        "首文件是主文件",
+        "Path",
+        "tuple",
+        "Host",
+        "Engine",
+        "asset identity",
+    ):
+        assert forbidden_fragment not in str(files_schema["description"])
+        assert forbidden_fragment not in str(primary_schema["description"])
+    assert fiscal_year_schema["description"] == (
+        "财年。上传 filing 时必填，且只接受 1000..9999 的整数；上传 material 时可选。"
+    )
+    assert fiscal_period_schema["description"] == (
+        "财报期间。上传 filing 时必填且只支持 FY、H1、Q1、Q2、Q3、Q4；上传 material 时可选。"
+    )
+    assert filing_date_schema["description"] == (
+        "可选披露日期。上传 filing 时若填写，必须是实际存在的 YYYY-MM-DD 日期；"
+        "文本不会自动去除空白，空串、纯空白或首尾空白均非法。"
+    )
+    assert report_date_schema["description"] == (
+        "可选报告期日期。上传 filing 时若填写，必须是实际存在的 YYYY-MM-DD 日期；"
+        "文本不会自动去除空白，空串、纯空白或首尾空白均非法。"
+    )
+    exact_messages = {
+        FinsUploadUsageCode.INVALID_FISCAL_YEAR: "财年（fiscal_year）必须是 1000..9999 的整数",
+        FinsUploadUsageCode.INVALID_FILING_DATE: "披露日期（filing_date）必须是实际存在的 YYYY-MM-DD 日期",
+        FinsUploadUsageCode.INVALID_REPORT_DATE: "报告期日期（report_date）必须是实际存在的 YYYY-MM-DD 日期",
+    }
+    for code, expected_message in exact_messages.items():
+        message = fins_upload_usage_failure(code).message
+        assert message == expected_message
+        assert "--" not in message
+
+    material_request = upload_tools._upload_request_from_arguments(
+        {
+            "ticker": "AAPL",
+            "upload_kind": "material",
+            "action": "delete",
+            "form_type": "MATERIAL_OTHER",
+            "material_name": "Deck",
+            "filing_date": " 2024-02-29 ",
+        }
+    )
+    assert isinstance(material_request, FinsUploadMaterialRequest)
+    assert material_request.filing_date == "2024-02-29"
+    assert material_request.report_date is None
+
+
+def test_upload_tool_adapter_projects_zero_or_one_filing_primary_selector(
+    tmp_path: Path,
+) -> None:
+    """tool adapter 必须只把可选单值 primary 机械投影为 0/1 raw selector。
+
+    Args:
+        tmp_path: 用于构造可 resolve 的文件路径。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: selector 被遗失、改成首文件或 material 接受 primary 时抛出。
+    """
+
+    companion = tmp_path / "schema.xsd"
+    primary = tmp_path / "report.pdf"
+    companion.write_text("schema", encoding="utf-8")
+    primary.write_text("filing", encoding="utf-8")
+    omitted = upload_tools._upload_request_from_arguments(
+        {
+            "ticker": "AAPL",
+            "upload_kind": "filing",
+            "action": "delete",
+            "fiscal_year": 2024,
+            "fiscal_period": "FY",
+        }
+    )
+    selected = upload_tools._upload_request_from_arguments(
+        {
+            "ticker": "AAPL",
+            "upload_kind": "filing",
+            "files": [str(companion), str(primary)],
+            "primary": str(primary),
+            "fiscal_year": 2024,
+            "fiscal_period": "FY",
+        }
+    )
+
+    assert isinstance(omitted, FinsUploadFilingRequest)
+    assert omitted.primary_selectors == ()
+    assert isinstance(selected, FinsUploadFilingRequest)
+    assert selected.files == (companion.resolve(), primary.resolve())
+    assert selected.primary_selectors == (primary.resolve(),)
+    with pytest.raises(ValueError) as material_error:
+        upload_tools._upload_request_from_arguments(
+            {
+                "ticker": "AAPL",
+                "upload_kind": "material",
+                "action": "delete",
+                "primary": str(primary),
+                "form_type": "MATERIAL_OTHER",
+                "material_name": "Deck",
+            }
+        )
+    assert str(material_error.value) == (
+        FINS_UPLOAD_FORMAT_TEXT.upload_tool_material_primary_failure
+    )
+
+
+def test_upload_tool_material_primary_failure_is_owned_and_has_zero_side_effects(
+    tmp_path: Path,
+) -> None:
+    """material-primary 必须投影 owner 中文文案、完整 hint 与零副作用。
+
+    Args:
+        tmp_path: 用于构造可比较快照的测试 workspace。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: message/hint 与 owner 漂移，或失败路径产生 state/job/workspace 副作用时抛出。
+    """
+
+    workspace_root = _build_workspace(tmp_path)
+    runtime, executor, state_repository = _runtime_with_static_admission_guard(
+        workspace_root=workspace_root
+    )
+    before_tree = _snapshot_tool_workspace_tree(workspace_root)
+
+    outcome = asyncio.run(
+        FinsUploadToolCallable(runtime=runtime)(
+            _call(
+                UPLOAD_TOOL_NAME,
+                {
+                    "ticker": "AAPL",
+                    "upload_kind": "material",
+                    "action": "delete",
+                    "primary": str(tmp_path / "report.pdf"),
+                    "form_type": "MATERIAL_OTHER",
+                    "material_name": "Deck",
+                },
+            ),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "invalid_argument"
+    assert outcome.result.message == (
+        FINS_UPLOAD_FORMAT_TEXT.upload_tool_material_primary_failure
+    )
+    assert outcome.result.hint == (
+        "请检查 ticker、upload_kind、action、files、primary、会计期间和材料字段后重试。"
+    )
+    assert state_repository.calls == []
+    assert executor.submitted_job_ids == ()
+    assert runtime._observations == {}
+    assert not tuple(_job_store_root(workspace_root).glob("*.json"))
+    assert _snapshot_tool_workspace_tree(workspace_root) == before_tree
+
+
+def test_upload_tool_valid_multi_primary_starts_observation(
+    tmp_path: Path,
+) -> None:
+    """filing 的非首位有效 primary 必须通过 owner validation 并登记 observation。
+
+    Args:
+        tmp_path: 用于构造 workspace 和多文件 filing。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 有效 selector 被按顺序改写或 observation 未登记时抛出。
+    """
+
+    workspace_root = _build_workspace(tmp_path)
+    upload_root = _build_upload_root(tmp_path)
+    companion = upload_root / "schema.xsd"
+    primary = upload_root / "report.pdf"
+    companion.write_text("schema", encoding="utf-8")
+    primary.write_text("filing", encoding="utf-8")
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+
+    outcome = asyncio.run(
+        FinsUploadToolCallable(runtime=runtime)(
+            _call(
+                UPLOAD_TOOL_NAME,
+                {
+                    "ticker": "AAPL",
+                    "upload_kind": "filing",
+                    "files": [str(companion), str(primary)],
+                    "primary": str(primary),
+                    "fiscal_year": 2024,
+                    "fiscal_period": "FY",
+                    "company_name": "Apple Inc.",
+                },
+            ),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolAwaitingOutcome)
+    assert outcome.await_spec.await_kind is ToolAwaitKind.EXTERNAL_JOB
+    assert len(runtime._observations) == 1
+
+
+@pytest.mark.parametrize(
+    ("action", "primary_name", "expected_message"),
+    (
+        ("auto", "outside.pdf", "--primary 必须精确匹配 --files 中的一个文件"),
+        ("delete", "report.pdf", "delete 不得提供 --primary"),
+    ),
+)
+def test_upload_tool_invalid_primary_fails_before_state_or_observation_registration(
+    tmp_path: Path,
+    action: str,
+    primary_name: str,
+    expected_message: str,
+) -> None:
+    """filing primary 业务错误必须由 Fins owner 在 state/observation 之前拒绝。
+
+    Args:
+        tmp_path: 用于构造零副作用 workspace。
+        action: 当前 filing 动作。
+        primary_name: 用于触发 membership 或 delete 规则的 selector basename。
+        expected_message: ingestion owner 的精确错误文案。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: adapter 重做业务判断或失败后产生副作用时抛出。
+    """
+
+    workspace_root = _build_workspace(tmp_path)
+    upload_root = _build_upload_root(tmp_path)
+    report = upload_root / "report.pdf"
+    report.write_text("filing", encoding="utf-8")
+    runtime, executor, state_repository = _runtime_with_static_admission_guard(
+        workspace_root=workspace_root
+    )
+    arguments: dict[str, JsonValue] = {
+        "ticker": "AAPL",
+        "upload_kind": "filing",
+        "action": action,
+        "primary": str(upload_root / primary_name),
+        "fiscal_year": 2024,
+        "fiscal_period": "FY",
+    }
+    if action != "delete":
+        arguments["files"] = [str(report)]
+
+    outcome = asyncio.run(
+        FinsUploadToolCallable(runtime=runtime)(
+            _call(UPLOAD_TOOL_NAME, arguments),
+            _context(),
+        )
+    )
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "invalid_argument"
+    assert outcome.result.message == expected_message
+    assert state_repository.calls == []
+    assert state_repository.batch_calls == []
+    assert executor.submitted_job_ids == ()
+    assert runtime._observations == {}
+    assert not tuple(_job_store_root(workspace_root).glob("*.json"))
+
+
 def test_awaiting_tool_callables_prepare_without_executor_submit(tmp_path: Path) -> None:
     """download/preprocess/upload callable 只 prepare observation，不提交 executor。"""
 
@@ -1199,6 +2135,7 @@ def test_upload_tool_accepts_local_file_outside_workspace_without_source_side_ef
                     "files": [str(outside_file)],
                     "fiscal_year": 2024,
                     "fiscal_period": "FY",
+                    "company_name": "Apple Inc.",
                 },
             ),
             _context(),
@@ -1209,6 +2146,115 @@ def test_upload_tool_accepts_local_file_outside_workspace_without_source_side_ef
     assert executor.submitted_job_ids == ()
     assert all(str(outside_file.parent) not in job_id for job_id in executor.submitted_job_ids)
     assert not (outside_file.parent / ".dayu").exists()
+
+
+def test_upload_tool_raw_material_request_reaches_production_usage_failure_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LLM tool raw material 请求必须经 production runner 得到格式 usage 终态。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: 外部读取与 mutation 禁用夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: tool adapter、runner、workflow 或 failure owner 发生旁路时抛出。
+    """
+
+    workspace_root = _build_workspace(tmp_path)
+    unsupported_file = tmp_path / "deck.zip"
+    unsupported_file.write_bytes(b"not read")
+    request = upload_tools._upload_request_from_arguments(
+        {
+            "ticker": "AAPL",
+            "upload_kind": "material",
+            "action": "create",
+            "files": [str(unsupported_file)],
+            "form_type": "MATERIAL_OTHER",
+            "material_name": "Deck",
+            "company_name": "Apple Inc.",
+        }
+    )
+    assert isinstance(request, FinsUploadMaterialRequest)
+    runtime = DefaultFinsRuntime.create(workspace_root=workspace_root).get_ingestion_runtime()
+    runner = runtime.upload_runner
+    assert isinstance(runner, ProductionFinsUploadRunner)
+
+    def reject_state_read(ticker: str, document_id: str, source_kind: SourceKind) -> None:
+        """拒绝 material published-state 读取。
+
+        Args:
+            ticker: 意外 ticker。
+            document_id: 意外文档 ID。
+            source_kind: 意外 source kind。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 始终抛出。
+        """
+
+        del ticker, document_id, source_kind
+        raise AssertionError("格式 admission 前禁止读取 published state")
+
+    def reject_batch(ticker: str) -> None:
+        """拒绝 production workflow 开启 batch。
+
+        Args:
+            ticker: 意外 batch ticker。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 始终抛出。
+        """
+
+        del ticker
+        raise AssertionError("格式 admission 失败禁止开启 batch")
+
+    def reject_file_read(path: Path) -> bytes:
+        """拒绝输入文件内容读取。
+
+        Args:
+            path: 意外读取路径。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 始终抛出。
+        """
+
+        raise AssertionError(f"格式 admission 失败禁止读取文件: {path.name}")
+
+    monkeypatch.setattr(runner.sec_pipeline, "_safe_get_document_meta", reject_state_read)
+    monkeypatch.setattr(runner.sec_pipeline._batching_repository, "begin_batch", reject_batch)
+    monkeypatch.setattr(Path, "read_bytes", reject_file_read)
+    cancellation_checker: FinsJobCancellationChecker = _OpenCancellationToken()
+
+    summary = runner.run_upload(
+        request,
+        cancellation_checker=cancellation_checker,
+    )
+
+    assert summary.status == "failed"
+    assert summary.requested_file_count == 1
+    assert summary.stored_file_count == 0
+    assert summary.failure_reason is not None
+    assert summary.failure_reason.to_json() == {
+        "kind": "usage",
+        "code": "unsupported_upload_format",
+        "message": "文件格式不受支持，请选择支持的文件后重试",
+        "retry_hint": "请查看上传帮助中的支持格式后重试",
+        "file_label": "deck.zip",
+    }
+    assert not (workspace_root / "portfolio" / "AAPL").exists()
 
 
 def test_upload_tool_empty_file_returns_failed_outcome_before_observation_start(tmp_path: Path) -> None:
@@ -1636,16 +2682,76 @@ def _job_store_root(workspace_root: Path) -> Path:
     return workspace_root / ".dayu" / "fins_ingestion" / "jobs"
 
 
+def _snapshot_tool_workspace_tree(workspace_root: Path) -> tuple[tuple[str, str], ...]:
+    """读取 tool workspace 的稳定目录/内容快照。
+
+    Args:
+        workspace_root: 待观测的 workspace 根目录。
+
+    Returns:
+        按相对路径排序的目录标记或文件 SHA-256 元组。
+
+    Raises:
+        OSError: workspace 遍历或文件读取失败时抛出。
+    """
+
+    entries: list[tuple[str, str]] = []
+    for path in sorted(workspace_root.rglob("*")):
+        relative_path = path.relative_to(workspace_root).as_posix()
+        if path.is_dir():
+            entries.append((relative_path, "directory"))
+        elif path.is_file():
+            entries.append((relative_path, hashlib.sha256(path.read_bytes()).hexdigest()))
+    return tuple(entries)
+
+
+def _runtime_with_static_admission_guard(
+    *,
+    workspace_root: Path,
+) -> tuple[FinsIngestionRuntime, _NoOpExecutor, _ForbiddenFilingUploadStateRepository]:
+    """构造禁止 state read 且记录 executor submit 的 tool runtime。
+
+    Args:
+        workspace_root: Fins workspace 根目录。
+
+    Returns:
+        ingestion runtime、记录执行器与禁止 state 仓储。
+
+    Raises:
+        OSError: 默认 runtime 仓储装配失败时抛出。
+    """
+
+    base_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    executor = _NoOpExecutor()
+    upload_runner = _RecordingFinsUploadRunner()
+    state_repository = _ForbiddenFilingUploadStateRepository()
+    runtime = FinsIngestionRuntime.create(
+        batching_repository=base_runtime.batching_repository,
+        source_repository=base_runtime.source_repository,
+        blob_repository=base_runtime.blob_repository,
+        filing_maintenance_repository=base_runtime.filing_maintenance_repository,
+        filing_upload_state_repository=state_repository,
+        processed_repository=base_runtime.processed_repository,
+        processor_registry=base_runtime.processor_registry,
+        job_store=base_runtime.ingestion_job_store,
+        executor=executor,
+        upload_runner=upload_runner,
+    )
+    return runtime, executor, state_repository
+
+
 def _runtime_with_executor(
     *,
     workspace_root: Path,
     executor: FinsIngestionExecutor,
+    upload_runner: FinsUploadRunner | None = None,
 ) -> FinsIngestionRuntime:
     """使用指定后台执行器构造 ingestion runtime。
 
     Args:
         workspace_root: Fins workspace root。
         executor: 测试注入的后台执行器。
+        upload_runner: 可选测试上传 runner。
 
     Returns:
         Fins ingestion 运行时。
@@ -1660,10 +2766,12 @@ def _runtime_with_executor(
         source_repository=base_runtime.source_repository,
         blob_repository=base_runtime.blob_repository,
         filing_maintenance_repository=base_runtime.filing_maintenance_repository,
+        filing_upload_state_repository=base_runtime.filing_upload_state_repository,
         processed_repository=base_runtime.processed_repository,
         processor_registry=base_runtime.processor_registry,
         job_store=base_runtime.ingestion_job_store,
         executor=executor,
+        upload_runner=upload_runner,
     )
 
 

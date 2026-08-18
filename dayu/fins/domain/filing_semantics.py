@@ -1,12 +1,14 @@
 """财报文档共享语义解析真源。
 
-本模块承载 Fins domain 层的窄业务值解析：SEC form、财期、文档质量和
-财务数据质量。pipeline、processor、storage decode 与 read runtime 只能消费
-这里的解析结果，避免各自维护字符串映射后产生语义漂移。
+本模块承载 Fins domain 层的窄业务值解析：SEC form、财期、四位 fiscal/partial
+year、canonical Gregorian full-date、文档质量和财务数据质量。calendar/year
+合法性由本模块统一拥有；pipeline、processor、storage decode 与 read runtime
+只能消费这里的解析结果，避免各自维护业务规则后产生语义漂移。
 """
 
 from __future__ import annotations
 
+import datetime
 import re
 from typing import Final, Literal, Optional, TypeAlias, cast
 
@@ -40,6 +42,21 @@ DocumentQuality: TypeAlias = Literal["full", "partial", "fallback"]
 
 FinancialDataQuality: TypeAlias = Literal["xbrl", "partial", "extracted"]
 """财务数据载荷质量封闭业务值。"""
+
+_MIN_CALENDAR_YEAR: Final[int] = 1000
+"""Fins 财年与 partial calendar year 的最小合法值。"""
+
+_MAX_CALENDAR_YEAR: Final[int] = 9999
+"""Fins 财年与 partial calendar year 的最大合法值。"""
+
+_CALENDAR_YEAR_RANGE_TEXT: Final[str] = f"{_MIN_CALENDAR_YEAR}..{_MAX_CALENDAR_YEAR}"
+"""由年份边界派生、供 owner 错误文案共用的闭区间文本。"""
+
+_STRICT_ISO_CALENDAR_DATE_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"(?P<year>[0-9]{4})-(?P<month>[0-9]{2})-(?P<day>[0-9]{2})",
+    flags=re.ASCII,
+)
+"""精确 ASCII ``YYYY-MM-DD`` 日期文本格式。"""
 
 SEC_FORM_GROUP_SC13D_G: Final[str] = "SC 13D/G"
 """SEC 下载筛选使用的 SC 13D/G 组合别名；该值不得作为单一 filing form 持久化。"""
@@ -324,28 +341,85 @@ def parse_fiscal_period_filter_value(
     return period
 
 
+def parse_calendar_year(value: int, *, field_name: str = "year") -> int:
+    """解析 Fins 财年或 partial calendar year。
+
+    Args:
+        value: 待解析的整数年份。
+        field_name: 报错使用的字段名。
+
+    Returns:
+        位于 ``1000..9999`` 闭区间内的原始整数年份。
+
+    Raises:
+        ValueError: 输入为 bool、非整数或超出 ``1000..9999`` 时抛出。
+    """
+
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < _MIN_CALENDAR_YEAR
+        or value > _MAX_CALENDAR_YEAR
+    ):
+        raise ValueError(f"{field_name} 必须是 {_CALENDAR_YEAR_RANGE_TEXT} 的整数")
+    return value
+
+
+def parse_iso_calendar_date(value: str, *, field_name: str = "date") -> datetime.date:
+    """解析精确且实际存在的 ISO 公历日期。
+
+    Args:
+        value: 待解析的日期文本，必须精确符合 ASCII ``YYYY-MM-DD``。
+        field_name: 报错使用的字段名。
+
+    Returns:
+        与输入文本完全一致的公历日期值。
+
+    Raises:
+        ValueError: 输入不是字符串、格式不精确或日期在公历中不存在时抛出。
+    """
+
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} 必须是实际存在的 YYYY-MM-DD 日期")
+    matched = _STRICT_ISO_CALENDAR_DATE_PATTERN.fullmatch(value)
+    if matched is None:
+        raise ValueError(f"{field_name} 必须是实际存在的 YYYY-MM-DD 日期")
+    try:
+        parsed = datetime.date(
+            int(matched.group("year")),
+            int(matched.group("month")),
+            int(matched.group("day")),
+        )
+    except ValueError:
+        raise ValueError(f"{field_name} 必须是实际存在的 YYYY-MM-DD 日期") from None
+    if parsed.isoformat() != value:
+        raise ValueError(f"{field_name} 必须是实际存在的 YYYY-MM-DD 日期")
+    return parsed
+
+
 def normalize_fiscal_year(value: JsonValue | None, *, field_name: str = "fiscal_year") -> int | None:
     """解析可选财年字段。
 
-    财年只能来自 producer 或仓储中的直接正整数事实。本函数不会从报告日期、
-    申报日期或财期推断年份，也不会接受 bool、数字文本或浮点数。
+    财年只能来自 producer 或仓储中的直接四位整数事实。本函数不会从报告日期、
+    申报日期或财期推断年份，也不会接受 bool、数字文本或浮点数；非空整数的
+    年份范围统一委托 :func:`parse_calendar_year` 校验。
 
     Args:
         value: 原始财年 JSON 值；字段缺失或显式为空时传入 ``None``。
         field_name: 报错使用的字段名。
 
     Returns:
-        正整数财年；输入缺失时返回 ``None``。
+        位于 ``1000..9999`` 闭区间内的财年；输入缺失时返回 ``None``。
 
     Raises:
-        ValueError: 非空输入不是正整数，或输入为 bool 时抛出。
+        ValueError: 非空输入为 bool、非整数或超出 ``1000..9999`` 时抛出。
     """
 
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ValueError(f"{field_name} 必须为正整数")
-    return value
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field_name} 必须是 {_CALENDAR_YEAR_RANGE_TEXT} 的整数")
+    return parse_calendar_year(value, field_name=field_name)
 
 
 def fiscal_period_recency_rank(period: str | None) -> int:

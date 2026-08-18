@@ -221,6 +221,8 @@ async def run_download_single_filing_stream(
         文件级与 filing 级事件。
 
     Raises:
+        SourceIntegrityPreflightError: Phase A 或 Phase B target 为 UNSAFE 时抛出。
+        SourceIntegrityRevisionConflictError: publication identity 连续变化耗尽重试时抛出。
         RuntimeError: 关键路径异常时抛出。
     """
 
@@ -232,6 +234,8 @@ async def run_download_single_filing_stream(
         document_id,
         SourceKind.FILING,
     )
+    if phase_a_integrity.status is SourceIntegrityStatus.UNSAFE:
+        raise SourceIntegrityPreflightError(SourceIntegrityPreflightReason.UNSAFE_PUBLICATION)
     previous_meta = (
         None
         if phase_a_integrity.status is SourceIntegrityStatus.MISSING
@@ -497,6 +501,8 @@ async def run_download_single_filing_stream(
             SourceKind.FILING,
             batch=token,
         )
+        if phase_b_integrity.status is SourceIntegrityStatus.UNSAFE:
+            raise SourceIntegrityPreflightError(SourceIntegrityPreflightReason.UNSAFE_PUBLICATION)
         if not has_same_source_publication_identity(
             phase_a_integrity,
             phase_b_integrity,

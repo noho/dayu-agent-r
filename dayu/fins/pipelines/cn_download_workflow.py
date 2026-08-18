@@ -13,7 +13,7 @@ from functools import partial
 from typing import TypeAlias, cast
 
 from dayu.contracts.json_value import JsonValue
-from dayu.fins.pipelines.cn_download_company_meta import upsert_company_meta_for_cn_download
+from dayu.fins.pipelines.cn_download_company_meta import stage_company_meta_for_cn_download
 from dayu.fins.pipelines.cn_download_filing_workflow import (
     project_cn_filing_failure,
     run_cn_download_single_filing_stream,
@@ -427,7 +427,7 @@ def _publish_cn_company_after_repair(
 
     company_batch = host.batching_repository.begin_batch(normalized_ticker)
     try:
-        upsert_company_meta_for_cn_download(
+        intent = stage_company_meta_for_cn_download(
             repository=host.company_meta_repository,
             profile=profile,
             normalized_ticker=normalized_ticker,
@@ -437,7 +437,10 @@ def _publish_cn_company_after_repair(
     except BaseException:
         host.batching_repository.rollback_batch(company_batch)
         raise
-    host.batching_repository.commit_batch(company_batch)
+    if intent is None:
+        host.batching_repository.rollback_batch(company_batch)
+    else:
+        host.batching_repository.commit_batch(company_batch)
 
 
 def _is_cancel_requested(cancel_checker: Callable[[], bool] | None) -> bool:

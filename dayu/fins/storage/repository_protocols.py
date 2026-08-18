@@ -15,10 +15,14 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from types import TracebackType
-from typing import BinaryIO, Literal, Optional, Protocol
+from typing import BinaryIO, Final, Literal, Optional, Protocol
 
 from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.source import Source
+from dayu.fins.domain.company_meta_contract import (
+    CompanyMetaCommitIntent,
+    CompanyMetaCommitOutcome,
+)
 from dayu.fins.domain.document_models import (
     BatchToken,
     CompanyMeta,
@@ -30,6 +34,8 @@ from dayu.fins.domain.document_models import (
     DownloadRejectionRegistry,
     DocumentSummary,
     FileObjectMeta,
+    FinsIngestMethod,
+    FinsSourceProvider,
     ProcessedCreateRequest,
     ProcessedDeleteRequest,
     ProcessedHandle,
@@ -43,8 +49,457 @@ from dayu.fins.domain.document_models import (
     SourceHandle,
 )
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.ticker_normalization import normalize_ticker
 
-from .source_integrity import SourceIntegrityClassification
+from .source_integrity import SourceIntegrityClassification, SourceIntegrityStatus
+
+
+FilingUploadAssetSource = Literal["original", "docling"]
+"""filing upload publication identity 中资产来源的封闭类型。"""
+
+FILING_UPLOAD_ASSET_SOURCE_ORIGINAL: Final[FilingUploadAssetSource] = "original"
+"""用户输入 original 资产来源。"""
+
+FILING_UPLOAD_ASSET_SOURCE_DOCLING: Final[FilingUploadAssetSource] = "docling"
+"""Docling 派生资产来源。"""
+
+_CANONICAL_SHA256_LENGTH: Final[int] = 64
+
+
+def _is_canonical_sha256(value: str) -> bool:
+    """判断文本是否为 canonical lowercase SHA-256。
+
+    Args:
+        value: 待检查摘要。
+
+    Returns:
+        64 位小写十六进制文本返回 ``True``。
+
+    Raises:
+        无。
+    """
+
+    if not isinstance(value, str):
+        return False
+    if len(value) != _CANONICAL_SHA256_LENGTH or value != value.lower():
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_path_free_asset_name(value: str) -> bool:
+    """判断资产名称是否为单段、无路径语义的业务标签。
+
+    Args:
+        value: storage name 或用户可读 basename。
+
+    Returns:
+        非空、非点目录、无分隔符与 NUL 时返回 ``True``。
+
+    Raises:
+        无。
+    """
+
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value not in {".", ".."}
+        and "\\" not in value
+        and "\0" not in value
+        and PurePosixPath(value).name == value
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class FilingUploadAssetDescriptor:
+    """filing upload publication identity 的单个无路径资产事实。
+
+    Attributes:
+        name: storage-owned 资产身份。
+        original_filename: 用户输入 basename。
+        derived_from: Docling 资产对应的 original storage name。
+        sha256: canonical lowercase SHA-256。
+        size: 非负字节数。
+        content_type: 可选媒体类型。
+        source: original 或 Docling 来源角色。
+    """
+
+    name: str
+    original_filename: str
+    derived_from: str | None
+    sha256: str
+    size: int
+    content_type: str | None
+    source: FilingUploadAssetSource
+
+    def __post_init__(self) -> None:
+        """校验资产 identity、摘要与来源角色不变量。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            TypeError: 文本、size 或 source 不是精确 contract 类型时抛出。
+            ValueError: 文本、摘要、大小或来源角色关系非法时抛出。
+        """
+
+        if not isinstance(self.name, str) or not isinstance(self.original_filename, str):
+            raise TypeError("filing upload asset name 与 original_filename 必须是字符串")
+        if not _is_path_free_asset_name(self.name) or not _is_path_free_asset_name(
+            self.original_filename
+        ):
+            raise ValueError("filing upload asset name 与 original_filename 必须是无路径 basename")
+        if type(self.size) is not int:
+            raise TypeError("filing upload asset size 必须是整数")
+        if self.size < 0:
+            raise ValueError("filing upload asset size 不得为负数")
+        if not isinstance(self.sha256, str):
+            raise TypeError("filing upload asset sha256 必须是字符串")
+        if not _is_canonical_sha256(self.sha256):
+            raise ValueError("filing upload asset sha256 必须是 canonical lowercase SHA-256")
+        if self.content_type is not None:
+            if not isinstance(self.content_type, str):
+                raise TypeError("filing upload asset content_type 必须是字符串或 None")
+            if not self.content_type:
+                raise ValueError("filing upload asset content_type 不得为空字符串")
+        if self.source not in {
+            FILING_UPLOAD_ASSET_SOURCE_ORIGINAL,
+            FILING_UPLOAD_ASSET_SOURCE_DOCLING,
+        }:
+            raise TypeError("filing upload asset source 必须属于封闭 contract")
+        if self.source == FILING_UPLOAD_ASSET_SOURCE_ORIGINAL:
+            if self.derived_from is not None:
+                raise ValueError("filing original asset 不得携带 derived_from")
+            return
+        if self.derived_from is not None and not isinstance(self.derived_from, str):
+            raise TypeError("filing Docling asset derived_from 必须是字符串或 None")
+        if self.derived_from is None or not _is_path_free_asset_name(self.derived_from):
+            raise ValueError("filing Docling asset 必须携带无路径 derived_from")
+
+
+@dataclass(frozen=True, slots=True)
+class FilingUploadPublicationIdentity:
+    """prepared 与 durable filing publication 共用的精确业务身份。
+
+    该契约只承载 exact publication equality 所需的业务事实，不包含路径、
+    revision、时间戳、batch identity 或原始字节。
+    """
+
+    ticker: str
+    document_id: str
+    internal_document_id: str
+    form_type: str
+    company_id: str
+    ingest_method: str
+    fiscal_year: int
+    fiscal_period: str
+    report_kind: str
+    filing_date: str | None
+    report_date: str | None
+    amended: bool
+    source_provider: str
+    is_deleted: bool
+    document_version: str
+    source_fingerprint: str
+    primary_document: str
+    primary_original_asset_name: str
+    companion_original_asset_names: tuple[str, ...]
+    assets: tuple[FilingUploadAssetDescriptor, ...]
+
+    def __post_init__(self) -> None:
+        """校验 publication identity 的 closed equality contract。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            TypeError: 文本、财年或布尔字段类型不精确时抛出。
+            ValueError: 身份、provenance、摘要、排序或资产角色关系非法时抛出。
+        """
+
+        required_texts = (
+            ("ticker", self.ticker),
+            ("document_id", self.document_id),
+            ("internal_document_id", self.internal_document_id),
+            ("form_type", self.form_type),
+            ("company_id", self.company_id),
+            ("ingest_method", self.ingest_method),
+            ("fiscal_period", self.fiscal_period),
+            ("report_kind", self.report_kind),
+            ("source_provider", self.source_provider),
+            ("document_version", self.document_version),
+            ("primary_document", self.primary_document),
+            ("primary_original_asset_name", self.primary_original_asset_name),
+        )
+        for field_name, value in required_texts:
+            if not isinstance(value, str):
+                raise TypeError(f"filing publication identity {field_name} 必须是字符串")
+            if not value:
+                raise ValueError(f"filing publication identity {field_name} 不能为空")
+        if normalize_ticker(self.ticker).canonical != self.ticker:
+            raise ValueError("filing publication identity ticker 必须 canonical")
+        if type(self.fiscal_year) is not int:
+            raise TypeError("filing publication identity fiscal_year 必须是整数")
+        if type(self.amended) is not bool or type(self.is_deleted) is not bool:
+            raise TypeError("filing publication identity amended/is_deleted 必须是布尔值")
+        if self.filing_date is not None:
+            if not isinstance(self.filing_date, str):
+                raise TypeError("filing publication identity filing_date 必须是字符串或 None")
+            if not self.filing_date:
+                raise ValueError("filing publication identity filing_date 不得为空字符串")
+        if self.report_date is not None:
+            if not isinstance(self.report_date, str):
+                raise TypeError("filing publication identity report_date 必须是字符串或 None")
+            if not self.report_date:
+                raise ValueError("filing publication identity report_date 不得为空字符串")
+        if not isinstance(self.source_fingerprint, str):
+            raise TypeError("filing publication identity source_fingerprint 必须是字符串")
+        if self.ingest_method != FinsIngestMethod.UPLOAD.to_storage_value():
+            raise ValueError("filing publication identity ingest_method 必须是 upload")
+        if self.source_provider != FinsSourceProvider.USER_UPLOAD.to_storage_value():
+            raise ValueError("filing publication identity source_provider 必须是 user_upload")
+        if self.is_deleted:
+            raise ValueError("deleted filing 不得形成 canonical publication identity")
+        if not _is_canonical_sha256(self.source_fingerprint):
+            raise ValueError("filing publication identity source_fingerprint 必须是 canonical SHA-256")
+        if not self.assets:
+            raise ValueError("filing publication identity 必须携带资产")
+        asset_names = tuple(asset.name for asset in self.assets)
+        if asset_names != tuple(sorted(asset_names)) or len(asset_names) != len(set(asset_names)):
+            raise ValueError("filing publication identity assets 必须按唯一 storage name 排序")
+        originals = tuple(
+            asset
+            for asset in self.assets
+            if asset.source == FILING_UPLOAD_ASSET_SOURCE_ORIGINAL
+        )
+        if not originals:
+            raise ValueError("filing publication identity 至少需要一个 original")
+        original_names = tuple(asset.name for asset in originals)
+        if self.primary_original_asset_name not in original_names:
+            raise ValueError("primary original 必须命中 original storage name")
+        expected_companions = tuple(
+            sorted(name for name in original_names if name != self.primary_original_asset_name)
+        )
+        if self.companion_original_asset_names != expected_companions:
+            raise ValueError("companions 必须精确分割并排序其余 original storage names")
+        primary_matches = tuple(asset for asset in self.assets if asset.name == self.primary_document)
+        if len(primary_matches) != 1:
+            raise ValueError("primary_document 必须精确命中一个 asset")
+        primary_asset = primary_matches[0]
+        if (
+            primary_asset.source != FILING_UPLOAD_ASSET_SOURCE_DOCLING
+            or primary_asset.derived_from != self.primary_original_asset_name
+        ):
+            raise ValueError("primary_document 必须是 primary original 的 Docling 派生资产")
+        original_name_set = frozenset(original_names)
+        for asset in self.assets:
+            if (
+                asset.source == FILING_UPLOAD_ASSET_SOURCE_DOCLING
+                and asset.derived_from not in original_name_set
+            ):
+                raise ValueError("Docling asset derived_from 必须命中 original storage name")
+
+
+CompanyTickerIdentityCorruptionKind = Literal[
+    "invalid_descriptor",
+    "invalid_meta",
+    "identity_mismatch",
+    "duplicate_owner",
+]
+"""Published company ticker identity corruption 的 closed kind。"""
+
+
+class CompanyTickerAliasConflictError(ValueError):
+    """本次 lookup ticker 已被另一 canonical corpus 占用。"""
+
+    alias: str
+    existing_canonical_ticker: str
+    incoming_canonical_ticker: str
+
+    def __init__(
+        self,
+        *,
+        alias: str,
+        existing_canonical_ticker: str,
+        incoming_canonical_ticker: str,
+    ) -> None:
+        """构造 incoming identity conflict。
+
+        Args:
+            alias: 发生冲突的 normalized lookup ticker。
+            existing_canonical_ticker: 当前 published owner。
+            incoming_canonical_ticker: 本次提交的 canonical corpus。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: 任一业务 identity 为空时抛出。
+        """
+
+        for field_name, ticker in (
+            ("alias", alias),
+            ("existing_canonical_ticker", existing_canonical_ticker),
+            ("incoming_canonical_ticker", incoming_canonical_ticker),
+        ):
+            if not ticker or normalize_ticker(ticker).canonical != ticker:
+                raise ValueError(f"{field_name} 必须是 normalized ticker")
+        self.alias = alias
+        self.existing_canonical_ticker = existing_canonical_ticker
+        self.incoming_canonical_ticker = incoming_canonical_ticker
+        super().__init__("股票代码别名已属于其他 canonical corpus")
+
+
+class CompanyTickerIdentityCorruptionError(ValueError):
+    """Published company ticker identity durable state 已损坏。"""
+
+    kind: CompanyTickerIdentityCorruptionKind
+    lookup_ticker: str | None
+
+    def __init__(
+        self,
+        *,
+        kind: CompanyTickerIdentityCorruptionKind,
+        lookup_ticker: str | None = None,
+    ) -> None:
+        """构造不携带 filesystem locator 的 durable corruption fact。
+
+        Args:
+            kind: closed corruption kind。
+            lookup_ticker: 可选 normalized lookup ticker，仅供结构化 owner 处理。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: kind 不属于 closed contract 或 lookup ticker 为空字符串时抛出。
+        """
+
+        allowed_kinds: frozenset[str] = frozenset(
+            {"invalid_descriptor", "invalid_meta", "identity_mismatch", "duplicate_owner"}
+        )
+        if kind not in allowed_kinds:
+            raise ValueError("未知 company ticker identity corruption kind")
+        if lookup_ticker is not None and normalize_ticker(lookup_ticker).canonical != lookup_ticker:
+            raise ValueError("lookup_ticker 必须是 normalized ticker")
+        self.kind = kind
+        self.lookup_ticker = lookup_ticker
+        super().__init__("工作区公司代码身份数据损坏")
+
+
+@dataclass(frozen=True, slots=True)
+class FilingUploadPublishedState:
+    """filing 上传校验所需的同版 published state。
+
+    Attributes:
+        company_meta: 当前已发布公司元数据；不存在时为 ``None``。
+        source_integrity: exact filing target 的 storage-owned 完整性事实。
+        source_meta: 当前已发布 filing source 元数据；不存在时为 ``None``。
+        publication_identity: COMPLETE user-upload filing 的精确 publication identity；
+            其它状态或无法完整投影时为 ``None``。
+    """
+
+    company_meta: CompanyMeta | None
+    source_integrity: SourceIntegrityClassification
+    source_meta: Mapping[str, JsonValue] | None
+    publication_identity: FilingUploadPublicationIdentity | None
+
+    def __post_init__(self) -> None:
+        """校验 classification 与 business meta 的 required 对应关系。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: target 不是 filing，或 status 与 source_meta presence 不一致时抛出。
+        """
+
+        if self.source_integrity.source_kind is not SourceKind.FILING:
+            raise ValueError("filing upload published state 必须引用 filing integrity")
+        if self.source_integrity.status in {
+            SourceIntegrityStatus.MISSING,
+            SourceIntegrityStatus.UNSAFE,
+        }:
+            if self.source_meta is not None or self.publication_identity is not None:
+                raise ValueError("MISSING/UNSAFE filing state 不得携带 source meta 或 publication identity")
+            return
+        if self.source_meta is None:
+            raise ValueError("COMPLETE/REPAIR_REQUIRED filing state 必须携带 source_meta")
+        if self.source_integrity.status is SourceIntegrityStatus.REPAIR_REQUIRED:
+            if self.publication_identity is not None:
+                raise ValueError("REPAIR_REQUIRED filing state 不得携带 publication identity")
+            return
+        if self.publication_identity is not None and (
+            self.publication_identity.ticker != self.source_integrity.ticker
+            or self.publication_identity.document_id != self.source_integrity.document_id
+        ):
+            raise ValueError("filing publication identity 与 published state target 不一致")
+
+
+class FilingUploadStateRepositoryProtocol(Protocol):
+    """filing 上传校验使用的最小只读仓储协议。"""
+
+    def read_filing_upload_state(
+        self,
+        ticker: str,
+        document_id: str,
+    ) -> FilingUploadPublishedState:
+        """读取同一 publication guard 下的公司与 filing source 状态。
+
+        Args:
+            ticker: 待校验的公司代码。
+            document_id: 待校验的 filing 文档 ID。
+
+        Returns:
+            同版 company meta、required source integrity 与按状态可用的 source meta。
+
+        Raises:
+            CompanyTickerIdentityCorruptionError: published target、descriptor、meta
+                或 identity durable state 损坏时抛出。
+            ValueError: ticker 或 document identity 非法时抛出；source directory、meta、
+                identity descriptor 等可归属 target 的结构损坏返回 ``UNSAFE`` typed state。
+            RuntimeFileLockError: publication guard 获取或释放失败时抛出。
+            OSError: identity descriptor、meta 或其它 published state operational 读取失败时
+                抛出 path-free 文件系统异常。
+        """
+
+        ...
+
+    def read_filing_upload_state_in_batch(
+        self,
+        batch: BatchToken,
+        document_id: str,
+    ) -> FilingUploadPublishedState:
+        """读取 open batch writer-owned staging 中的同版 filing 上传状态。
+
+        Args:
+            batch: 同一 storage core、ticker 且仍 open 的 batch capability。
+            document_id: 待校验的 exact filing 文档 ID。
+
+        Returns:
+            staging view 中同版 company meta、source state 与 publication identity。
+
+        Raises:
+            CompanyTickerIdentityCorruptionError: staging ticker descriptor、meta 或 identity
+                durable state 损坏时抛出。
+            ValueError: capability、ticker 或 document identity 非法时抛出。
+            OSError: staging state operational 读取失败时抛出 path-free 文件系统异常。
+            RuntimeError: exact inspector 未返回 target 或可信状态缺少 business meta 时抛出。
+        """
+
+        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,17 +698,20 @@ class BatchingRepositoryProtocol(Protocol):
         """
         ...
 
-    def commit_batch(self, batch: BatchToken) -> None:
+    def commit_batch(self, batch: BatchToken) -> CompanyMetaCommitOutcome | None:
         """提交批处理事务并消费 token。
 
         Args:
             batch: 当前 storage core 登记的活动 batch capability。
 
         Returns:
-            无；返回即表示 ``COMMITTED`` journal 已成为唯一提交事实。
+            batch 含 company-meta intent 时返回 publication-final typed outcome；
+            否则返回 ``None``。正常返回表示 ``COMMITTED`` journal 已成为唯一提交事实。
 
         Raises:
             ValueError: token 不是当前活动 batch 时抛出。
+            SourceIntegrityPreflightError: whole-tree inspection 遇到无法归属到
+                单一 source target 的结构损坏时抛出。
             OSError: ``COMMITTED`` 前 physical swap、journal 或 restore 失败时抛出；
                 capability 仍由本方法终态消费，caller 不得再次 rollback。
             RuntimeFileLockError: 没有更早 operation error 且 publication/writer lock
@@ -332,34 +790,38 @@ class CompanyMetaRepositoryProtocol(Protocol):
         """
         ...
 
-    def upsert_company_meta(self, meta: CompanyMeta, *, batch: BatchToken) -> None:
-        """在显式 transaction staging 中写入公司级元数据。
+    def stage_company_meta_intent(
+        self,
+        intent: CompanyMetaCommitIntent,
+        *,
+        batch: BatchToken,
+    ) -> None:
+        """在显式 transaction state 中记录公司元数据提交意图。
 
         Args:
-            meta: 待写入的公司级元数据。
+            intent: 待在 commit-time 与 authoritative published state 合并的意图。
             batch: 同一 storage core、ticker 且仍为 open 的显式 capability。
 
         Returns:
             无。
 
         Raises:
-            ValueError: capability、ticker 或元数据路径字段非法时抛出。
-            OSError: staging 写入失败时抛出。
+            ValueError: capability、ticker、意图不匹配或重复 stage 时抛出。
         """
         ...
 
-    def resolve_existing_ticker(self, ticker_candidates: list[str]) -> Optional[str]:
-        """只基于 published 公司目录与 alias 解析首个既有 ticker。
+    def resolve_company_ticker(self, ticker: str) -> str | None:
+        """按唯一 published identity index 解析 canonical corpus ticker。
 
         Args:
-            ticker_candidates: 按优先级排列的候选 ticker。
+            ticker: 单个 canonical 或 accepted alias 查询值。
 
         Returns:
-            首个命中的规范 ticker；没有命中时返回 ``None``。
+            唯一 canonical corpus ticker；输入非法或未命中时返回 ``None``。
 
         Raises:
-            ValueError: ticker 非法或一个 alias 对应多个 published 公司时抛出。
-            RuntimeFileLockError: publication guard 获取或释放失败时抛出。
+            CompanyTickerIdentityCorruptionError: descriptor、meta、identity 或唯一性损坏时抛出。
+            RuntimeFileLockError: identity/publication guard 获取或释放失败时抛出。
             OSError: published I/O 失败时抛出。
         """
         ...
@@ -523,6 +985,37 @@ class SourceDocumentRepositoryProtocol(Protocol):
         Raises:
             ValueError: capability、ticker、document ID 或 source kind 非法时抛出。
             OSError: 重置底层存储失败时抛出。
+        """
+        ...
+
+    def reset_source_document_for_repair(
+        self,
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+        expected_integrity: SourceIntegrityClassification,
+        *,
+        batch: BatchToken,
+    ) -> None:
+        """按 Phase A integrity 对真实 staging target 执行受约束修复重置。
+
+        Args:
+            ticker: exact external ticker。
+            document_id: exact external document ID。
+            source_kind: filing 来源类型。
+            expected_integrity: validator 携带的 Phase A repair-required classification。
+            batch: 同一 storage core、ticker 且仍 open 的显式 capability。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: capability、identity、source kind 或 expected classification 非法时抛出。
+            SourceIntegrityRevisionConflictError: staged target 的 presence、revision 或 repair status
+                与 expected classification 不再匹配时抛出。
+            SourceIntegrityRepairBlockedError: target 仍匹配但其它 source 或 canonical manifest
+                阻断安全 repair 时抛出。
+            OSError: staging 文件系统操作失败时抛出。
         """
         ...
 
@@ -1306,6 +1799,13 @@ class FilingMaintenanceRepositoryProtocol(Protocol):
 __all__ = [
     "BatchingRepositoryProtocol",
     "CompanyMetaRepositoryProtocol",
+    "FILING_UPLOAD_ASSET_SOURCE_DOCLING",
+    "FILING_UPLOAD_ASSET_SOURCE_ORIGINAL",
+    "FilingUploadAssetDescriptor",
+    "FilingUploadAssetSource",
+    "FilingUploadPublicationIdentity",
+    "FilingUploadPublishedState",
+    "FilingUploadStateRepositoryProtocol",
     "SourceSnapshotConsistencyError",
     "SourceSnapshotFileDescriptor",
     "SourceSnapshotProtocol",

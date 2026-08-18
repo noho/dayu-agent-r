@@ -17,6 +17,7 @@ from dayu.fins.domain.filing_semantics import (
     FiscalPeriod,
     normalize_fiscal_period,
 )
+from dayu.fins.upload_format_contract import FINS_UPLOAD_FORMAT_CAPABILITY
 
 BatchUploadAction = Literal["auto", "create", "update"]
 MaterialFormType = Literal[
@@ -36,25 +37,6 @@ UploadBatchSkipReasonCode = Literal[
     "periodic_cap",
     "material_cap",
 ]
-
-FINS_UPLOAD_FILE_SUFFIXES: Final[frozenset[str]] = frozenset(
-    {
-        ".csv",
-        ".docx",
-        ".htm",
-        ".html",
-        ".json",
-        ".md",
-        ".pdf",
-        ".txt",
-        ".xbrl",
-        ".xhtml",
-        ".xls",
-        ".xlsx",
-        ".xml",
-        ".zip",
-    }
-)
 
 _FISCAL_YEAR_PATTERN: Final[re.Pattern[str]] = re.compile(r"(?P<year>20\d{2})")
 _Q1_PATTERN: Final[re.Pattern[str]] = re.compile(
@@ -433,7 +415,7 @@ def _discover_source_files(
                 )
             )
             continue
-        if lexical_candidate.suffix.lower() not in FINS_UPLOAD_FILE_SUFFIXES:
+        if not FINS_UPLOAD_FORMAT_CAPABILITY.accepts_primary(lexical_candidate.suffix):
             skipped.append(
                 _skipped(
                     lexical_candidate,
@@ -910,7 +892,6 @@ def _is_within(path: Path, root: Path) -> bool:
 
 __all__: tuple[str, ...] = (
     "BatchUploadAction",
-    "FINS_UPLOAD_FILE_SUFFIXES",
     "MaterialFormType",
     "UploadBatchFilingEntry",
     "UploadBatchMaterialEntry",

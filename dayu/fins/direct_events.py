@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime
@@ -17,6 +18,7 @@ from pathlib import PurePosixPath
 from typing import Final, NoReturn
 
 from dayu.contracts.json_value import JsonValue
+from dayu.fins.company_metadata_warning import CompanyMetadataWarning
 from dayu.fins.download_contract import (
     FinsDownloadDocumentDisposition,
     FinsDownloadEffectiveFilters,
@@ -36,6 +38,8 @@ _MAX_TITLE_CHARS: Final[int] = 120
 _MAX_STAGE_CHARS: Final[int] = 120
 _MAX_DOCUMENT_LABEL_CHARS: Final[int] = 120
 _MAX_SHORT_FIELD_CHARS: Final[int] = 80
+_MAX_PUBLIC_FILE_LABEL_CHARS: Final[int] = 240
+_HIDDEN_PUBLIC_FILE_LABEL: Final[str] = "输入文件（文件名已隐藏）"
 
 _FINS_JOB_ID_PATTERN: Final[re.Pattern[str]] = re.compile(r"\bfinsjob_[0-9a-fA-F]{32}\b")
 _ABSOLUTE_POSIX_PATH_PATTERN: Final[re.Pattern[str]] = re.compile(
@@ -594,6 +598,7 @@ class FinsResultSummary:
         error_message: 用户可读失败说明；成功时通常为 ``None``。
         download: download 操作的 bounded public 业务对象。
         failure: download 失败的 closed public failure。
+        warnings: publication-final typed 公司元数据警告，当前最多一个。
     """
 
     status: FinsResultStatus
@@ -604,6 +609,7 @@ class FinsResultSummary:
     error_message: str | None
     download: FinsDownloadPublicSummary | None = None
     failure: FinsPublicFailure | None = None
+    warnings: tuple[CompanyMetadataWarning, ...] = ()
 
     def __post_init__(self) -> None:
         """校验终态摘要字段。
@@ -615,7 +621,8 @@ class FinsResultSummary:
             无。
 
         Raises:
-            ValueError: exit code 映射错误、标题或详情包含禁止内容时抛出。
+            TypeError: warning 元素不是精确 typed contract 时抛出。
+            ValueError: exit code、标题、详情或 warning 组合不符合契约时抛出。
         """
 
         _validate_result_exit_code(self.status, self.exit_code)
@@ -627,6 +634,12 @@ class FinsResultSummary:
         )
         for detail in self.details:
             _validate_detail_instance(detail)
+        if len(self.warnings) > 1:
+            raise ValueError("Fins result 最多允许一个 warning")
+        if any(type(warning) is not CompanyMetadataWarning for warning in self.warnings):
+            raise TypeError("Fins result warning 必须是精确 typed contract")
+        if self.warnings and self.status is not FinsResultStatus.SUCCESS:
+            raise ValueError("只有 SUCCESS Fins result 可携带 warning")
         if self.error_message is not None:
             _validate_safe_text(
                 self.error_message,
@@ -1064,6 +1077,98 @@ def _validate_optional_safe_text(value: str | None, field_name: str) -> None:
     )
 
 
+def canonicalize_fins_public_file_label(raw_basename: str) -> str:
+    """把单个原始 basename 投影为唯一 canonical public file label。
+
+    Args:
+        raw_basename: producer 从 ``Path.name`` 取得的原始文件 basename。
+
+    Returns:
+        可安全公开的原始 basename，或固定的文件名隐藏标签。
+
+    Raises:
+        TypeError: 输入不是字符串时抛出。
+        ValueError: 输入为空、是 dot segment 或包含路径分隔符时抛出。
+    """
+
+    _validate_public_file_basename_shape(raw_basename)
+    if _public_file_label_requires_hiding(raw_basename):
+        return _HIDDEN_PUBLIC_FILE_LABEL
+    return raw_basename
+
+
+def validate_fins_public_file_label(value: str) -> None:
+    """校验值属于 canonical public file label 的唯一接受集。
+
+    Args:
+        value: failure reason 或 direct projection 携带的 public file label。
+
+    Returns:
+        无。
+
+    Raises:
+        TypeError: 输入不是字符串时抛出。
+        ValueError: 输入不是 canonicalizer 可产生的安全 label 时抛出。
+    """
+
+    _validate_public_file_basename_shape(value)
+    if value == _HIDDEN_PUBLIC_FILE_LABEL:
+        return
+    if _public_file_label_requires_hiding(value):
+        raise ValueError("public file label 必须先经过 canonicalizer")
+
+
+def _validate_public_file_basename_shape(value: str) -> None:
+    """校验 public file label 输入是单个非空 basename。
+
+    Args:
+        value: canonicalizer 或 validator 的输入。
+
+    Returns:
+        无。
+
+    Raises:
+        TypeError: 输入不是字符串时抛出。
+        ValueError: 输入为空、是 dot segment 或包含路径分隔符时抛出。
+    """
+
+    if not isinstance(value, str):
+        raise TypeError("public file label 必须是字符串")
+    if value == "" or value in {".", ".."}:
+        raise ValueError("public file label 必须是非空 basename")
+    if "/" in value or "\\" in value:
+        raise ValueError("public file label 禁止路径分隔符")
+
+
+def _public_file_label_requires_hiding(value: str) -> bool:
+    """判断合法 basename 是否必须投影为固定隐藏标签。
+
+    Args:
+        value: 已通过 basename shape 校验的文件名。
+
+    Returns:
+        命中长度、Unicode control/format 或既有 public guard 时返回 ``True``。
+
+    Raises:
+        无。
+    """
+
+    if len(value) > _MAX_PUBLIC_FILE_LABEL_CHARS:
+        return True
+    if any(unicodedata.category(character) in {"Cc", "Cf"} for character in value):
+        return True
+    try:
+        _validate_safe_text(
+            value,
+            field_name="public file label",
+            max_chars=_MAX_PUBLIC_FILE_LABEL_CHARS,
+            allow_empty=False,
+        )
+    except ValueError:
+        return True
+    return False
+
+
 def _validate_safe_text(
     value: str,
     *,
@@ -1150,4 +1255,6 @@ __all__: tuple[str, ...] = (
     "FinsResultStatus",
     "FinsResultSummary",
     "ValidatedFinsEventStream",
+    "canonicalize_fins_public_file_label",
+    "validate_fins_public_file_label",
 )

@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
+from dayu.fins.domain.company_meta_contract import CompanyMetaCommitIntent
 from dayu.fins.domain.document_models import BatchToken, CompanyMeta, CompanyMetaInventoryEntry
 
 from ._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
@@ -76,36 +77,40 @@ class FsCompanyMetaRepository(CompanyMetaRepositoryProtocol):
 
         return self._repository_set.core.get_company_meta(ticker)
 
-    def upsert_company_meta(self, meta: CompanyMeta, *, batch: BatchToken) -> None:
-        """在显式 transaction staging 中写入公司级元数据。
+    def stage_company_meta_intent(
+        self,
+        intent: CompanyMetaCommitIntent,
+        *,
+        batch: BatchToken,
+    ) -> None:
+        """在显式 transaction state 中记录公司元数据提交意图。
 
         Args:
-            meta: 待写入的公司级元数据。
+            intent: commit-time authoritative merge 使用的提交意图。
             batch: 同一 shared core、ticker 且仍为 open 的显式 capability。
 
         Returns:
             无。
 
         Raises:
-            ValueError: capability、ticker 或元数据路径字段非法时抛出。
-            OSError: staging 写入失败时抛出。
+            ValueError: capability、ticker、意图不匹配或重复 stage 时抛出。
         """
 
-        self._repository_set.core.upsert_company_meta(meta, batch=batch)
+        self._repository_set.core.stage_company_meta_intent(intent, batch=batch)
 
-    def resolve_existing_ticker(self, ticker_candidates: list[str]) -> Optional[str]:
-        """只基于 published 公司目录与 alias 解析首个既有 ticker。
+    def resolve_company_ticker(self, ticker: str) -> str | None:
+        """按唯一 published identity index 解析 canonical corpus ticker。
 
         Args:
-            ticker_candidates: 按优先级排列的候选 ticker。
+            ticker: 单个 canonical 或 accepted alias 查询值。
 
         Returns:
-            首个命中的规范 ticker；没有命中时返回 ``None``。
+            唯一 canonical corpus ticker；非法或未命中时返回 ``None``。
 
         Raises:
-            ValueError: ticker 非法或一个 alias 对应多个 published 公司时抛出。
-            RuntimeFileLockError: publication guard 获取或释放失败时抛出。
+            CompanyTickerIdentityCorruptionError: published identity durable state 损坏时抛出。
+            RuntimeFileLockError: identity/publication guard 获取或释放失败时抛出。
             OSError: published I/O 失败时抛出。
         """
 
-        return self._repository_set.core.resolve_existing_ticker(ticker_candidates)
+        return self._repository_set.core.resolve_company_ticker(ticker)

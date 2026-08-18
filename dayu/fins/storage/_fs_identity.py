@@ -326,6 +326,38 @@ def _identity_directory_for_read(
     return directory
 
 
+def _identity_directory_if_present_for_read(
+    root: Path,
+    namespace: _IdentityNamespace,
+    external_identity: str,
+) -> Path | None:
+    """返回已存在且通过 descriptor 校验的 identity directory。
+
+    Args:
+        root: 当前 namespace 的固定 storage root。
+        namespace: storage 私有 identity namespace。
+        external_identity: 原始业务 identity。
+
+    Returns:
+        identity directory 存在且合法时返回 canonical locator；namespace 或
+        identity directory 不存在时返回 ``None``。
+
+    Raises:
+        ValueError: external identity、目录或 descriptor 不合法时抛出。
+        OSError: locator 或 descriptor 读取失败时抛出。
+    """
+
+    directory = _identity_directory_for_read(root, namespace, external_identity)
+    try:
+        if directory.exists() or directory.is_symlink():
+            return directory
+    except OSError as exc:
+        _raise_path_free_error(
+            _project_filesystem_error(exc, action="检查 identity directory 是否存在")
+        )
+    return None
+
+
 def _list_external_identities(
     root: Path,
     namespace: _IdentityNamespace,

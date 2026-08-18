@@ -40,6 +40,11 @@ from dayu.service.fins_wait_adapter import (
     build_fins_wait_adapter_registry,
     _operation_kind_from_tool_name,
 )
+from dayu.fins.company_metadata_warning import (
+    COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+    CompanyMetadataWarning,
+    CompanyMetadataWarningKind,
+)
 from dayu.fins.direct_events import (
     FINS_RESULT_EXIT_FAILURE,
     FINS_RESULT_EXIT_CANCELLED,
@@ -263,7 +268,65 @@ def test_fins_wait_poll_adapter_maps_observation_statuses() -> None:
     value = succeeded_poll.outcome.result.value
     assert isinstance(value, Mapping)
     assert value["operation"] == "download"
+    assert value["warnings"] == []
     assert "job_id" not in value
+    assert "warnings" not in failed_poll.outcome.result.message
+    assert "warnings" not in cancelled_poll.outcome.result.message
+
+
+def test_fins_wait_adapter_projects_completed_warning_exactly() -> None:
+    """completed wait value 应机械序列化同一 typed warning。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: completed warning 丢失、重算或 JSON shape 漂移时抛出。
+    """
+
+    handle = FinsObservationHandle(
+        handle_id=f"{FINS_OBSERVATION_HANDLE_ID_PREFIX}9999999999999999",
+        operation_kind=FinsOperationKind.UPLOAD_FILING,
+        created_at=_OBSERVATION_TIME,
+    )
+    warning = CompanyMetadataWarning(
+        kind=CompanyMetadataWarningKind.COMPANY_NAME_IGNORED,
+        message=COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+    )
+    result = FinsResultSummary(
+        status=FinsResultStatus.SUCCESS,
+        exit_code=FINS_RESULT_EXIT_SUCCESS,
+        title="上传完成",
+        details=(FinsEventDetail(label="stored files", value="1"),),
+        error_kind=None,
+        error_message=None,
+        warnings=(warning,),
+    )
+    runtime = _FakeObservationRuntime(
+        snapshots={
+            handle.handle_id: FinsObservationSnapshot(
+                handle=handle,
+                status=FinsObservationStatus.SUCCEEDED,
+                message="succeeded observation",
+                result=result,
+                error_kind=None,
+                retry_after_seconds=None,
+            )
+        }
+    )
+
+    poll = FinsIngestionWaitPollAdapter(runtime=runtime).poll_wait(
+        _wait_snapshot(handle.handle_id, UPLOAD_TOOL_NAME)
+    )
+
+    assert isinstance(poll, WaitPollReady)
+    assert isinstance(poll.outcome, ResolveWaitCompletedOutcome)
+    value = poll.outcome.result.value
+    assert isinstance(value, Mapping)
+    assert value["warnings"] == [warning.to_json()]
 
 
 def test_fins_wait_adapter_projects_same_typed_download_object() -> None:

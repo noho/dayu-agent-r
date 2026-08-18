@@ -6,11 +6,13 @@ import asyncio
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Final
+from typing import Final, cast
 
 import pytest
 
 from dayu.fins.direct_events import (
+    FINS_RESULT_EXIT_CANCELLED,
+    FINS_RESULT_EXIT_FAILURE,
     FINS_RESULT_EXIT_SUCCESS,
     FinsDirectStreamProtocolError,
     FinsDirectStreamProtocolErrorKind,
@@ -22,6 +24,11 @@ from dayu.fins.direct_events import (
     FinsResultSummary,
 )
 from dayu.fins.direct_events import ValidatedFinsEventStream
+from dayu.fins.company_metadata_warning import (
+    COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+    CompanyMetadataWarning,
+    CompanyMetadataWarningKind,
+)
 
 _TERMINAL_RESULT_NOT_AVAILABLE_MESSAGE: Final[str] = (
     "Fins direct terminal result is not available before clean stream exhaustion"
@@ -149,6 +156,86 @@ def _result_summary() -> FinsResultSummary:
         error_kind=None,
         error_message=None,
     )
+
+
+def _company_name_ignored_warning() -> CompanyMetadataWarning:
+    """构造 public result invariant 使用的规范 warning。
+
+    Args:
+        无。
+
+    Returns:
+        规范 typed company metadata warning。
+
+    Raises:
+        ValueError: 固定 fixture 与 warning 闭集不一致时抛出。
+    """
+
+    return CompanyMetadataWarning(
+        kind=CompanyMetadataWarningKind.COMPANY_NAME_IGNORED,
+        message=COMPANY_NAME_IGNORED_WARNING_MESSAGE,
+    )
+
+
+def test_fins_result_summary_warning_invariant_is_exact_bounded_and_success_only() -> None:
+    """public direct summary 只允许 SUCCESS 携带一个精确 warning。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: public invariant 接受非法 warning 组合时抛出。
+    """
+
+    warning = _company_name_ignored_warning()
+    success = FinsResultSummary(
+        status=FinsResultStatus.SUCCESS,
+        exit_code=FINS_RESULT_EXIT_SUCCESS,
+        title="上传完成",
+        details=(),
+        error_kind=None,
+        error_message=None,
+        warnings=(warning,),
+    )
+    assert success.warnings == (warning,)
+
+    with pytest.raises(TypeError, match="精确 typed contract"):
+        FinsResultSummary(
+            status=FinsResultStatus.SUCCESS,
+            exit_code=FINS_RESULT_EXIT_SUCCESS,
+            title="上传完成",
+            details=(),
+            error_kind=None,
+            error_message=None,
+            warnings=(cast(CompanyMetadataWarning, "not-a-warning"),),
+        )
+    with pytest.raises(ValueError, match="最多允许一个"):
+        FinsResultSummary(
+            status=FinsResultStatus.SUCCESS,
+            exit_code=FINS_RESULT_EXIT_SUCCESS,
+            title="上传完成",
+            details=(),
+            error_kind=None,
+            error_message=None,
+            warnings=(warning, warning),
+        )
+    for status, exit_code in (
+        (FinsResultStatus.FAILURE, FINS_RESULT_EXIT_FAILURE),
+        (FinsResultStatus.CANCELLED, FINS_RESULT_EXIT_CANCELLED),
+    ):
+        with pytest.raises(ValueError, match="只有 SUCCESS"):
+            FinsResultSummary(
+                status=status,
+                exit_code=exit_code,
+                title="上传未成功",
+                details=(),
+                error_kind=None,
+                error_message=None,
+                warnings=(warning,),
+            )
 
 
 def _result_event(

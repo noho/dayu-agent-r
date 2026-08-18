@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import gc
+import hashlib
+import json
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -14,6 +16,8 @@ from threading import Barrier, Event, Lock
 from typing import Final
 
 import pytest
+
+from tests.fins.company_meta_test_support import stage_company_meta_fixture
 import pandas as pd
 
 import dayu.fins.storage._fs_source_snapshot as source_snapshot_module
@@ -29,6 +33,7 @@ from dayu.documents.processors.base import (
 )
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.documents.processors.source import Source
+from dayu.fins.ticker_normalization import build_company_ticker_identity
 from dayu.fins.domain.document_models import (
     CompanyMeta,
     FinsSourceProvider,
@@ -38,6 +43,8 @@ from dayu.fins.domain.document_models import (
     now_iso8601,
 )
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.direct_events import FinsEventType, FinsResultStatus
+from dayu.fins.ingestion_runtime import FinsUploadFilingRequest
 from dayu.fins.processors.bs_ten_q_processor import BsTenQFormProcessor
 from dayu.fins.processors.bs_ten_k_processor import BsTenKFormProcessor
 from dayu.fins.processors.sec_form_section_common import (
@@ -68,12 +75,22 @@ from dayu.fins.processors.source_text import (
 )
 from dayu.fins.processors.ten_q_processor import TenQFormProcessor
 from dayu.fins.processors.ten_k_processor import TenKFormProcessor
+from dayu.fins.pipelines.docling_process_converter import (
+    DoclingConversionConfig,
+    DoclingConversionResult,
+)
+from dayu.fins.pipelines.sec_pipeline import SecPipeline
+from dayu.fins.service_runtime import (
+    DefaultFinsRuntime,
+    prevalidate_fins_upload_filing_request_for_workspace,
+)
 from dayu.fins.storage import (
     FsBatchingRepository,
     FsCompanyMetaRepository,
     FsDocumentBlobRepository,
     FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
+    SourceIntegrityStatus,
 )
 from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
 from dayu.fins.storage.local_file_source import LocalFileSource
@@ -86,8 +103,114 @@ from dayu.fins.tools.read_runtime_helpers import (
     FinsReadBusinessError,
     FinsReadCancelledError,
 )
+from dayu.service.fins_direct import FinsDirectCommandService
 
 _LOCK_REGISTRY_CACHE_CAPACITY: Final[int] = 4
+
+
+class _RepairPrimaryConverter:
+    """为 workflow/downstream 测试生成逐次不同的 Docling primary。"""
+
+    def __init__(self) -> None:
+        """初始化空转换记录。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.calls: list[str] = []
+
+    async def convert_to_json_bytes(
+        self,
+        input_bytes: bytes,
+        stream_name: str,
+        *,
+        config: DoclingConversionConfig,
+        cancellation: CancellationToken | None,
+    ) -> DoclingConversionResult:
+        """返回包含本次转换序号的确定性 Docling bytes。
+
+        Args:
+            input_bytes: authoritative primary bytes。
+            stream_name: public input basename。
+            config: 闭合转换配置。
+            cancellation: canonical cancellation token。
+
+        Returns:
+            digest 与 size 同源的 typed conversion result。
+
+        Raises:
+            无。
+        """
+
+        del input_bytes, config, cancellation
+        self.calls.append(stream_name)
+        payload = json.dumps(
+            {
+                "name": stream_name,
+                "format": "docling",
+                "version": f"repair-primary-v{len(self.calls)}",
+            },
+            separators=(",", ":"),
+        ).encode()
+        return DoclingConversionResult(
+            json_bytes=payload,
+            size=len(payload),
+            sha256=hashlib.sha256(payload).hexdigest(),
+        )
+
+
+def test_shared_converter_utf8_json_fixture_is_readable_by_source_decoder() -> None:
+    """shared converter 的唯一 JSON bytes 必须可被 process/read 解码链消费。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: UTF-8、digest 或 JSON 读取契约漂移时抛出。
+    """
+
+    json_bytes = json.dumps(
+        {"document": "年度财报", "tables": []},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    fixture = DoclingConversionResult(
+        json_bytes=json_bytes,
+        size=len(json_bytes),
+        sha256=hashlib.sha256(json_bytes).hexdigest(),
+    )
+
+    decoded = decode_source_bytes(fixture.json_bytes)
+    assert json.loads(decoded) == {"document": "年度财报", "tables": []}
+
+
+def test_web_fetch_docling_import_graph_remains_documents_only() -> None:
+    """web fetch 的 Docling 路径不得反向依赖 Fins shared converter。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: web import graph 被迁入 Fins owner 时抛出。
+    """
+
+    source = Path("dayu/tools/web/web_fetch_orchestrator.py").read_text(encoding="utf-8")
+    assert "from dayu.documents.docling_runtime import" in source
+    assert "dayu.fins.pipelines.docling_process_converter" not in source
+
+
 _LOCK_REGISTRY_MISSING_KEY_COUNT: Final[int] = 64
 _LOCK_REGISTRY_VALID_DOCUMENT_COUNT: Final[int] = 12
 
@@ -1085,15 +1208,14 @@ def _build_runtime(
     registry = _CountingProcessorRegistry()
     batching_repository = FsBatchingRepository(workspace_root, repository_set=repository_set)
     batch = batching_repository.begin_batch("AAPL")
-    company_repository.upsert_company_meta(
+    stage_company_meta_fixture(
+        company_repository,
         CompanyMeta(
             company_id="0000320193",
             company_name="Apple Inc.",
-            ticker="AAPL",
-            market="US",
+            ticker_identity=build_company_ticker_identity("AAPL", ()),
             resolver_version="test",
             updated_at=now_iso8601(),
-            ticker_aliases=[],
         ),
         batch=batch,
     )
@@ -1142,6 +1264,301 @@ def _build_runtime(
         processor_cache_max_entries=processor_cache_max_entries,
     )
     return runtime, source_repository, registry
+
+
+def test_read_runtime_consumes_exact_opaque_primary_instead_of_original_or_companion(tmp_path: Path) -> None:
+    """read runtime 必须只把 snapshot exact primary 交给 processor registry。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: read runtime 扫描 original/companion 或重选 primary 时抛出。
+    """
+
+    runtime, repository, registry = _build_runtime(tmp_path)
+    original_name = f"original-{'a' * 64}.pdf"
+    companion_name = f"original-{'b' * 64}.xsd"
+    derived_name = f"{original_name}_docling.json"
+    batch = repository._batching_repository.begin_batch("AAPL")
+    try:
+        repository.reset_source_document(
+            ticker="AAPL",
+            document_id="doc-1",
+            source_kind=SourceKind.FILING,
+            batch=batch,
+        )
+        handle = SourceHandle("AAPL", "doc-1", SourceKind.FILING.value)
+        files = [
+            repository._blob_repository.store_file(
+                handle,
+                original_name,
+                BytesIO(b"original-must-not-be-selected"),
+                batch=batch,
+                content_type="application/pdf",
+            ),
+            repository._blob_repository.store_file(
+                handle,
+                companion_name,
+                BytesIO(b"companion-must-not-be-selected"),
+                batch=batch,
+                content_type="application/xml",
+            ),
+            repository._blob_repository.store_file(
+                handle,
+                derived_name,
+                BytesIO(b"exact-derived-primary"),
+                batch=batch,
+                content_type="application/json",
+            ),
+        ]
+        repository.create_source_document(
+            SourceDocumentUpsertRequest(
+                ticker="AAPL",
+                document_id="doc-1",
+                internal_document_id="doc-1",
+                form_type="10-K",
+                primary_document=derived_name,
+            file_entries=[
+                {
+                    "name": original_name,
+                    "uri": files[0].uri,
+                    "etag": files[0].etag,
+                    "last_modified": files[0].last_modified,
+                    "size": files[0].size,
+                    "content_type": files[0].content_type,
+                    "sha256": files[0].sha256,
+                    "source": "original",
+                    "original_filename": "primary.pdf",
+                },
+                {
+                    "name": companion_name,
+                    "uri": files[1].uri,
+                    "etag": files[1].etag,
+                    "last_modified": files[1].last_modified,
+                    "size": files[1].size,
+                    "content_type": files[1].content_type,
+                    "sha256": files[1].sha256,
+                    "source": "original",
+                    "original_filename": "companion.xsd",
+                },
+                {
+                    "name": derived_name,
+                    "uri": files[2].uri,
+                    "etag": files[2].etag,
+                    "last_modified": files[2].last_modified,
+                    "size": files[2].size,
+                    "content_type": files[2].content_type,
+                    "sha256": files[2].sha256,
+                    "source": "docling",
+                    "original_filename": "primary.pdf",
+                    "derived_from": original_name,
+                },
+            ],
+                meta={
+                    "ingest_method": "upload",
+                    "source_provider": FinsSourceProvider.USER_UPLOAD.to_storage_value(),
+                    "ingest_complete": True,
+                    "is_deleted": False,
+                    "source_fingerprint": "opaque-primary",
+                },
+            ),
+            SourceKind.FILING,
+            batch=batch,
+        )
+    except BaseException:
+        repository._batching_repository.rollback_batch(batch)
+        raise
+    repository._batching_repository.commit_batch(batch)
+
+    result = runtime.get_document_sections(ticker="AAPL", document_id="doc-1")
+    section = runtime.read_section(ticker="AAPL", document_id="doc-1", ref="s_0001")
+
+    assert registry.create_count == 1
+    assert [processor.label for processor in registry.created] == ["exact-derived-primary"]
+    assert result["sections"][0]["title"] == "Overview"
+    assert section["content"] == "exact-derived-primary"
+    runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_repaired_snapshot_and_process_entry_consume_only_new_primary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """repair 后 snapshot 与 process 入口必须只消费新发布的 exact primary。
+
+    Args:
+        tmp_path: 临时 workspace。
+        monkeypatch: processor registry source spy 注入夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: repair revision、snapshot primary 或 process 输入漂移时抛出。
+        OSError: 真实 filesystem publication 读写失败时抛出。
+        ValueError: persisted source contract 非法时抛出。
+    """
+
+    workspace_root = tmp_path / "repair-downstream"
+    default_runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
+    ingestion = default_runtime.get_ingestion_runtime()
+    converter = _RepairPrimaryConverter()
+    pipeline = SecPipeline(
+        workspace_root=workspace_root,
+        processor_registry=default_runtime.processor_registry,
+        batching_repository=default_runtime.batching_repository,
+        company_repository=default_runtime.company_repository,
+        source_repository=default_runtime.source_repository,
+        processed_repository=default_runtime.processed_repository,
+        blob_repository=default_runtime.blob_repository,
+        filing_maintenance_repository=default_runtime.filing_maintenance_repository,
+        filing_upload_state_repository=default_runtime.filing_upload_state_repository,
+        docling_converter=converter,
+    )
+    primary = tmp_path / "repair-process-primary.pdf"
+    companion = tmp_path / "repair-process-companion.xlsx"
+    primary.write_bytes(b"authoritative primary")
+    companion.write_bytes(b"authoritative companion")
+    raw_request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        action="auto",
+        files=(primary, companion),
+        primary_selectors=(primary,),
+        fiscal_year=2025,
+        fiscal_period="Q1",
+        company_name="Apple Inc.",
+    )
+    create_request = prevalidate_fins_upload_filing_request_for_workspace(
+        raw_request,
+        workspace_root=workspace_root,
+    )
+    create_events = [event async for event in pipeline.upload_filing_stream(create_request)]
+    created = create_events[-1].payload["result"]
+    assert isinstance(created, dict)
+    assert created["status"] == "ok"
+    document_id = create_request.document_id
+    old_revision = default_runtime.source_repository.classify_source_integrity(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+    ).revision
+    source_meta = default_runtime.source_repository.get_source_meta(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+    )
+    old_primary = source_meta.get("primary_document")
+    assert isinstance(old_primary, str)
+    locator = default_runtime.source_repository.get_source_document_locator(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+    )
+    (workspace_root / locator / old_primary).unlink()
+    with pytest.raises(ValueError, match="^source snapshot 只允许读取完整 source$"):
+        default_runtime.source_repository.read_source_snapshot(
+            "AAPL",
+            document_id,
+            SourceKind.FILING,
+            materialize_files=False,
+        )
+    repair_request = prevalidate_fins_upload_filing_request_for_workspace(
+        raw_request,
+        workspace_root=workspace_root,
+    )
+    repair_events = [event async for event in pipeline.upload_filing_stream(repair_request)]
+    repaired_result = repair_events[-1].payload["result"]
+    assert isinstance(repaired_result, dict)
+    assert repaired_result["status"] == "ok"
+    repaired_integrity = default_runtime.source_repository.classify_source_integrity(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+    )
+    assert repaired_integrity.revision is not None
+    assert repaired_integrity.revision != old_revision
+    with default_runtime.source_repository.read_source_snapshot(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+        materialize_files=True,
+    ) as snapshot:
+        with snapshot.get_primary_source().open() as stream:
+            new_primary = stream.read()
+        assert snapshot.revision == repaired_integrity.revision
+        assert json.loads(new_primary.decode()) == {
+            "name": primary.name,
+            "format": "docling",
+            "version": "repair-primary-v2",
+        }
+
+    processor_inputs: list[bytes] = []
+
+    def observe_process_source(
+        source: Source,
+        *,
+        form_type: str | None = None,
+        media_type: str | None = None,
+        on_fallback: Callable[[type[DocumentProcessor], Exception, int, int], None] | None = None,
+    ) -> DocumentProcessor:
+        """记录 process 入口收到的 snapshot exact primary 并委托真实 registry。
+
+        Args:
+            source: snapshot exact primary source。
+            form_type: 可选 filing form type。
+            media_type: 可选媒体类型。
+            on_fallback: 可选 processor fallback callback。
+
+        Returns:
+            真实 registry 创建的 processor。
+
+        Raises:
+            OSError: source 读取失败时抛出。
+            ValueError: registry 无候选时抛出。
+            RuntimeError: processor 构建失败时抛出。
+        """
+
+        with source.open() as stream:
+            processor_inputs.append(stream.read())
+        return _ReadProcessor(
+            source,
+            form_type=form_type,
+            media_type=media_type,
+        )
+
+    monkeypatch.setattr(
+        ingestion.processor_registry,
+        "create_with_fallback",
+        observe_process_source,
+    )
+    service = FinsDirectCommandService(default_runtime)
+    process_events = [
+        event
+        async for event in service.process_filing(
+            ticker="AAPL",
+            document_ids=(document_id,),
+        )
+    ]
+
+    result_event = process_events[-1]
+    assert result_event.event_type is FinsEventType.RESULT
+    assert result_event.result is not None
+    assert result_event.result.status is FinsResultStatus.SUCCESS
+    assert result_event.result.exit_code == 0
+    assert processor_inputs == [new_primary]
+    post_process_integrity = default_runtime.source_repository.classify_source_integrity(
+        "AAPL",
+        document_id,
+        SourceKind.FILING,
+    )
+    assert post_process_integrity.status is SourceIntegrityStatus.COMPLETE
+    assert post_process_integrity.revision == repaired_integrity.revision
+    assert converter.calls == [primary.name, primary.name]
 
 
 def _update_source(
@@ -1318,10 +1735,7 @@ def _append_virtual_section(
 
 def _build_virtual_postprocess_probe(
     processor_type: (
-        type[TenQFormProcessor]
-        | type[BsTenQFormProcessor]
-        | type[TenKFormProcessor]
-        | type[BsTenKFormProcessor]
+        type[TenQFormProcessor] | type[BsTenQFormProcessor] | type[TenKFormProcessor] | type[BsTenKFormProcessor]
     ),
     harness: _VirtualHarness,
     monkeypatch: pytest.MonkeyPatch,
@@ -1826,9 +2240,7 @@ def _assert_processor_matches_base_public_contract(
     base_tables = SecProcessor.list_tables(processor)
     assert processor.list_sections() == base_sections
     assert processor.list_tables() == base_tables
-    assert [table["table_ref"] for table in processor.list_tables()] == [
-        table["table_ref"] for table in base_tables
-    ]
+    assert [table["table_ref"] for table in processor.list_tables()] == [table["table_ref"] for table in base_tables]
     assert [table["section_ref"] for table in processor.list_tables()] == [
         table["section_ref"] for table in base_tables
     ]
@@ -1900,9 +2312,7 @@ def test_ten_k_public_processor_assigns_tables_without_marker_capability(
     assert len(tables) == 1
     assert tables[0]["section_ref"] in {section["ref"] for section in sections}
     assert tables[0]["table_ref"] in {
-        table_ref
-        for section in sections
-        for table_ref in processor.read_section(section["ref"])["tables"]
+        table_ref for section in sections for table_ref in processor.read_section(section["ref"])["tables"]
     }
     _assert_processor_matches_base_public_contract(processor)
 
@@ -2270,10 +2680,7 @@ def test_both_ten_k_paths_migrate_to_shared_refresh_without_behavior_drift(
 def test_report_form_second_postprocess_keeps_base_fallback_terminal(
     monkeypatch: pytest.MonkeyPatch,
     processor_type: (
-        type[TenKFormProcessor]
-        | type[BsTenKFormProcessor]
-        | type[TenQFormProcessor]
-        | type[BsTenQFormProcessor]
+        type[TenKFormProcessor] | type[BsTenKFormProcessor] | type[TenQFormProcessor] | type[BsTenQFormProcessor]
     ),
 ) -> None:
     """四条 report-form 路径二次 postprocess 都不得重入 fallback proof。
@@ -2510,12 +2917,15 @@ def test_cross_document_diagnosis_does_not_reuse_stale_cached_processor(tmp_path
     _read_runtime_processor_for_document(runtime, "doc-2")
     _update_source(repository, fingerprint="doc-2-revision-two", document_id="doc-2")
 
-    assert runtime._diagnose_cross_document_locator(
-        ticker="AAPL",
-        current_document_id="doc-1",
-        kind="ref",
-        locator="s_0001",
-    ) is None
+    assert (
+        runtime._diagnose_cross_document_locator(
+            ticker="AAPL",
+            current_document_id="doc-1",
+            kind="ref",
+            locator="s_0001",
+        )
+        is None
+    )
     assert runtime._processor_cache.size() == 0
 
 
@@ -2619,11 +3029,7 @@ def test_sustained_storage_change_maps_once_to_source_changed_during_read(
                 repository,
                 fingerprint="sustained-b" if publish_b else "sustained-a",
                 payload=b"version-b" if publish_b else b"version-a",
-                source_provider=(
-                    FinsSourceProvider.USER_UPLOAD
-                    if publish_b
-                    else FinsSourceProvider.SEC_EDGAR
-                ),
+                source_provider=(FinsSourceProvider.USER_UPLOAD if publish_b else FinsSourceProvider.SEC_EDGAR),
             )
             publication_barrier.wait()
         with pytest.raises(FinsReadBusinessError) as error_info:
@@ -2820,9 +3226,7 @@ def test_creation_lock_registry_reclaims_missing_and_evicted_document_keys(
         tmp_path,
         processor_cache_max_entries=_LOCK_REGISTRY_CACHE_CAPACITY,
     )
-    missing_document_ids = tuple(
-        f"missing-{index}" for index in range(_LOCK_REGISTRY_MISSING_KEY_COUNT)
-    )
+    missing_document_ids = tuple(f"missing-{index}" for index in range(_LOCK_REGISTRY_MISSING_KEY_COUNT))
     for document_id in missing_document_ids:
         with pytest.raises(FileNotFoundError):
             _read_runtime_processor_for_document(runtime, document_id)
@@ -2831,9 +3235,7 @@ def test_creation_lock_registry_reclaims_missing_and_evicted_document_keys(
     assert runtime._processor_cache.size() == 0
     assert len(runtime._creation_locks) == 0
 
-    added_document_ids = tuple(
-        f"doc-{index}" for index in range(2, _LOCK_REGISTRY_VALID_DOCUMENT_COUNT + 1)
-    )
+    added_document_ids = tuple(f"doc-{index}" for index in range(2, _LOCK_REGISTRY_VALID_DOCUMENT_COUNT + 1))
     _create_test_source_documents(repository, added_document_ids)
     valid_document_ids = ("doc-1", *added_document_ids)
     for document_id in valid_document_ids:
@@ -2843,9 +3245,7 @@ def test_creation_lock_registry_reclaims_missing_and_evicted_document_keys(
     assert registry.create_count == _LOCK_REGISTRY_VALID_DOCUMENT_COUNT
     assert runtime._processor_cache.size() == _LOCK_REGISTRY_CACHE_CAPACITY
     assert len(runtime._creation_locks) == 0
-    assert sum(root.exists() for root in repository.full_snapshot_roots) == (
-        _LOCK_REGISTRY_CACHE_CAPACITY
-    )
+    assert sum(root.exists() for root in repository.full_snapshot_roots) == (_LOCK_REGISTRY_CACHE_CAPACITY)
     runtime.close()
     assert all(not root.exists() for root in repository.full_snapshot_roots)
 
@@ -2867,6 +3267,7 @@ def test_cache_eviction_defers_snapshot_close_until_active_borrow_releases(tmp_p
     old_borrow = runtime._borrow_processor(ticker="AAPL", document_id="doc-1")
     old_root = old_borrow.snapshot.get_primary_source().materialize().parent
     with ThreadPoolExecutor(max_workers=1) as executor:
+
         def _publish_and_read() -> DocumentProcessor:
             """发布 B 并借用新 processor。"""
 

@@ -1,4 +1,4 @@
-"""源文档物理完整性与跨 provider 预检的 typed contract。"""
+"""源文档 publication 完整性、repair 阻断与跨 provider 预检 typed contract。"""
 
 from __future__ import annotations
 
@@ -16,14 +16,58 @@ class SourceIntegrityStatus(str, Enum):
     MISSING = "missing"
     COMPLETE = "complete"
     REPAIR_REQUIRED = "repair_required"
+    UNSAFE = "unsafe"
 
 
 class SourceIntegrityReason(str, Enum):
-    """结构合法 source 需要修复的物理原因。"""
+    """source publication 完整性分类的封闭原因。"""
 
-    PHYSICAL_FILE_MISSING = "physical_file_missing"
+    ORIGINAL_FILE_MISSING = "original_file_missing"
+    PRIMARY_DOCLING_FILE_MISSING = "primary_docling_file_missing"
+    DECLARED_FILE_MISSING = "declared_file_missing"
     SIZE_MISMATCH = "size_mismatch"
     DIGEST_MISMATCH = "digest_mismatch"
+    PRIMARY_PROJECTION_MISMATCH = "primary_projection_mismatch"
+    DERIVED_PROJECTION_MISMATCH = "derived_projection_mismatch"
+    SOURCE_MANIFEST_MISSING = "source_manifest_missing"
+    SOURCE_MANIFEST_PROJECTION_MISMATCH = "source_manifest_projection_mismatch"
+    IDENTITY_UNTRUSTED = "identity_untrusted"
+    META_UNTRUSTED = "meta_untrusted"
+    REVISION_UNTRUSTED = "revision_untrusted"
+    PROVENANCE_UNTRUSTED = "provenance_untrusted"
+    FILE_DECLARATION_UNTRUSTED = "file_declaration_untrusted"
+    UNDECLARED_BUSINESS_FILE = "undeclared_business_file"
+    UNSAFE_FILESYSTEM_ENTRY = "unsafe_filesystem_entry"
+    SOURCE_MANIFEST_UNTRUSTED = "source_manifest_untrusted"
+    CROSS_SOURCE_INCONSISTENCY = "cross_source_inconsistency"
+
+
+_REPAIRABLE_REASONS: frozenset[SourceIntegrityReason] = frozenset(
+    {
+        SourceIntegrityReason.ORIGINAL_FILE_MISSING,
+        SourceIntegrityReason.PRIMARY_DOCLING_FILE_MISSING,
+        SourceIntegrityReason.DECLARED_FILE_MISSING,
+        SourceIntegrityReason.SIZE_MISMATCH,
+        SourceIntegrityReason.DIGEST_MISMATCH,
+        SourceIntegrityReason.PRIMARY_PROJECTION_MISMATCH,
+        SourceIntegrityReason.DERIVED_PROJECTION_MISMATCH,
+        SourceIntegrityReason.SOURCE_MANIFEST_MISSING,
+        SourceIntegrityReason.SOURCE_MANIFEST_PROJECTION_MISMATCH,
+    }
+)
+_UNSAFE_REASONS: frozenset[SourceIntegrityReason] = frozenset(
+    {
+        SourceIntegrityReason.IDENTITY_UNTRUSTED,
+        SourceIntegrityReason.META_UNTRUSTED,
+        SourceIntegrityReason.REVISION_UNTRUSTED,
+        SourceIntegrityReason.PROVENANCE_UNTRUSTED,
+        SourceIntegrityReason.FILE_DECLARATION_UNTRUSTED,
+        SourceIntegrityReason.UNDECLARED_BUSINESS_FILE,
+        SourceIntegrityReason.UNSAFE_FILESYSTEM_ENTRY,
+        SourceIntegrityReason.SOURCE_MANIFEST_UNTRUSTED,
+        SourceIntegrityReason.CROSS_SOURCE_INCONSISTENCY,
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,7 +80,7 @@ class SourceIntegrityClassification:
         document_id: exact external document ID。
         revision: 已存在 source 的 opaque revision；目标不存在时为 ``None``。
         status: 封闭完整性状态。
-        reasons: 需要修复时的去重、有序物理原因。
+        reasons: 按 enum 顺序去重的 repairable 或 unsafe 原因。
     """
 
     ticker: str
@@ -59,20 +103,38 @@ class SourceIntegrityClassification:
             ValueError: typed classification 内部状态不封闭时抛出。
         """
 
+        if not isinstance(self.source_kind, SourceKind):
+            raise ValueError("source_kind 必须是 SourceKind")
+        if not isinstance(self.status, SourceIntegrityStatus):
+            raise ValueError("status 必须是 SourceIntegrityStatus")
+        if self.revision is not None and not isinstance(self.revision, SourceDocumentRevision):
+            raise ValueError("revision 必须是 SourceDocumentRevision 或 None")
+        if any(not isinstance(reason, SourceIntegrityReason) for reason in self.reasons):
+            raise ValueError("reasons 必须只包含 SourceIntegrityReason")
+        ordered_reasons = tuple(reason for reason in SourceIntegrityReason if reason in set(self.reasons))
+        if self.reasons != ordered_reasons:
+            raise ValueError("reasons 必须按 enum 顺序去重")
+
         if self.status is SourceIntegrityStatus.MISSING:
             if self.revision is not None or self.reasons:
-                raise ValueError("MISSING classification 不得携带 revision 或 repair reasons")
+                raise ValueError("MISSING classification 不得携带 revision 或 reasons")
             return
-        if self.revision is None:
-            raise ValueError("已存在 source classification 必须携带 revision")
         if self.status is SourceIntegrityStatus.COMPLETE:
-            if self.reasons:
-                raise ValueError("COMPLETE classification 不得携带 repair reasons")
+            if self.revision is None or self.reasons:
+                raise ValueError("COMPLETE classification 必须携带 revision 且不得携带 reasons")
             return
-        if not self.reasons:
-            raise ValueError("REPAIR_REQUIRED classification 必须携带 repair reasons")
-        if len(set(self.reasons)) != len(self.reasons):
-            raise ValueError("repair reasons 不得重复")
+        if self.status is SourceIntegrityStatus.REPAIR_REQUIRED:
+            if self.revision is None or not self.reasons:
+                raise ValueError("REPAIR_REQUIRED classification 必须携带 revision 与 reasons")
+            if any(reason not in _REPAIRABLE_REASONS for reason in self.reasons):
+                raise ValueError("REPAIR_REQUIRED classification 只能携带 repairable reasons")
+            return
+        if self.status is not SourceIntegrityStatus.UNSAFE:
+            raise ValueError("status 必须是封闭四态")
+        if self.revision is not None or not self.reasons:
+            raise ValueError("UNSAFE classification 不得携带 revision 且必须携带 reasons")
+        if any(reason not in _UNSAFE_REASONS for reason in self.reasons):
+            raise ValueError("UNSAFE classification 只能携带 unsafe reasons")
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +185,7 @@ class SourceIntegrityPreflightReason(str, Enum):
     MULTIPLE_REPAIR_REQUIRED = "multiple_repair_required"
     UNSELECTED_REPAIR_REQUIRED = "unselected_repair_required"
     SELECTED_REJECTED_REPAIR_REQUIRED = "selected_rejected_repair_required"
+    UNSAFE_PUBLICATION = "unsafe_publication"
 
 
 class SourceIntegrityPreflightError(RuntimeError):
@@ -146,7 +209,7 @@ class SourceIntegrityPreflightError(RuntimeError):
 
 
 class SourceIntegrityRevisionConflictError(RuntimeError):
-    """目标 publication identity 连续变化超过允许轮次。"""
+    """Phase A 与真实 staged target 的 publication identity 不再匹配。"""
 
     def __init__(self) -> None:
         """构造不泄漏 revision 或路径的冲突异常。
@@ -161,7 +224,39 @@ class SourceIntegrityRevisionConflictError(RuntimeError):
             无。
         """
 
-        super().__init__("source publication identity 连续变化，无法安全应用预取结果")
+        super().__init__("source publication identity 已变化，无法安全应用预取结果")
+
+
+class SourceIntegrityRepairBlockedReason(str, Enum):
+    """target identity 仍匹配时阻断 staged repair 的封闭原因。"""
+
+    NON_TARGET_SOURCE_INCOMPLETE = "non_target_source_incomplete"
+    CROSS_SOURCE_PUBLICATION_UNSAFE = "cross_source_publication_unsafe"
+    CANONICAL_MANIFEST_UNAVAILABLE = "canonical_manifest_unavailable"
+
+
+class SourceIntegrityRepairBlockedError(RuntimeError):
+    """其它 source 或 canonical manifest 状态阻断本次 staged repair。"""
+
+    reason: SourceIntegrityRepairBlockedReason
+
+    def __init__(self, reason: SourceIntegrityRepairBlockedReason) -> None:
+        """构造不携带 target、revision、路径或 raw reason 的 typed error。
+
+        Args:
+            reason: 封闭 repair-blocked 原因。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: reason 不是封闭 enum 时抛出。
+        """
+
+        if not isinstance(reason, SourceIntegrityRepairBlockedReason):
+            raise ValueError("reason 必须是 SourceIntegrityRepairBlockedReason")
+        self.reason = reason
+        super().__init__("source repair 被其它 publication 完整性状态阻断")
 
 
 def has_same_source_publication_identity(
@@ -181,6 +276,8 @@ def has_same_source_publication_identity(
         ValueError: 两个 classification 不是同一 target 时抛出。
     """
 
+    if first.status is SourceIntegrityStatus.UNSAFE or second.status is SourceIntegrityStatus.UNSAFE:
+        raise ValueError("UNSAFE source classification 不得比较 publication identity")
     if (
         first.ticker != second.ticker
         or first.source_kind is not second.source_kind
@@ -210,6 +307,8 @@ def classify_source_integrity_preflight(
         SourceIntegrityPreflightError: corruption 无法由本次请求唯一、安全修复时抛出。
     """
 
+    if any(item.status is SourceIntegrityStatus.UNSAFE for item in inventory):
+        raise SourceIntegrityPreflightError(SourceIntegrityPreflightReason.UNSAFE_PUBLICATION)
     repair_targets = tuple(item for item in inventory if item.status is SourceIntegrityStatus.REPAIR_REQUIRED)
     if len(repair_targets) > 1:
         raise SourceIntegrityPreflightError(SourceIntegrityPreflightReason.MULTIPLE_REPAIR_REQUIRED)

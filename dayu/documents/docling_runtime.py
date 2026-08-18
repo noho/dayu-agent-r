@@ -1,10 +1,11 @@
-"""Docling 运行时装配辅助。
+"""Docling 转换能力与运行时装配真源。
 
-本模块是 Dayu 所有 Docling PDF 转换入口的总控真源，统一负责：
+本模块是 Dayu 所有 Docling 转换入口的能力与装配真源，统一负责：
 
-1. 解析稳定的设备策略；
-2. 构造带统一参数的 Docling `DocumentConverter`；
-3. 维护一条二维（backend × device）的有序回退尝试链，自动绕开
+1. 以不加载 Docling 的不可变声明冻结产品允许的输入格式与扩展名；
+2. 在构造转换器时延迟校验产品声明仍是已安装 Docling 能力的子集；
+3. 解析稳定的设备策略并构造带统一参数的 `DocumentConverter`；
+4. 维护一条二维（backend × device）的有序回退尝试链，自动绕开
    docling-parse 后端在某些上市公司年报 PDF 上把合法文档判定为
    ``not valid`` 的情况，并兼容 GPU/MPS 推理崩溃后的 CPU 兜底。
 
@@ -42,7 +43,7 @@ from typing import TYPE_CHECKING, Protocol, TypeVar, cast
 if TYPE_CHECKING:
     from docling.backend.abstract_backend import AbstractDocumentBackend
     from docling.datamodel.accelerator_options import AcceleratorOptions
-    from docling.datamodel.base_models import DocumentStream
+    from docling.datamodel.base_models import DocumentStream, InputFormat
     from docling.datamodel.document import ConversionResult
     from docling.datamodel.pipeline_options import PipelineOptions, TableFormerMode
     from docling.document_converter import DocumentConverter
@@ -65,6 +66,170 @@ _WINDOWS_PLATFORM_NAME = "win32"
 _TResult = TypeVar("_TResult")
 # Protocol 返回值需要协变，才能让更具体的转换结果回调安全替换更宽的调用点。
 _TResultCovariant = TypeVar("_TResultCovariant", covariant=True)
+
+
+def _normalize_docling_product_suffix(suffix: str) -> str:
+    """把候选扩展名规范化为产品 capability 使用的形式。
+
+    Args:
+        suffix: 候选扩展名，可包含首尾空白、大小写差异或省略前导点。
+
+    Returns:
+        带前导点的小写扩展名。
+
+    Raises:
+        ValueError: 扩展名为空或只包含前导点时抛出。
+    """
+
+    normalized_suffix = suffix.strip().lower()
+    if not normalized_suffix:
+        raise ValueError("Docling 产品扩展名不能为空")
+    if not normalized_suffix.startswith("."):
+        normalized_suffix = f".{normalized_suffix}"
+    if normalized_suffix == ".":
+        raise ValueError("Docling 产品扩展名不能只有前导点")
+    return normalized_suffix
+
+
+@dataclass(frozen=True, slots=True)
+class DoclingConverterFormat:
+    """一个不可变的产品 Docling 格式声明。
+
+    Args:
+        format_id: 可在构造期解析为 Docling ``InputFormat`` 的稳定标识。
+        suffixes: 当前产品明确承诺给该格式的有序扩展名 tuple。
+
+    Raises:
+        ValueError: 格式标识为空，或扩展名为空、未规范化、重复时抛出。
+    """
+
+    format_id: str
+    suffixes: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        """校验单个产品格式声明的静态不变量。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: 格式标识为空，或扩展名为空、未规范化、重复时抛出。
+        """
+
+        if not self.format_id.strip():
+            raise ValueError("Docling 产品格式标识不能为空")
+        if not self.suffixes:
+            raise ValueError(f"Docling 产品格式 {self.format_id!r} 必须声明扩展名")
+        normalized_suffixes = tuple(_normalize_docling_product_suffix(suffix) for suffix in self.suffixes)
+        if normalized_suffixes != self.suffixes:
+            raise ValueError(f"Docling 产品格式 {self.format_id!r} 的扩展名必须是规范化小写形式")
+        if len(frozenset(self.suffixes)) != len(self.suffixes):
+            raise ValueError(f"Docling 产品格式 {self.format_id!r} 不能声明重复扩展名")
+
+
+@dataclass(frozen=True, slots=True)
+class DoclingConverterCapability:
+    """不可变的产品 Docling 转换能力契约。
+
+    Args:
+        formats: 按产品投影顺序排列的非空格式声明 tuple。
+
+    Raises:
+        ValueError: 格式 tuple 为空，或格式标识、扩展名跨项重复时抛出。
+    """
+
+    formats: tuple[DoclingConverterFormat, ...]
+
+    def __post_init__(self) -> None:
+        """校验 capability 的唯一性与非空不变量。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            ValueError: 格式 tuple 为空，或格式标识、扩展名跨项重复时抛出。
+        """
+
+        if not self.formats:
+            raise ValueError("Docling 产品 capability 必须至少声明一个格式")
+        format_ids = self.format_ids
+        if len(frozenset(format_ids)) != len(format_ids):
+            raise ValueError("Docling 产品 capability 不能声明重复格式标识")
+        product_suffixes = self.product_suffixes
+        if len(frozenset(product_suffixes)) != len(product_suffixes):
+            raise ValueError("Docling 产品 capability 不能跨格式声明重复扩展名")
+
+    @property
+    def format_ids(self) -> tuple[str, ...]:
+        """投影稳定有序的产品格式标识。
+
+        Args:
+            无。
+
+        Returns:
+            与 ``formats`` 顺序一致的格式标识 tuple。
+
+        Raises:
+            无。
+        """
+
+        return tuple(format_item.format_id for format_item in self.formats)
+
+    @property
+    def product_suffixes(self) -> tuple[str, ...]:
+        """投影稳定有序且去重的产品转换扩展名。
+
+        Args:
+            无。
+
+        Returns:
+            按格式声明顺序展平的扩展名 tuple。
+
+        Raises:
+            无。
+        """
+
+        return tuple(suffix for format_item in self.formats for suffix in format_item.suffixes)
+
+    def accepts_product_suffix(self, suffix: str) -> bool:
+        """判断候选扩展名是否属于产品转换能力。
+
+        Args:
+            suffix: 待判断的扩展名。
+
+        Returns:
+            候选扩展名规范化后属于 capability 时返回 ``True``；空串、空白、仅有前导点
+            或不属于 capability 时返回 ``False``。
+
+        Raises:
+            无。
+        """
+
+        normalized_candidate = suffix.strip().lower()
+        if not normalized_candidate or normalized_candidate == ".":
+            return False
+        return _normalize_docling_product_suffix(normalized_candidate) in self.product_suffixes
+
+
+DOCLING_CONVERTER_CAPABILITY = DoclingConverterCapability(
+    formats=(
+        DoclingConverterFormat(format_id="PDF", suffixes=(".pdf",)),
+        DoclingConverterFormat(format_id="DOCX", suffixes=(".docx",)),
+        DoclingConverterFormat(format_id="PPTX", suffixes=(".pptx",)),
+        DoclingConverterFormat(format_id="HTML", suffixes=(".htm", ".html", ".xhtml")),
+        DoclingConverterFormat(format_id="MD", suffixes=(".md", ".txt")),
+        DoclingConverterFormat(format_id="CSV", suffixes=(".csv",)),
+        DoclingConverterFormat(format_id="XLSX", suffixes=(".xlsx",)),
+        DoclingConverterFormat(format_id="XML_XBRL", suffixes=(".xbrl", ".xml")),
+        DoclingConverterFormat(format_id="JSON_DOCLING", suffixes=(".json",)),
+    )
+)
 
 
 class DoclingRuntimeInitializationError(RuntimeError):
@@ -183,6 +348,55 @@ def _resolve_backend_class(backend_name: str) -> type["AbstractDocumentBackend"]
         raise DoclingRuntimeInitializationError(
             f"Docling 未安装，无法解析 backend {normalized_backend_name!r}"
         ) from exc
+
+
+def _resolve_docling_allowed_formats(
+    capability: DoclingConverterCapability,
+) -> list["InputFormat"]:
+    """延迟解析并校验产品 capability 对应的 Docling 格式。
+
+    校验是单向的：每个产品声明的扩展名都必须受已安装 Docling 对应格式支持；
+    第三方新增的扩展名不会进入产品投影，也不会导致构造失败。
+
+    Args:
+        capability: 待解析的不可变产品转换能力。
+
+    Returns:
+        与 capability 格式顺序一致、供 ``DocumentConverter`` 使用的格式列表。
+
+    Raises:
+        DoclingRuntimeInitializationError: Docling 依赖缺失、格式标识缺失、格式映射缺失，
+            或产品扩展名不再受对应格式支持时抛出。
+    """
+
+    try:
+        from docling.datamodel.base_models import FormatToExtensions, InputFormat
+    except ImportError as exc:  # pragma: no cover - 依赖缺失保护
+        raise DoclingRuntimeInitializationError("Docling 未安装，无法校验产品转换能力") from exc
+
+    allowed_formats: list[InputFormat] = []
+    for format_item in capability.formats:
+        try:
+            input_format = InputFormat[format_item.format_id]
+        except KeyError as exc:
+            raise DoclingRuntimeInitializationError(f"Docling 缺少产品声明的格式 {format_item.format_id!r}") from exc
+        try:
+            installed_extensions = FormatToExtensions[input_format]
+        except KeyError as exc:
+            raise DoclingRuntimeInitializationError(
+                f"Docling 缺少产品格式 {format_item.format_id!r} 的扩展名映射"
+            ) from exc
+        installed_suffixes = frozenset(
+            _normalize_docling_product_suffix(extension) for extension in installed_extensions
+        )
+        missing_suffixes = tuple(suffix for suffix in format_item.suffixes if suffix not in installed_suffixes)
+        if missing_suffixes:
+            missing_projection = ", ".join(missing_suffixes)
+            raise DoclingRuntimeInitializationError(
+                f"Docling 格式 {format_item.format_id!r} 缺少产品扩展名: {missing_projection}"
+            )
+        allowed_formats.append(input_format)
+    return allowed_formats
 
 
 def resolve_docling_device_name() -> str:
@@ -343,7 +557,11 @@ def build_docling_pdf_converter(
     device_name: str | None = None,
     backend_name: str = _DOCLING_PARSE_BACKEND_NAME,
 ) -> "DocumentConverter":
-    """构造带稳定设备与 backend 策略的 Docling PDF 转换器。
+    """构造带稳定设备与 backend 策略的 Docling 转换器。
+
+    Dayu 只为 PDF 注入受控的 pipeline 与 backend 配置。其余允许格式不在本函数中
+    重建第三方默认配置，而由 Docling ``DocumentConverter`` constructor 按
+    ``allowed_formats`` 生成当前版本的默认 format options。
 
     Args:
         do_ocr: 是否开启 OCR。
@@ -370,6 +588,7 @@ def build_docling_pdf_converter(
     )
 
     backend_class = _resolve_backend_class(backend_name)
+    allowed_formats = _resolve_docling_allowed_formats(DOCLING_CONVERTER_CAPABILITY)
 
     try:
         from docling.datamodel.base_models import InputFormat
@@ -377,13 +596,15 @@ def build_docling_pdf_converter(
     except ImportError as exc:  # pragma: no cover - 依赖缺失保护
         raise DoclingRuntimeInitializationError("Docling 未安装，无法构造 PDF 转换器") from exc
 
+    # 非 PDF 格式故意不传 option：默认值由 Docling constructor 拥有，Dayu 不复制第三方默认表。
     return DocumentConverter(
+        allowed_formats=allowed_formats,
         format_options={
             InputFormat.PDF: PdfFormatOption(
                 pipeline_options=cast("PipelineOptions", pipeline_options),
                 backend=backend_class,
             ),
-        }
+        },
     )
 
 

@@ -3,17 +3,34 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field, replace
+from datetime import datetime
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
+from tests.fins.company_meta_test_support import stage_company_meta_fixture
+
+import dayu.fins.pipelines.cn_pipeline as cn_pipeline_module
+import dayu.fins.pipelines._filing_upload_fresh_validation as fresh_validation_module
+from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.downloaders.hkexnews_downloader import HkexnewsDiscoveryClient
 from dayu.fins.domain.document_models import CompanyMeta, now_iso8601
+from dayu.fins.ticker_normalization import build_company_ticker_identity
 from dayu.fins.domain.enums import SourceKind
-from dayu.fins.ingestion_runtime import FinsDownloadProgressEvent
+from dayu.fins.ingestion_runtime import (
+    FinsDownloadProgressEvent,
+    FinsUploadFilingRequest,
+    FinsUploadPipelineResult,
+    FinsUploadUsageCode,
+    FinsUploadUsageError,
+    ValidatedFinsUploadFilingRequest,
+)
 from dayu.fins.pipelines.cn_download_models import (
     CnCompanyProfile,
     CnReportCandidate,
@@ -21,31 +38,282 @@ from dayu.fins.pipelines.cn_download_models import (
     CnReportQuery,
     DownloadedReportAsset,
 )
-from dayu.fins.pipelines.cn_download_protocols import CnDoclingConversionRunner
-from dayu.fins.pipelines.cn_pipeline import CnPipeline, collect_cn_download_result_from_events
+from dayu.fins.pipelines.cn_pipeline import (
+    CnPipeline,
+    CnPipelineUploadResult,
+    collect_cn_download_result_from_events,
+)
+from dayu.fins.pipelines.docling_upload_service import _build_filing_original_asset_identity
+from dayu.fins.pipelines.docling_process_converter import (
+    DoclingConversionCancelledError,
+    DoclingConversionConfig,
+    DoclingConversionError,
+    DoclingConversionFailureKind,
+    DoclingConversionResult,
+)
 from dayu.fins.pipelines.download_events import DownloadEventType
-from dayu.fins.pipelines.upload_company_meta import RESOLVER_VERSION
+from dayu.fins.pipelines.upload_company_meta import RESOLVER_VERSION, build_upload_company_id
 from dayu.fins.pipelines.upload_filing_events import UploadFilingEventType
 from dayu.fins.pipelines.upload_material_events import UploadMaterialEventType
+from dayu.fins.service_runtime import prevalidate_fins_upload_filing_request_for_workspace
+from dayu.fins.storage import (
+    FilingUploadPublishedState,
+    FsDocumentBlobRepository,
+    FsFilingUploadStateRepository,
+    SourceIntegrityStatus,
+)
+from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
+
+from .upload_filing_test_support import (
+    TrackingBatchingRepository,
+    TrackingCompanyMetaRepository,
+    TrackingSourceDocumentRepository,
+    published_tree_sha256,
+)
 
 _PDF_BYTES = b"%PDF-1.7\n" + b"0" * 2048
 _DOCLING_BYTES = b'{"document": "ok"}'
 
 
-def _never_cancel() -> bool:
-    """返回未取消的稳定测试信号。
+class _NeverCancelledToken(CancellationToken):
+    """始终未取消的 canonical 测试 token。"""
+
+    def __call__(self) -> bool:
+        """委托 canonical 观察方法。
+
+        Returns:
+            始终返回 ``False``。
+        """
+
+        return self.is_cancelled()
+
+    def is_cancelled(self) -> bool:
+        """返回未取消的稳定测试信号。
+
+        Args:
+            无。
+
+        Returns:
+            始终为 ``False``。
+
+        Raises:
+            无。
+        """
+
+        return False
+
+    def cancel_reason(self) -> str | None:
+        """返回取消原因。
+
+        Returns:
+            始终返回 ``None``。
+        """
+
+        return None
+
+    def requested_at(self) -> datetime | None:
+        """返回取消时间。
+
+        Returns:
+            始终返回 ``None``。
+        """
+
+        return None
+
+
+_never_cancel = _NeverCancelledToken()
+
+
+def _validated_cn_filing_request(
+    *,
+    pipeline: CnPipeline,
+    filing_file: Path,
+    action: str | None,
+    company_name: str | None,
+    overwrite: bool = False,
+    ticker_aliases: tuple[str, ...] = (),
+    fiscal_year: int = 2024,
+    fiscal_period: str = "FY",
+    filing_date: str | None = None,
+    report_date: str | None = None,
+    ticker: str = "600519",
+    companion_files: tuple[Path, ...] = (),
+) -> ValidatedFinsUploadFilingRequest:
+    """使用 production validator 构造 CN filing 测试请求。
 
     Args:
-        无。
+        pipeline: 持有当前 published state 的 CN pipeline。
+        filing_file: 上传文件。
+        action: 请求动作；``None`` 表示 auto。
+        company_name: 可选公司名称。
+        overwrite: 是否覆盖既有 filing。
+        ticker_aliases: 可选 ticker aliases。
+        fiscal_year: 财年。
+        fiscal_period: 财期。
+        filing_date: 可选披露日期。
+        report_date: 可选报告日期。
+        ticker: CN 或 HK 原始 ticker。
+        companion_files: 可选完整 authoritative companions。
 
     Returns:
-        始终为 ``False``。
+        由 production storage/validator owner 产生的 validated request。
 
     Raises:
-        无。
+        FinsUploadUsageError: 请求不满足 filing usage contract 时抛出。
+        OSError: published state 读取失败时抛出。
+        ValueError: published state 损坏时抛出。
     """
 
-    return False
+    return prevalidate_fins_upload_filing_request_for_workspace(
+        FinsUploadFilingRequest(
+            ticker=ticker,
+            action=action or "auto",
+            files=() if action == "delete" else (filing_file, *companion_files),
+            primary_selectors=(filing_file,) if companion_files else (),
+            fiscal_year=fiscal_year,
+            fiscal_period=fiscal_period,
+            filing_date=filing_date,
+            report_date=report_date,
+            company_name=company_name,
+            ticker_aliases=ticker_aliases,
+            overwrite=overwrite,
+        ),
+        workspace_root=pipeline._workspace_root,
+    )
+
+
+def _read_upload_json_object(path: Path) -> dict[str, JsonValue]:
+    """读取 CN/HK workflow filesystem fixture JSON 对象。
+
+    Args:
+        path: 已知 storage-owned JSON 文件。
+
+    Returns:
+        JSON object。
+
+    Raises:
+        OSError: 文件读取失败时抛出。
+        ValueError: JSON 根不是对象时抛出。
+    """
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("CN workflow repair fixture JSON 必须是对象")
+    return payload
+
+
+def _published_upload_source_dir(
+    *,
+    pipeline: CnPipeline,
+    ticker: str,
+    document_id: str,
+) -> Path:
+    """返回 CN/HK 测试已发布 filing 目录。
+
+    Args:
+        pipeline: 持有真实 filesystem repository 的 pipeline。
+        ticker: canonical ticker。
+        document_id: exact filing document ID。
+
+    Returns:
+        已发布 source directory。
+
+    Raises:
+        OSError: locator 读取失败时抛出。
+        ValueError: identity 非法时抛出。
+    """
+
+    locator = pipeline._source_repository.get_source_document_locator(
+        ticker,
+        document_id,
+        SourceKind.FILING,
+    )
+    return pipeline._workspace_root / locator
+
+
+def _corrupt_cn_filing_for_repair(
+    *,
+    pipeline: CnPipeline,
+    ticker: str,
+    document_id: str,
+) -> None:
+    """删除 CN/HK published primary Docling 以形成 repair target。
+
+    Args:
+        pipeline: 持有真实 filesystem repository 的 pipeline。
+        ticker: canonical ticker。
+        document_id: exact filing document ID。
+
+    Returns:
+        无。
+
+    Raises:
+        OSError: 文件读取或删除失败时抛出。
+        ValueError: fresh files contract 非法时抛出。
+    """
+
+    source_dir = _published_upload_source_dir(
+        pipeline=pipeline,
+        ticker=ticker,
+        document_id=document_id,
+    )
+    meta = _read_upload_json_object(source_dir / "meta.json")
+    raw_files = meta.get("files")
+    if not isinstance(raw_files, list):
+        raise ValueError("CN workflow repair fixture files 必须是数组")
+    derived_names = [
+        item.get("name")
+        for item in raw_files
+        if isinstance(item, dict) and item.get("source") == "docling"
+    ]
+    if len(derived_names) != 1 or not isinstance(derived_names[0], str):
+        raise ValueError("CN workflow repair fixture 缺少唯一 Docling")
+    (source_dir / derived_names[0]).unlink()
+
+
+def _tracking_cn_pipeline(
+    workspace_root: Path,
+    *,
+    converter: _PipelineDownloadFakeConversionRunner | None = None,
+) -> tuple[
+    CnPipeline,
+    TrackingBatchingRepository,
+    TrackingCompanyMetaRepository,
+    TrackingSourceDocumentRepository,
+]:
+    """构造共享同一 FS core 的 CN/HK upload tracking composition。
+
+    Args:
+        workspace_root: 测试工作区根目录。
+        converter: 可选 typed Docling converter recorder。
+
+    Returns:
+        pipeline、batch、company 与 source tracking repositories。
+
+    Raises:
+        OSError: storage composition 初始化失败时抛出。
+    """
+
+    repository_set = build_fs_repository_set(
+        workspace_root=workspace_root,
+        create_directories=False,
+    )
+    batching = TrackingBatchingRepository(workspace_root, repository_set=repository_set)
+    company = TrackingCompanyMetaRepository(workspace_root, repository_set=repository_set)
+    source = TrackingSourceDocumentRepository(workspace_root, repository_set=repository_set)
+    pipeline = CnPipeline(
+        workspace_root=workspace_root,
+        batching_repository=batching,
+        company_repository=company,
+        source_repository=source,
+        blob_repository=FsDocumentBlobRepository(workspace_root, repository_set=repository_set),
+        filing_upload_state_repository=FsFilingUploadStateRepository(
+            workspace_root,
+            repository_set=repository_set,
+        ),
+        docling_converter=converter or _PipelineDownloadFakeConversionRunner(),
+    )
+    return pipeline, batching, company, source
 
 
 @dataclass
@@ -237,24 +505,28 @@ class _PipelineDownloadFakeHkDiscoveryClient:
 
 
 @dataclass
-class _PipelineDownloadFakeConversionRunner(CnDoclingConversionRunner):
+class _PipelineDownloadFakeConversionRunner:
     """CnPipeline wrapper 测试用 typed Docling runner。"""
 
     calls: int = 0
+    cancellations: list[CancellationToken | None] = field(default_factory=list)
+    after_conversion: Callable[[int], None] | None = None
 
-    async def convert_pdf_to_docling_json(
+    async def convert_to_json_bytes(
         self,
-        pdf_bytes: bytes,
+        input_bytes: bytes,
         stream_name: str,
         *,
-        cancellation_checker: Callable[[], bool],
-    ) -> bytes:
+        config: DoclingConversionConfig,
+        cancellation: CancellationToken | None,
+    ) -> DoclingConversionResult:
         """返回固定 Docling JSON。
 
         Args:
-            pdf_bytes: PDF 字节。
+            input_bytes: 输入字节。
             stream_name: 流名称。
-            cancellation_checker: operation-scoped 取消检查器。
+            config: 闭合转换配置。
+            cancellation: canonical 取消 token。
 
         Returns:
             Docling JSON 字节。
@@ -263,28 +535,126 @@ class _PipelineDownloadFakeConversionRunner(CnDoclingConversionRunner):
             无。
         """
 
-        del pdf_bytes, stream_name
-        assert cancellation_checker() is False
+        del input_bytes, stream_name, config
+        assert cancellation is None or cancellation.is_cancelled() is False
         self.calls += 1
-        return _DOCLING_BYTES
+        self.cancellations.append(cancellation)
+        if self.after_conversion is not None:
+            self.after_conversion(self.calls)
+        return DoclingConversionResult(
+            json_bytes=_DOCLING_BYTES,
+            size=len(_DOCLING_BYTES),
+            sha256=hashlib.sha256(_DOCLING_BYTES).hexdigest(),
+        )
 
 
-def _convert_docling_stub(raw_data: bytes, stream_name: str) -> dict[str, JsonValue]:
-    """返回固定 Docling 转换结果。
+@dataclass(frozen=True, slots=True)
+class _ConversionBarrier:
+    """把线程 barrier 适配为 conversion 完成回调。"""
+
+    barrier: Barrier
+
+    def __call__(self, call_count: int) -> None:
+        """等待另一 upload worker 完成 conversion。
+
+        Args:
+            call_count: converter 的当前调用次数，仅用于满足 callback contract。
+
+        Returns:
+            无。
+
+        Raises:
+            threading.BrokenBarrierError: 另一 worker 未在超时内到达时抛出。
+        """
+
+        del call_count
+        self.barrier.wait(timeout=10)
+
+
+def _run_two_cn_uploads(
+    *,
+    pipeline: CnPipeline,
+    first_request: ValidatedFinsUploadFilingRequest,
+    second_request: ValidatedFinsUploadFilingRequest,
+) -> tuple[CnPipelineUploadResult, CnPipelineUploadResult]:
+    """在两个真实 OS 线程中同时执行 CN/HK upload。
 
     Args:
-        raw_data: 输入原始字节。
-        stream_name: 输入流名称。
+        pipeline: 两个 worker 共用的真实 FS composition。
+        first_request: 第一条已验证请求。
+        second_request: 第二条已验证请求。
 
     Returns:
-        固定结构化结果。
+        与输入顺序一致的两个聚合终态。
 
     Raises:
-        无。
+        BaseException: 任一 worker 未被 workflow 封闭的异常或超时时抛出。
     """
 
-    del raw_data
-    return {"name": stream_name, "format": "docling"}
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(pipeline.upload_filing, first_request)
+        second_future = executor.submit(pipeline.upload_filing, second_request)
+        return first_future.result(timeout=20), second_future.result(timeout=20)
+
+
+class _FailingCnUploadConverter:
+    """CN/HK filing failure classification 测试 converter。"""
+
+    def __init__(
+        self,
+        error: Exception,
+        *,
+        failing_name: str | None = None,
+        calls: list[str] | None = None,
+    ) -> None:
+        """初始化 failure converter。
+
+        Args:
+            error: conversion 调用应抛出的异常。
+            failing_name: 仅该 basename 抛错；``None`` 表示每次都抛错。
+            calls: 可选 converter 调用顺序记录。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.error = error
+        self._failing_name = failing_name
+        self._calls = calls
+
+    async def convert_to_json_bytes(
+        self,
+        input_bytes: bytes,
+        stream_name: str,
+        *,
+        config: DoclingConversionConfig,
+        cancellation: CancellationToken | None,
+    ) -> DoclingConversionResult:
+        """抛出预设异常。
+
+        Args:
+            input_bytes: 输入字节。
+            stream_name: 输入名称。
+            config: 闭合转换配置。
+            cancellation: canonical cancellation token。
+
+        Returns:
+            不返回。
+
+        Raises:
+            Exception: 始终抛出构造时传入的异常。
+        """
+
+        del input_bytes, config, cancellation
+        if self._calls is not None:
+            self._calls.append(stream_name)
+        if self._failing_name is None or stream_name == self._failing_name:
+            raise self.error
+        data = ('{"name": "' + stream_name + '"}').encode()
+        return DoclingConversionResult(data, len(data), hashlib.sha256(data).hexdigest())
 
 
 def _seed_cn_upload_company_meta(
@@ -293,6 +663,8 @@ def _seed_cn_upload_company_meta(
     company_name: str,
     resolver_version: str,
     ticker_aliases: list[str],
+    ticker: str = "600519",
+    company_id: str = "600519_CN",
 ) -> None:
     """写入 CN upload 测试用公司元数据。
 
@@ -301,6 +673,8 @@ def _seed_cn_upload_company_meta(
         company_name: 公司名称。
         resolver_version: 元数据 resolver 版本。
         ticker_aliases: ticker alias 列表。
+        ticker: canonical CN/HK ticker。
+        company_id: canonical company ID。
 
     Returns:
         无。
@@ -309,16 +683,15 @@ def _seed_cn_upload_company_meta(
         OSError: 仓储写入失败时抛出。
     """
 
-    batch = pipeline.batching_repository.begin_batch("600519")
-    pipeline._company_repository.upsert_company_meta(
+    batch = pipeline.batching_repository.begin_batch(ticker)
+    stage_company_meta_fixture(
+        pipeline._company_repository,
         CompanyMeta(
-            company_id="600519_CN",
+            company_id=company_id,
             company_name=company_name,
-            ticker="600519",
-            market="CN",
+            ticker_identity=build_company_ticker_identity(ticker, ticker_aliases),
             resolver_version=resolver_version,
             updated_at=now_iso8601(),
-            ticker_aliases=ticker_aliases,
         ),
         batch=batch,
     )
@@ -343,7 +716,7 @@ def test_download_runs_cn_workflow_with_injected_discovery_client(tmp_path: Path
     pipeline = CnPipeline(
         workspace_root=tmp_path,
         cn_discovery_client=discovery,
-        docling_conversion_runner=runner,
+        docling_converter=runner,
     )
     cancel_checker = _never_cancel
 
@@ -369,6 +742,7 @@ def test_download_runs_cn_workflow_with_injected_discovery_client(tmp_path: Path
     assert discovery.cancellation_checkpoints[0] is not None
     assert discovery.cancellation_checkpoints[0] is not cancel_checker
     assert runner.calls == 1
+    assert runner.cancellations == [cancel_checker]
 
 
 def test_default_hk_discovery_client_is_hkexnews(tmp_path: Path) -> None:
@@ -409,7 +783,7 @@ def test_download_runs_hk_workflow_with_injected_discovery_client(tmp_path: Path
     pipeline = CnPipeline(
         workspace_root=tmp_path,
         hk_discovery_client=discovery,
-        docling_conversion_runner=runner,
+        docling_converter=runner,
     )
     cancel_checker = _never_cancel
 
@@ -438,6 +812,7 @@ def test_download_runs_hk_workflow_with_injected_discovery_client(tmp_path: Path
     assert discovery.cancellation_checkpoints[0] is not None
     assert discovery.cancellation_checkpoints[0] is not cancel_checker
     assert runner.calls == 1
+    assert runner.cancellations == [cancel_checker]
 
 
 @pytest.mark.asyncio
@@ -461,7 +836,7 @@ async def test_download_stream_runs_cn_workflow_with_injected_discovery_client(
     pipeline = CnPipeline(
         workspace_root=tmp_path,
         cn_discovery_client=discovery,
-        docling_conversion_runner=runner,
+        docling_converter=runner,
     )
 
     events = [
@@ -514,7 +889,7 @@ async def test_hk_adapter_progress_sink_projects_conversion_lifecycle(tmp_path: 
     pipeline = CnPipeline(
         workspace_root=tmp_path,
         hk_discovery_client=_PipelineDownloadFakeHkDiscoveryClient(temp_dir=tmp_path),
-        docling_conversion_runner=_PipelineDownloadFakeConversionRunner(),
+        docling_converter=_PipelineDownloadFakeConversionRunner(),
     )
     progress_events: list[FinsDownloadProgressEvent] = []
 
@@ -580,7 +955,7 @@ def test_download_non_explicit_nonempty_start_keeps_default_business_limit(tmp_p
     pipeline = CnPipeline(
         workspace_root=tmp_path,
         cn_discovery_client=discovery,
-        docling_conversion_runner=runner,
+        docling_converter=runner,
     )
 
     result = pipeline.download(
@@ -613,25 +988,23 @@ async def test_upload_filing_stream_uploads_files_with_docling(tmp_path: Path) -
         AssertionError: 断言失败时抛出。
     """
 
-    pipeline = CnPipeline(workspace_root=tmp_path)
-    pipeline._upload_service._convert_with_docling = _convert_docling_stub
+    pipeline, batching, company, source = _tracking_cn_pipeline(tmp_path)
     filing_file = tmp_path / "annual.pdf"
     filing_file.write_text("demo cn filing", encoding="utf-8")
+    before_tree = published_tree_sha256(tmp_path, "600519")
 
     events = [
         event
         async for event in pipeline.upload_filing_stream(
-            ticker="600519",
-            action="create",
-            files=[filing_file],
-            fiscal_year=2024,
-            fiscal_period="FY",
-            amended=False,
-            filing_date="2025-04-01",
-            report_date="2024-12-31",
-            company_name="贵州茅台",
-            ticker_aliases=["600519", "600519.SH"],
-            overwrite=False,
+            _validated_cn_filing_request(
+                pipeline=pipeline,
+                filing_file=filing_file,
+                action="create",
+                company_name="贵州茅台",
+                ticker_aliases=("600519", "600519.SH"),
+                filing_date="2025-04-01",
+                report_date="2024-12-31",
+            )
         )
     ]
 
@@ -647,6 +1020,7 @@ async def test_upload_filing_stream_uploads_files_with_docling(tmp_path: Path) -
     assert result_value["pipeline"] == "cn"
     assert result_value["action"] == "upload_filing"
     assert result_value["status"] == "ok"
+    assert result_value["stored_file_count"] == 1
     assert str(result_value["document_id"]).startswith("fil_cn_")
     assert result_value["filing_action"] == "create"
     meta = pipeline._source_repository.get_source_meta(
@@ -656,6 +1030,14 @@ async def test_upload_filing_stream_uploads_files_with_docling(tmp_path: Path) -
     )
     assert str(meta["primary_document"]).endswith("_docling.json")
     assert meta["report_kind"] == "annual"
+    after_tree = published_tree_sha256(tmp_path, "600519")
+    assert before_tree == {}
+    assert after_tree
+    assert len(batching.begin_tokens) == 1
+    assert batching.commit_tokens == batching.begin_tokens
+    assert batching.rollback_tokens == []
+    assert company.stage_tokens == batching.begin_tokens
+    assert source.stage_tokens == batching.begin_tokens
 
 
 @pytest.mark.asyncio
@@ -672,8 +1054,10 @@ async def test_upload_filing_stream_refreshes_stale_company_meta(tmp_path: Path)
         AssertionError: 断言失败时抛出。
     """
 
-    pipeline = CnPipeline(workspace_root=tmp_path)
-    pipeline._upload_service._convert_with_docling = _convert_docling_stub
+    pipeline = CnPipeline(
+        workspace_root=tmp_path,
+        docling_converter=_PipelineDownloadFakeConversionRunner(),
+    )
     _seed_cn_upload_company_meta(
         pipeline=pipeline,
         company_name="旧贵州茅台",
@@ -686,17 +1070,15 @@ async def test_upload_filing_stream_refreshes_stale_company_meta(tmp_path: Path)
     events = [
         event
         async for event in pipeline.upload_filing_stream(
-            ticker="600519",
-            action="create",
-            files=[filing_file],
-            fiscal_year=2024,
-            fiscal_period="FY",
-            amended=False,
-            filing_date="2025-04-01",
-            report_date="2024-12-31",
-            company_name="贵州茅台",
-            ticker_aliases=["600519", "600519.SH"],
-            overwrite=False,
+            _validated_cn_filing_request(
+                pipeline=pipeline,
+                filing_file=filing_file,
+                action="create",
+                company_name="贵州茅台",
+                ticker_aliases=("600519", "600519.SH"),
+                filing_date="2025-04-01",
+                report_date="2024-12-31",
+            )
         )
     ]
 
@@ -705,7 +1087,7 @@ async def test_upload_filing_stream_refreshes_stale_company_meta(tmp_path: Path)
     assert company_meta.company_id == "600519_SSE"
     assert company_meta.company_name == "贵州茅台"
     assert company_meta.resolver_version == RESOLVER_VERSION
-    assert company_meta.ticker_aliases == ["600519"]
+    assert company_meta.ticker_identity.accepted_aliases == ("OLD",)
 
 
 @pytest.mark.asyncio
@@ -722,8 +1104,10 @@ async def test_upload_material_stream_uploads_files_with_docling(tmp_path: Path)
         AssertionError: 断言失败时抛出。
     """
 
-    pipeline = CnPipeline(workspace_root=tmp_path)
-    pipeline._upload_service._convert_with_docling = _convert_docling_stub
+    pipeline = CnPipeline(
+        workspace_root=tmp_path,
+        docling_converter=_PipelineDownloadFakeConversionRunner(),
+    )
     material_file = tmp_path / "deck.pdf"
     material_file.write_text("demo cn material", encoding="utf-8")
 
@@ -736,6 +1120,7 @@ async def test_upload_material_stream_uploads_files_with_docling(tmp_path: Path)
             material_name="Roadshow Deck",
             files=[material_file],
             company_name="贵州茅台",
+            ticker_aliases=["600519.SH", "MSFT", "V.BA"],
             overwrite=False,
         )
     ]
@@ -753,6 +1138,10 @@ async def test_upload_material_stream_uploads_files_with_docling(tmp_path: Path)
     assert result_value["action"] == "upload_material"
     assert result_value["status"] == "ok"
     assert str(result_value["document_id"]).startswith("mat_")
+    company_meta = pipeline._company_repository.get_company_meta("600519")
+    assert company_meta.ticker_identity.accepted_aliases == ("MSFT", "V-BA")
+    assert pipeline._company_repository.resolve_company_ticker("MSFT") == "600519"
+    assert pipeline._company_repository.resolve_company_ticker("V.BA") == "600519"
     meta = pipeline._source_repository.get_source_meta(
         "600519",
         str(result_value["document_id"]),
@@ -762,8 +1151,216 @@ async def test_upload_material_stream_uploads_files_with_docling(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_upload_material_failure_uses_shared_typed_failure_owner(tmp_path: Path) -> None:
+    """CN material terminal catch 必须复用共享 typed failure owner。
+
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: material 未使用 bounded typed failure projection 时抛出。
+    """
+
+    pipeline = CnPipeline(
+        workspace_root=tmp_path,
+        docling_converter=_PipelineDownloadFakeConversionRunner(),
+    )
+    material_file = tmp_path / "deck.pdf"
+    material_file.write_text("demo cn material", encoding="utf-8")
+
+    events = [
+        event
+        async for event in pipeline.upload_material_stream(
+            ticker="600519",
+            action="create",
+            form_type="MATERIAL_OTHER",
+            material_name="Roadshow Deck",
+            files=[material_file],
+            company_name=None,
+            overwrite=False,
+        )
+    ]
+
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    assert result["status"] == "failed"
+    assert result["stored_file_count"] == 0
+    assert result["message"] == "上传执行失败，请检查运行日志后重试"
+    assert result["failure"] == {
+        "kind": "runtime",
+        "code": "unexpected_runtime",
+        "message": "上传执行失败，请检查运行日志后重试",
+        "retry_hint": None,
+        "file_label": None,
+    }
+    assert events[-1].payload["error"] == "上传执行失败，请检查运行日志后重试"
+
+
+@pytest.mark.asyncio
+async def test_upload_material_unsupported_suffix_fails_before_reads_or_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CN/HK material 格式 admission 必须先于 published read 与 mutation。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: 外部读取与 mutation 禁用夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 格式错误逃逸、重分类或产生副作用时抛出。
+    """
+
+    converter = _PipelineDownloadFakeConversionRunner()
+    pipeline = CnPipeline(
+        workspace_root=tmp_path,
+        docling_converter=converter,
+    )
+    unsupported_file = tmp_path / "deck.zip"
+    unsupported_file.write_bytes(b"not read")
+
+    def reject_state_read(ticker: str, document_id: str, source_kind: SourceKind) -> None:
+        """拒绝 published-state 读取。
+
+        Args:
+            ticker: 意外 ticker。
+            document_id: 意外文档 ID。
+            source_kind: 意外 source kind。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 始终抛出。
+        """
+
+        del ticker, document_id, source_kind
+        raise AssertionError("格式 admission 前禁止读取 published state")
+
+    def reject_batch(ticker: str) -> None:
+        """拒绝任何 company/source batch。
+
+        Args:
+            ticker: 意外 batch ticker。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 始终抛出。
+        """
+
+        del ticker
+        raise AssertionError("格式 admission 失败禁止开启 batch")
+
+    def reject_file_read(path: Path) -> bytes:
+        """拒绝输入文件读取。
+
+        Args:
+            path: 意外读取路径。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 始终抛出。
+        """
+
+        raise AssertionError(f"格式 admission 失败禁止读取文件: {path.name}")
+
+    monkeypatch.setattr(pipeline, "_safe_get_upload_document_meta", reject_state_read)
+    monkeypatch.setattr(pipeline._batching_repository, "begin_batch", reject_batch)
+    monkeypatch.setattr(Path, "read_bytes", reject_file_read)
+
+    events = [
+        event
+        async for event in pipeline.upload_material_stream(
+            ticker="600519",
+            action="create",
+            form_type="MATERIAL_OTHER",
+            material_name="Roadshow Deck",
+            files=[unsupported_file],
+            company_name="贵州茅台",
+        )
+    ]
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+
+    assert [event.event_type for event in events] == [UploadMaterialEventType.UPLOAD_FAILED]
+    assert result["failure"] == {
+        "kind": "usage",
+        "code": "unsupported_upload_format",
+        "message": "文件格式不受支持，请选择支持的文件后重试",
+        "retry_hint": "请查看上传帮助中的支持格式后重试",
+        "file_label": "deck.zip",
+    }
+    assert converter.calls == 0
+    assert not (tmp_path / "portfolio" / "600519").exists()
+
+
+@pytest.mark.asyncio
+async def test_upload_material_alias_conflict_projects_exact_typed_terminal(tmp_path: Path) -> None:
+    """CN material alias conflict 必须从 storage typed error 投影 exact failure JSON。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: conflict 未原子拒绝或 terminal JSON 漂移时抛出。
+    """
+
+    pipeline = CnPipeline(
+        workspace_root=tmp_path,
+        docling_converter=_PipelineDownloadFakeConversionRunner(),
+    )
+    existing = pipeline._batching_repository.begin_batch("MSFT")
+    pipeline._batching_repository.commit_batch(existing)
+    material_file = tmp_path / "deck.pdf"
+    material_file.write_text("demo cn material", encoding="utf-8")
+
+    events = [
+        event
+        async for event in pipeline.upload_material_stream(
+            ticker="600519",
+            action="create",
+            form_type="MATERIAL_OTHER",
+            material_name="Roadshow Deck",
+            files=[material_file],
+            company_name="贵州茅台",
+            ticker_aliases=["MSFT"],
+            overwrite=False,
+        )
+    ]
+
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    expected_failure = {
+        "kind": "storage",
+        "code": "ticker_alias_conflict",
+        "message": "股票代码别名已属于当前工作区中的其他公司，请移除冲突别名后重试",
+        "retry_hint": "请确认公司的主代码与别名声明后重新上传",
+        "file_label": None,
+    }
+    assert events[-1].event_type is UploadMaterialEventType.UPLOAD_FAILED
+    assert result["status"] == "failed"
+    assert result["stored_file_count"] == 0
+    assert result["failure"] == expected_failure
+    assert events[-1].payload["error"] == expected_failure["message"]
+    assert not (tmp_path / "portfolio" / "600519").exists()
+
+
+@pytest.mark.asyncio
 async def test_upload_filing_stream_auto_resolves_create_update_skip(tmp_path: Path) -> None:
-    """CN filing upload stream 应自动 create/update 并跳过相同源文件。
+    """CN/HK shared facade 应完整替换 changed update 并跳过其相同重放。
 
     Args:
         tmp_path: 临时目录。
@@ -775,46 +1372,1206 @@ async def test_upload_filing_stream_auto_resolves_create_update_skip(tmp_path: P
         AssertionError: 断言失败时抛出。
     """
 
-    pipeline = CnPipeline(workspace_root=tmp_path)
-    pipeline._upload_service._convert_with_docling = _convert_docling_stub
+    pipeline = CnPipeline(
+        workspace_root=tmp_path,
+        docling_converter=_PipelineDownloadFakeConversionRunner(),
+    )
     filing_file = tmp_path / "annual.pdf"
+    renamed_file = tmp_path / "renamed-annual.pdf"
     filing_file.write_text("demo cn filing", encoding="utf-8")
+    renamed_file.write_text("changed cn filing", encoding="utf-8")
 
     create_events = [
         event
         async for event in pipeline.upload_filing_stream(
-            ticker="600519",
-            action=None,
-            files=[filing_file],
-            fiscal_year=2024,
-            fiscal_period="FY",
-            company_name="贵州茅台",
+            _validated_cn_filing_request(
+                pipeline=pipeline,
+                filing_file=filing_file,
+                action=None,
+                company_name="贵州茅台",
+            )
+        )
+    ]
+    update_events = [
+        event
+        async for event in pipeline.upload_filing_stream(
+            _validated_cn_filing_request(
+                pipeline=pipeline,
+                filing_file=renamed_file,
+                action=None,
+                company_name="贵州茅台",
+            )
         )
     ]
     skip_events = [
         event
         async for event in pipeline.upload_filing_stream(
-            ticker="600519",
-            action=None,
-            files=[filing_file],
-            fiscal_year=2024,
-            fiscal_period="FY",
-            company_name="贵州茅台",
+            _validated_cn_filing_request(
+                pipeline=pipeline,
+                filing_file=renamed_file,
+                action=None,
+                company_name="贵州茅台",
+            )
         )
     ]
     create_result = create_events[-1].payload["result"]
+    update_result = update_events[-1].payload["result"]
     skip_result = skip_events[-1].payload["result"]
 
     assert isinstance(create_result, dict)
+    assert isinstance(update_result, dict)
     assert isinstance(skip_result, dict)
     assert create_result["filing_action"] == "create"
+    assert update_result["filing_action"] == "update"
+    assert update_result["status"] == "ok"
+    assert update_result["stored_file_count"] == 1
+    assert update_result["document_id"] == create_result["document_id"]
     assert skip_result["filing_action"] == "update"
     assert skip_result["status"] == "skipped"
+    assert skip_result["stored_file_count"] == 0
+    handle = pipeline._source_repository.get_source_handle(
+        "600519",
+        str(create_result["document_id"]),
+        SourceKind.FILING,
+    )
+    file_names = sorted(meta.uri.split("/")[-1] for meta in pipeline._blob_repository.list_files(handle))
+    original_identity = _build_filing_original_asset_identity(renamed_file.resolve(strict=False))
+    assert file_names == sorted((original_identity, f"{original_identity}_docling.json"))
     assert [event.event_type for event in skip_events] == [
         UploadFilingEventType.UPLOAD_STARTED,
         UploadFilingEventType.FILE_SKIPPED,
         UploadFilingEventType.UPLOAD_COMPLETED,
     ]
+
+
+@pytest.mark.parametrize("overwrite", (False, True))
+@pytest.mark.asyncio
+async def test_upload_filing_fresh_missing_update_fails_before_conversion(
+    tmp_path: Path,
+    overwrite: bool,
+) -> None:
+    """CN/HK fresh owner 必须拒绝 stale update-missing，overwrite 不得授予 upsert。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        overwrite: stale update 请求的覆盖标志。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: fresh missing 未 typed fail、发生转换/batch 或 tree 漂移时抛出。
+    """
+
+    converter = _PipelineDownloadFakeConversionRunner()
+    pipeline, batching, company, source = _tracking_cn_pipeline(
+        tmp_path,
+        converter=converter,
+    )
+    filing_file = tmp_path / "annual.pdf"
+    filing_file.write_text("demo cn filing", encoding="utf-8")
+    create_events = [
+        event
+        async for event in pipeline.upload_filing_stream(
+            _validated_cn_filing_request(
+                pipeline=pipeline,
+                filing_file=filing_file,
+                action=None,
+                company_name="贵州茅台",
+            )
+        )
+    ]
+    create_result = create_events[-1].payload["result"]
+    assert isinstance(create_result, dict)
+    stale_update = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action="update",
+        company_name="贵州茅台",
+        overwrite=overwrite,
+    )
+    reset_batch = pipeline._batching_repository.begin_batch("600519")
+    pipeline._source_repository.reset_source_document(
+        "600519",
+        stale_update.document_id,
+        SourceKind.FILING,
+        batch=reset_batch,
+    )
+    pipeline._batching_repository.commit_batch(reset_batch)
+    converter.calls = 0
+    converter.cancellations.clear()
+    batching.begin_tokens.clear()
+    batching.commit_tokens.clear()
+    batching.rollback_tokens.clear()
+    company.stage_tokens.clear()
+    source.stage_tokens.clear()
+    published_tree = published_tree_sha256(tmp_path, "600519")
+
+    with pytest.raises(FinsUploadUsageError) as exc_info:
+        _ = [event async for event in pipeline.upload_filing_stream(stale_update)]
+
+    assert exc_info.value.failure.code is FinsUploadUsageCode.UPDATE_TARGET_MISSING
+    assert converter.calls == 0
+    assert batching.begin_tokens == []
+    assert company.stage_tokens == []
+    assert source.stage_tokens == []
+    assert published_tree_sha256(tmp_path, "600519") == published_tree
+
+
+@pytest.mark.parametrize("failure_point", ("company", "source"))
+@pytest.mark.asyncio
+async def test_upload_filing_stage_failure_rolls_back_one_batch_and_preserves_published_tree(
+    tmp_path: Path,
+    failure_point: str,
+) -> None:
+    """CN company/source stage failure 必须回滚同一 batch 且 published SHA 不变。
+
+    Args:
+        tmp_path: 临时目录。
+        failure_point: 注入 company 或 source stage failure。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: batch 计数、token identity 或 published tree 漂移时抛出。
+    """
+
+    pipeline, batching, company, source = _tracking_cn_pipeline(tmp_path)
+    filing_file = tmp_path / "annual.pdf"
+    filing_file.write_text("demo cn filing", encoding="utf-8")
+    request = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action="create",
+        company_name="贵州茅台",
+    )
+    company.fail_after_stage = failure_point == "company"
+    source.fail_after_stage = failure_point == "source"
+    before_tree = published_tree_sha256(tmp_path, "600519")
+
+    events = [event async for event in pipeline.upload_filing_stream(request)]
+
+    assert events[-1].event_type is UploadFilingEventType.UPLOAD_FAILED
+    assert published_tree_sha256(tmp_path, "600519") == before_tree == {}
+    assert len(batching.begin_tokens) == 1
+    assert batching.commit_tokens == []
+    assert batching.rollback_tokens == batching.begin_tokens
+    assert company.stage_tokens == batching.begin_tokens
+    if failure_point == "source":
+        assert source.stage_tokens == batching.begin_tokens
+    else:
+        assert source.stage_tokens == []
+
+
+@pytest.mark.asyncio
+async def test_upload_filing_fresh_recheck_discards_stale_action_and_company_decision(
+    tmp_path: Path,
+) -> None:
+    """CN workflow 必须丢弃 preflight 后失效的 action/company decision。
+
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: fresh recheck 未成为唯一 prepare/stage authority 时抛出。
+    """
+
+    pipeline, batching, company, source = _tracking_cn_pipeline(tmp_path)
+    filing_file = tmp_path / "annual.pdf"
+    filing_file.write_text("demo cn filing", encoding="utf-8")
+    stale_preflight = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action=None,
+        company_name="旧决策公司名",
+    )
+    assert stale_preflight.resolved_action == "create"
+    assert stale_preflight.company_meta_decision.disposition == "stage"
+    published_request = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action=None,
+        company_name="已发布公司名",
+    )
+    published_events = [event async for event in pipeline.upload_filing_stream(published_request)]
+    assert published_events[-1].event_type is UploadFilingEventType.UPLOAD_COMPLETED
+    batching.begin_tokens.clear()
+    batching.commit_tokens.clear()
+    batching.rollback_tokens.clear()
+    company.stage_tokens.clear()
+    source.stage_tokens.clear()
+    before_company_meta = pipeline._company_repository.get_company_meta("600519")
+    before_company_meta_bytes = json.dumps(
+        before_company_meta.to_dict(),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    before_source_state = pipeline._filing_upload_state_repository.read_filing_upload_state(
+        "600519",
+        stale_preflight.document_id,
+    )
+    published_tree = published_tree_sha256(tmp_path, "600519")
+
+    stale_events = [event async for event in pipeline.upload_filing_stream(stale_preflight)]
+
+    stale_result = stale_events[-1].payload["result"]
+    assert isinstance(stale_result, dict)
+    assert stale_result["filing_action"] == "update"
+    assert stale_result["status"] == "skipped"
+    assert stale_result["warnings"] == [
+        {
+            "kind": "company_name_ignored",
+            "message": "本次提交的公司名称未生效；已保留现有公司名称。请核对上传目标公司是否正确。",
+        }
+    ]
+    after_company_meta = pipeline._company_repository.get_company_meta("600519")
+    after_company_meta_bytes = json.dumps(
+        after_company_meta.to_dict(),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    after_source_state = pipeline._filing_upload_state_repository.read_filing_upload_state(
+        "600519",
+        stale_preflight.document_id,
+    )
+    assert after_company_meta.company_name == "已发布公司名"
+    assert after_company_meta.updated_at == before_company_meta.updated_at
+    assert after_company_meta_bytes == before_company_meta_bytes
+    assert after_source_state == before_source_state
+    assert len(batching.begin_tokens) == 1
+    assert batching.commit_tokens == batching.begin_tokens
+    assert batching.rollback_tokens == []
+    assert company.stage_tokens == batching.begin_tokens
+    assert source.stage_tokens == []
+    assert published_tree_sha256(tmp_path, "600519") == published_tree
+
+
+@pytest.mark.asyncio
+async def test_cn_fresh_different_company_name_uploads_changed_filing_with_warning(
+    tmp_path: Path,
+) -> None:
+    """CN fresh canonical name 在 filing 真更新成功时保持不变并产生 final warning。
+
+    Args:
+        tmp_path: 临时 workspace。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: uploaded warning 或 canonical company identity 漂移时抛出。
+    """
+
+    pipeline, _batching, _company, _source = _tracking_cn_pipeline(tmp_path)
+    filing_file = tmp_path / "fresh-name-update.pdf"
+    filing_file.write_bytes(b"cn-filing-v1")
+    create_request = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action="create",
+        company_name="贵州茅台",
+    )
+    create_events = [event async for event in pipeline.upload_filing_stream(create_request)]
+    assert create_events[-1].event_type is UploadFilingEventType.UPLOAD_COMPLETED
+    filing_file.write_bytes(b"cn-filing-v2")
+    update_request = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action="update",
+        company_name="贵州茅台集团",
+    )
+
+    events = [event async for event in pipeline.upload_filing_stream(update_request)]
+
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    assert result["status"] == "ok"
+    assert result["warnings"] == [
+        {
+            "kind": "company_name_ignored",
+            "message": "本次提交的公司名称未生效；已保留现有公司名称。请核对上传目标公司是否正确。",
+        }
+    ]
+    assert pipeline._company_repository.get_company_meta("600519").company_name == "贵州茅台"
+
+
+@pytest.mark.asyncio
+async def test_cn_upload_filing_identical_skip_atomically_commits_new_alias_only(
+    tmp_path: Path,
+) -> None:
+    """CN identical skip 应只提交合法 alias，且 source publication exact 不变。
+
+    Args:
+        tmp_path: 临时 workspace。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: alias durable、warning、batch 或 source tree contract 漂移时抛出。
+    """
+
+    pipeline, batching, company, source = _tracking_cn_pipeline(tmp_path)
+    filing_file = tmp_path / "alias-skip.pdf"
+    filing_file.write_bytes(b"identical CN alias skip")
+    first_request = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action=None,
+        company_name="贵州茅台",
+    )
+    first_events = [event async for event in pipeline.upload_filing_stream(first_request)]
+    assert first_events[-1].event_type is UploadFilingEventType.UPLOAD_COMPLETED
+    second_request = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action=None,
+        company_name="  贵州茅台  ",
+        ticker_aliases=("MOUTAI",),
+    )
+    before_state = pipeline._filing_upload_state_repository.read_filing_upload_state(
+        "600519",
+        second_request.document_id,
+    )
+    before_tree = published_tree_sha256(tmp_path, "600519")
+    batching.begin_tokens.clear()
+    batching.commit_tokens.clear()
+    batching.rollback_tokens.clear()
+    company.stage_tokens.clear()
+    source.stage_tokens.clear()
+
+    events = [event async for event in pipeline.upload_filing_stream(second_request)]
+
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    assert result["status"] == "skipped"
+    assert result["warnings"] == []
+    assert batching.commit_tokens == batching.begin_tokens
+    assert batching.rollback_tokens == []
+    assert company.stage_tokens == batching.begin_tokens
+    assert source.stage_tokens == []
+    final_meta = pipeline._company_repository.get_company_meta("600519")
+    assert final_meta.ticker_identity.accepted_aliases == ("MOUTAI",)
+    after_state = pipeline._filing_upload_state_repository.read_filing_upload_state(
+        "600519",
+        second_request.document_id,
+    )
+    assert after_state.source_integrity == before_state.source_integrity
+    assert after_state.source_meta == before_state.source_meta
+    assert after_state.publication_identity == before_state.publication_identity
+    before_source_tree = {
+        path: digest
+        for path, digest in before_tree.items()
+        if path != "portfolio/600519/meta.json"
+    }
+    after_source_tree = {
+        path: digest
+        for path, digest in published_tree_sha256(tmp_path, "600519").items()
+        if path != "portfolio/600519/meta.json"
+    }
+    assert after_source_tree == before_source_tree
+
+
+@pytest.mark.asyncio
+async def test_upload_filing_consumes_fresh_authoritative_file_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CN/HK workflow 必须原样消费 fresh validator 的 typed selection。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: fresh validator selection 注入夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: workflow 从 raw files 重建 selection 时抛出。
+    """
+
+    converter = _PipelineDownloadFakeConversionRunner()
+    pipeline, _batching, _company, _source = _tracking_cn_pipeline(
+        tmp_path,
+        converter=converter,
+    )
+    authoritative_file = tmp_path / "authoritative.docx"
+    authoritative_file.write_bytes(b"authoritative")
+    request = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=authoritative_file,
+        action="create",
+        company_name="贵州茅台",
+    )
+    owner_validator = fresh_validation_module.validate_fins_upload_filing_request
+    validator_calls: list[FinsUploadFilingRequest] = []
+
+    def authoritative_validator(
+        raw_request: FinsUploadFilingRequest,
+        *,
+        published_state: FilingUploadPublishedState,
+    ) -> ValidatedFinsUploadFilingRequest:
+        """保留 fresh identity，仅替换 owner 产生的 typed selection。
+
+        Args:
+            raw_request: immutable raw request。
+            published_state: fresh published snapshot。
+
+        Returns:
+            携带 authoritative file selection 的 validated request。
+
+        Raises:
+            FinsUploadUsageError: owner validator 拒绝请求时抛出。
+        """
+
+        validator_calls.append(raw_request)
+        return owner_validator(raw_request, published_state=published_state)
+
+    monkeypatch.setattr(
+        fresh_validation_module,
+        "validate_fins_upload_filing_request",
+        authoritative_validator,
+    )
+
+    events = [event async for event in pipeline.upload_filing_stream(request)]
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    handle = pipeline._source_repository.get_source_handle(
+        "600519",
+        str(result["document_id"]),
+        SourceKind.FILING,
+    )
+    stored_names = sorted(item.uri.rsplit("/", maxsplit=1)[-1] for item in pipeline._blob_repository.list_files(handle))
+
+    assert validator_calls == [request.request]
+    assert converter.calls == 1
+    original_identity = _build_filing_original_asset_identity(authoritative_file.resolve(strict=False))
+    assert stored_names == sorted((original_identity, f"{original_identity}_docling.json"))
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_code", "operator_marker"),
+    (
+        (OSError("private CN storage cause"), "storage_io", "storage operation failed"),
+        (
+            RuntimeError("private CN runtime cause"),
+            "unexpected_runtime",
+            "runtime operation failed",
+        ),
+    ),
+)
+@pytest.mark.asyncio
+async def test_upload_filing_storage_and_generic_failures_use_distinct_typed_catches(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    error: Exception,
+    expected_code: str,
+    operator_marker: str,
+) -> None:
+    """CN/HK filing storage 与 generic failure 必须走可观察的不同 typed catch。
+
+    Args:
+        tmp_path: 临时目录。
+        caplog: operator log 捕获夹具。
+        error: converter 注入异常。
+        expected_code: 预期 closed failure code。
+        operator_marker: 对应 typed catch 的 log marker。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: storage/generic 分类混淆或 internal cause 泄漏 public 时抛出。
+    """
+
+    pipeline = CnPipeline(
+        workspace_root=tmp_path,
+        docling_converter=_FailingCnUploadConverter(error),
+    )
+    filing_file = tmp_path / "annual.pdf"
+    filing_file.write_text("demo cn filing", encoding="utf-8")
+    request = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action="create",
+        company_name="贵州茅台",
+    )
+
+    with caplog.at_level("ERROR"):
+        events = [event async for event in pipeline.upload_filing_stream(request)]
+
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    failure = result["failure"]
+    assert isinstance(failure, dict)
+    assert result["stored_file_count"] == 0
+    assert failure["code"] == expected_code
+    assert operator_marker in caplog.text
+    assert str(error) in caplog.text
+    assert str(error) not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_cn_filing_failure_event_roundtrips_typed_reason_with_empty_warnings(
+    tmp_path: Path,
+) -> None:
+    """CN filing alias conflict 必须原子拒绝并投影 exact failure JSON。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: conflict 类型、count 或 durable tree 漂移时抛出。
+    """
+
+    pipeline, batching, _company, _source = _tracking_cn_pipeline(tmp_path)
+    existing = batching.begin_batch("MSFT")
+    batching.commit_batch(existing)
+    filing_file = tmp_path / "annual.pdf"
+    filing_file.write_text("demo cn filing", encoding="utf-8")
+    request = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action="create",
+        company_name="贵州茅台",
+        ticker_aliases=("MSFT",),
+    )
+
+    events = [event async for event in pipeline.upload_filing_stream(request)]
+
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    assert events[-1].event_type is UploadFilingEventType.UPLOAD_FAILED
+    assert result["stored_file_count"] == 0
+    assert result["warnings"] == []
+    assert result["failure"] == {
+        "kind": "storage",
+        "code": "ticker_alias_conflict",
+        "message": "股票代码别名已属于当前工作区中的其他公司，请移除冲突别名后重试",
+        "retry_hint": "请确认公司的主代码与别名声明后重新上传",
+        "file_label": None,
+    }
+    parsed = FinsUploadPipelineResult.from_pipeline_json(
+        result,
+        source_kind=SourceKind.FILING,
+    )
+    assert parsed.failure_reason is not None
+    assert parsed.failure_reason.to_json() == result["failure"]
+    assert parsed.warnings == ()
+    assert not (tmp_path / "portfolio" / "600519").exists()
+
+
+@pytest.mark.asyncio
+async def test_upload_filing_corrupt_primary_with_valid_companions_fails_atomically(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CN/HK corrupt primary 必须只转换一次并整批 typed fail。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        caplog: operator log 捕获夹具。
+        monkeypatch: workflow generic mapper 禁用夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: fail-fast、typed label 或 zero-publication 原子性漂移时抛出。
+    """
+
+    pipeline, batching, company, source = _tracking_cn_pipeline(tmp_path)
+
+    def reject_workflow_reclassification(
+        error: Exception,
+        *,
+        file_label: str | None,
+    ) -> None:
+        """若 typed exception 被 CN/HK workflow 重分类则立即失败。
+
+        Args:
+            error: 意外进入 generic mapper 的异常。
+            file_label: 意外进入 generic mapper 的 label。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 始终抛出。
+        """
+
+        del error, file_label
+        raise AssertionError("typed filing failure 禁止 workflow 字符串重分类")
+
+    monkeypatch.setattr(
+        cn_pipeline_module,
+        "fins_upload_failure_from_exception",
+        reject_workflow_reclassification,
+    )
+    corrupt_file = tmp_path / "corrupt.pdf"
+    companion_file = tmp_path / "companion.docx"
+    later_file = tmp_path / "later.xlsx"
+    for file_path in (corrupt_file, companion_file, later_file):
+        file_path.write_bytes(b"filing input")
+    calls: list[str] = []
+    cause = DoclingConversionError(
+        DoclingConversionFailureKind.CONVERTER_EXECUTION,
+        "Docling conversion execution failed",
+        29,
+    )
+    pipeline._upload_service._docling_converter = _FailingCnUploadConverter(
+        cause,
+        failing_name=corrupt_file.name,
+        calls=calls,
+    )
+    first_request = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=corrupt_file,
+        action="create",
+        company_name="贵州茅台",
+    )
+    request = fresh_validation_module.validate_fins_upload_filing_request(
+        replace(
+            first_request.request,
+            files=(corrupt_file, companion_file, later_file),
+            primary_selectors=(corrupt_file,),
+        ),
+        published_state=first_request.published_state,
+    )
+
+    with caplog.at_level("ERROR"):
+        events = [event async for event in pipeline.upload_filing_stream(request)]
+
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    failure = result["failure"]
+    assert isinstance(failure, dict)
+    assert result["warnings"] == []
+    assert result["stored_file_count"] == 0
+    assert failure["kind"] == "content"
+    assert failure["code"] == "docling_converter_execution"
+    assert failure["file_label"] == "corrupt.pdf"
+    assert calls == ["corrupt.pdf"]
+    assert "typed content admission failed" in caplog.text
+    assert str(cause) in caplog.text
+    assert str(cause) not in str(result)
+    assert batching.begin_tokens == []
+    assert batching.commit_tokens == []
+    assert batching.rollback_tokens == []
+    assert company.stage_tokens == []
+    assert source.stage_tokens == []
+    assert published_tree_sha256(tmp_path, "600519") == {}
+
+
+@pytest.mark.asyncio
+async def test_upload_filing_conversion_cancelled_has_zero_stored_count(tmp_path: Path) -> None:
+    """CN/HK conversion cancelled producer 必须显式投影 stored zero。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: cancelled terminal、count 或 publication 边界漂移时抛出。
+    """
+
+    pipeline = CnPipeline(
+        workspace_root=tmp_path,
+        docling_converter=_FailingCnUploadConverter(DoclingConversionCancelledError()),
+    )
+    filing_file = tmp_path / "annual.pdf"
+    filing_file.write_text("demo cn filing", encoding="utf-8")
+    request = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action="create",
+        company_name="贵州茅台",
+    )
+
+    events = [event async for event in pipeline.upload_filing_stream(request)]
+
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    assert events[-1].event_type is UploadFilingEventType.UPLOAD_COMPLETED
+    assert result["status"] == "cancelled"
+    assert result["stored_file_count"] == 0
+    assert published_tree_sha256(tmp_path, "600519") == {}
+
+
+@pytest.mark.asyncio
+async def test_upload_filing_authoritative_identity_mismatch_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CN/HK fresh validator identity 漂移必须在 prepare/mutation 前失败关闭。
+
+    Args:
+        tmp_path: 临时目录。
+        monkeypatch: authoritative validator 输出注入夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: identity mismatch 未失败关闭或产生 published mutation 时抛出。
+    """
+
+    pipeline, batching, _company, _source = _tracking_cn_pipeline(tmp_path)
+    filing_file = tmp_path / "annual.pdf"
+    filing_file.write_text("demo cn filing", encoding="utf-8")
+    request = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action="create",
+        company_name="贵州茅台",
+    )
+    owner_validator = fresh_validation_module.validate_fins_upload_filing_request
+
+    def mismatched_validator(
+        raw_request: FinsUploadFilingRequest,
+        *,
+        published_state: FilingUploadPublishedState,
+    ) -> ValidatedFinsUploadFilingRequest:
+        """返回仅 internal document identity 漂移的 validator 结果。
+
+        Args:
+            raw_request: immutable raw filing request。
+            published_state: workflow fresh snapshot。
+
+        Returns:
+            internal document ID 被注入漂移的 validated request。
+
+        Raises:
+            FinsUploadUsageError: owner validator 拒绝请求时抛出。
+        """
+
+        validated = owner_validator(raw_request, published_state=published_state)
+        return replace(
+            validated,
+            internal_document_id=f"{validated.internal_document_id}-mismatch",
+        )
+
+    monkeypatch.setattr(
+        fresh_validation_module,
+        "validate_fins_upload_filing_request",
+        mismatched_validator,
+    )
+
+    with pytest.raises(RuntimeError, match="filing authoritative identity mismatch"):
+        _ = [event async for event in pipeline.upload_filing_stream(request)]
+
+    assert batching.begin_tokens == []
+    assert published_tree_sha256(tmp_path, "600519") == {}
+
+
+@pytest.mark.asyncio
+async def test_hk_upload_filing_facade_consumes_typed_request_and_fresh_snapshot(
+    tmp_path: Path,
+) -> None:
+    """HK route 必须复用 CN facade 的 typed request 与 authoritative snapshot。
+
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: HK route 重建散参或未完成 fresh publication 时抛出。
+    """
+
+    pipeline = CnPipeline(
+        workspace_root=tmp_path,
+        docling_converter=_PipelineDownloadFakeConversionRunner(),
+    )
+    filing_file = tmp_path / "annual-hk.pdf"
+    filing_file.write_text("demo hk filing", encoding="utf-8")
+    request = prevalidate_fins_upload_filing_request_for_workspace(
+        FinsUploadFilingRequest(
+            ticker="0700",
+            action="create",
+            files=(filing_file,),
+            fiscal_year=2024,
+            fiscal_period="FY",
+            company_name="腾讯控股",
+        ),
+        workspace_root=tmp_path,
+    )
+    assert request.normalized_ticker.market == "HK"
+
+    events = [event async for event in pipeline.upload_filing_stream(request)]
+
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    assert result["pipeline"] == "hk"
+    assert result["status"] == "ok"
+    assert result["stored_file_count"] == 1
+    assert (
+        pipeline._filing_upload_state_repository.read_filing_upload_state(
+            request.normalized_ticker.canonical,
+            request.document_id,
+        ).source_meta
+        is not None
+    )
+
+
+@pytest.mark.parametrize(
+    ("ticker", "original_name", "initial_company", "stale_company", "repaired_company"),
+    (
+        ("600519", "annual-cn.pdf", "贵州茅台原始", "贵州茅台旧值", "贵州茅台修复"),
+        ("0700", "annual-hk.pdf", "腾讯控股原始", "腾讯控股旧值", "腾讯控股修复"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_cn_hk_upload_filing_repairs_real_filesystem_with_atomic_company_source(
+    tmp_path: Path,
+    ticker: str,
+    original_name: str,
+    initial_company: str,
+    stale_company: str,
+    repaired_company: str,
+) -> None:
+    """CN/HK workflow 必须各自完成 fresh repair wiring 与同批 publication。
+
+    Args:
+        tmp_path: 临时 workspace。
+        ticker: CN 或 HK ticker。
+        original_name: authoritative original basename。
+        initial_company: 初始 company name。
+        stale_company: repair 前注入的旧 resolver company name。
+        repaired_company: repair request 应原子发布的 company name。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: market wiring、revision、snapshot 或 batch 原子性漂移时抛出。
+        OSError: 真实 filesystem fixture 读写失败时抛出。
+        ValueError: persisted source contract 非法时抛出。
+    """
+
+    converter = _PipelineDownloadFakeConversionRunner()
+    pipeline, batching, company, source = _tracking_cn_pipeline(
+        tmp_path,
+        converter=converter,
+    )
+    primary = tmp_path / original_name
+    companion = tmp_path / f"{ticker}-companion.xlsx"
+    primary.write_bytes(f"{ticker}-authoritative-primary".encode())
+    companion.write_bytes(f"{ticker}-authoritative-companion".encode())
+    create_request = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=primary,
+        companion_files=(companion,),
+        action="create",
+        company_name=initial_company,
+        ticker=ticker,
+    )
+    create_events = [event async for event in pipeline.upload_filing_stream(create_request)]
+    create_result = create_events[-1].payload["result"]
+    assert isinstance(create_result, dict)
+    document_id = str(create_result["document_id"])
+    canonical_ticker = create_request.normalized_ticker.canonical
+    old_integrity = source.classify_source_integrity(
+        canonical_ticker,
+        document_id,
+        SourceKind.FILING,
+    )
+    assert old_integrity.status is SourceIntegrityStatus.COMPLETE
+    _seed_cn_upload_company_meta(
+        pipeline=pipeline,
+        company_name=stale_company,
+        resolver_version="market_resolver_v0.9.0",
+        ticker_aliases=[],
+        ticker=canonical_ticker,
+        company_id=build_upload_company_id(canonical_ticker),
+    )
+    batching.begin_tokens.clear()
+    batching.commit_tokens.clear()
+    batching.rollback_tokens.clear()
+    company.stage_tokens.clear()
+    source.stage_tokens.clear()
+    _corrupt_cn_filing_for_repair(
+        pipeline=pipeline,
+        ticker=canonical_ticker,
+        document_id=document_id,
+    )
+    repair_request = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=primary,
+        companion_files=(companion,),
+        action=None,
+        company_name=repaired_company,
+        ticker=ticker,
+    )
+    assert repair_request.published_state.source_integrity.status is (
+        SourceIntegrityStatus.REPAIR_REQUIRED
+    )
+
+    events = [event async for event in pipeline.upload_filing_stream(repair_request)]
+
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    assert events[-1].event_type is UploadFilingEventType.UPLOAD_COMPLETED
+    assert result["pipeline"] == create_request.normalized_ticker.market.lower()
+    assert result["status"] == "ok"
+    assert result["stored_file_count"] == len(repair_request.request.files) == 2
+    assert result["files"] == [str(primary), str(companion)]
+    repaired = source.classify_source_integrity(
+        canonical_ticker,
+        document_id,
+        SourceKind.FILING,
+    )
+    assert repaired.status is SourceIntegrityStatus.COMPLETE
+    assert repaired.revision is not None
+    assert repaired.revision != old_integrity.revision
+    repaired_meta = source.get_source_meta(canonical_ticker, document_id, SourceKind.FILING)
+    raw_files = repaired_meta.get("files")
+    primary_document = repaired_meta.get("primary_document")
+    assert isinstance(raw_files, list)
+    assert isinstance(primary_document, str)
+    assert sum(isinstance(item, dict) and item.get("source") == "original" for item in raw_files) == 2
+    assert sum(isinstance(item, dict) and item.get("source") == "docling" for item in raw_files) == 1
+    source_dir = _published_upload_source_dir(
+        pipeline=pipeline,
+        ticker=canonical_ticker,
+        document_id=document_id,
+    )
+    for raw_file in raw_files:
+        assert isinstance(raw_file, dict)
+        name = raw_file.get("name")
+        size = raw_file.get("size")
+        digest = raw_file.get("sha256")
+        assert isinstance(name, str)
+        assert isinstance(size, int) and not isinstance(size, bool)
+        assert isinstance(digest, str)
+        payload = (source_dir / name).read_bytes()
+        assert len(payload) == size
+        assert hashlib.sha256(payload).hexdigest() == digest
+    assert (source_dir.parent / "filing_manifest.json").is_file()
+    with source.read_source_snapshot(
+        canonical_ticker,
+        document_id,
+        SourceKind.FILING,
+        materialize_files=True,
+    ) as snapshot:
+        assert snapshot.revision == repaired.revision
+        assert snapshot.primary_filename == primary_document
+        with snapshot.get_primary_source().open() as stream:
+            assert stream.read() == _DOCLING_BYTES
+    assert converter.calls == 2
+    assert len(batching.begin_tokens) == 1
+    assert batching.commit_tokens == batching.begin_tokens
+    assert batching.rollback_tokens == []
+    assert company.stage_tokens == batching.begin_tokens
+    assert source.stage_tokens == batching.begin_tokens
+    assert pipeline._company_repository.get_company_meta(canonical_ticker).company_name == repaired_company
+
+
+@pytest.mark.parametrize(
+    ("ticker", "company_name"),
+    (("600519", "贵州茅台"), ("0700", "腾讯控股")),
+)
+@pytest.mark.asyncio
+async def test_cn_hk_upload_filing_fresh_unsafe_is_single_typed_failed_event(
+    tmp_path: Path,
+    ticker: str,
+    company_name: str,
+) -> None:
+    """CN/HK fresh validator 必须把真实 UNSAFE publication 收敛为 typed terminal。
+
+    Args:
+        tmp_path: 临时 workspace。
+        ticker: CN 或 HK ticker。
+        company_name: 对应 market company name。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: raw exception、generic failure 或 mutation 泄漏时抛出。
+        OSError: 真实 filesystem fixture 读写失败时抛出。
+    """
+
+    converter = _PipelineDownloadFakeConversionRunner()
+    pipeline, batching, company, source = _tracking_cn_pipeline(
+        tmp_path,
+        converter=converter,
+    )
+    filing_file = tmp_path / f"{ticker}-unsafe.pdf"
+    filing_file.write_bytes(b"unsafe fresh fixture")
+    create_request = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action="create",
+        company_name=company_name,
+        ticker=ticker,
+    )
+    create_events = [event async for event in pipeline.upload_filing_stream(create_request)]
+    create_result = create_events[-1].payload["result"]
+    assert isinstance(create_result, dict)
+    document_id = str(create_result["document_id"])
+    stale_preflight = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action=None,
+        company_name=company_name,
+        ticker=ticker,
+    )
+    canonical_ticker = stale_preflight.normalized_ticker.canonical
+    source_dir = _published_upload_source_dir(
+        pipeline=pipeline,
+        ticker=canonical_ticker,
+        document_id=document_id,
+    )
+    (source_dir / "undeclared.bin").write_bytes(b"unsafe")
+    batching.begin_tokens.clear()
+    batching.commit_tokens.clear()
+    batching.rollback_tokens.clear()
+    company.stage_tokens.clear()
+    source.stage_tokens.clear()
+
+    events = [event async for event in pipeline.upload_filing_stream(stale_preflight)]
+
+    assert [event.event_type for event in events] == [UploadFilingEventType.UPLOAD_FAILED]
+    result = events[0].payload["result"]
+    assert isinstance(result, dict)
+    failure = result["failure"]
+    assert isinstance(failure, dict)
+    assert failure["kind"] == "storage"
+    assert failure["code"] == "source_integrity_unsafe"
+    parsed = FinsUploadPipelineResult.from_pipeline_json(
+        result,
+        source_kind=SourceKind.FILING,
+    )
+    assert parsed.failure_reason is not None
+    assert parsed.failure_reason.to_json() == failure
+    assert parsed.warnings == ()
+    assert "undeclared.bin" not in str(result)
+    assert "unexpected_runtime" not in str(result)
+    assert converter.calls == 1
+    assert batching.begin_tokens == []
+    assert batching.commit_tokens == []
+    assert batching.rollback_tokens == []
+    assert company.stage_tokens == []
+    assert source.stage_tokens == []
+
+
+@pytest.mark.asyncio
+async def test_cn_upload_filing_phase_b_unsafe_state_is_typed_and_rolls_back(
+    tmp_path: Path,
+) -> None:
+    """CN repair fresh view 变为 UNSAFE 时必须 typed fail 并回滚唯一 batch。
+
+    Args:
+        tmp_path: 临时 workspace。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: unsafe reason、published tree 或 batch 原子性漂移时抛出。
+        OSError: 真实 filesystem fixture 读写失败时抛出。
+        ValueError: persisted source contract 非法时抛出。
+    """
+
+    converter = _PipelineDownloadFakeConversionRunner()
+    pipeline, batching, company, source = _tracking_cn_pipeline(
+        tmp_path,
+        converter=converter,
+    )
+    filing_file = tmp_path / "annual-cn-stale.pdf"
+    filing_file.write_bytes(b"authoritative stale fixture")
+    create_request = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action="create",
+        company_name="贵州茅台",
+    )
+    create_events = [event async for event in pipeline.upload_filing_stream(create_request)]
+    create_result = create_events[-1].payload["result"]
+    assert isinstance(create_result, dict)
+    document_id = str(create_result["document_id"])
+    _corrupt_cn_filing_for_repair(
+        pipeline=pipeline,
+        ticker="600519",
+        document_id=document_id,
+    )
+    repair_request = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action=None,
+        company_name="贵州茅台修复",
+    )
+    assert repair_request.published_state.source_integrity.status is (
+        SourceIntegrityStatus.REPAIR_REQUIRED
+    )
+    source_dir = _published_upload_source_dir(
+        pipeline=pipeline,
+        ticker="600519",
+        document_id=document_id,
+    )
+    externally_mutated_trees: list[dict[str, str]] = []
+
+    def mutate_after_repair_conversion(call_count: int) -> None:
+        """在 repair conversion 后改变 published target，制造 Phase B conflict。
+
+        Args:
+            call_count: converter 累计调用次数。
+
+        Returns:
+            无。
+
+        Raises:
+            OSError: 写入并读取真实 published tree 失败时抛出。
+        """
+
+        if call_count != 2:
+            return
+        (source_dir / "concurrent-undeclared.bin").write_bytes(b"concurrent change")
+        externally_mutated_trees.append(published_tree_sha256(tmp_path, "600519"))
+
+    converter.after_conversion = mutate_after_repair_conversion
+    batching.begin_tokens.clear()
+    batching.commit_tokens.clear()
+    batching.rollback_tokens.clear()
+    company.stage_tokens.clear()
+    source.stage_tokens.clear()
+
+    events = [event async for event in pipeline.upload_filing_stream(repair_request)]
+
+    assert [event.event_type for event in events] == [
+        UploadFilingEventType.UPLOAD_STARTED,
+        UploadFilingEventType.UPLOAD_FAILED,
+    ]
+    result = events[-1].payload["result"]
+    assert isinstance(result, dict)
+    failure = result["failure"]
+    assert isinstance(failure, dict)
+    assert failure["kind"] == "storage"
+    assert failure["code"] == "source_integrity_unsafe"
+    assert "concurrent-undeclared.bin" not in str(result)
+    assert "unexpected_runtime" not in str(result)
+    assert converter.calls == 2
+    assert len(externally_mutated_trees) == 1
+    assert published_tree_sha256(tmp_path, "600519") == externally_mutated_trees[0]
+    assert len(batching.begin_tokens) == 1
+    assert batching.commit_tokens == []
+    assert batching.rollback_tokens == batching.begin_tokens
+    assert company.stage_tokens == []
+    assert source.stage_tokens == []
 
 
 @pytest.mark.asyncio
@@ -831,8 +2588,10 @@ async def test_upload_material_stream_overwrite_resets_single_document(tmp_path:
         AssertionError: 断言失败时抛出。
     """
 
-    pipeline = CnPipeline(workspace_root=tmp_path)
-    pipeline._upload_service._convert_with_docling = _convert_docling_stub
+    pipeline = CnPipeline(
+        workspace_root=tmp_path,
+        docling_converter=_PipelineDownloadFakeConversionRunner(),
+    )
     old_file = tmp_path / "deck_old.pdf"
     new_file = tmp_path / "deck_new.pdf"
     old_file.write_text("old material", encoding="utf-8")
@@ -847,6 +2606,7 @@ async def test_upload_material_stream_overwrite_resets_single_document(tmp_path:
             material_name="Deck",
             files=[old_file],
             company_name="贵州茅台",
+            ticker_aliases=["OLD"],
         )
     ]
     overwrite_events = [
@@ -857,7 +2617,8 @@ async def test_upload_material_stream_overwrite_resets_single_document(tmp_path:
             form_type="MATERIAL_OTHER",
             material_name="Deck",
             files=[new_file],
-            company_name="贵州茅台",
+            company_name="本次名称不应覆盖 fresh meta",
+            ticker_aliases=["NEW"],
             overwrite=True,
         )
     ]
@@ -866,8 +2627,13 @@ async def test_upload_material_stream_overwrite_resets_single_document(tmp_path:
     assert isinstance(create_result, dict)
     assert isinstance(overwrite_result, dict)
     assert overwrite_result["status"] == "ok"
+    assert overwrite_result["stored_file_count"] == 1
     assert overwrite_result["material_action"] == "update"
     assert overwrite_result["document_id"] == create_result["document_id"]
+
+    company_meta = pipeline._company_repository.get_company_meta("600519")
+    assert company_meta.company_name == "贵州茅台"
+    assert company_meta.ticker_identity.accepted_aliases == ("OLD", "NEW")
 
     handle = pipeline._source_repository.get_source_handle(
         "600519",
@@ -876,3 +2642,79 @@ async def test_upload_material_stream_overwrite_resets_single_document(tmp_path:
     )
     file_names = sorted(meta.uri.split("/")[-1] for meta in pipeline._blob_repository.list_files(handle))
     assert file_names == ["deck_new.pdf", "deck_new_docling.json"]
+
+
+@pytest.mark.parametrize(
+    ("ticker", "company_name", "canonical_ticker"),
+    [
+        ("600519", "贵州茅台", "600519"),
+        ("0700.HK", "腾讯控股", "0700"),
+    ],
+)
+def test_cn_hk_concurrent_identical_auto_has_one_publish_and_one_skip(
+    tmp_path: Path,
+    ticker: str,
+    company_name: str,
+    canonical_ticker: str,
+) -> None:
+    """CN 与 HK workflow 都机械消费 shared publication owner。
+
+    Args:
+        tmp_path: 真实 filesystem workspace。
+        ticker: CN/HK 原始 ticker。
+        company_name: 对应公司名称。
+        canonical_ticker: storage owner 使用的 canonical ticker。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: CN/HK 竞争终态或 mutation 计数漂移时抛出。
+    """
+
+    converter = _PipelineDownloadFakeConversionRunner(
+        after_conversion=_ConversionBarrier(Barrier(2)),
+    )
+    pipeline, batching, company, source = _tracking_cn_pipeline(
+        tmp_path,
+        converter=converter,
+    )
+    filing_file = tmp_path / "annual.pdf"
+    filing_file.write_bytes(b"same-cn-hk-filing")
+    first_request = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action=None,
+        company_name=company_name,
+        ticker=ticker,
+    )
+    second_request = _validated_cn_filing_request(
+        pipeline=pipeline,
+        filing_file=filing_file,
+        action=None,
+        company_name=company_name,
+        ticker=ticker,
+    )
+
+    results = _run_two_cn_uploads(
+        pipeline=pipeline,
+        first_request=first_request,
+        second_request=second_request,
+    )
+
+    assert sorted(str(result["status"]) for result in results) == ["ok", "skipped"]
+    first_count = results[0]["stored_file_count"]
+    second_count = results[1]["stored_file_count"]
+    assert isinstance(first_count, int)
+    assert isinstance(second_count, int)
+    assert sorted((first_count, second_count)) == [0, 1]
+    assert len(batching.begin_tokens) == 2
+    assert len(batching.commit_tokens) == 1
+    assert len(batching.rollback_tokens) == 1
+    assert company.stage_tokens == batching.commit_tokens
+    assert source.stage_tokens == batching.commit_tokens
+    durable = pipeline._filing_upload_state_repository.read_filing_upload_state(
+        canonical_ticker,
+        first_request.document_id,
+    )
+    assert durable.source_integrity.status is SourceIntegrityStatus.COMPLETE

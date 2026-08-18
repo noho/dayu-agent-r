@@ -13,6 +13,7 @@ from collections.abc import AsyncIterator, Callable
 from io import BytesIO
 from typing import Literal, TypeAlias, cast
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.fins.domain.document_models import BatchToken, SourceHandle
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.download_contract import FinsDownloadProviderError
@@ -24,8 +25,12 @@ from dayu.fins.pipelines.cn_download_models import (
     DownloadedReportAsset,
 )
 from dayu.fins.pipelines.cn_download_protocols import (
-    CnDoclingConversionRunner,
     CnReportDiscoveryClientProtocol,
+)
+from dayu.fins.pipelines.docling_process_converter import (
+    DEFAULT_FINS_DOCLING_CONVERSION_CONFIG,
+    DoclingConversionCancelledError,
+    DoclingConverter,
 )
 from dayu.fins.pipelines.cn_download_source_upsert import (
     JsonObject,
@@ -43,6 +48,8 @@ from dayu.fins.storage import (
     ProcessedDocumentRepositoryProtocol,
     SourceDocumentRepositoryProtocol,
     SourceIntegrityClassification,
+    SourceIntegrityPreflightError,
+    SourceIntegrityPreflightReason,
     SourceIntegrityRevisionConflictError,
     SourceIntegrityStatus,
     has_same_source_publication_identity,
@@ -115,7 +122,7 @@ async def run_cn_download_single_filing_stream(
     processed_repository: ProcessedDocumentRepositoryProtocol,
     discovery_client: CnReportDiscoveryClientProtocol,
     pdf_download_gate: CnDownloadPdfGateProtocol,
-    docling_conversion_runner: CnDoclingConversionRunner,
+    docling_conversion_runner: DoclingConverter,
     ticker: str,
     profile: CnCompanyProfile,
     candidate: CnReportCandidate,
@@ -149,6 +156,8 @@ async def run_cn_download_single_filing_stream(
     Raises:
         CnDownloadFilingError: 仓储、下载或转换失败时抛出。
         CnDownloadCancelledError: 取消检查命中时抛出。
+        SourceIntegrityPreflightError: Phase A 或 Phase B target 为 UNSAFE 时抛出。
+        SourceIntegrityRevisionConflictError: publication identity 连续变化耗尽重试时抛出。
     """
 
     _raise_if_cancelled(module=module, ticker=ticker, document_id="", cancel_checker=cancel_checker)
@@ -166,6 +175,8 @@ async def run_cn_download_single_filing_stream(
         document_id,
         SourceKind.FILING,
     )
+    if phase_a_integrity.status is SourceIntegrityStatus.UNSAFE:
+        raise SourceIntegrityPreflightError(SourceIntegrityPreflightReason.UNSAFE_PUBLICATION)
     previous_meta = (
         None
         if phase_a_integrity.status is SourceIntegrityStatus.MISSING
@@ -299,13 +310,15 @@ async def run_cn_download_single_filing_stream(
                 f"source_file={pdf_filename}",
                 module=module,
             )
-            docling_json_bytes = await docling_conversion_runner.convert_pdf_to_docling_json(
+            conversion = await docling_conversion_runner.convert_to_json_bytes(
                 pdf_bytes,
                 pdf_filename,
-                cancellation_checker=_required_cancellation_checker(cancel_checker),
+                config=DEFAULT_FINS_DOCLING_CONVERSION_CONFIG,
+                cancellation=_canonical_cancellation(cancel_checker),
             )
-        except CnDownloadCancelledError:
-            raise
+            docling_json_bytes = conversion.json_bytes
+        except DoclingConversionCancelledError as exc:
+            raise CnDownloadCancelledError("操作已被取消") from exc
         except Exception as exc:
             reason_code, reason_message = project_cn_filing_failure(exc)
             failed = _build_filing_result(
@@ -441,7 +454,7 @@ async def _retry_cn_filing_after_identity_change(
     processed_repository: ProcessedDocumentRepositoryProtocol,
     discovery_client: CnReportDiscoveryClientProtocol,
     pdf_download_gate: CnDownloadPdfGateProtocol,
-    docling_conversion_runner: CnDoclingConversionRunner,
+    docling_conversion_runner: DoclingConverter,
     ticker: str,
     profile: CnCompanyProfile,
     candidate: CnReportCandidate,
@@ -553,6 +566,7 @@ def _commit_cn_filing_assets_batch(
 
     Raises:
         CnDownloadCancelledError: batch 内阶段边界命中取消时抛出并回滚。
+        SourceIntegrityPreflightError: staged target 为 UNSAFE 时抛出并回滚。
         OSError: 任一仓储写入、commit 或 rollback 失败时抛出。
         RuntimeError: batch/token owner 契约不成立时抛出。
     """
@@ -566,6 +580,8 @@ def _commit_cn_filing_assets_batch(
             SourceKind.FILING,
             batch=token,
         )
+        if phase_b_integrity.status is SourceIntegrityStatus.UNSAFE:
+            raise SourceIntegrityPreflightError(SourceIntegrityPreflightReason.UNSAFE_PUBLICATION)
         if not has_same_source_publication_identity(
             phase_a_integrity,
             phase_b_integrity,
@@ -879,37 +895,26 @@ def _raise_if_cancelled(
     raise CnDownloadCancelledError("操作已被取消")
 
 
-def _required_cancellation_checker(
+def _canonical_cancellation(
     cancel_checker: Callable[[], bool] | None,
-) -> Callable[[], bool]:
-    """把 optional workflow checker 收敛为 runner 必需的 callable。
+) -> CancellationToken | None:
+    """在 converter owner 前校验并保留 canonical token identity。
 
     Args:
         cancel_checker: workflow 调用方提供的可选取消检查器。
 
     Returns:
-        原 checker，或稳定返回 ``False`` 的 module-level checker。
+        原 canonical token；无取消源时返回 ``None``。
 
     Raises:
-        无。
+        TypeError: 调用方提供了仅可调用、但不满足 canonical contract 的旧 checker。
     """
 
     if cancel_checker is None:
-        return _never_cancelled
+        return None
+    if not isinstance(cancel_checker, CancellationToken):
+        raise TypeError("cancel_checker 必须实现 canonical CancellationToken")
     return cancel_checker
-
-
-def _never_cancelled() -> bool:
-    """返回未取消的稳定信号。
-
-    Returns:
-        始终为 ``False``。
-
-    Raises:
-        无。
-    """
-
-    return False
 
 
 __all__ = [

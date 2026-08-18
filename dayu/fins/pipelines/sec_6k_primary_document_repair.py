@@ -344,7 +344,7 @@ def _resolve_target_tickers(
     for entry in company_repository.scan_company_meta_inventory():
         if entry.status != "available" or entry.company_meta is None:
             continue
-        discovered.append(entry.company_meta.ticker)
+        discovered.append(entry.company_meta.ticker_identity.canonical_ticker)
     return sorted(set(discovered))
 
 

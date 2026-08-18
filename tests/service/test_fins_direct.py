@@ -11,6 +11,7 @@ from typing import cast
 import pytest
 
 import dayu.service.fins_direct as fins_direct_module
+import dayu.fins.ingestion_runtime as ingestion_runtime
 from dayu.contracts.cancellation import CancellationToken
 from dayu.fins.direct_events import (
     FinsErrorKind,
@@ -42,6 +43,16 @@ from dayu.fins.ingestion_runtime import (
     FinsUploadFilingRequest,
     FinsUploadMaterialRequest,
     FinsUploadRequest,
+    ValidatedFinsUploadFilingRequest,
+    validate_fins_upload_filing_request,
+)
+from dayu.fins.domain.document_models import CompanyMeta, SourceDocumentRevision
+from dayu.fins.ticker_normalization import build_company_ticker_identity
+from dayu.fins.pipelines.upload_company_meta import RESOLVER_VERSION
+from dayu.fins.storage import (
+    FilingUploadPublishedState,
+    SourceIntegrityClassification,
+    SourceIntegrityStatus,
 )
 from dayu.service.fins_direct import (
     FINS_DIRECT_EXIT_FAILURE,
@@ -52,6 +63,7 @@ from dayu.service.fins_direct import (
 from tests.host.fake_cancellation import ControllableCancellationToken
 
 _NOW: datetime = datetime(2026, 6, 14, tzinfo=timezone.utc)
+_PUBLISHED_SOURCE_REVISION_TOKEN = "test-published-source-revision"
 
 
 class _FakeIngestionRuntime:
@@ -59,7 +71,7 @@ class _FakeIngestionRuntime:
 
     download_requests: list[FinsDownloadRequest]
     preprocess_requests: list[FinsPreprocessRequest]
-    upload_requests: list[FinsUploadRequest]
+    upload_requests: list[ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest]
     cancellation_tokens: list[CancellationToken | None]
     events: tuple[FinsEvent, ...]
     stream_error: Exception | None
@@ -135,7 +147,7 @@ class _FakeIngestionRuntime:
 
     def upload(
         self,
-        request: FinsUploadRequest,
+        request: ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest,
         *,
         cancellation_token: CancellationToken | None = None,
     ) -> ValidatedFinsEventStream:
@@ -709,24 +721,49 @@ async def test_upload_methods_build_union_requests(tmp_path: Path) -> None:
 
     filing_file = tmp_path / "filing.pdf"
     material_file = tmp_path / "material.pdf"
+    filing_file.write_bytes(b"filing")
     runtime = _FakeIngestionRuntime((_result_event(operation_kind=FinsOperationKind.UPLOAD_FILING),))
     service = FinsDirectCommandService(runtime)
 
-    await _collect_events(
-        service.upload_filing(
-            ticker="AAPL",
-            action="update",
-            files=(filing_file,),
-            fiscal_year=2024,
-            fiscal_period="FY",
-            amended=True,
-            filing_date="2025-01-30",
-            report_date="2024-12-31",
-            company_name="Apple Inc.",
-            ticker_aliases=("Apple",),
-            overwrite=True,
-        )
+    raw_filing_request = FinsUploadFilingRequest(
+        ticker="AAPL",
+        action="update",
+        files=(filing_file,),
+        fiscal_year=2024,
+        fiscal_period="FY",
+        amended=True,
+        filing_date="2025-01-30",
+        report_date="2024-12-31",
+        company_name="Apple Inc.",
+        ticker_aliases=("Apple",),
+        overwrite=True,
     )
+    canonical_ticker, filing_document_id = ingestion_runtime._filing_upload_request_identity(
+        raw_filing_request
+    )
+    validated_filing_request = validate_fins_upload_filing_request(
+        raw_filing_request,
+        published_state=FilingUploadPublishedState(
+            company_meta=CompanyMeta(
+                company_id="company-aapl",
+                company_name="Apple Inc.",
+                ticker_identity=build_company_ticker_identity("AAPL", ()),
+                resolver_version=RESOLVER_VERSION,
+                updated_at="2026-08-13T00:00:00+00:00",
+            ),
+            source_integrity=SourceIntegrityClassification(
+                ticker=canonical_ticker,
+                source_kind=SourceKind.FILING,
+                document_id=filing_document_id,
+                revision=SourceDocumentRevision(_PUBLISHED_SOURCE_REVISION_TOKEN),
+                status=SourceIntegrityStatus.COMPLETE,
+                reasons=(),
+            ),
+            source_meta={"source_fingerprint": "old"},
+            publication_identity=None,
+        ),
+    )
+    await _collect_events(service.upload_filing(validated_filing_request))
     await _collect_events(
         service.upload_material(
             ticker="MSFT",
@@ -746,21 +783,7 @@ async def test_upload_methods_build_union_requests(tmp_path: Path) -> None:
         )
     )
 
-    assert isinstance(runtime.upload_requests[0], FinsUploadFilingRequest)
-    assert runtime.upload_requests[0] == FinsUploadFilingRequest(
-        ticker="AAPL",
-        source_kind=SourceKind.FILING,
-        action="update",
-        files=(filing_file,),
-        fiscal_year=2024,
-        fiscal_period="FY",
-        amended=True,
-        filing_date="2025-01-30",
-        report_date="2024-12-31",
-        company_name="Apple Inc.",
-        ticker_aliases=("Apple",),
-        overwrite=True,
-    )
+    assert runtime.upload_requests[0] is validated_filing_request
     assert isinstance(runtime.upload_requests[1], FinsUploadMaterialRequest)
     assert runtime.upload_requests[1] == FinsUploadMaterialRequest(
         ticker="MSFT",
@@ -937,6 +960,9 @@ def test_service_public_direct_api_does_not_export_job_handle() -> None:
     assert "FinsDirectJobEvent" not in dir(fins_direct_module)
     assert "FinsDirectTerminalResult" not in dir(fins_direct_module)
     assert "stream_job_events_until_terminal" not in dir(FinsDirectCommandService)
+    assert "start_upload" not in dir(FinsDirectCommandService)
+    assert "read_job" not in dir(FinsDirectCommandService)
+    assert "read_job_events" not in dir(FinsDirectCommandService)
     assert "wait_for_terminal" not in dir(FinsDirectCommandService)
     assert "request_cancel" not in dir(FinsDirectCommandService)
 

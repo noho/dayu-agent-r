@@ -261,7 +261,10 @@ dayu-cli download --ticker 0700 --rebuild
 `--ticker` 只接受一个 ticker，并统一转换为市场对应的规范写法；`--forms` 会按市场
 规范化并稳定去重，SEC 表单还会统一大小写。`--start` 与 `--end` 接受 `YYYY`、
 `YYYY-MM` 或 `YYYY-MM-DD`，分别展开为所给期间的起始日和结束日，形成包含边界的日期
-窗口。下载 SEC 文件前必须提供合规的 User-Agent 身份，例如：
+窗口。单独年份和年月中的年份必须在 `1000..9999`；完整日期允许实际公历
+`0001..9999`，月、日可写一位或两位。命令会忽略日期文本首尾空白、校验真实月末与
+闰年，并把接受的边界统一显示为补零的 `YYYY-MM-DD`。下载 SEC 文件前必须提供合规的
+User-Agent 身份，例如：
 
 ```bash
 export SEC_USER_AGENT="Your Organization contact@example.com"
@@ -289,15 +292,24 @@ HK 的中期业绩可显示覆盖 H1，但不能代替独立中期报告消除 H
 
 ```bash
 dayu-cli upload_filing \
-  --ticker AAPL \
+  --ticker AAPL,APPL \
   --action create \
   --files ./AAPL-2024-10K.pdf \
   --fiscal-year 2024 \
   --fiscal-period FY \
   --company-name "Apple Inc."
 
+dayu-cli upload_filing \
+  --ticker AAPL,APPL \
+  --action create \
+  --files ./filing/AAPL-2024-10K.pdf ./filing/AAPL-2024-instance.xml \
+  --primary ./filing/AAPL-2024-10K.pdf \
+  --fiscal-year 2024 \
+  --fiscal-period FY \
+  --company-name "Apple Inc."
+
 dayu-cli upload_material \
-  --ticker AAPL \
+  --ticker AAPL,APPL \
   --action create \
   --forms 10-K \
   --material-name "Investor Day" \
@@ -311,8 +323,44 @@ dayu-cli upload_filing --help
 dayu-cli upload_material --help
 ```
 
+`upload_filing --files` 声明同一 filing 的文件集合，文件顺序不决定主文件角色。单文件
+filing 可以省略 `--primary`，省略时唯一文件就是 primary；多文件 filing 必须恰好提供
+一次 `--primary PATH`，且该路径必须精确匹配 `--files` 中的一个文件。除 primary 外的
+文件都是 companions，只按输入内容原样保存；只有 primary 会执行 Docling 转换，后续
+预处理与读取也只消费该 primary 的 Docling 结果。不同目录中 basename 相同的文件，或
+stem 相同但后缀不同的文件，可以在同一 filing 中共存，不会互相覆盖。XBRL companion
+可以随同一批上传并原样保存。`.xml` 只是 XBRL XML candidate，`.json` 只是 Docling
+JSON candidate；主文件后缀通过只表示具备转换资格，不保证其内容一定转换成功；随附
+文件（含 `.xsd`）只按可随批保存的后缀准入，不做转换。当前支持的格式清单以
+`dayu-cli upload_filing --help` 的即时输出为准；不要将 legacy DOC/PPT/XLS 或 ZIP 视为已支持格式。
+
+以下情况都会在上传任务启动前作为用法错误退出 `2`，不会发布文件：`--files` 中包含
+解析后相同的重复路径；多文件没有 `--primary`；重复提供多个 `--primary`；primary 不在
+files 集合内；文件数超过 100；或 `delete` 携带 `--files` / `--primary`。恰好 100 个
+不同文件允许上传。
+
+`upload_filing` 与 `upload_material` 都会在上传任务启动前校验 `--ticker` 的逗号分隔值：首项必须是公司的规范主代码，后续项是用户声明、用于查询同一家公司归档的别名；每一项都必须符合支持市场的 ticker 写法，后续别名最多 100 个。ticker 写法非法或别名超过数量限制时，命令会作为用法错误输出一行具体原因并退出 `2`，不会创建上传任务或发布文件。
+
+`upload_filing` 还会在任务启动前校验文件与当前目标状态。文件解析、存储或执行失败会输出脱敏的可操作原因并退出 `1`；filing 的公司信息与文档内容只会一起发布，失败时不会留下只发布一半的结果。已有且仍新鲜的公司信息不会被单次 filing 上传改名；若本次填写的公司名称未被采用，命令仍按成功或跳过结果退出 `0`，stdout 摘要保持不变，并在 stderr 提示核对上传目标公司。上传成功后，使用主代码或任一已接收别名查询都会进入同一家公司归档；合法的新别名即使 filing 内容因完全相同而跳过，也会与公司信息原子保存。不要重复列出只是写法不同但含义相同的代码。若某个别名已属于工作区中的另一家公司，本次上传会在发布任何文件前拒绝，并提示移除冲突别名后重试。
+
+直接调用 `upload_filing` 或通过 `start_fins_upload` 工具上传 filing 时，`fiscal_year`
+必须是 `1000..9999` 的整数；`fiscal_period` 只接受 `FY`、`H1`、`Q1`、`Q2`、`Q3`、
+`Q4`，输入会忽略首尾空白并统一为大写，US、CN、HK 使用同一规则。CLI 收到其它值时
+会输出一行具体原因并以用法错误 `2` 退出；这两个入口都会在创建上传操作或改动 workspace
+前拒绝非法值。可选的 `filing_date` 与 `report_date` 若填写，必须是实际
+存在、月日补零且无首尾空白的 `YYYY-MM-DD`，完整日期年份允许 `0001..9999`。空串、
+纯空白、非补零日期和不存在的月日都会在运行期或上传任务创建前拒绝。该严格原始输入
+承诺只适用于这两个直接 filing 入口，不覆盖 `upload_filings_from` 的扫描与脚本生成元数据
+处理。
+
+上传终态摘要中的 `requested files` 是本次已校验的输入文件数，`stored files` 是本次成功发布的原始文件数；Docling 派生文件不重复计数。空文件、任一原始文件读取失败，或 filing primary / material 任一需要转换的文件内容无法成功转换时，整批上传失败且 `stored files` 为 `0`，不会把先处理成功的文件计为已保存；filing 失败时也不会回退为只保存原文件或 companions。stderr 会同时显示触发失败的文件名和有界原因。若 direct 命令遇到无法归入这些已知原因的内部异常，普通 stderr 只显示 `命令执行失败，请使用 --log-file PATH 重试并查看日志`；按提示为 `PATH` 选择可写文件并重新执行命令，即可在该文件中保留完整诊断。
+
 三个上传命令的 `--action` 默认都是 `auto`。单份上传还可显式使用
 `create`、`update` 或 `delete`；批量脚本只会生成 `auto`、`create` 或 `update`。
+
+`update` 只更新已经存在的同一 filing identity；目标不存在时即使同时传入 `--overwrite` 也会拒绝，请改用 `create`。`--overwrite` 不是 upsert 开关，只允许覆盖已存在的 create 目标或强制重建已存在目标。`auto` 遇到已逻辑删除的目标会执行 update 并恢复为 active，不会因输入内容相同而跳过；若本地目标已损坏但仍能由本次完整输入安全重建，`auto` 会原子替换全部原始文件和 Docling 文件并恢复完整索引。此类目标若显式使用 `create`、`update` 或 `delete` 会失败，并提示改用 `auto` 提供完整文件；无法确认身份或无法安全重建的本地状态也会在发布前失败，并提示先修复工作区。existing update 或安全重建后旧文件名不会残留，失败或发布前取消仍保留完整旧集合。
+
+上传期间第一次按下 `Ctrl-C` 只会请求一次协作取消，命令会继续等待并展示上传运行期给出的最终结果。若取消在文档发布前生效，最终显示 cancelled 并退出 `130`，不会先显示 completed；若文档发布或确定的跳过/删除结果已经完成，随后到达的 `Ctrl-C` 不会把该结果改写为 cancelled，也不会回滚已发布内容。
 
 ### 5.3 从目录生成批量上传脚本
 
@@ -327,7 +375,7 @@ dayu-cli upload_filings_from \
   --recursive
 ```
 
-`--ticker` 接受逗号分隔值：首项是规范 ticker，其余项作为 aliases，脚本中的每条上传命令都使用同一组值。
+`--ticker` 接受逗号分隔值：首项是公司的主代码，其余项是用户明确声明的同公司别名，脚本中的每条上传命令都使用同一组值；成功上传后，任一已接收代码都查询同一家公司归档。
 `--action` 默认 `auto`；需要固定动作时可显式传 `--action create` 或 `--action update`。
 
 未传 `--output` 时，脚本写到 `--base` 工作区根目录：POSIX 使用

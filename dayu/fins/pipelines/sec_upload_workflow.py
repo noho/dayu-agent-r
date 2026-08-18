@@ -6,25 +6,38 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
-from typing import Protocol, TypeAlias
+from typing import Final, Protocol, TypeAlias
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
+from dayu.fins.company_metadata_warning import company_metadata_warnings_to_json
 from dayu.fins.domain.document_models import FinsIngestMethod
 from dayu.fins.domain.enums import SourceKind
-from dayu.fins.downloaders.sec_downloader import SecDownloader
+from dayu.fins.ingestion_runtime import ValidatedFinsUploadFilingRequest
+from dayu.fins.pipelines._filing_upload_fresh_validation import (
+    resolve_fresh_filing_request,
+)
 from dayu.fins.pipelines.docling_upload_service import (
     DoclingUploadService,
     UploadOperationResult,
-    UploadCancellationChecker,
     build_material_ids,
-    build_sec_filing_ids,
+    commit_prepared_upload_batch,
     derive_report_kind,
     resolve_upload_action,
+    rollback_prepared_upload_batch,
     validate_material_upload_ids,
 )
-from dayu.fins.pipelines.upload_company_meta import build_upload_company_id, upsert_company_meta_for_upload
+from dayu.fins.pipelines.filing_upload_publication import (
+    execute_prepared_filing_publication,
+)
+from dayu.fins.pipelines.upload_company_meta import (
+    build_upload_company_id,
+    stage_company_meta_for_upload,
+    stage_upload_company_meta_decision,
+)
 from dayu.fins.pipelines.upload_filing_events import UploadFilingEvent, UploadFilingEventType
 from dayu.fins.pipelines.upload_material_events import UploadMaterialEvent, UploadMaterialEventType
 from dayu.fins.pipelines.upload_progress_helpers import (
@@ -34,11 +47,20 @@ from dayu.fins.pipelines.upload_progress_helpers import (
 from dayu.fins.storage import (
     BatchingRepositoryProtocol,
     CompanyMetaRepositoryProtocol,
+    FilingUploadStateRepositoryProtocol,
     SourceDocumentRepositoryProtocol,
 )
 from dayu.fins.ticker_normalization import normalize_ticker
+from dayu.fins.upload_format_contract import FinsUploadMaterialFiles
+from dayu.fins.upload_failure import (
+    FinsUploadFailureError,
+    FinsUploadFailureReason,
+    fins_upload_failure_from_exception,
+)
+from dayu.fins.upload_repair_contract import NoExistingSourceRepair
 
 JsonObject: TypeAlias = dict[str, JsonValue]
+_LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
 
 class SecUploadWorkflowHost(Protocol):
@@ -51,14 +73,14 @@ class SecUploadWorkflowHost(Protocol):
         ...
 
     @property
-    def _downloader(self) -> SecDownloader:
-        """返回 SEC 下载器实例。"""
+    def _company_repository(self) -> CompanyMetaRepositoryProtocol:
+        """返回公司元数据仓储。"""
 
         ...
 
     @property
-    def _company_repository(self) -> CompanyMetaRepositoryProtocol:
-        """返回公司元数据仓储。"""
+    def _filing_upload_state_repository(self) -> FilingUploadStateRepositoryProtocol:
+        """返回 filing authoritative snapshot 唯一仓储。"""
 
         ...
 
@@ -123,36 +145,14 @@ async def collect_upload_result_from_events(
 async def run_upload_filing_stream(
     host: SecUploadWorkflowHost,
     *,
-    ticker: str,
-    action: str | None,
-    files: list[Path],
-    fiscal_year: int,
-    fiscal_period: str,
-    amended: bool = False,
-    filing_date: str | None = None,
-    report_date: str | None = None,
-    company_id: str | None = None,
-    company_name: str | None = None,
-    ticker_aliases: list[str] | None = None,
-    overwrite: bool = False,
-    cancellation_checker: UploadCancellationChecker | None = None,
+    request: ValidatedFinsUploadFilingRequest,
+    cancellation_checker: CancellationToken | None = None,
 ) -> AsyncIterator[UploadFilingEvent]:
     """执行流式财报上传。
 
     Args:
         host: SEC pipeline facade 暴露出的最小宿主边界。
-        ticker: 股票代码。
-        action: 可选动作类型；为空时自动判定。
-        files: 上传文件列表。
-        fiscal_year: 财年。
-        fiscal_period: 财期。
-        amended: 是否修订版。
-        filing_date: 可选 filing 日期。
-        report_date: 可选 report 日期。
-        company_id: 可选兼容字段；上传链路不会把它作为身份真源。
-        company_name: 公司名称。
-        ticker_aliases: ticker alias 列表。
-        overwrite: 是否覆盖。
+        request: 已完成 preflight 的 typed filing 请求。
         cancellation_checker: 可选协作式取消检查器。
 
     Yields:
@@ -162,23 +162,32 @@ async def run_upload_filing_stream(
         RuntimeError: 上传执行失败时抛出。
     """
 
-    requested_action = str(action or "").strip().lower() or None
-    normalized_ticker = host._downloader.normalize_ticker(ticker)
+    raw_request = request.request
+    requested_action = raw_request.action.strip().lower()
+    fresh_resolution = resolve_fresh_filing_request(
+        repository=host._filing_upload_state_repository,
+        request=request,
+    )
+    if isinstance(fresh_resolution, FinsUploadFailureReason):
+        yield _build_sec_filing_failure_event(
+            host=host,
+            request=request,
+            requested_action=requested_action,
+            failure_reason=fresh_resolution,
+        )
+        return
+    authoritative_request = fresh_resolution
+    _assert_authoritative_filing_identity(request, authoritative_request)
+    if raw_request.fiscal_year is None:
+        raise AssertionError("validated filing request 缺少 fiscal_year")
+    normalized_ticker = authoritative_request.normalized_ticker.canonical
     normalized_company_id = build_upload_company_id(normalized_ticker)
-    normalized_period = str(fiscal_period).strip().upper()
+    normalized_period = authoritative_request.normalized_fiscal_period
     filing_form_type = normalized_period
-    document_id, internal_document_id = build_sec_filing_ids(
-        ticker=normalized_ticker,
-        fiscal_year=fiscal_year,
-        fiscal_period=normalized_period,
-        amended=amended,
-    )
-    previous_meta = host._safe_get_document_meta(
-        normalized_ticker,
-        document_id,
-        SourceKind.FILING,
-    )
-    normalized_action = resolve_upload_action(action, previous_meta)
+    document_id = authoritative_request.document_id
+    internal_document_id = authoritative_request.internal_document_id
+    previous_meta = authoritative_request.published_state.source_meta
+    normalized_action = authoritative_request.resolved_action
     yield UploadFilingEvent(
         event_type=UploadFilingEventType.UPLOAD_STARTED,
         ticker=normalized_ticker,
@@ -187,71 +196,84 @@ async def run_upload_filing_stream(
             "action": normalized_action,
             "requested_action": requested_action,
             "resolved_action": normalized_action,
-            "fiscal_year": fiscal_year,
+            "fiscal_year": raw_request.fiscal_year,
             "fiscal_period": normalized_period,
-            "amended": amended,
-            "filing_date": filing_date,
-            "report_date": report_date,
+            "amended": raw_request.amended,
+            "filing_date": raw_request.filing_date,
+            "report_date": raw_request.report_date,
             "company_id": normalized_company_id,
-            "company_name": company_name,
-            "ticker_aliases": _json_text_list(ticker_aliases),
-            "overwrite": overwrite,
-            "file_count": len(files),
+            "company_name": raw_request.company_name,
+            "ticker_aliases": _json_text_list(list(raw_request.ticker_aliases)),
+            "overwrite": raw_request.overwrite,
+            "file_count": len(raw_request.files),
         },
     )
     try:
-        company_batch = host._batching_repository.begin_batch(normalized_ticker)
-        try:
-            upsert_company_meta_for_upload(
-                repository=host._company_repository,
-                ticker=normalized_ticker,
-                action=normalized_action,
-                company_id=company_id,
-                company_name=company_name,
-                ticker_aliases=ticker_aliases,
-                batch=company_batch,
-            )
-        except BaseException:
-            host._batching_repository.rollback_batch(company_batch)
-            raise
-        host._batching_repository.commit_batch(company_batch)
-        prepared_upload = host._upload_service.prepare_upload(
+        prepared_upload = await host._upload_service.prepare_upload(
             ticker=normalized_ticker,
             source_kind=SourceKind.FILING,
             action=normalized_action,
             document_id=document_id,
             internal_document_id=internal_document_id,
             form_type=filing_form_type,
-            files=files,
-            overwrite=overwrite,
-            cancellation_checker=cancellation_checker,
+            selection=authoritative_request.file_selection,
+            overwrite=raw_request.overwrite,
+            previous_meta=previous_meta,
+            repair_disposition=authoritative_request.repair_disposition,
+            cancellation=cancellation_checker,
             meta={
                 "company_id": normalized_company_id,
                 "ingest_method": FinsIngestMethod.UPLOAD.to_storage_value(),
-                "fiscal_year": fiscal_year,
+                "fiscal_year": raw_request.fiscal_year,
                 "fiscal_period": normalized_period,
                 "report_kind": derive_report_kind(normalized_period),
-                "filing_date": filing_date,
-                "report_date": report_date,
-                "amended": amended,
+                "filing_date": raw_request.filing_date,
+                "report_date": raw_request.report_date,
+                "amended": raw_request.amended,
             },
         )
         if isinstance(prepared_upload, UploadOperationResult):
             upload_result = prepared_upload
-        else:
-            document_batch = host._batching_repository.begin_batch(normalized_ticker)
+            completed_request = authoritative_request
+            completed_warnings = ()
+        elif normalized_action == "delete":
+            publication_batch = host._batching_repository.begin_batch(normalized_ticker)
             try:
-                upload_result = host._upload_service.publish_prepared_upload(
-                    prepared_upload,
-                    batch=document_batch,
+                stage_upload_company_meta_decision(
+                    repository=host._company_repository,
+                    decision=authoritative_request.company_meta_decision,
+                    batch=publication_batch,
                 )
-            except BaseException:
-                host._batching_repository.rollback_batch(document_batch)
+            except BaseException as operation_error:
+                rollback_prepared_upload_batch(
+                    batching_repository=host._batching_repository,
+                    batch=publication_batch,
+                    operation_error=operation_error,
+                )
                 raise
-            if upload_result.status == "cancelled":
-                host._batching_repository.rollback_batch(document_batch)
-            else:
-                host._batching_repository.commit_batch(document_batch)
+            upload_result = commit_prepared_upload_batch(
+                service=host._upload_service,
+                batching_repository=host._batching_repository,
+                batch=publication_batch,
+                prepared=prepared_upload,
+                cancellation=cancellation_checker,
+            )
+            completed_request = authoritative_request
+            completed_warnings = ()
+        else:
+            publication_outcome = execute_prepared_filing_publication(
+                request=authoritative_request,
+                prepared=prepared_upload,
+                filing_state_repository=host._filing_upload_state_repository,
+                company_repository=host._company_repository,
+                batching_repository=host._batching_repository,
+                upload_service=host._upload_service,
+                cancellation=cancellation_checker,
+            )
+            completed_request = publication_outcome.authoritative_request
+            upload_result = publication_outcome.result
+            completed_warnings = publication_outcome.warnings
+        completed_action = completed_request.resolved_action
         for file_event in upload_result.file_events:
             yield UploadFilingEvent(
                 event_type=_map_upload_file_event_to_filing_event_type(file_event),
@@ -262,21 +284,23 @@ async def run_upload_filing_stream(
         result = host._build_result(
             action="upload_filing",
             ticker=normalized_ticker,
-            filing_action=normalized_action,
+            filing_action=completed_action,
             requested_action=requested_action,
-            resolved_action=normalized_action,
-            files=_json_text_list([str(path) for path in files]),
-            fiscal_year=fiscal_year,
+            resolved_action=completed_action,
+            files=_json_text_list([str(path) for path in raw_request.files]),
+            fiscal_year=raw_request.fiscal_year,
             fiscal_period=normalized_period,
-            amended=amended,
-            filing_date=filing_date,
-            report_date=report_date,
+            amended=raw_request.amended,
+            filing_date=raw_request.filing_date,
+            report_date=raw_request.report_date,
             company_id=normalized_company_id,
-            company_name=company_name,
-            ticker_aliases=_json_text_list(ticker_aliases),
-            overwrite=overwrite,
+            company_name=raw_request.company_name,
+            ticker_aliases=_json_text_list(list(raw_request.ticker_aliases)),
+            overwrite=raw_request.overwrite,
             **upload_result.payload,
+            stored_file_count=upload_result.stored_file_count,
             status=_resolve_upload_status(upload_result.status),
+            warnings=company_metadata_warnings_to_json(completed_warnings),
         )
         yield UploadFilingEvent(
             event_type=UploadFilingEventType.UPLOAD_COMPLETED,
@@ -284,32 +308,112 @@ async def run_upload_filing_stream(
             document_id=document_id,
             payload={"result": result},
         )
-    except Exception as exc:
-        failed_result = host._build_result(
-            action="upload_filing",
-            ticker=normalized_ticker,
-            filing_action=normalized_action,
+    except FinsUploadFailureError as exc:
+        _LOGGER.exception("SEC filing upload typed content admission failed")
+        yield _build_sec_filing_failure_event(
+            host=host,
+            request=authoritative_request,
             requested_action=requested_action,
-            resolved_action=normalized_action,
-            files=_json_text_list([str(path) for path in files]),
-            fiscal_year=fiscal_year,
-            fiscal_period=normalized_period,
-            amended=amended,
-            filing_date=filing_date,
-            report_date=report_date,
-            company_id=normalized_company_id,
-            company_name=company_name,
-            ticker_aliases=_json_text_list(ticker_aliases),
-            overwrite=overwrite,
-            status="failed",
-            message=str(exc),
+            failure_reason=exc.failure,
         )
-        yield UploadFilingEvent(
-            event_type=UploadFilingEventType.UPLOAD_FAILED,
-            ticker=normalized_ticker,
-            document_id=document_id,
-            payload={"error": str(exc), "result": failed_result},
+    except OSError as exc:
+        _LOGGER.exception("SEC filing upload storage operation failed")
+        failure_reason = fins_upload_failure_from_exception(exc, file_label=None)
+        yield _build_sec_filing_failure_event(
+            host=host,
+            request=authoritative_request,
+            requested_action=requested_action,
+            failure_reason=failure_reason,
         )
+    except Exception as exc:
+        _LOGGER.exception("SEC filing upload runtime operation failed")
+        failure_reason = fins_upload_failure_from_exception(exc, file_label=None)
+        yield _build_sec_filing_failure_event(
+            host=host,
+            request=authoritative_request,
+            requested_action=requested_action,
+            failure_reason=failure_reason,
+        )
+
+
+def _assert_authoritative_filing_identity(
+    preflight: ValidatedFinsUploadFilingRequest,
+    authoritative: ValidatedFinsUploadFilingRequest,
+) -> None:
+    """断言 fresh validator 未改变 filing deterministic identity。
+
+    Args:
+        preflight: 入口 preflight validated request。
+        authoritative: workflow fresh snapshot 产生的 validated request。
+
+    Returns:
+        无。
+
+    Raises:
+        RuntimeError: canonical ticker 或 filing identity 不一致时抛出。
+    """
+
+    if (
+        authoritative.normalized_ticker.canonical != preflight.normalized_ticker.canonical
+        or authoritative.document_id != preflight.document_id
+        or authoritative.internal_document_id != preflight.internal_document_id
+    ):
+        raise RuntimeError("filing authoritative identity mismatch")
+
+
+def _build_sec_filing_failure_event(
+    *,
+    host: SecUploadWorkflowHost,
+    request: ValidatedFinsUploadFilingRequest,
+    requested_action: str,
+    failure_reason: FinsUploadFailureReason,
+) -> UploadFilingEvent:
+    """从 authoritative request 与 typed reason 构造 SEC filing 失败事件。
+
+    Args:
+        host: SEC workflow 宿主。
+        request: authoritative validated request。
+        requested_action: 用户请求动作。
+        failure_reason: closed public failure reason。
+
+    Returns:
+        单个 typed upload failed 事件。
+
+    Raises:
+        无。
+    """
+
+    raw_request = request.request
+    normalized_ticker = request.normalized_ticker.canonical
+    normalized_company_id = build_upload_company_id(normalized_ticker)
+    failed_result = host._build_result(
+        action="upload_filing",
+        ticker=normalized_ticker,
+        filing_action=request.resolved_action,
+        requested_action=requested_action,
+        resolved_action=request.resolved_action,
+        files=_json_text_list([str(path) for path in raw_request.files]),
+        fiscal_year=raw_request.fiscal_year,
+        fiscal_period=request.normalized_fiscal_period,
+        amended=raw_request.amended,
+        filing_date=raw_request.filing_date,
+        report_date=raw_request.report_date,
+        company_id=normalized_company_id,
+        company_name=raw_request.company_name,
+        ticker_aliases=_json_text_list(list(raw_request.ticker_aliases)),
+        overwrite=raw_request.overwrite,
+        stored_file_count=0,
+        status="failed",
+        message=failure_reason.message,
+        failure=failure_reason.to_json(),
+        warnings=[],
+    )
+    return UploadFilingEvent(
+        event_type=UploadFilingEventType.UPLOAD_FAILED,
+        ticker=normalized_ticker,
+        document_id=request.document_id,
+        payload={"error": failure_reason.message, "result": failed_result},
+    )
 
 
 async def run_upload_material_stream(
@@ -330,7 +434,7 @@ async def run_upload_material_stream(
     company_name: str | None = None,
     ticker_aliases: list[str] | None = None,
     overwrite: bool = False,
-    cancellation_checker: UploadCancellationChecker | None = None,
+    cancellation_checker: CancellationToken | None = None,
 ) -> AsyncIterator[UploadMaterialEvent]:
     """执行流式材料上传。
 
@@ -364,7 +468,7 @@ async def run_upload_material_stream(
     normalized = normalize_ticker(ticker)
     if normalized.market != "US":
         raise ValueError(f"SecPipeline 仅支持 US，当前 market={normalized.market}")
-    normalized_ticker = host._downloader.normalize_ticker(ticker)
+    normalized_ticker = normalized.canonical
     normalized_company_id = build_upload_company_id(normalized_ticker)
     file_list = files or []
     normalized_fiscal_period = str(fiscal_period or "").strip().upper() or None
@@ -380,43 +484,48 @@ async def run_upload_material_stream(
         document_id=document_id,
         internal_document_id=internal_document_id,
     )
-    previous_meta = host._safe_get_document_meta(
-        normalized_ticker,
-        resolved_document_id,
-        SourceKind.MATERIAL,
-    )
     requested_action = str(action or "").strip().lower() or None
-    normalized_action = resolve_upload_action(action, previous_meta)
-    yield UploadMaterialEvent(
-        event_type=UploadMaterialEventType.UPLOAD_STARTED,
-        ticker=normalized_ticker,
-        document_id=resolved_document_id,
-        payload={
-            "action": normalized_action,
-            "requested_action": requested_action,
-            "resolved_action": normalized_action,
-            "form_type": form_type,
-            "material_name": material_name,
-            "internal_document_id": resolved_internal_id,
-            "fiscal_year": fiscal_year,
-            "fiscal_period": normalized_fiscal_period,
-            "filing_date": filing_date,
-            "report_date": report_date,
-            "company_id": normalized_company_id,
-            "company_name": company_name,
-            "ticker_aliases": _json_text_list(ticker_aliases),
-            "overwrite": overwrite,
-            "file_count": len(file_list),
-        },
-    )
+    normalized_action: str | None = None
     try:
+        selection = (
+            FinsUploadMaterialFiles.for_delete()
+            if requested_action == "delete"
+            else FinsUploadMaterialFiles.from_upsert_paths(tuple(file_list))
+        )
+        previous_meta = host._safe_get_document_meta(
+            normalized_ticker,
+            resolved_document_id,
+            SourceKind.MATERIAL,
+        )
+        normalized_action = resolve_upload_action(action, previous_meta)
+        yield UploadMaterialEvent(
+            event_type=UploadMaterialEventType.UPLOAD_STARTED,
+            ticker=normalized_ticker,
+            document_id=resolved_document_id,
+            payload={
+                "action": normalized_action,
+                "requested_action": requested_action,
+                "resolved_action": normalized_action,
+                "form_type": form_type,
+                "material_name": material_name,
+                "internal_document_id": resolved_internal_id,
+                "fiscal_year": fiscal_year,
+                "fiscal_period": normalized_fiscal_period,
+                "filing_date": filing_date,
+                "report_date": report_date,
+                "company_id": normalized_company_id,
+                "company_name": company_name,
+                "ticker_aliases": _json_text_list(ticker_aliases),
+                "overwrite": overwrite,
+                "file_count": len(file_list),
+            },
+        )
         company_batch = host._batching_repository.begin_batch(normalized_ticker)
         try:
-            upsert_company_meta_for_upload(
+            stage_company_meta_for_upload(
                 repository=host._company_repository,
                 ticker=normalized_ticker,
                 action=normalized_action,
-                company_id=company_id,
                 company_name=company_name,
                 ticker_aliases=ticker_aliases,
                 batch=company_batch,
@@ -425,16 +534,18 @@ async def run_upload_material_stream(
             host._batching_repository.rollback_batch(company_batch)
             raise
         host._batching_repository.commit_batch(company_batch)
-        prepared_upload = host._upload_service.prepare_upload(
+        prepared_upload = await host._upload_service.prepare_upload(
             ticker=normalized_ticker,
             source_kind=SourceKind.MATERIAL,
             action=normalized_action,
             document_id=resolved_document_id,
             internal_document_id=resolved_internal_id,
             form_type=form_type,
-            files=file_list,
+            selection=selection,
             overwrite=overwrite,
-            cancellation_checker=cancellation_checker,
+            previous_meta=previous_meta,
+            repair_disposition=NoExistingSourceRepair(),
+            cancellation=cancellation_checker,
             meta={
                 "company_id": normalized_company_id,
                 "ingest_method": FinsIngestMethod.UPLOAD.to_storage_value(),
@@ -448,19 +559,13 @@ async def run_upload_material_stream(
         if isinstance(prepared_upload, UploadOperationResult):
             upload_result = prepared_upload
         else:
-            document_batch = host._batching_repository.begin_batch(normalized_ticker)
-            try:
-                upload_result = host._upload_service.publish_prepared_upload(
-                    prepared_upload,
-                    batch=document_batch,
-                )
-            except BaseException:
-                host._batching_repository.rollback_batch(document_batch)
-                raise
-            if upload_result.status == "cancelled":
-                host._batching_repository.rollback_batch(document_batch)
-            else:
-                host._batching_repository.commit_batch(document_batch)
+            upload_result = commit_prepared_upload_batch(
+                service=host._upload_service,
+                batching_repository=host._batching_repository,
+                batch=host._batching_repository.begin_batch(normalized_ticker),
+                prepared=prepared_upload,
+                cancellation=cancellation_checker,
+            )
         for file_event in upload_result.file_events:
             yield UploadMaterialEvent(
                 event_type=_map_upload_file_event_to_material_event_type(file_event),
@@ -485,6 +590,7 @@ async def run_upload_material_stream(
             company_name=company_name,
             overwrite=overwrite,
             **upload_result.payload,
+            stored_file_count=upload_result.stored_file_count,
             status=_resolve_upload_status(upload_result.status),
         )
         yield UploadMaterialEvent(
@@ -494,6 +600,7 @@ async def run_upload_material_stream(
             payload={"result": final_result},
         )
     except Exception as exc:
+        failure_reason = fins_upload_failure_from_exception(exc, file_label=None)
         failed_result = host._build_result(
             action="upload_material",
             ticker=normalized_ticker,
@@ -512,14 +619,16 @@ async def run_upload_material_stream(
             company_id=normalized_company_id,
             company_name=company_name,
             overwrite=overwrite,
+            stored_file_count=0,
             status="failed",
-            message=str(exc),
+            message=failure_reason.message,
+            failure=failure_reason.to_json(),
         )
         yield UploadMaterialEvent(
             event_type=UploadMaterialEventType.UPLOAD_FAILED,
             ticker=normalized_ticker,
             document_id=resolved_document_id,
-            payload={"error": str(exc), "result": failed_result},
+            payload={"error": failure_reason.message, "result": failed_result},
         )
 
 

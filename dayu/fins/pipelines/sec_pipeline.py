@@ -8,16 +8,18 @@ rebuild。process、CLI、Host、tool/provider 装配不在本 Slice 内。
 
 from __future__ import annotations
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 
 import asyncio
 import datetime as dt
 from pathlib import Path
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import AsyncIterator, Callable, Coroutine, Final, Optional, TypeAlias, TypedDict, cast
 
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.fins._log import Log
+from dayu.fins.domain.company_meta_contract import CompanyMetaCommitIntent
 from dayu.fins.domain.document_models import (
     BatchToken,
     CompanyMeta,
@@ -46,8 +48,10 @@ from dayu.fins.ingestion_runtime import (
     FinsSourceDownloadAdapter,
     FinsSourceDownloadAdapterRequest,
     FinsSourceDownloadAdapterResult,
+    ValidatedFinsUploadFilingRequest,
 )
-from dayu.fins.pipelines.docling_upload_service import DoclingUploadService, UploadCancellationChecker
+from dayu.fins.pipelines.docling_process_converter import DoclingConverter, ProcessDoclingConverter
+from dayu.fins.pipelines.docling_upload_service import DoclingUploadService
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.pipelines.sec_6k_rules import (
     _has_6k_exhibit_candidate,
@@ -143,10 +147,12 @@ from dayu.fins.storage import (
     CompanyMetaRepositoryProtocol,
     DocumentBlobRepositoryProtocol,
     FilingMaintenanceRepositoryProtocol,
+    FilingUploadStateRepositoryProtocol,
     FsBatchingRepository,
     FsCompanyMetaRepository,
     FsDocumentBlobRepository,
     FsFilingMaintenanceRepository,
+    FsFilingUploadStateRepository,
     FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
     ProcessedDocumentRepositoryProtocol,
@@ -483,7 +489,9 @@ class SecPipeline:
         processed_repository: ProcessedDocumentRepositoryProtocol | None = None,
         blob_repository: DocumentBlobRepositoryProtocol | None = None,
         filing_maintenance_repository: FilingMaintenanceRepositoryProtocol | None = None,
+        filing_upload_state_repository: FilingUploadStateRepositoryProtocol | None = None,
         batching_repository: BatchingRepositoryProtocol | None = None,
+        docling_converter: DoclingConverter | None = None,
         user_agent: Optional[str] = None,
         sleep_seconds: float = DEFAULT_SLEEP_SECONDS,
         max_retries: int = DEFAULT_MAX_RETRIES,
@@ -499,7 +507,9 @@ class SecPipeline:
             processed_repository: 可选 processed 文档仓储。
             blob_repository: 可选文件对象仓储。
             filing_maintenance_repository: 可选 filing 维护仓储。
+            filing_upload_state_repository: 可选 filing 上传 published-state 只读仓储。
             batching_repository: 可选 batch lifecycle 仓储。
+            docling_converter: 可选共享 Docling converter；未提供时构造 production 实现。
             user_agent: SEC User-Agent。
             sleep_seconds: SEC 请求间隔秒数。
             max_retries: SEC 下载重试次数。
@@ -519,7 +529,10 @@ class SecPipeline:
             workspace_root=self._workspace_root,
             user_agent=user_agent,
         )
-        repository_set = build_fs_repository_set(workspace_root=self._workspace_root)
+        repository_set = build_fs_repository_set(
+            workspace_root=self._workspace_root,
+            create_directories=False,
+        )
         self._batching_repository = batching_repository or FsBatchingRepository(
             self._workspace_root,
             repository_set=repository_set,
@@ -544,6 +557,10 @@ class SecPipeline:
             self._workspace_root,
             repository_set=repository_set,
         )
+        self._filing_upload_state_repository = filing_upload_state_repository or FsFilingUploadStateRepository(
+            self._workspace_root,
+            repository_set=repository_set,
+        )
         self._processor_registry = processor_registry
         self._user_agent = user_agent
         self._sleep_seconds = sleep_seconds
@@ -551,6 +568,7 @@ class SecPipeline:
         self._upload_service = DoclingUploadService(
             source_repository=self._source_repository,
             blob_repository=self._blob_repository,
+            docling_converter=docling_converter or ProcessDoclingConverter(),
         )
 
     @property
@@ -725,36 +743,14 @@ class SecPipeline:
 
     def upload_filing(
         self,
-        ticker: str,
-        action: Optional[str],
-        files: list[Path],
-        fiscal_year: int,
-        fiscal_period: str,
-        amended: bool = False,
-        filing_date: Optional[str] = None,
-        report_date: Optional[str] = None,
-        company_id: Optional[str] = None,
-        company_name: Optional[str] = None,
-        ticker_aliases: Optional[list[str]] = None,
-        overwrite: bool = False,
+        request: ValidatedFinsUploadFilingRequest,
         *,
-        cancellation_checker: UploadCancellationChecker | None = None,
+        cancellation_checker: CancellationToken | None = None,
     ) -> SecPipelineUploadResult:
         """执行 SEC 财报上传并同步返回聚合结果。
 
         Args:
-            ticker: 股票代码。
-            action: 可选动作类型。
-            files: 上传文件列表。
-            fiscal_year: 财年。
-            fiscal_period: 财期。
-            amended: 是否修订版。
-            filing_date: 可选 filing 日期。
-            report_date: 可选 report 日期。
-            company_id: 可选兼容字段。
-            company_name: 公司名称。
-            ticker_aliases: 可选 ticker alias。
-            overwrite: 是否覆盖。
+            request: 已完成 preflight 的 typed filing 请求。
             cancellation_checker: 可选协作式取消检查器。
 
         Returns:
@@ -767,18 +763,7 @@ class SecPipeline:
         return _run_async_upload_sync(
             _collect_upload_result_from_events(
                 self.upload_filing_stream(
-                    ticker=ticker,
-                    action=action,
-                    files=files,
-                    fiscal_year=fiscal_year,
-                    fiscal_period=fiscal_period,
-                    amended=amended,
-                    filing_date=filing_date,
-                    report_date=report_date,
-                    company_id=company_id,
-                    company_name=company_name,
-                    ticker_aliases=ticker_aliases,
-                    overwrite=overwrite,
+                    request,
                     cancellation_checker=cancellation_checker,
                 ),
                 stream_name="upload_filing_stream",
@@ -787,36 +772,14 @@ class SecPipeline:
 
     async def upload_filing_stream(
         self,
-        ticker: str,
-        action: Optional[str],
-        files: list[Path],
-        fiscal_year: int,
-        fiscal_period: str,
-        amended: bool = False,
-        filing_date: Optional[str] = None,
-        report_date: Optional[str] = None,
-        company_id: Optional[str] = None,
-        company_name: Optional[str] = None,
-        ticker_aliases: Optional[list[str]] = None,
-        overwrite: bool = False,
+        request: ValidatedFinsUploadFilingRequest,
         *,
-        cancellation_checker: UploadCancellationChecker | None = None,
+        cancellation_checker: CancellationToken | None = None,
     ) -> AsyncIterator["UploadFilingEvent"]:
         """执行流式 SEC 财报上传。
 
         Args:
-            ticker: 股票代码。
-            action: 可选动作类型。
-            files: 上传文件列表。
-            fiscal_year: 财年。
-            fiscal_period: 财期。
-            amended: 是否修订版。
-            filing_date: 可选 filing 日期。
-            report_date: 可选 report 日期。
-            company_id: 可选兼容字段。
-            company_name: 公司名称。
-            ticker_aliases: 可选 ticker alias。
-            overwrite: 是否覆盖。
+            request: 已完成 preflight 的 typed filing 请求。
             cancellation_checker: 可选协作式取消检查器。
 
         Yields:
@@ -828,18 +791,7 @@ class SecPipeline:
 
         async for event in _run_upload_filing_stream(
             self,
-            ticker=ticker,
-            action=action,
-            files=files,
-            fiscal_year=fiscal_year,
-            fiscal_period=fiscal_period,
-            amended=amended,
-            filing_date=filing_date,
-            report_date=report_date,
-            company_id=company_id,
-            company_name=company_name,
-            ticker_aliases=ticker_aliases,
-            overwrite=overwrite,
+            request=request,
             cancellation_checker=cancellation_checker,
         ):
             yield event
@@ -862,7 +814,7 @@ class SecPipeline:
         ticker_aliases: Optional[list[str]] = None,
         overwrite: bool = False,
         *,
-        cancellation_checker: UploadCancellationChecker | None = None,
+        cancellation_checker: CancellationToken | None = None,
     ) -> SecPipelineUploadResult:
         """执行 SEC 材料上传并同步返回聚合结果。
 
@@ -933,7 +885,7 @@ class SecPipeline:
         ticker_aliases: Optional[list[str]] = None,
         overwrite: bool = False,
         *,
-        cancellation_checker: UploadCancellationChecker | None = None,
+        cancellation_checker: CancellationToken | None = None,
     ) -> AsyncIterator["UploadMaterialEvent"]:
         """执行流式 SEC 材料上传。
 
@@ -1751,10 +1703,10 @@ class SecPipeline:
         ticker: str,
         company_id: str,
         company_name: str,
-        ticker_aliases: Optional[list[str]] = None,
+        ticker_aliases: Optional[Sequence[str]] = None,
         *,
         batch: BatchToken,
-    ) -> None:
+    ) -> CompanyMetaCommitIntent | None:
         """写入公司元数据。
 
         Args:
@@ -1765,13 +1717,13 @@ class SecPipeline:
             batch: caller 显式传入的 batch capability。
 
         Returns:
-            无。
+            已 stage 的提交意图；fresh 且 identity 未变化时返回 ``None``。
 
         Raises:
             OSError: 仓储写入失败时由底层抛出。
         """
 
-        _upsert_company_meta_impl(
+        return _upsert_company_meta_impl(
             repository=self._company_repository,
             ticker=ticker,
             company_id=company_id,

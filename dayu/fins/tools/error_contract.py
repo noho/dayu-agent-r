@@ -16,6 +16,8 @@ class ErrorCode(str, Enum):
         SOURCE_DECODE_FAILED: source 无法被可靠读取或解码。
         SEARCH_INDEX_FAILED: 搜索索引或语义画像构建失败。
         SOURCE_CHANGED_DURING_READ: 源文档持续更新，暂时无法取得完整一致的读取版本。
+        WORKSPACE_IDENTITY_CORRUPTED: 工作区公司代码身份数据损坏。
+        STORAGE_UNAVAILABLE: storage 无法建立一致读取视图。
     """
 
     NOT_FOUND = "not_found"
@@ -25,3 +27,5 @@ class ErrorCode(str, Enum):
     SOURCE_DECODE_FAILED = "source_decode_failed"
     SEARCH_INDEX_FAILED = "search_index_failed"
     SOURCE_CHANGED_DURING_READ = "source_changed_during_read"
+    WORKSPACE_IDENTITY_CORRUPTED = "workspace_identity_corrupted"
+    STORAGE_UNAVAILABLE = "storage_unavailable"

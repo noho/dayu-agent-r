@@ -105,13 +105,10 @@ def _follow_up_process_runtime_close(runtime: DefaultFinsRuntime) -> None:
         runtime.close()
     except Exception as close_error:
         errno_value = (
-            str(close_error.errno)
-            if isinstance(close_error, OSError) and close_error.errno is not None
-            else "none"
+            str(close_error.errno) if isinstance(close_error, OSError) and close_error.errno is not None else "none"
         )
         Log.warning(
-            f"action={_PROCESS_RUNTIME_CLOSE_FOLLOW_UP_ACTION} "
-            f"type={type(close_error).__name__} errno={errno_value}",
+            f"action={_PROCESS_RUNTIME_CLOSE_FOLLOW_UP_ACTION} type={type(close_error).__name__} errno={errno_value}",
             module=MODULE,
         )
 
@@ -1720,9 +1717,7 @@ def _query_xbrl_facts_parameters() -> ToolParametersSchema:
         Exception: schema 构造失败时透出。
     """
 
-    fiscal_period_values: list[JsonValue] = [
-        fiscal_period for fiscal_period in sorted(FISCAL_PERIODS)
-    ]
+    fiscal_period_values: list[JsonValue] = [fiscal_period for fiscal_period in sorted(FISCAL_PERIODS)]
     return ToolParametersSchema(
         type="object",
         properties={
@@ -1769,8 +1764,8 @@ def _ticker_parameter_schema() -> dict[str, JsonValue]:
     return {
         "type": "string",
         "description": (
-            "股票代码。直接使用自然的股票代码写法，例如 AAPL、600519 或 0700；"
-            "不要传公司名称，也不要手工穷举代码变体。"
+            "公司财报代码。可传工作区已接收的主代码或该公司的任一已接收别名；"
+            "两者会查询同一家公司归档。不要传公司名称，也不要手工穷举代码变体。"
         ),
     }
 

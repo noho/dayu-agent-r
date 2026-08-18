@@ -14,6 +14,8 @@ from typing import Final, cast
 
 import pytest
 
+from tests.fins.company_meta_test_support import stage_company_meta_fixture
+
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.contracts.tool_await import ToolAwaitKind
@@ -33,6 +35,7 @@ from dayu.contracts.tool_outcome import (
 from dayu.contracts.tool_result import ToolResultMeta, ToolResultSuccess
 from dayu.contracts.tool_schema import ToolTruncateSpec
 from dayu.contracts.tool_source import ToolBundleSourceRef
+from dayu.fins.ticker_normalization import build_company_ticker_identity
 from dayu.fins.domain.document_models import (
     CompanyMeta,
     FinsSourceProvider,
@@ -338,9 +341,7 @@ def test_preprocess_provider_remains_independently_discoverable_and_callable(
     output = preprocess_provider.discover_tools(
         ToolsDiscoveryProviderSpec(
             spec_id="financial-preprocess-tools",
-            location=PythonImportPathProvider(
-                import_path="dayu.fins.tools.preprocess_provider:discover_tools"
-            ),
+            location=PythonImportPathProvider(import_path="dayu.fins.tools.preprocess_provider:discover_tools"),
             enabled=True,
             config={
                 "workspace_root": str(workspace_root),
@@ -349,9 +350,7 @@ def test_preprocess_provider_remains_independently_discoverable_and_callable(
         )
     )
 
-    assert tuple(definition.name for definition in output.definitions) == (
-        "start_fins_preprocess",
-    )
+    assert tuple(definition.name for definition in output.definitions) == ("start_fins_preprocess",)
     outcome = asyncio.run(
         output.definitions[0].callable(
             _call("start_fins_preprocess", {"ticker": "AAPL"}),
@@ -419,9 +418,7 @@ def test_compose_open_host_options_passes_effective_bundle_to_host(
     """
 
     _write_combined_tool_discovery_overlay(tmp_path)
-    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
-        workspace_config_dir=tmp_path / "config"
-    )
+    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(workspace_config_dir=tmp_path / "config")
     locations = resolve_runtime_locations(
         workspace_root=tmp_path,
         package_config_root=_PACKAGE_CONFIG_ROOT,
@@ -701,9 +698,7 @@ def _discover_combined_tools(tmp_path: Path) -> ServiceDiscoveredTools:
     _write_doc_fixture(tmp_path)
     _build_fins_workspace(tmp_path)
     _write_combined_tool_discovery_overlay(tmp_path)
-    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(
-        workspace_config_dir=tmp_path / "config"
-    )
+    config = ConfigLoader(package_config_dir=_PACKAGE_CONFIG_ROOT).load(workspace_config_dir=tmp_path / "config")
     effective_provider_configs = assemble_effective_tool_provider_configs(
         tuple(config.tool_discovery.providers.values()),
         workspace_root=tmp_path,
@@ -895,15 +890,14 @@ def _build_fins_workspace(tmp_path: Path) -> Path:
     source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
     blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
     company_batch = batching_repository.begin_batch("AAPL")
-    company_repository.upsert_company_meta(
+    stage_company_meta_fixture(
+        company_repository,
         CompanyMeta(
             company_id="0000320193",
             company_name="Apple Inc.",
-            ticker="AAPL",
-            market="US",
+            ticker_identity=build_company_ticker_identity("AAPL", ("APPLE",)),
             resolver_version="combined-test",
             updated_at=now_iso8601(),
-            ticker_aliases=["APPLE"],
         ),
         batch=company_batch,
     )

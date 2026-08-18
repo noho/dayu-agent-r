@@ -8,16 +8,21 @@ import json
 from collections.abc import AsyncGenerator, Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from types import TracebackType
 from typing import BinaryIO, Optional, cast
 
 import pytest
 
+from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
+from dayu.fins.domain.company_meta_contract import (
+    CompanyMetaCommitIntent,
+    CompanyMetaCommitOutcome,
+)
 from dayu.fins.domain.document_models import (
     BatchToken,
-    CompanyMeta,
     DocumentHandle,
     DocumentMeta,
     FileObjectMeta,
@@ -48,7 +53,12 @@ from dayu.fins.pipelines.cn_download_models import (
     DownloadedReportAsset,
 )
 from dayu.fins.pipelines.cn_download_pdf_gate import CnDownloadPdfGateProtocol
-from dayu.fins.pipelines.cn_download_protocols import CnDoclingConversionRunner
+from dayu.fins.pipelines.docling_process_converter import (
+    DoclingConversionCancelledError,
+    DoclingConversionConfig,
+    DoclingConversionResult,
+    DoclingConverter,
+)
 from dayu.fins.pipelines.cn_form_utils import (
     CnDownloadPeriodPolicy,
     build_cn_filing_ids,
@@ -60,8 +70,11 @@ from dayu.fins.storage import FsBatchingRepository, FsCompanyMetaRepository, FsD
 from dayu.fins.storage import FsFilingMaintenanceRepository, FsProcessedDocumentRepository
 from dayu.fins.storage import (
     FsSourceDocumentRepository,
+    SourceIntegrityClassification,
     SourceIntegrityPreflightError,
     SourceIntegrityPreflightReason,
+    SourceIntegrityReason,
+    SourceIntegrityStatus,
 )
 from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
 
@@ -177,8 +190,19 @@ class _BatchIdentityCnBatchingRepository(FsBatchingRepository):
         self.phases.append(("begin", token.transaction_id))
         return token
 
-    def commit_batch(self, batch: BatchToken) -> None:
-        """记录 caller 唯一 commit，并模拟 storage owner 消费 token 的失败。"""
+    def commit_batch(self, batch: BatchToken) -> CompanyMetaCommitOutcome | None:
+        """记录 caller 唯一 commit，并模拟 storage owner 消费 token 的失败。
+
+        Args:
+            batch: caller 转交的 batch capability。
+
+        Returns:
+            download batch 的真实 typed company-meta outcome；无 intent 时返回 ``None``。
+
+        Raises:
+            OSError: 启用 commit failure injection 或真实提交失败时抛出。
+            ValueError: capability 非法时抛出。
+        """
 
         self.record_phase("commit", batch)
         self.commit_calls += 1
@@ -186,8 +210,9 @@ class _BatchIdentityCnBatchingRepository(FsBatchingRepository):
             FsBatchingRepository.rollback_batch(self, batch)
             self.active_token = None
             raise OSError("forced CN storage commit failure")
-        super().commit_batch(batch)
+        outcome = super().commit_batch(batch)
         self.active_token = None
+        return outcome
 
     def rollback_batch(self, batch: BatchToken) -> None:
         """记录 caller operation rollback 并转发。"""
@@ -343,10 +368,15 @@ class _BatchIdentityCnProcessedRepository(FsProcessedDocumentRepository):
 class _FailingCnCompanyMetaRepository(FsCompanyMetaRepository):
     """在 company publication mutation 处失败的真实仓储 spy。"""
 
-    def upsert_company_meta(self, meta: CompanyMeta, *, batch: BatchToken) -> None:
+    def stage_company_meta_intent(
+        self,
+        intent: CompanyMetaCommitIntent,
+        *,
+        batch: BatchToken,
+    ) -> None:
         """拒绝 company mutation，以验证 top-level rollback owner。"""
 
-        del meta, batch
+        del intent, batch
         raise OSError("forced company publication failure")
 
 
@@ -494,24 +524,26 @@ class _FirstCandidateFailureDiscoveryClient(_FakeDiscoveryClient):
 
 
 @dataclass
-class _FakeConverter(CnDoclingConversionRunner):
+class _FakeConverter:
     """typed Docling conversion fake。"""
 
     calls: int = 0
 
-    async def convert_pdf_to_docling_json(
+    async def convert_to_json_bytes(
         self,
-        pdf_bytes: bytes,
+        input_bytes: bytes,
         stream_name: str,
         *,
-        cancellation_checker: Callable[[], bool],
-    ) -> bytes:
+        config: DoclingConversionConfig,
+        cancellation: CancellationToken | None,
+    ) -> DoclingConversionResult:
         """返回固定 Docling JSON。
 
         Args:
             pdf_bytes: PDF 字节。
             stream_name: 流名称。
-            cancellation_checker: operation-scoped 取消检查器。
+            config: 闭合转换配置。
+            cancellation: canonical 取消 token。
 
         Returns:
             Docling JSON 字节。
@@ -520,31 +552,37 @@ class _FakeConverter(CnDoclingConversionRunner):
             无。
         """
 
-        del pdf_bytes, stream_name, cancellation_checker
+        del input_bytes, stream_name, config, cancellation
         self.calls += 1
-        return _DOCLING_BYTES
+        return DoclingConversionResult(
+            json_bytes=_DOCLING_BYTES,
+            size=len(_DOCLING_BYTES),
+            sha256=hashlib.sha256(_DOCLING_BYTES).hexdigest(),
+        )
 
 
 @dataclass
-class _FailingConverter(CnDoclingConversionRunner):
+class _FailingConverter:
     """按配置抛出预构造异常的 typed Docling runner。"""
 
     failure: Exception
     calls: int = 0
 
-    async def convert_pdf_to_docling_json(
+    async def convert_to_json_bytes(
         self,
-        pdf_bytes: bytes,
+        input_bytes: bytes,
         stream_name: str,
         *,
-        cancellation_checker: Callable[[], bool],
-    ) -> bytes:
+        config: DoclingConversionConfig,
+        cancellation: CancellationToken | None,
+    ) -> DoclingConversionResult:
         """抛出预构造异常。
 
         Args:
             pdf_bytes: PDF 字节。
             stream_name: 流名称。
-            cancellation_checker: operation-scoped 取消检查器。
+            config: 闭合转换配置。
+            cancellation: canonical 取消 token。
 
         Returns:
             不返回。
@@ -553,7 +591,7 @@ class _FailingConverter(CnDoclingConversionRunner):
             Exception: 原样抛出 ``failure``。
         """
 
-        del pdf_bytes, stream_name, cancellation_checker
+        del input_bytes, stream_name, config, cancellation
         self.calls += 1
         raise self.failure
 
@@ -583,25 +621,27 @@ class _FilingFailureProjectionSpy:
 
 
 @dataclass
-class _CancelAfterConvertConverter(CnDoclingConversionRunner):
+class _CancelAfterConvertConverter:
     """转换返回前触发取消的 typed Docling runner。"""
 
     cancel_state: "_CancelState"
     calls: int = 0
 
-    async def convert_pdf_to_docling_json(
+    async def convert_to_json_bytes(
         self,
-        pdf_bytes: bytes,
+        input_bytes: bytes,
         stream_name: str,
         *,
-        cancellation_checker: Callable[[], bool],
-    ) -> bytes:
+        config: DoclingConversionConfig,
+        cancellation: CancellationToken | None,
+    ) -> DoclingConversionResult:
         """返回固定 Docling JSON 并设置取消状态。
 
         Args:
             pdf_bytes: PDF 字节。
             stream_name: 流名称。
-            cancellation_checker: operation-scoped 取消检查器。
+            config: 闭合转换配置。
+            cancellation: canonical 取消 token。
 
         Returns:
             Docling JSON 字节。
@@ -610,14 +650,18 @@ class _CancelAfterConvertConverter(CnDoclingConversionRunner):
             无。
         """
 
-        del pdf_bytes, stream_name, cancellation_checker
+        del input_bytes, stream_name, config, cancellation
         self.calls += 1
         self.cancel_state.cancelled = True
-        return _DOCLING_BYTES
+        return DoclingConversionResult(
+            json_bytes=_DOCLING_BYTES,
+            size=len(_DOCLING_BYTES),
+            sha256=hashlib.sha256(_DOCLING_BYTES).hexdigest(),
+        )
 
 
 @dataclass
-class _CancelState:
+class _CancelState(CancellationToken):
     """测试用取消状态。"""
 
     cancelled: bool = False
@@ -636,6 +680,33 @@ class _CancelState:
         """
 
         return self.cancelled
+
+    def is_cancelled(self) -> bool:
+        """返回当前取消状态。
+
+        Returns:
+            已取消时返回 ``True``。
+        """
+
+        return self.cancelled
+
+    def cancel_reason(self) -> str | None:
+        """返回测试取消原因。
+
+        Returns:
+            已取消时返回固定原因，否则返回 ``None``。
+        """
+
+        return "test_cancelled" if self.cancelled else None
+
+    def requested_at(self) -> datetime | None:
+        """返回测试取消时间。
+
+        Returns:
+            本测试不需要时间，返回 ``None``。
+        """
+
+        return None
 
 
 @dataclass
@@ -723,19 +794,21 @@ class _GateAwareConverter(_FakeConverter):
 
     gate: _RecordingPdfGate = field(default_factory=_RecordingPdfGate)
 
-    async def convert_pdf_to_docling_json(
+    async def convert_to_json_bytes(
         self,
-        pdf_bytes: bytes,
+        input_bytes: bytes,
         stream_name: str,
         *,
-        cancellation_checker: Callable[[], bool],
-    ) -> bytes:
+        config: DoclingConversionConfig,
+        cancellation: CancellationToken | None,
+    ) -> DoclingConversionResult:
         """断言转换阶段没有持有 PDF 下载 gate。
 
         Args:
             pdf_bytes: PDF 字节。
             stream_name: 流名称。
-            cancellation_checker: operation-scoped 取消检查器。
+            config: 闭合转换配置。
+            cancellation: canonical 取消 token。
 
         Returns:
             Docling JSON 字节。
@@ -745,10 +818,11 @@ class _GateAwareConverter(_FakeConverter):
         """
 
         assert self.gate.active is False
-        return await super().convert_pdf_to_docling_json(
-            pdf_bytes,
+        return await super().convert_to_json_bytes(
+            input_bytes,
             stream_name,
-            cancellation_checker=cancellation_checker,
+            config=config,
+            cancellation=cancellation,
         )
 
 
@@ -804,7 +878,7 @@ def _build_pipeline(
     tmp_path: Path,
     discovery: _FakeDiscoveryClient,
     hk_discovery: _FakeDiscoveryClient | None = None,
-    converter: CnDoclingConversionRunner,
+    converter: DoclingConverter,
     pdf_download_gate: CnDownloadPdfGateProtocol | None = None,
     repository_set: _FsRepositorySet | None = None,
     batching_repository: FsBatchingRepository | None = None,
@@ -853,7 +927,7 @@ def _build_pipeline(
         cn_discovery_client=discovery,
         hk_discovery_client=hk_discovery,
         pdf_download_gate=pdf_download_gate,
-        docling_conversion_runner=converter,
+        docling_converter=converter,
     )
 
 
@@ -893,6 +967,60 @@ def _collect_events(
             cancel_checker=cancel_checker,
         )
     )
+
+
+def test_repeat_cn_company_publication_rolls_back_zero_mutation_batch(
+    tmp_path: Path,
+) -> None:
+    """fresh 且 identity 未变化时 caller 必须 rollback，禁止 full-tree swap。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 明确 ``None`` mutation signal 未被 caller 消费时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching_repository = _BatchIdentityCnBatchingRepository(tmp_path, repository_set)
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=())
+    pipeline = _build_pipeline(
+        tmp_path=tmp_path,
+        discovery=discovery,
+        converter=_FakeConverter(),
+        repository_set=repository_set,
+        batching_repository=batching_repository,
+    )
+    profile = CnCompanyProfile(
+        provider="cninfo",
+        company_id="CNINFO:9900000600",
+        company_name="贵州茅台",
+        ticker="600519",
+    )
+
+    _cn_download_workflow._publish_cn_company_after_repair(
+        host=pipeline,
+        profile=profile,
+        normalized_ticker="600519",
+        ticker_aliases=None,
+    )
+    published_meta_path = tmp_path / "portfolio" / "600519" / "meta.json"
+    first_meta = published_meta_path.read_bytes()
+    _cn_download_workflow._publish_cn_company_after_repair(
+        host=pipeline,
+        profile=profile,
+        normalized_ticker="600519",
+        ticker_aliases=None,
+    )
+
+    assert batching_repository.commit_calls == 1
+    assert batching_repository.rollback_calls == 1
+    assert batching_repository.phases[-2][0] == "begin"
+    assert batching_repository.phases[-1][0] == "rollback"
+    assert published_meta_path.read_bytes() == first_meta
 
 
 async def _collect_events_async(
@@ -1670,7 +1798,7 @@ def test_cn_replacement_separates_company_and_document_transactions(
     assert result["status"] == "ok"
     assert phases == [
         "begin",
-        "commit",
+        "rollback",
         "begin",
         "reset",
         "blob:pdf",
@@ -1681,8 +1809,8 @@ def test_cn_replacement_separates_company_and_document_transactions(
     ]
     assert len(batch_ids) == 2
     assert batching_repository.begin_calls == begin_calls + 2
-    assert batching_repository.commit_calls == commit_calls + 2
-    assert batching_repository.rollback_calls == rollback_calls
+    assert batching_repository.commit_calls == commit_calls + 1
+    assert batching_repository.rollback_calls == rollback_calls + 1
 
 
 def test_cn_complete_phase_a_skips_transport_without_source_mutation(tmp_path: Path) -> None:
@@ -1721,12 +1849,150 @@ def test_cn_complete_phase_a_skips_transport_without_source_mutation(tmp_path: P
     summary = result["summary"]
     assert isinstance(summary, dict)
     assert summary["skipped"] == 1
-    assert phases == ["begin", "commit"]
+    assert phases == ["begin", "rollback"]
     assert len(batch_ids) == 1
     assert batching_repository.begin_calls == begin_calls + 1
-    assert batching_repository.commit_calls == commit_calls + 1
-    assert batching_repository.rollback_calls == rollback_calls
+    assert batching_repository.commit_calls == commit_calls
+    assert batching_repository.rollback_calls == rollback_calls + 1
     assert discovery.download_calls == download_calls
+
+
+def test_cn_unsafe_phase_a_fails_before_meta_transport_or_reset(tmp_path: Path) -> None:
+    """Phase A UNSAFE 必须消费 typed classification，且不读取/复用旧 source。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: UNSAFE 后仍发生 meta 相关传输或 mutation 时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching_repository = _BatchIdentityCnBatchingRepository(tmp_path, repository_set)
+    source_repository = _BatchIdentityCnSourceRepository(tmp_path, repository_set, batching_repository)
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(_candidate(),))
+    pipeline = _build_pipeline(
+        tmp_path=tmp_path,
+        discovery=discovery,
+        converter=_FakeConverter(),
+        repository_set=repository_set,
+        batching_repository=batching_repository,
+        source_repository=source_repository,
+    )
+    _collect_events(pipeline, start_is_explicit=True)
+    candidate = _candidate()
+    document_id, _internal_document_id = build_cn_filing_ids(
+        ticker="600519",
+        form_type=candidate.period_projection.identity_period,
+        fiscal_year=candidate.fiscal_year,
+        fiscal_period=candidate.period_projection.identity_period,
+        amended=candidate.amended,
+    )
+    locator = source_repository.get_source_document_locator("600519", document_id, SourceKind.FILING)
+    unsafe_file = tmp_path / locator / "undeclared.bin"
+    unsafe_file.write_bytes(b"unsafe")
+    begin_calls = batching_repository.begin_calls
+    reset_phases = [phase for phase, _batch_id in batching_repository.phases if phase == "reset"]
+    download_calls = discovery.download_calls
+
+    with pytest.raises(SourceIntegrityPreflightError) as exc_info:
+        _collect_single_filing_events(
+            pipeline=pipeline,
+            candidate=candidate,
+            cancel_checker=None,
+        )
+
+    assert exc_info.value.reason is SourceIntegrityPreflightReason.UNSAFE_PUBLICATION
+    assert batching_repository.begin_calls == begin_calls
+    assert [phase for phase, _batch_id in batching_repository.phases if phase == "reset"] == reset_phases
+    assert discovery.download_calls == download_calls
+    assert unsafe_file.read_bytes() == b"unsafe"
+
+
+def test_cn_unsafe_phase_b_rolls_back_without_reset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase B UNSAFE 必须在 identity 比较与 reset 前 typed fail closed。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        monkeypatch: pytest monkeypatch fixture。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: staged UNSAFE 进入 identity 比较、reset 或 commit 时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching_repository = _BatchIdentityCnBatchingRepository(tmp_path, repository_set)
+    source_repository = _BatchIdentityCnSourceRepository(tmp_path, repository_set, batching_repository)
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(_candidate(),))
+    pipeline = _build_pipeline(
+        tmp_path=tmp_path,
+        discovery=discovery,
+        converter=_FakeConverter(),
+        repository_set=repository_set,
+        batching_repository=batching_repository,
+        source_repository=source_repository,
+    )
+
+    def classify_staged_unsafe(
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+        *,
+        batch: BatchToken,
+    ) -> SourceIntegrityClassification:
+        """返回 storage owner 已确定的 staged UNSAFE fact。
+
+        Args:
+            ticker: exact ticker。
+            document_id: exact document ID。
+            source_kind: exact source kind。
+            batch: 已打开的 batch capability。
+
+        Returns:
+            staged target 的 typed UNSAFE classification。
+
+        Raises:
+            无。
+        """
+
+        del batch
+        return SourceIntegrityClassification(
+            ticker=ticker,
+            source_kind=source_kind,
+            document_id=document_id,
+            revision=None,
+            status=SourceIntegrityStatus.UNSAFE,
+            reasons=(SourceIntegrityReason.META_UNTRUSTED,),
+        )
+
+    monkeypatch.setattr(
+        source_repository,
+        "classify_staged_source_integrity",
+        classify_staged_unsafe,
+    )
+
+    with pytest.raises(SourceIntegrityPreflightError) as exc_info:
+        _collect_single_filing_events(
+            pipeline=pipeline,
+            candidate=_candidate(),
+            cancel_checker=None,
+        )
+
+    assert exc_info.value.reason is SourceIntegrityPreflightReason.UNSAFE_PUBLICATION
+    assert [phase for phase, _batch_id in batching_repository.phases] == ["begin", "rollback"]
+    assert batching_repository.commit_calls == 0
+    assert batching_repository.rollback_calls == 1
+    assert "reset" not in [phase for phase, _batch_id in batching_repository.phases]
+    assert source_repository.list_source_document_ids("600519", SourceKind.FILING) == []
 
 
 def test_cn_replacement_final_failure_restores_old_source_and_blobs(tmp_path: Path) -> None:
@@ -1762,6 +2028,7 @@ def test_cn_replacement_final_failure_restores_old_source_and_blobs(tmp_path: Pa
     old_meta = source_repository.get_source_meta("600519", document_id, SourceKind.FILING)
     old_pdf = blob_repository.read_file_bytes(handle, f"{document_id}.pdf")
     old_docling = blob_repository.read_file_bytes(handle, f"{document_id}_docling.json")
+    rollback_calls = batching_repository.rollback_calls
     source_repository.fail_final = True
     discovery.pdf_bytes = _PDF_BYTES + b"replacement"
 
@@ -1773,7 +2040,7 @@ def test_cn_replacement_final_failure_restores_old_source_and_blobs(tmp_path: Pa
     assert source_repository.get_source_meta("600519", document_id, SourceKind.FILING) == old_meta
     assert blob_repository.read_file_bytes(handle, f"{document_id}.pdf") == old_pdf
     assert blob_repository.read_file_bytes(handle, f"{document_id}_docling.json") == old_docling
-    assert batching_repository.rollback_calls == 1
+    assert batching_repository.rollback_calls == rollback_calls + 2
 
 
 def test_cn_replacement_success_exposes_source_blobs_and_processed_marker_together(
@@ -2270,7 +2537,7 @@ def test_cn_commit_failure_does_not_trigger_caller_rollback_or_success(tmp_path:
         source_repository.get_source_meta("600519", "fil2024", SourceKind.FILING)
 
 
-@pytest.mark.parametrize("corruption", ["size", "digest", "missing"])
+@pytest.mark.parametrize("corruption", ["size", "digest", "missing", "manifest"])
 def test_cn_top_level_repairs_selected_corruption_with_overwrite_false(
     tmp_path: Path,
     corruption: str,
@@ -2304,8 +2571,10 @@ def test_cn_top_level_repairs_selected_corruption_with_overwrite_false(
         pdf_path.write_bytes(old_pdf + b"-corrupt")
     elif corruption == "digest":
         pdf_path.write_bytes(b"X" * len(old_pdf))
-    else:
+    elif corruption == "missing":
         pdf_path.unlink()
+    else:
+        (tmp_path / locator.parent / "filing_manifest.json").unlink()
 
     result = _final_result(_collect_events(pipeline, start_is_explicit=True))
 
@@ -2313,6 +2582,12 @@ def test_cn_top_level_repairs_selected_corruption_with_overwrite_false(
     assert isinstance(summary, dict)
     assert summary["downloaded"] == 1
     assert converter.calls == 1
+    assert pipeline.source_repository.classify_source_integrity(
+        "600519",
+        document_id,
+        SourceKind.FILING,
+    ).status is SourceIntegrityStatus.COMPLETE
+    assert (tmp_path / locator.parent / "filing_manifest.json").is_file()
     with pipeline.source_repository.read_source_snapshot(
         "600519",
         document_id,
@@ -2374,7 +2649,7 @@ def test_cn_selected_repair_transport_failure_preserves_old_company_and_source(
 
 
 def test_cn_no_filing_with_corruption_fails_before_company_batch(tmp_path: Path) -> None:
-    """no-filing 若仍有 corruption，必须在首个新 batch 前 typed fail closed。"""
+    """whole manifest 缺失且 repair target 未选中时必须在首个新 batch 前拒绝。"""
 
     repository_set = build_fs_repository_set(workspace_root=tmp_path)
     batching_repository = _BatchIdentityCnBatchingRepository(tmp_path, repository_set)
@@ -2401,7 +2676,8 @@ def test_cn_no_filing_with_corruption_fails_before_company_batch(tmp_path: Path)
         document_id,
         SourceKind.FILING,
     )
-    (tmp_path / locator / f"{document_id}.pdf").unlink()
+    manifest_path = tmp_path / locator.parent / "filing_manifest.json"
+    manifest_path.unlink()
     begin_calls = batching_repository.begin_calls
     discovery.candidates = ()
 
@@ -2411,6 +2687,81 @@ def test_cn_no_filing_with_corruption_fails_before_company_batch(tmp_path: Path)
     assert exc_info.value.reason is SourceIntegrityPreflightReason.UNSELECTED_REPAIR_REQUIRED
     assert batching_repository.begin_calls == begin_calls
     assert pipeline._company_repository.get_company_meta("600519") == old_company
+    assert manifest_path.exists() is False
+
+
+def test_cn_whole_manifest_missing_with_multiple_selected_actual_sources_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """多个 actual/selected source 共享 manifest 缺失时不得任选一个 repair。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: preflight 未以 MULTIPLE_REPAIR_REQUIRED 零 mutation 拒绝时抛出。
+    """
+
+    fy_candidate = _candidate(source_id="FY", fiscal_period="FY")
+    h1_candidate = _candidate(source_id="H1", fiscal_period="H1")
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching_repository = _BatchIdentityCnBatchingRepository(tmp_path, repository_set)
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(fy_candidate,))
+    pipeline = _build_pipeline(
+        tmp_path=tmp_path,
+        discovery=discovery,
+        converter=_FakeConverter(),
+        repository_set=repository_set,
+        batching_repository=batching_repository,
+    )
+    _collect_events(pipeline, start_is_explicit=True, form_type="FY")
+    discovery.candidates = (h1_candidate,)
+    _collect_events(pipeline, start_is_explicit=True, form_type="H1")
+    document_ids = tuple(
+        build_cn_filing_ids(
+            ticker="600519",
+            form_type=candidate.period_projection.identity_period,
+            fiscal_year=candidate.fiscal_year,
+            fiscal_period=candidate.period_projection.identity_period,
+            amended=candidate.amended,
+        )[0]
+        for candidate in (fy_candidate, h1_candidate)
+    )
+    first_locator = pipeline.source_repository.get_source_document_locator(
+        "600519",
+        document_ids[0],
+        SourceKind.FILING,
+    )
+    manifest_path = tmp_path / first_locator.parent / "filing_manifest.json"
+    manifest_path.unlink()
+    begin_calls = batching_repository.begin_calls
+    download_calls = discovery.download_calls
+    old_company = pipeline._company_repository.get_company_meta("600519")
+    discovery.candidates = (fy_candidate, h1_candidate)
+
+    with pytest.raises(SourceIntegrityPreflightError) as exc_info:
+        _collect_events(
+            pipeline,
+            start_is_explicit=True,
+            form_type=None,
+        )
+
+    assert exc_info.value.reason is SourceIntegrityPreflightReason.MULTIPLE_REPAIR_REQUIRED
+    assert batching_repository.begin_calls == begin_calls
+    assert discovery.download_calls == download_calls
+    assert pipeline._company_repository.get_company_meta("600519") == old_company
+    assert manifest_path.exists() is False
+    for document_id in document_ids:
+        classification = pipeline.source_repository.classify_source_integrity(
+            "600519",
+            document_id,
+            SourceKind.FILING,
+        )
+        assert classification.status is SourceIntegrityStatus.REPAIR_REQUIRED
+        assert classification.reasons == (SourceIntegrityReason.SOURCE_MANIFEST_MISSING,)
 
 
 def test_cn_download_pdf_gate_does_not_cover_docling_convert(tmp_path: Path) -> None:
@@ -2588,7 +2939,7 @@ def test_cn_single_filing_owner_projects_closed_failure_pair(
             candidates=(candidate,),
             failure=failure,
         )
-        converter: CnDoclingConversionRunner = _FakeConverter()
+        converter: DoclingConverter = _FakeConverter()
     elif stage == "docling":
         discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(candidate,))
         converter = _FailingConverter(failure=failure)
@@ -2816,6 +3167,33 @@ def test_cn_docling_conversion_failure_leaves_document_absent(tmp_path: Path) ->
             document_id,
             SourceKind.FILING,
         )
+
+
+def test_cn_docling_converter_cancel_maps_to_download_cancelled(tmp_path: Path) -> None:
+    """shared converter cancel 必须在 workflow 边界映射为 CN/HK cancelled。
+
+    Args:
+        tmp_path: 临时目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: cancel 被投影为 failed 或产生半发布时抛出。
+    """
+
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(_candidate(),))
+    pipeline = _build_pipeline(
+        tmp_path=tmp_path,
+        discovery=discovery,
+        converter=_FailingConverter(failure=DoclingConversionCancelledError()),
+    )
+
+    result = _final_result(_collect_events(pipeline, start_is_explicit=True))
+
+    assert result["status"] == "cancelled"
+    assert result["filings"] == []
+    assert pipeline.source_repository.list_source_document_ids("600519", SourceKind.FILING) == []
 
 
 def test_cn_download_cancel_after_pdf_download_does_not_start_docling(
