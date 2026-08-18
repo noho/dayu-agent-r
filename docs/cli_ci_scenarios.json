@@ -127870,7 +127870,7 @@
       "scenario_id": "upload_filing.UF-030-owner-allows-cli-rejects-doc",
       "source_scenario_id": "UF-030-owner-allows-cli-rejects-doc",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "upload_filing",
       "path_kind": "calibration-static",
       "coverage_claims": {
@@ -127987,13 +127987,136 @@
       "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
       "applicable_from": "next-upload_filing-run-after-256786b2",
       "supersedes": null,
+      "superseded_by": "upload_filing.UF-030-unsupported-doc-prevalidation@1"
+    },
+    {
+      "scenario_id": "upload_filing.UF-030-unsupported-doc-prevalidation",
+      "source_scenario_id": "UF-030-unsupported-doc-prevalidation",
+      "version": 1,
+      "status": "accepted",
+      "command": "upload_filing",
+      "path_kind": "calibration-static",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--files"
+        ],
+        "precondition_state_ids": [
+          "observed:static:UF-030-unsupported-doc-prevalidation"
+        ],
+        "interactive_branch_option_ids": [],
+        "input_class_ids": [
+          "input:static"
+        ],
+        "combination_high_risk_ids": [
+          "risk:UF-030-unsupported-doc-prevalidation"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--files",
+          "precondition:observed:static:UF-030-unsupported-doc-prevalidation",
+          "input:static",
+          "risk:UF-030-unsupported-doc-prevalidation"
+        ]
+      },
+      "invocation": {
+        "argv": [
+          "dayu-cli",
+          "upload_filing",
+          "--base",
+          "<run-root>/workspaces/UF-030-unsupported-doc-prevalidation",
+          "--ticker",
+          "AAPL",
+          "--fiscal-year",
+          "2024",
+          "--fiscal-period",
+          "FY",
+          "--company-name",
+          "Apple Inc.",
+          "--files",
+          "<main-evidence-root>/inputs/probe.doc"
+        ],
+        "cwd": "<repo-root>",
+        "stdin": "DEVNULL; no bytes supplied",
+        "input_description": [
+          "input-class:static"
+        ],
+        "key_actions": [],
+        "unset_environment_names": []
+      },
+      "precondition": {
+        "state_id": "observed:static:UF-030-unsupported-doc-prevalidation",
+        "workspace": "<run-root>/workspaces/UF-030-unsupported-doc-prevalidation",
+        "setup_steps": [
+          "使用隔离 fresh workspace 与冻结真实输入，按本轮 exact argv 执行。"
+        ]
+      },
+      "accepted_oracle_refs": [
+        "cli.upload_filing.document-publication@1"
+      ],
+      "oracle_predicate_refs": [
+        "upload_filing.public-surface",
+        "upload_filing.validation-side-effects",
+        "upload_filing.error-classification",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "correctness_surfaces": [
+        "upload_filing.public-surface",
+        "upload_filing.validation-side-effects",
+        "upload_filing.error-classification",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "fixed-real-input-or-real-public-financial-source",
+        "mock-fake-provider-and-converter-forbidden",
+        "secret-values-never-projected"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 600.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-cwd-and-non-secret-environment",
+        "stdin-or-signal-timeline",
+        "stdout-stderr-screen-exit-and-duration",
+        "filesystem-before-after-and-diff",
+        "source-meta-manifest-original-and-docling-digests-or-not-applicable-proof",
+        "fins-public-state-and-summary-reconciliation",
+        "host-runtime-sqlite-eventlog-tool-trace-or-queried-absent-proof",
+        "cross-command-production-consumption-when-declared",
+        "log-and-secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_id": "upload-filing-final-calibration-20260818-y6gLgs",
+        "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+        "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+        "relative_ref": "cases/UF-030-owner-allows-cli-rejects-doc",
+        "execution_outcome": "error",
+        "exit_code": 2,
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle-second-round"
+      },
+      "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18",
+      "applicable_from": "upload-filing-second-round-conformance-after-47e78b23",
+      "supersedes": "upload_filing.UF-030-owner-allows-cli-rejects-doc@1",
       "superseded_by": null
     },
     {
       "scenario_id": "upload_filing.UF-031-owner-allows-cli-rejects-ppt",
       "source_scenario_id": "UF-031-owner-allows-cli-rejects-ppt",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "upload_filing",
       "path_kind": "calibration-static",
       "coverage_claims": {
@@ -128110,13 +128233,136 @@
       "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
       "applicable_from": "next-upload_filing-run-after-256786b2",
       "supersedes": null,
+      "superseded_by": "upload_filing.UF-031-unsupported-ppt-prevalidation@1"
+    },
+    {
+      "scenario_id": "upload_filing.UF-031-unsupported-ppt-prevalidation",
+      "source_scenario_id": "UF-031-unsupported-ppt-prevalidation",
+      "version": 1,
+      "status": "accepted",
+      "command": "upload_filing",
+      "path_kind": "calibration-static",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--files"
+        ],
+        "precondition_state_ids": [
+          "observed:static:UF-031-unsupported-ppt-prevalidation"
+        ],
+        "interactive_branch_option_ids": [],
+        "input_class_ids": [
+          "input:static"
+        ],
+        "combination_high_risk_ids": [
+          "risk:UF-031-unsupported-ppt-prevalidation"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--files",
+          "precondition:observed:static:UF-031-unsupported-ppt-prevalidation",
+          "input:static",
+          "risk:UF-031-unsupported-ppt-prevalidation"
+        ]
+      },
+      "invocation": {
+        "argv": [
+          "dayu-cli",
+          "upload_filing",
+          "--base",
+          "<run-root>/workspaces/UF-031-unsupported-ppt-prevalidation",
+          "--ticker",
+          "AAPL",
+          "--fiscal-year",
+          "2024",
+          "--fiscal-period",
+          "FY",
+          "--company-name",
+          "Apple Inc.",
+          "--files",
+          "<main-evidence-root>/inputs/probe.ppt"
+        ],
+        "cwd": "<repo-root>",
+        "stdin": "DEVNULL; no bytes supplied",
+        "input_description": [
+          "input-class:static"
+        ],
+        "key_actions": [],
+        "unset_environment_names": []
+      },
+      "precondition": {
+        "state_id": "observed:static:UF-031-unsupported-ppt-prevalidation",
+        "workspace": "<run-root>/workspaces/UF-031-unsupported-ppt-prevalidation",
+        "setup_steps": [
+          "使用隔离 fresh workspace 与冻结真实输入，按本轮 exact argv 执行。"
+        ]
+      },
+      "accepted_oracle_refs": [
+        "cli.upload_filing.document-publication@1"
+      ],
+      "oracle_predicate_refs": [
+        "upload_filing.public-surface",
+        "upload_filing.validation-side-effects",
+        "upload_filing.error-classification",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "correctness_surfaces": [
+        "upload_filing.public-surface",
+        "upload_filing.validation-side-effects",
+        "upload_filing.error-classification",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "fixed-real-input-or-real-public-financial-source",
+        "mock-fake-provider-and-converter-forbidden",
+        "secret-values-never-projected"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 600.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-cwd-and-non-secret-environment",
+        "stdin-or-signal-timeline",
+        "stdout-stderr-screen-exit-and-duration",
+        "filesystem-before-after-and-diff",
+        "source-meta-manifest-original-and-docling-digests-or-not-applicable-proof",
+        "fins-public-state-and-summary-reconciliation",
+        "host-runtime-sqlite-eventlog-tool-trace-or-queried-absent-proof",
+        "cross-command-production-consumption-when-declared",
+        "log-and-secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_id": "upload-filing-final-calibration-20260818-y6gLgs",
+        "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+        "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+        "relative_ref": "cases/UF-031-owner-allows-cli-rejects-ppt",
+        "execution_outcome": "error",
+        "exit_code": 2,
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle-second-round"
+      },
+      "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18",
+      "applicable_from": "upload-filing-second-round-conformance-after-47e78b23",
+      "supersedes": "upload_filing.UF-031-owner-allows-cli-rejects-ppt@1",
       "superseded_by": null
     },
     {
       "scenario_id": "upload_filing.UF-032-owner-allows-cli-rejects-pptx",
       "source_scenario_id": "UF-032-owner-allows-cli-rejects-pptx",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "upload_filing",
       "path_kind": "calibration-static",
       "coverage_claims": {
@@ -128233,13 +128479,136 @@
       "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
       "applicable_from": "next-upload_filing-run-after-256786b2",
       "supersedes": null,
+      "superseded_by": "upload_filing.UF-032-supported-pptx@1"
+    },
+    {
+      "scenario_id": "upload_filing.UF-032-supported-pptx",
+      "source_scenario_id": "UF-032-supported-pptx",
+      "version": 1,
+      "status": "accepted",
+      "command": "upload_filing",
+      "path_kind": "calibration-static",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--files"
+        ],
+        "precondition_state_ids": [
+          "observed:static:UF-032-supported-pptx"
+        ],
+        "interactive_branch_option_ids": [],
+        "input_class_ids": [
+          "input:static"
+        ],
+        "combination_high_risk_ids": [
+          "risk:UF-032-supported-pptx"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--files",
+          "precondition:observed:static:UF-032-supported-pptx",
+          "input:static",
+          "risk:UF-032-supported-pptx"
+        ]
+      },
+      "invocation": {
+        "argv": [
+          "dayu-cli",
+          "upload_filing",
+          "--base",
+          "<run-root>/workspaces/UF-032-supported-pptx",
+          "--ticker",
+          "AAPL",
+          "--fiscal-year",
+          "2024",
+          "--fiscal-period",
+          "FY",
+          "--company-name",
+          "Apple Inc.",
+          "--files",
+          "<main-evidence-root>/inputs/probe.pptx"
+        ],
+        "cwd": "<repo-root>",
+        "stdin": "DEVNULL; no bytes supplied",
+        "input_description": [
+          "input-class:static"
+        ],
+        "key_actions": [],
+        "unset_environment_names": []
+      },
+      "precondition": {
+        "state_id": "observed:static:UF-032-supported-pptx",
+        "workspace": "<run-root>/workspaces/UF-032-supported-pptx",
+        "setup_steps": [
+          "使用隔离 fresh workspace 与冻结真实输入，按本轮 exact argv 执行。"
+        ]
+      },
+      "accepted_oracle_refs": [
+        "cli.upload_filing.document-publication@1"
+      ],
+      "oracle_predicate_refs": [
+        "upload_filing.public-surface",
+        "upload_filing.validation-side-effects",
+        "upload_filing.error-classification",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "correctness_surfaces": [
+        "upload_filing.public-surface",
+        "upload_filing.validation-side-effects",
+        "upload_filing.error-classification",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "fixed-real-input-or-real-public-financial-source",
+        "mock-fake-provider-and-converter-forbidden",
+        "secret-values-never-projected"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 600.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-cwd-and-non-secret-environment",
+        "stdin-or-signal-timeline",
+        "stdout-stderr-screen-exit-and-duration",
+        "filesystem-before-after-and-diff",
+        "source-meta-manifest-original-and-docling-digests-or-not-applicable-proof",
+        "fins-public-state-and-summary-reconciliation",
+        "host-runtime-sqlite-eventlog-tool-trace-or-queried-absent-proof",
+        "cross-command-production-consumption-when-declared",
+        "log-and-secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_id": "upload-filing-final-calibration-20260818-y6gLgs",
+        "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+        "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+        "relative_ref": "cases/UF-032-owner-allows-cli-rejects-pptx",
+        "execution_outcome": "success",
+        "exit_code": 0,
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle-second-round"
+      },
+      "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18",
+      "applicable_from": "upload-filing-second-round-conformance-after-47e78b23",
+      "supersedes": "upload_filing.UF-032-owner-allows-cli-rejects-pptx@1",
       "superseded_by": null
     },
     {
       "scenario_id": "upload_filing.UF-033-cli-allows-owner-rejects-csv",
       "source_scenario_id": "UF-033-cli-allows-owner-rejects-csv",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "upload_filing",
       "path_kind": "calibration-static",
       "coverage_claims": {
@@ -128356,13 +128725,136 @@
       "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
       "applicable_from": "next-upload_filing-run-after-256786b2",
       "supersedes": null,
+      "superseded_by": "upload_filing.UF-033-supported-csv@1"
+    },
+    {
+      "scenario_id": "upload_filing.UF-033-supported-csv",
+      "source_scenario_id": "UF-033-supported-csv",
+      "version": 1,
+      "status": "accepted",
+      "command": "upload_filing",
+      "path_kind": "calibration-static",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--files"
+        ],
+        "precondition_state_ids": [
+          "observed:static:UF-033-supported-csv"
+        ],
+        "interactive_branch_option_ids": [],
+        "input_class_ids": [
+          "input:static"
+        ],
+        "combination_high_risk_ids": [
+          "risk:UF-033-supported-csv"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--files",
+          "precondition:observed:static:UF-033-supported-csv",
+          "input:static",
+          "risk:UF-033-supported-csv"
+        ]
+      },
+      "invocation": {
+        "argv": [
+          "dayu-cli",
+          "upload_filing",
+          "--base",
+          "<run-root>/workspaces/UF-033-supported-csv",
+          "--ticker",
+          "AAPL",
+          "--fiscal-year",
+          "2024",
+          "--fiscal-period",
+          "FY",
+          "--company-name",
+          "Apple Inc.",
+          "--files",
+          "<main-evidence-root>/inputs/probe.csv"
+        ],
+        "cwd": "<repo-root>",
+        "stdin": "DEVNULL; no bytes supplied",
+        "input_description": [
+          "input-class:static"
+        ],
+        "key_actions": [],
+        "unset_environment_names": []
+      },
+      "precondition": {
+        "state_id": "observed:static:UF-033-supported-csv",
+        "workspace": "<run-root>/workspaces/UF-033-supported-csv",
+        "setup_steps": [
+          "使用隔离 fresh workspace 与冻结真实输入，按本轮 exact argv 执行。"
+        ]
+      },
+      "accepted_oracle_refs": [
+        "cli.upload_filing.document-publication@1"
+      ],
+      "oracle_predicate_refs": [
+        "upload_filing.public-surface",
+        "upload_filing.validation-side-effects",
+        "upload_filing.error-classification",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "correctness_surfaces": [
+        "upload_filing.public-surface",
+        "upload_filing.validation-side-effects",
+        "upload_filing.error-classification",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "fixed-real-input-or-real-public-financial-source",
+        "mock-fake-provider-and-converter-forbidden",
+        "secret-values-never-projected"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 600.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-cwd-and-non-secret-environment",
+        "stdin-or-signal-timeline",
+        "stdout-stderr-screen-exit-and-duration",
+        "filesystem-before-after-and-diff",
+        "source-meta-manifest-original-and-docling-digests-or-not-applicable-proof",
+        "fins-public-state-and-summary-reconciliation",
+        "host-runtime-sqlite-eventlog-tool-trace-or-queried-absent-proof",
+        "cross-command-production-consumption-when-declared",
+        "log-and-secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_id": "upload-filing-final-calibration-20260818-y6gLgs",
+        "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+        "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+        "relative_ref": "cases/UF-033-cli-allows-owner-rejects-csv",
+        "execution_outcome": "success",
+        "exit_code": 0,
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle-second-round"
+      },
+      "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18",
+      "applicable_from": "upload-filing-second-round-conformance-after-47e78b23",
+      "supersedes": "upload_filing.UF-033-cli-allows-owner-rejects-csv@1",
       "superseded_by": null
     },
     {
       "scenario_id": "upload_filing.UF-034-cli-allows-owner-rejects-json",
       "source_scenario_id": "UF-034-cli-allows-owner-rejects-json",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "upload_filing",
       "path_kind": "calibration-static",
       "coverage_claims": {
@@ -128479,13 +128971,136 @@
       "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
       "applicable_from": "next-upload_filing-run-after-256786b2",
       "supersedes": null,
+      "superseded_by": "upload_filing.UF-034-json-content-failure@1"
+    },
+    {
+      "scenario_id": "upload_filing.UF-034-json-content-failure",
+      "source_scenario_id": "UF-034-json-content-failure",
+      "version": 1,
+      "status": "accepted",
+      "command": "upload_filing",
+      "path_kind": "calibration-static",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--files"
+        ],
+        "precondition_state_ids": [
+          "observed:static:UF-034-json-content-failure"
+        ],
+        "interactive_branch_option_ids": [],
+        "input_class_ids": [
+          "input:static"
+        ],
+        "combination_high_risk_ids": [
+          "risk:UF-034-json-content-failure"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--files",
+          "precondition:observed:static:UF-034-json-content-failure",
+          "input:static",
+          "risk:UF-034-json-content-failure"
+        ]
+      },
+      "invocation": {
+        "argv": [
+          "dayu-cli",
+          "upload_filing",
+          "--base",
+          "<run-root>/workspaces/UF-034-json-content-failure",
+          "--ticker",
+          "AAPL",
+          "--fiscal-year",
+          "2024",
+          "--fiscal-period",
+          "FY",
+          "--company-name",
+          "Apple Inc.",
+          "--files",
+          "<main-evidence-root>/inputs/probe.json"
+        ],
+        "cwd": "<repo-root>",
+        "stdin": "DEVNULL; no bytes supplied",
+        "input_description": [
+          "input-class:static"
+        ],
+        "key_actions": [],
+        "unset_environment_names": []
+      },
+      "precondition": {
+        "state_id": "observed:static:UF-034-json-content-failure",
+        "workspace": "<run-root>/workspaces/UF-034-json-content-failure",
+        "setup_steps": [
+          "使用隔离 fresh workspace 与冻结真实输入，按本轮 exact argv 执行。"
+        ]
+      },
+      "accepted_oracle_refs": [
+        "cli.upload_filing.document-publication@1"
+      ],
+      "oracle_predicate_refs": [
+        "upload_filing.public-surface",
+        "upload_filing.validation-side-effects",
+        "upload_filing.error-classification",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "correctness_surfaces": [
+        "upload_filing.public-surface",
+        "upload_filing.validation-side-effects",
+        "upload_filing.error-classification",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "fixed-real-input-or-real-public-financial-source",
+        "mock-fake-provider-and-converter-forbidden",
+        "secret-values-never-projected"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 600.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-cwd-and-non-secret-environment",
+        "stdin-or-signal-timeline",
+        "stdout-stderr-screen-exit-and-duration",
+        "filesystem-before-after-and-diff",
+        "source-meta-manifest-original-and-docling-digests-or-not-applicable-proof",
+        "fins-public-state-and-summary-reconciliation",
+        "host-runtime-sqlite-eventlog-tool-trace-or-queried-absent-proof",
+        "cross-command-production-consumption-when-declared",
+        "log-and-secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_id": "upload-filing-final-calibration-20260818-y6gLgs",
+        "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+        "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+        "relative_ref": "cases/UF-034-cli-allows-owner-rejects-json",
+        "execution_outcome": "error",
+        "exit_code": 1,
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle-second-round"
+      },
+      "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18",
+      "applicable_from": "upload-filing-second-round-conformance-after-47e78b23",
+      "supersedes": "upload_filing.UF-034-cli-allows-owner-rejects-json@1",
       "superseded_by": null
     },
     {
       "scenario_id": "upload_filing.UF-035-cli-allows-owner-rejects-xbrl",
       "source_scenario_id": "UF-035-cli-allows-owner-rejects-xbrl",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "upload_filing",
       "path_kind": "calibration-static",
       "coverage_claims": {
@@ -128602,13 +129217,136 @@
       "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
       "applicable_from": "next-upload_filing-run-after-256786b2",
       "supersedes": null,
+      "superseded_by": "upload_filing.UF-035-xbrl-content-failure@1"
+    },
+    {
+      "scenario_id": "upload_filing.UF-035-xbrl-content-failure",
+      "source_scenario_id": "UF-035-xbrl-content-failure",
+      "version": 1,
+      "status": "accepted",
+      "command": "upload_filing",
+      "path_kind": "calibration-static",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--files"
+        ],
+        "precondition_state_ids": [
+          "observed:static:UF-035-xbrl-content-failure"
+        ],
+        "interactive_branch_option_ids": [],
+        "input_class_ids": [
+          "input:static"
+        ],
+        "combination_high_risk_ids": [
+          "risk:UF-035-xbrl-content-failure"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--files",
+          "precondition:observed:static:UF-035-xbrl-content-failure",
+          "input:static",
+          "risk:UF-035-xbrl-content-failure"
+        ]
+      },
+      "invocation": {
+        "argv": [
+          "dayu-cli",
+          "upload_filing",
+          "--base",
+          "<run-root>/workspaces/UF-035-xbrl-content-failure",
+          "--ticker",
+          "AAPL",
+          "--fiscal-year",
+          "2024",
+          "--fiscal-period",
+          "FY",
+          "--company-name",
+          "Apple Inc.",
+          "--files",
+          "<main-evidence-root>/inputs/probe.xbrl"
+        ],
+        "cwd": "<repo-root>",
+        "stdin": "DEVNULL; no bytes supplied",
+        "input_description": [
+          "input-class:static"
+        ],
+        "key_actions": [],
+        "unset_environment_names": []
+      },
+      "precondition": {
+        "state_id": "observed:static:UF-035-xbrl-content-failure",
+        "workspace": "<run-root>/workspaces/UF-035-xbrl-content-failure",
+        "setup_steps": [
+          "使用隔离 fresh workspace 与冻结真实输入，按本轮 exact argv 执行。"
+        ]
+      },
+      "accepted_oracle_refs": [
+        "cli.upload_filing.document-publication@1"
+      ],
+      "oracle_predicate_refs": [
+        "upload_filing.public-surface",
+        "upload_filing.validation-side-effects",
+        "upload_filing.error-classification",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "correctness_surfaces": [
+        "upload_filing.public-surface",
+        "upload_filing.validation-side-effects",
+        "upload_filing.error-classification",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "fixed-real-input-or-real-public-financial-source",
+        "mock-fake-provider-and-converter-forbidden",
+        "secret-values-never-projected"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 600.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-cwd-and-non-secret-environment",
+        "stdin-or-signal-timeline",
+        "stdout-stderr-screen-exit-and-duration",
+        "filesystem-before-after-and-diff",
+        "source-meta-manifest-original-and-docling-digests-or-not-applicable-proof",
+        "fins-public-state-and-summary-reconciliation",
+        "host-runtime-sqlite-eventlog-tool-trace-or-queried-absent-proof",
+        "cross-command-production-consumption-when-declared",
+        "log-and-secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_id": "upload-filing-final-calibration-20260818-y6gLgs",
+        "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+        "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+        "relative_ref": "cases/UF-035-cli-allows-owner-rejects-xbrl",
+        "execution_outcome": "error",
+        "exit_code": 1,
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle-second-round"
+      },
+      "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18",
+      "applicable_from": "upload-filing-second-round-conformance-after-47e78b23",
+      "supersedes": "upload_filing.UF-035-cli-allows-owner-rejects-xbrl@1",
       "superseded_by": null
     },
     {
       "scenario_id": "upload_filing.UF-036-cli-allows-owner-rejects-xhtml",
       "source_scenario_id": "UF-036-cli-allows-owner-rejects-xhtml",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "upload_filing",
       "path_kind": "calibration-static",
       "coverage_claims": {
@@ -128725,13 +129463,136 @@
       "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
       "applicable_from": "next-upload_filing-run-after-256786b2",
       "supersedes": null,
+      "superseded_by": "upload_filing.UF-036-supported-xhtml@1"
+    },
+    {
+      "scenario_id": "upload_filing.UF-036-supported-xhtml",
+      "source_scenario_id": "UF-036-supported-xhtml",
+      "version": 1,
+      "status": "accepted",
+      "command": "upload_filing",
+      "path_kind": "calibration-static",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--files"
+        ],
+        "precondition_state_ids": [
+          "observed:static:UF-036-supported-xhtml"
+        ],
+        "interactive_branch_option_ids": [],
+        "input_class_ids": [
+          "input:static"
+        ],
+        "combination_high_risk_ids": [
+          "risk:UF-036-supported-xhtml"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--files",
+          "precondition:observed:static:UF-036-supported-xhtml",
+          "input:static",
+          "risk:UF-036-supported-xhtml"
+        ]
+      },
+      "invocation": {
+        "argv": [
+          "dayu-cli",
+          "upload_filing",
+          "--base",
+          "<run-root>/workspaces/UF-036-supported-xhtml",
+          "--ticker",
+          "AAPL",
+          "--fiscal-year",
+          "2024",
+          "--fiscal-period",
+          "FY",
+          "--company-name",
+          "Apple Inc.",
+          "--files",
+          "<main-evidence-root>/inputs/probe.xhtml"
+        ],
+        "cwd": "<repo-root>",
+        "stdin": "DEVNULL; no bytes supplied",
+        "input_description": [
+          "input-class:static"
+        ],
+        "key_actions": [],
+        "unset_environment_names": []
+      },
+      "precondition": {
+        "state_id": "observed:static:UF-036-supported-xhtml",
+        "workspace": "<run-root>/workspaces/UF-036-supported-xhtml",
+        "setup_steps": [
+          "使用隔离 fresh workspace 与冻结真实输入，按本轮 exact argv 执行。"
+        ]
+      },
+      "accepted_oracle_refs": [
+        "cli.upload_filing.document-publication@1"
+      ],
+      "oracle_predicate_refs": [
+        "upload_filing.public-surface",
+        "upload_filing.validation-side-effects",
+        "upload_filing.error-classification",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "correctness_surfaces": [
+        "upload_filing.public-surface",
+        "upload_filing.validation-side-effects",
+        "upload_filing.error-classification",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "fixed-real-input-or-real-public-financial-source",
+        "mock-fake-provider-and-converter-forbidden",
+        "secret-values-never-projected"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 600.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-cwd-and-non-secret-environment",
+        "stdin-or-signal-timeline",
+        "stdout-stderr-screen-exit-and-duration",
+        "filesystem-before-after-and-diff",
+        "source-meta-manifest-original-and-docling-digests-or-not-applicable-proof",
+        "fins-public-state-and-summary-reconciliation",
+        "host-runtime-sqlite-eventlog-tool-trace-or-queried-absent-proof",
+        "cross-command-production-consumption-when-declared",
+        "log-and-secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_id": "upload-filing-final-calibration-20260818-y6gLgs",
+        "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+        "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+        "relative_ref": "cases/UF-036-cli-allows-owner-rejects-xhtml",
+        "execution_outcome": "success",
+        "exit_code": 0,
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle-second-round"
+      },
+      "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18",
+      "applicable_from": "upload-filing-second-round-conformance-after-47e78b23",
+      "supersedes": "upload_filing.UF-036-cli-allows-owner-rejects-xhtml@1",
       "superseded_by": null
     },
     {
       "scenario_id": "upload_filing.UF-037-cli-allows-owner-rejects-xml",
       "source_scenario_id": "UF-037-cli-allows-owner-rejects-xml",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "upload_filing",
       "path_kind": "calibration-static",
       "coverage_claims": {
@@ -128848,13 +129709,136 @@
       "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
       "applicable_from": "next-upload_filing-run-after-256786b2",
       "supersedes": null,
+      "superseded_by": "upload_filing.UF-037-xml-content-failure@1"
+    },
+    {
+      "scenario_id": "upload_filing.UF-037-xml-content-failure",
+      "source_scenario_id": "UF-037-xml-content-failure",
+      "version": 1,
+      "status": "accepted",
+      "command": "upload_filing",
+      "path_kind": "calibration-static",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--files"
+        ],
+        "precondition_state_ids": [
+          "observed:static:UF-037-xml-content-failure"
+        ],
+        "interactive_branch_option_ids": [],
+        "input_class_ids": [
+          "input:static"
+        ],
+        "combination_high_risk_ids": [
+          "risk:UF-037-xml-content-failure"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--files",
+          "precondition:observed:static:UF-037-xml-content-failure",
+          "input:static",
+          "risk:UF-037-xml-content-failure"
+        ]
+      },
+      "invocation": {
+        "argv": [
+          "dayu-cli",
+          "upload_filing",
+          "--base",
+          "<run-root>/workspaces/UF-037-xml-content-failure",
+          "--ticker",
+          "AAPL",
+          "--fiscal-year",
+          "2024",
+          "--fiscal-period",
+          "FY",
+          "--company-name",
+          "Apple Inc.",
+          "--files",
+          "<main-evidence-root>/inputs/probe.xml"
+        ],
+        "cwd": "<repo-root>",
+        "stdin": "DEVNULL; no bytes supplied",
+        "input_description": [
+          "input-class:static"
+        ],
+        "key_actions": [],
+        "unset_environment_names": []
+      },
+      "precondition": {
+        "state_id": "observed:static:UF-037-xml-content-failure",
+        "workspace": "<run-root>/workspaces/UF-037-xml-content-failure",
+        "setup_steps": [
+          "使用隔离 fresh workspace 与冻结真实输入，按本轮 exact argv 执行。"
+        ]
+      },
+      "accepted_oracle_refs": [
+        "cli.upload_filing.document-publication@1"
+      ],
+      "oracle_predicate_refs": [
+        "upload_filing.public-surface",
+        "upload_filing.validation-side-effects",
+        "upload_filing.error-classification",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "correctness_surfaces": [
+        "upload_filing.public-surface",
+        "upload_filing.validation-side-effects",
+        "upload_filing.error-classification",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "fixed-real-input-or-real-public-financial-source",
+        "mock-fake-provider-and-converter-forbidden",
+        "secret-values-never-projected"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 600.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-cwd-and-non-secret-environment",
+        "stdin-or-signal-timeline",
+        "stdout-stderr-screen-exit-and-duration",
+        "filesystem-before-after-and-diff",
+        "source-meta-manifest-original-and-docling-digests-or-not-applicable-proof",
+        "fins-public-state-and-summary-reconciliation",
+        "host-runtime-sqlite-eventlog-tool-trace-or-queried-absent-proof",
+        "cross-command-production-consumption-when-declared",
+        "log-and-secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_id": "upload-filing-final-calibration-20260818-y6gLgs",
+        "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+        "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+        "relative_ref": "cases/UF-037-cli-allows-owner-rejects-xml",
+        "execution_outcome": "error",
+        "exit_code": 1,
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle-second-round"
+      },
+      "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18",
+      "applicable_from": "upload-filing-second-round-conformance-after-47e78b23",
+      "supersedes": "upload_filing.UF-037-cli-allows-owner-rejects-xml@1",
       "superseded_by": null
     },
     {
       "scenario_id": "upload_filing.UF-038-cli-allows-owner-rejects-zip",
       "source_scenario_id": "UF-038-cli-allows-owner-rejects-zip",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "upload_filing",
       "path_kind": "calibration-static",
       "coverage_claims": {
@@ -128971,6 +129955,129 @@
       "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
       "applicable_from": "next-upload_filing-run-after-256786b2",
       "supersedes": null,
+      "superseded_by": "upload_filing.UF-038-unsupported-zip-prevalidation@1"
+    },
+    {
+      "scenario_id": "upload_filing.UF-038-unsupported-zip-prevalidation",
+      "source_scenario_id": "UF-038-unsupported-zip-prevalidation",
+      "version": 1,
+      "status": "accepted",
+      "command": "upload_filing",
+      "path_kind": "calibration-static",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--files"
+        ],
+        "precondition_state_ids": [
+          "observed:static:UF-038-unsupported-zip-prevalidation"
+        ],
+        "interactive_branch_option_ids": [],
+        "input_class_ids": [
+          "input:static"
+        ],
+        "combination_high_risk_ids": [
+          "risk:UF-038-unsupported-zip-prevalidation"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--files",
+          "precondition:observed:static:UF-038-unsupported-zip-prevalidation",
+          "input:static",
+          "risk:UF-038-unsupported-zip-prevalidation"
+        ]
+      },
+      "invocation": {
+        "argv": [
+          "dayu-cli",
+          "upload_filing",
+          "--base",
+          "<run-root>/workspaces/UF-038-unsupported-zip-prevalidation",
+          "--ticker",
+          "AAPL",
+          "--fiscal-year",
+          "2024",
+          "--fiscal-period",
+          "FY",
+          "--company-name",
+          "Apple Inc.",
+          "--files",
+          "<main-evidence-root>/inputs/probe.zip"
+        ],
+        "cwd": "<repo-root>",
+        "stdin": "DEVNULL; no bytes supplied",
+        "input_description": [
+          "input-class:static"
+        ],
+        "key_actions": [],
+        "unset_environment_names": []
+      },
+      "precondition": {
+        "state_id": "observed:static:UF-038-unsupported-zip-prevalidation",
+        "workspace": "<run-root>/workspaces/UF-038-unsupported-zip-prevalidation",
+        "setup_steps": [
+          "使用隔离 fresh workspace 与冻结真实输入，按本轮 exact argv 执行。"
+        ]
+      },
+      "accepted_oracle_refs": [
+        "cli.upload_filing.document-publication@1"
+      ],
+      "oracle_predicate_refs": [
+        "upload_filing.public-surface",
+        "upload_filing.validation-side-effects",
+        "upload_filing.error-classification",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "correctness_surfaces": [
+        "upload_filing.public-surface",
+        "upload_filing.validation-side-effects",
+        "upload_filing.error-classification",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "fixed-real-input-or-real-public-financial-source",
+        "mock-fake-provider-and-converter-forbidden",
+        "secret-values-never-projected"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 600.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-cwd-and-non-secret-environment",
+        "stdin-or-signal-timeline",
+        "stdout-stderr-screen-exit-and-duration",
+        "filesystem-before-after-and-diff",
+        "source-meta-manifest-original-and-docling-digests-or-not-applicable-proof",
+        "fins-public-state-and-summary-reconciliation",
+        "host-runtime-sqlite-eventlog-tool-trace-or-queried-absent-proof",
+        "cross-command-production-consumption-when-declared",
+        "log-and-secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_id": "upload-filing-final-calibration-20260818-y6gLgs",
+        "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+        "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+        "relative_ref": "cases/UF-038-cli-allows-owner-rejects-zip",
+        "execution_outcome": "error",
+        "exit_code": 2,
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle-second-round"
+      },
+      "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18",
+      "applicable_from": "upload-filing-second-round-conformance-after-47e78b23",
+      "supersedes": "upload_filing.UF-038-cli-allows-owner-rejects-zip@1",
       "superseded_by": null
     },
     {
@@ -130170,7 +131277,7 @@
       "scenario_id": "upload_filing.UF-W08-debug-log-file",
       "source_scenario_id": "UF-W08-debug-log-file",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "upload_filing",
       "path_kind": "calibration-workspace",
       "coverage_claims": {
@@ -130292,6 +131399,134 @@
       "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
       "applicable_from": "next-upload_filing-run-after-256786b2",
       "supersedes": null,
+      "superseded_by": "upload_filing.UF-W08-debug-log-file@2"
+    },
+    {
+      "scenario_id": "upload_filing.UF-W08-debug-log-file",
+      "source_scenario_id": "UF-W08-debug-log-file",
+      "version": 2,
+      "status": "accepted",
+      "command": "upload_filing",
+      "path_kind": "calibration-workspace",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "parameter:--base",
+          "parameter:--debug",
+          "parameter:--log-file",
+          "parameter:--ticker",
+          "parameter:--action",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name"
+        ],
+        "precondition_state_ids": [
+          "observed:workspace:UF-W08-debug-log-file"
+        ],
+        "interactive_branch_option_ids": [],
+        "input_class_ids": [
+          "input:workspace"
+        ],
+        "combination_high_risk_ids": [
+          "risk:UF-W08-debug-log-file"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "parameter:--base",
+          "parameter:--debug",
+          "parameter:--log-file",
+          "parameter:--ticker",
+          "parameter:--action",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "precondition:observed:workspace:UF-W08-debug-log-file",
+          "input:workspace",
+          "risk:UF-W08-debug-log-file"
+        ]
+      },
+      "invocation": {
+        "argv": [
+          "dayu-cli",
+          "upload_filing",
+          "--base",
+          "<run-root>/workspaces/replacements/exact-registry/workspace-options/debug-log",
+          "--debug",
+          "--log-file",
+          "<main-evidence-root>/evidence/workspace-debug.log",
+          "--ticker",
+          "WLOG",
+          "--action",
+          "create",
+          "--files",
+          "<main-evidence-root>/inputs/probe.txt",
+          "--fiscal-year",
+          "2024",
+          "--fiscal-period",
+          "FY",
+          "--company-name",
+          "WLOG Corp."
+        ],
+        "cwd": "<repo-root>",
+        "stdin": "DEVNULL; no bytes supplied",
+        "input_description": [
+          "input-class:workspace"
+        ],
+        "key_actions": [],
+        "unset_environment_names": []
+      },
+      "precondition": {
+        "state_id": "observed:workspace:UF-W08-debug-log-file",
+        "workspace": "<run-root>/workspaces/replacements/exact-registry/workspace-options/debug-log",
+        "setup_steps": [
+          "预创建 --log-file 的父目录，再执行冻结 argv。"
+        ]
+      },
+      "accepted_oracle_refs": [
+        "cli.upload_filing.document-publication@1"
+      ],
+      "oracle_predicate_refs": [
+        "upload_filing.workspace-and-log-wiring"
+      ],
+      "correctness_surfaces": [
+        "upload_filing.workspace-and-log-wiring"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "fixed-real-input-or-real-public-financial-source",
+        "mock-fake-provider-and-converter-forbidden",
+        "secret-values-never-projected"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 600.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-cwd-and-non-secret-environment",
+        "stdin-or-signal-timeline",
+        "stdout-stderr-screen-exit-and-duration",
+        "filesystem-before-after-and-diff",
+        "source-meta-manifest-original-and-docling-digests-or-not-applicable-proof",
+        "fins-public-state-and-summary-reconciliation",
+        "host-runtime-sqlite-eventlog-tool-trace-or-queried-absent-proof",
+        "cross-command-production-consumption-when-declared",
+        "log-and-secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_id": "upload-filing-final-calibration-20260818-y6gLgs",
+        "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+        "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+        "relative_ref": "cases/R2-UF-W08-debug-log-file",
+        "execution_outcome": "success",
+        "exit_code": 0,
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle-second-round"
+      },
+      "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18",
+      "applicable_from": "upload-filing-second-round-conformance-after-47e78b23",
+      "supersedes": "upload_filing.UF-W08-debug-log-file@1",
       "superseded_by": null
     },
     {
@@ -131293,7 +132528,7 @@
       "scenario_id": "upload_filing.UF-A08-update-missing-overwrite-creates",
       "source_scenario_id": "UF-A08-update-missing-overwrite-creates",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "upload_filing",
       "path_kind": "calibration-action",
       "coverage_claims": {
@@ -131415,13 +132650,141 @@
       "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
       "applicable_from": "next-upload_filing-run-after-256786b2",
       "supersedes": null,
+      "superseded_by": "upload_filing.UF-A08-update-missing-overwrite-rejected@1"
+    },
+    {
+      "scenario_id": "upload_filing.UF-A08-update-missing-overwrite-rejected",
+      "source_scenario_id": "UF-A08-update-missing-overwrite-rejected",
+      "version": 1,
+      "status": "accepted",
+      "command": "upload_filing",
+      "path_kind": "calibration-action",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--action",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--overwrite"
+        ],
+        "precondition_state_ids": [
+          "observed:action:UF-A08-update-missing-overwrite-rejected"
+        ],
+        "interactive_branch_option_ids": [],
+        "input_class_ids": [
+          "input:action"
+        ],
+        "combination_high_risk_ids": [
+          "risk:UF-A08-update-missing-overwrite-rejected"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--action",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--overwrite",
+          "precondition:observed:action:UF-A08-update-missing-overwrite-rejected",
+          "input:action",
+          "risk:UF-A08-update-missing-overwrite-rejected"
+        ]
+      },
+      "invocation": {
+        "argv": [
+          "dayu-cli",
+          "upload_filing",
+          "--base",
+          "<run-root>/workspaces/UF-actions",
+          "--ticker",
+          "BETA",
+          "--action",
+          "update",
+          "--files",
+          "<main-evidence-root>/inputs/probe.txt",
+          "--fiscal-year",
+          "2024",
+          "--fiscal-period",
+          "FY",
+          "--company-name",
+          "Beta Corp.",
+          "--overwrite"
+        ],
+        "cwd": "<repo-root>",
+        "stdin": "DEVNULL; no bytes supplied",
+        "input_description": [
+          "input-class:action"
+        ],
+        "key_actions": [],
+        "unset_environment_names": []
+      },
+      "precondition": {
+        "state_id": "observed:action:UF-A08-update-missing-overwrite-rejected",
+        "workspace": "<run-root>/workspaces/UF-actions",
+        "setup_steps": [
+          "使用隔离 fresh workspace 与冻结真实输入，按本轮 exact argv 执行。"
+        ]
+      },
+      "accepted_oracle_refs": [
+        "cli.upload_filing.document-publication@1"
+      ],
+      "oracle_predicate_refs": [
+        "upload_filing.action-core",
+        "upload_filing.irrelevant-and-repeated-options",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "correctness_surfaces": [
+        "upload_filing.action-core",
+        "upload_filing.irrelevant-and-repeated-options",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "fixed-real-input-or-real-public-financial-source",
+        "mock-fake-provider-and-converter-forbidden",
+        "secret-values-never-projected"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 600.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-cwd-and-non-secret-environment",
+        "stdin-or-signal-timeline",
+        "stdout-stderr-screen-exit-and-duration",
+        "filesystem-before-after-and-diff",
+        "source-meta-manifest-original-and-docling-digests-or-not-applicable-proof",
+        "fins-public-state-and-summary-reconciliation",
+        "host-runtime-sqlite-eventlog-tool-trace-or-queried-absent-proof",
+        "cross-command-production-consumption-when-declared",
+        "log-and-secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_id": "upload-filing-final-calibration-20260818-y6gLgs",
+        "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+        "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+        "relative_ref": "cases/UF-A08-update-missing-overwrite-creates",
+        "execution_outcome": "error",
+        "exit_code": 2,
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle-second-round"
+      },
+      "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18",
+      "applicable_from": "upload-filing-second-round-conformance-after-47e78b23",
+      "supersedes": "upload_filing.UF-A08-update-missing-overwrite-creates@1",
       "superseded_by": null
     },
     {
       "scenario_id": "upload_filing.UF-A09-delete-existing",
       "source_scenario_id": "UF-A09-delete-existing",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "upload_filing",
       "path_kind": "calibration-action",
       "coverage_claims": {
@@ -131532,13 +132895,130 @@
       "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
       "applicable_from": "next-upload_filing-run-after-256786b2",
       "supersedes": null,
+      "superseded_by": "upload_filing.UF-A09-delete-existing@2"
+    },
+    {
+      "scenario_id": "upload_filing.UF-A09-delete-existing",
+      "source_scenario_id": "UF-A09-delete-existing",
+      "version": 2,
+      "status": "accepted",
+      "command": "upload_filing",
+      "path_kind": "calibration-action",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--action",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period"
+        ],
+        "precondition_state_ids": [
+          "observed:action:UF-A09-delete-existing"
+        ],
+        "interactive_branch_option_ids": [],
+        "input_class_ids": [
+          "input:action"
+        ],
+        "combination_high_risk_ids": [
+          "risk:UF-A09-delete-existing"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--action",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "precondition:observed:action:UF-A09-delete-existing",
+          "input:action",
+          "risk:UF-A09-delete-existing"
+        ]
+      },
+      "invocation": {
+        "argv": [
+          "dayu-cli",
+          "upload_filing",
+          "--base",
+          "<run-root>/workspaces/replacements/PF02-action-chain",
+          "--ticker",
+          "PFAC",
+          "--action",
+          "delete",
+          "--fiscal-year",
+          "2024",
+          "--fiscal-period",
+          "FY"
+        ],
+        "cwd": "<repo-root>",
+        "stdin": "DEVNULL; no bytes supplied",
+        "input_description": [
+          "input-class:action"
+        ],
+        "key_actions": [],
+        "unset_environment_names": []
+      },
+      "precondition": {
+        "state_id": "observed:action:UF-A09-delete-existing",
+        "workspace": "<run-root>/workspaces/replacements/PF02-action-chain",
+        "setup_steps": [
+          "在隔离 workspace 先 create 并完成同名/改名 update，形成 existing filing 后执行 delete。"
+        ]
+      },
+      "accepted_oracle_refs": [
+        "cli.upload_filing.document-publication@1"
+      ],
+      "oracle_predicate_refs": [
+        "upload_filing.action-core",
+        "upload_filing.irrelevant-and-repeated-options",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "correctness_surfaces": [
+        "upload_filing.action-core",
+        "upload_filing.irrelevant-and-repeated-options",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "fixed-real-input-or-real-public-financial-source",
+        "mock-fake-provider-and-converter-forbidden",
+        "secret-values-never-projected"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 600.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-cwd-and-non-secret-environment",
+        "stdin-or-signal-timeline",
+        "stdout-stderr-screen-exit-and-duration",
+        "filesystem-before-after-and-diff",
+        "source-meta-manifest-original-and-docling-digests-or-not-applicable-proof",
+        "fins-public-state-and-summary-reconciliation",
+        "host-runtime-sqlite-eventlog-tool-trace-or-queried-absent-proof",
+        "cross-command-production-consumption-when-declared",
+        "log-and-secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_id": "upload-filing-final-calibration-20260818-y6gLgs",
+        "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+        "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+        "relative_ref": "cases/R-PF02-07-delete-existing",
+        "execution_outcome": "success",
+        "exit_code": 0,
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle-second-round"
+      },
+      "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18",
+      "applicable_from": "upload-filing-second-round-conformance-after-47e78b23",
+      "supersedes": "upload_filing.UF-A09-delete-existing@1",
       "superseded_by": null
     },
     {
       "scenario_id": "upload_filing.UF-A10-delete-already-deleted",
       "source_scenario_id": "UF-A10-delete-already-deleted",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "upload_filing",
       "path_kind": "calibration-action",
       "coverage_claims": {
@@ -131649,6 +133129,123 @@
       "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
       "applicable_from": "next-upload_filing-run-after-256786b2",
       "supersedes": null,
+      "superseded_by": "upload_filing.UF-A10-delete-already-deleted@2"
+    },
+    {
+      "scenario_id": "upload_filing.UF-A10-delete-already-deleted",
+      "source_scenario_id": "UF-A10-delete-already-deleted",
+      "version": 2,
+      "status": "accepted",
+      "command": "upload_filing",
+      "path_kind": "calibration-action",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--action",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period"
+        ],
+        "precondition_state_ids": [
+          "observed:action:UF-A10-delete-already-deleted"
+        ],
+        "interactive_branch_option_ids": [],
+        "input_class_ids": [
+          "input:action"
+        ],
+        "combination_high_risk_ids": [
+          "risk:UF-A10-delete-already-deleted"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--action",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "precondition:observed:action:UF-A10-delete-already-deleted",
+          "input:action",
+          "risk:UF-A10-delete-already-deleted"
+        ]
+      },
+      "invocation": {
+        "argv": [
+          "dayu-cli",
+          "upload_filing",
+          "--base",
+          "<run-root>/workspaces/replacements/PF02-action-chain",
+          "--ticker",
+          "PFAC",
+          "--action",
+          "delete",
+          "--fiscal-year",
+          "2024",
+          "--fiscal-period",
+          "FY"
+        ],
+        "cwd": "<repo-root>",
+        "stdin": "DEVNULL; no bytes supplied",
+        "input_description": [
+          "input-class:action"
+        ],
+        "key_actions": [],
+        "unset_environment_names": []
+      },
+      "precondition": {
+        "state_id": "observed:action:UF-A10-delete-already-deleted",
+        "workspace": "<run-root>/workspaces/replacements/PF02-action-chain",
+        "setup_steps": [
+          "在隔离 workspace 建立 existing filing 并成功 delete 一次，再重复执行 delete。"
+        ]
+      },
+      "accepted_oracle_refs": [
+        "cli.upload_filing.document-publication@1"
+      ],
+      "oracle_predicate_refs": [
+        "upload_filing.action-core",
+        "upload_filing.irrelevant-and-repeated-options",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "correctness_surfaces": [
+        "upload_filing.action-core",
+        "upload_filing.irrelevant-and-repeated-options",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "fixed-real-input-or-real-public-financial-source",
+        "mock-fake-provider-and-converter-forbidden",
+        "secret-values-never-projected"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 600.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-cwd-and-non-secret-environment",
+        "stdin-or-signal-timeline",
+        "stdout-stderr-screen-exit-and-duration",
+        "filesystem-before-after-and-diff",
+        "source-meta-manifest-original-and-docling-digests-or-not-applicable-proof",
+        "fins-public-state-and-summary-reconciliation",
+        "host-runtime-sqlite-eventlog-tool-trace-or-queried-absent-proof",
+        "cross-command-production-consumption-when-declared",
+        "log-and-secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_id": "upload-filing-final-calibration-20260818-y6gLgs",
+        "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+        "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+        "relative_ref": "cases/R-PF02-08-delete-repeated",
+        "execution_outcome": "success",
+        "exit_code": 0,
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle-second-round"
+      },
+      "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18",
+      "applicable_from": "upload-filing-second-round-conformance-after-47e78b23",
+      "supersedes": "upload_filing.UF-A10-delete-already-deleted@1",
       "superseded_by": null
     },
     {
@@ -131772,7 +133369,7 @@
       "scenario_id": "upload_filing.UF-A12-auto-restores-deleted",
       "source_scenario_id": "UF-A12-auto-restores-deleted",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "upload_filing",
       "path_kind": "calibration-action",
       "coverage_claims": {
@@ -131889,6 +133486,129 @@
       "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
       "applicable_from": "next-upload_filing-run-after-256786b2",
       "supersedes": null,
+      "superseded_by": "upload_filing.UF-A12-auto-restores-deleted@2"
+    },
+    {
+      "scenario_id": "upload_filing.UF-A12-auto-restores-deleted",
+      "source_scenario_id": "UF-A12-auto-restores-deleted",
+      "version": 2,
+      "status": "accepted",
+      "command": "upload_filing",
+      "path_kind": "calibration-action",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name"
+        ],
+        "precondition_state_ids": [
+          "observed:action:UF-A12-auto-restores-deleted"
+        ],
+        "interactive_branch_option_ids": [],
+        "input_class_ids": [
+          "input:action"
+        ],
+        "combination_high_risk_ids": [
+          "risk:UF-A12-auto-restores-deleted"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "precondition:observed:action:UF-A12-auto-restores-deleted",
+          "input:action",
+          "risk:UF-A12-auto-restores-deleted"
+        ]
+      },
+      "invocation": {
+        "argv": [
+          "dayu-cli",
+          "upload_filing",
+          "--base",
+          "<run-root>/workspaces/replacements/PF02-action-chain",
+          "--ticker",
+          "PFAC",
+          "--files",
+          "<main-evidence-root>/inputs/replacement-pf02-renamed.txt",
+          "--fiscal-year",
+          "2024",
+          "--fiscal-period",
+          "FY",
+          "--company-name",
+          "PF Action Corp."
+        ],
+        "cwd": "<repo-root>",
+        "stdin": "DEVNULL; no bytes supplied",
+        "input_description": [
+          "input-class:action"
+        ],
+        "key_actions": [],
+        "unset_environment_names": []
+      },
+      "precondition": {
+        "state_id": "observed:action:UF-A12-auto-restores-deleted",
+        "workspace": "<run-root>/workspaces/replacements/PF02-action-chain",
+        "setup_steps": [
+          "在隔离 workspace 建立 filing、完成 update 并 delete，再以相同 filing identity 执行 auto。"
+        ]
+      },
+      "accepted_oracle_refs": [
+        "cli.upload_filing.document-publication@1"
+      ],
+      "oracle_predicate_refs": [
+        "upload_filing.action-core",
+        "upload_filing.irrelevant-and-repeated-options",
+        "upload_filing.direct-boundary-and-summary",
+        "upload_filing.auto-after-delete"
+      ],
+      "correctness_surfaces": [
+        "upload_filing.action-core",
+        "upload_filing.irrelevant-and-repeated-options",
+        "upload_filing.direct-boundary-and-summary",
+        "upload_filing.auto-after-delete"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "fixed-real-input-or-real-public-financial-source",
+        "mock-fake-provider-and-converter-forbidden",
+        "secret-values-never-projected"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 600.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-cwd-and-non-secret-environment",
+        "stdin-or-signal-timeline",
+        "stdout-stderr-screen-exit-and-duration",
+        "filesystem-before-after-and-diff",
+        "source-meta-manifest-original-and-docling-digests-or-not-applicable-proof",
+        "fins-public-state-and-summary-reconciliation",
+        "host-runtime-sqlite-eventlog-tool-trace-or-queried-absent-proof",
+        "cross-command-production-consumption-when-declared",
+        "log-and-secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_id": "upload-filing-final-calibration-20260818-y6gLgs",
+        "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+        "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+        "relative_ref": "cases/R-PF02-09-auto-after-delete",
+        "execution_outcome": "success",
+        "exit_code": 0,
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle-second-round"
+      },
+      "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18",
+      "applicable_from": "upload-filing-second-round-conformance-after-47e78b23",
+      "supersedes": "upload_filing.UF-A12-auto-restores-deleted@1",
       "superseded_by": null
     },
     {
@@ -133673,7 +135393,7 @@
       "scenario_id": "upload_filing.UF-F06-xls-ooxml-bytes",
       "source_scenario_id": "UF-F06-xls-ooxml-bytes",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "upload_filing",
       "path_kind": "calibration-format",
       "coverage_claims": {
@@ -133794,6 +135514,133 @@
       "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
       "applicable_from": "next-upload_filing-run-after-256786b2",
       "supersedes": null,
+      "superseded_by": "upload_filing.UF-F06-unsupported-xls-prevalidation@1"
+    },
+    {
+      "scenario_id": "upload_filing.UF-F06-unsupported-xls-prevalidation",
+      "source_scenario_id": "UF-F06-unsupported-xls-prevalidation",
+      "version": 1,
+      "status": "accepted",
+      "command": "upload_filing",
+      "path_kind": "calibration-format",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--action",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name"
+        ],
+        "precondition_state_ids": [
+          "observed:format:UF-F06-unsupported-xls-prevalidation"
+        ],
+        "interactive_branch_option_ids": [],
+        "input_class_ids": [
+          "input:format"
+        ],
+        "combination_high_risk_ids": [
+          "risk:UF-F06-unsupported-xls-prevalidation"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--action",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "precondition:observed:format:UF-F06-unsupported-xls-prevalidation",
+          "input:format",
+          "risk:UF-F06-unsupported-xls-prevalidation"
+        ]
+      },
+      "invocation": {
+        "argv": [
+          "dayu-cli",
+          "upload_filing",
+          "--base",
+          "<run-root>/workspaces/formats/UF-F06-unsupported-xls-prevalidation",
+          "--ticker",
+          "ZOLD",
+          "--action",
+          "create",
+          "--files",
+          "<main-evidence-root>/inputs/probe.xls",
+          "--fiscal-year",
+          "2024",
+          "--fiscal-period",
+          "FY",
+          "--company-name",
+          "ZOLD Corp."
+        ],
+        "cwd": "<repo-root>",
+        "stdin": "DEVNULL; no bytes supplied",
+        "input_description": [
+          "input-class:format"
+        ],
+        "key_actions": [],
+        "unset_environment_names": []
+      },
+      "precondition": {
+        "state_id": "observed:format:UF-F06-unsupported-xls-prevalidation",
+        "workspace": "<run-root>/workspaces/formats/UF-F06-unsupported-xls-prevalidation",
+        "setup_steps": [
+          "使用隔离 fresh workspace 与冻结真实输入，按本轮 exact argv 执行。"
+        ]
+      },
+      "accepted_oracle_refs": [
+        "cli.upload_filing.document-publication@1"
+      ],
+      "oracle_predicate_refs": [
+        "upload_filing.format-owner",
+        "upload_filing.malformed-and-empty-input",
+        "upload_filing.multi-file-and-primary",
+        "upload_filing.path-and-name-input"
+      ],
+      "correctness_surfaces": [
+        "upload_filing.format-owner",
+        "upload_filing.malformed-and-empty-input",
+        "upload_filing.multi-file-and-primary",
+        "upload_filing.path-and-name-input"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "fixed-real-input-or-real-public-financial-source",
+        "mock-fake-provider-and-converter-forbidden",
+        "secret-values-never-projected"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 600.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-cwd-and-non-secret-environment",
+        "stdin-or-signal-timeline",
+        "stdout-stderr-screen-exit-and-duration",
+        "filesystem-before-after-and-diff",
+        "source-meta-manifest-original-and-docling-digests-or-not-applicable-proof",
+        "fins-public-state-and-summary-reconciliation",
+        "host-runtime-sqlite-eventlog-tool-trace-or-queried-absent-proof",
+        "cross-command-production-consumption-when-declared",
+        "log-and-secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_id": "upload-filing-final-calibration-20260818-y6gLgs",
+        "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+        "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+        "relative_ref": "cases/UF-F06-xls-ooxml-bytes",
+        "execution_outcome": "error",
+        "exit_code": 2,
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle-second-round"
+      },
+      "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18",
+      "applicable_from": "upload-filing-second-round-conformance-after-47e78b23",
+      "supersedes": "upload_filing.UF-F06-xls-ooxml-bytes@1",
       "superseded_by": null
     },
     {
@@ -134308,7 +136155,7 @@
       "scenario_id": "upload_filing.UF-F11-multi-file",
       "source_scenario_id": "UF-F11-multi-file",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "upload_filing",
       "path_kind": "calibration-format",
       "coverage_claims": {
@@ -134430,6 +136277,136 @@
       "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
       "applicable_from": "next-upload_filing-run-after-256786b2",
       "supersedes": null,
+      "superseded_by": "upload_filing.UF-F11-multi-file@2"
+    },
+    {
+      "scenario_id": "upload_filing.UF-F11-multi-file",
+      "source_scenario_id": "UF-F11-multi-file",
+      "version": 2,
+      "status": "accepted",
+      "command": "upload_filing",
+      "path_kind": "calibration-format",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--action",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name"
+        ],
+        "precondition_state_ids": [
+          "observed:format:UF-F11-multi-file"
+        ],
+        "interactive_branch_option_ids": [],
+        "input_class_ids": [
+          "input:format"
+        ],
+        "combination_high_risk_ids": [
+          "risk:UF-F11-multi-file"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--action",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "precondition:observed:format:UF-F11-multi-file",
+          "input:format",
+          "risk:UF-F11-multi-file"
+        ]
+      },
+      "invocation": {
+        "argv": [
+          "dayu-cli",
+          "upload_filing",
+          "--base",
+          "<run-root>/workspaces/scenario-refresh/V2-UF-F11-multi-file",
+          "--ticker",
+          "ZMUL",
+          "--action",
+          "create",
+          "--files",
+          "<main-evidence-root>/inputs/probe.txt",
+          "<main-evidence-root>/inputs/probe.md",
+          "--primary",
+          "<main-evidence-root>/inputs/probe.txt",
+          "--fiscal-year",
+          "2024",
+          "--fiscal-period",
+          "FY",
+          "--company-name",
+          "ZMUL Corp."
+        ],
+        "cwd": "<repo-root>",
+        "stdin": "DEVNULL; no bytes supplied",
+        "input_description": [
+          "input-class:format"
+        ],
+        "key_actions": [],
+        "unset_environment_names": []
+      },
+      "precondition": {
+        "state_id": "observed:format:UF-F11-multi-file",
+        "workspace": "<run-root>/workspaces/scenario-refresh/V2-UF-F11-multi-file",
+        "setup_steps": [
+          "使用两个冻结真实输入，并显式指定属于 --files 的 primary。"
+        ]
+      },
+      "accepted_oracle_refs": [
+        "cli.upload_filing.document-publication@1"
+      ],
+      "oracle_predicate_refs": [
+        "upload_filing.format-owner",
+        "upload_filing.malformed-and-empty-input",
+        "upload_filing.multi-file-and-primary",
+        "upload_filing.path-and-name-input"
+      ],
+      "correctness_surfaces": [
+        "upload_filing.format-owner",
+        "upload_filing.malformed-and-empty-input",
+        "upload_filing.multi-file-and-primary",
+        "upload_filing.path-and-name-input"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "fixed-real-input-or-real-public-financial-source",
+        "mock-fake-provider-and-converter-forbidden",
+        "secret-values-never-projected"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 600.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-cwd-and-non-secret-environment",
+        "stdin-or-signal-timeline",
+        "stdout-stderr-screen-exit-and-duration",
+        "filesystem-before-after-and-diff",
+        "source-meta-manifest-original-and-docling-digests-or-not-applicable-proof",
+        "fins-public-state-and-summary-reconciliation",
+        "host-runtime-sqlite-eventlog-tool-trace-or-queried-absent-proof",
+        "cross-command-production-consumption-when-declared",
+        "log-and-secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_id": "upload-filing-final-calibration-20260818-y6gLgs",
+        "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+        "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+        "relative_ref": "cases/V2-UF-F11-multi-file",
+        "execution_outcome": "success",
+        "exit_code": 0,
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle-second-round"
+      },
+      "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18",
+      "applicable_from": "upload-filing-second-round-conformance-after-47e78b23",
+      "supersedes": "upload_filing.UF-F11-multi-file@1",
       "superseded_by": null
     },
     {
@@ -134564,7 +136541,7 @@
       "scenario_id": "upload_filing.UF-F13-duplicate-basename",
       "source_scenario_id": "UF-F13-duplicate-basename",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "upload_filing",
       "path_kind": "calibration-format",
       "coverage_claims": {
@@ -134686,6 +136663,136 @@
       "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
       "applicable_from": "next-upload_filing-run-after-256786b2",
       "supersedes": null,
+      "superseded_by": "upload_filing.UF-F13-duplicate-basename@2"
+    },
+    {
+      "scenario_id": "upload_filing.UF-F13-duplicate-basename",
+      "source_scenario_id": "UF-F13-duplicate-basename",
+      "version": 2,
+      "status": "accepted",
+      "command": "upload_filing",
+      "path_kind": "calibration-format",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--action",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name"
+        ],
+        "precondition_state_ids": [
+          "observed:format:UF-F13-duplicate-basename"
+        ],
+        "interactive_branch_option_ids": [],
+        "input_class_ids": [
+          "input:format"
+        ],
+        "combination_high_risk_ids": [
+          "risk:UF-F13-duplicate-basename"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--action",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "precondition:observed:format:UF-F13-duplicate-basename",
+          "input:format",
+          "risk:UF-F13-duplicate-basename"
+        ]
+      },
+      "invocation": {
+        "argv": [
+          "dayu-cli",
+          "upload_filing",
+          "--base",
+          "<run-root>/workspaces/scenario-refresh/V2-UF-F13-duplicate-basename",
+          "--ticker",
+          "ZBAS",
+          "--action",
+          "create",
+          "--files",
+          "<main-evidence-root>/inputs/probe.txt",
+          "<main-evidence-root>/inputs/duplicate/probe.txt",
+          "--primary",
+          "<main-evidence-root>/inputs/probe.txt",
+          "--fiscal-year",
+          "2024",
+          "--fiscal-period",
+          "FY",
+          "--company-name",
+          "ZBAS Corp."
+        ],
+        "cwd": "<repo-root>",
+        "stdin": "DEVNULL; no bytes supplied",
+        "input_description": [
+          "input-class:format"
+        ],
+        "key_actions": [],
+        "unset_environment_names": []
+      },
+      "precondition": {
+        "state_id": "observed:format:UF-F13-duplicate-basename",
+        "workspace": "<run-root>/workspaces/scenario-refresh/V2-UF-F13-duplicate-basename",
+        "setup_steps": [
+          "使用不同目录的同 basename 输入，并显式指定 primary。"
+        ]
+      },
+      "accepted_oracle_refs": [
+        "cli.upload_filing.document-publication@1"
+      ],
+      "oracle_predicate_refs": [
+        "upload_filing.format-owner",
+        "upload_filing.malformed-and-empty-input",
+        "upload_filing.multi-file-and-primary",
+        "upload_filing.path-and-name-input"
+      ],
+      "correctness_surfaces": [
+        "upload_filing.format-owner",
+        "upload_filing.malformed-and-empty-input",
+        "upload_filing.multi-file-and-primary",
+        "upload_filing.path-and-name-input"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "fixed-real-input-or-real-public-financial-source",
+        "mock-fake-provider-and-converter-forbidden",
+        "secret-values-never-projected"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 600.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-cwd-and-non-secret-environment",
+        "stdin-or-signal-timeline",
+        "stdout-stderr-screen-exit-and-duration",
+        "filesystem-before-after-and-diff",
+        "source-meta-manifest-original-and-docling-digests-or-not-applicable-proof",
+        "fins-public-state-and-summary-reconciliation",
+        "host-runtime-sqlite-eventlog-tool-trace-or-queried-absent-proof",
+        "cross-command-production-consumption-when-declared",
+        "log-and-secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_id": "upload-filing-final-calibration-20260818-y6gLgs",
+        "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+        "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+        "relative_ref": "cases/V2-UF-F13-duplicate-basename",
+        "execution_outcome": "success",
+        "exit_code": 0,
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle-second-round"
+      },
+      "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18",
+      "applicable_from": "upload-filing-second-round-conformance-after-47e78b23",
+      "supersedes": "upload_filing.UF-F13-duplicate-basename@1",
       "superseded_by": null
     },
     {
@@ -135896,7 +138003,7 @@
       "scenario_id": "upload_filing.UF-C05-real-msft-multi-file",
       "source_scenario_id": "UF-C05-real-msft-multi-file",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "upload_filing",
       "path_kind": "calibration-corpus",
       "coverage_claims": {
@@ -136017,13 +138124,142 @@
       "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
       "applicable_from": "next-upload_filing-run-after-256786b2",
       "supersedes": null,
+      "superseded_by": "upload_filing.UF-C05-real-msft-multi-file@2"
+    },
+    {
+      "scenario_id": "upload_filing.UF-C05-real-msft-multi-file",
+      "source_scenario_id": "UF-C05-real-msft-multi-file",
+      "version": 2,
+      "status": "accepted",
+      "command": "upload_filing",
+      "path_kind": "calibration-corpus",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--action",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name"
+        ],
+        "precondition_state_ids": [
+          "observed:corpus:UF-C05-real-msft-multi-file"
+        ],
+        "interactive_branch_option_ids": [],
+        "input_class_ids": [
+          "input:corpus"
+        ],
+        "combination_high_risk_ids": [
+          "risk:UF-C05-real-msft-multi-file"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--action",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "precondition:observed:corpus:UF-C05-real-msft-multi-file",
+          "input:corpus",
+          "risk:UF-C05-real-msft-multi-file"
+        ]
+      },
+      "invocation": {
+        "argv": [
+          "dayu-cli",
+          "upload_filing",
+          "--base",
+          "<run-root>/workspaces/replacements/PF06-real-msft-multi",
+          "--ticker",
+          "MSFT",
+          "--action",
+          "create",
+          "--files",
+          "<main-evidence-root>/inputs/real-corpus/msft_10q.docx",
+          "<main-evidence-root>/inputs/real-corpus/msft_financials.xlsx",
+          "<main-evidence-root>/inputs/real-corpus/msft_release.docx",
+          "--primary",
+          "<main-evidence-root>/inputs/real-corpus/msft_10q.docx",
+          "--fiscal-year",
+          "2025",
+          "--fiscal-period",
+          "Q3",
+          "--company-name",
+          "Microsoft Corp."
+        ],
+        "cwd": "<repo-root>",
+        "stdin": "DEVNULL; no bytes supplied",
+        "input_description": [
+          "input-class:corpus"
+        ],
+        "key_actions": [],
+        "unset_environment_names": []
+      },
+      "precondition": {
+        "state_id": "observed:corpus:UF-C05-real-msft-multi-file",
+        "workspace": "<run-root>/workspaces/replacements/PF06-real-msft-multi",
+        "setup_steps": [
+          "使用真实 MSFT 三文件，并显式指定 DOCX primary。"
+        ]
+      },
+      "accepted_oracle_refs": [
+        "cli.upload_filing.document-publication@1"
+      ],
+      "oracle_predicate_refs": [
+        "upload_filing.format-owner",
+        "upload_filing.multi-file-and-primary",
+        "upload_filing.real-market-cross-command"
+      ],
+      "correctness_surfaces": [
+        "upload_filing.format-owner",
+        "upload_filing.multi-file-and-primary",
+        "upload_filing.real-market-cross-command"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "fixed-real-input-or-real-public-financial-source",
+        "mock-fake-provider-and-converter-forbidden",
+        "secret-values-never-projected"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 1800.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-cwd-and-non-secret-environment",
+        "stdin-or-signal-timeline",
+        "stdout-stderr-screen-exit-and-duration",
+        "filesystem-before-after-and-diff",
+        "source-meta-manifest-original-and-docling-digests-or-not-applicable-proof",
+        "fins-public-state-and-summary-reconciliation",
+        "host-runtime-sqlite-eventlog-tool-trace-or-queried-absent-proof",
+        "cross-command-production-consumption-when-declared",
+        "log-and-secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_id": "upload-filing-final-calibration-20260818-y6gLgs",
+        "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+        "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+        "relative_ref": "cases/R-PF06-real-msft-multi-primary",
+        "execution_outcome": "success",
+        "exit_code": 0,
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle-second-round"
+      },
+      "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18",
+      "applicable_from": "upload-filing-second-round-conformance-after-47e78b23",
+      "supersedes": "upload_filing.UF-C05-real-msft-multi-file@1",
       "superseded_by": null
     },
     {
       "scenario_id": "upload_filing.UF-C06-real-xbrl-html-xsd",
       "source_scenario_id": "UF-C06-real-xbrl-html-xsd",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "upload_filing",
       "path_kind": "calibration-corpus",
       "coverage_claims": {
@@ -136143,13 +138379,141 @@
       "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
       "applicable_from": "next-upload_filing-run-after-256786b2",
       "supersedes": null,
+      "superseded_by": "upload_filing.UF-C06-real-xbrl-html-xsd@2"
+    },
+    {
+      "scenario_id": "upload_filing.UF-C06-real-xbrl-html-xsd",
+      "source_scenario_id": "UF-C06-real-xbrl-html-xsd",
+      "version": 2,
+      "status": "accepted",
+      "command": "upload_filing",
+      "path_kind": "calibration-corpus",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--action",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name"
+        ],
+        "precondition_state_ids": [
+          "observed:corpus:UF-C06-real-xbrl-html-xsd"
+        ],
+        "interactive_branch_option_ids": [],
+        "input_class_ids": [
+          "input:corpus"
+        ],
+        "combination_high_risk_ids": [
+          "risk:UF-C06-real-xbrl-html-xsd"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--action",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "precondition:observed:corpus:UF-C06-real-xbrl-html-xsd",
+          "input:corpus",
+          "risk:UF-C06-real-xbrl-html-xsd"
+        ]
+      },
+      "invocation": {
+        "argv": [
+          "dayu-cli",
+          "upload_filing",
+          "--base",
+          "<run-root>/workspaces/focused/PF06-xbrl-primary-companion",
+          "--ticker",
+          "CME",
+          "--action",
+          "create",
+          "--files",
+          "<main-evidence-root>/inputs/real-corpus/cme_html.htm",
+          "<main-evidence-root>/inputs/real-corpus/cme_schema.xsd",
+          "--primary",
+          "<main-evidence-root>/inputs/real-corpus/cme_html.htm",
+          "--fiscal-year",
+          "2025",
+          "--fiscal-period",
+          "Q3",
+          "--company-name",
+          "CME Group Inc."
+        ],
+        "cwd": "<repo-root>",
+        "stdin": "DEVNULL; no bytes supplied",
+        "input_description": [
+          "input-class:corpus"
+        ],
+        "key_actions": [],
+        "unset_environment_names": []
+      },
+      "precondition": {
+        "state_id": "observed:corpus:UF-C06-real-xbrl-html-xsd",
+        "workspace": "<run-root>/workspaces/focused/PF06-xbrl-primary-companion",
+        "setup_steps": [
+          "使用真实 HTML 与 XSD companion，并显式指定 HTML primary。"
+        ]
+      },
+      "accepted_oracle_refs": [
+        "cli.upload_filing.document-publication@1"
+      ],
+      "oracle_predicate_refs": [
+        "upload_filing.format-owner",
+        "upload_filing.multi-file-and-primary",
+        "upload_filing.real-market-cross-command"
+      ],
+      "correctness_surfaces": [
+        "upload_filing.format-owner",
+        "upload_filing.multi-file-and-primary",
+        "upload_filing.real-market-cross-command"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "fixed-real-input-or-real-public-financial-source",
+        "mock-fake-provider-and-converter-forbidden",
+        "secret-values-never-projected"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 1800.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-cwd-and-non-secret-environment",
+        "stdin-or-signal-timeline",
+        "stdout-stderr-screen-exit-and-duration",
+        "filesystem-before-after-and-diff",
+        "source-meta-manifest-original-and-docling-digests-or-not-applicable-proof",
+        "fins-public-state-and-summary-reconciliation",
+        "host-runtime-sqlite-eventlog-tool-trace-or-queried-absent-proof",
+        "cross-command-production-consumption-when-declared",
+        "log-and-secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_id": "upload-filing-final-calibration-20260818-y6gLgs",
+        "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+        "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+        "relative_ref": "cases/PF06-xbrl-primary-companion",
+        "execution_outcome": "success",
+        "exit_code": 0,
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle-second-round"
+      },
+      "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18",
+      "applicable_from": "upload-filing-second-round-conformance-after-47e78b23",
+      "supersedes": "upload_filing.UF-C06-real-xbrl-html-xsd@1",
       "superseded_by": null
     },
     {
       "scenario_id": "upload_filing.UF-C07-real-xbrl-html-instance",
       "source_scenario_id": "UF-C07-real-xbrl-html-instance",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "upload_filing",
       "path_kind": "calibration-corpus",
       "coverage_claims": {
@@ -136269,13 +138633,141 @@
       "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
       "applicable_from": "next-upload_filing-run-after-256786b2",
       "supersedes": null,
+      "superseded_by": "upload_filing.UF-C07-real-xbrl-html-instance@2"
+    },
+    {
+      "scenario_id": "upload_filing.UF-C07-real-xbrl-html-instance",
+      "source_scenario_id": "UF-C07-real-xbrl-html-instance",
+      "version": 2,
+      "status": "accepted",
+      "command": "upload_filing",
+      "path_kind": "calibration-corpus",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--action",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name"
+        ],
+        "precondition_state_ids": [
+          "observed:corpus:UF-C07-real-xbrl-html-instance"
+        ],
+        "interactive_branch_option_ids": [],
+        "input_class_ids": [
+          "input:corpus"
+        ],
+        "combination_high_risk_ids": [
+          "risk:UF-C07-real-xbrl-html-instance"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--action",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "precondition:observed:corpus:UF-C07-real-xbrl-html-instance",
+          "input:corpus",
+          "risk:UF-C07-real-xbrl-html-instance"
+        ]
+      },
+      "invocation": {
+        "argv": [
+          "dayu-cli",
+          "upload_filing",
+          "--base",
+          "<run-root>/workspaces/scenario-refresh/V2-UF-C07-real-xbrl-html-instance",
+          "--ticker",
+          "CME",
+          "--action",
+          "create",
+          "--files",
+          "<main-evidence-root>/inputs/real-corpus/cme_html.htm",
+          "<main-evidence-root>/inputs/real-corpus/cme_instance.xml",
+          "--primary",
+          "<main-evidence-root>/inputs/real-corpus/cme_html.htm",
+          "--fiscal-year",
+          "2025",
+          "--fiscal-period",
+          "Q3",
+          "--company-name",
+          "CME Group Inc."
+        ],
+        "cwd": "<repo-root>",
+        "stdin": "DEVNULL; no bytes supplied",
+        "input_description": [
+          "input-class:corpus"
+        ],
+        "key_actions": [],
+        "unset_environment_names": []
+      },
+      "precondition": {
+        "state_id": "observed:corpus:UF-C07-real-xbrl-html-instance",
+        "workspace": "<run-root>/workspaces/scenario-refresh/V2-UF-C07-real-xbrl-html-instance",
+        "setup_steps": [
+          "使用真实 HTML 与 XML companion，并显式指定 HTML primary。"
+        ]
+      },
+      "accepted_oracle_refs": [
+        "cli.upload_filing.document-publication@1"
+      ],
+      "oracle_predicate_refs": [
+        "upload_filing.format-owner",
+        "upload_filing.multi-file-and-primary",
+        "upload_filing.real-market-cross-command"
+      ],
+      "correctness_surfaces": [
+        "upload_filing.format-owner",
+        "upload_filing.multi-file-and-primary",
+        "upload_filing.real-market-cross-command"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "fixed-real-input-or-real-public-financial-source",
+        "mock-fake-provider-and-converter-forbidden",
+        "secret-values-never-projected"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 1800.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-cwd-and-non-secret-environment",
+        "stdin-or-signal-timeline",
+        "stdout-stderr-screen-exit-and-duration",
+        "filesystem-before-after-and-diff",
+        "source-meta-manifest-original-and-docling-digests-or-not-applicable-proof",
+        "fins-public-state-and-summary-reconciliation",
+        "host-runtime-sqlite-eventlog-tool-trace-or-queried-absent-proof",
+        "cross-command-production-consumption-when-declared",
+        "log-and-secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_id": "upload-filing-final-calibration-20260818-y6gLgs",
+        "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+        "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+        "relative_ref": "cases/V2-UF-C07-real-xbrl-html-instance",
+        "execution_outcome": "success",
+        "exit_code": 0,
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle-second-round"
+      },
+      "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18",
+      "applicable_from": "upload-filing-second-round-conformance-after-47e78b23",
+      "supersedes": "upload_filing.UF-C07-real-xbrl-html-instance@1",
       "superseded_by": null
     },
     {
       "scenario_id": "upload_filing.UF-C05-real-msft-multi-file-process",
       "source_scenario_id": "UF-C05-real-msft-multi-file-process",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "upload_filing",
       "path_kind": "calibration-corpus",
       "coverage_claims": {
@@ -136380,6 +138872,117 @@
       "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
       "applicable_from": "next-upload_filing-run-after-256786b2",
       "supersedes": null,
+      "superseded_by": "upload_filing.UF-C05-real-msft-multi-file-process@2"
+    },
+    {
+      "scenario_id": "upload_filing.UF-C05-real-msft-multi-file-process",
+      "source_scenario_id": "UF-C05-real-msft-multi-file-process",
+      "version": 2,
+      "status": "accepted",
+      "command": "upload_filing",
+      "path_kind": "calibration-corpus",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--document-id"
+        ],
+        "precondition_state_ids": [
+          "observed:corpus:UF-C05-real-msft-multi-file-process"
+        ],
+        "interactive_branch_option_ids": [],
+        "input_class_ids": [
+          "input:corpus"
+        ],
+        "combination_high_risk_ids": [
+          "risk:UF-C05-real-msft-multi-file-process"
+        ],
+        "cross_command_assertion_ids": [
+          "cross-command:process_filing-production-consume"
+        ],
+        "raw_stable_claims": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--document-id",
+          "precondition:observed:corpus:UF-C05-real-msft-multi-file-process",
+          "input:corpus",
+          "risk:UF-C05-real-msft-multi-file-process"
+        ]
+      },
+      "invocation": {
+        "argv": [
+          "dayu-cli",
+          "process_filing",
+          "--base",
+          "<run-root>/workspaces/replacements/PF06-real-msft-multi",
+          "--ticker",
+          "MSFT",
+          "--document-id",
+          "fil_sec_9169e628177e275301682af298ca27cbf5a0527b"
+        ],
+        "cwd": "<repo-root>",
+        "stdin": "DEVNULL; no bytes supplied",
+        "input_description": [
+          "input-class:corpus"
+        ],
+        "key_actions": [],
+        "unset_environment_names": []
+      },
+      "precondition": {
+        "state_id": "observed:corpus:UF-C05-real-msft-multi-file-process",
+        "workspace": "<run-root>/workspaces/replacements/PF06-real-msft-multi",
+        "setup_steps": [
+          "先完成 UF-C05 version 2 的真实三文件 upload，再用公开 document id 执行 process_filing。"
+        ]
+      },
+      "accepted_oracle_refs": [
+        "cli.upload_filing.document-publication@1"
+      ],
+      "oracle_predicate_refs": [
+        "upload_filing.format-owner",
+        "upload_filing.multi-file-and-primary",
+        "upload_filing.real-market-cross-command"
+      ],
+      "correctness_surfaces": [
+        "upload_filing.format-owner",
+        "upload_filing.multi-file-and-primary",
+        "upload_filing.real-market-cross-command"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "fixed-real-input-or-real-public-financial-source",
+        "mock-fake-provider-and-converter-forbidden",
+        "secret-values-never-projected"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 1800.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-cwd-and-non-secret-environment",
+        "stdin-or-signal-timeline",
+        "stdout-stderr-screen-exit-and-duration",
+        "filesystem-before-after-and-diff",
+        "source-meta-manifest-original-and-docling-digests-or-not-applicable-proof",
+        "fins-public-state-and-summary-reconciliation",
+        "host-runtime-sqlite-eventlog-tool-trace-or-queried-absent-proof",
+        "cross-command-production-consumption-when-declared",
+        "log-and-secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_id": "upload-filing-final-calibration-20260818-y6gLgs",
+        "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+        "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+        "relative_ref": "cases/R-PF06-real-msft-multi-process",
+        "execution_outcome": "success",
+        "exit_code": 0,
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle-second-round"
+      },
+      "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18",
+      "applicable_from": "upload-filing-second-round-conformance-after-47e78b23",
+      "supersedes": "upload_filing.UF-C05-real-msft-multi-file-process@1",
       "superseded_by": null
     },
     {
@@ -137739,7 +140342,7 @@
       "scenario_id": "upload_filing.UF-I12-valid-plus-corrupt-atomic",
       "source_scenario_id": "UF-I12-valid-plus-corrupt-atomic",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "upload_filing",
       "path_kind": "calibration-integrity",
       "coverage_claims": {
@@ -137857,6 +140460,134 @@
       "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
       "applicable_from": "next-upload_filing-run-after-256786b2",
       "supersedes": null,
+      "superseded_by": "upload_filing.UF-I12-valid-plus-corrupt-atomic@2"
+    },
+    {
+      "scenario_id": "upload_filing.UF-I12-valid-plus-corrupt-atomic",
+      "source_scenario_id": "UF-I12-valid-plus-corrupt-atomic",
+      "version": 2,
+      "status": "accepted",
+      "command": "upload_filing",
+      "path_kind": "calibration-integrity",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name"
+        ],
+        "precondition_state_ids": [
+          "observed:integrity:UF-I12-valid-plus-corrupt-atomic"
+        ],
+        "interactive_branch_option_ids": [],
+        "input_class_ids": [
+          "input:integrity"
+        ],
+        "combination_high_risk_ids": [
+          "risk:UF-I12-valid-plus-corrupt-atomic"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "precondition:observed:integrity:UF-I12-valid-plus-corrupt-atomic",
+          "input:integrity",
+          "risk:UF-I12-valid-plus-corrupt-atomic"
+        ]
+      },
+      "invocation": {
+        "argv": [
+          "dayu-cli",
+          "upload_filing",
+          "--base",
+          "<run-root>/workspaces/scenario-refresh/V2-UF-I12-valid-plus-corrupt-atomic",
+          "--ticker",
+          "ICMX",
+          "--action",
+          "create",
+          "--files",
+          "<main-evidence-root>/inputs/probe.txt",
+          "<main-evidence-root>/inputs/corrupt.pdf",
+          "--primary",
+          "<main-evidence-root>/inputs/corrupt.pdf",
+          "--fiscal-year",
+          "2024",
+          "--fiscal-period",
+          "FY",
+          "--company-name",
+          "ICMX Corp."
+        ],
+        "cwd": "<repo-root>",
+        "stdin": "DEVNULL; no bytes supplied",
+        "input_description": [
+          "input-class:integrity"
+        ],
+        "key_actions": [],
+        "unset_environment_names": []
+      },
+      "precondition": {
+        "state_id": "observed:integrity:UF-I12-valid-plus-corrupt-atomic",
+        "workspace": "<run-root>/workspaces/scenario-refresh/V2-UF-I12-valid-plus-corrupt-atomic",
+        "setup_steps": [
+          "使用有效 TXT 与损坏 PDF，并显式指定损坏 PDF 为 primary。"
+        ]
+      },
+      "accepted_oracle_refs": [
+        "cli.upload_filing.document-publication@1"
+      ],
+      "oracle_predicate_refs": [
+        "upload_filing.existing-source-integrity",
+        "upload_filing.malformed-and-empty-input",
+        "upload_filing.company-meta-refresh",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "correctness_surfaces": [
+        "upload_filing.existing-source-integrity",
+        "upload_filing.malformed-and-empty-input",
+        "upload_filing.company-meta-refresh",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "fixed-real-input-or-real-public-financial-source",
+        "mock-fake-provider-and-converter-forbidden",
+        "secret-values-never-projected"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 600.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-cwd-and-non-secret-environment",
+        "stdin-or-signal-timeline",
+        "stdout-stderr-screen-exit-and-duration",
+        "filesystem-before-after-and-diff",
+        "source-meta-manifest-original-and-docling-digests-or-not-applicable-proof",
+        "fins-public-state-and-summary-reconciliation",
+        "host-runtime-sqlite-eventlog-tool-trace-or-queried-absent-proof",
+        "cross-command-production-consumption-when-declared",
+        "log-and-secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_id": "upload-filing-final-calibration-20260818-y6gLgs",
+        "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+        "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+        "relative_ref": "cases/V2-UF-I12-valid-plus-corrupt-atomic",
+        "execution_outcome": "error",
+        "exit_code": 1,
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle-second-round"
+      },
+      "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18",
+      "applicable_from": "upload-filing-second-round-conformance-after-47e78b23",
+      "supersedes": "upload_filing.UF-I12-valid-plus-corrupt-atomic@1",
       "superseded_by": null
     },
     {
@@ -138109,7 +140840,7 @@
       "scenario_id": "upload_filing.UF-I15-stale-company-refresh",
       "source_scenario_id": "UF-I15-stale-company-refresh",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "upload_filing",
       "path_kind": "calibration-integrity",
       "coverage_claims": {
@@ -138226,13 +140957,136 @@
       "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
       "applicable_from": "next-upload_filing-run-after-256786b2",
       "supersedes": null,
+      "superseded_by": "upload_filing.UF-I15-stale-company-refresh@2"
+    },
+    {
+      "scenario_id": "upload_filing.UF-I15-stale-company-refresh",
+      "source_scenario_id": "UF-I15-stale-company-refresh",
+      "version": 2,
+      "status": "accepted",
+      "command": "upload_filing",
+      "path_kind": "calibration-integrity",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name"
+        ],
+        "precondition_state_ids": [
+          "observed:integrity:UF-I15-stale-company-refresh"
+        ],
+        "interactive_branch_option_ids": [],
+        "input_class_ids": [
+          "input:integrity"
+        ],
+        "combination_high_risk_ids": [
+          "risk:UF-I15-stale-company-refresh"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "precondition:observed:integrity:UF-I15-stale-company-refresh",
+          "input:integrity",
+          "risk:UF-I15-stale-company-refresh"
+        ]
+      },
+      "invocation": {
+        "argv": [
+          "dayu-cli",
+          "upload_filing",
+          "--base",
+          "<run-root>/workspaces/replacements/PF11-stale",
+          "--ticker",
+          "STAL",
+          "--files",
+          "<main-evidence-root>/inputs/probe-v2.txt",
+          "--fiscal-year",
+          "2023",
+          "--fiscal-period",
+          "FY",
+          "--company-name",
+          "Refreshed Name"
+        ],
+        "cwd": "<repo-root>",
+        "stdin": "DEVNULL; no bytes supplied",
+        "input_description": [
+          "input-class:integrity"
+        ],
+        "key_actions": [],
+        "unset_environment_names": []
+      },
+      "precondition": {
+        "state_id": "observed:integrity:UF-I15-stale-company-refresh",
+        "workspace": "<run-root>/workspaces/replacements/PF11-stale",
+        "setup_steps": [
+          "先发布 baseline，再把 company meta resolver_version 改为旧版本，随后提供显式新名称上传新 filing。"
+        ]
+      },
+      "accepted_oracle_refs": [
+        "cli.upload_filing.document-publication@1"
+      ],
+      "oracle_predicate_refs": [
+        "upload_filing.existing-source-integrity",
+        "upload_filing.malformed-and-empty-input",
+        "upload_filing.company-meta-refresh",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "correctness_surfaces": [
+        "upload_filing.existing-source-integrity",
+        "upload_filing.malformed-and-empty-input",
+        "upload_filing.company-meta-refresh",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "fixed-real-input-or-real-public-financial-source",
+        "mock-fake-provider-and-converter-forbidden",
+        "secret-values-never-projected"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 600.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-cwd-and-non-secret-environment",
+        "stdin-or-signal-timeline",
+        "stdout-stderr-screen-exit-and-duration",
+        "filesystem-before-after-and-diff",
+        "source-meta-manifest-original-and-docling-digests-or-not-applicable-proof",
+        "fins-public-state-and-summary-reconciliation",
+        "host-runtime-sqlite-eventlog-tool-trace-or-queried-absent-proof",
+        "cross-command-production-consumption-when-declared",
+        "log-and-secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_id": "upload-filing-final-calibration-20260818-y6gLgs",
+        "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+        "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+        "relative_ref": "cases/R-PF11-stale-explicit-refresh",
+        "execution_outcome": "success",
+        "exit_code": 0,
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle-second-round"
+      },
+      "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18",
+      "applicable_from": "upload-filing-second-round-conformance-after-47e78b23",
+      "supersedes": "upload_filing.UF-I15-stale-company-refresh@1",
       "superseded_by": null
     },
     {
       "scenario_id": "upload_filing.UF-I16-stale-company-missing-name",
       "source_scenario_id": "UF-I16-stale-company-missing-name",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "upload_filing",
       "path_kind": "calibration-integrity",
       "coverage_claims": {
@@ -138345,6 +141199,125 @@
       "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
       "applicable_from": "next-upload_filing-run-after-256786b2",
       "supersedes": null,
+      "superseded_by": "upload_filing.UF-I16-stale-company-missing-name@2"
+    },
+    {
+      "scenario_id": "upload_filing.UF-I16-stale-company-missing-name",
+      "source_scenario_id": "UF-I16-stale-company-missing-name",
+      "version": 2,
+      "status": "accepted",
+      "command": "upload_filing",
+      "path_kind": "calibration-integrity",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period"
+        ],
+        "precondition_state_ids": [
+          "observed:integrity:UF-I16-stale-company-missing-name"
+        ],
+        "interactive_branch_option_ids": [],
+        "input_class_ids": [
+          "input:integrity"
+        ],
+        "combination_high_risk_ids": [
+          "risk:UF-I16-stale-company-missing-name"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "precondition:observed:integrity:UF-I16-stale-company-missing-name",
+          "input:integrity",
+          "risk:UF-I16-stale-company-missing-name"
+        ]
+      },
+      "invocation": {
+        "argv": [
+          "dayu-cli",
+          "upload_filing",
+          "--base",
+          "<run-root>/workspaces/replacements/PF11-stale",
+          "--ticker",
+          "STAL",
+          "--files",
+          "<main-evidence-root>/inputs/probe-v3.txt",
+          "--fiscal-year",
+          "2022",
+          "--fiscal-period",
+          "FY"
+        ],
+        "cwd": "<repo-root>",
+        "stdin": "DEVNULL; no bytes supplied",
+        "input_description": [
+          "input-class:integrity"
+        ],
+        "key_actions": [],
+        "unset_environment_names": []
+      },
+      "precondition": {
+        "state_id": "observed:integrity:UF-I16-stale-company-missing-name",
+        "workspace": "<run-root>/workspaces/replacements/PF11-stale",
+        "setup_steps": [
+          "先发布 baseline，再把 company meta resolver_version 改为旧版本，随后不提供 company name 上传新 filing。"
+        ]
+      },
+      "accepted_oracle_refs": [
+        "cli.upload_filing.document-publication@1"
+      ],
+      "oracle_predicate_refs": [
+        "upload_filing.existing-source-integrity",
+        "upload_filing.malformed-and-empty-input",
+        "upload_filing.company-meta-refresh",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "correctness_surfaces": [
+        "upload_filing.existing-source-integrity",
+        "upload_filing.malformed-and-empty-input",
+        "upload_filing.company-meta-refresh",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "fixed-real-input-or-real-public-financial-source",
+        "mock-fake-provider-and-converter-forbidden",
+        "secret-values-never-projected"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 600.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-cwd-and-non-secret-environment",
+        "stdin-or-signal-timeline",
+        "stdout-stderr-screen-exit-and-duration",
+        "filesystem-before-after-and-diff",
+        "source-meta-manifest-original-and-docling-digests-or-not-applicable-proof",
+        "fins-public-state-and-summary-reconciliation",
+        "host-runtime-sqlite-eventlog-tool-trace-or-queried-absent-proof",
+        "cross-command-production-consumption-when-declared",
+        "log-and-secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_id": "upload-filing-final-calibration-20260818-y6gLgs",
+        "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+        "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+        "relative_ref": "cases/R-PF11-stale-missing-name",
+        "execution_outcome": "error",
+        "exit_code": 2,
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle-second-round"
+      },
+      "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18",
+      "applicable_from": "upload-filing-second-round-conformance-after-47e78b23",
+      "supersedes": "upload_filing.UF-I16-stale-company-missing-name@1",
       "superseded_by": null
     },
     {
@@ -139540,7 +142513,7 @@
       "scenario_id": "upload_filing.UF-D01-create-baseline",
       "source_scenario_id": "UF-D01-create-baseline",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "upload_filing",
       "path_kind": "calibration-diagnostic",
       "coverage_claims": {
@@ -139664,13 +142637,143 @@
       "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
       "applicable_from": "next-upload_filing-run-after-256786b2",
       "supersedes": null,
+      "superseded_by": "upload_filing.UF-D01-create-baseline@2"
+    },
+    {
+      "scenario_id": "upload_filing.UF-D01-create-baseline",
+      "source_scenario_id": "UF-D01-create-baseline",
+      "version": 2,
+      "status": "accepted",
+      "command": "upload_filing",
+      "path_kind": "calibration-diagnostic",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--debug",
+          "parameter:--log-file"
+        ],
+        "precondition_state_ids": [
+          "observed:diagnostic:UF-D01-create-baseline"
+        ],
+        "interactive_branch_option_ids": [],
+        "input_class_ids": [
+          "input:diagnostic"
+        ],
+        "combination_high_risk_ids": [
+          "risk:UF-D01-create-baseline"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--debug",
+          "parameter:--log-file",
+          "precondition:observed:diagnostic:UF-D01-create-baseline",
+          "input:diagnostic",
+          "risk:UF-D01-create-baseline"
+        ]
+      },
+      "invocation": {
+        "argv": [
+          "dayu-cli",
+          "upload_filing",
+          "--base",
+          "<run-root>/workspaces/replacements/exact-registry/diagnostics/update-chain",
+          "--ticker",
+          "DUPD",
+          "--files",
+          "<main-evidence-root>/inputs/diagnostic-same-name.txt",
+          "--fiscal-year",
+          "2024",
+          "--fiscal-period",
+          "FY",
+          "--company-name",
+          "Diagnostic Update Corp.",
+          "--debug",
+          "--log-file",
+          "<main-evidence-root>/evidence/diagnostic-logs/UF-D01-create-baseline.log"
+        ],
+        "cwd": "<repo-root>",
+        "stdin": "DEVNULL; no bytes supplied",
+        "input_description": [
+          "input-class:diagnostic"
+        ],
+        "key_actions": [],
+        "unset_environment_names": []
+      },
+      "precondition": {
+        "state_id": "observed:diagnostic:UF-D01-create-baseline",
+        "workspace": "<run-root>/workspaces/replacements/exact-registry/diagnostics/update-chain",
+        "setup_steps": [
+          "预创建全部 operator log 父目录，再建立 diagnostic update baseline。"
+        ]
+      },
+      "accepted_oracle_refs": [
+        "cli.upload_filing.document-publication@1"
+      ],
+      "oracle_predicate_refs": [
+        "upload_filing.workspace-and-log-wiring",
+        "upload_filing.renamed-update",
+        "upload_filing.multi-file-and-primary",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "correctness_surfaces": [
+        "upload_filing.workspace-and-log-wiring",
+        "upload_filing.renamed-update",
+        "upload_filing.multi-file-and-primary",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "fixed-real-input-or-real-public-financial-source",
+        "mock-fake-provider-and-converter-forbidden",
+        "secret-values-never-projected"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 600.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-cwd-and-non-secret-environment",
+        "stdin-or-signal-timeline",
+        "stdout-stderr-screen-exit-and-duration",
+        "filesystem-before-after-and-diff",
+        "source-meta-manifest-original-and-docling-digests-or-not-applicable-proof",
+        "fins-public-state-and-summary-reconciliation",
+        "host-runtime-sqlite-eventlog-tool-trace-or-queried-absent-proof",
+        "cross-command-production-consumption-when-declared",
+        "log-and-secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_id": "upload-filing-final-calibration-20260818-y6gLgs",
+        "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+        "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+        "relative_ref": "cases/R2-UF-D01-create-baseline",
+        "execution_outcome": "success",
+        "exit_code": 0,
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle-second-round"
+      },
+      "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18",
+      "applicable_from": "upload-filing-second-round-conformance-after-47e78b23",
+      "supersedes": "upload_filing.UF-D01-create-baseline@1",
       "superseded_by": null
     },
     {
       "scenario_id": "upload_filing.UF-D02-auto-changed-same-name",
       "source_scenario_id": "UF-D02-auto-changed-same-name",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "upload_filing",
       "path_kind": "calibration-diagnostic",
       "coverage_claims": {
@@ -139794,13 +142897,143 @@
       "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
       "applicable_from": "next-upload_filing-run-after-256786b2",
       "supersedes": null,
+      "superseded_by": "upload_filing.UF-D02-auto-changed-same-name@2"
+    },
+    {
+      "scenario_id": "upload_filing.UF-D02-auto-changed-same-name",
+      "source_scenario_id": "UF-D02-auto-changed-same-name",
+      "version": 2,
+      "status": "accepted",
+      "command": "upload_filing",
+      "path_kind": "calibration-diagnostic",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--debug",
+          "parameter:--log-file"
+        ],
+        "precondition_state_ids": [
+          "observed:diagnostic:UF-D02-auto-changed-same-name"
+        ],
+        "interactive_branch_option_ids": [],
+        "input_class_ids": [
+          "input:diagnostic"
+        ],
+        "combination_high_risk_ids": [
+          "risk:UF-D02-auto-changed-same-name"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--debug",
+          "parameter:--log-file",
+          "precondition:observed:diagnostic:UF-D02-auto-changed-same-name",
+          "input:diagnostic",
+          "risk:UF-D02-auto-changed-same-name"
+        ]
+      },
+      "invocation": {
+        "argv": [
+          "dayu-cli",
+          "upload_filing",
+          "--base",
+          "<run-root>/workspaces/replacements/exact-registry/diagnostics/update-chain",
+          "--ticker",
+          "DUPD",
+          "--files",
+          "<main-evidence-root>/inputs/diagnostic-same-name.txt",
+          "--fiscal-year",
+          "2024",
+          "--fiscal-period",
+          "FY",
+          "--company-name",
+          "Diagnostic Update Corp.",
+          "--debug",
+          "--log-file",
+          "<main-evidence-root>/evidence/diagnostic-logs/UF-D02-auto-changed-same-name.log"
+        ],
+        "cwd": "<repo-root>",
+        "stdin": "DEVNULL; no bytes supplied",
+        "input_description": [
+          "input-class:diagnostic"
+        ],
+        "key_actions": [],
+        "unset_environment_names": []
+      },
+      "precondition": {
+        "state_id": "observed:diagnostic:UF-D02-auto-changed-same-name",
+        "workspace": "<run-root>/workspaces/replacements/exact-registry/diagnostics/update-chain",
+        "setup_steps": [
+          "复用 D01 baseline，替换同名冻结输入内容并预创建 log 父目录，再执行 auto。"
+        ]
+      },
+      "accepted_oracle_refs": [
+        "cli.upload_filing.document-publication@1"
+      ],
+      "oracle_predicate_refs": [
+        "upload_filing.workspace-and-log-wiring",
+        "upload_filing.renamed-update",
+        "upload_filing.multi-file-and-primary",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "correctness_surfaces": [
+        "upload_filing.workspace-and-log-wiring",
+        "upload_filing.renamed-update",
+        "upload_filing.multi-file-and-primary",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "fixed-real-input-or-real-public-financial-source",
+        "mock-fake-provider-and-converter-forbidden",
+        "secret-values-never-projected"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 600.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-cwd-and-non-secret-environment",
+        "stdin-or-signal-timeline",
+        "stdout-stderr-screen-exit-and-duration",
+        "filesystem-before-after-and-diff",
+        "source-meta-manifest-original-and-docling-digests-or-not-applicable-proof",
+        "fins-public-state-and-summary-reconciliation",
+        "host-runtime-sqlite-eventlog-tool-trace-or-queried-absent-proof",
+        "cross-command-production-consumption-when-declared",
+        "log-and-secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_id": "upload-filing-final-calibration-20260818-y6gLgs",
+        "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+        "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+        "relative_ref": "cases/R2-UF-D02-auto-changed-same-name",
+        "execution_outcome": "success",
+        "exit_code": 0,
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle-second-round"
+      },
+      "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18",
+      "applicable_from": "upload-filing-second-round-conformance-after-47e78b23",
+      "supersedes": "upload_filing.UF-D02-auto-changed-same-name@1",
       "superseded_by": null
     },
     {
       "scenario_id": "upload_filing.UF-D03-auto-changed-different-name",
       "source_scenario_id": "UF-D03-auto-changed-different-name",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "upload_filing",
       "path_kind": "calibration-diagnostic",
       "coverage_claims": {
@@ -139924,13 +143157,143 @@
       "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
       "applicable_from": "next-upload_filing-run-after-256786b2",
       "supersedes": null,
+      "superseded_by": "upload_filing.UF-D03-auto-changed-different-name@2"
+    },
+    {
+      "scenario_id": "upload_filing.UF-D03-auto-changed-different-name",
+      "source_scenario_id": "UF-D03-auto-changed-different-name",
+      "version": 2,
+      "status": "accepted",
+      "command": "upload_filing",
+      "path_kind": "calibration-diagnostic",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--debug",
+          "parameter:--log-file"
+        ],
+        "precondition_state_ids": [
+          "observed:diagnostic:UF-D03-auto-changed-different-name"
+        ],
+        "interactive_branch_option_ids": [],
+        "input_class_ids": [
+          "input:diagnostic"
+        ],
+        "combination_high_risk_ids": [
+          "risk:UF-D03-auto-changed-different-name"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--debug",
+          "parameter:--log-file",
+          "precondition:observed:diagnostic:UF-D03-auto-changed-different-name",
+          "input:diagnostic",
+          "risk:UF-D03-auto-changed-different-name"
+        ]
+      },
+      "invocation": {
+        "argv": [
+          "dayu-cli",
+          "upload_filing",
+          "--base",
+          "<run-root>/workspaces/replacements/exact-registry/diagnostics/update-chain",
+          "--ticker",
+          "DUPD",
+          "--files",
+          "<main-evidence-root>/inputs/diagnostic-renamed.txt",
+          "--fiscal-year",
+          "2024",
+          "--fiscal-period",
+          "FY",
+          "--company-name",
+          "Diagnostic Update Corp.",
+          "--debug",
+          "--log-file",
+          "<main-evidence-root>/evidence/diagnostic-logs/UF-D03-auto-changed-different-name.log"
+        ],
+        "cwd": "<repo-root>",
+        "stdin": "DEVNULL; no bytes supplied",
+        "input_description": [
+          "input-class:diagnostic"
+        ],
+        "key_actions": [],
+        "unset_environment_names": []
+      },
+      "precondition": {
+        "state_id": "observed:diagnostic:UF-D03-auto-changed-different-name",
+        "workspace": "<run-root>/workspaces/replacements/exact-registry/diagnostics/update-chain",
+        "setup_steps": [
+          "复用 D02 filing identity，提供改名冻结输入并预创建 log 父目录，再执行 auto。"
+        ]
+      },
+      "accepted_oracle_refs": [
+        "cli.upload_filing.document-publication@1"
+      ],
+      "oracle_predicate_refs": [
+        "upload_filing.workspace-and-log-wiring",
+        "upload_filing.renamed-update",
+        "upload_filing.multi-file-and-primary",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "correctness_surfaces": [
+        "upload_filing.workspace-and-log-wiring",
+        "upload_filing.renamed-update",
+        "upload_filing.multi-file-and-primary",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "fixed-real-input-or-real-public-financial-source",
+        "mock-fake-provider-and-converter-forbidden",
+        "secret-values-never-projected"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 600.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-cwd-and-non-secret-environment",
+        "stdin-or-signal-timeline",
+        "stdout-stderr-screen-exit-and-duration",
+        "filesystem-before-after-and-diff",
+        "source-meta-manifest-original-and-docling-digests-or-not-applicable-proof",
+        "fins-public-state-and-summary-reconciliation",
+        "host-runtime-sqlite-eventlog-tool-trace-or-queried-absent-proof",
+        "cross-command-production-consumption-when-declared",
+        "log-and-secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_id": "upload-filing-final-calibration-20260818-y6gLgs",
+        "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+        "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+        "relative_ref": "cases/R2-UF-D03-auto-changed-different-name",
+        "execution_outcome": "success",
+        "exit_code": 0,
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle-second-round"
+      },
+      "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18",
+      "applicable_from": "upload-filing-second-round-conformance-after-47e78b23",
+      "supersedes": "upload_filing.UF-D03-auto-changed-different-name@1",
       "superseded_by": null
     },
     {
       "scenario_id": "upload_filing.UF-D04-multi-distinct-stems",
       "source_scenario_id": "UF-D04-multi-distinct-stems",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "upload_filing",
       "path_kind": "calibration-diagnostic",
       "coverage_claims": {
@@ -140059,13 +143422,150 @@
       "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
       "applicable_from": "next-upload_filing-run-after-256786b2",
       "supersedes": null,
+      "superseded_by": "upload_filing.UF-D04-multi-distinct-stems@2"
+    },
+    {
+      "scenario_id": "upload_filing.UF-D04-multi-distinct-stems",
+      "source_scenario_id": "UF-D04-multi-distinct-stems",
+      "version": 2,
+      "status": "accepted",
+      "command": "upload_filing",
+      "path_kind": "calibration-diagnostic",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--action",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--debug",
+          "parameter:--log-file"
+        ],
+        "precondition_state_ids": [
+          "observed:diagnostic:UF-D04-multi-distinct-stems"
+        ],
+        "interactive_branch_option_ids": [],
+        "input_class_ids": [
+          "input:diagnostic"
+        ],
+        "combination_high_risk_ids": [
+          "risk:UF-D04-multi-distinct-stems"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--action",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--debug",
+          "parameter:--log-file",
+          "precondition:observed:diagnostic:UF-D04-multi-distinct-stems",
+          "input:diagnostic",
+          "risk:UF-D04-multi-distinct-stems"
+        ]
+      },
+      "invocation": {
+        "argv": [
+          "dayu-cli",
+          "upload_filing",
+          "--base",
+          "<run-root>/workspaces/scenario-refresh/V2-UF-D04-multi-distinct-stems",
+          "--ticker",
+          "TEMS",
+          "--action",
+          "create",
+          "--files",
+          "<main-evidence-root>/inputs/probe.txt",
+          "<main-evidence-root>/inputs/probe-v2.txt",
+          "--primary",
+          "<main-evidence-root>/inputs/probe.txt",
+          "--fiscal-year",
+          "2024",
+          "--fiscal-period",
+          "FY",
+          "--company-name",
+          "UF-D04-multi-distinct-stems Corp.",
+          "--debug",
+          "--log-file",
+          "<main-evidence-root>/evidence/scenario-refresh/UF-D04.log"
+        ],
+        "cwd": "<repo-root>",
+        "stdin": "DEVNULL; no bytes supplied",
+        "input_description": [
+          "input-class:diagnostic"
+        ],
+        "key_actions": [],
+        "unset_environment_names": []
+      },
+      "precondition": {
+        "state_id": "observed:diagnostic:UF-D04-multi-distinct-stems",
+        "workspace": "<run-root>/workspaces/scenario-refresh/V2-UF-D04-multi-distinct-stems",
+        "setup_steps": [
+          "预创建 log 父目录，使用不同 stem 输入并显式指定 primary。"
+        ]
+      },
+      "accepted_oracle_refs": [
+        "cli.upload_filing.document-publication@1"
+      ],
+      "oracle_predicate_refs": [
+        "upload_filing.workspace-and-log-wiring",
+        "upload_filing.renamed-update",
+        "upload_filing.multi-file-and-primary",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "correctness_surfaces": [
+        "upload_filing.workspace-and-log-wiring",
+        "upload_filing.renamed-update",
+        "upload_filing.multi-file-and-primary",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "fixed-real-input-or-real-public-financial-source",
+        "mock-fake-provider-and-converter-forbidden",
+        "secret-values-never-projected"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 600.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-cwd-and-non-secret-environment",
+        "stdin-or-signal-timeline",
+        "stdout-stderr-screen-exit-and-duration",
+        "filesystem-before-after-and-diff",
+        "source-meta-manifest-original-and-docling-digests-or-not-applicable-proof",
+        "fins-public-state-and-summary-reconciliation",
+        "host-runtime-sqlite-eventlog-tool-trace-or-queried-absent-proof",
+        "cross-command-production-consumption-when-declared",
+        "log-and-secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_id": "upload-filing-final-calibration-20260818-y6gLgs",
+        "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+        "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+        "relative_ref": "cases/V2-UF-D04-multi-distinct-stems",
+        "execution_outcome": "success",
+        "exit_code": 0,
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle-second-round"
+      },
+      "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18",
+      "applicable_from": "upload-filing-second-round-conformance-after-47e78b23",
+      "supersedes": "upload_filing.UF-D04-multi-distinct-stems@1",
       "superseded_by": null
     },
     {
       "scenario_id": "upload_filing.UF-D05-multi-same-stem",
       "source_scenario_id": "UF-D05-multi-same-stem",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "upload_filing",
       "path_kind": "calibration-diagnostic",
       "coverage_claims": {
@@ -140194,13 +143694,150 @@
       "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
       "applicable_from": "next-upload_filing-run-after-256786b2",
       "supersedes": null,
+      "superseded_by": "upload_filing.UF-D05-multi-same-stem@2"
+    },
+    {
+      "scenario_id": "upload_filing.UF-D05-multi-same-stem",
+      "source_scenario_id": "UF-D05-multi-same-stem",
+      "version": 2,
+      "status": "accepted",
+      "command": "upload_filing",
+      "path_kind": "calibration-diagnostic",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--action",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--debug",
+          "parameter:--log-file"
+        ],
+        "precondition_state_ids": [
+          "observed:diagnostic:UF-D05-multi-same-stem"
+        ],
+        "interactive_branch_option_ids": [],
+        "input_class_ids": [
+          "input:diagnostic"
+        ],
+        "combination_high_risk_ids": [
+          "risk:UF-D05-multi-same-stem"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--action",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--debug",
+          "parameter:--log-file",
+          "precondition:observed:diagnostic:UF-D05-multi-same-stem",
+          "input:diagnostic",
+          "risk:UF-D05-multi-same-stem"
+        ]
+      },
+      "invocation": {
+        "argv": [
+          "dayu-cli",
+          "upload_filing",
+          "--base",
+          "<run-root>/workspaces/scenario-refresh/V2-UF-D05-multi-same-stem",
+          "--ticker",
+          "STEM",
+          "--action",
+          "create",
+          "--files",
+          "<main-evidence-root>/inputs/probe.txt",
+          "<main-evidence-root>/inputs/probe.md",
+          "--primary",
+          "<main-evidence-root>/inputs/probe.txt",
+          "--fiscal-year",
+          "2024",
+          "--fiscal-period",
+          "FY",
+          "--company-name",
+          "UF-D05-multi-same-stem Corp.",
+          "--debug",
+          "--log-file",
+          "<main-evidence-root>/evidence/scenario-refresh/UF-D05.log"
+        ],
+        "cwd": "<repo-root>",
+        "stdin": "DEVNULL; no bytes supplied",
+        "input_description": [
+          "input-class:diagnostic"
+        ],
+        "key_actions": [],
+        "unset_environment_names": []
+      },
+      "precondition": {
+        "state_id": "observed:diagnostic:UF-D05-multi-same-stem",
+        "workspace": "<run-root>/workspaces/scenario-refresh/V2-UF-D05-multi-same-stem",
+        "setup_steps": [
+          "预创建 log 父目录，使用同 stem 不同后缀输入并显式指定 primary。"
+        ]
+      },
+      "accepted_oracle_refs": [
+        "cli.upload_filing.document-publication@1"
+      ],
+      "oracle_predicate_refs": [
+        "upload_filing.workspace-and-log-wiring",
+        "upload_filing.renamed-update",
+        "upload_filing.multi-file-and-primary",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "correctness_surfaces": [
+        "upload_filing.workspace-and-log-wiring",
+        "upload_filing.renamed-update",
+        "upload_filing.multi-file-and-primary",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "fixed-real-input-or-real-public-financial-source",
+        "mock-fake-provider-and-converter-forbidden",
+        "secret-values-never-projected"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 600.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-cwd-and-non-secret-environment",
+        "stdin-or-signal-timeline",
+        "stdout-stderr-screen-exit-and-duration",
+        "filesystem-before-after-and-diff",
+        "source-meta-manifest-original-and-docling-digests-or-not-applicable-proof",
+        "fins-public-state-and-summary-reconciliation",
+        "host-runtime-sqlite-eventlog-tool-trace-or-queried-absent-proof",
+        "cross-command-production-consumption-when-declared",
+        "log-and-secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_id": "upload-filing-final-calibration-20260818-y6gLgs",
+        "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+        "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+        "relative_ref": "cases/V2-UF-D05-multi-same-stem",
+        "execution_outcome": "success",
+        "exit_code": 0,
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle-second-round"
+      },
+      "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18",
+      "applicable_from": "upload-filing-second-round-conformance-after-47e78b23",
+      "supersedes": "upload_filing.UF-D05-multi-same-stem@1",
       "superseded_by": null
     },
     {
       "scenario_id": "upload_filing.UF-D06-multi-same-path",
       "source_scenario_id": "UF-D06-multi-same-path",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "upload_filing",
       "path_kind": "calibration-diagnostic",
       "coverage_claims": {
@@ -140329,6 +143966,141 @@
       "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
       "applicable_from": "next-upload_filing-run-after-256786b2",
       "supersedes": null,
+      "superseded_by": "upload_filing.UF-D06-multi-same-path@2"
+    },
+    {
+      "scenario_id": "upload_filing.UF-D06-multi-same-path",
+      "source_scenario_id": "UF-D06-multi-same-path",
+      "version": 2,
+      "status": "accepted",
+      "command": "upload_filing",
+      "path_kind": "calibration-diagnostic",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--action",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--debug",
+          "parameter:--log-file"
+        ],
+        "precondition_state_ids": [
+          "observed:diagnostic:UF-D06-multi-same-path"
+        ],
+        "interactive_branch_option_ids": [],
+        "input_class_ids": [
+          "input:diagnostic"
+        ],
+        "combination_high_risk_ids": [
+          "risk:UF-D06-multi-same-path"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--action",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "parameter:--debug",
+          "parameter:--log-file",
+          "precondition:observed:diagnostic:UF-D06-multi-same-path",
+          "input:diagnostic",
+          "risk:UF-D06-multi-same-path"
+        ]
+      },
+      "invocation": {
+        "argv": [
+          "dayu-cli",
+          "upload_filing",
+          "--base",
+          "<run-root>/workspaces/replacements/exact-registry/diagnostics/UF-D06-multi-same-path",
+          "--ticker",
+          "PATH",
+          "--action",
+          "create",
+          "--files",
+          "<main-evidence-root>/inputs/probe.txt",
+          "<main-evidence-root>/inputs/probe.txt",
+          "--fiscal-year",
+          "2024",
+          "--fiscal-period",
+          "FY",
+          "--company-name",
+          "UF-D06-multi-same-path Corp.",
+          "--debug",
+          "--log-file",
+          "<main-evidence-root>/evidence/diagnostic-logs/UF-D06-multi-same-path.log"
+        ],
+        "cwd": "<repo-root>",
+        "stdin": "DEVNULL; no bytes supplied",
+        "input_description": [
+          "input-class:diagnostic"
+        ],
+        "key_actions": [],
+        "unset_environment_names": []
+      },
+      "precondition": {
+        "state_id": "observed:diagnostic:UF-D06-multi-same-path",
+        "workspace": "<run-root>/workspaces/replacements/exact-registry/diagnostics/UF-D06-multi-same-path",
+        "setup_steps": [
+          "预创建 log 父目录，重复提供同一解析路径，验证 conversion 前 usage rejection。"
+        ]
+      },
+      "accepted_oracle_refs": [
+        "cli.upload_filing.document-publication@1"
+      ],
+      "oracle_predicate_refs": [
+        "upload_filing.workspace-and-log-wiring",
+        "upload_filing.renamed-update",
+        "upload_filing.multi-file-and-primary",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "correctness_surfaces": [
+        "upload_filing.workspace-and-log-wiring",
+        "upload_filing.renamed-update",
+        "upload_filing.multi-file-and-primary",
+        "upload_filing.direct-boundary-and-summary"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "fixed-real-input-or-real-public-financial-source",
+        "mock-fake-provider-and-converter-forbidden",
+        "secret-values-never-projected"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 600.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-cwd-and-non-secret-environment",
+        "stdin-or-signal-timeline",
+        "stdout-stderr-screen-exit-and-duration",
+        "filesystem-before-after-and-diff",
+        "source-meta-manifest-original-and-docling-digests-or-not-applicable-proof",
+        "fins-public-state-and-summary-reconciliation",
+        "host-runtime-sqlite-eventlog-tool-trace-or-queried-absent-proof",
+        "cross-command-production-consumption-when-declared",
+        "log-and-secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_id": "upload-filing-final-calibration-20260818-y6gLgs",
+        "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+        "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+        "relative_ref": "cases/R2-UF-D06-multi-same-path",
+        "execution_outcome": "error",
+        "exit_code": 2,
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle-second-round"
+      },
+      "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18",
+      "applicable_from": "upload-filing-second-round-conformance-after-47e78b23",
+      "supersedes": "upload_filing.UF-D06-multi-same-path@1",
       "superseded_by": null
     },
     {
@@ -141203,7 +144975,7 @@
       "scenario_id": "upload_filing.UFS-006-files-count-100",
       "source_scenario_id": "UFS-006-files-count-100",
       "version": 1,
-      "status": "accepted",
+      "status": "superseded",
       "command": "upload_filing",
       "path_kind": "calibration-supplement",
       "coverage_claims": {
@@ -141419,6 +145191,232 @@
       "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
       "applicable_from": "next-upload_filing-run-after-256786b2",
       "supersedes": null,
+      "superseded_by": "upload_filing.UFS-006-files-count-100@2"
+    },
+    {
+      "scenario_id": "upload_filing.UFS-006-files-count-100",
+      "source_scenario_id": "UFS-006-files-count-100",
+      "version": 2,
+      "status": "accepted",
+      "command": "upload_filing",
+      "path_kind": "calibration-supplement",
+      "coverage_claims": {
+        "command_parameter_ids": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name"
+        ],
+        "precondition_state_ids": [
+          "observed:supplement:UFS-006-files-count-100"
+        ],
+        "interactive_branch_option_ids": [],
+        "input_class_ids": [
+          "input:supplement"
+        ],
+        "combination_high_risk_ids": [
+          "risk:UFS-006-files-count-100"
+        ],
+        "cross_command_assertion_ids": [],
+        "raw_stable_claims": [
+          "parameter:--base",
+          "parameter:--ticker",
+          "parameter:--files",
+          "parameter:--fiscal-year",
+          "parameter:--fiscal-period",
+          "parameter:--company-name",
+          "precondition:observed:supplement:UFS-006-files-count-100",
+          "input:supplement",
+          "risk:UFS-006-files-count-100"
+        ]
+      },
+      "invocation": {
+        "argv": [
+          "dayu-cli",
+          "upload_filing",
+          "--base",
+          "<run-root>/workspaces/scenario-refresh/V2-UFS-006-files-count-100",
+          "--ticker",
+          "BNDR",
+          "--action",
+          "create",
+          "--files",
+          "<supplement-evidence-root>/inputs/one-hundred/part-000.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-001.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-002.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-003.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-004.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-005.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-006.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-007.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-008.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-009.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-010.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-011.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-012.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-013.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-014.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-015.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-016.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-017.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-018.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-019.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-020.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-021.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-022.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-023.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-024.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-025.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-026.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-027.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-028.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-029.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-030.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-031.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-032.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-033.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-034.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-035.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-036.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-037.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-038.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-039.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-040.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-041.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-042.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-043.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-044.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-045.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-046.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-047.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-048.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-049.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-050.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-051.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-052.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-053.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-054.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-055.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-056.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-057.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-058.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-059.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-060.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-061.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-062.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-063.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-064.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-065.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-066.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-067.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-068.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-069.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-070.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-071.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-072.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-073.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-074.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-075.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-076.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-077.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-078.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-079.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-080.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-081.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-082.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-083.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-084.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-085.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-086.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-087.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-088.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-089.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-090.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-091.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-092.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-093.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-094.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-095.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-096.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-097.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-098.txt",
+          "<supplement-evidence-root>/inputs/one-hundred/part-099.txt",
+          "--primary",
+          "<supplement-evidence-root>/inputs/one-hundred/part-037.txt",
+          "--fiscal-year",
+          "2024",
+          "--fiscal-period",
+          "FY",
+          "--company-name",
+          "BNDR Corp."
+        ],
+        "cwd": "<repo-root>",
+        "stdin": "DEVNULL; no bytes supplied",
+        "input_description": [
+          "input-class:supplement"
+        ],
+        "key_actions": [],
+        "unset_environment_names": []
+      },
+      "precondition": {
+        "state_id": "observed:supplement:UFS-006-files-count-100",
+        "workspace": "<run-root>/workspaces/scenario-refresh/V2-UFS-006-files-count-100",
+        "setup_steps": [
+          "使用 100 个冻结输入，并显式指定第 38 个文件为 primary。"
+        ]
+      },
+      "accepted_oracle_refs": [
+        "cli.upload_filing.document-publication@1"
+      ],
+      "oracle_predicate_refs": [
+        "upload_filing.date-and-year-domain",
+        "upload_filing.ticker-and-alias",
+        "upload_filing.fiscal-period-domain",
+        "upload_filing.multi-file-and-primary"
+      ],
+      "correctness_surfaces": [
+        "upload_filing.date-and-year-domain",
+        "upload_filing.ticker-and-alias",
+        "upload_filing.fiscal-period-domain",
+        "upload_filing.multi-file-and-primary"
+      ],
+      "authorization_requirements": [
+        "ci-owned-workspace-write",
+        "fixed-real-input-or-real-public-financial-source",
+        "mock-fake-provider-and-converter-forbidden",
+        "secret-values-never-projected"
+      ],
+      "resource_budget": {
+        "timeout_seconds": 600.0,
+        "mock_fake_policy": "forbidden"
+      },
+      "required_evidence": [
+        "exact-argv-cwd-and-non-secret-environment",
+        "stdin-or-signal-timeline",
+        "stdout-stderr-screen-exit-and-duration",
+        "filesystem-before-after-and-diff",
+        "source-meta-manifest-original-and-docling-digests-or-not-applicable-proof",
+        "fins-public-state-and-summary-reconciliation",
+        "host-runtime-sqlite-eventlog-tool-trace-or-queried-absent-proof",
+        "cross-command-production-consumption-when-declared",
+        "log-and-secret-scan"
+      ],
+      "observed_evidence": {
+        "bundle_id": "upload-filing-final-calibration-20260818-y6gLgs",
+        "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+        "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+        "relative_ref": "cases/V2-UFS-006-files-count-100",
+        "execution_outcome": "success",
+        "exit_code": 0,
+        "evidence_status": "sufficient",
+        "gap_kind": "none",
+        "conformance_at_observation": "matches-accepted-oracle-second-round"
+      },
+      "user_adjudication_identity": "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18",
+      "applicable_from": "upload-filing-second-round-conformance-after-47e78b23",
+      "supersedes": "upload_filing.UFS-006-files-count-100@1",
       "superseded_by": null
     },
     {
@@ -142497,7 +146495,7 @@
   },
   "readiness_proof": {
     "proof_version": 5,
-    "generated_at": "2026-08-17T00:00:00Z",
+    "generated_at": "2026-08-18T00:00:00Z",
     "target_commit": "256786b255021ee429a20f22aad726b1ad33916c",
     "registry_scope": [
       "init",
@@ -142706,8 +146704,8 @@
       },
       "upload_filing": {
         "validation_result": "ready",
-        "calibration_status": "oracle-and-scenarios-accepted",
-        "implementation_conformance_status": "residual-fix-required-before-second-round-pass",
+        "calibration_status": "oracle-scenarios-and-second-round-conformance-accepted",
+        "implementation_conformance_status": "second-round-conformance-pass",
         "parser_inventory": {
           "inventory_id": "dayu.cli.arg_parsing.build_parser:upload_filing",
           "inventory_version": 4,
@@ -142718,7 +146716,7 @@
         "mandatory_scenario_obligation_count": 137,
         "covered_scenario_obligation_count": 137,
         "accepted_scenario_count": 137,
-        "superseded_scenario_count": 0,
+        "superseded_scenario_count": 31,
         "unadjudicated_scenario_count": 0,
         "gap_count": 0,
         "distinct_coverage_id_counts": {
@@ -142729,16 +146727,17 @@
           "combination_high_risk_ids": 137,
           "cross_command_assertion_ids": 1
         },
-        "coverage_inventory_sha256": "afa68a50ec9253cb806edaecf6dc26869f1df6af85d4a1412997ccb70c469be1",
-        "frozen_report_digest_entry_count": 3,
-        "frozen_report_digest_set_sha256": "a853bfff5f72f4e7599a3b57b2830de9c5d936a7c6ffc90d5103acfe717a5b98",
-        "user_adjudication_identity_count": 1,
-        "user_adjudication_identity_set_sha256": "b2ba42ad0913dac97362ba3229cf95a524027ab1bcda04bcdf5758d3d0ef8622",
+        "coverage_inventory_sha256": "012f40e635ee5d8b70e6a2074cefa6671dce1638516e7dc94c706f5f1cf9eacc",
+        "frozen_report_digest_entry_count": 4,
+        "frozen_report_digest_set_sha256": "43ed846df3790767748934b5398e4aba869c3817b9683feb1955bb0991978289",
+        "user_adjudication_identity_count": 2,
+        "user_adjudication_identity_set_sha256": "4b0fd8ed3a935cc2dd801fde9459af83277bca4721cced310a3db03f0ab54ea5",
         "accepted_oracle_refs": [
           "cli.upload_filing.document-publication@1"
         ],
         "latest_user_adjudication_identities": [
-          "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12"
+          "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
+          "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18"
         ],
         "shared_cli_owner_equivalence": {
           "status": "accepted-and-reused",
@@ -142757,7 +146756,7 @@
           {
             "finding_id": "UF-FIX01",
             "slug": "validation-atomic-boundary",
-            "status": "reopened-after-post-fix-residual",
+            "status": "fix-complete-post-fix-accepted",
             "closeout_commit": "114430ce",
             "closeout_artifact": "docs/gateflow/uf-fix01-validation-atomic-boundary-final-closeout-20260813.md",
             "oracle_predicate_refs": [
@@ -142767,7 +146766,7 @@
             "accepted_requirement": "把全部可预判 usage validation 前移到 workspace mutation 前；company meta 与 source publication 同一原子业务边界。",
             "implementation_authorization": "completed-by-user-authorized-gateflow-work-unit",
             "residual_id": "UF-FIX01-R1",
-            "residual_status": "fix-required",
+            "residual_status": "resolved-and-accepted",
             "residual_requirement": "由 upload/download 可复用的 fiscal-period 单一 owner 在 operation/workspace mutation 前执行 strip、uppercase 与 FY/H1/Q1/Q2/Q3/Q4 闭集校验；US/CN/HK 的非法值统一投影为可行动的 usage failure（exit 2），不得进入 runtime unexpected failure。",
             "residual_evidence": {
               "run_id": "upload-filing-postfix-all-20260817-p26wBp",
@@ -142776,6 +146775,19 @@
               "observed_exit_code": 1,
               "observed_failure_kind": "runtime",
               "observed_failure_code": "unexpected_runtime"
+            },
+            "residual_closeout_commit": "47e78b2366ff6eedcaa4275a8a10bdfc1522b347",
+            "residual_closeout_artifact": "docs/gateflow/uf-fix01-fiscal-period-prevalidation-residual-final-closeout-20260818.md",
+            "residual_resolution_evidence": {
+              "run_id": "upload-filing-final-calibration-20260818-y6gLgs",
+              "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+              "case_refs": [
+                "cases/UF-A21-us-invalid-period",
+                "cases/PF01-US-invalid-banana",
+                "cases/PF01-CN-invalid-banana",
+                "cases/PF01-HK-invalid-banana"
+              ],
+              "user_adjudication": "accepted-2026-08-18"
             }
           },
           {
@@ -142906,17 +146918,24 @@
         "required_post_fix_reruns": [
           {
             "rerun_id": "UF-PF01",
-            "status": "residual-found-fix-and-rerun-required",
-            "blocked_by_finding_ids": [
-              "UF-FIX01"
-            ],
+            "status": "accepted-post-fix-observation",
+            "blocked_by_finding_ids": [],
             "required_observation": "修复 UF-FIX01-R1 后补跑 fiscal-period invalid slice，覆盖 US/CN/HK 共用闭集校验 owner，断言 exit 2、具体 reason、operation 未开始且 workspace 零业务 mutation。",
             "evidence_policy": "real-cli-frozen-report-no-mock-no-fake",
-            "adjudication": "not-accepted-as-complete-2026-08-17",
+            "adjudication": "accepted-2026-08-18",
             "observed_evidence": {
-              "run_id": "upload-filing-postfix-all-20260817-p26wBp",
-              "report_sha256": "c5212306d27af50ac78a8b559c9c4b7348f154a1ec149f105712fabe652d4ddb",
-              "residual_case_ref": "cases/UF-A21-us-invalid-period"
+              "run_id": "upload-filing-final-calibration-20260818-y6gLgs",
+              "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+              "case_refs": [
+                "cases/UF-024-cn-invalid-period",
+                "cases/UF-A21-us-invalid-period",
+                "cases/PF01-US-invalid-banana",
+                "cases/PF01-CN-invalid-banana",
+                "cases/PF01-HK-invalid-banana",
+                "cases/PF01-US-normalized-q1",
+                "cases/PF01-CN-normalized-q1",
+                "cases/PF01-HK-normalized-q1"
+              ]
             }
           },
           {
@@ -143128,37 +147147,42 @@
           },
           {
             "rerun_id": "UF-PF12",
-            "status": "full-matrix-executed-conformance-blocked",
-            "blocked_by_finding_ids": [
-              "UF-FIX01"
-            ],
+            "status": "accepted-second-round-conformance",
+            "blocked_by_finding_ids": [],
             "required_observation": "修复汇总后重新执行 upload_filing 137 条 full-real mandatory matrix并重算 conformance；第一轮 evidence 不重写。",
             "evidence_policy": "real-cli-frozen-report-no-mock-no-fake",
-            "adjudication": "not-accepted-as-second-round-pass-2026-08-17",
+            "adjudication": "accepted-2026-08-18",
             "observed_evidence": {
-              "run_id": "upload-filing-postfix-all-20260817-p26wBp",
-              "report_sha256": "c5212306d27af50ac78a8b559c9c4b7348f154a1ec149f105712fabe652d4ddb",
+              "run_id": "upload-filing-final-calibration-20260818-y6gLgs",
+              "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
               "executed_scenario_count": 137,
               "accepted_scenario_obligation_count": 137,
-              "blocking_residual_ref": "UF-FIX01-R1"
+              "total_case_directories": 196,
+              "blocking_residuals": []
             }
           }
         ],
         "accepted_scenario_refreshes": [
           {
             "refresh_id": "UF-SR01",
-            "status": "accepted-2026-08-17",
+            "status": "materialized-2026-08-18",
             "scope": "action-precondition-chain",
             "requirement": "UF-A08 的 update missing + overwrite 必须保持 usage failure 且不得创建 BETA；UF-A09 delete existing 与 UF-A10 repeated delete 必须各自建立独立、可复现的 existing/deleted 前置，不再依赖 UF-A08 的旧副作用。",
             "observed_case_refs": [
               "cases/UF-A08-update-missing-overwrite-creates",
               "cases/R-PF02-07-delete-existing",
               "cases/R-PF02-08-delete-repeated"
+            ],
+            "successor_scenario_refs": [
+              "upload_filing.UF-A08-update-missing-overwrite-rejected@1",
+              "upload_filing.UF-A09-delete-existing@2",
+              "upload_filing.UF-A10-delete-already-deleted@2",
+              "upload_filing.UF-A12-auto-restores-deleted@2"
             ]
           },
           {
             "refresh_id": "UF-SR02",
-            "status": "accepted-2026-08-17",
+            "status": "materialized-2026-08-18",
             "scope": "multi-file-primary",
             "requirement": "所有多文件正向场景显式传入属于 --files 的 --primary；重复解析路径继续作为前置 usage failure；显式 primary 下覆盖不同 stem、同 stem、重复 basename、真实多附件与 100 文件边界。",
             "observed_case_refs": [
@@ -143169,11 +147193,23 @@
               "cases/R-PF07-duplicate-basename",
               "cases/PF07-one-hundred-explicit-primary",
               "cases/R-PF03-mixed-corrupt-primary"
+            ],
+            "successor_scenario_refs": [
+              "upload_filing.UF-F11-multi-file@2",
+              "upload_filing.UF-F13-duplicate-basename@2",
+              "upload_filing.UF-C05-real-msft-multi-file@2",
+              "upload_filing.UF-C06-real-xbrl-html-xsd@2",
+              "upload_filing.UF-C07-real-xbrl-html-instance@2",
+              "upload_filing.UF-C05-real-msft-multi-file-process@2",
+              "upload_filing.UF-I12-valid-plus-corrupt-atomic@2",
+              "upload_filing.UF-D04-multi-distinct-stems@2",
+              "upload_filing.UF-D05-multi-same-stem@2",
+              "upload_filing.UFS-006-files-count-100@2"
             ]
           },
           {
             "refresh_id": "UF-SR03",
-            "status": "accepted-2026-08-17",
+            "status": "materialized-2026-08-18",
             "scope": "converter-capability-case-names",
             "requirement": "刷新 UF-030～UF-038 与 UF-F06 中携带旧 owner-drift 判断的场景名称，使名称只描述当前 capability/输入类别与期望边界；通过 supersedes/superseded_by 保留原 source scenario lineage，不改写第一轮冻结 evidence。",
             "observed_case_refs": [
@@ -143187,14 +147223,50 @@
               "cases/UF-037-cli-allows-owner-rejects-xml",
               "cases/UF-038-cli-allows-owner-rejects-zip",
               "cases/UF-F06-xls-ooxml-bytes"
+            ],
+            "successor_scenario_refs": [
+              "upload_filing.UF-030-unsupported-doc-prevalidation@1",
+              "upload_filing.UF-031-unsupported-ppt-prevalidation@1",
+              "upload_filing.UF-032-supported-pptx@1",
+              "upload_filing.UF-033-supported-csv@1",
+              "upload_filing.UF-034-json-content-failure@1",
+              "upload_filing.UF-035-xbrl-content-failure@1",
+              "upload_filing.UF-036-supported-xhtml@1",
+              "upload_filing.UF-037-xml-content-failure@1",
+              "upload_filing.UF-038-unsupported-zip-prevalidation@1",
+              "upload_filing.UF-F06-unsupported-xls-prevalidation@1"
             ]
           },
           {
             "refresh_id": "UF-SR04",
-            "status": "accepted-2026-08-17",
+            "status": "materialized-2026-08-18",
             "scope": "evidence-lineage",
             "requirement": "本轮 replacement/focused case 登记为新的 observed evidence；第一轮 calibration/supplement report 与既有 scenario evidence 保持冻结，不覆盖、不重写。",
-            "registry_materialization": "在 UF-FIX01-R1 closeout 后、UF-PF12 重跑前生成 versioned successor scenarios；只有已有精确 replacement evidence 的定义可直接物化，仍需精确 argv 的定义并入 UF-PF12 真实运行。"
+            "registry_materialization": "31 个 accepted successor 已从本轮精确 evidence 物化；第一轮条目仅改为 superseded，冻结 evidence 未重写。"
+          },
+          {
+            "refresh_id": "UF-SR05",
+            "status": "materialized-2026-08-18",
+            "scope": "operator-log-and-company-stale-preconditions",
+            "requirement": "operator log case 预创建父目录；company stale case 由 resolver_version owner 构造 stale，不再使用 wall-clock age。",
+            "successor_scenario_refs": [
+              "upload_filing.UF-W08-debug-log-file@2",
+              "upload_filing.UF-I15-stale-company-refresh@2",
+              "upload_filing.UF-I16-stale-company-missing-name@2",
+              "upload_filing.UF-D01-create-baseline@2",
+              "upload_filing.UF-D02-auto-changed-same-name@2",
+              "upload_filing.UF-D03-auto-changed-different-name@2",
+              "upload_filing.UF-D06-multi-same-path@2"
+            ],
+            "observed_case_refs": [
+              "cases/R2-UF-W08-debug-log-file",
+              "cases/R2-UF-D01-create-baseline",
+              "cases/R2-UF-D02-auto-changed-same-name",
+              "cases/R2-UF-D03-auto-changed-different-name",
+              "cases/R2-UF-D06-multi-same-path",
+              "cases/R-PF11-stale-explicit-refresh",
+              "cases/R-PF11-stale-missing-name"
+            ]
           }
         ],
         "frozen_report_digests": [
@@ -143209,6 +147281,10 @@
           {
             "run_id": "upload-filing-postfix-all-20260817-p26wBp",
             "sha256": "c5212306d27af50ac78a8b559c9c4b7348f154a1ec149f105712fabe652d4ddb"
+          },
+          {
+            "run_id": "upload-filing-final-calibration-20260818-y6gLgs",
+            "sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6"
           }
         ],
         "adjudication_artifact_digests": [
@@ -143235,8 +147311,30 @@
           {
             "artifact": "upload-filing-postfix-all-20260817-p26wBp/manifest-sha256.json",
             "sha256": "3696696b145b84152fdec3bb97a55a84e7f6bb3ffcceff1c4aeaa478dcba5b6e"
+          },
+          {
+            "artifact": "upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.json",
+            "sha256": "29ec185fa94d219d463149e243ef4eef08efd67880d98c0b87abe8f993342f4c"
+          },
+          {
+            "artifact": "upload-filing-final-calibration-20260818-y6gLgs/secret-scan.json",
+            "sha256": "58c68623832a99c554fa30373d0559471e18ae35cb2988026a2773bfc69789a5"
+          },
+          {
+            "artifact": "upload-filing-final-calibration-20260818-y6gLgs/manifest-sha256.json",
+            "sha256": "58b448bf7881055eb45d5dc1b774dd71e2dc12f8a0133828f3ef2c3548436b56"
           }
-        ]
+        ],
+        "post_fix_conformance_commit": "47e78b2366ff6eedcaa4275a8a10bdfc1522b347",
+        "second_round_evidence": {
+          "run_id": "upload-filing-final-calibration-20260818-y6gLgs",
+          "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+          "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+          "executed_registry_scenarios": 137,
+          "total_case_directories": 196,
+          "blocking_residuals": [],
+          "user_adjudication": "accepted-2026-08-18"
+        }
       }
     },
     "reference_validation": {
@@ -143250,8 +147348,9 @@
       "local_report_digest_mismatches": 0
     },
     "post_fix_conformance_refresh": {
-      "status": "residual-fix-and-rerun-required",
+      "status": "complete",
       "accepted_post_fix_observations": [
+        "UF-PF01",
         "UF-PF02",
         "UF-PF03",
         "UF-PF04",
@@ -143261,17 +147360,13 @@
         "UF-PF08",
         "UF-PF09",
         "UF-PF10",
-        "UF-PF11"
-      ],
-      "remaining_required_refreshes": [
-        "UF-PF01",
+        "UF-PF11",
         "UF-PF12"
       ],
-      "blocking_residual_refs": [
-        "UF-FIX01-R1"
-      ],
-      "last_user_adjudication_date": "2026-08-17",
-      "boundary": "UF-PF02～UF-PF11 已按真实 CLI evidence 接受；US 非法 fiscal-period 残余修复并完成 UF-PF01 与全量 UF-PF12 前，不得宣称 upload_filing 第二轮 conformance pass。第一轮 oracle/scenario coverage 与冻结 evidence 不受影响。"
+      "remaining_required_refreshes": [],
+      "blocking_residual_refs": [],
+      "last_user_adjudication_date": "2026-08-18",
+      "boundary": "UF-PF01～UF-PF12 均已按真实 CLI evidence 接受；UF-FIX01-R1 已关闭，31 个 successor scenario 已版本化物化，upload_filing 第二轮 conformance pass。"
     },
     "global": {
       "validation_result": "ready",
@@ -143291,9 +147386,9 @@
         "session",
         "tool_trace"
       ],
-    "reason": "五个命令的第一轮真实运行、逐项用户裁决与 accepted Oracle/scenarios 已闭合；upload_filing 的 UF-PF02～UF-PF11 post-fix observation 已接受，UF-FIX01 因 US 非法 fiscal-period 仍落入 runtime failure 而重开，UF-PF01 与 UF-PF12 必须在残余修复后补跑；该残余不回写第一轮冻结 evidence，也不构成第一轮 calibration coverage gap。"
+      "reason": "五个命令的第一轮真实运行、逐项用户裁决与 accepted Oracle/scenarios 已闭合；upload_filing 的 UF-FIX01～UF-FIX11 均完成，UF-PF01～UF-PF12 真实补跑已接受，31 个受影响场景已以 successor 版本物化并保留历史 lineage，第二轮 conformance pass。"
     },
-    "registry_digest_basis": "f17b6bccc66910fafa3b4a003284ed49ea27dd1a37f2dc08ee545e8e8d62c0e5",
-    "accepted_oracle_registry_digest_basis": "73fc031eca26c30c79f089bce918362cbb397b8ff4aa1592d6831a1636b4a0ec"
+    "registry_digest_basis": "9de64adb659ee0027b52d803e011dbce473dbfee3a8ee3d4441862b464ae94b1",
+    "accepted_oracle_registry_digest_basis": "b99a73399013f4b6bf99bdc17678ac69b4be6101fc45b220b10b8ab7767422c0"
   }
 }
