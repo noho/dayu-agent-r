@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import re
+from datetime import date
 from collections.abc import Callable, Mapping
 from typing import Final, Optional, TypeAlias
 
@@ -22,6 +23,13 @@ from dayu.fins.pipelines.cn_download_models import (
     HkexnewsRawAnnouncement,
 )
 
+
+from dayu.fins.pipelines.hk_fiscal_calendar import (
+    annual_end_dates,
+    fiscal_quarter_at,
+    has_unresolved_end_date,
+    report_end_date,
+)
 
 ReadHeadMeta: TypeAlias = Callable[[str], CnReportHeadMeta]
 """读取 PDF HEAD 元数据的窄 callable 类型。"""
@@ -138,18 +146,23 @@ _HK_REPORT_FORBIDDEN_RESULT_TOKENS: Final[tuple[str, ...]] = (
     "季業績",
     "季业绩",
 )
+_HK_QUARTER_LENGTH_TOKENS: Final[tuple[str, ...]] = (
+    "三個月",
+    "三个月",
+    "3個月",
+    "3个月",
+    "THREE MONTHS",
+    "3 MONTHS",
+)
 _HK_RESULTS_PERIOD_TOKENS: Final[dict[CnFiscalPeriod, tuple[str, ...]]] = {
     "Q1": (
+        "Q1",
         "FIRST QUARTER",
         "FIRST QUARTERLY",
-        "THREE MONTHS",
-        "3 MONTHS",
         "第一季度",
         "第一季",
         "一季度",
         "一季",
-        "三個月",
-        "三个月",
     ),
     "Q2": (
         "INTERIM RESULTS",
@@ -170,6 +183,7 @@ _HK_RESULTS_PERIOD_TOKENS: Final[dict[CnFiscalPeriod, tuple[str, ...]]] = {
         "中期业绩",
     ),
     "Q3": (
+        "Q3",
         "THIRD QUARTER",
         "THIRD QUARTERLY",
         "NINE MONTHS",
@@ -203,6 +217,10 @@ _HK_RESULTS_PERIOD_TOKENS: Final[dict[CnFiscalPeriod, tuple[str, ...]]] = {
 }
 _HK_TITLE_YEAR_PATTERN: Final[re.Pattern[str]] = re.compile(r"(20\d{2}|19\d{2})")
 _HK_TITLE_CHINESE_YEAR_PATTERN: Final[re.Pattern[str]] = re.compile(r"([零〇一二三四五六七八九]{4})年")
+_HK_FISCAL_YEAR_LABEL: Final[re.Pattern[str]] = re.compile(
+    r"FY\s*(19\d{2}|20\d{2})|(19\d{2}|20\d{2})\s*(?:財年|财年|FISCAL YEAR)",
+    re.IGNORECASE,
+)
 _HK_CHINESE_DIGIT_TO_INT: Final[dict[str, int]] = {
     "零": 0,
     "〇": 0,
@@ -287,20 +305,20 @@ def select_hkexnews_report_candidates(
 
     grouped: dict[tuple[CnFiscalPeriod, int], list[HkexnewsRawAnnouncement]] = {}
     projection_by_document_id: dict[str, CnReportPeriodProjection] = {}
-    for item in _deduplicate_hk_announcements(announcements):
+    unique = _deduplicate_hk_announcements(announcements)
+    annual_ends = annual_end_dates(tuple(item.title for item in unique))
+    for item in unique:
         if _is_english_hk_announcement(item):
             continue
-        period_projection = _classify_hk_period_projection(
+        facts = resolve_hk_report_period(
             title=item.title,
             category_text=item.category_text,
+            annual_ends=annual_ends,
         )
-        if period_projection is None or period_projection.identity_period not in query.discovery_periods:
+        if facts is None:
             continue
-        fiscal_year = _infer_hk_fiscal_year(
-            title=item.title,
-            filing_date=item.filing_date,
-        )
-        if fiscal_year is None:
+        fiscal_year, period_projection = facts
+        if period_projection.identity_period not in query.discovery_periods:
             continue
         projection_by_document_id[item.document_id] = period_projection
         grouped.setdefault((period_projection.identity_period, fiscal_year), []).append(item)
@@ -449,12 +467,12 @@ def _build_cninfo_candidate(
     )
 
 
-def _infer_hk_fiscal_year(title: str, filing_date: str) -> int | None:
-    """从披露易标题和披露日期推断财年。
+def _infer_hk_fiscal_year(title: str, annual_ends: tuple[date, ...] = ()) -> int | None:
+    """从标题和有依据的年结日识别财年，日期标题采用财年结束年份。
 
     Args:
         title: 公告标题。
-        filing_date: 披露日期。
+        annual_ends: 同公司年度截止日证据。
 
     Returns:
         推断财年；无法解析返回 `None`。
@@ -463,17 +481,59 @@ def _infer_hk_fiscal_year(title: str, filing_date: str) -> int | None:
         无。
     """
 
-    matched = _HK_TITLE_YEAR_PATTERN.search(title)
-    if matched is not None:
-        return int(matched.group(1))
-    chinese_matched = _HK_TITLE_CHINESE_YEAR_PATTERN.search(title)
-    if chinese_matched is not None:
-        chinese_year = _parse_chinese_digit_year(chinese_matched.group(1))
-        if chinese_year is not None:
-            return chinese_year
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", filing_date):
-        return int(filing_date[:4])
-    return None
+    end = report_end_date(title)
+    if end is not None:
+        if end in annual_end_dates((title,)):
+            return end.year
+        calendar_period = fiscal_quarter_at(end, annual_ends)
+        return calendar_period[0] if calendar_period is not None else None
+    years = _hk_title_years(title)
+    return next(iter(years)) if len(years) == 1 else None
+
+
+def _hk_title_years(title: str) -> set[int]:
+    """参数为原始标题；返回所有有效中英文年份；无异常，不按出现顺序挑年份。"""
+    years = {int(value) for value in _HK_TITLE_YEAR_PATTERN.findall(title)}
+    years.update(
+        year
+        for value in _HK_TITLE_CHINESE_YEAR_PATTERN.findall(title)
+        if (year := _parse_chinese_digit_year(value)) is not None
+    )
+    return years
+
+
+def resolve_hk_report_period(
+    *,
+    title: str,
+    category_text: str,
+    annual_ends: tuple[date, ...],
+) -> tuple[int, CnReportPeriodProjection] | None:
+    """为发现与本地重建统一解析港股财年和财期。
+
+    参数：title、category_text 为来源事实；annual_ends 为同公司年度截止日证据。
+    返回：财年和身份/覆盖投影；缺少或冲突返回 None。异常：无。
+    """
+    if has_unresolved_end_date(title):
+        return None
+    # 财年区间简写与普通日期不同；没有明确命名规则时不选择区间中的某一年。
+    if re.search(r"\d{4}\s*/\s*\d{2,4}(?![/\d])", title):
+        return None
+    projection = _classify_hk_period_projection(
+        title=title,
+        category_text=category_text,
+        annual_ends=annual_ends,
+    )
+    year = _infer_hk_fiscal_year(title, annual_ends)
+    end = report_end_date(title)
+    if year is None and end is not None and projection is not None and not annual_ends:
+        ordinal = {"Q1": 1, "Q2": 2, "Q3": 3, "Q4": 4, "H1": 2, "FY": 4}[projection.identity_period]
+        year = end.year + (end.month + (4 - ordinal) * 3 - 1) // 12
+    labelled = {int(value) for match in _HK_FISCAL_YEAR_LABEL.finditer(title) for value in match.groups() if value}
+    if labelled and (len(labelled) != 1 or year not in labelled):
+        return None
+    if not labelled and len(_hk_title_years(title)) > 1:
+        return None
+    return (year, projection) if year is not None and projection is not None else None
 
 
 def _parse_chinese_digit_year(value: str) -> int | None:
@@ -507,12 +567,14 @@ def _classify_hk_period_projection(
     *,
     title: str,
     category_text: str,
+    annual_ends: tuple[date, ...] = (),
 ) -> CnReportPeriodProjection | None:
     """先按披露易分类确定报告家族，再从分类与标题投影身份和覆盖财期。
 
     Args:
         title: 公告标题。
         category_text: 分类文本。
+        annual_ends: 同公司有明确截止日的年度业绩证据。
 
     Returns:
         分类与标题共同形成的财期投影；任何歧义返回 ``None``。
@@ -521,6 +583,8 @@ def _classify_hk_period_projection(
         无。
     """
 
+    if has_unresolved_end_date(title):
+        return None
     normalized_category = category_text.strip().upper()
     if not normalized_category:
         return None
@@ -540,6 +604,11 @@ def _classify_hk_period_projection(
         if has_results_period or has_fy == has_h1:
             return None
         identity: CnFiscalPeriod = "FY" if has_fy else "H1"
+        end = report_end_date(title)
+        if end is not None and annual_ends:
+            calendar_period = fiscal_quarter_at(end, annual_ends)
+            if calendar_period is None or calendar_period[1] != (4 if has_fy else 2):
+                return None
         return CnReportPeriodProjection(identity_period=identity, covered_periods=(identity,))
 
     matched: set[CnFiscalPeriod] = {
@@ -547,6 +616,15 @@ def _classify_hk_period_projection(
         for period, tokens in _HK_RESULTS_PERIOD_TOKENS.items()
         if _contains_any_token(normalized_material_facts, tokens)
     }
+    end = report_end_date(title)
+    calendar_period = fiscal_quarter_at(end, annual_ends) if end is not None else None
+    if calendar_period is not None:
+        if not matched and not _contains_any_token(normalized_material_facts, _HK_QUARTER_LENGTH_TOKENS):
+            return None
+        calendar_identity: CnFiscalPeriod = ("Q1", "Q2", "Q3", "Q4")[calendar_period[1] - 1]
+        matched.add(calendar_identity)
+    elif end is not None and annual_ends:
+        return None
     result_identity = _resolve_hk_results_identity(matched)
     if result_identity is None:
         return None
@@ -571,7 +649,14 @@ def _contains_any_token(text: str, tokens: tuple[str, ...]) -> bool:
         无。
     """
 
-    return any(token.upper() in text for token in tokens)
+    return any(
+        (
+            bool(re.search(r"(?<![A-Z])" + token + r"(?![A-Z0-9])", text))
+            if re.fullmatch(r"Q[1-4]", token)
+            else token.upper() in text
+        )
+        for token in tokens
+    )
 
 
 def _remove_tokens(text: str, tokens: tuple[str, ...]) -> str:
@@ -595,7 +680,7 @@ def _remove_tokens(text: str, tokens: tuple[str, ...]) -> str:
 
 
 def _resolve_hk_results_identity(matched: set[CnFiscalPeriod]) -> CnFiscalPeriod | None:
-    """按累计期优先规则收敛 HK results 身份财期。
+    """只接受唯一季度事实；期间长度三个月不产生独立季度信号。
 
     Args:
         matched: 标题命中的季度候选集合。
@@ -607,15 +692,7 @@ def _resolve_hk_results_identity(matched: set[CnFiscalPeriod]) -> CnFiscalPeriod
         无。
     """
 
-    if "Q4" in matched:
-        return "Q4" if not ({"Q2", "Q3"} & matched) else None
-    if "Q3" in matched:
-        return "Q3" if "Q2" not in matched else None
-    if "Q2" in matched:
-        return "Q2"
-    if matched == {"Q1"}:
-        return "Q1"
-    return None
+    return next(iter(matched)) if len(matched) == 1 else None
 
 
 def _deduplicate_hk_announcements(
@@ -786,12 +863,15 @@ def _build_hk_candidate(
         无。
     """
 
+    end = report_end_date(announcement.title)
     return CnReportCandidate(
         provider="hkexnews",
         source_id=announcement.document_id,
         source_url=announcement.source_url,
         title=announcement.title,
         language=announcement.language,
+        category_text=announcement.category_text,
+        report_date=end.isoformat() if end is not None else None,
         filing_date=announcement.filing_date,
         fiscal_year=fiscal_year,
         period_projection=period_projection,

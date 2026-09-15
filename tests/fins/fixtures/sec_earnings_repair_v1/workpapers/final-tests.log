@@ -1,0 +1,29 @@
+........................................................................ [ 26%]
+........................................................................ [ 52%]
+........................................................................ [ 79%]
+........................................................                 [100%]
+=============================== warnings summary ===============================
+.venv/lib/python3.11/site-packages/edgar/_markdown.py:9
+  /Users/leo/workspace/dayu-agent-r/.venv/lib/python3.11/site-packages/edgar/_markdown.py:9: DeprecationWarning: edgar.files.html_documents module (including HtmlDocument) is deprecated and will be removed in v6.0. Please use edgar.documents.HTMLParser instead. See migration guide: https://edgartools.readthedocs.io/en/latest/migration/
+    from edgar.files.html_documents import HtmlDocument
+
+.venv/lib/python3.11/site-packages/edgar/files/markdown.py:4
+  /Users/leo/workspace/dayu-agent-r/.venv/lib/python3.11/site-packages/edgar/files/markdown.py:4: DeprecationWarning: edgar.files.html module is deprecated and will be removed in v6.0. Please use edgar.documents.HTMLParser instead. See migration guide: https://edgartools.readthedocs.io/en/latest/migration/
+    from edgar.files.html import BaseNode, Document
+
+.venv/lib/python3.11/site-packages/edgar/_filings.py:58
+  /Users/leo/workspace/dayu-agent-r/.venv/lib/python3.11/site-packages/edgar/_filings.py:58: DeprecationWarning: edgar.files.htmltools module (including ChunkedDocument) is deprecated and will be removed in v6.0. Please use edgar.documents.HTMLParser instead. See migration guide: https://edgartools.readthedocs.io/en/latest/migration/
+    from edgar.files.htmltools import html_sections
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+================================ tests coverage ================================
+______________ coverage: platform darwin, python 3.11.15-final-0 _______________
+
+Name                                      Stmts   Miss  Cover   Missing
+-----------------------------------------------------------------------
+dayu/fins/downloaders/sec_downloader.py     919     55    94%   237, 239, 395, 412, 434, 504, 605, 642, 646, 681, 726, 785, 856-857, 859, 867-868, 967, 972-974, 1003, 1020, 1025-1027, 1156, 1240, 1252, 1354, 1384, 1569-1570, 1627, 1657, 2407, 2504-2505, 2609, 2618, 2659, 2670, 2673, 2705, 2737, 2765, 2768, 2794, 2813, 2842, 2847, 2892, 2916, 2924, 2934
+dayu/fins/pipelines/sec_6k_rules.py         448     57    87%   159, 187-188, 243, 247, 249, 286, 401-402, 411, 414, 416, 423-430, 440, 444, 458, 472, 478, 490, 504, 509, 512, 521, 625-652, 757, 765, 788, 905, 1003, 1095, 1375-1377, 1407, 1488, 1587-1598, 1615, 1661-1666
+-----------------------------------------------------------------------
+TOTAL                                      1367    112    92%
+Coverage JSON written to file workspace/tmp/sec_earnings_fix/coverage.json
+272 passed, 3 warnings in 55.33s

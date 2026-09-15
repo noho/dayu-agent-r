@@ -22,6 +22,7 @@ from dayu.fins.pipelines.cn_download_models import (
     CnMarketKind,
 )
 from dayu.fins.pipelines.cn_download_protocols import CnDownloadWorkflowHost
+from dayu.fins.pipelines.hk_download_rebuild import rebuild_hk_periods
 from dayu.fins.pipelines.cn_form_utils import (
     PeriodDownloadWindow,
     resolve_period_windows,
@@ -75,26 +76,29 @@ def rebuild_cn_download_artifacts(
     )
     started_at = time.perf_counter()
     filings: list[JsonObject] = []
-    document_ids = host.source_repository.list_source_document_ids(ticker, SourceKind.FILING)
-    cancelled = False
-    for document_id in document_ids:
-        if _is_cancel_requested(cancel_checker):
-            cancelled = True
-            break
-        previous_meta = host.source_repository.get_source_meta(ticker, document_id, SourceKind.FILING)
-        meta = dict(previous_meta)
-        period_projection = _resolve_rebuild_period_projection(meta=meta, period_windows=period_windows)
-        if period_projection is None:
-            continue
-        filings.append(
-            _rebuild_single_cn_download_document(
-                host=host,
-                ticker=ticker,
-                document_id=document_id,
-                previous_meta=meta,
-                covered_fiscal_periods=period_projection[1],
+    if market == "HK":
+        filings, cancelled = rebuild_hk_periods(host, ticker, period_windows, cancel_checker)
+    else:
+        document_ids = host.source_repository.list_source_document_ids(ticker, SourceKind.FILING)
+        cancelled = False
+        for document_id in document_ids:
+            if _is_cancel_requested(cancel_checker):
+                cancelled = True
+                break
+            previous_meta = host.source_repository.get_source_meta(ticker, document_id, SourceKind.FILING)
+            meta = dict(previous_meta)
+            period_projection = _resolve_rebuild_period_projection(meta=meta, period_windows=period_windows)
+            if period_projection is None:
+                continue
+            filings.append(
+                _rebuild_single_cn_download_document(
+                    host=host,
+                    ticker=ticker,
+                    document_id=document_id,
+                    previous_meta=meta,
+                    covered_fiscal_periods=period_projection[1],
+                )
             )
-        )
     elapsed_ms = int((time.perf_counter() - started_at) * 1000)
     warnings: list[str] = []
     if not filings:

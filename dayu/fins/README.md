@@ -567,7 +567,28 @@ Legacy job helpers 仍保留 `start_*`、`read_job(...)`、`read_job_events(...)
 
 production download overwrite 只替换本轮实际写入的目标文档。SEC 下载在单 filing staging、文件写入、final meta 与 reprocess 标记之间使用 storage batch；文件下载失败、取消或本轮无有效目标文档时，不提交本轮 staging，也不清理其它旧 filing。CN/HK 下载不再把 overwrite 映射成 ticker 级 filings 清空。
 
+SEC downloader 统一持有远端文件选择：6-K 保留同 filing HTML 补链；8-K 从目录、文档类型索引及
+封面相对链接选择 EX-99 HTML，类型索引可识别不含 EX99 字样的附件名。8-K 不扩展为全部附件或
+图片抓取，候选只接受同目录未编码 HTML 文件名，稳定去重后进入现有下载事务。完整缓存仍先行
+增量跳过；显式 overwrite 才重新发现附件并重试历史拒绝。内容 hash 由 blob 字节计算，SEC source
+fingerprint 由本轮远端描述符按原契约计算，文件集合变化会触发现有 processed 重处理标记。
+6-K 当前业绩强信号接受“Reports + 明确季度/年份 + Unaudited Financial Results”及 Q4/FY 联合标题；
+它与预告判断复用同一标题规则，避免被公告内的经营亮点先行拒绝。扫描上限、预告和经营更新排除规则不变。
+
 `rebuild_local_artifacts=true` 是 download 自身的 local-only 模式：SEC、CNInfo 与 HKEXNews workflow 只枚举已下载的 source document，并从本地 source meta、文件描述符和内容重建下载 meta/manifest；该分支不配置或调用 provider，也不新增、删除或替换 source 内容。它与 preprocess 的 `rebuild_processed` 是两个独立 owner，不通过 persisted summary 互相映射。
+
+HK 财期语义由 report selection owner 同时供 discovery 与本地 rebuild 使用。三个月只表示长度；
+明确季度和累计期间须相互一致，日期推季度需同公司邻近年度截止日支持，财年采用结束年份。
+不使用披露日期推断财年或季度；多日期、季度冲突、年度截止日变化及缺少依据均失败关闭。
+report/results 的 identity 与 coverage 契约保持不变。新下载保留原始分类和可解析的截止日。
+
+HK 本地 rebuild 在 ticker writer lock 内读取来源证据并重投影财期，按旧或新 identity 与披露日期
+选定目标，同事务同步 source/filing manifest 和已有 processed 财期索引。正文、内容 fingerprint、
+remote fingerprint 和内容版本保持不变；元数据 revision 可变化。重复执行无变化时回滚空事务。
+取消或仓储异常回滚本次暂存；单文档依据不足报告失败并保留原文档。来源不完整时不执行财期纠正。
+新下载保存 provider category；旧缓存缺该字段时仅从原始标题识别 report/results 家族。
+已有 HK 来源优先按 provider/source ID 绑定原文档身份；纠正后的 ID 占用了其它真实期间的旧分配位置时，
+新来源按 provider/source ID 分配独立身份。普通增量遇到财期不一致明确要求 rebuild，不能把新候选财期当作已持久化状态。
 
 Download terminal 由同一个 typed `FinsResultSummary` 收口：成功、失败与取消具有固定 status/exit code，downloaded、skipped、rejected 与 failed 对同一候选集合互斥且守恒，并携带有界文档明细和缺失期间。每个 `FinsDownloadDocumentResult` 与 public document row 都必填 `covered_fiscal_periods`；CN/HK 原样投影 workflow coverage，SEC 与不适用来源显式投影空 tuple/JSON array。CLI、Service、awaiting observation 与 legacy job projection 只消费该 terminal truth，不从日志、文件树或 provider payload 重建结果。SEC transport 在首个 HTTP 请求前要求显式 User-Agent 或 `SEC_USER_AGENT`；缺失身份、provider failure、取消与完整性失败均按封闭类型进入 download terminal，不用隐式 provider fallback 伪造成功。
 
