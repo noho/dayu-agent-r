@@ -4591,6 +4591,9 @@ def test_sec_form_domain_parser_accepts_supported_aliases() -> None:
 
     assert parse_sec_form_type("10K") == "10-K"
     assert parse_sec_form_type("10-K/A") == "10-K/A"
+    assert parse_sec_form_type("F1") == "F-1"
+    assert parse_sec_form_type("F-1/A") == "F-1/A"
+    assert sec_pipeline.expand_form_aliases(["F1/A", "F-1"]) == ["F-1", "F-1/A"]
     assert parse_sec_form_type("def 14a") == "DEF 14A"
     assert parse_sec_form_filter_value("SC13D/G") == "SC 13D/G"
     assert expand_sec_form_aliases(["SC13D/G"]) == ["SC 13D", "SC 13D/A", "SC 13G", "SC 13G/A"]
@@ -4613,7 +4616,7 @@ def test_shared_domain_parsers_reject_invalid_values() -> None:
     with pytest.raises(ValueError, match="form_type 不能为空"):
         parse_sec_form_type("")
     with pytest.raises(ValueError, match="form_type 不支持"):
-        parse_sec_form_type("F-1")
+        parse_sec_form_type("S-1")
     with pytest.raises(ValueError, match="fiscal_period 非法"):
         normalize_fiscal_period("Q5")
     with pytest.raises(ValueError, match="quality 非法"):

@@ -528,7 +528,7 @@ HKEXNews title search 由 downloader 内的 provider-private strict contract 持
 Processors 在 `dayu.documents.processors` 通用能力上增加财报语义：
 
 - Fins Docling / Markdown / BS 处理器对表格补充金融语义标注。
-- `SecProcessor` 基于 edgartools 读取 SEC 文档章节、表格、XBRL 与 financial statement。
+- `SecProcessor` 基于 edgartools 读取 SEC 文档章节、表格、XBRL 与 financial statement，并为显式下载的 `F-1` 注册声明提供通用 SEC 处理路径。
 - SEC 表单专项处理器通过虚拟章节 mixin 处理 `10-K`、`10-Q`、`20-F`、`8-K`、`DEF 14A`、`SC 13D/G`、`6-K` 等表单的章节切分、搜索和财务表回退。
 - `build_fins_processor_registry()` 在 documents 默认处理器注册表基础上覆盖注册 Fins 增强处理器，并按优先级注册 SEC 表单专项主路径、回退路径和通用 SEC 兜底。
 
