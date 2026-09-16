@@ -1,5 +1,7 @@
 {
   "pythonVersion": "3.11",
+  "venvPath": ".",
+  "venv": ".venv",
   "include": [
     "dayu",
     "tests",

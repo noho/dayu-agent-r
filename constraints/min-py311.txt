@@ -1,6 +1,7 @@
 # Python 3.11 最低支持边界验证。
 # 只锁公开依赖的最低边界，以及少量对解析/安装影响显著的关键传递依赖。
 # dev / test 工具链在这里固定为已验证版本，避免“工具自身太旧”污染最低兼容验证。
+# 下界由 pyproject 声明定义；torch 下界由 transformers 5.x 声明（torch>=2.5）抬高。
 
 requests==2.32.2
 httpx==0.28.1
@@ -10,8 +11,8 @@ aiohttp==3.9.0
 prompt_toolkit==3.0.0
 fastapi==0.115.0
 edgartools==5.30.0
-docling==2.90.0
-docling-core==2.74.0
+docling==2.127.0
+docling-core==2.96.0
 pandas==2.1.4
 numpy==1.26.0
 lxml==5.2.2
@@ -23,14 +24,13 @@ html2text==2024.2.26
 tabulate==0.9.0
 playwright==1.40.0
 playwright-stealth==2.0.3
-torch==2.2.2
-torchvision==0.17.2
-rapidocr==3.8.0
-ocrmac==1.0.0 ; sys_platform == "darwin"
+torch==2.5.1
+torchvision==0.20.1
+rapidocr==3.9.1
 httpxthrottlecache==0.3.5
-transformers==4.57.6
-tokenizers==0.22.2
-huggingface_hub==0.36.2
+transformers==5.16.1
+tokenizers==0.23.1
+huggingface_hub==1.5.0
 streamlit==1.49.0
 
 # 已验证的测试/静态检查工具版本。

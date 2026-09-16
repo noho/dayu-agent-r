@@ -13,17 +13,12 @@ from typing import BinaryIO
 
 import pytest
 
-from docling_core.types.doc.document import (
-    DoclingDocument,
-    ProvenanceItem,
-    RefItem,
-    SectionHeaderItem,
-    TableCell,
-    TableData,
-    TableItem,
-    TextItem,
-)
 from docling_core.types.doc.base import BoundingBox
+from docling_core.types.doc.common.reference import ProvenanceItem, RefItem
+from docling_core.types.doc.document import DoclingDocument
+from docling_core.types.doc.items.table.table import TableItem
+from docling_core.types.doc.items.table.table_data import TableCell, TableData
+from docling_core.types.doc.items.text import SectionHeaderItem, TextItem
 from docling_core.types.doc.labels import DocItemLabel
 
 from dayu.documents.processors import build_documents_processor_registry
