@@ -52,7 +52,7 @@
 
 1. 根目录 `AGENTS.md`，遵守目录、语义 owner、中文及验证约束。
 2. `docs/cli_ci.md`、`docs/cli_ci_oracles.json`、`docs/cli_ci_scenarios.json`。大文件按结构分段读取，了解现有 registry/readiness 与 download/upload_filing lineage，不复制其业务语义。
-3. 本文件的已裁决记录及 `docs/reviews/upload-material-um-o07-oracle-adjudication.md`。
+3. 本文件的已裁决记录、`docs/reviews/upload-material-um-o01-o06-oracle-adjudication.md` 及 `docs/reviews/upload-material-um-o07-oracle-adjudication.md`。
 4. 外置冻结 `observed-behavior.md`、`observed-behavior.json`，再读当前项目的原始证据。
 
 权威顺序：用户最终裁决 > 此次正式 adjudication > 冻结报告中的原建议。冻结报告仍将各项写为 pending，它是当时快照；不能据此把 UM-O01～UM-O07 恢复为未裁决。UM-O08～UM-O36 尚未逐项讨论，不得将“尚未提出异议”推定为已经全部接受。
@@ -107,7 +107,7 @@ screen 是非 TTY stdout/stderr 合并解码视图，不是 GUI 截图或终端�
 
 ## 6. 已裁决 UM-O01～UM-O07
 
-UM-O01～UM-O06 的确认来自本轮用户逐项“同意建议，下一个”；当时约定完整讨论后统一登记，它们尚未分别写入正式 registry。保留这些确认，不再次请求裁决；后续统一落库不得依据简略摘要扩张语义。
+UM-O01～UM-O06 的确认来自本轮用户逐项“同意建议，下一个”。2026-09-16 已补齐正式 adjudication 与修复登记，详见 `docs/reviews/upload-material-um-o01-o06-oracle-adjudication.md`；修复标识为 UM-O03-F01、UM-O04-F01、UM-O05-F01、UM-O06-F01，均已接受方向、未实施。前六项的 accepted 行为也在该文档完整登记；正式 oracle/scenario JSON registry 的统一映射仍待完成。不要再称前六项只有会话/交接摘要，也不要重新请求裁决；后续落库以详细 adjudication 为准，不能扩张语义。
 
 | 编号 | 已确认决定 |
 | --- | --- |
