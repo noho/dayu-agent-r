@@ -71,7 +71,15 @@ transformers 5.17.0。项目锁定的 torch 2.4.1 / transformers 4.57.6 落后�
 |---|---|---|---|
 | rapidocr | 3.8.1 | 3.9.2 | docling 2.127 硬性运行时检查：rapid_ocr_model.py 报错信息明确要求 "rapidocr>=3.9.1,<4.0.0"；3.8.1 缺 PP-OCRv6 模型集与 `rapidocr.utils.typings.OCRVersion` 类型，会直接失败 |
 
-OCR 栈无需变动：ocrmac 1.0.1（已最新，docling 集成只用 `ocrmac.OCR`）；
+OCR 栈策略（**实施阶段经 A/B 实测后裁决变更**）：三平台统一 **rapidocr 3.9.2 +
+PP-OCRv6**。docling 2.90 曾把 ocrmac 作为 darwin 直接依赖，2.127 改为可选 extra
+（`feat-ocr-mac`），导致 ocrmac 在锁文件中成为无人安装的残留条目。A/B 实测
+（`docs/reviews/ab-ocr-engine-20260916.md`）显示：6 份样本中 5 份两引擎输出逐字符
+相同；唯一实质差异样本（s04 扫描资产负债表页）rapidocr 输出正常中文而 Apple Vision
+输出乱码，s01 上 Vision 另出现疑似幻觉数字、rapidocr 与历史基线数字 Dice 为 1.0。
+据此裁决统一 rapidocr，并从 macos-arm64 lock 与 min-py311 移除 ocrmac 与 pyobjc-*
+残留条目（新增契约测试守卫，禁止其静默回流）。
+
 opencv-python 4.13/4.10（rapidocr 3.9 要求 >=4.5.1.48 满足）；easyocr /
 onnxruntime / tesserocr / nemotron-ocr 未安装，`OcrAutoOptions` 自动跳过。
 
@@ -109,20 +117,31 @@ requests 依赖，不升级）。
 注意：2.127.0 中 `PdfFormatOption.backend` 默认值改为 `ThreadedDoclingParseDocumentBackend`
 （v2.123 起全局默认），项目显式传入 `DoclingParseDocumentBackend`，不受默认切换影响。
 
-**docling-core 包**（基于 2.96.0 wheel 实测验证，MiMo 02 闭环）：
+**docling-core 包**（2.96.0 wheel 验证；**实施阶段修正了原结论**）：
 
-项目 `dayu/documents/processors/docling_processor.py` 重度使用 docling-core 类型 API
-（`from docling_core.types.doc.document import DoclingDocument, TextItem`、
-`DoclingDocument.load_from_json()`、`document.iterate_items()`）。docling-core 自
-v2.87.0 起将 document.py 拆分为子模块，但 2.96.0 的 document.py 保留 re-export：
+项目 `dayu/documents/processors/docling_processor.py` 与 `tests/documents/test_processors.py`
+使用 docling-core 类型 API（`DoclingDocument.load_from_json()`、`document.iterate_items()`
+及多个 item 类型）。docling-core 自 v2.87.0 起将 `document.py` 拆分为子模块：
 
-- `TextItem`（document.py:146，re-export 自 items.text）✓
-- `NodeItem`（document.py:107，re-export 自 items.node）✓
-- `TableItem`（document.py:138，re-export 自 items.table.table）✓
-- `DoclingDocument.load_from_json()`（document.py:3603）✓
-- `DoclingDocument.iterate_items()`（document.py:3296）✓
+- **运行时兼容**：`docling_core.types.doc.document` 保留了 re-export，`import` 与调用
+  不报错（实测 57 passed）。
+- **但 pyright 拒绝**：pyright 对 py.typed 库的 `reportPrivateImportUsage` 规则不承认
+  这种未显式 `as`/未列入 `__all__` 的隐式 re-export，报 10 处
+  `"X" is not exported from module "docling_core.types.doc.document"`。
+  **原"代码层无需改动"的结论被证伪**（当时只验证了符号存在，未验证类型检查层）。
+- **修复**：按 pyright 提示的 owner 规范路径迁移导入（禁止用 `# type: ignore`
+  或配置豁免掩盖），映射如下：
 
-结论：import 路径与调用面均兼容，代码层无需改动。`load_from_json` 对旧版
+| 符号 | 规范导入路径（pyright 认可） |
+|---|---|
+| `DoclingDocument` | `docling_core.types.doc.document`（定义处，不变） |
+| `TextItem` / `SectionHeaderItem` | `docling_core.types.doc.items.text` |
+| `NodeItem` | `docling_core.types.doc.items.node` |
+| `TableItem` | `docling_core.types.doc.items.table.table` |
+| `TableCell` / `TableData` | `docling_core.types.doc.items.table.table_data` |
+| `ProvenanceItem` / `RefItem` | `docling_core.types.doc.common.reference` |
+
+迁移后 pyright 0 errors，tests/documents 57 passed。`load_from_json` 对旧版
 （2.90 生成、version 1.10.0）json 的反序列化兼容性仍列入回归验证（见步骤 2）。
 
 ### 2.3 平台可行性评估
@@ -212,6 +231,22 @@ macOS 上 auto 优先 ocrmac。
     由 docling-slim 排除列表收窄，平台 lock 分别锁 5.16.1/5.17.0）
   - 更新依赖注释：删除"受支持的 macOS x64"表述（平台已放弃）
   - requests、pandas 约束不变（2.33.1 与 3.0.2 均满足目标版本）
+- **代码迁移（实施阶段新增，见 2.2）**：
+  - `dayu/documents/processors/docling_processor.py` 与 `tests/documents/test_processors.py`
+    的 docling-core 导入迁移到 owner 规范路径（10 处 pyright 报错清零，不用 type: ignore）
+  - `tests/cli/test_public_package_entrypoints.py` 契约测试按新模型栈迁移
+    （移除 macOS x64、runtime 约束改 `>=5.16.1,<6.0.0`、按平台映射锁定值、
+    反向断言禁止旧栈回流）
+- **`pyrightconfig.json` 固定项目 venv**：新增 `venvPath: "."` 与 `venv: ".venv"`。
+  原因：原配置未声明 venv，pyright 会解析到 Homebrew 系统 site-packages 中残留的
+  旧 docling 全家桶（docling 2.84.0 / docling_core 2.71.0 / docling_parse 5.7.0），
+  产生**假阴性**（venv 内 docling 已损坏时仍报 0 errors）。固定后搜索路径确定为
+  `.venv/lib/python3.11/site-packages`。
+- **环境重建方式（已知升级危害）**：docling ≤2.126 是真实包、2.127 改为 meta-package
+  （代码在 docling-slim）。在既有 venv 就地升级时，pip 安装 docling-slim 后卸载
+  docling 旧包，会按旧 RECORD 删除与 docling-slim 重叠的文件（实测残留 49/259 个 .py，
+  `import docling` 因退化为 namespace package 而假性成功）。**升级路径必须是新建 venv
+  安装，或升级后 force-reinstall docling-slim**；此条对步骤 4 的 README 升级指引是必需项。
 
 ### 步骤 2：样本库输出回归
 
@@ -300,10 +335,12 @@ macOS 上 auto 优先 ocrmac。
 | **docling-ibm-models 3.13→4.0 跨 major 模型权重/架构变化**（决定 diff 量级） | 高 | 实施前先导核对两版本模型 revision/架构差异；据差异量级调整语义抽样下限 |
 | docling-parse 跨代升级的解析质量退化（表格/中文文本） | 中 | 步骤 2.3 文档级判定清单 |
 | 模型栈升级（torch/transformers）引起表格结构识别数值级变化 | 中 | 步骤 2.3 含表格样本分层；对齐官方 lock 组合可对照官方行为 |
-| rapidocr PP-OCRv6 路径仅 Linux docker 子集回归（Windows 未覆盖） | 中 | 2.4 子集回归 + Windows 登记残余风险 + 上线首周抽检 |
+| rapidocr PP-OCRv6 路径回归覆盖 | 低 | OCR 策略统一后 macOS 全量回归本身即覆盖 rapidocr（A/B 实测已在 macOS 验证该路径可用）；Linux docker 子集回归（2.4）覆盖平台差异；Windows 登记残余风险 + 上线首周抽检 |
 | PPTX / DOCX 回归无真实财报样本覆盖 | 中 | 真实转换冒烟脚本（自建样本）+ 首批 10 份人工抽检量化 |
 | Linux docker 镜像体积 5.5GB+（CUDA 依赖链） | 中 | 已量化；CPU-only index 已评估不采用（与 constraints 机制冲突）；镜像分层缓存 |
 | huggingface-hub 0.x→1.x 跨 major 的兼容影响 | 低 | 项目代码不直接使用（grep 无命中）；模型下载冒烟验证 |
+| 类型检查假阴性：pyright 解析到系统 site-packages 而非项目 venv | 高 | pyrightconfig.json 固定 venvPath/venv（已修复）；今后 pyright 结论以固定后的搜索路径为准 |
+| 既有 venv 就地升级导致的 docling 文件残缺 | 高 | 升级指引要求新建 venv 或 force-reinstall docling-slim；文件数对齐检查（docling 259 个 .py）纳入验证 |
 | 新增依赖（doclang 等）与项目现有依赖树冲突 | 低 | 已逐包核对 requires_dist；安装冒烟兜底 |
 | macOS 下限收紧到 14+ 的用户影响 | 低 | 产品决策已确认；根 README 同步 |
 
@@ -312,7 +349,10 @@ macOS 上 auto 优先 ocrmac。
 | Finding | 来源 | 裁决 | 落地位置 |
 |---|---|---|---|
 | 版本偏离官方 lock（2.96.1/7.20.0） | MiMo 01 | docling-core 改 2.96.0（官方 lock 精确）；docling-parse 改 7.20.0（官方 lock 系列 + 后续 bugfix，如实说明偏离理由）；requests 不升级 | 2.1、步骤 1 |
-| docling-core API 未验证 | MiMo 02 | 已实测 2.96.0 wheel 补验证 | 2.2 |
+| docling-core API 未验证 | MiMo 02 | 已实测 2.96.0 wheel；**实施阶段进一步发现原结论不足**：运行时 re-export 存在但 pyright 拒绝（10 处 reportPrivateImportUsage），已按 owner 规范路径迁移导入 | 2.2、步骤 1 |
+| 就地升级文件覆盖删除（方案外发现） | 实施阶段 | 主 .venv 的 docling 被 pip 卸载覆盖删除（49/259）；用户裁决彻底重建 venv；危害已记入方案供 README 升级指引使用 | 步骤 1 |
+| pyright 解析系统 site-packages 假阴性（方案外发现） | 实施阶段 | pyrightconfig.json 增加 venvPath/venv 固定项目 venv；固定前所有 pyright 结论不可信 | 步骤 1 |
+| OCR 引擎策略变更（方案外发现） | 实施阶段 | docling 2.127 把 ocrmac 降为可选 extra；A/B 实测后裁决三平台统一 rapidocr PP-OCRv6，移除 ocrmac/pyobjc 残留并加契约测试守卫 | 2.1、步骤 1 |
 | export_to_dict 风险定位错 | MiMo 03 | 重定位为 load_from_json + LLM 语义 | 2.4、步骤 2.2 |
 | 回退细节遗漏 | MiMo 04 | 三层回退 | 第 5 节 |
 | CUDA 体积未量化 | MiMo 05 / DS F09 | 逐包量化 5.5GB；CPU-only 评估不采用；docker 承担 | 2.3 |
