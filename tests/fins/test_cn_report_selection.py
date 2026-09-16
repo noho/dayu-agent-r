@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from dayu.fins.pipelines.cn_download_models import (
@@ -328,6 +330,137 @@ def test_cninfo_selection_keeps_years_and_prefers_amended_per_year() -> None:
         (2024, "A2", True),
         (2023, "A3", False),
     ]
+
+
+@pytest.mark.parametrize(("period", "report"), (("Q1", "第一季度报告"), ("Q3", "第三季度报告")))
+@pytest.mark.parametrize("full_suffix", ("", "全文"))
+@pytest.mark.parametrize("revision", ("", "（更正后）"))
+@pytest.mark.parametrize("reverse", (False, True))
+def test_cninfo_same_release_prefers_full_report(
+    period: CnFiscalPeriod, report: str, full_suffix: str, revision: str, reverse: bool
+) -> None:
+    """同日同修订级别完整报告稳定胜出，英文和摘要不得参与竞争。
+
+    Args:
+        period: 一季或三季报。
+        report: 对应中文报告名称。
+        full_suffix: 完整报告可带全文标记或不带标记。
+        revision: 同一发布组的修订后缀。
+        reverse: 是否反转来源输入顺序。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 候选身份、来源或财期不符合 owner 契约。
+    """
+
+    full = _cn_raw(announcement_id="A1", title=f"2024年{report}{full_suffix}{revision}")
+    rows = (
+        _cn_raw(announcement_id="Z9", title=f"2024年{report}全文（英文版）{revision}"),
+        _cn_raw(announcement_id="Z8", title=f"2024年{report}摘要{revision}"),
+        _cn_raw(announcement_id="Z7", title=f"2024年{report}正文{revision}"),
+        full,
+    )
+    candidates = select_cninfo_report_candidates(
+        query=_cn_query((period,)),
+        announcements_by_period={period: tuple(reversed(rows)) if reverse else rows},
+        read_head_meta=_head_meta,
+    )
+
+    assert len(candidates) == 1
+    selected = candidates[0]
+    assert (selected.source_id, selected.title, selected.source_url) == (
+        full.announcement_id, full.title, full.source_url
+    )
+    assert selected.period_projection == CnReportPeriodProjection(identity_period=period, covered_periods=(period,))
+    assert selected.fiscal_year == 2024
+    assert selected.amended is bool(revision)
+
+
+@pytest.mark.parametrize(("period", "report"), (("Q1", "第一季度报告"), ("Q3", "第三季度报告")))
+def test_cninfo_body_remains_a_valid_only_report(period: CnFiscalPeriod, report: str) -> None:
+    """唯一正文不得被过滤。
+
+    Args:
+        period: 一季或三季报。
+        report: 对应报告中文名。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 唯一正文被错误排除。
+    """
+
+    body = _cn_raw(announcement_id="body", title=f"2024年{report}正文")
+    candidates = select_cninfo_report_candidates(
+        query=_cn_query((period,)), announcements_by_period={period: (body,)}, read_head_meta=_head_meta
+    )
+    assert len(candidates) == 1
+    assert candidates[0].source_id == body.announcement_id
+
+
+@pytest.mark.parametrize(
+    ("body_title", "body_date", "full_date", "amended"),
+    (
+        ("2024年第一季度报告正文（更正后）", "2025-04-01", "2025-04-01", True),
+        ("2024年第一季度报告正文（更正后）", "2025-04-01", "2025-04-02", True),
+        ("2024年第一季度报告正文（修订版）", "2025-04-02", "2025-04-01", True),
+        ("2024年第一季度报告正文", "2025-04-02", "2025-04-01", False),
+    ),
+)
+def test_cninfo_revision_and_date_take_precedence_over_report_form(
+    body_title: str, body_date: str, full_date: str, amended: bool
+) -> None:
+    """保持修订及日期的既有版本优先级，不用全文标签推翻版本事实。
+
+    Args:
+        body_title: 应选正文的标题。
+        body_date: 正文公告日期。
+        full_date: 普通全文公告日期。
+        amended: 应投影的修订标记。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 修订或日期优先级改变。
+    """
+
+    body = _cn_raw(announcement_id="A1", title=body_title, announcement_date=body_date)
+    full = _cn_raw(announcement_id="Z9", title="2024年第一季度报告全文", announcement_date=full_date)
+    for rows in ((body, full), (full, body)):
+        candidates = select_cninfo_report_candidates(
+            query=_cn_query(("Q1",)), announcements_by_period={"Q1": rows}, read_head_meta=_head_meta
+        )
+        assert len(candidates) == 1
+        assert candidates[0].source_id == body.announcement_id
+        assert candidates[0].amended is amended
+
+
+@pytest.mark.parametrize("same_id", (False, True))
+def test_cninfo_equal_reports_use_stable_source_identity(same_id: bool) -> None:
+    """同分报告用来源身份稳定裁决，ID 相同则使用 URL。
+
+    Args:
+        same_id: 是否使用同公告 ID、不同 URL 的输入。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 输入反转改变选中来源。
+    """
+
+    first = _cn_raw(announcement_id="A1", title="2024年第一季度报告全文")
+    second = replace(first, source_url=first.source_url + "?version=2") if same_id else replace(first, announcement_id="A2")
+    for rows in ((first, second), (second, first)):
+        candidates = select_cninfo_report_candidates(
+            query=_cn_query(("Q1",)), announcements_by_period={"Q1": rows}, read_head_meta=_head_meta
+        )
+        assert len(candidates) == 1
+        assert (candidates[0].source_id, candidates[0].source_url) == (second.announcement_id, second.source_url)
 
 
 def test_hkexnews_selection_filters_english_and_infers_periods() -> None:

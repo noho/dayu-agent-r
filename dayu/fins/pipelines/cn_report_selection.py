@@ -78,6 +78,7 @@ _CNINFO_REPORT_TITLE_TOKENS: Final[tuple[str, ...]] = (
     "第三季度报告",
 )
 _CNINFO_TITLE_AMENDED_TOKENS: Final[tuple[str, ...]] = ("更正", "更正后", "修订", "补充", "修正")
+_CNINFO_REPORT_BODY_TOKEN: Final[str] = "正文"
 _CNINFO_TITLE_FY_PATTERN: Final[re.Pattern[str]] = re.compile(r"(\d{4})\s*年[年度]?\s*(年度报告|年报)")
 _CNINFO_TITLE_FISCAL_YEAR_FALLBACK: Final[re.Pattern[str]] = re.compile(r"(\d{4})\s*年")
 
@@ -422,11 +423,47 @@ def _pick_best_cninfo_announcement(items: list[CninfoRawAnnouncement]) -> Option
     if not items:
         return None
 
-    def sort_key(announcement: CninfoRawAnnouncement) -> tuple[int, str]:
-        is_amended = any(token in announcement.title for token in _CNINFO_TITLE_AMENDED_TOKENS)
-        return (1 if is_amended else 0, announcement.announcement_date)
+    return max(items, key=_cninfo_announcement_sort_key)
 
-    return max(items, key=sort_key)
+
+def _cninfo_announcement_sort_key(announcement: CninfoRawAnnouncement) -> tuple[bool, str, bool, str, str]:
+    """在修订状态及公告日期相同时优先完整报告，并稳定裁决平手。
+
+    Args:
+        announcement: 已通过财报标题与语言过滤的巨潮公告。
+
+    Returns:
+        修订优先、较新日期优先、非正文优先及来源身份组成的排序键。
+        来源 ID 和 URL 仅用于确定性平手，不代表版本先后或报告质量。
+
+    Raises:
+        无。
+    """
+
+    # 正文仍可作为唯一历史来源；不能让旧全文盖过真正修订或较新报告。
+    return (
+        _is_cninfo_amended_title(announcement.title),
+        announcement.announcement_date,
+        _CNINFO_REPORT_BODY_TOKEN not in announcement.title,
+        announcement.announcement_id,
+        announcement.source_url,
+    )
+
+
+def _is_cninfo_amended_title(title: str) -> bool:
+    """统一判定巨潮报告修订标记，供排序与候选投影共用。
+
+    Args:
+        title: 已归一化的公告标题。
+
+    Returns:
+        标题包含修订标记时返回 True。
+
+    Raises:
+        无。
+    """
+
+    return any(token in title for token in _CNINFO_TITLE_AMENDED_TOKENS)
 
 
 def _build_cninfo_candidate(
@@ -460,7 +497,7 @@ def _build_cninfo_candidate(
         filing_date=announcement.announcement_date,
         fiscal_year=fiscal_year,
         period_projection=CnReportPeriodProjection(identity_period=period, covered_periods=(period,)),
-        amended=any(token in announcement.title for token in _CNINFO_TITLE_AMENDED_TOKENS),
+        amended=_is_cninfo_amended_title(announcement.title),
         content_length=head_meta.content_length,
         etag=head_meta.etag,
         last_modified=head_meta.last_modified,

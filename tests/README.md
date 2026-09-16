@@ -17,6 +17,10 @@ propagate 与 disabled 状态，并关闭本测试新增的 logger handler，避
 
 ## 常用命令
 
+巨潮正文/全文选择与覆盖补源回归：`python -m pytest tests/fins/test_cn_report_selection.py tests/fins/test_cninfo_downloader.py tests/fins/test_cn_download_workflow.py -q`。
+选择测试覆盖 Q1/Q3 同日形态优先、唯一正文保留、修订和日期优先级、英文/摘要排除及输入顺序稳定性；
+下载测试使用真实隔离仓储核对完整旧缓存跳过、显式覆盖后的来源/文件指纹与清单一致性，以及再次增量跳过。
+
 SEC 业绩补源回归：`pytest -q tests/fins/test_sec_earnings_repair.py tests/fins/test_sec_downloader.py tests/fins/test_sec_pipeline_download.py`。
 新增回归使用 `tests/fins/fixtures/sec_earnings_repair_v1` 中有来源与 hash 清单的真实 HTML 字节；
 HTTP transport 被隔离替换，公开 CLI、分类、文件发现和仓储真实执行。覆盖历史完整 8-K 封面补附件、

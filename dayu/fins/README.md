@@ -513,6 +513,11 @@ batching repository 是 begin / commit / rollback 的唯一 lifecycle owner。pr
 
 CNInfo / HKEXNews downloader 只负责 HTTP 请求响应、provider JSON 解析、provider raw 字段归一、股票代码匹配、PDF URL 归一、HEAD / GET 与 PDF 字节校验。产品级财报候选语义由 `dayu.fins.pipelines.cn_report_selection` 持有：title blocklist、语言过滤、report kind / fiscal period / fiscal year 推断、同 period/year 去重、amended 优先和 `CnReportCandidate` 构造都在 pipeline helper 内完成。HKEXNews 的 Q1～Q4 共用一次全 results group discovery；selection 先只由 provider category 判定 report/results family，再在该 family 内共同解释 category 与 title 的期间事实。category family 或期间事实不唯一、同一 source ID 的核心事实冲突时失败关闭。
 
+CNInfo 同财年、财期内先按修订标记、公告日期优先选择；两者相同时，非“正文”报告优先。
+完整报告标题不必含“全文”；只有正文时仍返回正文。剩余平手使用公告 ID、来源 URL 的字符串
+顺序稳定裁决，这些身份字段不代表版本新旧或报告质量。该规则只描述候选选择，不承诺 PDF
+财务表完整性；本地完整缓存仍沿用增量跳过契约，更新选中来源使用显式覆盖下载。
+
 CN/HK candidate 使用 `CnReportPeriodProjection` 区分唯一 `identity_period` 与只读
 `covered_periods`。identity 是 document ID、窗口、form、fiscal period、report kind 与
 missing satisfaction 的唯一输入；coverage 只描述同一 source 内容覆盖的期间，不生成额外
