@@ -24,9 +24,9 @@
 
 ## 1. 安装
 
-项目默认和依赖锁定环境是 Python 3.11。Docling 模型栈统一约束为
-`transformers>=4.57.6,<5.0.0`；不要在受控约束上另行升级到 Transformers 5.x，
-否则使用 `torch 2.2.x` 的 macOS Intel 环境无法运行 Docling。
+项目默认和依赖锁定环境是 Python 3.11；macOS 需要 14 及以上版本。Docling 模型栈
+（docling / torch / transformers）的版本组合由平台约束文件锁定并经过验证，
+不要另行升降这些依赖。
 
 ### 1.1 从源码安装
 
@@ -39,7 +39,7 @@ python -m pip install -e ".[test,dev,browser]" \
 
 按平台替换约束文件：
 
-- macOS Intel：`constraints/lock-macos-x64-py311.txt`
+- macOS Apple Silicon：`constraints/lock-macos-arm64-py311.txt`
 - Linux x64：`constraints/lock-linux-x64-py311.txt`
 - Windows x64：`constraints/lock-windows-x64-py311.txt`
 
@@ -577,6 +577,14 @@ FIRST/RESET 的配置已经发布成功，warning 只表示本进程未完成两
 
 这是当前设计：未传 `--log-file` 的诊断流在进程结束时自动清理。重现问题时加上
 `--debug --log-file <path>`；排查高频流式链路时改用 `--debug-stream`。
+
+### 升级依赖后 Docling 报导入或初始化错误
+
+不要在已有 `.venv` 里就地升级 Docling 依赖：Docling 2.127 起代码拆分到 `docling-slim`
+包，就地升级时旧包卸载会连带删除新装文件，使 `docling` 导入残缺，上传或预处理时报
+Docling 初始化失败。解决方法是删除 `.venv` 后按第 1.1 节重新创建并安装；若必须就地
+修复，可在升级后执行
+`python -m pip install --force-reinstall --no-deps -c constraints/lock-<平台>-py311.txt docling-slim`。
 
 ### 批量上传脚本没有生成
 
