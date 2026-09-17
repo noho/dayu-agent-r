@@ -11,11 +11,13 @@ opencv-python==4.13.0.92
 watchdog==6.0.0
 
 # torch 2.14.0 在 Linux 无条件声明 CUDA pip 依赖链（CPU 推理同样安装），
-# 以下按 torch 2.14.0 元数据精确 pin；cuda-toolkit extras 展开的子包按
-# cuda-toolkit 13.0.3 元数据 pin，nvidia-nvjitlink 与 cuda-bindings 取声明区间
+# 以下按 torch 2.14.0 元数据精确 pin；cuda-toolkit extras（cublas/cudart/cufft/
+# cufile/cupti/curand/cusolver/cusparse/nvjitlink/nvrtc/nvtx）展开的子包按其
+# 元数据 pin，nvidia-nvjitlink 与 cuda-bindings 取声明区间
 # （<14,>=13.0.88 / <14,>=13.0.3）内当前最新，triton 按 ~=3.8.0 取 3.8.0。
-# 注意：本段未在 Linux 实机核对，留待 Linux docker 验证任务确认。
-cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==13.0.3
+# 注意：constraints 文件不允许 extras 形式（pip 会报 "Constraints cannot have
+# extras"），故 cuda-toolkit 只写名称+版本，extras 子包在下方逐条 pin。
+cuda-toolkit==13.0.3
 cuda-bindings==13.4.1
 cuda-pathfinder==1.8.1
 nvidia-cublas==13.1.1.3
