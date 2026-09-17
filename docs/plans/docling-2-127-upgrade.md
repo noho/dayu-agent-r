@@ -1,10 +1,25 @@
 # Docling 2.90.0 → 2.127.0 升级方案
 
 - 日期：2026-09-16
-- 状态：已通过两路 plan review（MiMo + DS），修订闭环，待用户批准后实施
+- 状态：**实施中**（步骤 1 完成并提交；步骤 2 回归基本完成，单档退化待处置裁决）
 - Review artifacts：
   - `docs/reviews/plan-review-20260916-105307.md`（AgentDS，fail → 已修订）
   - `docs/reviews/plan-review-20260916-105857.md`（AgentMiMo，pass-with-risks → 已修订）
+
+## 0. 实施状态（2026-09-17 更新）
+
+| 步骤 | 状态 | 证据/产物 |
+|---|---|---|
+| 1 依赖与代码迁移 | ✅ 完成并提交 | commits `6e318109` / `08d34eab` / `c3c776e7` / `1281f584`；.venv 重建后与参照安装 39260 文件零差异、pyright 0 errors |
+| 2.1 先导冒烟 gate | ✅ 通过 | `docs/reviews/docling-schema-regression-20260916.md` |
+| 2.2 schema 全量（250 份） | ✅ 全绿 | 同上：反序列化 250/250、顶层 key 零差异、version 全 1.10.0 |
+| 2.3 语义判定（100 份双路 + 抽查） | ✅ 完成，**1 档确认真实退化** | 4 份判定 artifact + 抽查裁决；退化样本 `fil_cn_8492e128…`（泡泡玛特 2025 年报附注 25 股本变动表数据行丢失） |
+| 2.4 Linux 验证 | ◐ 安装层已过，转换层样本补足中 | linux/amd64 容器：pip check 干净、import 15/15、CUDA 链 19 包/6.5G；rapidocr 引擎选择已验证 |
+| 2.5 PPTX/DOCX 冒烟 | ✅ 5/5 通过 | `docs/reviews/docling-pptx-docx-smoke-20260917.md` |
+| 单档退化根因定位 | ✅ 完成 | `docs/reviews/docling-regression-8492e128-rootcause.md`：**上游回归，引入版本 docling 2.118.0**；配置层可规避（`table_mode=fast`） |
+| 处置裁决 | ⏸ 待用户裁决 | 数据来源：`docs/reviews/docling-table-mode-ab-20260917.md`（40 份双模式研究，进行中） |
+
+**OCR 引擎决策复核**：`docs/reviews/visual-verification-ds-20260917.md` 独立程序化复核支持三平台统一 rapidocr 的裁决（s04 扫描页 rapidocr 输出与页面一致、Vision 输出乱码）。
 
 ## 1. 背景与目标
 
@@ -271,6 +286,11 @@ macOS 上 auto 优先 ocrmac。
 - 判定粒度：文档级聚合判定
 - 判定清单：数字保真（表格单元格数值）、表格结构、heading 层级、阅读顺序、
   文本完整性
+- **判定素材口径约束（实施阶段发现并修正）**：数字抽取必须覆盖
+  `texts ∪ tables[].data.table_cells[].text`。本次升级的典型差异是「文本块被识别为
+  表格」（tables 86 份增加），若只从 texts 取数会把「移入表格」误判为「内容丢失」。
+  digest 需同时给出 merged（合并口径）与 texts-only / tables-only 分项计数，
+  并对文本 delete 块给出"数字是否出现在新版表格单元格"的命中率提示。
 - 判定人（用户裁决）：AgentMiMo/AgentDS 按判定 prompt 执行 LLM 判定，
   人工抽查 10%；判定报告入 `docs/reviews/`
 - 退化且配置层无法适配的分支：明确决策条件——单档数字保真/表格结构退化
