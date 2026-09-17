@@ -14,7 +14,8 @@
 | 2.1 先导冒烟 gate | ✅ 通过 | `docs/reviews/docling-schema-regression-20260916.md` |
 | 2.2 schema 全量（250 份） | ✅ 全绿 | 同上：反序列化 250/250、顶层 key 零差异、version 全 1.10.0 |
 | 2.3 语义判定（100 份双路 + 抽查） | ✅ 完成，**1 档确认真实退化** | 4 份判定 artifact + 抽查裁决；退化样本 `fil_cn_8492e128…`（泡泡玛特 2025 年报附注 25 股本变动表数据行丢失） |
-| 2.4 Linux 验证 | ◐ 安装层已过，转换层样本补足中 | linux/amd64 容器：pip check 干净、import 15/15、CUDA 链 19 包/6.5G；rapidocr 引擎选择已验证 |
+| 2.4 Linux 验证 | ✅ 完成 | linux/amd64 容器：pip check 干净、import 15/15、CUDA 链 19 包/6.5G；9 份样本转换全部 closed JSON、9/9 引擎日志确认 rapidocr；`docs/reviews/docling-linux-rapidocr-verify-20260917.md` |
+| **OCR 引擎显式化（用户追加要求）** | ✅ 完成并提交 | `dayu/documents/docling_runtime.py` 显式设置 `RapidOcrOptions(backend="torch", lang=["ch"])`，消除"环境装了谁就用谁"的隐式依赖；owner 级契约测试守卫；等价性验证零行为变化（commit `84c003f4`） |
 | 2.5 PPTX/DOCX 冒烟 | ✅ 5/5 通过 | `docs/reviews/docling-pptx-docx-smoke-20260917.md` |
 | 单档退化根因定位 | ✅ 完成 | `docs/reviews/docling-regression-8492e128-rootcause.md`：**上游回归，引入版本 docling 2.118.0**；配置层可规避（`table_mode=fast`） |
 | 40 份双模式研究 | ✅ 完成 | `docs/reviews/docling-table-mode-ab-20260917.md`：两模式各有真实损失（accurate 丢 61 token/12 份、fast 丢 27 token/8 份，含单页复核确认的真实数据丢失），**非单边改善** |
