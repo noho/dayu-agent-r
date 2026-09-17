@@ -17,7 +17,9 @@
 | 2.4 Linux 验证 | ◐ 安装层已过，转换层样本补足中 | linux/amd64 容器：pip check 干净、import 15/15、CUDA 链 19 包/6.5G；rapidocr 引擎选择已验证 |
 | 2.5 PPTX/DOCX 冒烟 | ✅ 5/5 通过 | `docs/reviews/docling-pptx-docx-smoke-20260917.md` |
 | 单档退化根因定位 | ✅ 完成 | `docs/reviews/docling-regression-8492e128-rootcause.md`：**上游回归，引入版本 docling 2.118.0**；配置层可规避（`table_mode=fast`） |
-| 处置裁决 | ⏸ 待用户裁决 | 数据来源：`docs/reviews/docling-table-mode-ab-20260917.md`（40 份双模式研究，进行中） |
+| 40 份双模式研究 | ✅ 完成 | `docs/reviews/docling-table-mode-ab-20260917.md`：两模式各有真实损失（accurate 丢 61 token/12 份、fast 丢 27 token/8 份，含单页复核确认的真实数据丢失），**非单边改善** |
+| **处置裁决（用户）** | ✅ **已裁定：保持 accurate + 记录 + 上报上游** | 理由：accurate 是已验证的生产配置；其损失是上游回归可上报修复；fast 的损失是模式固有，全局切换会把扫描件反向损失引入生产 |
+| 上游上报材料 | ◐ 准备中（用户确认后发布） | `docs/reviews/docling-upstream-issue-draft-20260917.md` |
 
 **OCR 引擎决策复核**：`docs/reviews/visual-verification-ds-20260917.md` 独立程序化复核支持三平台统一 rapidocr 的裁决（s04 扫描页 rapidocr 输出与页面一致、Vision 输出乱码）。
 
@@ -353,7 +355,8 @@ macOS 上 auto 优先 ocrmac。
 |---|---|---|
 | `load_from_json` 对旧版 docling json 反序列化失败或 LLM 投影语义退化 | 高 | 步骤 2.1 冒烟 gate + 2.2 全量解析断言 + 2.3 语义判定 |
 | **docling-ibm-models 3.13→4.0 跨 major 模型权重/架构变化**（决定 diff 量级） | 高 | 实施前先导核对两版本模型 revision/架构差异；据差异量级调整语义抽样下限 |
-| docling-parse 跨代升级的解析质量退化（表格/中文文本） | 中 | 步骤 2.3 文档级判定清单 |
+| **docling 2.118+ accurate 模式表格数据行丢失**（已确认的已知回归） | 中 | 用户 2026-09-17 裁决：保持 accurate + 记录 + 上报上游；失败签名 = TableFormer 触顶不收敛 OTSL → MatchingPostProcessor 丢弃 cells；检测式重试列为后续候选工作单元；档案见 `docs/reviews/docling-regression-8492e128-rootcause.md` |
+| docling-parse 跨代升级的解析质量退化（表格/中文文本） | 低 | 步骤 2.3 文档级判定已覆盖，未发现 docling-parse 层问题（根因定位到 docling 自身 layout/pipeline 变更） |
 | 模型栈升级（torch/transformers）引起表格结构识别数值级变化 | 中 | 步骤 2.3 含表格样本分层；对齐官方 lock 组合可对照官方行为 |
 | rapidocr PP-OCRv6 路径回归覆盖 | 低 | OCR 策略统一后 macOS 全量回归本身即覆盖 rapidocr（A/B 实测已在 macOS 验证该路径可用）；Linux docker 子集回归（2.4）覆盖平台差异；Windows 登记残余风险 + 上线首周抽检 |
 | PPTX / DOCX 回归无真实财报样本覆盖 | 中 | 真实转换冒烟脚本（自建样本）+ 首批 10 份人工抽检量化 |

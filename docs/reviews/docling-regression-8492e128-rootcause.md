@@ -160,16 +160,22 @@ p331 以 scale 3.0 渲染为 PNG（`workspace/tmp/spot-check/popmart-p331.png` �
   报告范围内评估（需另做全量 A/B）。
 - `do_cell_matching=False` 不可作为规避路径。
 
-## 8. 候选处置（待裁决，均未实施）
+## 8. 候选处置与最终裁决
 
-1. **接受并记录**：accurate 退化只影响部分表格样本；2.127 升级的其它收益
-   （新 layout、新 OCR、语义模型等）保留。记录本报告作为已知回归档案。
-2. **生产切 `table_mode=fast`**：本样本数字保真优于基线，但需先做全量质量
-   A/B（fast vs accurate 的表格结构质量差异）再决策。
-3. **pin docling-ibm-models 3.15**：与 2.127 pipeline 代码的兼容性未验证
-   （2.127 调用 4.x API），大概率不可行，仅列为候选。
-4. **上报上游**：附最小复现（`workspace/tmp/docling-regression/p331/p331.pdf`
-   单页 + 探针数据），提交 docling GitHub issue。
+**用户裁决（2026-09-17）：候选 1 + 候选 4 —— 保持 accurate + 记录 + 上报上游。**
+
+| 候选 | 结论 |
+|---|---|
+| 1. **接受并记录** | ✅ **已采纳**：保持生产 accurate 配置；本报告 + 40 份双模式研究（`docling-table-mode-ab-20260917.md`）作为已知回归档案 |
+| 2. 生产切 `table_mode=fast` | ❌ 已评估否决：40 份 A/B 显示两模式**各有真实损失**（accurate 丢 61 token/12 份，fast 丢 27 token/8 份，含单页复核确认的扫描件反向丢失），非单边改善 |
+| 3. pin docling-ibm-models 3.15 | ❌ 未采纳：兼容性未验证，且 ibm-models 不是引入点（2.117/2.118 同为 3.15.0） |
+| 4. **上报上游** | ✅ **已执行**：**https://github.com/docling-project/docling/issues/4255**；材料包 `workspace/tmp/docling-regression/upstream-issue/`（6 文件，已脱敏） |
+| 5. 检测式重试（方案 B） | ⏸ 未采纳：需修改 `dayu.documents.docling_runtime`（质量门 + 条件重试）；用户裁定维持 A，列为后续候选工作单元 |
+
+**已知风险的接受形态**：恢复上传后，新转换文档若命中同类表格结构（TableFormer 触顶
+不收敛），该表数据行会**静默缺失**；失败签名见第 5 节
+（`MatchingPostProcessor ... pdf cells matched neither a row nor a column band ... dropped`，
+或结果表中只有框架/表头单元格而无数据行）。上游修复后应跟进升级。
 
 ## 9. 残余风险与未覆盖项
 
