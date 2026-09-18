@@ -734,6 +734,133 @@ def test_upload_filings_from_usage_empty_and_write_failures(
     )
     assert outside == EXIT_FAILURE
     assert "escapes workspace root" in capsys.readouterr().err
+    assert not (tmp_path / "outside.sh").exists()
+
+
+def test_upload_filings_from_publish_contract_errors_project_specific_message(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同一 publisher contract 的三个 typed 错误变体必须投影具体消息且无发布副作用。"""
+
+    _install_forbidden_direct_service(monkeypatch)
+    monkeypatch.setattr(upload_script.os, "name", "posix")
+    source_dir = tmp_path / "source"
+    base = tmp_path / "workspace"
+    source_dir.mkdir()
+    (source_dir / "2024FY年报.pdf").write_text("filing", encoding="utf-8")
+
+    real_dir = base / "real"
+    real_dir.mkdir(parents=True)
+    linked_dir = base / "linked"
+    linked_dir.symlink_to(real_dir, target_is_directory=True)
+    _assert_publish_contract_failure(
+        (
+            "upload_filings_from",
+            "--base",
+            str(base),
+            "--ticker",
+            "AAPL",
+            "--from",
+            str(source_dir),
+            "--output",
+            str(linked_dir / "upload.sh"),
+        ),
+        expected_stderr_fragment="internal symlink",
+        target=real_dir / "upload.sh",
+        expect_target_absent=True,
+        workspace=base,
+        capsys=capsys,
+    )
+    _assert_publish_contract_failure(
+        (
+            "upload_filings_from",
+            "--base",
+            str(base),
+            "--ticker",
+            "AAPL",
+            "--from",
+            str(source_dir),
+            "--output",
+            str(base / "missing" / "upload.sh"),
+        ),
+        expected_stderr_fragment="output parent is not an existing directory",
+        target=base / "missing" / "upload.sh",
+        expect_target_absent=True,
+        workspace=base,
+        capsys=capsys,
+    )
+
+    (base / "upload_filings_AAPL.sh").mkdir()
+    _assert_publish_contract_failure(
+        (
+            "upload_filings_from",
+            "--base",
+            str(base),
+            "--ticker",
+            "AAPL",
+            "--from",
+            str(source_dir),
+        ),
+        expected_stderr_fragment="output target is not a regular file",
+        target=base / "upload_filings_AAPL.sh",
+        expect_target_absent=False,
+        workspace=base,
+        capsys=capsys,
+    )
+
+
+def test_upload_filings_from_unknown_failure_uses_generic_message(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """publisher 未知内部异常必须投影通用消息且不泄漏内部异常细节。"""
+
+    _install_forbidden_direct_service(monkeypatch)
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    (source_dir / "2024FY年报.pdf").write_text("filing", encoding="utf-8")
+
+    def fail_publish(
+        workspace_root: Path,
+        output: Path | None,
+        canonical_ticker: str,
+        platform: upload_script.UploadScriptPlatform,
+        content: str,
+    ) -> Path:
+        """模拟 publisher 内部未知失败。
+
+        :param workspace_root: workspace root。
+        :param output: 显式输出路径。
+        :param canonical_ticker: 默认文件名使用的 canonical ticker。
+        :param platform: 目标脚本平台。
+        :param content: renderer 已生成的完整文本。
+        :returns: 不返回。
+        :raises RuntimeError: 始终抛出。
+        """
+
+        raise RuntimeError("internal-boom-detail")
+
+    monkeypatch.setattr(fins_command, "publish_upload_script", fail_publish)
+
+    exit_code = cli_main.main(
+        (
+            "upload_filings_from",
+            "--base",
+            str(tmp_path / "workspace"),
+            "--ticker",
+            "AAPL",
+            "--from",
+            str(source_dir),
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_FAILURE
+    assert "命令执行失败，请使用 --log-file PATH 重试并查看日志" in captured.err
+    assert "internal-boom-detail" not in captured.err
 
 
 def test_upload_filings_from_keyboard_interrupt_exits_130(
@@ -1184,6 +1311,45 @@ def _decode_windows_batch_fixed_token(value: str) -> str:
         decoded.append(character)
         index += 1
     return "".join(decoded)
+
+
+def _assert_publish_contract_failure(
+    argv: tuple[str, ...],
+    *,
+    expected_stderr_fragment: str,
+    target: Path,
+    expect_target_absent: bool,
+    workspace: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """执行一个 publisher contract 违例变体并断言安全失败与零发布副作用。
+
+    零副作用断言是 owner 级不变量：对 workspace 做条目集合快照，CLI 调用前后
+    必须完全一致。该断言不依赖 publisher 私有 temp 命名规则，因此 publisher
+    临时文件残留（无论命名如何变化）与任何其它新增条目都会被捕获。
+
+    :param argv: 完整 CLI argv（不含程序名）。
+    :param expected_stderr_fragment: typed contract 错误消息必须包含的片段。
+    :param target: 当前变体的最终 publish target 路径。
+    :param expect_target_absent: target 在变体中是否必然完全不存在；``True``
+        时断言 ``not target.exists()``，``False`` 时（target 是预建目录）仅
+        断言 ``not target.is_file()``。
+    :param workspace: workspace root，用于快照零副作用断言。
+    :param capsys: pytest stdout/stderr capture fixture。
+    :returns: ``None``。
+    :raises AssertionError: 退出码、stderr 投影或发布副作用断言失败时抛出。
+    """
+
+    before = {p.relative_to(workspace) for p in workspace.rglob("*")}
+    exit_code = cli_main.main(argv)
+    assert exit_code == EXIT_FAILURE
+    assert expected_stderr_fragment in capsys.readouterr().err
+    after = {p.relative_to(workspace) for p in workspace.rglob("*")}
+    assert after == before
+    if expect_target_absent:
+        assert not target.exists()
+    else:
+        assert not target.is_file()
 
 
 def _install_forbidden_direct_service(monkeypatch: pytest.MonkeyPatch) -> None:
