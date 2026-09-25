@@ -95,7 +95,7 @@
 
 | 风险 | 分类 / owner |
 |---|---|
-| storage 预检异常（如 `SourceIntegrityPreflightError`）被兜底投影为“下载执行失败”，掩盖真实原因 | requiring new issue / explicit user decision；owner：Dayu 维护方（本次排障实证代价） |
+| storage 预检异常（如 `SourceIntegrityPreflightError`）被兜底投影为“下载执行失败”，掩盖真实原因 | tracked by issue [#198](https://github.com/noho/dayu-agent-r/issues/198)；owner：Dayu 维护方 |
 | 本验收为 skip 路径；全新 PDF+docling 落盘链路未在本窗口端到端演练 | assigned to later work unit（仅当需要下载演练时） |
 | 其它 ticker/filing 目录可能同类工具残留污染 | assigned to later work unit（消费方 CMB/YUMC 下载排障时同口径处理） |
 | 巨潮未来省略 `announcements` key 表达空结果 → 再次协议失败（fail-closed 设计使然） | 接受的残留边界 |
@@ -113,5 +113,5 @@
 ## Next entry point
 
 1. 用户 merge PR #197 后：消费方 fixture-refresh 工作流继续（招商银行、百胜中国下载），同口径排障。
-2. 建议开新 issue：storage 预检异常的 public 投影修复（`classification=execution` 兜底掩盖 typed 失败原因）。
+2. 已开 issue [#198](https://github.com/noho/dayu-agent-r/issues/198)：storage 预检异常的 public 投影修复（`classification=execution` 兜底掩盖 typed 失败原因），待排期。
 3. 用户 merge 前如需对捎带 20 commit 重新评审，另开 review 任务。
