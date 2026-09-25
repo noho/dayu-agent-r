@@ -15,7 +15,9 @@
   - ``GET http://www.cninfo.com.cn/new/data/szse_stock.json``：
     全市场 A 股公司基础映射（``code`` -> ``orgId``）。
   - ``POST http://www.cninfo.com.cn/new/hisAnnouncement/query``：按
-    ``stock={code},{orgId}`` + ``category_*_szsh;`` 分类拉公告列表。
+    ``stock={code},{orgId}`` + ``category_*_szsh;`` 分类拉公告列表。空结果时
+    响应 ``announcements`` 字段为 ``null``（key 存在、值为 null），与空数组
+    同义；缺 key 或其它类型按协议失败处理。
   - ``GET http://static.cninfo.com.cn/{adjunctUrl}``：PDF 实体下载。
 
 - 产品级候选筛选、标题黑名单、fiscal year 推断、同 period/year 去重、
@@ -470,7 +472,15 @@ class CninfoDiscoveryClient:
                 cancellation_checkpoint()
             if not isinstance(payload, dict):
                 raise _cninfo_protocol_error("巨潮来源返回的公告列表格式不符合预期")
-            items = payload.get("announcements")
+            if "announcements" not in payload:
+                # 空结果编码恒带 key（值为 null）；缺 key 是未知契约形态，
+                # 必须失败，防止错误载荷被伪装成“无候选”空成功。
+                raise _cninfo_protocol_error("巨潮来源返回的公告列表格式不符合预期")
+            items = payload["announcements"]
+            if items is None:
+                # 巨潮用 null 编码空结果（key 存在、值为 null，与
+                # totalRecordNum=0 同现）；与空数组同义，按空页结束分页。
+                break
             if not isinstance(items, list):
                 raise _cninfo_protocol_error("巨潮来源返回的公告列表格式不符合预期")
             if not items:

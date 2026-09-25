@@ -24,9 +24,9 @@
 
 ## 1. 安装
 
-项目默认和依赖锁定环境是 Python 3.11。Docling 模型栈统一约束为
-`transformers>=4.57.6,<5.0.0`；不要在受控约束上另行升级到 Transformers 5.x，
-否则使用 `torch 2.2.x` 的 macOS Intel 环境无法运行 Docling。
+项目默认和依赖锁定环境是 Python 3.11；macOS 需要 14 及以上版本。Docling 模型栈
+（docling / torch / transformers）的版本组合由平台约束文件锁定并经过验证，
+不要另行升降这些依赖。
 
 ### 1.1 从源码安装
 
@@ -39,7 +39,7 @@ python -m pip install -e ".[test,dev,browser]" \
 
 按平台替换约束文件：
 
-- macOS Intel：`constraints/lock-macos-x64-py311.txt`
+- macOS Apple Silicon：`constraints/lock-macos-arm64-py311.txt`
 - Linux x64：`constraints/lock-linux-x64-py311.txt`
 - Windows x64：`constraints/lock-windows-x64-py311.txt`
 
@@ -274,6 +274,42 @@ export SEC_USER_AGENT="Your Organization contact@example.com"
 空结果、失败或取消也不会删除非目标旧文档。`--rebuild` 只根据已经下载到本地的源文档
 重建下载元数据和 manifest，不发送数据提供方请求，也不新增、删除或替换源文档内容。
 两者是互斥模式，不能在同一命令中同时使用。
+
+巨潮同财期报告先按修订标记和公告日期选择；两者相同时，完整报告优先于“报告正文”，
+只有正文时仍保留该来源。已缓存的正文可能拥有完整的本地文件，因此普通增量仍会跳过；
+需要重新获取选中的完整报告时，对目标公司和披露窗口执行一次覆盖下载，例如：
+
+```bash
+dayu-cli download --base /path/to/workspace --ticker 000333 --forms Q1 --start 2021-04-29 --end 2021-04-30 --overwrite
+```
+
+完成后去掉 `--overwrite` 再运行应跳过。`--rebuild` 不会下载缺失的完整报告。
+下载成功表示文件已获取，分析所需财务原表是否齐全仍需核对报告内容。
+
+SEC 的 8-K 下载包含同一披露下识别到的 EX-99 HTML 附件。已有完整封面缓存不会在普通
+增量下载时重新检查附件；升级后需对受影响的公司、表单和披露日执行一次 `--overwrite`，例如：
+
+```bash
+dayu-cli download --base /path/to/workspace --ticker MSFT --forms 8-K --start 2025-07-30 --end 2025-07-30 --overwrite
+```
+
+该命令会重新获取所选披露的文件并更新登记，随后去掉 `--overwrite` 再运行应显示增量跳过。
+修正分类规则后，历史被拒的 6-K 也用这一方式重新下载并接受分类检查；`--rebuild` 不能补远端
+附件，也不能将被拒文件变成正式来源。当前下载筛选粒度是公司、表单和披露日，没有按文档 ID
+筛选的下载参数；同日存在多份匹配披露时会一起处理。
+
+港股已有季度识别错误时，使用本地重建重新核定财期，例如：
+
+```bash
+dayu-cli download --base /path/to/workspace --ticker 3690 --forms Q1 Q3 --start 2024-11-01 --end 2025-11-30 --rebuild
+```
+
+范围按披露日期和纠正前或纠正后的财期筛选。重建会使用同公司本地公告标题中的明确季度、
+截止日及邻近年度截止日，同步文档元数据与索引，保留文档 ID、正文和内容 hash。
+第二次执行应显示跳过且不再修改文档。依据不足或冲突会逐文档报错并保留原数据；
+仅“三个月”和九月末日期不足以判定财年 Q3。若缺少年度依据，可先通过 Dayu 下载对应
+年度业绩（`--forms Q4`，选择覆盖该年度业绩披露的日期范围），再执行重建。
+普通增量下载发现本地财期与来源识别不一致时会提示重建；它不会自动更改已有财期。
 
 未传 `--forms` 时，CN 默认请求 `FY H1 Q1 Q3`；HK 的必需基线是 `FY H1`，同时会发现
 来源实际披露的 Q1～Q4 可选业绩材料。缺失期间只针对当前市场适用的必需基线计算：例如
@@ -541,6 +577,14 @@ FIRST/RESET 的配置已经发布成功，warning 只表示本进程未完成两
 
 这是当前设计：未传 `--log-file` 的诊断流在进程结束时自动清理。重现问题时加上
 `--debug --log-file <path>`；排查高频流式链路时改用 `--debug-stream`。
+
+### 升级依赖后 Docling 报导入或初始化错误
+
+不要在已有 `.venv` 里就地升级 Docling 依赖：Docling 2.127 起代码拆分到 `docling-slim`
+包，就地升级时旧包卸载会连带删除新装文件，使 `docling` 导入残缺，上传或预处理时报
+Docling 初始化失败。解决方法是删除 `.venv` 后按第 1.1 节重新创建并安装；若必须就地
+修复，可在升级后执行
+`python -m pip install --force-reinstall --no-deps -c constraints/lock-<平台>-py311.txt docling-slim`。
 
 ### 批量上传脚本没有生成
 

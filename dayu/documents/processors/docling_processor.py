@@ -14,10 +14,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Optional, Protocol, TypeVar, cast, overload
 
 import pandas as pd
-from docling_core.types.doc.document import TextItem
+from docling_core.types.doc.items.text import TextItem
 
 if TYPE_CHECKING:
-    from docling_core.types.doc.document import DoclingDocument, NodeItem, TableItem
+    from docling_core.types.doc.document import DoclingDocument
+    from docling_core.types.doc.items.node import NodeItem
+    from docling_core.types.doc.items.table.table import TableItem
 
 from .base import (
     PageContentResult,

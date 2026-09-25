@@ -91,6 +91,7 @@ _SUPPORTED_FORMS = frozenset(
         "10-K",
         "10-Q",
         "20-F",
+        "F-1",
         "8-K",
         "DEF 14A",
         "SC 13D",

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from dayu.fins.pipelines.cn_download_models import (
@@ -14,10 +16,129 @@ from dayu.fins.pipelines.cn_download_models import (
     HkexnewsRawAnnouncement,
 )
 from dayu.fins.pipelines.cn_report_selection import (
+    _classify_hk_period_projection,
+    resolve_hk_report_period,
     select_cninfo_report_candidates,
     select_hkexnews_report_candidates,
 )
+from dayu.fins.pipelines.hk_fiscal_calendar import annual_end_dates
 from dayu.fins.pipelines.docling_upload_service import build_cn_filing_ids
+
+
+@pytest.mark.parametrize("duration", ("三個月", "三个月", "THREE MONTHS", "3 MONTHS"))
+def test_hk_three_months_alone_is_not_q1(duration: str) -> None:
+    """参数为四种期间长度；返回无；错误把期间长度当季度时抛出断言异常。"""
+    assert (
+        _classify_hk_period_projection(
+            title=f"截至2025年9月30日止{duration}業績公告",
+            category_text="季度業績",
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("title", "annual_title", "year", "period"),
+    (
+        ("截至2025年3月31日止三個月業績", "截至2024年12月31日止全年業績", 2025, "Q1"),
+        ("截至2025年6月30日止三个月业绩", "截至2025年12月31日止全年业绩", 2025, "Q2"),
+        ("截至二零二五年九月三十日止三個月業績", "截至二零二五年十二月三十一日止全年業績", 2025, "Q3"),
+        ("截至二〇二五年十二月三十一日止三個月業績", "截至二〇二四年十二月三十一日止全年業績", 2025, "Q4"),
+        ("THREE MONTHS ENDED 30 SEPTEMBER 2025", "ANNUAL RESULTS FOR YEAR ENDED 31 MARCH 2025", 2026, "Q2"),
+        ("3 MONTHS ENDED SEPTEMBER 30, 2025", "FINAL RESULTS FOR YEAR ENDED JUNE 30, 2025", 2026, "Q1"),
+        ("截至2025年9月30日止三個月及九個月業績", "截至2024年12月31日止全年業績", 2025, "Q3"),
+        ("截至2025年6月30日止三個月及六個月業績", "截至2024年12月31日止全年業績", 2025, "Q2"),
+        ("2025 FIRST QUARTER RESULTS", "", 2025, "Q1"),
+        ("2025 Q2 RESULTS", "", 2025, "Q2"),
+        ("2025 THIRD QUARTER AND NINE MONTHS RESULTS", "", 2025, "Q3"),
+        ("2025 FOURTH QUARTER AND FULL YEAR RESULTS", "", 2025, "Q4"),
+        ("2025年第三季度業績", "", 2025, "Q3"),
+        ("2025年第四季度业绩", "", 2025, "Q4"),
+        ("FY2026 SECOND QUARTER ENDED 30 SEPTEMBER 2025", "FINAL RESULTS FOR YEAR ENDED 31 MARCH 2025", 2026, "Q2"),
+    ),
+)
+def test_hk_period_facts_use_fiscal_evidence(
+    title: str,
+    annual_title: str,
+    year: int,
+    period: CnFiscalPeriod,
+) -> None:
+    """参数为标题、同公司年度证据和期望财期；返回无；财期或 coverage 漂移抛出断言异常。"""
+    facts = resolve_hk_report_period(
+        title=title, category_text="季度業績", annual_ends=annual_end_dates((annual_title,))
+    )
+    assert facts is not None
+    assert facts[0] == year
+    assert facts[1].identity_period == period
+    assert facts[1].covered_periods == {"Q2": ("H1", "Q2"), "Q4": ("FY", "Q4")}.get(period, (period,))
+
+
+@pytest.mark.parametrize(
+    "title",
+    (
+        "2025 FIRST QUARTER AND THIRD QUARTER RESULTS",
+        "2025年第一季度及九個月業績",
+        "2025 Q2 AND Q3 RESULTS",
+        "2025 Q10 RESULTS",
+        "截至2025年9月30日止第一季度業績",
+        "截至2025年8月31日止三個月業績",
+        "截至2025年9月31日止第三季度業績",
+        "截至2024年9月30日及2025年9月30日止第三季度業績",
+        "2024/25年第三季度業績",
+        "2024及2025年第三季度業績",
+        "FY2024 THIRD QUARTER ENDED 30 SEPTEMBER 2025",
+    ),
+)
+def test_hk_conflicting_period_facts_fail_closed(title: str) -> None:
+    """参数为矛盾或非季度日期标题；返回无；错误接纳时抛出断言异常。"""
+    assert (
+        resolve_hk_report_period(
+            title=title,
+            category_text="季度業績",
+            annual_ends=annual_end_dates(("截至2024年12月31日止全年業績",)),
+        )
+        is None
+    )
+
+
+def test_hk_selection_uses_annual_announcements_before_period_filtering() -> None:
+    """无参数与返回值；真实候选选择必须使用非请求财期的年度 raw 证据，否则断言失败。"""
+    candidates = select_hkexnews_report_candidates(
+        query=_hk_query(("Q3",)),
+        announcements=(
+            _hk_raw(document_id="annual", title="截至2024年12月31日止全年業績", category_text="末期業績"),
+            _hk_raw(
+                document_id="quarter",
+                title="截至2025年9月30日止三個月業績公告",
+                category_text="季度業績",
+                filing_date="2026-02-01",
+            ),
+        ),
+        read_head_meta=_head_meta,
+    )
+    assert [(c.source_id, c.fiscal_year, c.period_projection.identity_period) for c in candidates] == [
+        ("quarter", 2025, "Q3")
+    ]
+
+
+def test_hk_no_disclosure_year_fallback_or_changed_year_end_guess() -> None:
+    """无参数与返回值；无报告年份或变更年结日时应不确定，否则断言失败。"""
+    assert (
+        select_hkexnews_report_candidates(
+            query=_hk_query(("Q1",)),
+            announcements=(_hk_raw(document_id="no-year", title="第一季度業績", category_text="季度業績"),),
+            read_head_meta=_head_meta,
+        )
+        == ()
+    )
+    assert (
+        resolve_hk_report_period(
+            title="截至2025年9月30日止三個月業績",
+            category_text="季度業績",
+            annual_ends=annual_end_dates(("截至2024年12月31日止全年業績", "截至2025年6月30日止全年業績")),
+        )
+        is None
+    )
 
 
 def _head_meta(_source_url: str) -> CnReportHeadMeta:
@@ -209,6 +330,137 @@ def test_cninfo_selection_keeps_years_and_prefers_amended_per_year() -> None:
         (2024, "A2", True),
         (2023, "A3", False),
     ]
+
+
+@pytest.mark.parametrize(("period", "report"), (("Q1", "第一季度报告"), ("Q3", "第三季度报告")))
+@pytest.mark.parametrize("full_suffix", ("", "全文"))
+@pytest.mark.parametrize("revision", ("", "（更正后）"))
+@pytest.mark.parametrize("reverse", (False, True))
+def test_cninfo_same_release_prefers_full_report(
+    period: CnFiscalPeriod, report: str, full_suffix: str, revision: str, reverse: bool
+) -> None:
+    """同日同修订级别完整报告稳定胜出，英文和摘要不得参与竞争。
+
+    Args:
+        period: 一季或三季报。
+        report: 对应中文报告名称。
+        full_suffix: 完整报告可带全文标记或不带标记。
+        revision: 同一发布组的修订后缀。
+        reverse: 是否反转来源输入顺序。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 候选身份、来源或财期不符合 owner 契约。
+    """
+
+    full = _cn_raw(announcement_id="A1", title=f"2024年{report}{full_suffix}{revision}")
+    rows = (
+        _cn_raw(announcement_id="Z9", title=f"2024年{report}全文（英文版）{revision}"),
+        _cn_raw(announcement_id="Z8", title=f"2024年{report}摘要{revision}"),
+        _cn_raw(announcement_id="Z7", title=f"2024年{report}正文{revision}"),
+        full,
+    )
+    candidates = select_cninfo_report_candidates(
+        query=_cn_query((period,)),
+        announcements_by_period={period: tuple(reversed(rows)) if reverse else rows},
+        read_head_meta=_head_meta,
+    )
+
+    assert len(candidates) == 1
+    selected = candidates[0]
+    assert (selected.source_id, selected.title, selected.source_url) == (
+        full.announcement_id, full.title, full.source_url
+    )
+    assert selected.period_projection == CnReportPeriodProjection(identity_period=period, covered_periods=(period,))
+    assert selected.fiscal_year == 2024
+    assert selected.amended is bool(revision)
+
+
+@pytest.mark.parametrize(("period", "report"), (("Q1", "第一季度报告"), ("Q3", "第三季度报告")))
+def test_cninfo_body_remains_a_valid_only_report(period: CnFiscalPeriod, report: str) -> None:
+    """唯一正文不得被过滤。
+
+    Args:
+        period: 一季或三季报。
+        report: 对应报告中文名。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 唯一正文被错误排除。
+    """
+
+    body = _cn_raw(announcement_id="body", title=f"2024年{report}正文")
+    candidates = select_cninfo_report_candidates(
+        query=_cn_query((period,)), announcements_by_period={period: (body,)}, read_head_meta=_head_meta
+    )
+    assert len(candidates) == 1
+    assert candidates[0].source_id == body.announcement_id
+
+
+@pytest.mark.parametrize(
+    ("body_title", "body_date", "full_date", "amended"),
+    (
+        ("2024年第一季度报告正文（更正后）", "2025-04-01", "2025-04-01", True),
+        ("2024年第一季度报告正文（更正后）", "2025-04-01", "2025-04-02", True),
+        ("2024年第一季度报告正文（修订版）", "2025-04-02", "2025-04-01", True),
+        ("2024年第一季度报告正文", "2025-04-02", "2025-04-01", False),
+    ),
+)
+def test_cninfo_revision_and_date_take_precedence_over_report_form(
+    body_title: str, body_date: str, full_date: str, amended: bool
+) -> None:
+    """保持修订及日期的既有版本优先级，不用全文标签推翻版本事实。
+
+    Args:
+        body_title: 应选正文的标题。
+        body_date: 正文公告日期。
+        full_date: 普通全文公告日期。
+        amended: 应投影的修订标记。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 修订或日期优先级改变。
+    """
+
+    body = _cn_raw(announcement_id="A1", title=body_title, announcement_date=body_date)
+    full = _cn_raw(announcement_id="Z9", title="2024年第一季度报告全文", announcement_date=full_date)
+    for rows in ((body, full), (full, body)):
+        candidates = select_cninfo_report_candidates(
+            query=_cn_query(("Q1",)), announcements_by_period={"Q1": rows}, read_head_meta=_head_meta
+        )
+        assert len(candidates) == 1
+        assert candidates[0].source_id == body.announcement_id
+        assert candidates[0].amended is amended
+
+
+@pytest.mark.parametrize("same_id", (False, True))
+def test_cninfo_equal_reports_use_stable_source_identity(same_id: bool) -> None:
+    """同分报告用来源身份稳定裁决，ID 相同则使用 URL。
+
+    Args:
+        same_id: 是否使用同公告 ID、不同 URL 的输入。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 输入反转改变选中来源。
+    """
+
+    first = _cn_raw(announcement_id="A1", title="2024年第一季度报告全文")
+    second = replace(first, source_url=first.source_url + "?version=2") if same_id else replace(first, announcement_id="A2")
+    for rows in ((first, second), (second, first)):
+        candidates = select_cninfo_report_candidates(
+            query=_cn_query(("Q1",)), announcements_by_period={"Q1": rows}, read_head_meta=_head_meta
+        )
+        assert len(candidates) == 1
+        assert (candidates[0].source_id, candidates[0].source_url) == (second.announcement_id, second.source_url)
 
 
 def test_hkexnews_selection_filters_english_and_infers_periods() -> None:

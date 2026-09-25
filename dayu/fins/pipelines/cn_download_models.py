@@ -188,7 +188,7 @@ class CnReportCandidate:
     """单份候选报告的远端元数据。
 
     downloader 返回此对象，但**不**生成 ``document_id``（document_id 由
-    ``build_cn_filing_ids`` 在 pipeline 层统一生成）。``content_length`` /
+    pipeline 的来源身份绑定规则统一分配或复用）。``content_length`` /
     ``etag`` / ``last_modified`` 用于参与 ``remote_fingerprint`` 计算。
 
     Attributes:
@@ -197,6 +197,8 @@ class CnReportCandidate:
             ``DOC_ID``）。
         source_url: 直接可下载 PDF 的绝对 URL。
         title: 公告标题（用于诊断、白/黑名单匹配）。
+        category_text: 原始 provider 分类；缺少时为空。
+        report_date: 从原始标题识别的截止日；缺少时为 None。
         language: 候选语言；副语言不入主 candidate。
         filing_date: 公告披露日期，``YYYY-MM-DD``。
         fiscal_year: 推断财年；``fiscal_year_source`` 在 source meta 标记为
@@ -221,6 +223,9 @@ class CnReportCandidate:
     content_length: Optional[int]
     etag: Optional[str]
     last_modified: Optional[str]
+
+    category_text: str = ""
+    report_date: str | None = None
 
 
 @dataclass(frozen=True)

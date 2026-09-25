@@ -40,7 +40,7 @@ from dayu.fins.pipelines.cn_download_source_upsert import (
     build_remote_fingerprint,
     commit_cn_filing_source_document,
 )
-from dayu.fins.pipelines.cn_form_utils import build_cn_filing_ids
+from dayu.fins.pipelines.cn_download_identity import resolve_cn_download_ids
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.storage import (
     BatchingRepositoryProtocol,
@@ -161,13 +161,7 @@ async def run_cn_download_single_filing_stream(
     """
 
     _raise_if_cancelled(module=module, ticker=ticker, document_id="", cancel_checker=cancel_checker)
-    document_id, internal_document_id = build_cn_filing_ids(
-        ticker=ticker,
-        form_type=candidate.period_projection.identity_period,
-        fiscal_year=candidate.fiscal_year,
-        fiscal_period=candidate.period_projection.identity_period,
-        amended=candidate.amended,
-    )
+    document_id, internal_document_id = resolve_cn_download_ids(ticker, candidate, source_repository)
     pdf_filename = f"{document_id}.pdf"
     docling_filename = f"{document_id}_docling.json"
     phase_a_integrity = source_repository.classify_source_integrity(
@@ -192,6 +186,31 @@ async def run_cn_download_single_filing_stream(
     )
     remote_fingerprint = build_remote_fingerprint(candidate)
     if phase_a_integrity.status is SourceIntegrityStatus.COMPLETE and not overwrite:
+        if (
+            candidate.provider == "hkexnews"
+            and previous_meta is not None
+            and (
+                previous_meta.get("fiscal_period") != candidate.period_projection.identity_period
+                or previous_meta.get("fiscal_year") != candidate.fiscal_year
+                or previous_meta.get("covered_fiscal_periods") != list(candidate.period_projection.covered_periods)
+            )
+        ):
+            mismatch_result = _build_filing_result(
+                document_id=document_id,
+                status="failed",
+                candidate=candidate,
+                reason_code="period_metadata_mismatch",
+                reason_message="本地财期与来源识别不一致，请使用 download --rebuild 纠正本地财期",
+                downloaded_files=0,
+                skipped_files=0,
+            )
+            yield DownloadEvent(
+                event_type=DownloadEventType.FILING_FAILED,
+                ticker=ticker,
+                document_id=document_id,
+                payload=_filing_event_payload(mismatch_result),
+            )
+            return
         skip_result = _build_filing_result(
             document_id=document_id,
             status="skipped",
@@ -821,7 +840,7 @@ def _build_filing_result(
         "status": status,
         "form_type": candidate.period_projection.identity_period,
         "filing_date": candidate.filing_date,
-        "report_date": None,
+        "report_date": candidate.report_date,
         "fiscal_year": candidate.fiscal_year,
         "fiscal_period": candidate.period_projection.identity_period,
         "covered_fiscal_periods": list(candidate.period_projection.covered_periods),

@@ -1,0 +1,693 @@
+{
+  "generated_at": "2026-09-10T01:37:29.725784+00:00",
+  "git_head": "fac32ecbff9bfe792b63ee9667c8697826b631f4",
+  "scope": "code and isolated verification; no investment workspace update or KPI extraction",
+  "source_manifests": [
+    "data/source_manifest/sources.json",
+    "data/source_manifest/downloaded_sources.json"
+  ],
+  "classifier_replay": [
+    {
+      "document_id": "fil_0001104659-24-120329",
+      "input_raw": "data/raw/tm2428837d1_ex99-1.htm",
+      "max_lines": 120,
+      "before": {
+        "document_id": "fil_0001104659-24-120329",
+        "classification": "EXCLUDE_NON_QUARTERLY",
+        "head_characters": 7751,
+        "title_offset": 92,
+        "title": "Reports Third Quarter of 2024 Unaudited Financial Results",
+        "strong_current_results": false
+      },
+      "after": {
+        "classification": "RESULTS_RELEASE",
+        "strong_current_results": true,
+        "title_offset": 92
+      }
+    },
+    {
+      "document_id": "fil_0001104659-25-027458",
+      "input_raw": "data/raw/tm2510227d1_ex99-1.htm",
+      "max_lines": 120,
+      "before": {
+        "document_id": "fil_0001104659-25-027458",
+        "classification": "EXCLUDE_NON_QUARTERLY",
+        "head_characters": 7195,
+        "title_offset": 92,
+        "title": "Reports Fourth Quarter and Full Year 2024 Unaudited Financial Results",
+        "strong_current_results": false
+      },
+      "after": {
+        "classification": "RESULTS_RELEASE",
+        "strong_current_results": true,
+        "title_offset": 92
+      }
+    }
+  ],
+  "live_public_cli": [
+    {
+      "ticker": "MSFT",
+      "day": "2025-07-30",
+      "document_id": "fil_0000950170-25-100226",
+      "command": [
+        "/Users/leo/workspace/dayu-agent-r/.venv/bin/dayu-cli",
+        "download",
+        "--base",
+        "/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/dayu-sec-earnings-live-cs_cnxwo",
+        "--ticker",
+        "MSFT",
+        "--forms",
+        "8-K",
+        "--start",
+        "2025-07-30",
+        "--end",
+        "2025-07-30",
+        "--log-file",
+        "/Users/leo/workspace/dayu-agent-r/workspace/tmp/sec_earnings_fix/live-MSFT-2025-07-30.log"
+      ],
+      "returncode": 0,
+      "at": "2026-09-10T01:29:00.138172+00:00",
+      "primary_document": "msft-20250730.htm",
+      "source_fingerprint": "c83ad618b921c67e9147e98ff21f5febc04a0508671c652499d045e2338438ce",
+      "integrity": "complete",
+      "files": [
+        {
+          "name": "msft-20250730.htm",
+          "size": 63347,
+          "sha256": "2b6e1ff764c01ed0b6ee708cad6f222d77b8bacd75f485234c1dcc8f90223982",
+          "source_url": "https://www.sec.gov/Archives/edgar/data/789019/000095017025100226/msft-20250730.htm",
+          "uri": "local://MSFT/filings/id-79cc4a43fa1212d1d19222af74024a84a157f727d266c84dffdee9414bec6bad/msft-20250730.htm"
+        },
+        {
+          "name": "msft-20250730.xsd",
+          "size": 54439,
+          "sha256": "66b23292cd48da1aa54c7ec643dc59b65894f5a62fa1f13dc9e53fde80de5eab",
+          "source_url": "https://www.sec.gov/Archives/edgar/data/789019/000095017025100226/msft-20250730.xsd",
+          "uri": "local://MSFT/filings/id-79cc4a43fa1212d1d19222af74024a84a157f727d266c84dffdee9414bec6bad/msft-20250730.xsd"
+        },
+        {
+          "name": "msft-20250730_htm.xml",
+          "size": 7247,
+          "sha256": "eaa7fe529b542c5360634a1be4cf24097dcb0d038b4ed5b956ff5470e8dbc5c1",
+          "source_url": "https://www.sec.gov/Archives/edgar/data/789019/000095017025100226/msft-20250730_htm.xml",
+          "uri": "local://MSFT/filings/id-79cc4a43fa1212d1d19222af74024a84a157f727d266c84dffdee9414bec6bad/msft-20250730_htm.xml"
+        },
+        {
+          "name": "msft-ex99_1.htm",
+          "size": 821887,
+          "sha256": "57732d737ec3696b0a059dec7c2a6d865d799f28a1c3233472a409cb1c4ae592",
+          "source_url": "https://www.sec.gov/Archives/edgar/data/789019/000095017025100226/msft-ex99_1.htm",
+          "uri": "local://MSFT/filings/id-79cc4a43fa1212d1d19222af74024a84a157f727d266c84dffdee9414bec6bad/msft-ex99_1.htm"
+        }
+      ],
+      "second_returncode": 0,
+      "second_skipped": true
+    },
+    {
+      "ticker": "META",
+      "day": "2024-02-01",
+      "document_id": "fil_0001326801-24-000010",
+      "command": [
+        "/Users/leo/workspace/dayu-agent-r/.venv/bin/dayu-cli",
+        "download",
+        "--base",
+        "/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/dayu-sec-earnings-live-cs_cnxwo",
+        "--ticker",
+        "META",
+        "--forms",
+        "8-K",
+        "--start",
+        "2024-02-01",
+        "--end",
+        "2024-02-01",
+        "--log-file",
+        "/Users/leo/workspace/dayu-agent-r/workspace/tmp/sec_earnings_fix/live-META-2024-02-01.log"
+      ],
+      "returncode": 0,
+      "at": "2026-09-10T01:29:07.768634+00:00",
+      "primary_document": "meta-20240201.htm",
+      "source_fingerprint": "5b45d3e3585f551001b0483063f6632a0176b39ee5cfab69118f814822d18d5d",
+      "integrity": "complete",
+      "files": [
+        {
+          "name": "meta-12312023xexhibit991.htm",
+          "size": 342282,
+          "sha256": "2c85fe7a8066e5a2e71bf5051851c63b27467eef9f5055b8bc7c0ee8d73ff165",
+          "source_url": "https://www.sec.gov/Archives/edgar/data/1326801/000132680124000010/meta-12312023xexhibit991.htm",
+          "uri": "local://META/filings/id-97893f647892a27bb9bcf2355a6e93a0b283ed9bfc07690bfba300f0b24bd3d8/meta-12312023xexhibit991.htm"
+        },
+        {
+          "name": "meta-20240201.htm",
+          "size": 30637,
+          "sha256": "6f2e485c9b14d56409671cf5ea0fdaa41eead6fd89f10ea1e7fc086decc3fa8e",
+          "source_url": "https://www.sec.gov/Archives/edgar/data/1326801/000132680124000010/meta-20240201.htm",
+          "uri": "local://META/filings/id-97893f647892a27bb9bcf2355a6e93a0b283ed9bfc07690bfba300f0b24bd3d8/meta-20240201.htm"
+        },
+        {
+          "name": "meta-20240201.xsd",
+          "size": 1917,
+          "sha256": "912f7b4c1b2abbf07ace894d5d2d33d4224dfe6dbe6c5bb3ef37f5e00e1b7e3c",
+          "source_url": "https://www.sec.gov/Archives/edgar/data/1326801/000132680124000010/meta-20240201.xsd",
+          "uri": "local://META/filings/id-97893f647892a27bb9bcf2355a6e93a0b283ed9bfc07690bfba300f0b24bd3d8/meta-20240201.xsd"
+        },
+        {
+          "name": "meta-20240201_htm.xml",
+          "size": 2707,
+          "sha256": "c8fa584294f1b2cd319f8ff947c9a99eb1a283a0f0d2a47d1ee1953b35b9133c",
+          "source_url": "https://www.sec.gov/Archives/edgar/data/1326801/000132680124000010/meta-20240201_htm.xml",
+          "uri": "local://META/filings/id-97893f647892a27bb9bcf2355a6e93a0b283ed9bfc07690bfba300f0b24bd3d8/meta-20240201_htm.xml"
+        },
+        {
+          "name": "meta-20240201_lab.xml",
+          "size": 24139,
+          "sha256": "c54c80f6a8cc394153ed8e539f22b26b8d3cb8800cbcc8d1370badf786bf8365",
+          "source_url": "https://www.sec.gov/Archives/edgar/data/1326801/000132680124000010/meta-20240201_lab.xml",
+          "uri": "local://META/filings/id-97893f647892a27bb9bcf2355a6e93a0b283ed9bfc07690bfba300f0b24bd3d8/meta-20240201_lab.xml"
+        },
+        {
+          "name": "meta-20240201_pre.xml",
+          "size": 12522,
+          "sha256": "5cd6d7cddc479f5a7acf48a1454ab5e83376ca3b8a256ecc58402f35c9d98ffb",
+          "source_url": "https://www.sec.gov/Archives/edgar/data/1326801/000132680124000010/meta-20240201_pre.xml",
+          "uri": "local://META/filings/id-97893f647892a27bb9bcf2355a6e93a0b283ed9bfc07690bfba300f0b24bd3d8/meta-20240201_pre.xml"
+        }
+      ],
+      "second_returncode": 0,
+      "second_skipped": true
+    },
+    {
+      "ticker": "META",
+      "day": "2025-01-29",
+      "document_id": "fil_0001326801-25-000014",
+      "command": [
+        "/Users/leo/workspace/dayu-agent-r/.venv/bin/dayu-cli",
+        "download",
+        "--base",
+        "/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/dayu-sec-earnings-live-cs_cnxwo",
+        "--ticker",
+        "META",
+        "--forms",
+        "8-K",
+        "--start",
+        "2025-01-29",
+        "--end",
+        "2025-01-29",
+        "--log-file",
+        "/Users/leo/workspace/dayu-agent-r/workspace/tmp/sec_earnings_fix/live-META-2025-01-29.log"
+      ],
+      "returncode": 0,
+      "at": "2026-09-10T01:29:14.308366+00:00",
+      "primary_document": "meta-20250129.htm",
+      "source_fingerprint": "d423eae7898db5c15e282066742862f334d2a2c1215931d0c0d5854726d648cb",
+      "integrity": "complete",
+      "files": [
+        {
+          "name": "meta-12312024xexhibit991.htm",
+          "size": 300347,
+          "sha256": "3f803df799a14a69ac522fe4367411a653b0739095c2def85178c5808d741bc1",
+          "source_url": "https://www.sec.gov/Archives/edgar/data/1326801/000132680125000014/meta-12312024xexhibit991.htm",
+          "uri": "local://META/filings/id-e1965adac49a8327dd280a72922a306231cb1f0ef69699ca4f7ed028d76fcb12/meta-12312024xexhibit991.htm"
+        },
+        {
+          "name": "meta-20250129.htm",
+          "size": 29618,
+          "sha256": "9f546def2c13139dcf34082b37d060898918c98b6dcb8d941f3a9d58afc930bc",
+          "source_url": "https://www.sec.gov/Archives/edgar/data/1326801/000132680125000014/meta-20250129.htm",
+          "uri": "local://META/filings/id-e1965adac49a8327dd280a72922a306231cb1f0ef69699ca4f7ed028d76fcb12/meta-20250129.htm"
+        },
+        {
+          "name": "meta-20250129.xsd",
+          "size": 1798,
+          "sha256": "77fea29eb705de11aff203a7abef8743e2c06c20afed1f3a927fd65e5d967ecb",
+          "source_url": "https://www.sec.gov/Archives/edgar/data/1326801/000132680125000014/meta-20250129.xsd",
+          "uri": "local://META/filings/id-e1965adac49a8327dd280a72922a306231cb1f0ef69699ca4f7ed028d76fcb12/meta-20250129.xsd"
+        },
+        {
+          "name": "meta-20250129_htm.xml",
+          "size": 2707,
+          "sha256": "81b98317f762956e36204e1d97829daedc2467fdfb474758dece4012485f19e7",
+          "source_url": "https://www.sec.gov/Archives/edgar/data/1326801/000132680125000014/meta-20250129_htm.xml",
+          "uri": "local://META/filings/id-e1965adac49a8327dd280a72922a306231cb1f0ef69699ca4f7ed028d76fcb12/meta-20250129_htm.xml"
+        },
+        {
+          "name": "meta-20250129_lab.xml",
+          "size": 21885,
+          "sha256": "29b82f5a2fddbd10b914e7de03645adcf8aad6db348c1674e1465ded123ffad1",
+          "source_url": "https://www.sec.gov/Archives/edgar/data/1326801/000132680125000014/meta-20250129_lab.xml",
+          "uri": "local://META/filings/id-e1965adac49a8327dd280a72922a306231cb1f0ef69699ca4f7ed028d76fcb12/meta-20250129_lab.xml"
+        },
+        {
+          "name": "meta-20250129_pre.xml",
+          "size": 12522,
+          "sha256": "44b28888adc0a4993e9a8c030a7bed86b98d897c33d2897b7ddc6f1e96a93d2d",
+          "source_url": "https://www.sec.gov/Archives/edgar/data/1326801/000132680125000014/meta-20250129_pre.xml",
+          "uri": "local://META/filings/id-e1965adac49a8327dd280a72922a306231cb1f0ef69699ca4f7ed028d76fcb12/meta-20250129_pre.xml"
+        }
+      ],
+      "second_returncode": 0,
+      "second_skipped": true
+    },
+    {
+      "ticker": "META",
+      "day": "2026-01-28",
+      "document_id": "fil_0001628280-26-003832",
+      "command": [
+        "/Users/leo/workspace/dayu-agent-r/.venv/bin/dayu-cli",
+        "download",
+        "--base",
+        "/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/dayu-sec-earnings-live-cs_cnxwo",
+        "--ticker",
+        "META",
+        "--forms",
+        "8-K",
+        "--start",
+        "2026-01-28",
+        "--end",
+        "2026-01-28",
+        "--log-file",
+        "/Users/leo/workspace/dayu-agent-r/workspace/tmp/sec_earnings_fix/live-META-2026-01-28.log"
+      ],
+      "returncode": 0,
+      "at": "2026-09-10T01:29:20.680805+00:00",
+      "primary_document": "meta-20260128.htm",
+      "source_fingerprint": "bfef6323d740dac07a56c54d501672b233ee16deed39f0dc9c5190323296a52b",
+      "integrity": "complete",
+      "files": [
+        {
+          "name": "meta-12312025xexhibit991.htm",
+          "size": 288572,
+          "sha256": "0428bd5297e97c910c77566767eb48db35fc2c9ff7e2aa88ff8f7f3f340c0bca",
+          "source_url": "https://www.sec.gov/Archives/edgar/data/1326801/000162828026003832/meta-12312025xexhibit991.htm",
+          "uri": "local://META/filings/id-2e9b0447285214787a1fbb6b6408602471a3ad9857dabefdeb448d48f3fc4516/meta-12312025xexhibit991.htm"
+        },
+        {
+          "name": "meta-20260128.htm",
+          "size": 29178,
+          "sha256": "db0dfec841d8a03feed53dfae673220f341d495d3a9c1a06895741982cfc780c",
+          "source_url": "https://www.sec.gov/Archives/edgar/data/1326801/000162828026003832/meta-20260128.htm",
+          "uri": "local://META/filings/id-2e9b0447285214787a1fbb6b6408602471a3ad9857dabefdeb448d48f3fc4516/meta-20260128.htm"
+        },
+        {
+          "name": "meta-20260128.xsd",
+          "size": 1798,
+          "sha256": "2214a4df7d60c73316564aba1b344aeb218ee420a0c47373f8d5f0d616bf4ecb",
+          "source_url": "https://www.sec.gov/Archives/edgar/data/1326801/000162828026003832/meta-20260128.xsd",
+          "uri": "local://META/filings/id-2e9b0447285214787a1fbb6b6408602471a3ad9857dabefdeb448d48f3fc4516/meta-20260128.xsd"
+        },
+        {
+          "name": "meta-20260128_htm.xml",
+          "size": 2707,
+          "sha256": "4b112a6a17072c2d42a55c8c7bead7609f0d6acbf07ffdd70e50ecef15b2830d",
+          "source_url": "https://www.sec.gov/Archives/edgar/data/1326801/000162828026003832/meta-20260128_htm.xml",
+          "uri": "local://META/filings/id-2e9b0447285214787a1fbb6b6408602471a3ad9857dabefdeb448d48f3fc4516/meta-20260128_htm.xml"
+        },
+        {
+          "name": "meta-20260128_lab.xml",
+          "size": 21885,
+          "sha256": "0dc93e1216e7853f4a68b2211e9987eebc0e6ed13a1b1b7fa453759299e7cf46",
+          "source_url": "https://www.sec.gov/Archives/edgar/data/1326801/000162828026003832/meta-20260128_lab.xml",
+          "uri": "local://META/filings/id-2e9b0447285214787a1fbb6b6408602471a3ad9857dabefdeb448d48f3fc4516/meta-20260128_lab.xml"
+        },
+        {
+          "name": "meta-20260128_pre.xml",
+          "size": 12522,
+          "sha256": "bd961b25684222d0dfe635a0b3eb0f3994c948c21a3334fcce97759fc7c7d43c",
+          "source_url": "https://www.sec.gov/Archives/edgar/data/1326801/000162828026003832/meta-20260128_pre.xml",
+          "uri": "local://META/filings/id-2e9b0447285214787a1fbb6b6408602471a3ad9857dabefdeb448d48f3fc4516/meta-20260128_pre.xml"
+        }
+      ],
+      "second_returncode": 0,
+      "second_skipped": true
+    },
+    {
+      "ticker": "ATAT",
+      "day": "2024-11-19",
+      "document_id": "fil_0001104659-24-120329",
+      "command": [
+        "/Users/leo/workspace/dayu-agent-r/.venv/bin/dayu-cli",
+        "download",
+        "--base",
+        "/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/dayu-sec-earnings-live-cs_cnxwo",
+        "--ticker",
+        "ATAT",
+        "--forms",
+        "6-K",
+        "--start",
+        "2024-11-19",
+        "--end",
+        "2024-11-19",
+        "--log-file",
+        "/Users/leo/workspace/dayu-agent-r/workspace/tmp/sec_earnings_fix/live-ATAT-2024-11-19.log"
+      ],
+      "returncode": 0,
+      "at": "2026-09-10T01:29:27.486722+00:00",
+      "primary_document": "tm2428837d1_ex99-1.htm",
+      "source_fingerprint": "af6fc84a575aca57244b157332486e09d4147689da48c2910c214ed396febac5",
+      "integrity": "complete",
+      "files": [
+        {
+          "name": "tm2428837d1_6k.htm",
+          "size": 12017,
+          "sha256": "ca06f063ca7df4b63450eeb4fa3634b690278b663210642ac77575c47e2bf6bc",
+          "source_url": "https://www.sec.gov/Archives/edgar/data/1853717/000110465924120329/tm2428837d1_6k.htm",
+          "uri": "local://ATAT/filings/id-e01c10f5f78c3ed8207a35d13f2ce2c5ba7078dbcae7e696b114bde0b2cc5426/tm2428837d1_6k.htm"
+        },
+        {
+          "name": "tm2428837d1_ex99-1.htm",
+          "size": 369492,
+          "sha256": "c256f80d7dadb934294bacf2e1990874e0bbdc76f2f23cc5e4baa21e8f6938f9",
+          "source_url": "https://www.sec.gov/Archives/edgar/data/1853717/000110465924120329/tm2428837d1_ex99-1.htm",
+          "uri": "local://ATAT/filings/id-e01c10f5f78c3ed8207a35d13f2ce2c5ba7078dbcae7e696b114bde0b2cc5426/tm2428837d1_ex99-1.htm"
+        }
+      ],
+      "second_returncode": 0,
+      "second_skipped": true
+    },
+    {
+      "ticker": "ATAT",
+      "day": "2025-03-25",
+      "document_id": "fil_0001104659-25-027458",
+      "command": [
+        "/Users/leo/workspace/dayu-agent-r/.venv/bin/dayu-cli",
+        "download",
+        "--base",
+        "/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/dayu-sec-earnings-live-cs_cnxwo",
+        "--ticker",
+        "ATAT",
+        "--forms",
+        "6-K",
+        "--start",
+        "2025-03-25",
+        "--end",
+        "2025-03-25",
+        "--log-file",
+        "/Users/leo/workspace/dayu-agent-r/workspace/tmp/sec_earnings_fix/live-ATAT-2025-03-25.log"
+      ],
+      "returncode": 0,
+      "at": "2026-09-10T01:29:33.798713+00:00",
+      "primary_document": "tm2510227d1_ex99-1.htm",
+      "source_fingerprint": "a7cfc78c7aa54d3dbf3bfb667aa97539a2c1462b994185e65d4936f38da14c71",
+      "integrity": "complete",
+      "files": [
+        {
+          "name": "tm2510227d1_6k.htm",
+          "size": 12011,
+          "sha256": "198741347ef370a3258dd7f07dce8d0f17521bb88e8e3a31a0c0e7e821b8629d",
+          "source_url": "https://www.sec.gov/Archives/edgar/data/1853717/000110465925027458/tm2510227d1_6k.htm",
+          "uri": "local://ATAT/filings/id-faa1e5ee416c0f3524216e5a1c55948fbe5998ada7bc0f84a36e92ab6139ba63/tm2510227d1_6k.htm"
+        },
+        {
+          "name": "tm2510227d1_ex99-1.htm",
+          "size": 397242,
+          "sha256": "3a5186bc2806994392d4ac35def7948923d429b18742b4b10d0b44c6ccbd5bb1",
+          "source_url": "https://www.sec.gov/Archives/edgar/data/1853717/000110465925027458/tm2510227d1_ex99-1.htm",
+          "uri": "local://ATAT/filings/id-faa1e5ee416c0f3524216e5a1c55948fbe5998ada7bc0f84a36e92ab6139ba63/tm2510227d1_ex99-1.htm"
+        }
+      ],
+      "second_returncode": 0,
+      "second_skipped": true
+    }
+  ],
+  "live_public_cli_old_complete_cover_repair": [
+    {
+      "ticker": "MSFT",
+      "day": "2025-07-30",
+      "document_id": "fil_0000950170-25-100226",
+      "command": [
+        "/Users/leo/workspace/dayu-agent-r/.venv/bin/dayu-cli",
+        "download",
+        "--base",
+        "/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/dayu-sec-old-covers-live-jyzi99w4",
+        "--ticker",
+        "MSFT",
+        "--forms",
+        "8-K",
+        "--start",
+        "2025-07-30",
+        "--end",
+        "2025-07-30",
+        "--log-file",
+        "/Users/leo/workspace/dayu-agent-r/workspace/tmp/sec_earnings_fix/old-live-MSFT-2025-07-30.log",
+        "--overwrite"
+      ],
+      "before_integrity": "complete",
+      "after_integrity": "complete",
+      "cover_unchanged": true,
+      "all_hashes_checked": true,
+      "fingerprint_recomputed": true,
+      "unrelated_unchanged": true,
+      "second_skipped": true,
+      "files": [
+        {
+          "name": "msft-20250730.htm",
+          "sha256": "2b6e1ff764c01ed0b6ee708cad6f222d77b8bacd75f485234c1dcc8f90223982",
+          "size": 63347
+        },
+        {
+          "name": "msft-20250730.xsd",
+          "sha256": "66b23292cd48da1aa54c7ec643dc59b65894f5a62fa1f13dc9e53fde80de5eab",
+          "size": 54439
+        },
+        {
+          "name": "msft-20250730_htm.xml",
+          "sha256": "eaa7fe529b542c5360634a1be4cf24097dcb0d038b4ed5b956ff5470e8dbc5c1",
+          "size": 7247
+        },
+        {
+          "name": "msft-ex99_1.htm",
+          "sha256": "57732d737ec3696b0a059dec7c2a6d865d799f28a1c3233472a409cb1c4ae592",
+          "size": 821887
+        }
+      ]
+    },
+    {
+      "ticker": "META",
+      "day": "2024-02-01",
+      "document_id": "fil_0001326801-24-000010",
+      "command": [
+        "/Users/leo/workspace/dayu-agent-r/.venv/bin/dayu-cli",
+        "download",
+        "--base",
+        "/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/dayu-sec-old-covers-live-jyzi99w4",
+        "--ticker",
+        "META",
+        "--forms",
+        "8-K",
+        "--start",
+        "2024-02-01",
+        "--end",
+        "2024-02-01",
+        "--log-file",
+        "/Users/leo/workspace/dayu-agent-r/workspace/tmp/sec_earnings_fix/old-live-META-2024-02-01.log",
+        "--overwrite"
+      ],
+      "before_integrity": "complete",
+      "after_integrity": "complete",
+      "cover_unchanged": true,
+      "all_hashes_checked": true,
+      "fingerprint_recomputed": true,
+      "unrelated_unchanged": true,
+      "second_skipped": true,
+      "files": [
+        {
+          "name": "meta-12312023xexhibit991.htm",
+          "sha256": "2c85fe7a8066e5a2e71bf5051851c63b27467eef9f5055b8bc7c0ee8d73ff165",
+          "size": 342282
+        },
+        {
+          "name": "meta-20240201.htm",
+          "sha256": "6f2e485c9b14d56409671cf5ea0fdaa41eead6fd89f10ea1e7fc086decc3fa8e",
+          "size": 30637
+        },
+        {
+          "name": "meta-20240201.xsd",
+          "sha256": "912f7b4c1b2abbf07ace894d5d2d33d4224dfe6dbe6c5bb3ef37f5e00e1b7e3c",
+          "size": 1917
+        },
+        {
+          "name": "meta-20240201_htm.xml",
+          "sha256": "c8fa584294f1b2cd319f8ff947c9a99eb1a283a0f0d2a47d1ee1953b35b9133c",
+          "size": 2707
+        },
+        {
+          "name": "meta-20240201_lab.xml",
+          "sha256": "c54c80f6a8cc394153ed8e539f22b26b8d3cb8800cbcc8d1370badf786bf8365",
+          "size": 24139
+        },
+        {
+          "name": "meta-20240201_pre.xml",
+          "sha256": "5cd6d7cddc479f5a7acf48a1454ab5e83376ca3b8a256ecc58402f35c9d98ffb",
+          "size": 12522
+        }
+      ]
+    },
+    {
+      "ticker": "META",
+      "day": "2025-01-29",
+      "document_id": "fil_0001326801-25-000014",
+      "command": [
+        "/Users/leo/workspace/dayu-agent-r/.venv/bin/dayu-cli",
+        "download",
+        "--base",
+        "/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/dayu-sec-old-covers-live-jyzi99w4",
+        "--ticker",
+        "META",
+        "--forms",
+        "8-K",
+        "--start",
+        "2025-01-29",
+        "--end",
+        "2025-01-29",
+        "--log-file",
+        "/Users/leo/workspace/dayu-agent-r/workspace/tmp/sec_earnings_fix/old-live-META-2025-01-29.log",
+        "--overwrite"
+      ],
+      "before_integrity": "complete",
+      "after_integrity": "complete",
+      "cover_unchanged": true,
+      "all_hashes_checked": true,
+      "fingerprint_recomputed": true,
+      "unrelated_unchanged": true,
+      "second_skipped": true,
+      "files": [
+        {
+          "name": "meta-12312024xexhibit991.htm",
+          "sha256": "3f803df799a14a69ac522fe4367411a653b0739095c2def85178c5808d741bc1",
+          "size": 300347
+        },
+        {
+          "name": "meta-20250129.htm",
+          "sha256": "9f546def2c13139dcf34082b37d060898918c98b6dcb8d941f3a9d58afc930bc",
+          "size": 29618
+        },
+        {
+          "name": "meta-20250129.xsd",
+          "sha256": "77fea29eb705de11aff203a7abef8743e2c06c20afed1f3a927fd65e5d967ecb",
+          "size": 1798
+        },
+        {
+          "name": "meta-20250129_htm.xml",
+          "sha256": "81b98317f762956e36204e1d97829daedc2467fdfb474758dece4012485f19e7",
+          "size": 2707
+        },
+        {
+          "name": "meta-20250129_lab.xml",
+          "sha256": "29b82f5a2fddbd10b914e7de03645adcf8aad6db348c1674e1465ded123ffad1",
+          "size": 21885
+        },
+        {
+          "name": "meta-20250129_pre.xml",
+          "sha256": "44b28888adc0a4993e9a8c030a7bed86b98d897c33d2897b7ddc6f1e96a93d2d",
+          "size": 12522
+        }
+      ]
+    },
+    {
+      "ticker": "META",
+      "day": "2026-01-28",
+      "document_id": "fil_0001628280-26-003832",
+      "command": [
+        "/Users/leo/workspace/dayu-agent-r/.venv/bin/dayu-cli",
+        "download",
+        "--base",
+        "/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/dayu-sec-old-covers-live-jyzi99w4",
+        "--ticker",
+        "META",
+        "--forms",
+        "8-K",
+        "--start",
+        "2026-01-28",
+        "--end",
+        "2026-01-28",
+        "--log-file",
+        "/Users/leo/workspace/dayu-agent-r/workspace/tmp/sec_earnings_fix/old-live-META-2026-01-28.log",
+        "--overwrite"
+      ],
+      "before_integrity": "complete",
+      "after_integrity": "complete",
+      "cover_unchanged": true,
+      "all_hashes_checked": true,
+      "fingerprint_recomputed": true,
+      "unrelated_unchanged": true,
+      "second_skipped": true,
+      "files": [
+        {
+          "name": "meta-12312025xexhibit991.htm",
+          "sha256": "0428bd5297e97c910c77566767eb48db35fc2c9ff7e2aa88ff8f7f3f340c0bca",
+          "size": 288572
+        },
+        {
+          "name": "meta-20260128.htm",
+          "sha256": "db0dfec841d8a03feed53dfae673220f341d495d3a9c1a06895741982cfc780c",
+          "size": 29178
+        },
+        {
+          "name": "meta-20260128.xsd",
+          "sha256": "2214a4df7d60c73316564aba1b344aeb218ee420a0c47373f8d5f0d616bf4ecb",
+          "size": 1798
+        },
+        {
+          "name": "meta-20260128_htm.xml",
+          "sha256": "4b112a6a17072c2d42a55c8c7bead7609f0d6acbf07ffdd70e50ecef15b2830d",
+          "size": 2707
+        },
+        {
+          "name": "meta-20260128_lab.xml",
+          "sha256": "0dc93e1216e7853f4a68b2211e9987eebc0e6ed13a1b1b7fa453759299e7cf46",
+          "size": 21885
+        },
+        {
+          "name": "meta-20260128_pre.xml",
+          "sha256": "bd961b25684222d0dfe635a0b3eb0f3994c948c21a3334fcce97759fc7c7d43c",
+          "size": 12522
+        }
+      ]
+    }
+  ],
+  "regression": {
+    "passed": 272,
+    "warnings": "3 existing edgartools deprecations",
+    "log": "final-tests.log",
+    "coverage": {
+      "sec_downloader": 94,
+      "sec_6k_rules": 87
+    }
+  },
+  "locking_regression": {
+    "passed": 8,
+    "deselected": 201,
+    "log": "lock-tests.log"
+  },
+  "pyright": {
+    "errors": 0,
+    "warnings": 0,
+    "log": "final-pyright.log"
+  },
+  "baseline_protection": {
+    "README.md": "original content preserved; task documentation inserted",
+    "dayu/fins/README.md": "original content preserved; task documentation inserted",
+    "dayu/fins/domain/filing_semantics.py": "unchanged",
+    "dayu/fins/pipelines/cn_download_filing_workflow.py": "unchanged",
+    "dayu/fins/pipelines/cn_download_models.py": "unchanged",
+    "dayu/fins/pipelines/cn_download_rebuild.py": "unchanged",
+    "dayu/fins/pipelines/cn_download_source_upsert.py": "unchanged",
+    "dayu/fins/pipelines/cn_download_workflow.py": "unchanged",
+    "dayu/fins/pipelines/cn_report_selection.py": "unchanged",
+    "dayu/fins/pipelines/sec_form_utils.py": "unchanged",
+    "dayu/fins/processors/sec_processor.py": "unchanged",
+    "tests/README.md": "original content preserved; task documentation inserted",
+    "tests/fins/test_cn_report_selection.py": "unchanged",
+    "tests/fins/test_financial_read_contracts.py": "unchanged",
+    "tests/fins/test_sec_pipeline_download.py": "unchanged",
+    "dayu/fins/pipelines/cn_download_identity.py": "unchanged",
+    "dayu/fins/pipelines/hk_download_rebuild.py": "unchanged",
+    "dayu/fins/pipelines/hk_fiscal_calendar.py": "unchanged",
+    "docs/reviews/hk-quarter-cache-fix-20260907.md": "unchanged",
+    "tests/fins/test_hk_period_rebuild.py": "unchanged"
+  },
+  "scripts": [
+    "workspace/tmp/sec_earnings_fix/live_smoke.py",
+    "workspace/tmp/sec_earnings_fix/live_cached_smoke.py",
+    "workspace/tmp/sec_earnings_fix/capture_live_fixtures.py"
+  ]
+}

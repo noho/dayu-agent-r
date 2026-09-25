@@ -12,7 +12,12 @@ import pytest
 from docling.backend.docling_parse_backend import DoclingParseDocumentBackend
 from docling.datamodel.accelerator_options import AcceleratorDevice
 from docling.datamodel.base_models import DocumentStream, FormatToExtensions, InputFormat
-from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode
+from docling.datamodel.pipeline_options import (
+    OcrMode,
+    PdfPipelineOptions,
+    RapidOcrOptions,
+    TableFormerMode,
+)
 from docling.document_converter import PdfFormatOption
 
 from dayu.documents import docling_runtime
@@ -33,6 +38,9 @@ _INVALID_DEVICE = "quantum"
 _ACCURATE_TABLE_MODE = "accurate"
 _FAST_TABLE_MODE = "fast"
 _INVALID_TABLE_MODE = "approximate"
+_EXPECTED_OCR_BACKEND = "torch"
+_EXPECTED_OCR_LANGUAGE = "ch"
+_EXPECTED_OCR_LANGUAGES = ("ch",)
 _NON_WINDOWS_PLATFORM = "darwin"
 _WINDOWS_PLATFORM = "win32"
 _STREAM_NAME = "annual-report.pdf"
@@ -687,9 +695,48 @@ def test_build_docling_pdf_pipeline_options_projects_supported_settings(
     assert options.do_table_structure is do_table_structure
     assert options.accelerator_options is not None
     assert options.accelerator_options.device is expected_device
+    assert isinstance(options.ocr_options, RapidOcrOptions)
+    assert options.ocr_options.backend == _EXPECTED_OCR_BACKEND
+    assert options.ocr_options.mode is OcrMode.DEFAULT
+    assert tuple(options.ocr_options.lang) == _EXPECTED_OCR_LANGUAGES
     if expected_table_mode is not None:
         assert options.table_structure_options.mode is expected_table_mode
         assert options.table_structure_options.do_cell_matching is do_cell_matching
+
+
+def test_build_docling_pdf_converter_pins_ocr_engine_instead_of_autoselect() -> None:
+    """验证 converter 装配把 OCR 引擎钉死为显式 RapidOCR/torch/ch，禁止回落到 auto。
+
+    Docling 的 auto 选择按平台与已安装包改写引擎（darwin 优先 ocrmac、linux 优先
+    nemotron），会让同一份文档因环境差异被不同引擎识别且代码无法感知。本测试锁定
+    owner 级契约：装配产物必须携带显式 RapidOcrOptions，任何改回 OcrAutoOptions
+    或换引擎/后端/语言的改动都必须在此失败。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        无。
+    """
+
+    converter = docling_runtime.build_docling_pdf_converter(
+        do_ocr=True,
+        table_mode=_ACCURATE_TABLE_MODE,
+        device_name=_CPU_DEVICE,
+    )
+
+    pdf_option = converter.format_to_options[InputFormat.PDF]
+    assert isinstance(pdf_option, PdfFormatOption)
+    pdf_pipeline_options = pdf_option.pipeline_options
+    assert isinstance(pdf_pipeline_options, PdfPipelineOptions)
+    assert isinstance(pdf_pipeline_options.ocr_options, RapidOcrOptions)
+    assert pdf_pipeline_options.ocr_options.backend == _EXPECTED_OCR_BACKEND
+    assert pdf_pipeline_options.ocr_options.mode is OcrMode.DEFAULT
+    assert tuple(pdf_pipeline_options.ocr_options.lang) == _EXPECTED_OCR_LANGUAGES
+    assert _EXPECTED_OCR_LANGUAGE in pdf_pipeline_options.ocr_options.lang
 
 
 def test_build_docling_pdf_pipeline_options_rejects_invalid_table_mode() -> None:

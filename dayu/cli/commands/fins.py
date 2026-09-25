@@ -41,6 +41,7 @@ from dayu.cli.output import (
     render_fins_direct_event,
 )
 from dayu.cli.upload_script import (
+    UploadScriptPublishError,
     current_upload_script_platform,
     publish_upload_script,
     render_upload_script,
@@ -207,6 +208,9 @@ def run_fins_direct_command(args: ParsedCliArgs) -> int:
     except FinsDirectStreamProtocolError as exc:
         render_cli_error(f"dayu-cli {args.command_name}: {exc.message}")
         return EXIT_FAILURE
+    except UploadScriptPublishError as exc:
+        render_cli_error(f"dayu-cli {args.command_name}: {exc}")
+        return EXIT_FAILURE
     except KeyboardInterrupt:
         return EXIT_KEYBOARD_INTERRUPT
     except Exception:
@@ -299,6 +303,7 @@ def _run_upload_filings_from(args: ParsedCliArgs) -> int:
     :raises UploadBatchPlanUsageError: Fins batch helper 判断输入非法时抛出。
     :raises UploadBatchPlanEmptyError: 源目录无可识别文件时抛出。
     :raises RuntimeError: FMP 结果与用户 canonical ticker 冲突时抛出。
+    :raises UploadScriptPublishError: 脚本发布违反 containment/symlink/target-type contract 时抛出。
     :raises OSError: 脚本发布失败时由底层抛出。
     """
 

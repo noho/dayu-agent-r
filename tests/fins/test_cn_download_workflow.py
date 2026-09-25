@@ -7,7 +7,7 @@ import hashlib
 import json
 from collections.abc import AsyncGenerator, Callable
 from contextlib import AbstractContextManager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from types import TracebackType
@@ -53,6 +53,7 @@ from dayu.fins.pipelines.cn_download_models import (
     DownloadedReportAsset,
 )
 from dayu.fins.pipelines.cn_download_pdf_gate import CnDownloadPdfGateProtocol
+from dayu.fins.pipelines.cn_download_source_upsert import build_content_fingerprint, build_remote_fingerprint
 from dayu.fins.pipelines.docling_process_converter import (
     DoclingConversionCancelledError,
     DoclingConversionConfig,
@@ -1814,7 +1815,17 @@ def test_cn_replacement_separates_company_and_document_transactions(
 
 
 def test_cn_complete_phase_a_skips_transport_without_source_mutation(tmp_path: Path) -> None:
-    """Phase A COMPLETE+overwrite=False 必须零 PDF 传输且不打开 source batch。"""
+    """完整正文缓存面对合成全文候选时保留旧来源和文件，且不打开 source batch。
+
+    Args:
+        tmp_path: pytest 隔离工作区。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 默认跳过发生传输、来源变更或文档事务时抛出。
+    """
 
     repository_set = build_fs_repository_set(workspace_root=tmp_path)
     batching_repository = _BatchIdentityCnBatchingRepository(tmp_path, repository_set)
@@ -1824,7 +1835,8 @@ def test_cn_complete_phase_a_skips_transport_without_source_mutation(tmp_path: P
         repository_set,
         batching_repository,
     )
-    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(_candidate(),))
+    old_candidate = replace(_candidate(), title="合成测试：2024年年度报告正文")
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(old_candidate,))
     pipeline = _build_pipeline(
         tmp_path=tmp_path,
         discovery=discovery,
@@ -1835,12 +1847,23 @@ def test_cn_complete_phase_a_skips_transport_without_source_mutation(tmp_path: P
         blob_repository=blob_repository,
     )
     _collect_events(pipeline, start_is_explicit=True)
+    document_id, = source_repository.list_source_document_ids("600519", SourceKind.FILING)
+    old_meta = source_repository.get_source_meta("600519", document_id, SourceKind.FILING)
+    handle = source_repository.get_source_handle("600519", document_id, SourceKind.FILING)
+    old_pdf = blob_repository.read_file_bytes(handle, f"{document_id}.pdf")
+    assert old_meta["source_id"] == old_candidate.source_id
+    assert old_meta["source_title"] == old_candidate.title
+    assert old_meta["source_url"] == old_candidate.source_url
+    assert old_pdf == _PDF_BYTES
     batching_repository.phases.clear()
     begin_calls = batching_repository.begin_calls
     commit_calls = batching_repository.commit_calls
     rollback_calls = batching_repository.rollback_calls
     download_calls = discovery.download_calls
-    discovery.candidates = (_candidate(source_id="A2", etag='"v2"'),)
+    discovery.candidates = (
+        replace(_candidate(source_id="A2", etag='"v2"'), title="合成测试：2024年年度报告全文"),
+    )
+    discovery.pdf_bytes = _PDF_BYTES + b"synthetic-full-report"
 
     result = _final_result(_collect_events(pipeline, start_is_explicit=True))
 
@@ -1855,6 +1878,8 @@ def test_cn_complete_phase_a_skips_transport_without_source_mutation(tmp_path: P
     assert batching_repository.commit_calls == commit_calls
     assert batching_repository.rollback_calls == rollback_calls + 1
     assert discovery.download_calls == download_calls
+    assert source_repository.get_source_meta("600519", document_id, SourceKind.FILING) == old_meta
+    assert blob_repository.read_file_bytes(handle, f"{document_id}.pdf") == old_pdf
 
 
 def test_cn_unsafe_phase_a_fails_before_meta_transport_or_reset(tmp_path: Path) -> None:
@@ -2046,13 +2071,25 @@ def test_cn_replacement_final_failure_restores_old_source_and_blobs(tmp_path: Pa
 def test_cn_replacement_success_exposes_source_blobs_and_processed_marker_together(
     tmp_path: Path,
 ) -> None:
-    """replacement commit 成功后 final source、新 blobs 与 processed marker 同时可见。"""
+    """合成正文覆盖为全文后来源、文件及清单同步，随后增量保持完成态。
 
-    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(_candidate(),))
+    Args:
+        tmp_path: pytest 隔离工作区。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 覆盖投影、重处理标记或再次增量跳过不符合合同。
+    """
+
+    old_candidate = replace(_candidate(), title="合成测试：2024年年度报告正文")
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(old_candidate,))
+    converter = _FakeConverter()
     pipeline = _build_pipeline(
         tmp_path=tmp_path,
         discovery=discovery,
-        converter=_FakeConverter(),
+        converter=converter,
     )
     _collect_events(pipeline, start_is_explicit=True)
     document_id, internal_document_id = build_cn_filing_ids(
@@ -2077,9 +2114,15 @@ def test_cn_replacement_success_exposes_source_blobs_and_processed_marker_togeth
         batch=setup_batch,
     )
     pipeline.batching_repository.commit_batch(setup_batch)
+    old_meta = pipeline.source_repository.get_source_meta("600519", document_id, SourceKind.FILING)
     replacement_pdf = _PDF_BYTES + b"replacement"
     discovery.pdf_bytes = replacement_pdf
-    discovery.candidates = (_candidate(source_id="A2", etag='"v2"'),)
+    new_candidate = replace(
+        _candidate(source_id="A2", etag='"v2"'),
+        title="合成测试：2024年年度报告全文",
+        content_length=len(replacement_pdf),
+    )
+    discovery.candidates = (new_candidate,)
 
     result = _final_result(_collect_events(pipeline, start_is_explicit=True, overwrite=True))
 
@@ -2092,9 +2135,52 @@ def test_cn_replacement_success_exposes_source_blobs_and_processed_marker_togeth
     handle = pipeline.source_repository.get_source_handle("600519", document_id, SourceKind.FILING)
     assert result["status"] == "ok"
     assert source_meta["ingest_complete"] is True
+    assert source_meta["source_id"] == new_candidate.source_id
+    assert source_meta["source_title"] == new_candidate.title
+    assert source_meta["source_url"] == new_candidate.source_url
+    assert source_meta["pdf_sha256"] == hashlib.sha256(replacement_pdf).hexdigest()
+    assert source_meta["source_fingerprint"] == build_content_fingerprint(
+        pdf_bytes=replacement_pdf, docling_json_bytes=_DOCLING_BYTES,
+    )
+    assert source_meta["remote_fingerprint"] == build_remote_fingerprint(new_candidate)
+    assert source_meta["source_fingerprint"] != old_meta["source_fingerprint"]
+    assert source_meta["remote_fingerprint"] != old_meta["remote_fingerprint"]
     assert pipeline.blob_repository.read_file_bytes(handle, f"{document_id}.pdf") == replacement_pdf
     assert pipeline.blob_repository.read_file_bytes(handle, f"{document_id}_docling.json") == _DOCLING_BYTES
     assert processed_meta["reprocess_required"] is True
+    files = pipeline.blob_repository.list_files(handle)
+    expected_files = {
+        f"{document_id}.pdf": replacement_pdf,
+        f"{document_id}_docling.json": _DOCLING_BYTES,
+    }
+    assert len(files) == len(expected_files)
+    assert {Path(file.uri).name for file in files} == set(expected_files)
+    for file in files:
+        expected_bytes = expected_files[Path(file.uri).name]
+        assert file.size == len(expected_bytes)
+        assert file.sha256 == hashlib.sha256(expected_bytes).hexdigest()
+    # 仓储完整性 owner 比较落盘 manifest 与当前 meta 的完整规范投影，
+    # 同时拒绝缺项、多余项和投影漂移；不在测试中另造 manifest 字段规则。
+    integrity, = pipeline.source_repository.list_source_integrity("600519")
+    assert integrity.document_id == document_id
+    assert integrity.status is SourceIntegrityStatus.COMPLETE
+    assert integrity.reasons == ()
+
+    download_calls = discovery.download_calls
+    conversion_calls = converter.calls
+    incremental_result = _final_result(_collect_events(pipeline, start_is_explicit=True))
+    summary = incremental_result["summary"]
+    assert incremental_result["status"] == "ok"
+    assert isinstance(summary, dict)
+    assert summary["skipped"] == 1
+    assert summary["downloaded"] == 0
+    assert summary["failed"] == 0
+    assert discovery.download_calls == download_calls
+    assert converter.calls == conversion_calls
+    assert pipeline.source_repository.get_source_meta("600519", document_id, SourceKind.FILING) == source_meta
+    assert pipeline.blob_repository.list_files(handle) == files
+    assert pipeline.blob_repository.read_file_bytes(handle, f"{document_id}.pdf") == replacement_pdf
+    assert pipeline.source_repository.list_source_integrity("600519") == (integrity,)
 
 
 def test_cn_rebuild_updates_only_source_in_one_batch(tmp_path: Path) -> None:

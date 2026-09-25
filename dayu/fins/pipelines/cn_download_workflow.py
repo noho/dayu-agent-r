@@ -18,6 +18,7 @@ from dayu.fins.pipelines.cn_download_filing_workflow import (
     project_cn_filing_failure,
     run_cn_download_single_filing_stream,
 )
+from dayu.fins.pipelines.cn_download_identity import resolve_cn_download_ids
 from dayu.fins.pipelines.cn_download_models import (
     CnDownloadCancelledError,
     CnCompanyProfile,
@@ -33,13 +34,13 @@ from dayu.fins.pipelines.cn_download_protocols import (
 )
 from dayu.fins.pipelines.cn_form_utils import (
     PeriodDownloadWindow,
-    build_cn_filing_ids,
     resolve_period_windows,
     resolve_download_period_policy,
     resolve_window,
 )
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.storage import (
+    SourceDocumentRepositoryProtocol,
     SelectedSourceRepairRequired,
     SourceIntegrityRevisionConflictError,
     classify_source_integrity_preflight,
@@ -220,7 +221,9 @@ async def run_cn_download_stream_impl(
             period_windows=period_windows,
             use_default_business_limits=not start_is_explicit,
         )
-        accepted_filing_ids = frozenset(_candidate_document_id(normalized_ticker, candidate) for candidate in selected)
+        accepted_filing_ids = frozenset(
+            _candidate_document_id(normalized_ticker, candidate, host.source_repository) for candidate in selected
+        )
         preflight = classify_source_integrity_preflight(
             host.source_repository.list_source_integrity(normalized_ticker),
             accepted_filing_ids=accepted_filing_ids,
@@ -232,7 +235,9 @@ async def run_cn_download_stream_impl(
             selected = tuple(
                 sorted(
                     selected,
-                    key=lambda item: (_candidate_document_id(normalized_ticker, item) != repair_document_id,),
+                    key=lambda item: (
+                        _candidate_document_id(normalized_ticker, item, host.source_repository) != repair_document_id,
+                    ),
                 )
             )
         missing_periods = _resolve_missing_periods(
@@ -254,7 +259,7 @@ async def run_cn_download_stream_impl(
                 notes.append("cancelled")
                 cancelled = True
                 break
-            document_id = _candidate_document_id(normalized_ticker, candidate)
+            document_id = _candidate_document_id(normalized_ticker, candidate, host.source_repository)
             yield DownloadEvent(
                 event_type=DownloadEventType.FILING_STARTED,
                 ticker=normalized_ticker,
@@ -306,7 +311,7 @@ async def run_cn_download_stream_impl(
             except Exception as exc:
                 reason_code, reason_message = project_cn_filing_failure(exc)
                 failed_item = _build_candidate_failed_result(
-                    ticker=normalized_ticker,
+                    document_id=document_id,
                     candidate=candidate,
                     reason_code=reason_code,
                     reason_message=reason_message,
@@ -592,7 +597,7 @@ def _resolve_missing_periods(
 
 def _build_candidate_failed_result(
     *,
-    ticker: str,
+    document_id: str,
     candidate: CnReportCandidate,
     reason_code: str,
     reason_message: str,
@@ -600,7 +605,7 @@ def _build_candidate_failed_result(
     """构建单候选异常失败结果。
 
     Args:
-        ticker: ticker。
+        document_id: 已绑定的文档 ID。
         candidate: 远端候选。
         reason_code: 稳定原因码。
         reason_message: 失败说明。
@@ -613,11 +618,11 @@ def _build_candidate_failed_result(
     """
 
     return {
-        "document_id": _candidate_document_id(ticker, candidate),
+        "document_id": document_id,
         "status": "failed",
         "form_type": candidate.period_projection.identity_period,
         "filing_date": candidate.filing_date,
-        "report_date": None,
+        "report_date": candidate.report_date,
         "fiscal_year": candidate.fiscal_year,
         "fiscal_period": candidate.period_projection.identity_period,
         "covered_fiscal_periods": list(candidate.period_projection.covered_periods),
@@ -823,8 +828,12 @@ def _build_result(
     }
 
 
-def _candidate_document_id(ticker: str, candidate: CnReportCandidate) -> str:
-    """构建单候选真实 document_id。
+def _candidate_document_id(
+    ticker: str,
+    candidate: CnReportCandidate,
+    repository: SourceDocumentRepositoryProtocol,
+) -> str:
+    """构建单候选真实 document_id；repository 为来源身份绑定仓储。
 
     Args:
         ticker: 已归一化 ticker。
@@ -837,13 +846,7 @@ def _candidate_document_id(ticker: str, candidate: CnReportCandidate) -> str:
         无。
     """
 
-    document_id, _ = build_cn_filing_ids(
-        ticker=ticker,
-        form_type=candidate.period_projection.identity_period,
-        fiscal_year=candidate.fiscal_year,
-        fiscal_period=candidate.period_projection.identity_period,
-        amended=candidate.amended,
-    )
+    document_id, _ = resolve_cn_download_ids(ticker, candidate, repository)
     return document_id
 
 

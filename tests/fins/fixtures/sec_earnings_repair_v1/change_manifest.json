@@ -1,0 +1,137 @@
+{
+  "git_head": "fac32ecbff9bfe792b63ee9667c8697826b631f4",
+  "tracked_worktree_diff_sha256": "d388219ba04c42bde5ec55908190a02755e7023b01acddb69177b315b187463b",
+  "note": "本次文件清单；3 个 README 含已保留的既有改动；不含本清单自身及本地临时脚本。",
+  "files": [
+    {
+      "path": "README.md",
+      "size": 31063,
+      "sha256": "15d5eeb989f4321ff61dadbe0b27d6749e1adeb7f232a3c8c965dbfba8abaf21"
+    },
+    {
+      "path": "dayu/fins/README.md",
+      "size": 93392,
+      "sha256": "6adb07d0e1cc59d42f01cdd43474d4db538f7b73aa327404253b0bc530c3d51c"
+    },
+    {
+      "path": "dayu/fins/downloaders/sec_downloader.py",
+      "size": 97684,
+      "sha256": "ba30d59a789de144bffd259d0a55cfddda87b94de204200139815ad5ec42e300"
+    },
+    {
+      "path": "dayu/fins/pipelines/sec_6k_rules.py",
+      "size": 67634,
+      "sha256": "0e33c648ad585bd2322b84f9b1b57696a53c3a2d6baff55c5fa738d8a4d769c2"
+    },
+    {
+      "path": "docs/reviews/sec-earnings-repair-20260910.md",
+      "size": 8821,
+      "sha256": "40258738e9b2e05d4433d88f36422701f11a1507260fdd6408f1d9569410cb78"
+    },
+    {
+      "path": "tests/README.md",
+      "size": 121004,
+      "sha256": "415162de13b87cb8a8b961620764c6dd0baedcd10fd73be55daf0d98b648c032"
+    },
+    {
+      "path": "tests/fins/fixtures/sec_earnings_repair_v1/README.md",
+      "size": 2208,
+      "sha256": "46d38710ef8a1a5fb3033f80f5ab0bd1041225d094e0b4d085a07d7b8fb05c7f"
+    },
+    {
+      "path": "tests/fins/fixtures/sec_earnings_repair_v1/data/raw/meta-12312023xexhibit991.htm",
+      "size": 342282,
+      "sha256": "2c85fe7a8066e5a2e71bf5051851c63b27467eef9f5055b8bc7c0ee8d73ff165"
+    },
+    {
+      "path": "tests/fins/fixtures/sec_earnings_repair_v1/data/raw/meta-12312024xexhibit991.htm",
+      "size": 300347,
+      "sha256": "3f803df799a14a69ac522fe4367411a653b0739095c2def85178c5808d741bc1"
+    },
+    {
+      "path": "tests/fins/fixtures/sec_earnings_repair_v1/data/raw/meta-12312025xexhibit991.htm",
+      "size": 288572,
+      "sha256": "0428bd5297e97c910c77566767eb48db35fc2c9ff7e2aa88ff8f7f3f340c0bca"
+    },
+    {
+      "path": "tests/fins/fixtures/sec_earnings_repair_v1/data/raw/meta-20240201.htm",
+      "size": 30637,
+      "sha256": "6f2e485c9b14d56409671cf5ea0fdaa41eead6fd89f10ea1e7fc086decc3fa8e"
+    },
+    {
+      "path": "tests/fins/fixtures/sec_earnings_repair_v1/data/raw/meta-20250129.htm",
+      "size": 29618,
+      "sha256": "9f546def2c13139dcf34082b37d060898918c98b6dcb8d941f3a9d58afc930bc"
+    },
+    {
+      "path": "tests/fins/fixtures/sec_earnings_repair_v1/data/raw/meta-20260128.htm",
+      "size": 29178,
+      "sha256": "db0dfec841d8a03feed53dfae673220f341d495d3a9c1a06895741982cfc780c"
+    },
+    {
+      "path": "tests/fins/fixtures/sec_earnings_repair_v1/data/raw/msft-20250730.htm",
+      "size": 63347,
+      "sha256": "2b6e1ff764c01ed0b6ee708cad6f222d77b8bacd75f485234c1dcc8f90223982"
+    },
+    {
+      "path": "tests/fins/fixtures/sec_earnings_repair_v1/data/raw/msft-ex99_1.htm",
+      "size": 821887,
+      "sha256": "57732d737ec3696b0a059dec7c2a6d865d799f28a1c3233472a409cb1c4ae592"
+    },
+    {
+      "path": "tests/fins/fixtures/sec_earnings_repair_v1/data/raw/tm2428837d1_6k.htm",
+      "size": 12017,
+      "sha256": "ca06f063ca7df4b63450eeb4fa3634b690278b663210642ac77575c47e2bf6bc"
+    },
+    {
+      "path": "tests/fins/fixtures/sec_earnings_repair_v1/data/raw/tm2428837d1_ex99-1.htm",
+      "size": 369492,
+      "sha256": "c256f80d7dadb934294bacf2e1990874e0bbdc76f2f23cc5e4baa21e8f6938f9"
+    },
+    {
+      "path": "tests/fins/fixtures/sec_earnings_repair_v1/data/raw/tm2510227d1_6k.htm",
+      "size": 12011,
+      "sha256": "198741347ef370a3258dd7f07dce8d0f17521bb88e8e3a31a0c0e7e821b8629d"
+    },
+    {
+      "path": "tests/fins/fixtures/sec_earnings_repair_v1/data/raw/tm2510227d1_ex99-1.htm",
+      "size": 397242,
+      "sha256": "3a5186bc2806994392d4ac35def7948923d429b18742b4b10d0b44c6ccbd5bb1"
+    },
+    {
+      "path": "tests/fins/fixtures/sec_earnings_repair_v1/data/source_manifest/downloaded_sources.json",
+      "size": 12495,
+      "sha256": "4237a705cec7c8a24f88f75771943b5842893bc5195b1fd9342aab1f85d3d83e"
+    },
+    {
+      "path": "tests/fins/fixtures/sec_earnings_repair_v1/data/source_manifest/sources.json",
+      "size": 3397,
+      "sha256": "60650bf2d5ed131a906937b56376fb7b87949c9ad10521d56346c14a4ae0c2db"
+    },
+    {
+      "path": "tests/fins/fixtures/sec_earnings_repair_v1/workpapers/final-pyright.log",
+      "size": 191,
+      "sha256": "70a0f3577f8953319fd286c94822becc2dd8c6ec2ba6d76e8bc67172b4e12691"
+    },
+    {
+      "path": "tests/fins/fixtures/sec_earnings_repair_v1/workpapers/final-tests.log",
+      "size": 2967,
+      "sha256": "b33c0a52aa594b5cc9d21550d97446ac14eebc0e9ad055f9dc868306dffebd37"
+    },
+    {
+      "path": "tests/fins/fixtures/sec_earnings_repair_v1/workpapers/lock-tests.log",
+      "size": 114,
+      "sha256": "0261de8c6d7179e0cd674d2332ed75f928ef185d407c5e1fe278083b7e0a550d"
+    },
+    {
+      "path": "tests/fins/fixtures/sec_earnings_repair_v1/workpapers/validation.json",
+      "size": 27559,
+      "sha256": "5da17626bc1b84de0e4c5996a91cc2fe44b884109d75c1a90d4f92ede24e4203"
+    },
+    {
+      "path": "tests/fins/test_sec_earnings_repair.py",
+      "size": 22280,
+      "sha256": "ba5ab57a51c9b2a756e77d97a9ab5569e57f8a4662f05d49c95a711027f86447"
+    }
+  ]
+}

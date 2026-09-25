@@ -583,11 +583,11 @@ def pick_taxonomy_files(items: Sequence[Mapping[str, JsonValue]]) -> list[str]:
 
 
 def pick_exhibit_files(items: Sequence[Mapping[str, JsonValue]]) -> list[str]:
-    """选择 6-K exhibit 文件。
+    """选择 current report 的 EX-99 HTML exhibit 文件。
 
     识别策略：
     1. 优先使用 SEC 文档类型（`EX-99.x`）；
-    2. 若无类型字段，回退到文件名模式（`dex99*` / `ex99*`）。
+    2. 若无类型字段，使用文件名模式（`dex99*` / `ex99*` / `exhibit99*`）。
 
     Args:
         items: 文件条目列表（可来自 `index.json` 或 `index-headers` 解析结果）。
@@ -613,7 +613,7 @@ def pick_exhibit_files(items: Sequence[Mapping[str, JsonValue]]) -> list[str]:
             continue
         # Donnelley 格式: dex991.htm, dex992.htm, ...
         # Edgar Filing Services 格式: xxx_ex99-1.htm, xxx_ex99_1.htm, ...
-        if "dex99" in lowered or "ex99" in lowered:
+        if "dex99" in lowered or "ex99" in lowered or "exhibit99" in lowered:
             exhibits.append(name)
     return sorted(set(exhibits))
 
@@ -717,6 +717,9 @@ def _normalize_same_filing_relative_html_href(
         return None
     parsed = urlparse(normalized_href)
     if parsed.scheme or parsed.netloc:
+        return None
+    # SEC 同目录文件名无需转义；拒绝编码路径，避免后续 HTTP 解码绕过目录边界。
+    if "%" in parsed.path:
         return None
     normalized_path = posixpath.normpath(parsed.path.strip())
     if normalized_path in {"", "."}:
@@ -1428,7 +1431,7 @@ class SecDownloader:
             primary_document: primaryDocument 文件名。
             form_type: filing form 类型。
             include_xbrl: 是否包含 XBRL 文件。
-            include_exhibits: 是否包含 exhibit 文件（6-K）。
+            include_exhibits: 是否包含 6-K/8-K 的 EX-99 HTML；6-K 另保留原有同 filing 补链。
             include_http_metadata: 是否额外拉取文件级 HTTP 元数据。
             cancellation_checker: 可选协作式取消检查器。
 
@@ -1454,7 +1457,7 @@ class SecDownloader:
                     cancellation_checker=cancellation_checker,
                 )
             )
-        if include_exhibits and form_type == "6-K":
+        if include_exhibits and form_type in {"6-K", "8-K"}:
             _raise_if_download_cancelled(cancellation_checker)
             index_header_documents = await _await_if_needed(
                 self._try_fetch_index_header_documents(
@@ -1468,21 +1471,30 @@ class SecDownloader:
             if extracted_xml:
                 filenames.append(extracted_xml)
             filenames.extend(pick_taxonomy_files(index_items))
-        if include_exhibits and form_type == "6-K":
-            filenames.extend(pick_form_document_files(index_items, form_type))
-            filenames.extend(pick_form_document_files(index_header_documents, form_type))
-            filenames.extend(pick_exhibit_files(index_items))
-            filenames.extend(pick_exhibit_files(index_header_documents))
+        if include_exhibits and form_type in {"6-K", "8-K"}:
+            exhibit_names = pick_exhibit_files(index_items) + pick_exhibit_files(index_header_documents)
+            if form_type == "6-K":
+                filenames.extend(pick_form_document_files(index_items, form_type))
+                filenames.extend(pick_form_document_files(index_header_documents, form_type))
             _raise_if_download_cancelled(cancellation_checker)
-            filenames.extend(
-                await _await_if_needed(
-                    self._try_fetch_primary_linked_html_files(
-                        archive_base=archive_base,
-                        primary_document=primary_document,
-                        cancellation_checker=cancellation_checker,
-                    )
+            linked_names = await _await_if_needed(
+                self._try_fetch_primary_linked_html_files(
+                    archive_base=archive_base,
+                    primary_document=primary_document,
+                    cancellation_checker=cancellation_checker,
                 )
             )
+            if form_type == "8-K":
+                # 8-K 只补 EX-99 HTML，避免把签署协议、年报链接或图片一起抓入。
+                exhibit_names.extend(pick_exhibit_files([{"name": name} for name in linked_names]))
+                filenames.extend(
+                    name
+                    for candidate in exhibit_names
+                    if (name := _normalize_same_filing_relative_html_href(candidate, primary_document)) is not None
+                )
+            else:
+                filenames.extend(exhibit_names)
+                filenames.extend(linked_names)
         file_meta_map = _build_file_metadata_map(index_items, index_header_documents)
         unique_filenames = sorted(set(filenames))
         Log.verbose(
