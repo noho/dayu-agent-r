@@ -279,6 +279,8 @@ def _inspect_source_kind_unguarded(
         if child_state is None:
             unassignable_root_fact = True
             continue
+        if _is_ignorable_hidden_metadata_entry(child, child_state):
+            continue
         if not _is_non_symlink_directory(child_state):
             unassignable_root_fact = True
             continue
@@ -857,6 +859,10 @@ def _validate_physical_structure(
             continue
         child_state = _lstat_optional(child, action="检查 source integrity business entry")
         if child_state is None:
+            continue
+        if child.name not in declared_names and _is_ignorable_hidden_metadata_entry(
+            child, child_state
+        ):
             continue
         if not _is_non_symlink_regular_file(child_state):
             return SourceIntegrityReason.UNSAFE_FILESYSTEM_ENTRY
@@ -1838,6 +1844,40 @@ def _is_allowed_filing_control(name: str, source_kind: SourceKind) -> bool:
         _DOWNLOAD_REJECTIONS_FILENAME,
         _REJECTED_FILINGS_DIRNAME,
     }
+
+
+def _is_ignorable_hidden_metadata_entry(path: Path, path_state: os.stat_result) -> bool:
+    """判断未声明点号条目是否为安全的物理元数据树。
+
+    Args:
+        path: source kind 根或文档目录中的直属条目。
+        path_state: 该条目由 ``lstat`` 得到的物理状态。
+
+    Returns:
+        点号普通文件或后代全为普通文件和目录的点号目录返回 ``True``。
+
+    Raises:
+        OSError: 枚举或读取隐藏树时发生非 missing I/O 错误。
+    """
+
+    if not path.name.startswith("."):
+        return False
+    if _is_non_symlink_regular_file(path_state):
+        return True
+    if not _is_non_symlink_directory(path_state):
+        return False
+    pending = [path]
+    while pending:
+        directory = pending.pop()
+        for child in _list_directory(directory, action="枚举隐藏元数据目录"):
+            child_state = _lstat_optional(child, action="检查隐藏元数据条目")
+            if child_state is None:
+                return False
+            if _is_non_symlink_directory(child_state):
+                pending.append(child)
+            elif not _is_non_symlink_regular_file(child_state):
+                return False
+    return True
 
 
 def _lstat_optional(path: Path, *, action: str) -> os.stat_result | None:

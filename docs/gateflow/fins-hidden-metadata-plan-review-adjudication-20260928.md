@@ -40,3 +40,7 @@ MiMo 本轮两个低严重度命令规格 finding 均 **accepted，已修复于�
 MiMo 关于 document 枚举插入点的 open question 作为 code review 核对点：已声明名称优先，非普通项仍归 `UNSAFE_FILESYSTEM_ENTRY`，未声明非点号项原错误原因不得漂移；snapshot/commit 拒绝的类型与消息按现有 owner contract 精确断言。README 限定“未声明、安全的点号元数据”，不得扩大到 rejected/control 区。超大隐藏树成本与 TOCTOU 归本 work unit closeout；rejected/control 区归 `fins-rejected-control-hidden-metadata` 后续 work unit。
 
 **裁决：plan review gate pass。** 当前/下一 gate 为 `accepted plan commit`，随后唯一 S1 `implementation`。上述命令规格已在本裁决 artifact 给出确定执行值，未改动已受审 plan 的业务设计；实施结果与代码仍须双路 code review，不把计划通过当成修复完成。
+
+## S1 code review 后的覆盖率命令勘误（2026-09-29）
+
+前述第 2 条声称路径式 `--cov=dayu/fins/storage/_fs_source_integrity.py` 可正常收集，是当时 plan review 的环境观察，**不能继续作为本次实施 gate 的有效命令规格**。S1 实施及 MiMo code review 在当前 coverage 7.13.5 环境直接复现：该参数被当作模块名，产生 `module-not-imported` / `no-data-collected`；组合命令中的文件路径目标也是死参数。真实有效数据来自 `--cov=dayu/fins/storage`，再读取 `_fs_source_integrity.py` 文件行（574 statements / 81 missed / 86%）。本执行规约改为仅使用目录式收集并核对单文件行、无上述 warning；不改代码 owner 或 80% 目标。该勘误是后续代码审查的 accepted 证据修正，不倒改历史 plan review 派发状态。
