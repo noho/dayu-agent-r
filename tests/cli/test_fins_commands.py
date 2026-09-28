@@ -8,6 +8,7 @@ import errno
 import hashlib
 import io
 import logging
+import os
 import subprocess
 import sys
 from collections.abc import AsyncGenerator
@@ -605,6 +606,254 @@ def fake_service(monkeypatch: pytest.MonkeyPatch) -> _FakeFinsDirectService:
 
     monkeypatch.setattr(fins_command, "FINS_DIRECT_SERVICE_FACTORY", factory)
     return service
+
+
+def test_upload_material_file_base_rejected_before_factory_and_input(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """真实 parser/main 在装配和读取缺失上传输入前拒绝普通文件 base。
+
+    Args:
+        tmp_path: 隔离路径根目录。
+        capsys: 标准流捕获夹具。
+        monkeypatch: 替换 Service factory 的夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: factory 被调用或路径用法语义错误时抛出。
+    """
+
+    base = tmp_path / "base"
+    base.write_bytes(b"original base")
+    calls: list[Path] = []
+
+    def forbidden_factory(path: Path) -> fins_command.FinsDirectCommandService:
+        """记录不应发生的 Service 装配。
+
+        Args:
+            path: 请求的 workspace 路径。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 一旦装配 Service 即抛出。
+        """
+
+        calls.append(path)
+        raise AssertionError("base 类型错误必须先于 Service 装配")
+
+    monkeypatch.setattr(fins_command, "FINS_DIRECT_SERVICE_FACTORY", forbidden_factory)
+    result = cli_main.main(
+        (
+            "upload_material", "--base", str(base), "--ticker", "AAPL",
+            "--forms", "10-K", "--material-name", "sample", "--files",
+            str(tmp_path / "missing-input.pdf"),
+        )
+    )
+    output = capsys.readouterr()
+    assert result == EXIT_USAGE_ERROR
+    assert output.err == (
+        "dayu-cli upload_material: --base must point to a directory; "
+        "choose a directory path\n"
+    )
+    assert "missing-input" not in output.err
+    assert calls == []
+    assert base.read_bytes() == b"original base"
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["base"]
+
+
+@pytest.mark.parametrize("option", ("--base", "-b", "--workspace"))
+def test_fins_workspace_aliases_use_one_resolved_target(
+    option: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """三个工作区参数别名都将同一规范化目录交给 Service。
+
+    Args:
+        option: 待验证的工作区参数别名。
+        tmp_path: 隔离路径根目录。
+        capsys: 标准流捕获夹具。
+        monkeypatch: 替换 Service factory 的夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 解析结果或 CLI 退出码错误时抛出。
+    """
+
+    base = tmp_path / "workspace"
+    base.mkdir()
+    calls: list[Path] = []
+    service = _FakeFinsDirectService()
+    monkeypatch.setattr(
+        fins_command, "FINS_DIRECT_SERVICE_FACTORY",
+        partial(_recording_direct_service_factory, service=service, factory_calls=calls),
+    )
+    assert cli_main.main(("download", option, str(base), "--ticker", "AAPL")) == EXIT_SUCCESS
+    capsys.readouterr()
+    assert calls == [base]
+
+
+def test_fins_repeated_base_uses_last_value(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """重复 scalar base 的最终值决定唯一装配路径。
+
+    Args:
+        tmp_path: 隔离路径根目录。
+        capsys: 标准流捕获夹具。
+        monkeypatch: 替换 Service factory 的夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 首值被使用或装配路径错误时抛出。
+    """
+
+    invalid = tmp_path / "file"
+    invalid.write_bytes(b"first")
+    valid = tmp_path / "directory"
+    valid.mkdir()
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        fins_command, "FINS_DIRECT_SERVICE_FACTORY",
+        partial(
+            _recording_direct_service_factory,
+            service=_FakeFinsDirectService(),
+            factory_calls=calls,
+        ),
+    )
+    assert cli_main.main(
+        ("download", "--base", str(invalid), "--base", str(valid), "--ticker", "AAPL")
+    ) == EXIT_SUCCESS
+    capsys.readouterr()
+    assert calls == [valid]
+    assert invalid.read_bytes() == b"first"
+
+
+def test_fins_default_base_resolves_against_current_directory(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """省略 base 参数时按当前 cwd 解析默认 workspace。
+
+    Args:
+        tmp_path: 隔离路径根目录。
+        capsys: 标准流捕获夹具。
+        monkeypatch: 切换 cwd 并替换 factory 的夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 默认路径或退出码错误时抛出。
+    """
+
+    monkeypatch.chdir(tmp_path)
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        fins_command, "FINS_DIRECT_SERVICE_FACTORY",
+        partial(
+            _recording_direct_service_factory,
+            service=_FakeFinsDirectService(),
+            factory_calls=calls,
+        ),
+    )
+    assert cli_main.main(("download", "--ticker", "AAPL")) == EXIT_SUCCESS
+    capsys.readouterr()
+    assert calls == [tmp_path / "workspace"]
+
+
+def test_real_upload_material_cli_rejects_file_base_from_this_checkout(tmp_path: Path) -> None:
+    """真实子进程先证明 checkout 身份，再复验普通文件 base 的无副作用拒绝。
+
+    Args:
+        tmp_path: 子进程临时 cwd。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 解释器、导入树、错误或文件快照不符合契约时抛出。
+    """
+
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    expected_import = Path(__file__).resolve().parents[2] / "dayu" / "__init__.py"
+    identity = subprocess.run(
+        (
+            sys.executable, "-c",
+            "import dayu,pathlib,sys; print(pathlib.Path(dayu.__file__).resolve()); "
+            "print(pathlib.Path(sys.executable).resolve()); print(pathlib.Path(sys.prefix).resolve())",
+        ),
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert identity.returncode == 0, identity.stderr
+    assert identity.stdout.splitlines() == [
+        str(expected_import.resolve()),
+        str(Path(sys.executable).resolve()),
+        str(Path(sys.prefix).resolve()),
+    ]
+
+    base = tmp_path / "base"
+    original = b"ordinary file base"
+    base.write_bytes(original)
+    before = sorted(path.name for path in tmp_path.iterdir())
+    command = (
+        sys.executable, "-m", "dayu.cli", "upload_material", "--base", str(base),
+        "--ticker", "AAPL", "--forms", "10-K", "--material-name", "sample",
+        "--files", str(tmp_path / "missing-input.pdf"),
+    )
+    result = subprocess.run(
+        command,
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == EXIT_USAGE_ERROR
+    assert result.stderr == (
+        "dayu-cli upload_material: --base must point to a directory; "
+        "choose a directory path\n"
+    )
+    assert str(tmp_path) not in result.stderr
+    assert result.stdout == ""
+    assert base.read_bytes() == original
+    assert sorted(path.name for path in tmp_path.iterdir()) == before
+
+    directory = tmp_path / "directory"
+    directory.mkdir()
+    directory_link = tmp_path / "directory-link"
+    directory_link.symlink_to(directory, target_is_directory=True)
+    symlink_command = tuple(
+        str(directory_link) if part == str(base) else part for part in command
+    )
+    symlink_result = subprocess.run(
+        symlink_command,
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert "--base must point to a directory" not in symlink_result.stderr
 
 
 def _recording_direct_service_factory(

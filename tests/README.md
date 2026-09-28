@@ -348,6 +348,8 @@ TTY 路径由 `PromptToolkitInteractiveComposer` 独占整个 invocation 的 std
 
 non-TTY interactive 测试覆盖一次读取 whole UTF-8 stdin、CRLF/CR 归一、外层 trim、内部多行/Unicode/literal `0x04` 保留、空白输入零 Run、非空输入恰好一个 Run、无提示符及非法 UTF-8 稳定错误。CLI terminal cursor、activity/thinking renderer、interactive run view、startup reconnect、FAILED/CANCELLED 继续输入与 LOST fatal 仍由各自独立测试覆盖。
 
+普通 CLI workspace 路径 owner 测试覆盖空值、现存非目录、目录与符号链接、缺失目标、首尾空白和相对路径，并检查直接消费者只从公共解析模块导入；Fins CLI 测试另用真实子进程验证本 checkout 身份及普通文件 `--base` 的早拒绝和文件快照。
+
 Session command 测试覆盖 shared labeled slot 与 anonymous/other display、含点号 label 不拆分、旧 `cli.prompt.*` / `cli.interactive.*` 只显示为 other 且不复用、`session list` public Host 调用与 open/closed 输出、label selector 删除 `--kind`、`session resume --mode prompt|interactive` 路由，以及 mode-specific ticker/config 拒绝；同时覆盖 CLOSED/missing label、resume/purge label TOCTOU、purge `--yes` 门禁、Host `INVALID_STATE` 和输出不暴露内部治理字段。Fins direct command 测试覆盖
 `download`、`upload_filing`、`upload_material`、`process`、`process_filing`、`process_material` 的 CLI 参数到
 `FinsDirectCommandService` 显式方法参数转换、Service event stream 消费、progress / terminal summary

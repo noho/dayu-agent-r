@@ -175,6 +175,8 @@ dayu-cli <command> --help
 | `--debug-stream` | 额外打开高频 stream/SSE 诊断，不改变普通日志等级；不可与 `quiet` 组合 |
 | `--log-file PATH` | 把诊断日志追加写入指定文件；可与任意合法日志等级选择组合 |
 
+普通 CLI 命令的 `--base` 若指向已有目标，该目标须是目录；指向普通文件时会提示改用目录并以用法错误 `2` 退出。`upload_material` 等直接财报命令可使用指向目录的符号链接。`init` 对符号链接另有禁止规则。
+
 `--log-level` 和所有日志等级快捷参数彼此互斥，一次调用只能选择其中一个。
 `--debug-stream` 可以单独使用，也可以与 `debug`、`verbose`、`info`、`warn` / `warning`、
 `error` 或 `critical` 组合。

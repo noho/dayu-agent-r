@@ -46,6 +46,7 @@ from dayu.cli.upload_script import (
     publish_upload_script,
     render_upload_script,
 )
+from dayu.cli.workspace_root import resolve_workspace_root
 from dayu.fins.direct_events import (
     FinsDirectStreamProtocolError,
     FinsEvent,
@@ -239,7 +240,7 @@ async def _run_fins_direct_command_async(args: ParsedCliArgs) -> int:
     if args.command_name == COMMAND_UPLOAD_FILINGS_FROM:
         return _run_upload_filings_from(args)
     download_request = _prevalidate_download_request(args)
-    workspace_root = _resolve_workspace_root(args.workspace_root)
+    workspace_root = resolve_workspace_root(args.workspace_root, error_factory=CliFinsUsageError)
     upload_filing_request = _prevalidate_upload_filing_request(
         args,
         workspace_root=workspace_root,
@@ -330,7 +331,7 @@ def _run_upload_filings_from(args: ParsedCliArgs) -> int:
         if company_name is None:
             company_name = resolved_info.company_name
     material_form = _single_batch_material_form(args.material_forms)
-    workspace_root = _resolve_workspace_root(args.workspace_root)
+    workspace_root = resolve_workspace_root(args.workspace_root, error_factory=CliFinsUsageError)
     source_dir = Path(args.source_dir)
     plan = generate_upload_batch_plan(
         UploadBatchPlanRequest(
@@ -1091,19 +1092,6 @@ def _bounded_diagnostic_text(value: str) -> str:
         value[: _FINS_DIAGNOSTIC_TEXT_MAX_CHARS - len(_FINS_DIAGNOSTIC_TRUNCATED_SUFFIX)]
         + _FINS_DIAGNOSTIC_TRUNCATED_SUFFIX
     )
-
-
-def _resolve_workspace_root(raw_value: str) -> Path:
-    """解析 CLI workspace root。
-
-    :param raw_value: ``--base`` / ``--workspace`` 原始值。
-    :returns: 解析后的绝对路径。
-    :raises CliFinsUsageError: 路径为空时抛出。
-    """
-
-    if raw_value.strip() == "":
-        raise CliFinsUsageError(f"{_BASE_OPTION} must not be empty")
-    return Path(raw_value).expanduser().resolve(strict=False)
 
 
 def _parse_ticker_csv(raw_value: str | None) -> CompanyTickerIdentity:

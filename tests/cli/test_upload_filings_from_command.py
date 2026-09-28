@@ -186,6 +186,7 @@ def test_upload_filings_from_default_output_generates_posix_script_and_summary(
     assert content.startswith("#!/usr/bin/env sh\nset -eu\n")
     assert "python -m dayu.cli upload_filing" in content
     assert "python -m dayu.cli upload_material" in content
+    assert content.count("--base") >= 3
     assert "--ticker AAPL,MSFT" in content
     assert "--action update" in content
     assert "--overwrite" in content
@@ -679,6 +680,87 @@ def test_publisher_allows_external_ancestor_symlink(tmp_path: Path) -> None:
     assert target == (workspace / "upload_filings_AAPL.sh").resolve()
 
 
+def test_upload_filings_from_file_base_precedes_plan_and_publish(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """批量脚本入口在扫描和发布前拒绝普通文件 base。
+
+    Args:
+        tmp_path: 隔离路径根目录。
+        capsys: 标准流捕获夹具。
+        monkeypatch: 禁止下游计划与发布的夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 下游被调用或 usage 投影错误时抛出。
+    """
+
+    base = tmp_path / "base"
+    base.write_bytes(b"original")
+    source = tmp_path / "source"
+    source.mkdir()
+    before = sorted(path.name for path in tmp_path.iterdir())
+
+    def forbidden_plan(_request: UploadBatchPlanRequest) -> UploadBatchPlan:
+        """禁止扫描和生成批量计划。
+
+        Args:
+            _request: 不应传入的计划请求。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 发生计划生成时抛出。
+        """
+
+        raise AssertionError("base 类型错误必须先于计划生成")
+
+    def forbidden_publish(
+        *,
+        workspace_root: Path,
+        output: Path | None,
+        canonical_ticker: str,
+        platform: upload_script.UploadScriptPlatform,
+        content: str,
+    ) -> Path:
+        """禁止发布批量脚本。
+
+        Args:
+            workspace_root: 不应收到的工作区路径。
+            output: 不应收到的输出路径。
+            canonical_ticker: 不应收到的代码。
+            platform: 不应收到的平台。
+            content: 不应收到的脚本内容。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 发生发布时抛出。
+        """
+
+        raise AssertionError("base 类型错误必须先于脚本发布")
+
+    monkeypatch.setattr(fins_command, "generate_upload_batch_plan", forbidden_plan)
+    monkeypatch.setattr(fins_command, "publish_upload_script", forbidden_publish)
+    exit_code = cli_main.main(
+        ("upload_filings_from", "--base", str(base), "--ticker", "AAPL", "--from", str(source))
+    )
+    output = capsys.readouterr()
+    assert exit_code == EXIT_USAGE_ERROR
+    assert output.err == (
+        "dayu-cli upload_filings_from: --base must point to a directory; "
+        "choose a directory path\n"
+    )
+    assert base.read_bytes() == b"original"
+    assert sorted(path.name for path in tmp_path.iterdir()) == before
+
+
 def test_upload_filings_from_usage_empty_and_write_failures(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -891,13 +973,17 @@ def test_upload_filings_from_keyboard_interrupt_exits_130(
     ) == EXIT_KEYBOARD_INTERRUPT
 
 
-def test_posix_generated_script_runs_real_cli_into_temp_storage() -> None:
-    """真实生成脚本必须经 parser→Service→Fins 写入临时 storage。"""
+def test_posix_generated_script_runs_real_cli_into_temp_storage(tmp_path: Path) -> None:
+    """真实生成脚本必须经 parser→Service→Fins 写入临时 storage。
+
+    :param tmp_path: 当前测试独占的临时目录。
+    :returns: 无。
+    :raises AssertionError: 脚本生成、执行或仓储结果不符合预期时抛出。
+    """
 
     if os.name == "nt":
         pytest.skip("POSIX real workflow is exercised on non-Windows runners")
-    smoke_root = Path(__file__).resolve().parents[2] / "workspace/tmp/r11-posix-real"
-    shutil.rmtree(smoke_root, ignore_errors=True)
+    smoke_root = tmp_path / "posix-real"
     source_dir = smoke_root / "source"
     storage = smoke_root / "storage"
     source_dir.mkdir(parents=True)
