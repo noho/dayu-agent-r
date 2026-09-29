@@ -280,11 +280,11 @@ def _upload_parameters_schema() -> ToolParametersSchema:
         },
         "filing_date": {
             "type": "string",
-            "description": "可选披露日期。上传 filing 时若填写，必须是实际存在的 YYYY-MM-DD 日期；文本不会自动去除空白，空串、纯空白或首尾空白均非法。",
+            "description": "可选披露日期文本，filing 与 material 上传都适用。省略或填 null 表示未提供；若填写，必须是实际存在的公历日，格式 YYYY-MM-DD，例如 2024-02-29。空串、纯空白或首尾空白均非法，不能用于清空日期。",
         },
         "report_date": {
             "type": "string",
-            "description": "可选报告期日期。上传 filing 时若填写，必须是实际存在的 YYYY-MM-DD 日期；文本不会自动去除空白，空串、纯空白或首尾空白均非法。",
+            "description": "可选报告期日期文本，filing 与 material 上传都适用。省略或填 null 表示未提供；若填写，必须是实际存在的公历日，格式 YYYY-MM-DD，例如 2024-02-29。空串、纯空白或首尾空白均非法，不能用于清空日期。",
         },
         "company_name": {
             "type": "string",
@@ -359,8 +359,8 @@ def _upload_request_from_arguments(arguments: Mapping[str, JsonValue]) -> FinsUp
         fiscal_year=_optional_int(arguments, "fiscal_year"),
         fiscal_period=_optional_nullable_text(arguments, "fiscal_period"),
         amended=_optional_bool(arguments, "amended", default=False),
-        filing_date=_optional_nullable_text(arguments, "filing_date"),
-        report_date=_optional_nullable_text(arguments, "report_date"),
+        filing_date=_optional_raw_nullable_text(arguments, "filing_date"),
+        report_date=_optional_raw_nullable_text(arguments, "report_date"),
         company_name=_optional_nullable_text(arguments, "company_name"),
         ticker_aliases=_optional_text_tuple(arguments, "ticker_aliases"),
         overwrite=_optional_bool(arguments, "overwrite", default=False),
@@ -397,7 +397,7 @@ def _optional_raw_nullable_text(
     arguments: Mapping[str, JsonValue],
     key: str,
 ) -> str | None:
-    """读取 filing 分支需保留原始形态的可选文本。
+    """读取上传日期需保留原始形态的可选文本。
 
     Args:
         arguments: 工具参数。

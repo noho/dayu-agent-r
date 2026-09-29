@@ -2932,6 +2932,64 @@ def test_upload_commands_map_args_and_validate_files(
 
 
 @pytest.mark.parametrize(
+    ("option", "raw_value", "expected_value"),
+    (
+        ("--filing-date", "", None),
+        ("--filing-date", " 2024-02-29 ", " 2024-02-29 "),
+        ("--report-date", "2024-02-29 ", "2024-02-29 "),
+    ),
+)
+def test_upload_material_cli_preserves_nonempty_date_text_and_empty_filing_exception(
+    tmp_path: Path,
+    fake_service: _FakeFinsDirectService,
+    option: str,
+    raw_value: str,
+    expected_value: str | None,
+) -> None:
+    """CLI 只折叠 material 空日期，其余原文交给共享准入。
+
+    Args:
+        tmp_path: 测试材料文件所在临时目录。
+        fake_service: 记录 Service 参数的替身。
+        option: 当前日期命令参数。
+        raw_value: CLI 收到的原始文本。
+        expected_value: 传给 Service 的原文或缺失值。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: CLI 空值例外或非空日期保真漂移时抛出。
+    """
+
+    material_file = tmp_path / "material.html"
+    material_file.write_text("<html></html>", encoding="utf-8")
+    exit_code = cli_main.main(
+        (
+            "upload_material",
+            "--ticker",
+            "AAPL",
+            "--forms",
+            "MATERIAL_OTHER",
+            "--material-name",
+            "Deck",
+            "--files",
+            str(material_file),
+            option,
+            raw_value,
+        )
+    )
+
+    assert exit_code == EXIT_SUCCESS
+    assert len(fake_service.upload_material_requests) == 1
+    request = fake_service.upload_material_requests[0]
+    if option == "--filing-date":
+        assert request.filing_date == expected_value
+    else:
+        assert request.report_date == expected_value
+
+
+@pytest.mark.parametrize(
     ("basename", "expected_message"),
     (
         ("schema.xsd", "补充材料文件格式不受支持：schema.xsd"),

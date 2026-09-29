@@ -4765,7 +4765,7 @@ class FinsIngestionRuntime:
             filing 返回 validated typed request；material 返回既有 normalized request。
 
         Raises:
-            FinsUploadUsageError: raw filing request 违反 usage contract 时抛出。
+            FinsUploadUsageError: raw filing request 或 material 日期违反 usage contract 时抛出。
             FinsUploadPrevalidationError: raw filing target 为 ``UNSAFE`` 时原样抛出。
             ValueError: material request 非法或 published state 损坏时抛出。
             OSError: filing published state 读取失败时抛出。
@@ -7823,6 +7823,7 @@ def _normalize_upload_request(request: FinsUploadRequest) -> FinsUploadRequest:
         已归一化 action 字段的上传请求。
 
     Raises:
+        FinsUploadUsageError: material 日期不是实际存在的 strict ISO full date 时抛出。
         ValueError: source_kind、action 或有界字段非法时抛出。
     """
 
@@ -7832,6 +7833,8 @@ def _normalize_upload_request(request: FinsUploadRequest) -> FinsUploadRequest:
     if isinstance(request, FinsUploadFilingRequest):
         return replace(request, action=action)
     if isinstance(request, FinsUploadMaterialRequest):
+        _validate_optional_upload_iso_date(request.filing_date, FinsUploadUsageCode.INVALID_FILING_DATE)
+        _validate_optional_upload_iso_date(request.report_date, FinsUploadUsageCode.INVALID_REPORT_DATE)
         return replace(request, action=action)
     assert_never(request)
 

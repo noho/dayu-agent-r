@@ -737,8 +737,8 @@ def _upload_material_stream(
         fiscal_year=args.fiscal_year,
         fiscal_period=_optional_stripped_text(args.fiscal_period),
         amended=args.amended,
-        filing_date=_optional_stripped_text(args.filing_date),
-        report_date=_optional_stripped_text(args.report_date),
+        filing_date=_optional_material_date_text(args.filing_date),
+        report_date=_optional_material_date_text(args.report_date),
         company_name=_optional_stripped_text(args.company_name),
         ticker_aliases=ticker.accepted_aliases,
         overwrite=args.overwrite,
@@ -1265,6 +1265,19 @@ def _optional_stripped_text(value: str | None) -> str | None:
     if stripped == "":
         return None
     return stripped
+
+
+def _optional_material_date_text(value: str | None) -> str | None:
+    """保留 material 日期原文，仅投影 CLI 已有的空值行为。
+
+    :param value: argparse 读取的原始日期文本。
+    :returns: ``None`` 或空白文本返回 ``None``；非空文本原样返回。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if value is None or value.strip() == "":
+        return None
+    return value
 
 
 __all__: tuple[str, ...] = (

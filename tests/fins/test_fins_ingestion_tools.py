@@ -1630,6 +1630,65 @@ def test_upload_tool_filing_dates_preserve_raw_text_until_domain_admission(
     assert runtime._observations == {}
 
 
+@pytest.mark.parametrize(
+    ("field_name", "raw_value", "expected_message"),
+    (
+        ("filing_date", "2025-02-30", "披露日期（filing_date）必须是实际存在的 YYYY-MM-DD 日期"),
+        ("filing_date", "", "披露日期（filing_date）必须是实际存在的 YYYY-MM-DD 日期"),
+        ("filing_date", " ", "披露日期（filing_date）必须是实际存在的 YYYY-MM-DD 日期"),
+        ("filing_date", " 2024-02-29 ", "披露日期（filing_date）必须是实际存在的 YYYY-MM-DD 日期"),
+        ("report_date", "not-a-date", "报告期日期（report_date）必须是实际存在的 YYYY-MM-DD 日期"),
+        ("report_date", "", "报告期日期（report_date）必须是实际存在的 YYYY-MM-DD 日期"),
+        ("report_date", "\t", "报告期日期（report_date）必须是实际存在的 YYYY-MM-DD 日期"),
+        ("report_date", "2024-02-29 ", "报告期日期（report_date）必须是实际存在的 YYYY-MM-DD 日期"),
+    ),
+)
+def test_upload_tool_material_dates_reach_shared_admission_without_rewriting(
+    tmp_path: Path,
+    field_name: str,
+    raw_value: str,
+    expected_message: str,
+) -> None:
+    """material 日期原文进入 Fins 准入并在 observation、job 和发布前失败。
+
+    Args:
+        tmp_path: 独立 workspace 的临时根目录。
+        field_name: 当前待验证的日期字段。
+        raw_value: 未经 adapter 清洗的文本。
+        expected_message: Fins owner 的字段级文案。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: adapter 改写原文或非法值产生副作用时抛出。
+    """
+
+    workspace_root = _build_workspace(tmp_path)
+    runtime, executor, state_repository = _runtime_with_static_admission_guard(workspace_root=workspace_root)
+    before_tree = _snapshot_tool_workspace_tree(workspace_root)
+    arguments: dict[str, JsonValue] = {
+        "ticker": "AAPL",
+        "upload_kind": "material",
+        "action": "delete",
+        "form_type": "MATERIAL_OTHER",
+        "material_name": "Deck",
+        field_name: raw_value,
+    }
+
+    outcome = asyncio.run(FinsUploadToolCallable(runtime=runtime)(_call(UPLOAD_TOOL_NAME, arguments), _context()))
+
+    assert isinstance(outcome, ToolFailedOutcome)
+    assert outcome.result.error == "invalid_argument"
+    assert outcome.result.message == expected_message
+    assert state_repository.calls == []
+    assert state_repository.batch_calls == []
+    assert executor.submitted_job_ids == ()
+    assert runtime._observations == {}
+    assert not tuple(_job_store_root(workspace_root).glob("*.json"))
+    assert _snapshot_tool_workspace_tree(workspace_root) == before_tree
+
+
 def test_upload_tool_calendar_year_schema_and_usage_messages_are_business_neutral(
     tmp_path: Path,
 ) -> None:
@@ -1732,12 +1791,14 @@ def test_upload_tool_calendar_year_schema_and_usage_messages_are_business_neutra
         "财报期间。上传 filing 时必填且只支持 FY、H1、Q1、Q2、Q3、Q4；上传 material 时可选。"
     )
     assert filing_date_schema["description"] == (
-        "可选披露日期。上传 filing 时若填写，必须是实际存在的 YYYY-MM-DD 日期；"
-        "文本不会自动去除空白，空串、纯空白或首尾空白均非法。"
+        "可选披露日期文本，filing 与 material 上传都适用。省略或填 null 表示未提供；"
+        "若填写，必须是实际存在的公历日，格式 YYYY-MM-DD，例如 2024-02-29。"
+        "空串、纯空白或首尾空白均非法，不能用于清空日期。"
     )
     assert report_date_schema["description"] == (
-        "可选报告期日期。上传 filing 时若填写，必须是实际存在的 YYYY-MM-DD 日期；"
-        "文本不会自动去除空白，空串、纯空白或首尾空白均非法。"
+        "可选报告期日期文本，filing 与 material 上传都适用。省略或填 null 表示未提供；"
+        "若填写，必须是实际存在的公历日，格式 YYYY-MM-DD，例如 2024-02-29。"
+        "空串、纯空白或首尾空白均非法，不能用于清空日期。"
     )
     exact_messages = {
         FinsUploadUsageCode.INVALID_FISCAL_YEAR: "财年（fiscal_year）必须是 1000..9999 的整数",
@@ -1760,7 +1821,7 @@ def test_upload_tool_calendar_year_schema_and_usage_messages_are_business_neutra
         }
     )
     assert isinstance(material_request, FinsUploadMaterialRequest)
-    assert material_request.filing_date == "2024-02-29"
+    assert material_request.filing_date == " 2024-02-29 "
     assert material_request.report_date is None
 
 

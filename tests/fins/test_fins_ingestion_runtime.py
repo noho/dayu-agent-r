@@ -9634,6 +9634,117 @@ def test_material_upload_reuses_ticker_identity_admission_before_job_creation(
     assert not tuple((workspace_root / ".dayu" / "fins_ingestion" / "jobs").glob("*.json"))
 
 
+@pytest.mark.parametrize("ticker", ("AAPL", "600519", "0700.HK"))
+@pytest.mark.parametrize(
+    ("field_name", "raw_date", "expected_code"),
+    (
+        ("filing_date", "2025-02-30", FinsUploadUsageCode.INVALID_FILING_DATE),
+        ("filing_date", "2024-2-29", FinsUploadUsageCode.INVALID_FILING_DATE),
+        ("filing_date", "", FinsUploadUsageCode.INVALID_FILING_DATE),
+        ("filing_date", " ", FinsUploadUsageCode.INVALID_FILING_DATE),
+        ("filing_date", " 2024-02-29 ", FinsUploadUsageCode.INVALID_FILING_DATE),
+        ("report_date", "not-a-date", FinsUploadUsageCode.INVALID_REPORT_DATE),
+        ("report_date", "2024-2-29", FinsUploadUsageCode.INVALID_REPORT_DATE),
+        ("report_date", "", FinsUploadUsageCode.INVALID_REPORT_DATE),
+        ("report_date", "\t", FinsUploadUsageCode.INVALID_REPORT_DATE),
+        ("report_date", "2024-02-29 ", FinsUploadUsageCode.INVALID_REPORT_DATE),
+    ),
+)
+def test_material_dates_fail_shared_admission_before_all_upload_lifecycles(
+    tmp_path: Path,
+    ticker: str,
+    field_name: str,
+    raw_date: str,
+    expected_code: FinsUploadUsageCode,
+) -> None:
+    """material 日期在三个入口共用的准入处 typed 拒绝，且不创建任何上传事实。
+
+    Args:
+        tmp_path: 独立 workspace 的临时根目录。
+        ticker: US、CN 或 HK 公司代码。
+        field_name: 当前待验证的日期字段。
+        raw_date: 未经入口清洗的原始日期。
+        expected_code: 当前字段的 typed usage code。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 字段错误、准入时点或零副作用边界漂移时抛出。
+    """
+
+    workspace_root = tmp_path / "fins-workspace"
+    runtime, executor, state_repository, runner = _build_static_admission_guarded_runtime(workspace_root)
+    request = FinsUploadMaterialRequest(
+        ticker=ticker,
+        action="delete",
+        form_type="MATERIAL_OTHER",
+        material_name="Deck",
+        filing_date=raw_date if field_name == "filing_date" else None,
+        report_date=raw_date if field_name == "report_date" else None,
+    )
+    before = _snapshot_runtime_workspace_tree(workspace_root)
+
+    for entrance in ("direct", "observation", "observed", "job"):
+        with pytest.raises(FinsUploadUsageError) as exc_info:
+            if entrance == "direct":
+                runtime.upload(request)
+            elif entrance == "observation":
+                runtime.prepare_observed_upload(request, _NeverCancelledToken())
+            elif entrance == "observed":
+                runtime.start_observed_upload(request, _NeverCancelledToken())
+            else:
+                runtime.start_upload(request)
+        assert exc_info.value.failure.code is expected_code
+        assert exc_info.value.failure.message == fins_upload_usage_failure(expected_code).message
+
+    assert state_repository.calls == []
+    assert state_repository.batch_calls == []
+    assert executor.operations == []
+    assert runner.requests == []
+    assert runtime._observations == {}
+    assert _snapshot_runtime_workspace_tree(workspace_root) == before
+    assert not (workspace_root / ".dayu" / "fins_ingestion" / "jobs").exists()
+    assert not (workspace_root / "portfolio").exists()
+
+
+@pytest.mark.parametrize("date_value", (None, "2024-02-29"))
+def test_material_dates_accept_none_and_real_leap_day_before_job_creation(
+    tmp_path: Path,
+    date_value: str | None,
+) -> None:
+    """合法闰日与缺失值通过同一 material 准入，原值进入 job 请求摘要。
+
+    Args:
+        tmp_path: 独立 workspace 的临时根目录。
+        date_value: 缺失日期或合法闰日原文。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 合法日期被拒绝或上传摘要改写原值时抛出。
+    """
+
+    workspace_root = tmp_path / "fins-workspace"
+    runtime = _build_ingestion_runtime(workspace_root, executor=_HoldingExecutor())
+    request = FinsUploadMaterialRequest(
+        ticker="AAPL",
+        action="delete",
+        form_type="MATERIAL_OTHER",
+        material_name="Deck",
+        filing_date=date_value,
+        report_date=date_value,
+    )
+
+    runtime.upload(request)
+    runtime.prepare_observed_upload(request, _NeverCancelledToken())
+    start = runtime.start_upload(request)
+    summary = runtime.read_job(start.job_id).request_summary
+    assert summary["filing_date"] == date_value
+    assert summary["report_date"] == date_value
+
+
 def test_start_upload_projects_real_corrupt_company_meta_before_job_creation(
     tmp_path: Path,
 ) -> None:
