@@ -10,6 +10,7 @@ import io
 import logging
 import re
 import sys
+import traceback
 from collections.abc import Iterator
 from pathlib import Path
 from types import FrameType, TracebackType
@@ -148,14 +149,32 @@ def test_safe_exception_trace_redacts_external_filename_and_bad_type_metadata(
     assert "BadMetadataError" not in bad_trace
 
 
-def test_safe_exception_trace_bounds_deep_stack_and_handles_missing_traceback() -> None:
-    """深栈只保留末十六帧，无 traceback 使用固定缺失标记。
+def test_safe_exception_trace_bounds_deep_stack_and_handles_missing_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """深栈只校验并输出末十六帧，无 traceback 使用固定缺失标记。
 
+    :param monkeypatch: 观察受信帧校验调用而不改变校验结果。
     :returns: 无。
-    :raises AssertionError: 深栈边界或缺失 traceback 投影不符时抛出。
+    :raises AssertionError: 校验范围、深栈边界或缺失 traceback 投影不符时抛出。
     """
 
     source_root = Path(runtime_log.__file__).parent.parent
+    validated_frames: list[tuple[FrameType, int]] = []
+    validate_frame = runtime_log._safe_trace_frame
+
+    def record_validation(frame: FrameType, line_number: int, root: Path) -> str:
+        """记录实际校验的帧并使用原校验规则生成诊断。
+
+        :param frame: 待校验的 traceback 帧。
+        :param line_number: traceback 记录的行号。
+        :param root: 调用方传入的受信包根。
+        :returns: 原校验规则生成的安全帧片段。
+        :raises Exception: 遵循原校验函数的异常契约。
+        """
+
+        validated_frames.append((frame, line_number))
+        return validate_frame(frame, line_number, root)
 
     def raise_deep(depth: int) -> NoReturn:
         """构造有界测试递归栈。
@@ -173,7 +192,12 @@ def test_safe_exception_trace_bounds_deep_stack_and_handles_missing_traceback() 
     try:
         raise_deep(25)
     except RuntimeError as exc:
-        trace = safe_exception_trace(exc, source_root=source_root)
+        original_frames = list(traceback.walk_tb(exc.__traceback__))
+        with monkeypatch.context() as patch:
+            patch.setattr(runtime_log, "_safe_trace_frame", record_validation)
+            trace = safe_exception_trace(exc, source_root=source_root)
+    assert len(original_frames) > 16
+    assert validated_frames == original_frames[-16:]
     assert trace.count("[external]") == 16
     assert trace.endswith("truncated=true")
     assert "token=hidden" not in trace

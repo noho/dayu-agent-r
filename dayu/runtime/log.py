@@ -99,12 +99,17 @@ def safe_exception_trace(exc: Exception, *, source_root: Path) -> str:
 
     try:
         exception_type, custom_type = _safe_exception_type(exc)
-        frames: deque[str] = deque(maxlen=_SAFE_TRACE_FRAME_LIMIT)
+        frames: deque[tuple[FrameType, int]] = deque(maxlen=_SAFE_TRACE_FRAME_LIMIT)
         frame_count = 0
         for frame, line_number in traceback.walk_tb(exc.__traceback__):
             frame_count += 1
-            frames.append(_safe_trace_frame(frame, line_number, source_root))
-        stack = ",".join(frames) if frames else _SAFE_TRACE_UNAVAILABLE
+            frames.append((frame, line_number))
+        # 仅对最终可见的帧执行受信路径校验，避免深栈诊断重复触发文件系统 I/O。
+        stack = (
+            ",".join(_safe_trace_frame(frame, line_number, source_root) for frame, line_number in frames)
+            if frames
+            else _SAFE_TRACE_UNAVAILABLE
+        )
         truncated = "true" if frame_count > _SAFE_TRACE_FRAME_LIMIT else "false"
         return f"exception_type={exception_type} custom_type={custom_type} stack={stack} truncated={truncated}"
     except Exception:
