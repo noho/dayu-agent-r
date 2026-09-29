@@ -14,11 +14,11 @@ Issue：`https://github.com/noho/dayu-agent-r/issues/198`。已接受的 S1 修 
 
 重要集成事实：PR #197 原 head `9735800c` 与 #198 S2 `2643de25` 从共同基线 `8d8d494f` 分叉，前者**不是**后者祖先。上一 Agent 已在 PR head 上受控 merge #198，合并 commit `2219d40b` 两父为 `9735800c` 与已过 aggregate deepreview 的 `cc6ee444`；没有强推覆盖 PR 原有点号元数据/O03/O20 提交。接手时仍要核实时 `gh pr view` 与 `git merge-base`，不沿用旧“可快进”推断。
 
-**#198 交接检查点（2026-09-29）**：整项 aggregate accepted commit `cc6ee444fba62ff128fd01d97263a6c53efe5bc7`；PR review F1 修复后双路同版 MiMo/ds-flash 复审有效且无新 material finding，accepted PR review commit `c37b71ee1a271e22c3a2330a0fb88bcd32f6aab4`。该 commit 已推送并经 `git ls-remote` 与 `gh pr view` 读回，PR #197 OPEN/draft/mergeable、base main、CI checks 空。PR body 唯一普通文本 `Closes #198`，GraphQL `closingIssuesReferences` 返回 OPEN issue #198，用户手工 merge 后预计自动关闭。四份 PR review artifact、总控裁决与修复队列均在 PR 中；`docs/gateflow/issue-198-final-closeout-20260929.md` 是 final closeout 真源。**issue closeout comment 仍需 `$gateflow` 规定的额外用户授权**；未获授权或未读回发布结果时，状态只能是 `draft-PR-pass / final closeout pending comment`，不能称 `final closeout pass`。若上一 Agent 在交接后获得授权并完成文档收尾提交，以实时 PR head 与该 closeout artifact 的最新版本为准，不把本段代码验收 commit 当作最终文档 head。
+**#198 交接检查点（2026-09-29）**：整项 aggregate accepted commit `cc6ee444fba62ff128fd01d97263a6c53efe5bc7`；PR review F1 修复后双路同版 MiMo/ds-flash 复审有效且无新 material finding，accepted PR review commit `c37b71ee1a271e22c3a2330a0fb88bcd32f6aab4`。该 commit 已推送并经 `git ls-remote` 与 `gh pr view` 读回，PR #197 OPEN/draft/mergeable、base main、CI checks 空。PR body 唯一普通文本 `Closes #198`，GraphQL `closingIssuesReferences` 返回 OPEN issue #198，用户手工 merge 后预计自动关闭。四份 PR review artifact、总控裁决与修复队列均在 PR 中；`docs/gateflow/issue-198-final-closeout-20260929.md` 是 final closeout 真源。用户已单独授权 issue closeout comment，评论 `https://github.com/noho/dayu-agent-r/issues/198#issuecomment-5893424991` 已发布且正文读回一致；**#198 已 final closeout pass / work unit completed**。接手时以实时 PR head 与 closeout artifact 的最新版本为准，不把本段代码验收 commit 当作最终文档 head。
 
 ## 3. 新 Agent 的下一个入口
 
-只在 #198 已按 Gateflow 到达 final closeout pass 后，按主队列依赖顺序选择**下一个 eligible WU**，从该 WU 当前**下一个未完成 gate**继续，不回退已通过 gate，不把 plan 候选当产品修复。若 closeout comment 未获授权，先停在 #198 的 final closeout gate，不跨项推进。候选顺序要由当前依赖重新裁决：
+#198 已通过 final closeout。用户已指示上一 Agent 到此停止；**新 Agent**接手后按主队列依赖顺序选择**下一个 eligible WU**，从该 WU 当前**下一个未完成 gate**继续，不回退已通过 gate，不把 plan 候选当产品修复。候选顺序要由当前依赖重新裁决：
 
 - 点号元数据与 UM-O03 的闭环增量此前已在 PR #197；核实时以线上 commit 与 review artifact 为准，不重复实施。
 - O04/O23 统一资产规划与文件名→Docling 文件名函数是 O25 primary 选择的前置；隔离工作树和审查结果见主队列，已有候选修复/findings 不得漏掉。

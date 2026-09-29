@@ -1,10 +1,10 @@
-# Issue #198 final closeout（待 issue 评论授权）
+# Issue #198 final closeout（pass）
 
 ## Gate 状态与目标
 
 - Work unit：GitHub issue [#198](https://github.com/noho/dayu-agent-r/issues/198)，范围为 Fins download 的 typed source integrity 公共失败投影/partial publication 守恒（S1）与真正未知 download 的安全 operator 诊断及 CLI 日志定位（S2）。
 - 已通过：goal、plan/双路 review、S1/S2 实施及双路 code review、整项双路 aggregate deepreview、合入既有 draft PR #197 后双路 PR re-review、accepted PR review commit、final push、`draft-PR-pass`。
-- 当前：`final closeout` 的本地证据已备妥；`$gateflow` 要求给 issue 添加 closeout comment，且该外部 comment 需要用户额外授权。**评论未获授权/未发出前不得记 `final closeout pass` 或 `work unit completed`。**
+- 用户已单独授权 issue closeout comment，已发布并逐字读回。PR 关联、评论、finding/residual owner 均满足 `$gateflow` final closeout；**final closeout pass / work unit completed**。用户要求到此停止，不启动下一 WU。
 
 ## 改动与验证
 
@@ -22,14 +22,14 @@
 
 ## PR 与 issue 关联
 
-- Draft PR：[ #197 ](https://github.com/noho/dayu-agent-r/pull/197)，base `main`、head `codex/upload-material-oracle`，用户手工 merge。2026-09-29 线上 readback：OPEN/draft/mergeable，head `c37b71ee1a271e22c3a2330a0fb88bcd32f6aab4`，CI checks 空。
+- Draft PR：[ #197 ](https://github.com/noho/dayu-agent-r/pull/197)，base `main`、head `codex/upload-material-oracle`，用户手工 merge。2026-09-29 代码验收 head `c37b71ee1a271e22c3a2330a0fb88bcd32f6aab4`；随后文档交接 commit `853b8ced50f551b621205097fbc10aec1709e1c5` 也已线上读回。PR 保持 OPEN/draft/mergeable，CI checks 空；本 closeout 文档推送会继续产生 docs-only head，接手时以线上 PR 读回为准。
 - PR body 有唯一普通文本 `Closes #198`；GitHub GraphQL `closingIssuesReferences` 已读回 OPEN issue #198。用户 merge 后应由 GitHub 自动关闭；当前不得主动关 issue。
 - 推送 `c37b71ee` 的远端写入成功并经 `git ls-remote`/`gh pr view` 双重证实；共享 `.git` 内本地远端跟踪 ref 的 lock 更新受权限阻挡，不影响 PR 远端 head。
-- **Issue closeout comment：待额外用户授权。** 拟发布内容如下，获授权后用临时 body file 提交并读回 URL/body，再将本段改为已发布并记录 comment URL。
+- **Issue closeout comment：已获用户单独授权并发布。** URL：https://github.com/noho/dayu-agent-r/issues/198#issuecomment-5893424991 。`gh issue view` 读回 issue `OPEN`、comment_count=1，唯一评论正文与从下方草稿生成的 body file 去首尾空白后逐字一致。评论不主动关闭 issue；用户手工 merge 后预计由 GitHub 自动关闭。
 
 > #198 的 S1/S2 已完成并进入 draft PR #197：https://github.com/noho/dayu-agent-r/pull/197 。S1/S2、整项 aggregate deepreview 和 PR 双路复审已通过；受影响 863 项测试通过、pyright 0 errors，真实隔离 CLI 已验证成功发布、typed 完整性失败及恢复。PR review 的 F1/F3 已修复，F2 有证据驳回，F1 论证精度已更正；没有未裁决的 #198 finding。其它独立残余与 owner 见 PR 中 `docs/gateflow/upload-material-issue-198-repair-sequence-20260928.md`（包括 direct failsafe、其它 storage 分类、CNInfo 中国本地披露日等），不计入本 issue 的 S1/S2 范围。PR body 有 `Closes #198`；issue 目前保持 OPEN，用户手工 merge PR 后预计由 GitHub 自动关闭。
 
 ## 下一入口与停止点
 
 - 当前用户要求完成 #198 后停下；不启动下一 WU。给下一位 Agent 的指令是 `docs/upload_material_repair_handoff_prompt_3.md`，以主队列实时依赖和 PR head 为准选择下一项。
-- 若用户批准上述 comment：发布、读回、把本文件和主队列更新为 `final closeout pass / work unit completed`，仅提交/推送这些文档，不再修改产品代码，然后停止并汇报。若未获批准：保持 `final closeout pending external comment`，已通过的 PR 和代码门禁不倒退。
+- 下一 Agent 先核 PR #197 最新 head、issue 状态、主队列和本文件，再按依赖选择下一 eligible WU；本次工作不推进它。用户继续保留 PR merge 权。
