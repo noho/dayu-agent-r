@@ -361,6 +361,10 @@ dayu-cli upload_filing --help
 dayu-cli upload_material --help
 ```
 
+上传材料时，`.json` 仅是 Docling 格式的 JSON 文档候选，`.xml/.xbrl` 仅是
+XBRL 财报实例文档候选；后缀符合要求不保证文件内容转换成功。当前支持的后缀清单
+以 `dayu-cli upload_material --help` 的即时输出为准。
+
 `upload_filing --files` 声明同一 filing 的文件集合，文件顺序不决定主文件角色。单文件
 filing 可以省略 `--primary`，省略时唯一文件就是 primary；多文件 filing 必须恰好提供
 一次 `--primary PATH`，且该路径必须精确匹配 `--files` 中的一个文件。除 primary 外的

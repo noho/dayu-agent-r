@@ -1671,6 +1671,16 @@ def test_upload_tool_calendar_year_schema_and_usage_messages_are_business_neutra
     assert "查询同一财报归档" in str(aliases_schema["description"])
     assert files_schema["description"] == FINS_UPLOAD_FORMAT_TEXT.upload_tool_files
     assert files_schema["maxItems"] == 100
+    expected_material_text = (
+        "后缀通过只表示具备转换资格，不保证文件内容转换成功。"
+        ".json 仅是 Docling 格式的 JSON 文档候选，不代表任意 JSON 内容可转换。"
+        ".xml/.xbrl 仅是 XBRL 财报实例文档候选，不代表任意 XML 或独立 linkbase 文件可转换。"
+        "delete 不得提供文件。"
+    )
+    assert expected_material_text in str(files_schema["description"])
+    assert f"upload_kind=material 时，{FINS_UPLOAD_FORMAT_TEXT.material_files}" in str(
+        files_schema["description"]
+    )
     assert primary_schema == {
         "type": "string",
         "description": FINS_UPLOAD_FORMAT_TEXT.upload_tool_primary,

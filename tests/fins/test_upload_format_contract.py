@@ -307,7 +307,10 @@ def test_text_projection_is_self_contained_and_uses_exact_suffix_order() -> None
     expected_material_text = (
         "auto/create/update 必须至少提供一个文件；"
         f"每个文件都必须使用转换器支持的后缀：{suffix_text}，并逐个实际转换成功；"
-        "后缀通过只表示具备转换资格，不保证文件内容转换成功。delete 不得提供文件。"
+        "后缀通过只表示具备转换资格，不保证文件内容转换成功。"
+        ".json 仅是 Docling 格式的 JSON 文档候选，不代表任意 JSON 内容可转换。"
+        ".xml/.xbrl 仅是 XBRL 财报实例文档候选，不代表任意 XML 或独立 linkbase 文件可转换。"
+        "delete 不得提供文件。"
     )
     expected_tool_text = (
         f"upload_kind=filing 时，{expected_filing_text}"
