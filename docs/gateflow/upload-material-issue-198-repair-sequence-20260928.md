@@ -8,14 +8,16 @@
 
 用户在 #198 closeout 后另行授权对 PR #197 当前完整 diff 做一轮 MiMo/ds-flash 同版并行审查，随后更新交接 prompt；审查快照 base `fac32ecbf`、head `2c1d0a71`，255 changed files。总控 artifact 为 `docs/gateflow/pr-197-full-review-adjudication-20260929.md`，最终 review 为 `docs/reviews/pr-197-review-20260930-003634.md`；它们与此前各 WU 局部 PR review 不是同一范围。两路结构化结果均有效，以下为总控独立裁决。新 repair 候选须在本表与总控 artifact 同步裁决，不因 #198 已 closeout 就丢失。
 
+**后续用户优先级裁决**：下一 Agent 先修复本轮 PR review 中成立的 `F2/F3/F4/F5/F6/F7`，按各自 owner/WU 走 Gateflow 并完成同版双路复审与总控 PR closeout，之后再推进下文既有 upload_material/其它 WU 队列。`F4/F6` 的 `deferred-with-owner` 是归属裁决，**不是允许跳过本轮修复**；`F1` 已拒绝，不修。所有修复代码与证据进 PR #197，用户手工 merge。
+
 | 审查项 | 直接观察与 owner | 当前状态 |
 | --- | --- | --- |
 | `PR197-R1/F1` | 生成上传脚本使用 PATH 的 `python`；未激活 venv、系统 Docling Core 低于 PR 声明下界时真实子进程 import 失败；README §1.1 已要求激活 venv，激活后 2128 tests passed；`python` 脚本选择在 base 已存在。 | 中／rejected-with-reason：失败环境不满足当前安装前置，PR 提升 Docling 下界是有意支持范围；不把脚本绑定绝对 `sys.executable`。 |
 | `PR197-R1/F2` | 新增 Fins 测试循环外读取循环内 `result`，总控用系统 pyright 1.1.408 在当前 PR checkout 独立复现 possibly unbound/exit1，当前隔离工具链报 0；测试/类型门禁 owner。 | 低／accepted／待修；交 gpt-6-sol 在 test owner 最小修，两版 pyright 复核。 |
 | `PR197-R1/F3` | 多个新增 utils 分析脚本固定操作者私有语料绝对路径和样例身份，缺样本根输入；仓库 PUBLIC、base 无同一路径，分析脚本输入 owner。 | 低／accepted／待修；参数化 current tree 不能消除已公开历史，历史级清除须另作决策，不在本轮改写历史。 |
-| `PR197-R1/F4` | HK identity resolver 每候选逐文档读 meta，accepted/sort/逐候选重复调用，含多次 publication guard；显式日期窗口可使候选数增长，下载身份与仓储批量读取 owner。 | 低／accepted／deferred-with-owner；独立 `fins-hk-download-identity-batch-read` WU，先定义存储层一致快照，不用跨发布 stale cache。 |
+| `PR197-R1/F4` | HK identity resolver 每候选逐文档读 meta，accepted/sort/逐候选重复调用，含多次 publication guard；显式日期窗口可使候选数增长，下载身份与仓储批量读取 owner。 | 低／accepted／deferred-with-owner；独立 `fins-hk-download-identity-batch-read` WU，本轮 PR findings 优先批次内修复；先定义存储层一致快照，不用跨发布 stale cache。 |
 | `PR197-R1/F5` | HK discovery 仅从本次远端公告批次推年度锚点，rebuild 从本地 COMPLETE 年度来源取锚点；窄窗口会静默丢掉长度型季度公告并报 missing。年度证据与财期投影 owner。 | 中／accepted／待独立 goal；`fins-hk-fiscal-anchor-consistency`，先统一受信锚点来源及无法判定时的公开 missing 语义，再让 Sol plan/双路 review。 |
-| `PR197-R1/F6` | RevisionConflict 在 public 侧归 EXECUTION、无专门 reason；#198 计划和回归明确将其作为未修复残余。 | 中／deferred-with-owner；关联已登记 `fins-download-storage-sibling-errors`，不重开 #198 或重算为本轮新增。 |
+| `PR197-R1/F6` | RevisionConflict 在 public 侧归 EXECUTION、无专门 reason；#198 计划和回归明确将其作为未修复残余。 | 中／deferred-with-owner；关联已登记 `fins-download-storage-sibling-errors`，本轮 PR findings 优先批次内修复；不重开 #198 或重算为本轮新增。 |
 | `PR197-R1/F7` | workflow 结果 status 的 `ok/cancelled/integrity_failed` 词表分散于 workflow 和 adapter 的私有常量，adapter 跨模块 import `_INTEGRITY_FAILED_STATUS`。 | 低／accepted／待独立 goal；`fins-download-status-contract-owner` 在 workflow→adapter 契约 owner 收敛词表，避免另造兼容转发。 |
 
 ds-flash 的 HK 年度锚点 Open Question 由 MiMo 与总控升为 F5；mismatch/rebuild 恢复并入 F5 的边界核对；macOS Intel 支持收缩有既有明确决策；`--overwrite` 刷新流程已有 README 说明；6-K 标题漏判在 base 已存在，若真实语料证明影响再另立 WU。总控独立验证：激活隔离 venv 的 22 个 changed Python test 文件 **2128 passed / 2 skipped**，当前 venv 模块 pyright 0，但系统 pyright 1.1.408 对 F2 报 1；首次未激活环境的脚本失败已归因为验证环境误配。全 PR `git diff --check` 另有一处 fixture 日志 EOF 空行（卫生项，非业务 finding）。本轮只审查、裁决与交接，未改产品代码；accepted 项尚未完成，**不得据此称 PR 已可合并**。
