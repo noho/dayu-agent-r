@@ -41,6 +41,7 @@ from dayu.fins.direct_events import (
     FINS_RESULT_EXIT_SUCCESS,
     FinsDownloadPublicDocument,
     FinsDownloadPublicSummary,
+    FinsDownloadFailureReason,
     FinsErrorKind,
     FinsEvent,
     FinsEventDetail,
@@ -116,6 +117,9 @@ from dayu.fins.storage import (
     FilingUploadStateRepositoryProtocol,
     ProcessedDocumentRepositoryProtocol,
     SourceDocumentRepositoryProtocol,
+    SourceIntegrityPreflightError,
+    SourceIntegrityPreflightReason,
+    SourceIntegrityRevisionConflictError,
     SourceIntegrityStatus,
 )
 from dayu.fins.pipelines.docling_upload_service import (
@@ -578,6 +582,34 @@ class FinsSourceDownloadAdapterResult:
     rejected_artifacts: tuple[FinsRejectedFilingDownloadArtifact, ...] = ()
     failed_count: int = 0
     persisted_summary: _FinsDownloadResultSummary | None = None
+
+
+class FinsSourceDownloadAdapterFailure(Exception):
+    """携带已验证文档摘要和原始封闭异常的 Fins 私有失败。"""
+
+    def __init__(
+        self,
+        cause: SourceIntegrityPreflightError | SourceIntegrityRevisionConflictError,
+        persisted_summary: _FinsDownloadResultSummary,
+    ) -> None:
+        """保存 source adapter 的失败快照。
+
+        Args:
+            cause: 原始完整性异常。
+            persisted_summary: 经 adapter 严格投影的已处理文档摘要。
+
+        Returns:
+            无。
+
+        Raises:
+            TypeError: 原异常不是封闭完整性类型时抛出。
+        """
+
+        if not isinstance(cause, SourceIntegrityPreflightError | SourceIntegrityRevisionConflictError):
+            raise TypeError("adapter failure cause must be a source integrity exception")
+        super().__init__("下载来源完整性中止")
+        self.cause = cause
+        self.persisted_summary = persisted_summary
 
 
 class FinsSourceDownloadAdapter(Protocol):
@@ -4304,17 +4336,20 @@ class FinsIngestionRuntime:
         try:
             producer(context)
         except Exception as exc:
+            cause = _download_exception_cause(exc)
             error_kind = _classify_direct_error(
-                exc,
+                cause,
                 operation_kind=context.direct_operation_kind,
             )
+            typed_summary = exc.persisted_summary if isinstance(exc, FinsSourceDownloadAdapterFailure) else None
             download_summary = (
                 None
                 if context.download_request is None
                 else _public_download_summary(
-                    _empty_download_summary_from_request(
-                        context.download_request,
-                        terminal_disposition=FinsDownloadTerminalDisposition.FAILED,
+                    typed_summary
+                    if typed_summary is not None
+                    else _empty_download_summary_from_request(
+                        context.download_request, terminal_disposition=FinsDownloadTerminalDisposition.FAILED
                     )
                 )
             )
@@ -4322,7 +4357,7 @@ class FinsIngestionRuntime:
                 None
                 if context.download_request is None
                 else _download_public_failure_from_exception(
-                    exc,
+                    cause,
                     request=context.download_request,
                 )
             )
@@ -4956,8 +4991,48 @@ class FinsIngestionRuntime:
             self._save_succeeded(latest, summary.to_json_summary())
         except _UnsupportedDownloadSourceError as exc:
             self._save_download_unsupported(job_id, request=request, message=str(exc))
+        except (FinsSourceDownloadAdapterFailure, SourceIntegrityPreflightError) as exc:
+            self._save_typed_download_failure(job_id, request=request, exc=exc)
         except Exception as exc:
             self._save_failed_from_exception(job_id, exc)
+
+    def _save_typed_download_failure(
+        self,
+        job_id: str,
+        *,
+        request: FinsDownloadRequest,
+        exc: FinsSourceDownloadAdapterFailure | SourceIntegrityPreflightError,
+    ) -> None:
+        """用与 direct 同源的安全失败及已验证摘要保存 typed job。
+
+        Args:
+            job_id: 后台任务标识。
+            request: 当前下载请求。
+            exc: 私有部分摘要或初始请求级预检失败。
+
+        Returns:
+            无。
+
+        Raises:
+            无。二次读写失败只记录固定安全事件。
+        """
+
+        cause = _download_exception_cause(exc)
+        failure = _download_public_failure_from_exception(cause, request=request)
+        summary = (
+            exc.persisted_summary
+            if isinstance(exc, FinsSourceDownloadAdapterFailure)
+            else _empty_download_summary_from_request(
+                request, terminal_disposition=FinsDownloadTerminalDisposition.FAILED
+            )
+        )
+        try:
+            record = self.job_store.read_job(job_id)
+            if record.status in _TERMINAL_STATUSES:
+                return
+            self._save_failed(record, message=failure.safe_message, result_summary=summary.to_json_summary())
+        except Exception:
+            _LOGGER.warning("fins.download.typed_failed_record_save_failed")
 
     def _run_upload_job(
         self,
@@ -5278,7 +5353,7 @@ class FinsIngestionRuntime:
         """执行单个下载请求。
 
         Args:
-            record: 已进入 running 的 job record。
+            context: 当前下载执行上下文。
             normalized: 已归一化 ticker。
             request: 下载请求。
 
@@ -5289,6 +5364,7 @@ class FinsIngestionRuntime:
             _UnsupportedDownloadSourceError: 没有匹配 adapter 时抛出。
             ValueError: adapter 返回字段非法时抛出。
             OSError: 仓储读取或写入失败时抛出。
+            FinsSourceDownloadAdapterFailure: adapter 已验证文档快照的封闭中止。
         """
 
         adapter = self._select_download_adapter(source=request.source.value, market=normalized.market)
@@ -5309,7 +5385,12 @@ class FinsIngestionRuntime:
             document_id=None,
             payload=_download_context_request_progress_payload(context, adapter_request),
         )
-        adapter_result = adapter.download(adapter_request)
+        try:
+            adapter_result = adapter.download(adapter_request)
+        except FinsSourceDownloadAdapterFailure as exc:
+            summary = _bounded_download_summary(exc.persisted_summary)
+            _validate_download_summary_request_identity(summary, request=request)
+            raise
         if adapter_result.persisted_summary is not None:
             if adapter_result.documents or adapter_result.rejected_artifacts:
                 raise ValueError("adapter persisted_summary 不得与 documents/rejected_artifacts 同时返回")
@@ -6820,6 +6901,30 @@ def _empty_download_summary_from_request(
     )
 
 
+_SOURCE_INTEGRITY_PUBLIC_REASONS: Final[Mapping[SourceIntegrityPreflightReason, FinsDownloadFailureReason]] = {
+    SourceIntegrityPreflightReason.MULTIPLE_REPAIR_REQUIRED: FinsDownloadFailureReason.MULTIPLE_REPAIR_REQUIRED,
+    SourceIntegrityPreflightReason.UNSELECTED_REPAIR_REQUIRED: FinsDownloadFailureReason.UNSELECTED_REPAIR_REQUIRED,
+    SourceIntegrityPreflightReason.SELECTED_REJECTED_REPAIR_REQUIRED: FinsDownloadFailureReason.SELECTED_REJECTED_REPAIR_REQUIRED,
+    SourceIntegrityPreflightReason.UNSAFE_PUBLICATION: FinsDownloadFailureReason.UNSAFE_PUBLICATION,
+}
+
+
+def _download_exception_cause(exc: Exception) -> Exception:
+    """在 Fins 边界唯一解出 adapter 持有的原始 typed cause。
+
+    Args:
+        exc: adapter 或 storage 抛出的异常。
+
+    Returns:
+        原始完整性异常；其它异常保持原对象。
+
+    Raises:
+        无。
+    """
+
+    return exc.cause if isinstance(exc, FinsSourceDownloadAdapterFailure) else exc
+
+
 def _download_public_failure_from_exception(
     exc: Exception,
     *,
@@ -6838,6 +6943,7 @@ def _download_public_failure_from_exception(
         ValueError: public failure contract 校验失败时抛出。
     """
 
+    exc = _download_exception_cause(exc)
     if isinstance(exc, FinsDownloadProviderError):
         kind = (
             FinsPublicFailureKind.CONFIGURATION
@@ -6859,6 +6965,15 @@ def _download_public_failure_from_exception(
             transport_category=exc.transport_category,
             safe_message=exc.safe_message,
             retry_hint=retry_hint,
+        )
+    if isinstance(exc, SourceIntegrityPreflightError):
+        return FinsPublicFailure(
+            kind=FinsPublicFailureKind.STORAGE,
+            source=request.source,
+            transport_category=None,
+            safe_message="本地来源完整性预检失败",
+            retry_hint="请检查并修复工作区来源状态后重试；重复下载不会自行修复。",
+            reason_code=_SOURCE_INTEGRITY_PUBLIC_REASONS[exc.reason],
         )
     if isinstance(exc, OSError):
         return FinsPublicFailure(
@@ -7061,10 +7176,11 @@ def _classify_direct_error(
         无。
     """
 
+    exc = _download_exception_cause(exc)
     if isinstance(exc, FinsDownloadProviderError):
         return FinsErrorKind.PROVIDER
     if operation_kind is FinsOperationKind.DOWNLOAD:
-        if isinstance(exc, OSError):
+        if isinstance(exc, OSError | SourceIntegrityPreflightError):
             return FinsErrorKind.STORAGE
         return FinsErrorKind.EXECUTION
     if isinstance(exc, _UnsupportedDownloadSourceError | ValueError | FileNotFoundError):

@@ -179,3 +179,133 @@ MiMo 同版 review `docs/reviews/plan-review-20260929-094111-issue198-s1-mimo.md
 **K-F1 接受并设为实现验收条件**：这是测试配方静默分支造成的可达性缺口，设计 contract 不受影响；必须用 fresh ticker、新 alias 或真实变更 profile 使 `stage_company_meta_for_cn_download` 返回非 `None`，在注入前断言意图存在，并由代码评审确认真实 `commit_batch` 与 `_validate_complete_source_tree` 到达。此项保留为未完成修复项直至实现和双路 code review 验证，不得因 plan pass 遗忘。
 
 双路同 SHA 复审均 pass-with-risks，所有 blocking plan finding 已闭合；**plan gate pass**，下一 entry 为 accepted plan commit。第十次 Sol 派发本身按失败协议记录，不把它算有效 agent 结果；总控对落盘计划独立核证并以两路有效复审作为计划 gate 证据。
+
+## S1 Sol 实施候选与待审方法偏差（2026-09-29）
+
+`issue198-s1-implement-sol-20260929-01` 在 HEAD `47a9cb64` 后结束，进程 exit0、JSONL `turn.completed`、canary `gpt-6-sol-551d1adc` 匹配；但结构化流含多条测试、pyright、查询及预期 CLI 业务失败 command exit1，stderr 另有一次 patch verification 失败，故严格 **agent_status=failed**，仅将 diff 与 `docs/gateflow/issue-198-s1-implementation-20260929.md` 作为候选。实施者还调用了被 sub-agents 进程管理协议禁止的 `ps`；命令因沙箱拒绝，不能作判活证据。总控须独立核验最终结果，不能采信其自述为 gate pass。
+
+候选最终自报 844 passed、六改动生产文件覆盖率 81/84/87/92/92/92%、pyright 0；总控正在独立复跑。K-F1 的 fresh ticker 非空 company intent 与真实 `commit_batch→_validate_complete_source_tree` 路径已写入测试，仍须代码审查复核。
+
+**CLI 方法偏差/验收缺口**：accepted plan 指定 2025-03-28 窄窗口先取得至少一个真实 filing；实测 exit0 但 `discovered=0`，因此这条具体 baseline 不通过。实施者改用 2024-01-01～2026-12-31 宽窗口，在同一 fresh base 取得 3 个真实 filing，再制造 filings 根目录非点号外来文件，真实 CLI 以预期 exit1 返回 `storage/unsafe_publication`、安全双流与修复后重试提示。宽窗口验证同一 whole-kind preflight 与公开投影，但不是原命令；总控裁决前保留“窄窗口未通过”事实，并让双路 code review 明确评价此替代证据是否足够证明 S1 目标。不能在实施记录中将预期业务 exit1 当生产失败，也不能将改窗口写成原 recipe 已通过。若需保持 exact 日期，先取得来源候选事实再补跑，不凭空假定外部来源有文档。
+
+总控独立复跑同一受影响八文件测试命令，exit0、**844 passed**；完整 `python -m pyright dayu/ tests/ utils/` exit0、**0 errors/0 warnings**。精确 14 文件 `git diff --binary` SHA-256 再算为 `f2766de5d4deb8ebfd922854892e575829d578bbd4faa2e03f38e0351239d448`，与 Sol 实施报告一致；其它脏 hunk 未并入本审查版本。Kimi/MiMo 已各自预检 `setup_status=ok`，对同一 digest 以独立 output/stderr/canary 派发 `$deepreview`，sessions `4235`/`28006` 正运行；两路未完成前 S1 代码 gate 不通过。
+
+总控另用 Sol 留存的最终 coverage 数据文件只读复算六改生产文件：`output.py` 81%、`direct_events.py` 84%、`ingestion_runtime.py` 87%、`cn_download_workflow.py` 92%、`cn_pipeline.py` 92%、`fins_wait_adapter.py` 92%，每文件均达到 80%；该数据的运行命令排除了两项 coverage 插桩敏感的取消时序测试，普通完整受影响 suite 已独立 844 passed，二者方法边界保持分列。Kimi code review session `4235` 后因提供方五小时额度 HTTP 403、进程 exit1/JSON `is_error=true`，无有效审查结果；MiMo 同 digest 仍运行。不得把 Kimi 早期工具调用或输出当第二路 gate pass。
+
+## S1 MiMo code review 裁决：revision conflict owner 断言
+
+MiMo `docs/reviews/code-review-issue198-s1-mimo-20260929.md` 对精确 14 文件 diff SHA `f2766de5d4deb8ebfd922854892e575829d578bbd4faa2e03f38e0351239d448` 审查完成：进程 exit0、JSON `subtype=success/is_error=false/terminal_reason=completed`、canary `mimo-189b8ac5` 与预检逐字匹配，stderr 仅白名单模型提示，`agent_status=completed`。独立复跑 844 passed、pyright0；结论 **fail，1 项中 finding**。总控沿 `cn_download_workflow.py:402` 的 post-repair 显式 `SourceIntegrityRevisionConflictError` → `CnDownloadAdapter.download` 包装 → runtime `_download_exception_cause` → `_download_public_failure_from_exception` 的 EXECUTION 兜底与 `persisted_summary` 消费路径核对，当前代码确会保留已确认文档并不造 `reason_code`；但现有 workflow 测试仅断言 cause/rows，runtime direct/job 没有锁定该组合，accepted plan S1 第 57 行明示「revision conflict 沿既有分类」。**F1 accepted，未修复**：仅补真实仓储/adapter/runtime 的 direct/job owner 级测试，断言 `EXECUTION`、`reason_code=None`、已确认文档终态/ID/计数守恒及 job 安全文案；不得改正确的生产映射或给 revision conflict 私造 public reason。若建立两 candidate 的真实 selected-source 前提不可达，先留直接证据停下，不用 fake 直接构造公共失败冒充端到端。
+
+MiMo 对窄 2025-03-28 CLI `discovered=0` 的事实判断成立；宽日期的真实 filing/whole-kind preflight/双流确与同一生产调用链同源，可证明 S1 行为，但不等于原计划那条 exact baseline 完成。总控将原日期前提登记为 **validation gap / 外部数据可用性**，后续尝试用实际发现 filing 的单日窗口补充窄窗口等价证据；在补证前不写「原命令通过」。代码 gate 仍因 F1 未修复、Kimi 第二路无效而 fail，下一 entry 为 Sol 仅补 F1 test+fix artifact，再对新 SHA 双路 re-review。
+
+总控后续只读查询一手定位该单日差异：巨潮对 `seDate=2025-03-28~2025-03-28` 的第一页返回 `totalRecordNum=0`，对 `2025-03-27~2025-03-29` 返回当天两条，其中完整年报一条。具体方法/原始双流和独立修复项 `fins-cninfo-single-day-discovery-window` 见 `docs/gateflow/issue-198-s1-cninfo-single-day-evidence-20260929.md`。总控用三天窗口在 fresh base 真实 CLI 完整发布 `discovered=downloaded=1`、仓储完整性 `complete` 且 manifest/primary 同源，随后只加合成外来文件，重跑按预期 exit1、`storage/unsafe_publication`、安全零摘要与双流/普通日志；外来文件移除后仓储读回仍 complete。该补证提供更窄且确有候选的同路径行为证据，**不**把原单日命令改写成通过；单日发现合同作为独立 WU。F1 及 Kimi re-review 仍是代码 gate 阻断。
+
+Sol F1 test fix `issue198-s1-review-f1-test-fix-sol-20260929-01` 进程 exit0、JSONL `turn.completed`、canary `gpt-6-sol-e1838ce7` 匹配、stderr 空，但一条 README `rg` 无匹配 exit1，按严格协议 `agent_status=failed`；实施者 fix artifact 误写「非零命令：无」，总控已在该 artifact 后附结构化纠正，不把 agent 自述当 gate pass。仅 `tests/fins/test_cn_download_runtime.py` 增 direct/job 参数化真实两来源测试，代码沿仓储二次分类→workflow revision conflict→adapter→runtime，断言既有 EXECUTION、`reason_code=None`、成功 repair 行/ID/计数与 job 安全文案。总控读代码确认没有手工公共结果，14 文件 diff SHA 从 `f2766de5...` 变为 `86aa9a2bdecdd4f9f817c555cf2eb94da668f9329a264428e192bf91f07b8cb5`；Sol 最终 846 passed、六生产文件 81–92%、pyright0。**F1 状态：部分修复，待 MiMo/Kimi 对新 SHA 的 code re-review**；在复审前不提交 S1。
+
+## MiMo F1 同版 re-review 候选与严格执行状态
+
+```yaml
+setup_status: ok
+agent_status: failed
+tool_evidence: yes
+canary_status: match
+warnings:
+  - "Claude stderr: [claude-code:unrecognized_model] mimo-v2.6-pro[1m]；精确白名单非致命诊断"
+retry_class: none
+```
+
+MiMo label `issue198-s1-f1-code-rereview-mimo-20260929-01`，显式绝对主 workspace、独立 JSON/stderr/canary，进程 exit0、JSON `subtype=success/is_error=false/stop_reason=end_turn`、59 turns、canary `mimo-b4b44e63` 匹配；review artifact `docs/reviews/code-review-20260929-123046.md` 已实读，锁 14 文件 diff SHA `86aa9a2b...`。其独立测试 2 focused/846 受影响 passed、pyright0，内容结论 pass、F1 真实 owner 链补测成立，三天 CLI 替代证据界限也正确。但 artifact 明列一条探索性 shell 的 `echo ====` 被 zsh 解析失败（非零命令）；按本轮 sub-agents 严格执行协议，**agent_status=failed**，不能把内容 pass 计有效 MiMo code gate。候选内容可供总控核读：F1 仅测试文件增量，真实仓储枚举→post-repair revision conflict→adapter→runtime direct/job，断言 EXECUTION/no reason、已确认行/ID/计数与 job 安全文案；原单日 CLI 命令仍未通过，归独立日期 WU。需同 SHA 新 label MiMo 修复性 re-review，Kimi 有效第二路仍缺；S1 不提交、不集成。
+
+## MiMo F1 同版修复性复审通过（2026-09-29）
+
+```yaml
+setup_status: ok
+agent_status: completed
+tool_evidence: yes
+canary_status: match
+warnings:
+  - "Claude stderr: [claude-code:unrecognized_model] mimo-v2.6-pro[1m]；精确白名单非致命诊断"
+retry_class: none
+```
+
+- 新 label `issue198-s1-f1-rereview2-mimo-20260929-01`，显式绝对主 workspace、独立 JSON/stderr/canary，进程 exit0、JSON `subtype=success/is_error=false/terminal_reason=completed`、57 turns、canary `mimo-1a992a96` 匹配。artifact `docs/reviews/code-review-20260929-131006.md` 锁 HEAD `47a9cb64e63780deb568a9e2c6fdd0120441cf2f` 与精确 14 文件 diff SHA `86aa9a2bdecdd4f9f817c555cf2eb94da668f9329a264428e192bf91f07b8cb5`，本轮全部 shell 命令本身 exit0。独立 focused 2 passed、受影响八文件 846 passed、pyright 0；结论 pass，无新增 finding。
+- 总控核对 F1 owner 测试及报告中的直接链：两个已发布 selected source 经真实 FS 仓储复核，post-repair 第二次枚举注入变更后取得真实 `REPAIR_REQUIRED`，workflow 的 revision conflict 经 adapter、runtime direct/job 映射为既有 `EXECUTION`、`reason_code=None`，保留已确认行/ID/计数并在 job 只给安全摘要。**F1 最终状态：已修复**，当前 S1 code review 有效 MiMo 一路通过；Kimi 对相同 SHA 的有效第二路仍缺，故 slice code gate 未通过、不得提交或汇入 PR #197。原单日 CNInfo recipe 仍未验证成功，独立日期 WU 待用户语义裁决；三天 CLI 只证明 typed 路径，不能替代该单日验收。
+
+## Kimi 同版 S1 复审状态
+
+```yaml
+setup_status: ok
+agent_status: failed
+tool_evidence: yes
+canary_status: match
+warnings: []
+retry_class: none
+```
+
+- Kimi `issue198-s1-final-kimi-20260929-01` 锁 HEAD `47a9cb64` 与精确 14 文件 diff SHA `86aa9a2b...`，JSONL `turn.completed`、canary `kimi-46f56d2f` 匹配；两条 shell 非零和一次 `apply_patch` 工具失败，且会话中断后 exec session 退出码无法回读，严格 `agent_status=failed`，不计有效第二路。`docs/reviews/code-review-20260929-164741.md` 内容判 pass、无新 finding；独立复跑八文件 846 passed、pyright0，真实 FS post-repair→adapter→direct/job 仍 `EXECUTION`/reason None、守恒摘要。总控按内容接受 F1 无回退的佐证，但 S1 code gate 仍未过、未提交/集成。单日 CNInfo recipe 仍归独立日期 WU。
+
+## Kimi Claude 同 SHA 修复性复审提供方失败
+
+```yaml
+setup_status: ok
+agent_status: failed
+tool_evidence: no
+canary_status: not_run
+warnings:
+  - "Claude stderr [claude-code:unrecognized_model] 精确白名单模型名提示"
+retry_class: provider
+```
+
+- `issue198-s1-final-kimi-claude-retry-20260929-01` 显式绝对主工作区、独立 JSON/stderr/canary，进程 exit1；JSON `is_error=true`、`terminal_reason=api_error`、`api_error_status=403`、最终提示 Kimi 五小时额度用尽。虽 24 turns，未形成可验收的最终 review/canary。MiMo 同 SHA pass 保持有效，但缺 Kimi 第二路，S1 code gate 仍未过，不提交/集成。额度恢复前不重派。
+- 用户明确授权 Kimi 额度不足时以 `ds-flash` 备份。总控按上述 HTTP403 切换，同一 14 文件 diff SHA `86aa9a2b...` 对 `issue198-s1-final-dsflash-backup-20260929-01` 预检 ok、显式绝对主 workspace、独立 JSON/stderr/canary 派发 session `90039`。MiMo 原同 SHA pass 保持；备份终态及同源代码结论收齐前仍不得宣布 code gate 通过或集成。
+
+## ds-flash 同版复审裁决：F2 待补测试
+
+- `issue198-s1-final-dsflash-backup-20260929-01` 进程 exit0，JSON `subtype=success/is_error=false/terminal_reason=completed`，canary `ds-flash-04e0a6bf` 匹配；stderr 仅模型名提示白名单。review `docs/reviews/code-review-20260929-190212.md` 锁同一 14 文件 diff SHA `86aa9a2bdecdd4f9f817c555cf2eb94da668f9329a264428e192bf91f07b8cb5`，独立复跑 846 tests、pyright0；内容 `fail`，提出 F2。总控实读 accepted plan 第 57 行和现有多候选测试，**接受 F2 中／未修复**：计划明定修复 mutation 后同请求重跑，证实前次已完成候选按完整来源 skip、未处理候选正常处理；现有测试均只执行中止前半程，不能证明恢复语义。仅在 `tests/fins/test_cn_download_runtime.py` 或真实 owner workflow 测试补同仓真实 FS/adapter direct 或 job 回归，不改已审通过的产品映射，不把前次未处理候选计为已处理。修后新 SHA 必须重新双路同版 code review；当前 S1 gate 不通过、不提交/集成。
+- 该 review 的 L1 双处 `integrity_failed` 私有常量属于同一状态事实重复，接受为低优先级 F3／未修复，归 `cn_pipeline`/`cn_download_workflow` 私有契约真源收敛，须避免跨层反向依赖；与 F2 一并交 Sol 评估最小改法并验证。L2～L4 import 顺序、docstring 风格、空行属于纯风格，不登记产品缺陷，也不阻断 gate。
+
+## F2/F3 Sol 修复候选与结构化裁决
+
+```yaml
+setup_status: ok
+agent_status: failed
+tool_evidence: yes
+canary_status: match
+warnings: []
+retry_class: none
+```
+
+- `issue198-s1-f2f3-sol-20260929-01` 显式绝对主 workspace、独立 JSONL/stderr/canary，进程 exit0、106 条 JSONL 可解析且 `turn.completed`、canary `gpt-6-sol-2b86f7f3` 匹配、stderr 空；一次中途 pyright exit1 的 `item.status=failed` 构成严格 agent 失败，虽随后修正并跑 846 passed/最终 pyright0，也不追认为有效实施 gate。仅采用经总控实读的内容候选。
+- 总控核 `tests/fins/test_cn_download_runtime.py` 新 direct/job 参数化真实 FS/adapter/runtime 回归：首候选原先发布、损坏后真实 repair，post-repair 第二次 inventory 注入外来文件导致 typed 中止；此时第二候选无目录、未调用传输；移除外来文件，以**同一 request 对象**重跑，首候选真实 row 为 skipped、第二候选 downloaded，计数 `discovered=2/downloaded=1/skipped=1/failed=0`，仅第二候选传输，两个来源完整。F2 内容候选已修。`cn_pipeline.py` 现在同向导入 workflow 私有 `_INTEGRITY_FAILED_STATUS`，已有 abort 类型/执行函数依赖方向不变；F3 内容候选已修。14 文件精确 diff SHA `f1e1a91557cda273c5d0b77900920381727322a8edea69d6061cda27f0f6bd21`，细证据与 README 判定见 `docs/gateflow/issue-198-s1-code-review-f2f3-fix-20260929.md`。新快照仍需 MiMo 与用户授权的 `ds-flash` 备份同版深审，未提交/集成。
+- 新 SHA `f1e1a915...` 的 `issue198-s1-final2-mimo-20260929-01` 与 `issue198-s1-final2-dsflash-backup-20260929-01` 均预检 `setup_status=ok`，显式绝对主 workspace、各自独立 JSON/stderr/canary 和不冲突的新 review artifact 路径，sessions `62380`/`48712` 并行在途。不得用 Sol 最终测试通过代替这两路内容裁决。
+
+## F2/F3 ds-flash 新快照复审结果
+
+```yaml
+setup_status: ok
+agent_status: failed
+tool_evidence: yes
+canary_status: match
+warnings:
+  - "Claude stderr [claude-code:unrecognized_model] 精确白名单模型名提示"
+retry_class: none
+```
+
+- `issue198-s1-final2-dsflash-backup-20260929-01` 进程 exit0、JSON `subtype=success/is_error=false/terminal_reason=completed`、canary `ds-flash-4a996352` 匹配、stderr 仅白名单提示；但 review `docs/reviews/code-review-issue198-s1-final2-dsflash-20260929.md` 自披露一条 glob 错误 `rg` exit1、两条预期无匹配 `rg` exit1 及两条反证内层 pytest exit1，违反本轮 prompt 所定“所有 shell 探索命令自身 exit0”，严格 **agent_status=failed**，不能计有效第二路。内容 pass-with-risks、无新阻断 finding；总控实读其 F2 同请求 direct/job 回归、F3 单一常量与旧 S1 输出均为可用旁证，不替代有效 code gate。MiMo 同 SHA session `62380` 在途；若 MiMo 有效且无新 finding，另用新 label 对相同 SHA 重派一条纯只读、零失败命令的备份复审。
+- 已基于明确的执行协议失败使用新 label 修复性重派 `issue198-s1-final3-dsflash-backup-20260929-01`，同一 SHA `f1e1a915...`、显式绝对主 workspace、独立 JSON/stderr/canary 与固定新 review artifact，preflight ok、session `84407` 在途；prompt 明确禁止故意失败 pytest/无匹配 rg。该次不并入旧失败审查的通过率，仍须收集结构化终态和总控内容裁决。
+
+## F2/F3 最终同快照双路代码审查裁决
+
+```yaml
+setup_status: ok
+agent_status: completed
+tool_evidence: yes
+canary_status: match
+warnings: ["[claude-code:unrecognized_model]"]
+retry_class: none
+```
+
+- MiMo `issue198-s1-final2-mimo-20260929-01` exit0、JSON success/60 turns、canary `mimo-aa24b3b3` 匹配，stderr 仅白名单提示；review `docs/reviews/code-review-issue198-s1-final2-mimo-20260929.md` 锁 HEAD `47a9cb64` 与精确 14 文件 diff SHA `f1e1a91557cda273c5d0b77900920381727322a8edea69d6061cda27f0f6bd21`，内容 pass-with-risks、无 blocker。自报本轮 shell 全部 exit0，独立 2 focused/846 affected passed、pyright0、六生产文件 coverage ≥80%、diff check0。
+- ds-flash 额度备份修复性复审 `issue198-s1-final3-dsflash-backup-20260929-01` exit0、JSON success/81 turns、canary `ds-flash-4d0d85f8` 匹配，stderr 仅白名单提示；review `docs/reviews/code-review-issue198-s1-final3-dsflash-20260929.md` 锁相同 HEAD/diff SHA，内容 pass-with-risks、无 blocker。其命令表及自报均为 exit0，独立 2 focused/846 affected passed、pyright0、diff check0。旧失败轮未追认。
+- 总控实读两份审查中的真实 FS→workflow→adapter→direct/job 回归：中止时已确认第一候选且第二候选未开始；清除外来 mutation 后**同一 request**重跑，第一候选依仓储 COMPLETE 跳过、第二候选下载且仅第二候选传输，durable byte/meta/完整性读回；F2/F3 成立。`integrity_failed` 只有 workflow 常量一处定义，pipeline 同向消费，无下游重算。review N1 指出 fix 记录漏写“替换旧用例”，已补到 fix artifact；不改代码快照。
+- N2 空行属于风格，不影响语义或测试；N3 typed job 投影构造范围是 accepted plan 已分类残余。ds-flash N4 `__all__` 不列显式跨模块导入符号没有行为影响，`__all__` 只管 wildcard import，当前不作为公共 contract；N5 内部 abort 文案当前无消费者，`cause` 是投影真源，若未来暴露 message 须由 owner 同源分类，当前不立无消费者修复项。N1 测试行数由 `FinsDownloadPublicSummary` 守恒 contract 蕴含，N2 job 摘要无逐行是既有公共上限；不为可读性做产品修补。三份 README 相邻另一 WU 点号元数据句**必须按行分开 stage**。S1 code review/re-review gate 通过，下一 gate 为只含 S1 的 accepted slice commit，之后 aggregate deepreview；S2/单日 WU 不因本 gate 通过而宣称完成。

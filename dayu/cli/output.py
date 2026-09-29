@@ -483,12 +483,14 @@ def _print_download_failure(failure: FinsPublicFailure, stream: TextIO) -> None:
     """
 
     transport = _EMPTY_CELL if failure.transport_category is None else failure.transport_category.value
+    reason = _EMPTY_CELL if failure.reason_code is None else failure.reason_code.value
     print(
         (
             "Fins failure detail: "
             f"classification={_bounded_json_text(failure.kind.value)} "
             f"source={_bounded_json_text(failure.source.value)} "
             f"transport={_bounded_json_text(transport)} "
+            f"reason_code={_bounded_json_text(reason)} "
             f"retry_hint={_bounded_json_text(failure.retry_hint)}"
         ),
         file=stream,

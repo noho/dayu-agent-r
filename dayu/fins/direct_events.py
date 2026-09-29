@@ -171,6 +171,15 @@ class FinsPublicFailureKind(str, Enum):
     EXECUTION = "execution"
 
 
+class FinsDownloadFailureReason(str, Enum):
+    """下载来源完整性预检的封闭公共失败原因。"""
+
+    MULTIPLE_REPAIR_REQUIRED = "multiple_repair_required"
+    UNSELECTED_REPAIR_REQUIRED = "unselected_repair_required"
+    SELECTED_REJECTED_REPAIR_REQUIRED = "selected_rejected_repair_required"
+    UNSAFE_PUBLICATION = "unsafe_publication"
+
+
 @dataclass(frozen=True, slots=True)
 class FinsPublicFailure:
     """下载 terminal 对 CLI 与 LLM 共享的脱敏失败对象。
@@ -181,6 +190,7 @@ class FinsPublicFailure:
         transport_category: provider/configuration 失败的 transport 分类。
         safe_message: 不含敏感 transport 内容的用户可读说明。
         retry_hint: 用户可读恢复建议。
+        reason_code: 下载来源预检的封闭公共原因；无细分原因时为空。
     """
 
     kind: FinsPublicFailureKind
@@ -188,6 +198,7 @@ class FinsPublicFailure:
     transport_category: FinsDownloadTransportCategory | None
     safe_message: str
     retry_hint: str
+    reason_code: FinsDownloadFailureReason | None = None
 
     def __post_init__(self) -> None:
         """校验 public failure 字段。
@@ -237,6 +248,11 @@ class FinsPublicFailure:
             max_chars=_MAX_MESSAGE_CHARS,
             allow_empty=False,
         )
+        if self.reason_code is not None:
+            if not isinstance(self.reason_code, FinsDownloadFailureReason):
+                raise TypeError("reason_code must be FinsDownloadFailureReason")
+            if self.kind is not FinsPublicFailureKind.STORAGE or self.transport_category is not None:
+                raise ValueError("reason_code requires storage failure without transport_category")
 
     def to_json_value(self) -> dict[str, JsonValue]:
         """转换为 CLI/wait 可共享的 JSON-compatible 业务字段。
@@ -254,6 +270,7 @@ class FinsPublicFailure:
             "transport_category": (None if self.transport_category is None else self.transport_category.value),
             "message": self.safe_message,
             "retry_hint": self.retry_hint,
+            "reason_code": None if self.reason_code is None else self.reason_code.value,
         }
 
 
@@ -661,8 +678,8 @@ class FinsResultSummary:
             if self.status is FinsResultStatus.FAILURE:
                 if self.failure is None:
                     raise ValueError("failed download result requires public failure")
-                if self.download.terminal_disposition is not FinsDownloadTerminalDisposition.FAILED:
-                    raise ValueError("failed download result requires failed disposition")
+                if self.download.terminal_disposition is FinsDownloadTerminalDisposition.CANCELLED:
+                    raise ValueError("failed download result cannot contain cancelled disposition")
             elif self.status is FinsResultStatus.CANCELLED:
                 if self.download.terminal_disposition is not FinsDownloadTerminalDisposition.CANCELLED:
                     raise ValueError("cancelled download result requires cancelled disposition")
@@ -1244,6 +1261,7 @@ __all__: tuple[str, ...] = (
     "FinsDirectStreamProtocolErrorKind",
     "FinsDownloadPublicDocument",
     "FinsDownloadPublicSummary",
+    "FinsDownloadFailureReason",
     "FinsErrorKind",
     "FinsEvent",
     "FinsEventDetail",

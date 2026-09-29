@@ -74,10 +74,12 @@ from dayu.fins.storage import (
     SourceIntegrityClassification,
     SourceIntegrityPreflightError,
     SourceIntegrityPreflightReason,
+    SourceIntegrityRevisionConflictError,
     SourceIntegrityReason,
     SourceIntegrityStatus,
 )
 from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
+from dayu.fins.storage._fs_identity import _FILING_IDENTITY_NAMESPACE, _identity_directory_path
 
 _PDF_BYTES = b"%PDF-1.7\n" + b"0" * 2048
 _DOCLING_BYTES = b'{"document": "ok"}'
@@ -2682,6 +2684,505 @@ def test_cn_top_level_repairs_selected_corruption_with_overwrite_false(
     ) as snapshot:
         with snapshot.get_primary_source().open() as stream:
             assert stream.read() == _DOCLING_BYTES
+
+
+def test_cn_phase_b_real_preflight_aborts_with_confirmed_prior_filing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """第二候选的真实 staged exact target UNSAFE 仅终止未提交文档并保留前一结果。
+
+    Args:
+        tmp_path: 独立真实仓储根。
+        monkeypatch: 在第二次 PDF 返回时放置未声明的真实文件。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: Phase B 未到达或已确认文档快照丢失时抛出。
+    """
+
+    first = _candidate(source_id="A1", fiscal_year=2024)
+    second = _candidate(source_id="A2", fiscal_year=2025)
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(first, second))
+    repositories = build_fs_repository_set(workspace_root=tmp_path)
+    batching = _BatchIdentityCnBatchingRepository(tmp_path, repositories)
+    pipeline = _build_pipeline(
+        tmp_path=tmp_path,
+        discovery=discovery,
+        converter=_FakeConverter(),
+        repository_set=repositories,
+        batching_repository=batching,
+    )
+    second_id, _ = build_cn_filing_ids(
+        ticker="600519", form_type="FY", fiscal_year=2025, fiscal_period="FY", amended=False
+    )
+    original_download = discovery.download_report_pdf
+    injected: list[Path] = []
+
+    def download_and_inject(candidate: CnReportCandidate) -> DownloadedReportAsset:
+        """在第二候选 Phase A 后创建 exact target 非点号未声明文件。
+
+        Args:
+            candidate: 当前 provider 候选。
+
+        Returns:
+            fake provider PDF 资产。
+
+        Raises:
+            OSError: 测试文件创建失败时抛出。
+        """
+
+        if candidate.source_id == second.source_id:
+            source_root = tmp_path / "portfolio" / "600519" / "filings"
+            assert source_root.is_dir()
+            target = _identity_directory_path(source_root, _FILING_IDENTITY_NAMESPACE, second_id)
+            assert not target.exists()
+            target.mkdir()
+            (target / "undeclared.bin").write_bytes(b"foreign")
+            injected.append(target)
+        return original_download(candidate)
+
+    monkeypatch.setattr(discovery, "download_report_pdf", download_and_inject)
+    events: list[DownloadEvent] = []
+
+    async def consume() -> None:
+        """在异常传播前保留真实事件序列。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            CnDownloadIntegrityAbort: workflow 的私有封闭中止。
+        """
+
+        async for event in pipeline.download_stream(
+            ticker="600519", form_type="FY", start_date="2024", end_date="2026",
+            overwrite=False, start_is_explicit=True,
+        ):
+            events.append(event)
+
+    with pytest.raises(_cn_download_workflow.CnDownloadIntegrityAbort) as exc_info:
+        asyncio.run(consume())
+    abort = exc_info.value
+    assert isinstance(abort.cause, SourceIntegrityPreflightError)
+    assert abort.cause.reason is SourceIntegrityPreflightReason.UNSAFE_PUBLICATION
+    assert abort.__cause__ is abort.cause
+    assert abort.result["status"] == "integrity_failed"
+    rows = abort.result["filings"]
+    assert isinstance(rows, list)
+    assert [row["status"] for row in rows if isinstance(row, dict)] == ["downloaded", "failed"]
+    assert isinstance(rows[1], dict)
+    assert rows[1]["reason_code"] == "source_integrity_preflight"
+    assert [event.event_type for event in events].count(DownloadEventType.FILING_FAILED) == 1
+    assert DownloadEventType.PIPELINE_COMPLETED not in [event.event_type for event in events]
+    assert batching.commit_calls == 2
+    assert batching.rollback_calls == 1
+    assert injected and injected[0].is_dir()
+    first_id, _ = build_cn_filing_ids(
+        ticker="600519", form_type="FY", fiscal_year=2024, fiscal_period="FY", amended=False
+    )
+    assert pipeline.source_repository.get_source_meta("600519", first_id, SourceKind.FILING)
+    with pytest.raises(ValueError, match="identity descriptor"):
+        pipeline.source_repository.get_source_meta("600519", second_id, SourceKind.FILING)
+
+
+def test_cn_post_repair_real_preflight_keeps_confirmed_repair_and_old_company(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """repair 已确认发布后真实 whole-kind 预检失败仍保留该 filing 与旧公司元数据。
+
+    Args:
+        tmp_path: 独立真实仓储根。
+        monkeypatch: 在 post-repair list 前放置非点号外来文件。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: repair、preflight 抛点或快照所有权漂移时抛出。
+    """
+
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(_candidate(),))
+    pipeline = _build_pipeline(tmp_path=tmp_path, discovery=discovery, converter=_FakeConverter())
+    _collect_events(pipeline, start_is_explicit=True)
+    candidate = _candidate()
+    document_id, _ = build_cn_filing_ids(
+        ticker="600519", form_type="FY", fiscal_year=candidate.fiscal_year,
+        fiscal_period="FY", amended=False,
+    )
+    locator = pipeline.source_repository.get_source_document_locator("600519", document_id, SourceKind.FILING)
+    pdf_path = tmp_path / locator / f"{document_id}.pdf"
+    original_pdf = pdf_path.read_bytes()
+    pdf_path.write_bytes(original_pdf + b"-repair-needed")
+    company_path = tmp_path / "portfolio" / "600519" / "meta.json"
+    old_company = company_path.read_bytes()
+    source = pipeline.source_repository
+    assert isinstance(source, FsSourceDocumentRepository)
+    real_list = source.list_source_integrity
+    calls: list[int] = []
+
+    def inject_before_post_repair(ticker: str) -> tuple[SourceIntegrityClassification, ...]:
+        """在第二次 whole-kind 枚举前让真实 classifier 看到 root 外来文件。
+
+        Args:
+            ticker: canonical ticker。
+
+        Returns:
+            真实仓储枚举结果。
+
+        Raises:
+            SourceIntegrityPreflightError: post-repair root 非法时透传。
+        """
+
+        calls.append(1)
+        if len(calls) == 2:
+            (tmp_path / "portfolio" / "600519" / "filings" / "foreign-after-repair.bin").write_bytes(b"foreign")
+        return real_list(ticker)
+
+    monkeypatch.setattr(source, "list_source_integrity", inject_before_post_repair)
+    events: list[DownloadEvent] = []
+
+    async def consume() -> None:
+        """观察 post-repair 中止之前的真实事件。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            CnDownloadIntegrityAbort: 已处理 filing 后的私有中止。
+        """
+
+        async for event in pipeline.download_stream(
+            ticker="600519", form_type="FY", start_date="2024", end_date="2026",
+            overwrite=False, start_is_explicit=True,
+        ):
+            events.append(event)
+
+    with pytest.raises(_cn_download_workflow.CnDownloadIntegrityAbort) as exc_info:
+        asyncio.run(consume())
+    abort = exc_info.value
+    assert len(calls) == 2
+    assert isinstance(abort.cause, SourceIntegrityPreflightError)
+    assert abort.cause.reason is SourceIntegrityPreflightReason.UNSAFE_PUBLICATION
+    rows = abort.result["filings"]
+    assert isinstance(rows, list) and len(rows) == 1
+    assert isinstance(rows[0], dict) and rows[0]["status"] == "downloaded"
+    assert abort.result["status"] == "integrity_failed"
+    assert pdf_path.read_bytes() == original_pdf
+    assert company_path.read_bytes() == old_company
+    assert DownloadEventType.FILING_FAILED not in [event.event_type for event in events]
+    assert DownloadEventType.PIPELINE_COMPLETED not in [event.event_type for event in events]
+
+
+def test_cn_post_repair_company_preswap_typed_spy_preserves_snapshot_and_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """company batch 的受控 pre-swap typed 只在后置调用点携带已确认 filing 快照。
+
+    Args:
+        tmp_path: 隔离真实仓储根。
+        monkeypatch: 在 company token 已 stage 后模拟 owner pre-swap typed。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 调用点、原异常链或旧发布字节漂移时抛出。
+    """
+
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(_candidate(),))
+    pipeline = _build_pipeline(tmp_path=tmp_path, discovery=discovery, converter=_FakeConverter())
+    _collect_events(pipeline, start_is_explicit=True)
+    document_id, _ = build_cn_filing_ids(
+        ticker="600519", form_type="FY", fiscal_year=2024, fiscal_period="FY", amended=False
+    )
+    locator = pipeline.source_repository.get_source_document_locator("600519", document_id, SourceKind.FILING)
+    pdf_path = tmp_path / locator / f"{document_id}.pdf"
+    original_pdf = pdf_path.read_bytes()
+    pdf_path.write_bytes(original_pdf + b"-repair-needed")
+    company_path = tmp_path / "portfolio" / "600519" / "meta.json"
+    old_company = company_path.read_bytes()
+    batching = pipeline.batching_repository
+    assert isinstance(batching, FsBatchingRepository)
+    core = batching._repository_set.core
+    original_commit = batching.commit_batch
+    cleanup_error = OSError("journal cleanup failed")
+    preflight_error = SourceIntegrityPreflightError(SourceIntegrityPreflightReason.UNSAFE_PUBLICATION)
+    preflight_error.__cause__ = cleanup_error
+    company_intents: list[bool] = []
+
+    def company_preswap_failure(batch: BatchToken) -> CompanyMetaCommitOutcome | None:
+        """真实 filing commit 后在 company intent 已 stage 的边界注入原 typed。
+
+        Args:
+            batch: 当前真实 batch token。
+
+        Returns:
+            普通 filing 委托真实 commit 的结果。
+
+        Raises:
+            SourceIntegrityPreflightError: company pre-swap 受控失败。
+        """
+
+        state = core._resolve_active_batch(batch, batch.ticker)
+        if state.company_meta_intent is not None:
+            company_intents.append(True)
+            batching.rollback_batch(batch)
+            raise preflight_error
+        return original_commit(batch)
+
+    monkeypatch.setattr(batching, "commit_batch", company_preswap_failure)
+
+    async def consume() -> None:
+        """运行同一 selected repair 到后置 company 失败边界。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            CnDownloadIntegrityAbort: 后置 typed 快照透传。
+        """
+
+        async for _event in pipeline.download_stream(
+            ticker="600519", form_type="FY", start_date="2024", end_date="2026",
+            overwrite=False, ticker_aliases=["600520"], start_is_explicit=True,
+        ):
+            pass
+
+    with pytest.raises(_cn_download_workflow.CnDownloadIntegrityAbort) as exc_info:
+        asyncio.run(consume())
+    abort = exc_info.value
+    assert company_intents == [True]
+    assert abort.cause is preflight_error
+    assert abort.cause.__cause__ is cleanup_error
+    rows = abort.result["filings"]
+    assert isinstance(rows, list) and len(rows) == 1
+    assert isinstance(rows[0], dict) and rows[0]["status"] == "downloaded"
+    assert pdf_path.read_bytes() == original_pdf
+    assert company_path.read_bytes() == old_company
+
+
+def test_cn_second_filing_real_commit_tree_preflight_keeps_first_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """第二候选真实 commit whole-tree 抛 typed 时第一份文档字节仍已确认。
+
+    Args:
+        tmp_path: 独立真实仓储根。
+        monkeypatch: 在第二候选 Phase A 后向 source root 放置外来文件。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 异常未到真实 commit 或已发布字节改变时抛出。
+    """
+
+    first = _candidate(source_id="A1", fiscal_year=2024)
+    second = _candidate(source_id="A2", fiscal_year=2025)
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(first, second))
+    repositories = build_fs_repository_set(workspace_root=tmp_path)
+    batching = _BatchIdentityCnBatchingRepository(tmp_path, repositories)
+    pipeline = _build_pipeline(
+        tmp_path=tmp_path, discovery=discovery, converter=_FakeConverter(),
+        repository_set=repositories, batching_repository=batching,
+    )
+    original_download = discovery.download_report_pdf
+    injected: list[Path] = []
+
+    def inject_root_on_second(candidate: CnReportCandidate) -> DownloadedReportAsset:
+        """让 Phase B exact-target 保持 MISSING，再由真实 commit 检查全树。
+
+        Args:
+            candidate: 当前候选。
+
+        Returns:
+            fake PDF 资产。
+
+        Raises:
+            OSError: root 文件创建失败时抛出。
+        """
+
+        if candidate.source_id == second.source_id:
+            root = tmp_path / "portfolio" / "600519" / "filings"
+            assert root.is_dir()
+            rogue = root / "foreign-at-commit.bin"
+            rogue.write_bytes(b"foreign")
+            injected.append(rogue)
+        return original_download(candidate)
+
+    monkeypatch.setattr(discovery, "download_report_pdf", inject_root_on_second)
+    first_id, _ = build_cn_filing_ids(
+        ticker="600519", form_type="FY", fiscal_year=2024, fiscal_period="FY", amended=False
+    )
+    second_id, _ = build_cn_filing_ids(
+        ticker="600519", form_type="FY", fiscal_year=2025, fiscal_period="FY", amended=False
+    )
+
+    with pytest.raises(_cn_download_workflow.CnDownloadIntegrityAbort) as exc_info:
+        _collect_events(pipeline, start_is_explicit=True)
+    abort = exc_info.value
+    assert injected
+    assert isinstance(abort.cause, SourceIntegrityPreflightError)
+    assert abort.cause.reason is SourceIntegrityPreflightReason.UNSAFE_PUBLICATION
+    assert batching.commit_calls == 3  # company、首候选、第二候选的真实 commit。
+    rows = abort.result["filings"]
+    assert isinstance(rows, list) and len(rows) == 2
+    assert isinstance(rows[0], dict) and rows[0]["status"] == "downloaded"
+    assert isinstance(rows[1], dict) and rows[1]["status"] == "failed"
+    locator = pipeline.source_repository.get_source_document_locator("600519", first_id, SourceKind.FILING)
+    assert (tmp_path / locator / f"{first_id}.pdf").read_bytes() == _PDF_BYTES
+    with pytest.raises(FileNotFoundError):
+        pipeline.source_repository.get_source_document_locator("600519", second_id, SourceKind.FILING)
+
+
+def test_cn_mid_filing_revision_conflict_injection_remains_ordinary_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """受控单 filing 冲突仅证明 workflow 宽 catch 继续候选的已知残余。
+
+    Args:
+        tmp_path: 独立仓储根。
+        monkeypatch: 在第一候选 Phase A owner 查询边界注入冲突。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 宽 catch 行为或第二候选处理发生变化时抛出。
+    """
+
+    discovery = _FakeDiscoveryClient(
+        temp_dir=tmp_path,
+        candidates=(_candidate(source_id="A1", fiscal_year=2024), _candidate(source_id="A2", fiscal_year=2025)),
+    )
+    pipeline = _build_pipeline(tmp_path=tmp_path, discovery=discovery, converter=_FakeConverter())
+    source = pipeline.source_repository
+    assert isinstance(source, FsSourceDocumentRepository)
+    real_classify = source.classify_source_integrity
+    injected: list[bool] = []
+
+    def first_phase_a_conflict(
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+    ) -> SourceIntegrityClassification:
+        """只在第一候选的单 filing Phase A 抛受控冲突。
+
+        Args:
+            ticker: 当前 ticker。
+            document_id: 当前候选 ID。
+            source_kind: 来源种类。
+
+        Returns:
+            其它调用的真实 owner 分类。
+
+        Raises:
+            SourceIntegrityRevisionConflictError: 首次调用的受控注入。
+        """
+
+        if not injected:
+            injected.append(True)
+            raise SourceIntegrityRevisionConflictError()
+        return real_classify(ticker, document_id, source_kind)
+
+    monkeypatch.setattr(source, "classify_source_integrity", first_phase_a_conflict)
+    result = _final_result(_collect_events(pipeline, start_is_explicit=True))
+    rows = result["filings"]
+    assert isinstance(rows, list) and len(rows) == 2
+    assert isinstance(rows[0], dict) and rows[0]["status"] == "failed"
+    assert rows[0]["reason_code"] == "filing_execution_failed"
+    assert isinstance(rows[1], dict) and rows[1]["status"] == "downloaded"
+    assert injected == [True]
+
+
+def test_cn_post_repair_real_second_selected_source_conflict_preserves_first_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """repair 后另一 selected source 真正变坏时显式 revision conflict 保留已确认行。
+
+    Args:
+        tmp_path: 独立真实仓储根。
+        monkeypatch: 在后置真实枚举前修改第二份已发布 PDF。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 后置 classifier、原异常或旧公司状态漂移时抛出。
+    """
+
+    discovery = _FakeDiscoveryClient(
+        temp_dir=tmp_path,
+        candidates=(_candidate(source_id="A1", fiscal_year=2024), _candidate(source_id="A2", fiscal_year=2025)),
+    )
+    pipeline = _build_pipeline(tmp_path=tmp_path, discovery=discovery, converter=_FakeConverter())
+    _collect_events(pipeline, start_is_explicit=True)
+    first_id, _ = build_cn_filing_ids(
+        ticker="600519", form_type="FY", fiscal_year=2024, fiscal_period="FY", amended=False
+    )
+    second_id, _ = build_cn_filing_ids(
+        ticker="600519", form_type="FY", fiscal_year=2025, fiscal_period="FY", amended=False
+    )
+    first_locator = pipeline.source_repository.get_source_document_locator("600519", first_id, SourceKind.FILING)
+    second_locator = pipeline.source_repository.get_source_document_locator("600519", second_id, SourceKind.FILING)
+    first_pdf = tmp_path / first_locator / f"{first_id}.pdf"
+    second_pdf = tmp_path / second_locator / f"{second_id}.pdf"
+    original_first = first_pdf.read_bytes()
+    first_pdf.write_bytes(original_first + b"-repair-needed")
+    company_path = tmp_path / "portfolio" / "600519" / "meta.json"
+    old_company = company_path.read_bytes()
+    source = pipeline.source_repository
+    assert isinstance(source, FsSourceDocumentRepository)
+    real_list = source.list_source_integrity
+    calls: list[int] = []
+
+    def second_source_changes_after_repair(ticker: str) -> tuple[SourceIntegrityClassification, ...]:
+        """第二次真实枚举前把另一 selected source 改为待修复。
+
+        Args:
+            ticker: canonical ticker。
+
+        Returns:
+            真实仓储的完整性 inventory。
+
+        Raises:
+            OSError: 文件变更或仓储读取失败时抛出。
+        """
+
+        calls.append(1)
+        if len(calls) == 2:
+            second_pdf.write_bytes(second_pdf.read_bytes() + b"-new-corruption")
+        return real_list(ticker)
+
+    monkeypatch.setattr(source, "list_source_integrity", second_source_changes_after_repair)
+    with pytest.raises(_cn_download_workflow.CnDownloadIntegrityAbort) as exc_info:
+        _collect_events(pipeline, start_is_explicit=True)
+    abort = exc_info.value
+    assert len(calls) == 2
+    assert isinstance(abort.cause, SourceIntegrityRevisionConflictError)
+    assert abort.__cause__ is abort.cause
+    rows = abort.result["filings"]
+    assert isinstance(rows, list) and len(rows) == 1
+    assert isinstance(rows[0], dict) and rows[0]["status"] == "downloaded"
+    assert first_pdf.read_bytes() == original_first
+    assert company_path.read_bytes() == old_company
 
 
 def test_cn_selected_repair_transport_failure_preserves_old_company_and_source(

@@ -46,13 +46,20 @@ from dayu.fins.domain.company_meta_contract import CompanyMetaCommitOutcome
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins import ingestion_runtime
 from dayu.fins.direct_events import (
+    FINS_RESULT_EXIT_FAILURE,
+    FINS_RESULT_EXIT_SUCCESS,
+    FinsDownloadPublicDocument,
+    FinsDownloadPublicSummary,
     canonicalize_fins_public_file_label,
+    FinsDownloadFailureReason,
     FinsErrorKind,
     FinsEvent,
     FinsEventType,
     FinsOperationKind,
+    FinsPublicFailure,
     FinsPublicFailureKind,
     FinsResultStatus,
+    FinsResultSummary,
     validate_fins_public_file_label,
 )
 from dayu.fins.direct_event_text import (
@@ -86,6 +93,7 @@ from dayu.fins.ingestion_events import (
 from dayu.fins.ingestion.observation_handle import (
     FinsObservationStatus,
 )
+from dayu.fins.storage import SourceIntegrityPreflightError, SourceIntegrityPreflightReason
 from dayu.fins.domain.document_models import (
     BatchToken,
     CompanyMeta,
@@ -6046,6 +6054,8 @@ async def test_direct_download_projects_typed_provider_failure_without_raw_cause
     assert result.download.terminal_disposition is FinsDownloadTerminalDisposition.FAILED
     assert result.failure is not None
     assert result.failure.transport_category is FinsDownloadTransportCategory.CONNECTION
+    assert result.failure.reason_code is None
+    assert result.failure.to_json_value()["reason_code"] is None
     serialized = str(result)
     assert "contact-canary" not in serialized
     assert "https://provider.invalid" not in serialized
@@ -6095,10 +6105,296 @@ async def test_direct_download_projects_storage_and_execution_without_raw_text(
     assert result.failure is not None
     assert result.failure.kind is expected_failure_kind
     assert result.failure.safe_message == expected_safe_message
+    assert result.failure.reason_code is None
+    assert result.failure.to_json_value()["reason_code"] is None
     serialized = str(result)
     assert "secret.invalid" not in serialized
     assert "contact-canary" not in serialized
     assert "/Users/private" not in serialized
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("storage_reason", "public_reason"),
+    [
+        (SourceIntegrityPreflightReason.MULTIPLE_REPAIR_REQUIRED, FinsDownloadFailureReason.MULTIPLE_REPAIR_REQUIRED),
+        (SourceIntegrityPreflightReason.UNSELECTED_REPAIR_REQUIRED, FinsDownloadFailureReason.UNSELECTED_REPAIR_REQUIRED),
+        (
+            SourceIntegrityPreflightReason.SELECTED_REJECTED_REPAIR_REQUIRED,
+            FinsDownloadFailureReason.SELECTED_REJECTED_REPAIR_REQUIRED,
+        ),
+        (SourceIntegrityPreflightReason.UNSAFE_PUBLICATION, FinsDownloadFailureReason.UNSAFE_PUBLICATION),
+    ],
+)
+async def test_direct_download_preserves_every_preflight_reason(
+    tmp_path: Path,
+    storage_reason: SourceIntegrityPreflightReason,
+    public_reason: FinsDownloadFailureReason,
+) -> None:
+    """四种来源预检原因均从唯一映射点进入安全公共失败。
+
+    Args:
+        tmp_path: 隔离工作区根目录。
+        storage_reason: storage owner 产生的预检原因。
+        public_reason: 对应的公共原因。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 分类、原因、提示或脱敏投影不符合契约时抛出。
+    """
+
+    assert set(ingestion_runtime._SOURCE_INTEGRITY_PUBLIC_REASONS) == set(SourceIntegrityPreflightReason)
+    assert set(ingestion_runtime._SOURCE_INTEGRITY_PUBLIC_REASONS.values()) == set(FinsDownloadFailureReason)
+    assert ingestion_runtime._SOURCE_INTEGRITY_PUBLIC_REASONS[storage_reason] is public_reason
+    assert storage_reason.value == public_reason.value
+    ingestion = _build_ingestion_runtime(
+        tmp_path / "fins-workspace",
+        executor=_HoldingExecutor(),
+        download_adapters={("sec", "US"): _OperationFailureDownloadAdapter(SourceIntegrityPreflightError(storage_reason))},
+    )
+    events = await _collect_direct_events(ingestion.download(build_fins_download_request(ticker="AAPL")))
+    result = events[-1].result
+    assert result is not None
+    assert result.error_kind is FinsErrorKind.STORAGE
+    assert result.failure is not None
+    assert result.failure.kind is FinsPublicFailureKind.STORAGE
+    assert result.failure.transport_category is None
+    assert result.failure.reason_code is public_reason
+    assert result.failure.to_json_value()["reason_code"] == public_reason.value
+    assert result.failure.safe_message == "本地来源完整性预检失败"
+    assert "检查并修复工作区来源状态" in result.failure.retry_hint
+    assert "重复下载不会自行修复" in result.failure.retry_hint
+    serialized = str(result.failure.to_json_value())
+    assert "https://" not in serialized
+    assert "/Users/" not in serialized
+
+
+def test_download_public_failure_rejects_open_or_non_storage_reason() -> None:
+    """公共失败契约拒绝宽松字符串及非 storage 原因。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法原因被接受时抛出。
+    """
+
+    with pytest.raises(TypeError, match="reason_code"):
+        FinsPublicFailure(
+            kind=FinsPublicFailureKind.STORAGE,
+            source=FinsDownloadSource.SEC,
+            transport_category=None,
+            safe_message="本地来源完整性预检失败",
+            retry_hint="请检查并修复工作区来源状态后重试。",
+            reason_code=cast(FinsDownloadFailureReason, "unsafe_publication"),
+        )
+    with pytest.raises(ValueError, match="reason_code"):
+        FinsPublicFailure(
+            kind=FinsPublicFailureKind.EXECUTION,
+            source=FinsDownloadSource.SEC,
+            transport_category=None,
+            safe_message="本地来源完整性预检失败",
+            retry_hint="请检查并修复工作区来源状态后重试。",
+            reason_code=FinsDownloadFailureReason.UNSAFE_PUBLICATION,
+        )
+
+
+def test_failed_operation_accepts_only_valid_processed_document_dispositions() -> None:
+    """整体失败与文档 FAILED/PARTIAL_FAILURE/SUCCEEDED 独立，取消与缺 failure 仍拒绝。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 组合校验越过文档或整体状态所有权时抛出。
+    """
+
+    failure = FinsPublicFailure(
+        kind=FinsPublicFailureKind.STORAGE,
+        source=FinsDownloadSource.SEC,
+        transport_category=None,
+        safe_message="本地来源完整性预检失败",
+        retry_hint="请检查并修复工作区来源状态后重试。",
+        reason_code=FinsDownloadFailureReason.UNSAFE_PUBLICATION,
+    )
+    zero = FinsDownloadPublicSummary(
+        source=FinsDownloadSource.SEC,
+        canonical_ticker="AAPL",
+        effective_filters=FinsDownloadEffectiveFilters(
+            form_types=(), start_date=None, end_date=None,
+            overwrite_existing=False, rebuild_local_artifacts=False,
+        ),
+        discovered_count=0,
+        downloaded_count=0,
+        skipped_count=0,
+        rejected_count=0,
+        failed_count=0,
+        document_rows=(),
+        missing_periods=(),
+        omitted_count=0,
+        terminal_disposition=FinsDownloadTerminalDisposition.FAILED,
+    )
+    downloaded = FinsDownloadPublicDocument(
+        document_id="fil-confirmed", form_or_period="10-K", filing_date=None,
+        report_date=None, covered_fiscal_periods=(),
+        disposition=FinsDownloadDocumentDisposition.DOWNLOADED,
+        reason_category=None, reason_message=None,
+        artifact_locator="portfolio/AAPL/filings/fil-confirmed",
+    )
+    failed = FinsDownloadPublicDocument(
+        document_id="fil-failed", form_or_period="10-K", filing_date=None,
+        report_date=None, covered_fiscal_periods=(),
+        disposition=FinsDownloadDocumentDisposition.FAILED,
+        reason_category="source_integrity_preflight", reason_message="财报来源未能完成该文档",
+        artifact_locator=None,
+    )
+    partial = replace(
+        zero,
+        discovered_count=2, downloaded_count=1, failed_count=1,
+        document_rows=(downloaded, failed),
+        terminal_disposition=FinsDownloadTerminalDisposition.PARTIAL_FAILURE,
+    )
+    succeeded = replace(
+        zero,
+        discovered_count=1, downloaded_count=1,
+        document_rows=(downloaded,),
+        terminal_disposition=FinsDownloadTerminalDisposition.SUCCEEDED,
+    )
+    for download in (zero, partial, succeeded):
+        result = FinsResultSummary(
+            status=FinsResultStatus.FAILURE,
+            exit_code=FINS_RESULT_EXIT_FAILURE,
+            title="下载失败",
+            details=(),
+            error_kind=FinsErrorKind.STORAGE,
+            error_message=failure.safe_message,
+            download=download,
+            failure=failure,
+        )
+        assert result.download is download
+        with pytest.raises(ValueError, match="requires public failure"):
+            replace(result, failure=None)
+        with pytest.raises(ValueError, match="only valid for FAILURE"):
+            replace(result, status=FinsResultStatus.SUCCESS, exit_code=FINS_RESULT_EXIT_SUCCESS)
+    with pytest.raises(ValueError, match="cannot contain cancelled disposition"):
+        replace(result, download=replace(zero, terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED))
+
+
+def test_initial_typed_download_job_saves_structured_zero_summary_and_safe_message(tmp_path: Path) -> None:
+    """初始完整性预检的后台失败与 direct 使用同一公共消息及请求级零摘要。
+
+    Args:
+        tmp_path: 隔离工作区根。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 结构化摘要或安全消息丢失时抛出。
+    """
+
+    executor = _HoldingExecutor()
+    ingestion = _build_ingestion_runtime(
+        tmp_path / "fins-workspace",
+        executor=executor,
+        download_adapters={
+            ("sec", "US"): _OperationFailureDownloadAdapter(
+                SourceIntegrityPreflightError(SourceIntegrityPreflightReason.UNSAFE_PUBLICATION)
+            )
+        },
+    )
+    request = build_fins_download_request(ticker="AAPL")
+    start = ingestion.start_download(request)
+    executor.run_all()
+    record = ingestion.read_job(start.job_id)
+    expected = ingestion_runtime._empty_download_summary_from_request(
+        request, terminal_disposition=FinsDownloadTerminalDisposition.FAILED
+    )
+    assert record.status is FinsIngestionJobStatus.FAILED
+    assert record.result_summary == expected.to_json_summary()
+    assert record.failure_summary["message"] == "本地来源完整性预检失败"
+
+
+class _SecretPathTokenError(Exception):
+    """包含可识别类名的测试二次保存异常。"""
+
+
+def test_typed_download_job_second_save_failure_logs_only_fixed_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """typed job 二次保存失败不暴露异常类名、原文、路径或 traceback。
+
+    Args:
+        tmp_path: 隔离工作区根。
+        monkeypatch: 定向注入 job 终态保存异常。
+        caplog: 捕获真实 logger 记录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 日志泄漏或 job 虚称已保存时抛出。
+    """
+
+    executor = _HoldingExecutor()
+    ingestion = _build_ingestion_runtime(
+        tmp_path / "fins-workspace",
+        executor=executor,
+        download_adapters={
+            ("sec", "US"): _OperationFailureDownloadAdapter(
+                SourceIntegrityPreflightError(SourceIntegrityPreflightReason.UNSAFE_PUBLICATION)
+            )
+        },
+    )
+
+    def fail_save(
+        record: FinsIngestionJobRecord,
+        *,
+        message: str,
+        result_summary: dict[str, JsonValue] | None = None,
+    ) -> FinsIngestionJobRecord:
+        """模拟二次持久化失败。
+
+        Args:
+            record: 仍处于 running 的任务。
+            message: 安全公共消息。
+            result_summary: 结构化失败摘要。
+
+        Returns:
+            永不返回。
+
+        Raises:
+            _SecretPathTokenError: 含私密路径的测试异常。
+        """
+
+        del record, message, result_summary
+        raise _SecretPathTokenError("/Users/private/contact-canary/secret-token")
+
+    monkeypatch.setattr(ingestion, "_save_failed", fail_save)
+    start = ingestion.start_download(build_fins_download_request(ticker="AAPL"))
+    with caplog.at_level(logging.WARNING, logger="dayu.fins.ingestion_runtime"):
+        executor.run_all()
+    record = ingestion.read_job(start.job_id)
+    assert record.status is FinsIngestionJobStatus.RUNNING
+    assert record.result_summary == {}
+    assert len(caplog.records) == 1
+    log_record = caplog.records[0]
+    assert log_record.getMessage() == "fins.download.typed_failed_record_save_failed"
+    assert log_record.exc_info is None
+    assert "error_type" not in log_record.__dict__
+    assert "_SecretPathTokenError" not in caplog.text
+    assert "contact-canary" not in caplog.text
+    assert "/Users/private" not in caplog.text
 
 
 @pytest.mark.parametrize(

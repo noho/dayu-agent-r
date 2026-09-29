@@ -27,6 +27,7 @@ from dayu.fins.direct_events import (
     FINS_RESULT_EXIT_SUCCESS,
     FinsDownloadPublicDocument,
     FinsDownloadPublicSummary,
+    FinsDownloadFailureReason,
     FinsEvent,
     FinsEventDetail,
     FinsEventType,
@@ -242,11 +243,12 @@ def test_fins_download_failure_projects_typed_rows_missing_periods_and_recovery(
         terminal_disposition=FinsDownloadTerminalDisposition.FAILED,
     )
     failure = FinsPublicFailure(
-        kind=FinsPublicFailureKind.EXECUTION,
+        kind=FinsPublicFailureKind.STORAGE,
         source=FinsDownloadSource.SEC,
         transport_category=None,
-        safe_message="下载执行失败",
-        retry_hint="请稍后重试",
+        safe_message="本地来源完整性预检失败",
+        retry_hint="请检查并修复工作区来源状态后重试",
+        reason_code=FinsDownloadFailureReason.UNSAFE_PUBLICATION,
     )
     event = FinsEvent(
         event_type=FinsEventType.RESULT,
@@ -262,7 +264,7 @@ def test_fins_download_failure_projects_typed_rows_missing_periods_and_recovery(
             exit_code=FINS_RESULT_EXIT_FAILURE,
             title="下载失败",
             details=(),
-            error_kind=FinsErrorKind.EXECUTION,
+            error_kind=FinsErrorKind.STORAGE,
             error_message=failure.safe_message,
             download=download,
             failure=failure,
@@ -278,8 +280,32 @@ def test_fins_download_failure_projects_typed_rows_missing_periods_and_recovery(
     assert 'reason_category="provider"' in output
     assert 'reason="来源暂时不可用"' in output
     assert 'Fins missing periods: "FY2024"' in output
-    assert 'classification="execution"' in output
-    assert 'retry_hint="请稍后重试"' in output
+    assert 'classification="storage"' in output
+    assert 'reason_code="unsafe_publication"' in output
+    assert failure.to_json_value()["reason_code"] == "unsafe_publication"
+    assert 'retry_hint="请检查并修复工作区来源状态后重试"' in output
+
+    execution_failure = FinsPublicFailure(
+        kind=FinsPublicFailureKind.EXECUTION,
+        source=FinsDownloadSource.SEC,
+        transport_category=None,
+        safe_message="下载执行失败",
+        retry_hint="请保存脱敏诊断并排查失败原因后重试。",
+    )
+    assert event.result is not None
+    execution_event = replace(
+        event,
+        result=replace(
+            event.result,
+            error_kind=FinsErrorKind.EXECUTION,
+            error_message=execution_failure.safe_message,
+            failure=execution_failure,
+        ),
+    )
+    execution_stderr = io.StringIO()
+    render_fins_direct_event(execution_event, stdout=io.StringIO(), stderr=execution_stderr)
+    assert 'classification="execution"' in execution_stderr.getvalue()
+    assert 'reason_code="-"' in execution_stderr.getvalue()
 
 
 def test_prompt_and_interactive_render_non_cancelled_terminal_matrix() -> None:

@@ -319,6 +319,7 @@ HK 的中期业绩可显示覆盖 H1，但不能代替独立中期报告消除 H
 下载、上传和预处理命令会显示执行进度及最终摘要。下载摘要包含规范 ticker、实际表单与
 日期窗口、overwrite/rebuild 状态，以及发现、下载、跳过、拒绝、失败和缺失期间信息；
 每个下载文档行还会显示来源声明的 `covered_fiscal_periods` 数组。
+下载显示 `classification="storage"`、`reason_code="unsafe_publication"` 时，请检查工作区来源状态并修复后重试；重复下载不会自行修复。
 下载期间按下 `Ctrl-C` 会请求协作取消并等待当前操作收口；取消终态使用规范退出码
 `130`，不会用内部取消原因替代用户可见摘要。财报保存在
 `<workspace>/portfolio/<规范 ticker>/`，例如 AAPL 对应

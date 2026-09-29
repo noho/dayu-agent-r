@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 
@@ -14,9 +15,20 @@ from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.fins.domain.document_models import FinsSourceProvider, ProcessedCreateRequest
+from dayu.fins.domain.document_models import BatchToken
+from dayu.fins.domain.company_meta_contract import CompanyMetaCommitOutcome
+from dayu.fins.direct_events import (
+    FinsDownloadFailureReason,
+    FinsErrorKind,
+    FinsEvent,
+    FinsEventType,
+    FinsPublicFailureKind,
+    FinsResultStatus,
+)
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.download_contract import (
     FinsDownloadDateRange,
+    FinsDownloadTerminalDisposition,
     FinsDownloadProviderError,
     FinsDownloadSource,
     FinsDownloadTransportCategory,
@@ -29,6 +41,10 @@ from dayu.fins.ingestion_runtime import (
     FinsSourceDownloadAdapterRequest,
     FsFinsIngestionJobStore,
 )
+from dayu.fins import ingestion_runtime as ingestion_runtime_module
+from dayu.fins.storage._fs_storage_infra import _ActiveBatchState
+from dayu.fins.storage._fs_identity import _FILING_IDENTITY_NAMESPACE, _identity_directory_path
+from dayu.fins.pipelines.cn_form_utils import build_cn_filing_ids
 from dayu.fins.pipelines.cn_download_models import (
     CnMarketKind,
     CnCompanyProfile,
@@ -59,6 +75,8 @@ from dayu.fins.storage import (
     FsFilingUploadStateRepository,
     FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
+    SourceIntegrityClassification,
+    SourceIntegrityStatus,
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
 from dayu.fins.ticker_normalization import Exchange, NormalizedTicker
@@ -818,6 +836,52 @@ def test_cn_adapter_rejects_legacy_failed_terminal_without_guessing_provider(
         )
 
 
+def test_cn_integrity_snapshot_has_separate_strict_projection_entry(tmp_path: Path) -> None:
+    """失败快照只经私有状态入口投影，普通 ok 入口与坏行仍严格拒绝。
+
+    Args:
+        tmp_path: 隔离 source 仓储根。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: status 或 row 校验被绕过时抛出。
+    """
+
+    result = _cn_projection_result([{
+        "document_id": "fil-failed",
+        "status": "failed",
+        "reason_code": "source_integrity_preflight",
+        "form_type": "FY",
+        "filing_date": "2025-04-01",
+        "report_date": None,
+        "covered_fiscal_periods": ["FY"],
+    }])
+    result["status"] = "integrity_failed"
+    repository = FsSourceDocumentRepository(tmp_path)
+    with pytest.raises(ValueError, match="status 未封闭"):
+        cn_pipeline_module._summary_from_pipeline_result(
+            result, request=_cn_projection_request(), source_repository=repository
+        )
+    summary = cn_pipeline_module._summary_from_integrity_abort(
+        result, request=_cn_projection_request(), source_repository=repository
+    )
+    assert summary.failed_count == 1
+    assert summary.discovered_count == 1
+    result["status"] = "ok"
+    with pytest.raises(ValueError, match="失败快照 status 未封闭"):
+        cn_pipeline_module._summary_from_integrity_abort(
+            result, request=_cn_projection_request(), source_repository=repository
+        )
+    result["status"] = "integrity_failed"
+    result["filings"] = [{"document_id": "fil-bad", "status": "downloaded"}]
+    with pytest.raises(ValueError):
+        cn_pipeline_module._summary_from_integrity_abort(
+            result, request=_cn_projection_request(), source_repository=repository
+        )
+
+
 @pytest.mark.parametrize("invalid_missing_periods", [None, "FY", [""]])
 def test_cn_rebuild_projection_requires_exact_missing_periods_field(
     tmp_path: Path,
@@ -1246,3 +1310,790 @@ def _build_runtime_repositories(tmp_path: Path) -> _RuntimeRepositorySet:
             repository_set=repository_set,
         ),
     )
+
+
+@pytest.mark.parametrize("entry", ("direct", "job"))
+def test_initial_company_commit_real_preswap_preflight_keeps_zero_request_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+) -> None:
+    """fresh company 意图经真实 commit 与 whole-tree 校验抛 typed，保持零候选请求事实。
+
+    Args:
+        tmp_path: 独立文件系统工作区。
+        monkeypatch: 只在真实提交前注入 staging 外来条目。
+        entry: direct 或后台 job 入口。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: company 意图、真实校验、pre-swap 或公开摘要不符时抛出。
+    """
+
+    runtime, discovery, _hk_discovery, _converter = _build_runtime_with_cn_hk_adapters(tmp_path)
+    adapter = runtime.download_adapters[(CN_DOWNLOAD_SOURCE, "CN")]
+    assert isinstance(adapter, CnDownloadAdapter)
+    batching = adapter._pipeline.batching_repository
+    assert isinstance(batching, FsBatchingRepository)
+    core = batching._repository_set.core
+    real_commit = batching.commit_batch
+    real_validate = core._validate_complete_source_tree
+    staged_intents: list[bool] = []
+    validation_visits: list[bool] = []
+    target_paths: list[Path] = []
+
+    def validate_real_tree(state: _ActiveBatchState) -> None:
+        """观察并委托真实 whole-tree 预检。
+
+        Args:
+            state: storage 当前活动 batch。
+
+        Returns:
+            无。
+
+        Raises:
+            SourceIntegrityPreflightError: 原 storage 校验拒绝外来条目时透传。
+        """
+
+        validation_visits.append(True)
+        real_validate(state)
+
+    def commit_with_staging_stray(batch: BatchToken) -> CompanyMetaCommitOutcome | None:
+        """确认 company mutation 已 stage 后把外来文件交给真实 commit。
+
+        Args:
+            batch: workflow 转交的真实批次。
+
+        Returns:
+            真实 commit 的结果。
+
+        Raises:
+            SourceIntegrityPreflightError: 真实 whole-tree 预检拒绝外来条目。
+        """
+
+        state = core._resolve_active_batch(batch, batch.ticker)
+        assert state.company_meta_intent is not None
+        staged_intents.append(True)
+        target_paths.append(state.target_ticker_dir)
+        source_root = state.staging_ticker_dir / "filings"
+        source_root.mkdir(parents=True, exist_ok=True)
+        (source_root / "undeclared-company.bin").write_bytes(b"foreign")
+        return real_commit(batch)
+
+    monkeypatch.setattr(core, "_validate_complete_source_tree", validate_real_tree)
+    monkeypatch.setattr(batching, "commit_batch", commit_with_staging_stray)
+    request = build_fins_download_request(
+        ticker="600519", form_types=("FY",), start="2025-01-01", end="2026-12-31"
+    )
+    if entry == "direct":
+        async def collect() -> list[FinsEvent]:
+            """收集真实 direct 流到唯一终态。
+
+            Args:
+                无。
+
+            Returns:
+                direct 事件列表。
+
+            Raises:
+                无。
+            """
+
+            return [event async for event in runtime.download(request)]
+
+        events = asyncio.run(collect())
+        results = [event.result for event in events if event.event_type is FinsEventType.RESULT]
+        assert len(results) == 1
+        result = results[0]
+        assert result is not None
+        assert result.status is FinsResultStatus.FAILURE
+        assert result.download is not None
+        assert result.download.terminal_disposition is FinsDownloadTerminalDisposition.FAILED
+        assert result.download.discovered_count == 0
+        assert result.download.document_rows == ()
+        assert result.failure is not None
+        assert result.failure.reason_code is FinsDownloadFailureReason.UNSAFE_PUBLICATION
+        assert result.failure.safe_message == "本地来源完整性预检失败"
+    else:
+        start = runtime.start_download(request)
+        record = runtime.read_job(start.job_id)
+        assert record.status is FinsIngestionJobStatus.FAILED
+        expected = ingestion_runtime_module._empty_download_summary_from_request(
+            request, terminal_disposition=FinsDownloadTerminalDisposition.FAILED
+        )
+        assert record.result_summary == expected.to_json_summary()
+        assert record.failure_summary["message"] == "本地来源完整性预检失败"
+    assert staged_intents == [True]
+    assert validation_visits == [True]
+    assert all(not path.exists() for path in target_paths)
+    assert discovery.download_calls == 0
+
+
+@pytest.mark.parametrize("entry", ("direct", "job"))
+def test_cn_real_phase_b_abort_keeps_published_document_in_result_and_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+) -> None:
+    """真实 CN adapter 在第二候选 Phase B typed 中止后保留第一份已发布文档。
+
+    Args:
+        tmp_path: 独立仓储根。
+        monkeypatch: 在第二候选下载回调放置未声明文件。
+        entry: direct 或后台 job 入口。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 已确认文档与失败投影不一致时抛出。
+    """
+
+    runtime, discovery, _hk_discovery, _converter = _build_runtime_with_cn_hk_adapters(tmp_path)
+    original_list = discovery.list_report_candidates
+    original_download = discovery.download_report_pdf
+    second_id, _ = build_cn_filing_ids(
+        ticker="600519", form_type="FY", fiscal_year=2024, fiscal_period="FY", amended=False
+    )
+    injected: list[Path] = []
+
+    def list_two(
+        query: CnReportQuery,
+        profile: CnCompanyProfile,
+        *,
+        cancellation_checkpoint: Callable[[], None] | None = None,
+    ) -> tuple[CnReportCandidate, ...]:
+        """返回两个不同文档 ID 的候选。
+
+        Args:
+            query: 来源查询。
+            profile: 公司 profile。
+            cancellation_checkpoint: 取消检查点。
+
+        Returns:
+            两个候选。
+
+        Raises:
+            无。
+        """
+
+        first = original_list(query, profile, cancellation_checkpoint=cancellation_checkpoint)[0]
+        return (first, replace(first, source_id="cn-runtime-b2", fiscal_year=2024, filing_date="2025-04-01"))
+
+    def download_second_with_stray(candidate: CnReportCandidate) -> DownloadedReportAsset:
+        """在第二候选 Phase A 后创建未发布 exact target。
+
+        Args:
+            candidate: 当前候选。
+
+        Returns:
+            fake PDF 资产。
+
+        Raises:
+            OSError: 文件创建失败时抛出。
+        """
+
+        if candidate.source_id == "cn-runtime-b2":
+            source_root = tmp_path / "workspace" / "portfolio" / "600519" / "filings"
+            assert source_root.is_dir()
+            target = _identity_directory_path(source_root, _FILING_IDENTITY_NAMESPACE, second_id)
+            assert not target.exists()
+            target.mkdir()
+            (target / "undeclared.bin").write_bytes(b"foreign")
+            injected.append(target)
+        return original_download(candidate)
+
+    monkeypatch.setattr(discovery, "list_report_candidates", list_two)
+    monkeypatch.setattr(discovery, "download_report_pdf", download_second_with_stray)
+    request = build_fins_download_request(
+        ticker="600519", form_types=("FY",), start="2025-01-01", end="2026-12-31"
+    )
+    if entry == "direct":
+        async def collect() -> list[FinsEvent]:
+            """收集 direct 流中的唯一失败终态。
+
+            Args:
+                无。
+
+            Returns:
+                direct 事件列表。
+
+            Raises:
+                无。
+            """
+
+            return [event async for event in runtime.download(request)]
+
+        events = asyncio.run(collect())
+        results = [event.result for event in events if event.event_type is FinsEventType.RESULT]
+        assert len(results) == 1
+        result = results[0]
+        assert result is not None
+        assert result.status is FinsResultStatus.FAILURE
+        assert result.download is not None
+        assert result.download.discovered_count == 2
+        assert result.download.downloaded_count == 1
+        assert result.download.failed_count == 1
+        assert result.download.terminal_disposition is FinsDownloadTerminalDisposition.PARTIAL_FAILURE
+        assert result.failure is not None
+        assert result.failure.reason_code is FinsDownloadFailureReason.UNSAFE_PUBLICATION
+    else:
+        start = runtime.start_download(request)
+        record = runtime.read_job(start.job_id)
+        assert record.status is FinsIngestionJobStatus.FAILED
+        assert record.result_summary["discovered_count"] == 2
+        assert record.result_summary["downloaded_count"] == 1
+        assert record.result_summary["failed_count"] == 1
+        assert record.result_summary["terminal_disposition"] == "partial_failure"
+        assert record.failure_summary["message"] == "本地来源完整性预检失败"
+    assert injected
+    first_id, _ = build_cn_filing_ids(
+        ticker="600519", form_type="FY", fiscal_year=2025, fiscal_period="FY", amended=False
+    )
+    assert runtime.source_repository.get_source_meta("600519", first_id, SourceKind.FILING)
+
+
+@pytest.mark.parametrize("entry", ("direct", "job"))
+def test_hk_real_commit_preflight_uses_same_partial_failure_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+) -> None:
+    """HK adapter 共享 CN workflow 的真实 commit typed 与 direct/job 文档守恒。
+
+    Args:
+        tmp_path: 独立仓储根。
+        monkeypatch: 在第二份 HK 候选 Phase A 后放置非点号 root 文件。
+        entry: direct 或后台 job 入口。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: HK 路由或已确认文档摘要不一致时抛出。
+    """
+
+    runtime, _cn_discovery, discovery, _converter = _build_runtime_with_cn_hk_adapters(tmp_path)
+    original_list = discovery.list_report_candidates
+    original_download = discovery.download_report_pdf
+    injected: list[Path] = []
+
+    def list_two(
+        query: CnReportQuery,
+        profile: CnCompanyProfile,
+        *,
+        cancellation_checkpoint: Callable[[], None] | None = None,
+    ) -> tuple[CnReportCandidate, ...]:
+        """给 HK 来源增加第二个不同年份的候选。
+
+        Args:
+            query: HK 来源查询。
+            profile: 公司 profile。
+            cancellation_checkpoint: 取消检查点。
+
+        Returns:
+            两个候选。
+
+        Raises:
+            无。
+        """
+
+        first = original_list(query, profile, cancellation_checkpoint=cancellation_checkpoint)[0]
+        return (first, replace(first, source_id="hk-runtime-b2", fiscal_year=2023, filing_date="2024-04-08"))
+
+    def root_stray_after_first(candidate: CnReportCandidate) -> DownloadedReportAsset:
+        """在第二次真实 commit 的 whole-tree 校验前创建 root 外来文件。
+
+        Args:
+            candidate: 当前 HK 候选。
+
+        Returns:
+            fake PDF 资产。
+
+        Raises:
+            OSError: 文件创建失败时抛出。
+        """
+
+        if candidate.source_id == "hk-runtime-b2":
+            root = tmp_path / "workspace" / "portfolio" / "0700" / "filings"
+            assert root.is_dir()
+            rogue = root / "foreign-hk-commit.bin"
+            rogue.write_bytes(b"foreign")
+            injected.append(rogue)
+        return original_download(candidate)
+
+    monkeypatch.setattr(discovery, "list_report_candidates", list_two)
+    monkeypatch.setattr(discovery, "download_report_pdf", root_stray_after_first)
+    request = build_fins_download_request(
+        ticker="0700", form_types=("FY",), start="2024-01-01", end="2026-12-31"
+    )
+    if entry == "direct":
+        async def collect() -> list[FinsEvent]:
+            """收集 HK direct 流。
+
+            Args:
+                无。
+
+            Returns:
+                direct 事件列表。
+
+            Raises:
+                无。
+            """
+
+            return [event async for event in runtime.download(request)]
+
+        events = asyncio.run(collect())
+        results = [event.result for event in events if event.event_type is FinsEventType.RESULT]
+        assert len(results) == 1
+        result = results[0]
+        assert result is not None and result.status is FinsResultStatus.FAILURE
+        assert result.download is not None
+        assert result.download.source is FinsDownloadSource.HKEXNEWS
+        assert result.download.terminal_disposition is FinsDownloadTerminalDisposition.PARTIAL_FAILURE
+        assert result.download.discovered_count == 2
+        assert result.download.downloaded_count == result.download.failed_count == 1
+        assert result.failure is not None
+        assert result.failure.reason_code is FinsDownloadFailureReason.UNSAFE_PUBLICATION
+        published_id = result.download.document_rows[0].document_id
+    else:
+        start = runtime.start_download(request)
+        record = runtime.read_job(start.job_id)
+        assert record.status is FinsIngestionJobStatus.FAILED
+        assert record.result_summary["terminal_disposition"] == "partial_failure"
+        assert record.result_summary["discovered_count"] == 2
+        assert record.result_summary["downloaded_count"] == record.result_summary["failed_count"] == 1
+        assert record.failure_summary["message"] == "本地来源完整性预检失败"
+        written_ids = record.result_summary["written_document_ids"]
+        assert isinstance(written_ids, list) and len(written_ids) == 1
+        published_id = str(written_ids[0])
+    assert injected
+    assert runtime.source_repository.get_source_meta("0700", published_id, SourceKind.FILING)
+
+
+@pytest.mark.parametrize("entry", ("direct", "job"))
+def test_cn_post_repair_abort_then_same_request_skips_complete_source_and_downloads_next(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+) -> None:
+    """真实 post-repair 中止后，同请求重跑跳过完整来源并处理此前未开始的候选。
+
+    Args:
+        tmp_path: 独立真实仓储根。
+        monkeypatch: 在 post-repair 枚举前放置 root 外来文件。
+        entry: direct 或后台 job 入口。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 文档发布、原公司字节或整体终态不一致时抛出。
+    """
+
+    runtime, discovery, _hk_discovery, _converter = _build_runtime_with_cn_hk_adapters(tmp_path)
+    request = build_fins_download_request(
+        ticker="600519", form_types=("FY",), start="2025-01-01", end="2026-12-31"
+    )
+    first = runtime.start_download(request)
+    published = runtime.read_job(first.job_id)
+    assert published.status is FinsIngestionJobStatus.SUCCEEDED
+    written_ids = published.result_summary["written_document_ids"]
+    assert isinstance(written_ids, list) and len(written_ids) == 1
+    document_id = str(written_ids[0])
+    second_id, _ = build_cn_filing_ids(
+        ticker="600519", form_type="FY", fiscal_year=2024, fiscal_period="FY", amended=False
+    )
+    original_candidates = discovery.list_report_candidates
+    original_download = discovery.download_report_pdf
+    downloaded_sources: list[str] = []
+
+    def list_two(
+        query: CnReportQuery,
+        profile: CnCompanyProfile,
+        *,
+        cancellation_checkpoint: Callable[[], None] | None = None,
+    ) -> tuple[CnReportCandidate, ...]:
+        """从中止请求起提供原候选及尚未发布的第二候选。
+
+        Args:
+            query: 来源查询。
+            profile: 公司资料。
+            cancellation_checkpoint: 取消检查点。
+
+        Returns:
+            两个不同财年的候选。
+
+        Raises:
+            无。
+        """
+
+        first_candidate = original_candidates(query, profile, cancellation_checkpoint=cancellation_checkpoint)[0]
+        return (
+            first_candidate,
+            replace(first_candidate, source_id="cn-runtime-b2", fiscal_year=2024, filing_date="2025-04-01"),
+        )
+
+    def record_download(candidate: CnReportCandidate) -> DownloadedReportAsset:
+        """观察真实 workflow 是否调用远端传输。
+
+        Args:
+            candidate: 待下载候选。
+
+        Returns:
+            fake transport 的 PDF 资产。
+
+        Raises:
+            无。
+        """
+
+        downloaded_sources.append(candidate.source_id)
+        return original_download(candidate)
+
+    monkeypatch.setattr(discovery, "list_report_candidates", list_two)
+    monkeypatch.setattr(discovery, "download_report_pdf", record_download)
+    locator = runtime.source_repository.get_source_document_locator("600519", document_id, SourceKind.FILING)
+    pdf_path = tmp_path / "workspace" / locator / f"{document_id}.pdf"
+    original_pdf = pdf_path.read_bytes()
+    pdf_path.write_bytes(original_pdf + b"-repair-needed")
+    source_root = tmp_path / "workspace" / "portfolio" / "600519" / "filings"
+    second_target = _identity_directory_path(source_root, _FILING_IDENTITY_NAMESPACE, second_id)
+    assert not second_target.exists()
+    company_path = tmp_path / "workspace" / "portfolio" / "600519" / "meta.json"
+    old_company = company_path.read_bytes()
+    source = runtime.source_repository
+    assert isinstance(source, FsSourceDocumentRepository)
+    original_list = source.list_source_integrity
+    calls: list[int] = []
+
+    def inject_post_repair(ticker: str) -> tuple[SourceIntegrityClassification, ...]:
+        """第二次真实 whole-kind 枚举前让 root 产生不可归属事实。
+
+        Args:
+            ticker: 当前 ticker。
+
+        Returns:
+            真实仓储 inventory。
+
+        Raises:
+            SourceIntegrityPreflightError: post-repair root 非法时透传。
+        """
+
+        calls.append(1)
+        if len(calls) == 2:
+            (tmp_path / "workspace" / "portfolio" / "600519" / "filings" / "foreign-post-repair.bin").write_bytes(
+                b"foreign"
+            )
+        return original_list(ticker)
+
+    monkeypatch.setattr(source, "list_source_integrity", inject_post_repair)
+    async def collect() -> list[FinsEvent]:
+        """收集同一请求在 direct 入口的事件。
+
+        Args:
+            无。
+
+        Returns:
+            direct 事件列表。
+
+        Raises:
+            无。
+        """
+
+        return [event async for event in runtime.download(request)]
+
+    if entry == "direct":
+        events = asyncio.run(collect())
+        results = [event.result for event in events if event.event_type is FinsEventType.RESULT]
+        assert len(results) == 1
+        result = results[0]
+        assert result is not None and result.status is FinsResultStatus.FAILURE
+        assert result.download is not None
+        assert result.download.terminal_disposition is FinsDownloadTerminalDisposition.SUCCEEDED
+        assert result.download.discovered_count == result.download.downloaded_count == 1
+        assert result.download.failed_count == 0
+        assert result.download.document_rows[0].document_id == document_id
+        assert result.failure is not None
+        assert result.failure.reason_code is FinsDownloadFailureReason.UNSAFE_PUBLICATION
+    else:
+        start = runtime.start_download(request)
+        record = runtime.read_job(start.job_id)
+        assert record.status is FinsIngestionJobStatus.FAILED
+        assert record.result_summary["terminal_disposition"] == "succeeded"
+        assert record.result_summary["discovered_count"] == record.result_summary["downloaded_count"] == 1
+        assert record.result_summary["failed_count"] == 0
+        assert record.result_summary["written_document_ids"] == [document_id]
+        assert record.failure_summary["message"] == "本地来源完整性预检失败"
+    assert len(calls) == 2
+    assert downloaded_sources == ["cn-runtime-a1"]
+    assert not second_target.exists()
+    assert pdf_path.read_bytes() == original_pdf
+    assert company_path.read_bytes() == old_company
+
+    # 只清除外来 mutation；同一 request 再经真实 adapter/runtime 与同仓 FS 执行。
+    (source_root / "foreign-post-repair.bin").unlink()
+    downloaded_sources.clear()
+    if entry == "direct":
+        retry_events = asyncio.run(collect())
+        retry_results = [event.result for event in retry_events if event.event_type is FinsEventType.RESULT]
+        assert len(retry_results) == 1
+        retry = retry_results[0]
+        assert retry is not None and retry.status is FinsResultStatus.SUCCESS
+        assert retry.download is not None
+        summary = retry.download
+        assert summary.terminal_disposition is FinsDownloadTerminalDisposition.SUCCEEDED
+        assert summary.discovered_count == 2
+        assert (summary.downloaded_count, summary.skipped_count, summary.rejected_count, summary.failed_count) == (
+            1, 1, 0, 0
+        )
+        assert [(row.document_id, row.disposition.value) for row in summary.document_rows] == [
+            (document_id, "skipped"), (second_id, "downloaded")
+        ]
+    else:
+        retry_start = runtime.start_download(request)
+        retry_record = runtime.read_job(retry_start.job_id)
+        assert retry_record.status is FinsIngestionJobStatus.SUCCEEDED
+        retry_summary = retry_record.result_summary
+        assert retry_summary["terminal_disposition"] == "succeeded"
+        assert retry_summary["discovered_count"] == 2
+        assert (
+            retry_summary["downloaded_count"], retry_summary["skipped_count"],
+            retry_summary["rejected_count"], retry_summary["failed_count"],
+        ) == (1, 1, 0, 0)
+        assert retry_summary["written_document_ids"] == [second_id]
+    assert downloaded_sources == ["cn-runtime-b2"]
+    assert pdf_path.read_bytes() == original_pdf
+    assert source.get_source_meta("600519", document_id, SourceKind.FILING)
+    assert source.get_source_meta("600519", second_id, SourceKind.FILING)
+    assert {item.document_id: item.status for item in original_list("600519")} == {
+        document_id: SourceIntegrityStatus.COMPLETE,
+        second_id: SourceIntegrityStatus.COMPLETE,
+    }
+
+
+@pytest.mark.parametrize("entry", ("direct", "job"))
+def test_cn_post_repair_real_second_source_revision_conflict_preserves_public_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+) -> None:
+    """第二 selected source 的真实 revision conflict 保留 repair 文档并沿既有执行分类投影。
+
+    Args:
+        tmp_path: 独立真实仓储根。
+        monkeypatch: 仅在 post-repair 真实枚举前改变第二来源的 PDF 字节。
+        entry: direct 或后台 job 入口。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 仓储分类、公共失败或已发布摘要不守恒时抛出。
+    """
+
+    runtime, discovery, _hk_discovery, _converter = _build_runtime_with_cn_hk_adapters(tmp_path)
+    original_candidates = discovery.list_report_candidates
+
+    def list_two(
+        query: CnReportQuery,
+        profile: CnCompanyProfile,
+        *,
+        cancellation_checkpoint: Callable[[], None] | None = None,
+    ) -> tuple[CnReportCandidate, ...]:
+        """返回两份身份财期不同且都会被选中的真实仓储候选。
+
+        Args:
+            query: 来源查询。
+            profile: 公司 profile。
+            cancellation_checkpoint: 取消检查点。
+
+        Returns:
+            2025 与 2024 年度报告候选。
+
+        Raises:
+            无。
+        """
+
+        first = original_candidates(query, profile, cancellation_checkpoint=cancellation_checkpoint)[0]
+        return (first, replace(first, source_id="cn-runtime-b2", fiscal_year=2024, filing_date="2025-04-01"))
+
+    monkeypatch.setattr(discovery, "list_report_candidates", list_two)
+    request = build_fins_download_request(
+        ticker="600519", form_types=("FY",), start="2025-01-01", end="2026-12-31"
+    )
+    first = runtime.start_download(request)
+    published = runtime.read_job(first.job_id)
+    assert published.status is FinsIngestionJobStatus.SUCCEEDED
+    initial_ids = published.result_summary["written_document_ids"]
+    assert isinstance(initial_ids, list) and len(initial_ids) == 2
+    repair_id, _ = build_cn_filing_ids(
+        ticker="600519", form_type="FY", fiscal_year=2025, fiscal_period="FY", amended=False
+    )
+    second_id, _ = build_cn_filing_ids(
+        ticker="600519", form_type="FY", fiscal_year=2024, fiscal_period="FY", amended=False
+    )
+    assert set(initial_ids) == {repair_id, second_id}
+    source = runtime.source_repository
+    assert isinstance(source, FsSourceDocumentRepository)
+    repair_locator = source.get_source_document_locator("600519", repair_id, SourceKind.FILING)
+    second_locator = source.get_source_document_locator("600519", second_id, SourceKind.FILING)
+    repair_pdf = tmp_path / "workspace" / repair_locator / f"{repair_id}.pdf"
+    second_pdf = tmp_path / "workspace" / second_locator / f"{second_id}.pdf"
+    original_repair = repair_pdf.read_bytes()
+    original_second = second_pdf.read_bytes()
+    repair_pdf.write_bytes(original_repair + b"-repair-needed")
+    company_path = tmp_path / "workspace" / "portfolio" / "600519" / "meta.json"
+    old_company = company_path.read_bytes()
+    real_list = source.list_source_integrity
+    calls: list[int] = []
+    second_statuses: list[SourceIntegrityStatus] = []
+
+    def second_source_changes_after_repair(ticker: str) -> tuple[SourceIntegrityClassification, ...]:
+        """post-repair 枚举前改变另一 selected source，并返回真实仓储分类。
+
+        Args:
+            ticker: 当前 canonical ticker。
+
+        Returns:
+            真实文件系统仓储的完整性 inventory。
+
+        Raises:
+            OSError: 文件变更或仓储读取失败时抛出。
+        """
+
+        calls.append(1)
+        if len(calls) == 2:
+            assert repair_pdf.read_bytes() == original_repair
+            second_pdf.write_bytes(original_second + b"-revision-changed")
+        inventory = real_list(ticker)
+        if len(calls) == 2:
+            second_statuses.extend(item.status for item in inventory if item.document_id == second_id)
+        return inventory
+
+    monkeypatch.setattr(source, "list_source_integrity", second_source_changes_after_repair)
+    if entry == "direct":
+        async def collect() -> list[FinsEvent]:
+            """收集真实 adapter/runtime 的 direct 终态。
+
+            Args:
+                无。
+
+            Returns:
+                direct 事件列表。
+
+            Raises:
+                无。
+            """
+
+            return [event async for event in runtime.download(request)]
+
+        events = asyncio.run(collect())
+        results = [event.result for event in events if event.event_type is FinsEventType.RESULT]
+        assert len(results) == 1
+        result = results[0]
+        assert result is not None and result.status is FinsResultStatus.FAILURE
+        assert result.error_kind is FinsErrorKind.EXECUTION
+        assert result.download is not None
+        assert result.download.terminal_disposition is FinsDownloadTerminalDisposition.SUCCEEDED
+        assert result.download.discovered_count == result.download.downloaded_count == 1
+        assert result.download.skipped_count == result.download.rejected_count == result.download.failed_count == 0
+        assert [row.document_id for row in result.download.document_rows] == [repair_id]
+        assert result.failure is not None
+        assert result.failure.kind is FinsPublicFailureKind.EXECUTION
+        assert result.failure.reason_code is None
+        assert result.failure.safe_message == "下载执行失败"
+        assert result.error_message == result.failure.safe_message
+    else:
+        start = runtime.start_download(request)
+        record = runtime.read_job(start.job_id)
+        assert record.status is FinsIngestionJobStatus.FAILED
+        assert record.result_summary["terminal_disposition"] == "succeeded"
+        assert record.result_summary["discovered_count"] == record.result_summary["downloaded_count"] == 1
+        assert record.result_summary["skipped_count"] == 0
+        assert record.result_summary["rejected_count"] == record.result_summary["failed_count"] == 0
+        assert record.result_summary["written_document_ids"] == [repair_id]
+        assert record.result_summary["omitted_written_document_count"] == 0
+        assert record.failure_summary == {"message": "下载执行失败"}
+    assert len(calls) == 2
+    assert second_statuses == [SourceIntegrityStatus.REPAIR_REQUIRED]
+    assert repair_pdf.read_bytes() == original_repair
+    assert second_pdf.read_bytes() == original_second + b"-revision-changed"
+    assert company_path.read_bytes() == old_company
+    assert source.get_source_meta("600519", repair_id, SourceKind.FILING)
+    assert source.get_source_meta("600519", second_id, SourceKind.FILING)
+
+
+@pytest.mark.parametrize("entry", ("direct", "job"))
+def test_cn_real_initial_whole_kind_preflight_uses_request_zero_summary(
+    tmp_path: Path,
+    entry: str,
+) -> None:
+    """真实已发布来源 root 外来文件在首候选前产生请求级 FAILED 零摘要。
+
+    Args:
+        tmp_path: 独立真实仓储根。
+        entry: direct 或后台 job 入口。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 初始 whole-kind typed 或公共零摘要漂移时抛出。
+    """
+
+    runtime, discovery, _hk_discovery, _converter = _build_runtime_with_cn_hk_adapters(tmp_path)
+    request = build_fins_download_request(
+        ticker="600519", form_types=("FY",), start="2025-01-01", end="2026-12-31"
+    )
+    first = runtime.start_download(request)
+    published = runtime.read_job(first.job_id)
+    assert published.status is FinsIngestionJobStatus.SUCCEEDED
+    written_ids = published.result_summary["written_document_ids"]
+    assert isinstance(written_ids, list) and len(written_ids) == 1
+    document_id = str(written_ids[0])
+    locator = runtime.source_repository.get_source_document_locator("600519", document_id, SourceKind.FILING)
+    pdf_path = tmp_path / "workspace" / locator / f"{document_id}.pdf"
+    old_pdf = pdf_path.read_bytes()
+    root = tmp_path / "workspace" / "portfolio" / "600519" / "filings"
+    (root / "foreign-before-candidates.bin").write_bytes(b"foreign")
+    previous_download_calls = discovery.download_calls
+    expected = ingestion_runtime_module._empty_download_summary_from_request(
+        request, terminal_disposition=FinsDownloadTerminalDisposition.FAILED
+    )
+    if entry == "direct":
+        async def collect() -> list[FinsEvent]:
+            """收集真实初始 whole-kind direct 失败。
+
+            Args:
+                无。
+
+            Returns:
+                direct 事件列表。
+
+            Raises:
+                无。
+            """
+
+            return [event async for event in runtime.download(request)]
+
+        events = asyncio.run(collect())
+        results = [event.result for event in events if event.event_type is FinsEventType.RESULT]
+        assert len(results) == 1
+        result = results[0]
+        assert result is not None and result.status is FinsResultStatus.FAILURE
+        assert result.download is not None
+        assert result.download.terminal_disposition is FinsDownloadTerminalDisposition.FAILED
+        assert result.download.discovered_count == 0 and result.download.document_rows == ()
+        assert result.failure is not None
+        assert result.failure.reason_code is FinsDownloadFailureReason.UNSAFE_PUBLICATION
+        assert result.failure.safe_message == "本地来源完整性预检失败"
+    else:
+        start = runtime.start_download(request)
+        record = runtime.read_job(start.job_id)
+        assert record.status is FinsIngestionJobStatus.FAILED
+        assert record.result_summary == expected.to_json_summary()
+        assert record.failure_summary["message"] == "本地来源完整性预检失败"
+    assert discovery.download_calls == previous_download_calls
+    assert pdf_path.read_bytes() == old_pdf
