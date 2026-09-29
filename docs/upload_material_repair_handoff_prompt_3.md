@@ -18,7 +18,18 @@ Issue：`https://github.com/noho/dayu-agent-r/issues/198`。已接受的 S1 修 
 
 ## 3. 新 Agent 的下一个入口
 
-#198 已通过 final closeout。用户已指示上一 Agent 到此停止；**新 Agent**接手后按主队列依赖顺序选择**下一个 eligible WU**，从该 WU 当前**下一个未完成 gate**继续，不回退已通过 gate，不把 plan 候选当产品修复。候选顺序要由当前依赖重新裁决：
+#198 已通过 final closeout。用户随后要求先对 **PR #197 完整 diff** 做一轮 MiMo/ds-flash 并行审查，再更新本 prompt；这轮已经完成并总控裁决，**没有在此轮修产品代码**。代码审查快照 base `fac32ecbf`、head `2c1d0a71`，全 PR 255 changed files/45 commits；两路原始 review 为 `docs/reviews/pr-197-review-20260930-002934.md` 与 `docs/reviews/pr-197-review-20260930-000803.md`，总控结论为 `docs/reviews/pr-197-review-20260930-003634.md`，逐项裁决为 `docs/gateflow/pr-197-full-review-adjudication-20260929.md`。它与 #198 已闭环的局部 PR review 是两件事。**总控结论：完整 PR 尚有 accepted finding，当前不是可合并验收状态；GitHub 的 MERGEABLE 只说明当时无 Git 冲突。**接手时先读上述 artifact、主队列开头的 `PR197-R1` 表，并在线核对新 PR head；不要把审查快照 head 当成此后文档提交的最新 head。
+
+下一步优先把本轮 review 的缺口变成 Gateflow 可审的修复，然后对最终同一 head 做两路复审；仍未闭环的独立 WU 按主队列依赖推进，不回退已通过 gate，不把 plan 候选当产品修复：
+
+1. `PR197-R1/F2`：test owner 的 `result` 循环外引用在 pyright 1.1.408 报 possibly-unbound。低风险，Sol 最小修测试后同时用 1.1.408 与项目 venv 模块版 pyright 复核。
+2. `PR197-R1/F3`：四个新增 `utils/` 分析脚本有硬编码私有绝对样本路径/身份。Sol 将样本根与清单改为显式输入并用临时样本核验；**普通提交无法抹去公开 PR 历史**，不能擅自 force push 或声称历史已清除。历史级处理如确有需要须另行裁决。
+3. `PR197-R1/F5`：HK discovery 与 rebuild 使用不同年度锚点证据；窄窗口可能把长度型季度公告静默丢弃并报 missing。先对独立 `fins-hk-fiscal-anchor-consistency` 做 goal confirmation，再由 Sol plan/implement/fix、MiMo/ds-flash 双路 review；owner 必须统一受信公司年度证据，明确并发/冲突与“有候选但证据不足”的公开语义，不能恢复“三个月直接猜 Q1”。这是本轮中等优先级语义 finding。
+4. `PR197-R1/F7`：`ok/cancelled/integrity_failed` workflow→adapter status 词表所有权分散；独立 `fins-download-status-contract-owner` goal 后在协议 owner 收敛，勿加兼容 re-export。低优先级，可结合相邻下载契约 WU 排序。
+5. `PR197-R1/F4`：HK identity O(S·D) 重复 meta/锁读取，已归 `fins-hk-download-identity-batch-read`。先由 storage owner 设计同一 publication guard 下的一致批量快照，不用跨发布 stale cache 局部修。
+6. `PR197-R1/F6`：RevisionConflict 的公开 EXECUTION 分类是真实残余，但 #198 plan/测试已明确归既有 `fins-download-storage-sibling-errors`，不是本轮新建 #198 回归。该 WU 要区分损坏需修复与并发冲突重试的安全 reason/hint。生成脚本 PATH 候选 `F1` 因未激活/不满足 Docling 依赖下界而 rejected-with-reason；不安排该项产品修复。
+
+本轮激活隔离 venv 的 22 个变更 Python test 文件 **2128 passed/2 skipped/3 warnings**；当前 venv `python -m pyright dayu/ tests/ utils/` 0 errors，但系统 pyright 1.1.408 对 F2 报 1。全 PR `git diff --check` 有 fixture `final-pyright.log` 一处 EOF 空行；后续编辑/合并前清理并复核。没有远端 CI checks、全仓 pytest、coverage 或真实外网 provider 验证。以上是锁定 `2c1d0a71` 的审查证据，任何修复 commit 后都要对新 head 重新验证。完成这些 PR 缺口后，再按主队列依赖顺序选择下一 eligible WU：
 
 - 点号元数据与 UM-O03 的闭环增量此前已在 PR #197；核实时以线上 commit 与 review artifact 为准，不重复实施。
 - O04/O23 统一资产规划与文件名→Docling 文件名函数是 O25 primary 选择的前置；隔离工作树和审查结果见主队列，已有候选修复/findings 不得漏掉。
@@ -29,7 +40,7 @@ Issue：`https://github.com/noho/dayu-agent-r/issues/198`。已接受的 S1 修 
 
 ## 4. 外部子 Agent 与门禁合同
 
-按用户指定：gpt-6-sol 负责 plan、implement、fix；MiMo 与 Kimi 做两路并行独立 review，Kimi 因额度不足失败时可用 ds-flash 备份。所有外部 runner 调用必须显式 `--cwd` 工作区**绝对路径**、每次唯一 label/instance、独立 output/stderr/last-message/canary；先 `sub-agent-preflight` 且 `setup_status=ok`，再以独立提权调用派发。总控检查 process exit、JSON/JSONL terminal、失败事件、stderr 白名单、canary 逐字匹配、工具成功证据及实际 artifact，自己裁决；代理自述不能代替 gate pass。只允许一次有理由的同 provider 修复性重试，再失败切换路线并登记。并行 review 用不同干净 worktree，不允许写冲突。
+按用户最新指定：gpt-6-sol 负责 plan、implement、fix；MiMo 与 ds-flash 做两路并行独立 review。所有外部 runner 调用必须显式 `--cwd` 工作区**绝对路径**、每次唯一 label/instance、独立 output/stderr/last-message/canary；先 `sub-agent-preflight` 且 `setup_status=ok`，再以独立提权调用派发。总控检查 process exit、JSON/JSONL terminal、失败事件、stderr 白名单、canary 逐字匹配、工具成功证据及实际 artifact，自己裁决；代理自述不能代替 gate pass。只允许一次有理由的同 provider 修复性重试，再失败切换路线并登记。并行 review 用不同干净 clone/worktree，不允许写冲突。
 
 每个 WU 按 Gateflow 的 goal→plan/双路 review→实施/双路 review→aggregate deepreview→draft PR 复审→final closeout 顺序推进；accepted finding 先 Sol 修复后同版双路复审。每次代码改动补测试、跑受影响 pytest 和全量 pyright，按根 `AGENTS.md` 判断 README 更新；单文件覆盖率目标 ≥80%。只 stage 当前 gate 授权路径，先 `git diff --cached --check`。所有闭环代码、评审证据和必要 handoff 文档进入同一个 PR #197；不要新开 PR、mark ready 或 merge，用户手工 merge。
 
