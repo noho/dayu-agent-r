@@ -589,12 +589,20 @@ def _completed_result_value(
     return value
 
 
+_DOWNLOAD_FAILURE_SCOPE_MESSAGE = "下载摘要只统计已处理文档；整体下载操作失败，请按失败原因和处理建议处理。"
+
+
 def _failure_message(result: FinsResultSummary) -> str:
     """提取模型可读失败说明。
 
-    :param result: terminal result summary。
-    :returns: 非空失败说明。
-    :raises ValueError: failed result 缺少业务可读失败说明时抛出。
+    Args:
+        result: 已验证的 Fins 终态摘要。
+
+    Returns:
+        非空的业务可读失败说明。
+
+    Raises:
+        ValueError: 下载失败缺少文档摘要，或结果缺少业务可读失败说明时抛出。
     """
 
     if result.failure is not None:
@@ -607,6 +615,7 @@ def _failure_message(result: FinsResultSummary) -> str:
                 "title": result.title,
                 "download": result.download.to_json_value(),
                 "failure": result.failure.to_json_value(),
+                "scope_note": _DOWNLOAD_FAILURE_SCOPE_MESSAGE,
             },
             ensure_ascii=False,
             sort_keys=True,

@@ -33,6 +33,7 @@ from dayu.fins.pipelines.cn_download_protocols import (
     CnReportDiscoveryClientProtocol,
 )
 from dayu.fins.pipelines.cn_form_utils import (
+    CnDownloadPeriodPolicy,
     PeriodDownloadWindow,
     resolve_period_windows,
     resolve_download_period_policy,
@@ -42,6 +43,7 @@ from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.storage import (
     SourceDocumentRepositoryProtocol,
     SelectedSourceRepairRequired,
+    SourceIntegrityPreflightError,
     SourceIntegrityRevisionConflictError,
     classify_source_integrity_preflight,
 )
@@ -49,6 +51,35 @@ from dayu.fins._log import Log
 from dayu.fins.ticker_normalization import ticker_to_company_id, try_normalize_ticker
 
 JsonObject: TypeAlias = dict[str, JsonValue]
+_INTEGRITY_FAILED_STATUS = "integrity_failed"
+_INTEGRITY_PREFLIGHT_REASON = "source_integrity_preflight"
+_INTEGRITY_PREFLIGHT_MESSAGE = "本地来源完整性预检失败"
+
+
+class CnDownloadIntegrityAbort(Exception):
+    """携带原始完整性异常及已处理文档快照的私有下载中止。"""
+
+    def __init__(
+        self,
+        cause: SourceIntegrityPreflightError | SourceIntegrityRevisionConflictError,
+        result: JsonObject,
+    ) -> None:
+        """保存同一 workflow owner 产生的失败事实。
+
+        Args:
+            cause: 原始完整性异常。
+            result: 已处理文档的私有失败快照。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        super().__init__(_INTEGRITY_PREFLIGHT_MESSAGE)
+        self.cause = cause
+        self.result = result
 
 
 async def run_cn_download_stream_impl(
@@ -88,6 +119,8 @@ async def run_cn_download_stream_impl(
     Raises:
         ValueError: ticker、form 或日期参数非法时抛出。
         OSError: 仓储读写失败时抛出。
+        SourceIntegrityPreflightError: 首候选前完整性预检失败时抛出。
+        CnDownloadIntegrityAbort: 已处理候选后的封闭完整性失败时抛出。
     """
 
     started_at = time.perf_counter()
@@ -308,6 +341,32 @@ async def run_cn_download_stream_impl(
                 notes.append("cancelled")
                 cancelled = True
                 break
+            except SourceIntegrityPreflightError as exc:
+                failed_item = _build_candidate_failed_result(
+                    document_id=document_id,
+                    candidate=candidate,
+                    reason_code=_INTEGRITY_PREFLIGHT_REASON,
+                    reason_message=_INTEGRITY_PREFLIGHT_MESSAGE,
+                )
+                filings.append(failed_item)
+                yield DownloadEvent(
+                    event_type=DownloadEventType.FILING_FAILED,
+                    ticker=normalized_ticker,
+                    document_id=document_id,
+                    payload=_filing_event_payload(failed_item),
+                )
+                raise _integrity_abort(
+                    cause=exc,
+                    started_at=started_at,
+                    pipeline_name=pipeline_name,
+                    ticker=normalized_ticker,
+                    company_info=company_info,
+                    filters=_download_filters(period_policy, period_windows, window.end_date, overwrite),
+                    warnings=warnings,
+                    notes=notes,
+                    filings=filings,
+                    missing_periods=missing_periods,
+                ) from exc
             except Exception as exc:
                 reason_code, reason_message = project_cn_filing_failure(exc)
                 failed_item = _build_candidate_failed_result(
@@ -333,25 +392,53 @@ async def run_cn_download_stream_impl(
                 if filing_terminal_status == "failed":
                     # 单 filing owner 已投影失败；repair gate 直接终止，company 保持旧值。
                     break
-                post_repair = classify_source_integrity_preflight(
-                    host.source_repository.list_source_integrity(normalized_ticker),
-                    accepted_filing_ids=accepted_filing_ids,
-                    rejected_filing_ids=frozenset(),
-                )
-                if isinstance(post_repair, SelectedSourceRepairRequired):
-                    raise SourceIntegrityRevisionConflictError
+                try:
+                    post_repair = classify_source_integrity_preflight(
+                        host.source_repository.list_source_integrity(normalized_ticker),
+                        accepted_filing_ids=accepted_filing_ids,
+                        rejected_filing_ids=frozenset(),
+                    )
+                    if isinstance(post_repair, SelectedSourceRepairRequired):
+                        raise SourceIntegrityRevisionConflictError
+                except (SourceIntegrityPreflightError, SourceIntegrityRevisionConflictError) as exc:
+                    raise _integrity_abort(
+                        cause=exc,
+                        started_at=started_at,
+                        pipeline_name=pipeline_name,
+                        ticker=normalized_ticker,
+                        company_info=company_info,
+                        filters=_download_filters(period_policy, period_windows, window.end_date, overwrite),
+                        warnings=warnings,
+                        notes=notes,
+                        filings=filings,
+                        missing_periods=missing_periods,
+                    ) from exc
                 _raise_if_cancelled(
                     module=module,
                     ticker=normalized_ticker,
                     document_id=document_id,
                     cancel_checker=cancel_checker,
                 )
-                _publish_cn_company_after_repair(
-                    host=host,
-                    profile=profile,
-                    normalized_ticker=normalized_ticker,
-                    ticker_aliases=ticker_aliases,
-                )
+                try:
+                    _publish_cn_company_after_repair(
+                        host=host,
+                        profile=profile,
+                        normalized_ticker=normalized_ticker,
+                        ticker_aliases=ticker_aliases,
+                    )
+                except SourceIntegrityPreflightError as exc:
+                    raise _integrity_abort(
+                        cause=exc,
+                        started_at=started_at,
+                        pipeline_name=pipeline_name,
+                        ticker=normalized_ticker,
+                        company_info=company_info,
+                        filters=_download_filters(period_policy, period_windows, window.end_date, overwrite),
+                        warnings=warnings,
+                        notes=notes,
+                        filings=filings,
+                        missing_periods=missing_periods,
+                    ) from exc
                 repair_gate_completed = True
     except CnDownloadCancelledError:
         notes.append("cancelled")
@@ -369,12 +456,7 @@ async def run_cn_download_stream_impl(
         status="cancelled" if final_cancelled else "ok",
         ticker=normalized_ticker,
         company_info=company_info,
-        filters={
-            "forms": list(period_policy.effective_periods),
-            "start_dates": {item.fiscal_period: item.start_date for item in period_windows},
-            "end_date": window.end_date,
-            "overwrite": overwrite,
-        },
+        filters=_download_filters(period_policy, period_windows, window.end_date, overwrite),
         warnings=warnings,
         notes=notes,
         filings=filings,
@@ -405,6 +487,85 @@ def _select_discovery_client(
     """按市场选择 discovery client。"""
 
     return host.cn_discovery_client if market == "CN" else host.hk_discovery_client
+
+
+def _download_filters(
+    period_policy: CnDownloadPeriodPolicy,
+    period_windows: tuple[PeriodDownloadWindow, ...],
+    end_date: str | None,
+    overwrite: bool,
+) -> JsonObject:
+    """从本次请求的有效期间与窗口构造唯一筛选快照。
+
+    Args:
+        period_policy: 已解析的财期策略。
+        period_windows: 已解析的分财期起点。
+        end_date: 已解析的窗口终点。
+        overwrite: 是否覆盖已存在文档。
+
+    Returns:
+        与正常及中止结果共用的筛选字段。
+
+    Raises:
+        无。
+    """
+
+    return {
+        "forms": list(period_policy.effective_periods),
+        "start_dates": {item.fiscal_period: item.start_date for item in period_windows},
+        "end_date": end_date,
+        "overwrite": overwrite,
+    }
+
+
+def _integrity_abort(
+    *,
+    cause: SourceIntegrityPreflightError | SourceIntegrityRevisionConflictError,
+    started_at: float,
+    pipeline_name: str,
+    ticker: str,
+    company_info: JsonObject,
+    filters: JsonObject,
+    warnings: list[str],
+    notes: list[str],
+    filings: list[JsonObject],
+    missing_periods: tuple[str, ...],
+) -> CnDownloadIntegrityAbort:
+    """仅从已处理 filing 真源冻结完整性中止快照。
+
+    Args:
+        cause: 原始封闭异常。
+        started_at: 工作流启动时刻。
+        pipeline_name: 当前来源管线名。
+        ticker: canonical ticker。
+        company_info: 已解析公司信息。
+        filters: 有效请求筛选条件。
+        warnings: 当前业务警告。
+        notes: 当前业务说明。
+        filings: 已确认终态 filing 列表。
+        missing_periods: 来源缺失财期。
+
+    Returns:
+        携带原异常和严格同源快照的私有中止。
+
+    Raises:
+        无。
+    """
+
+    summary = _build_summary(filings=filings, elapsed_ms=int((time.perf_counter() - started_at) * 1000))
+    result = _build_result(
+        pipeline_name=pipeline_name,
+        status=_INTEGRITY_FAILED_STATUS,
+        ticker=ticker,
+        company_info=company_info,
+        filters=filters,
+        warnings=warnings,
+        notes=notes,
+        filings=filings,
+        missing_periods=missing_periods,
+        summary=summary,
+    )
+    return CnDownloadIntegrityAbort(cause, result)
 
 
 def _publish_cn_company_after_repair(

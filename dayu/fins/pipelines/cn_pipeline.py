@@ -40,6 +40,7 @@ from dayu.fins.ingestion_runtime import (
     FinsDownloadProgressEvent,
     FinsDownloadProgressSink,
     FinsSourceDownloadAdapter,
+    FinsSourceDownloadAdapterFailure,
     FinsSourceDownloadAdapterRequest,
     FinsSourceDownloadAdapterResult,
     ValidatedFinsUploadFilingRequest,
@@ -54,7 +55,11 @@ from dayu.fins.pipelines.cn_download_pdf_gate import (
 from dayu.fins.pipelines.cn_download_protocols import (
     CnReportDiscoveryClientProtocol,
 )
-from dayu.fins.pipelines.cn_download_workflow import run_cn_download_stream_impl
+from dayu.fins.pipelines.cn_download_workflow import (
+    _INTEGRITY_FAILED_STATUS,
+    CnDownloadIntegrityAbort,
+    run_cn_download_stream_impl,
+)
 from dayu.fins.pipelines._filing_upload_fresh_validation import (
     resolve_fresh_filing_request,
 )
@@ -199,6 +204,7 @@ async def collect_cn_download_result_from_events(
 
     Raises:
         RuntimeError: 事件流未产生完成事件，或完成事件缺少结果时抛出。
+        CnDownloadIntegrityAbort: 工作流已有文档后遇到封闭完整性失败时透传。
     """
 
     async for event in events:
@@ -677,6 +683,8 @@ class CnPipeline:
         Raises:
             RuntimeError: 当前线程已有事件循环时抛出。
             ValueError: ticker 或过滤参数非法时抛出。
+            CnDownloadIntegrityAbort: 已处理文档后的完整性中止。
+            SourceIntegrityPreflightError: 首候选前的完整性预检失败。
         """
 
         return _run_async_download_sync(
@@ -726,6 +734,8 @@ class CnPipeline:
 
         Raises:
             ValueError: ticker 或过滤参数非法时抛出。
+            CnDownloadIntegrityAbort: 已处理文档后的完整性中止。
+            SourceIntegrityPreflightError: 首候选前的完整性预检失败。
         """
 
         pipeline_name = _pipeline_name_for_ticker(ticker)
@@ -1347,6 +1357,8 @@ class CnDownloadAdapter(FinsSourceDownloadAdapter):
         Raises:
             ValueError: ticker 市场或来源非法时抛出。
             RuntimeError: CN/HK 下载失败时抛出。
+            FinsSourceDownloadAdapterFailure: 已处理文档后的完整性中止。
+            SourceIntegrityPreflightError: 首候选前的完整性预检失败。
         """
 
         if request.normalized_ticker.market != self._market:
@@ -1356,21 +1368,29 @@ class CnDownloadAdapter(FinsSourceDownloadAdapter):
         expected_source = FinsDownloadSource.CNINFO if self._market == "CN" else FinsDownloadSource.HKEXNEWS
         if request.source is not expected_source:
             raise ValueError(f"CN/HK 下载来源不匹配: expected={expected_source.value} actual={request.source.value}")
-        result = _run_async_download_sync(
-            collect_cn_download_result_from_events(
-                self._pipeline.download_stream(
-                    ticker=request.normalized_ticker.canonical,
-                    form_type=_form_type_from_adapter_request(request.form_types),
-                    start_date=request.date_range.start_text,
-                    end_date=request.date_range.end_text,
-                    overwrite=request.overwrite_existing,
-                    rebuild=request.rebuild_local_artifacts,
-                    start_is_explicit=request.date_range.start_is_explicit,
-                    cancel_checker=request.cancellation_checker,
-                ),
-                progress_sink=request.progress_sink,
+        try:
+            result = _run_async_download_sync(
+                collect_cn_download_result_from_events(
+                    self._pipeline.download_stream(
+                        ticker=request.normalized_ticker.canonical,
+                        form_type=_form_type_from_adapter_request(request.form_types),
+                        start_date=request.date_range.start_text,
+                        end_date=request.date_range.end_text,
+                        overwrite=request.overwrite_existing,
+                        rebuild=request.rebuild_local_artifacts,
+                        start_is_explicit=request.date_range.start_is_explicit,
+                        cancel_checker=request.cancellation_checker,
+                    ),
+                    progress_sink=request.progress_sink,
+                )
             )
-        )
+        except CnDownloadIntegrityAbort as exc:
+            persisted_summary = _summary_from_integrity_abort(
+                exc.result,
+                request=request,
+                source_repository=self._pipeline.source_repository,
+            )
+            raise FinsSourceDownloadAdapterFailure(exc.cause, persisted_summary) from exc
         persisted_summary = _summary_from_pipeline_result(
             result,
             request=request,
@@ -1424,6 +1444,57 @@ def _summary_from_pipeline_result(
     status = _required_cn_text(result, "status")
     if status not in {_CN_TERMINAL_OK, _CN_TERMINAL_CANCELLED}:
         raise ValueError(f"CN/HK 下载结果 terminal status 未封闭: {status}")
+    return _project_cn_pipeline_summary(result, request=request, source_repository=source_repository)
+
+
+def _summary_from_integrity_abort(
+    result: Mapping[str, JsonValue],
+    *,
+    request: FinsSourceDownloadAdapterRequest,
+    source_repository: SourceDocumentRepositoryProtocol,
+) -> FinsDownloadResultSummary:
+    """严格验证私有失败状态后投影同一已处理文档快照。
+
+    Args:
+        result: workflow 给出的失败快照。
+        request: 原下载请求。
+        source_repository: 文档 locator 真源。
+
+    Returns:
+        已验证的持久文档摘要。
+
+    Raises:
+        ValueError: 状态或任何行、身份、筛选条件非法时抛出。
+        OSError: locator 查询失败时抛出。
+    """
+
+    status = _required_cn_text(result, "status")
+    if status != _INTEGRITY_FAILED_STATUS:
+        raise ValueError(f"CN/HK 完整性失败快照 status 未封闭: {status}")
+    return _project_cn_pipeline_summary(result, request=request, source_repository=source_repository)
+
+
+def _project_cn_pipeline_summary(
+    result: Mapping[str, JsonValue],
+    *,
+    request: FinsSourceDownloadAdapterRequest,
+    source_repository: SourceDocumentRepositoryProtocol,
+) -> FinsDownloadResultSummary:
+    """在各入口已验证 status 后复用唯一纯文档投影。
+
+    Args:
+        result: workflow 结果。
+        request: 原下载请求。
+        source_repository: 文档 locator 真源。
+
+    Returns:
+        已验证的持久文档摘要。
+
+    Raises:
+        ValueError: 行、身份或筛选条件非法时抛出。
+        OSError: locator 查询失败时抛出。
+    """
+
     ticker = _required_cn_text(result, "ticker")
     if ticker != request.normalized_ticker.canonical:
         raise ValueError("CN/HK 下载结果 ticker 与 typed request 不一致")

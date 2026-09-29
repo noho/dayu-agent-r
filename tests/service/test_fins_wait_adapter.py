@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -39,6 +39,7 @@ from dayu.service.fins_wait_adapter import (
     build_fins_wait_activation_registry,
     build_fins_wait_adapter_registry,
     _operation_kind_from_tool_name,
+    _failure_message,
 )
 from dayu.fins.company_metadata_warning import (
     COMPANY_NAME_IGNORED_WARNING_MESSAGE,
@@ -52,6 +53,7 @@ from dayu.fins.direct_events import (
     FinsErrorKind,
     FinsDownloadPublicDocument,
     FinsDownloadPublicSummary,
+    FinsDownloadFailureReason,
     FinsEventDetail,
     FinsOperationKind,
     FinsPublicFailure,
@@ -417,7 +419,6 @@ def test_fins_wait_adapter_projects_same_typed_download_object() -> None:
     assert "https://" not in serialized
     assert "/Users/" not in serialized
 
-
 def test_fins_wait_adapter_failure_contains_same_typed_download_and_failure() -> None:
     """失败 wait result 应序列化完整 download/failure，而非仅输出泛化错误。
 
@@ -439,29 +440,42 @@ def test_fins_wait_adapter_failure_contains_same_typed_download_and_failure() ->
             overwrite_existing=False,
             rebuild_local_artifacts=False,
         ),
-        discovered_count=0,
-        downloaded_count=0,
+        discovered_count=1,
+        downloaded_count=1,
         skipped_count=0,
         rejected_count=0,
         failed_count=0,
-        document_rows=(),
+        document_rows=(
+            FinsDownloadPublicDocument(
+                document_id="fil-confirmed",
+                form_or_period="10-K",
+                filing_date=None,
+                report_date=None,
+                covered_fiscal_periods=(),
+                disposition=FinsDownloadDocumentDisposition.DOWNLOADED,
+                reason_category=None,
+                reason_message=None,
+                artifact_locator="portfolio/AAPL/filings/fil-confirmed",
+            ),
+        ),
         missing_periods=(),
         omitted_count=0,
-        terminal_disposition=FinsDownloadTerminalDisposition.FAILED,
+        terminal_disposition=FinsDownloadTerminalDisposition.SUCCEEDED,
     )
     failure = FinsPublicFailure(
-        kind=FinsPublicFailureKind.PROVIDER_TRANSPORT,
+        kind=FinsPublicFailureKind.STORAGE,
         source=FinsDownloadSource.SEC,
-        transport_category=FinsDownloadTransportCategory.CONNECTION,
-        safe_message="无法连接 SEC 来源",
-        retry_hint="请稍后重试；若持续失败，请检查来源服务状态。",
+        transport_category=None,
+        safe_message="本地来源完整性预检失败",
+        retry_hint="请检查并修复工作区来源状态后重试；重复下载不会自行修复。",
+        reason_code=FinsDownloadFailureReason.UNSAFE_PUBLICATION,
     )
     result = FinsResultSummary(
         status=FinsResultStatus.FAILURE,
         exit_code=FINS_RESULT_EXIT_FAILURE,
         title="下载失败",
         details=(),
-        error_kind=FinsErrorKind.PROVIDER,
+        error_kind=FinsErrorKind.STORAGE,
         error_message=failure.safe_message,
         download=download,
         failure=failure,
@@ -485,12 +499,39 @@ def test_fins_wait_adapter_failure_contains_same_typed_download_and_failure() ->
     assert isinstance(poll.outcome, ResolveWaitFailedOutcome)
     message_value = json.loads(poll.outcome.result.message)
     assert isinstance(message_value, Mapping)
+    assert message_value["status"] == "failure"
     assert message_value["download"] == download.to_json_value()
     assert message_value["failure"] == failure.to_json_value()
+    assert message_value["scope_note"] == "下载摘要只统计已处理文档；整体下载操作失败，请按失败原因和处理建议处理。"
+    download_value = message_value["download"]
+    assert isinstance(download_value, Mapping)
+    assert download_value["terminal_disposition"] == "succeeded"
+    failure_value = message_value["failure"]
+    assert isinstance(failure_value, Mapping)
+    assert failure_value["reason_code"] == "unsafe_publication"
+    assert failure_value["message"] == "本地来源完整性预检失败"
+    assert failure_value["retry_hint"] == "请检查并修复工作区来源状态后重试；重复下载不会自行修复。"
     assert poll.outcome.result.hint == failure.retry_hint
     serialized = str(message_value)
     assert "https://" not in serialized
     assert "/Users/" not in serialized
+
+    # 跨操作结果允许无 download；下载 wait 投影仍必须拒绝缺摘要的失败帧。
+    without_download = replace(result, download=None)
+    with pytest.raises(ValueError, match="typed download failure must contain download summary"):
+        _failure_message(without_download)
+    revision_failure = replace(
+        failure,
+        kind=FinsPublicFailureKind.EXECUTION,
+        safe_message="下载执行失败",
+        retry_hint="请排查失败原因后重试。",
+        reason_code=None,
+    )
+    revision_message = json.loads(
+        _failure_message(replace(result, failure=revision_failure, error_kind=FinsErrorKind.EXECUTION))
+    )
+    assert revision_message["failure"]["reason_code"] is None
+    assert revision_message["scope_note"] == "下载摘要只统计已处理文档；整体下载操作失败，请按失败原因和处理建议处理。"
 
 
 def test_fins_wait_poll_adapter_rejects_failed_result_without_message() -> None:
