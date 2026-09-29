@@ -3086,12 +3086,12 @@ def test_stream_failure_propagates_to_cli_error(
     assert service.closed_streams == 1
 
 
-def test_unknown_fins_direct_failure_logs_traceback_and_hides_exception_from_stderr(
+def test_unknown_download_command_logs_safe_trace_and_hides_exception_from_stderr(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """未知 direct 异常只进入 operator traceback，普通 stderr 使用固定文案。
+    """未知 download 外层异常只记录安全诊断，普通 stderr 使用固定文案。
 
     Args:
         monkeypatch: direct async 主流程异常注入夹具。
@@ -3102,7 +3102,7 @@ def test_unknown_fins_direct_failure_logs_traceback_and_hides_exception_from_std
         无。
 
     Raises:
-        AssertionError: stderr 泄漏异常或 operator 日志缺少 traceback 时抛出。
+        AssertionError: stderr 或日志泄漏原文、安全诊断缺失时抛出。
     """
 
     monkeypatch.setattr(
@@ -3122,10 +3122,86 @@ def test_unknown_fins_direct_failure_logs_traceback_and_hides_exception_from_std
     assert "/absolute/path" not in captured.err
     assert "Traceback" not in captured.err
     assert "RuntimeError" not in captured.err
-    assert "Fins direct command failed; command=download" in caplog.text
+    assert "fins.download.command_unexpected_failure" in caplog.text
+    assert "exception_type=RuntimeError" in caplog.text
+    assert _UNKNOWN_DIRECT_FAILURE_MARKER not in caplog.text
+    assert "/absolute/path" not in caplog.text
+    assert "Traceback" not in caplog.text
+    records = [record for record in caplog.records if "fins.download.command_unexpected_failure" in record.getMessage()]
+    assert len(records) == 1
+    assert records[0].levelno == logging.ERROR
+    assert records[0].exc_info is None
+
+
+def test_unknown_download_command_log_file_is_readable_and_helper_failure_is_safe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """显式日志文件可读取安全诊断；共享 helper 内部故障不改变 CLI 终态。
+
+    :param tmp_path: 临时日志目录。
+    :param monkeypatch: 外层异常和 helper 内部故障注入。
+    :param capsys: 用户输出捕获。
+    :returns: 无。
+    :raises AssertionError: 文件不可读、泄密或退出码漂移时抛出。
+    """
+
+    monkeypatch.setattr(fins_command, "_run_fins_direct_command_async", _raise_unknown_fins_direct_error)
+    log_file = tmp_path / "download.log"
+    assert cli_main.main(("download", "--ticker", "AAPL", "--log-file", str(log_file))) == EXIT_FAILURE
+    first_output = capsys.readouterr()
+    assert first_output.err == _UNKNOWN_DIRECT_FAILURE_STDERR
+    log_text = log_file.read_text(encoding="utf-8")
+    assert "fins.download.command_unexpected_failure" in log_text
+    assert "exception_type=RuntimeError" in log_text
+    assert _UNKNOWN_DIRECT_FAILURE_MARKER not in log_text
+    assert "Traceback" not in log_text
+
+    def fail_type(_exc: Exception) -> tuple[str, str]:
+        """模拟共用 helper 内部类型判断失败。
+
+        :param _exc: 原始异常。
+        :returns: 不返回。
+        :raises RuntimeError: 始终抛出。
+        """
+
+        raise RuntimeError("token=helper-secret")
+
+    monkeypatch.setattr(fins_command.runtime_log, "_safe_exception_type", fail_type)
+    assert cli_main.main(("download", "--ticker", "AAPL", "--log-file", str(log_file))) == EXIT_FAILURE
+    second_output = capsys.readouterr()
+    assert second_output.err == _UNKNOWN_DIRECT_FAILURE_STDERR
+    log_text = log_file.read_text(encoding="utf-8")
+    assert "exception_type=redacted custom_type=redacted stack=[unavailable]" in log_text
+    assert "helper-secret" not in log_text
+    assert _UNKNOWN_DIRECT_FAILURE_MARKER not in log_text
+
+
+def test_non_download_unknown_command_keeps_original_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """非 download direct 外层异常保留既有 raw 日志与固定用户文案。
+
+    :param monkeypatch: 外层异常注入。
+    :param caplog: operator 日志捕获。
+    :param capsys: 用户输出捕获。
+    :returns: 无。
+    :raises AssertionError: 原有日志行为或固定文案漂移时抛出。
+    """
+
+    monkeypatch.setattr(fins_command, "_run_fins_direct_command_async", _raise_unknown_fins_direct_error)
+    caplog.set_level(logging.ERROR, logger=fins_command.__name__)
+    args = parse_cli_args(("process", "--ticker", "AAPL", "--document-id", "doc-1"))
+    assert fins_command.run_fins_direct_command(args) == EXIT_FAILURE
+    assert capsys.readouterr().err == (
+        "dayu-cli process: 命令执行失败，请使用 --log-file PATH 重试并查看日志\n"
+    )
+    assert "Fins direct command failed; command=process" in caplog.text
     assert _UNKNOWN_DIRECT_FAILURE_MARKER in caplog.text
     assert "Traceback" in caplog.text
-    assert "RuntimeError" in caplog.text
 
 
 @pytest.mark.parametrize(

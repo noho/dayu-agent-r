@@ -284,6 +284,7 @@ def test_fins_download_failure_projects_typed_rows_missing_periods_and_recovery(
     assert 'reason_code="unsafe_publication"' in output
     assert failure.to_json_value()["reason_code"] == "unsafe_publication"
     assert 'retry_hint="请检查并修复工作区来源状态后重试"' in output
+    assert "请使用 --log-file PATH 重试并查看日志" not in output
 
     execution_failure = FinsPublicFailure(
         kind=FinsPublicFailureKind.EXECUTION,
@@ -306,6 +307,7 @@ def test_fins_download_failure_projects_typed_rows_missing_periods_and_recovery(
     render_fins_direct_event(execution_event, stdout=io.StringIO(), stderr=execution_stderr)
     assert 'classification="execution"' in execution_stderr.getvalue()
     assert 'reason_code="-"' in execution_stderr.getvalue()
+    assert execution_stderr.getvalue().count("请使用 --log-file PATH 重试并查看日志") == 1
 
 
 def test_prompt_and_interactive_render_non_cancelled_terminal_matrix() -> None:

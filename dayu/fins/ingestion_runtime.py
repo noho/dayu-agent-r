@@ -157,6 +157,7 @@ from dayu.fins.ticker_normalization import Exchange as NormalizedTickerExchange
 from dayu.fins.ticker_normalization import Market as NormalizedTickerMarket
 from dayu.fins.ticker_normalization import NormalizedTicker
 from dayu.runtime.filelock import file_lock
+from dayu.runtime.log import safe_exception_trace
 
 _DOWNLOAD_INGEST_METHOD: Final[FinsIngestMethod] = FinsIngestMethod.DOWNLOAD
 _DOWNLOAD_REJECTION_CLASSIFICATION_VERSION: Final[str] = "fins-download-runtime-v1"
@@ -4374,6 +4375,11 @@ class FinsIngestionRuntime:
                 download=download_summary,
                 failure=public_failure,
             )
+            if public_failure is not None and public_failure.kind is FinsPublicFailureKind.EXECUTION:
+                _LOGGER.error(
+                    "fins.download.unexpected_failure %s",
+                    safe_exception_trace(cause, source_root=Path(__file__).parent.parent),
+                )
         finally:
             _put_direct_queue(context, _DirectStreamProducerDone())
 
@@ -6988,7 +6994,7 @@ def _download_public_failure_from_exception(
         source=request.source,
         transport_category=None,
         safe_message="下载执行失败",
-        retry_hint="请重新发起下载；若持续失败，请检查运行日志中的脱敏分类。",
+        retry_hint="请保存脱敏诊断并排查失败原因后重试。",
     )
 
 

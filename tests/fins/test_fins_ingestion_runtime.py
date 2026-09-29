@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import os
 import time
 from collections.abc import AsyncIterator, Callable, Mapping
@@ -24,8 +25,10 @@ from threading import (
     enumerate as enumerate_threads,
 )
 from typing import cast
+from unittest.mock import Mock
 
 import pytest
+import dayu.runtime.log as runtime_log
 
 from tests.fins.company_meta_test_support import stage_company_meta_fixture
 
@@ -6021,6 +6024,41 @@ async def test_direct_download_missing_adapter_returns_failure_result(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_direct_download_document_failure_is_execution_without_unknown_diagnostic(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """无来源文档的非异常失败保留文档详情，但不伪造未知异常诊断。
+
+    :param tmp_path: 隔离工作区。
+    :param caplog: 捕获真实 operator 日志。
+    :returns: 无。
+    :raises AssertionError: 文档 RESULT 或日志分类漂移时抛出。
+    """
+
+    ingestion = _build_ingestion_runtime(
+        tmp_path / "fins-workspace",
+        executor=_HoldingExecutor(),
+        download_adapters={
+            ("sec", "US"): _PersistedSummaryDownloadAdapter(_typed_download_summary(failed_ids=("fil-failed",)))
+        },
+    )
+    with caplog.at_level(logging.INFO, logger="dayu.fins.ingestion_runtime"):
+        events = await _collect_direct_events(ingestion.download(build_fins_download_request(ticker="AAPL")))
+    result = events[-1].result
+    assert result is not None
+    assert result.status is FinsResultStatus.FAILURE
+    assert result.error_kind is FinsErrorKind.EXECUTION
+    assert result.failure is not None
+    assert result.failure.kind is FinsPublicFailureKind.EXECUTION
+    assert result.failure.safe_message == "下载请求未写入任何源文档"
+    assert result.download is not None
+    assert result.download.document_rows[0].document_id == "fil-failed"
+    assert result.download.document_rows[0].reason_category == "provider_failure"
+    assert "fins.download.unexpected_failure" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_direct_download_projects_typed_provider_failure_without_raw_cause(
     tmp_path: Path,
 ) -> None:
@@ -6082,6 +6120,7 @@ async def test_direct_download_projects_typed_provider_failure_without_raw_cause
 )
 async def test_direct_download_projects_storage_and_execution_without_raw_text(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
     failure: Exception,
     expected_error_kind: FinsErrorKind,
     expected_failure_kind: FinsPublicFailureKind,
@@ -6097,7 +6136,8 @@ async def test_direct_download_projects_storage_and_execution_without_raw_text(
         },
     )
 
-    events = await _collect_direct_events(ingestion.download(build_fins_download_request(ticker="AAPL")))
+    with caplog.at_level(logging.ERROR, logger="dayu.fins.ingestion_runtime"):
+        events = await _collect_direct_events(ingestion.download(build_fins_download_request(ticker="AAPL")))
     result = events[-1].result
 
     assert result is not None
@@ -6111,6 +6151,96 @@ async def test_direct_download_projects_storage_and_execution_without_raw_text(
     assert "secret.invalid" not in serialized
     assert "contact-canary" not in serialized
     assert "/Users/private" not in serialized
+    unknown_records = [record for record in caplog.records if "fins.download.unexpected_failure" in record.getMessage()]
+    if expected_failure_kind is FinsPublicFailureKind.EXECUTION:
+        assert len(unknown_records) == 1
+        assert unknown_records[0].levelno == logging.ERROR
+        assert unknown_records[0].exc_info is None
+        assert "exception_type=RuntimeError" in unknown_records[0].getMessage()
+        assert re.search(r"ingestion_runtime\.py:[1-9][0-9]*", unknown_records[0].getMessage())
+        assert "secret.invalid" not in unknown_records[0].getMessage()
+        assert "contact-canary" not in unknown_records[0].getMessage()
+        assert "/Users/private" not in unknown_records[0].getMessage()
+        assert result.failure.retry_hint == "请保存脱敏诊断并排查失败原因后重试。"
+    else:
+        assert unknown_records == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("helper_failure", (False, True))
+async def test_direct_download_emits_result_before_one_safe_error_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    helper_failure: bool,
+) -> None:
+    """未知 download 先发布 RESULT，随后只记录一次安全 ERROR；helper 故障也不改变终态。
+
+    :param tmp_path: 隔离工作区。
+    :param monkeypatch: 注入 RESULT 和诊断顺序观测。
+    :param caplog: 捕获真实 operator 日志。
+    :param helper_failure: 是否使共享 helper 的内部类型步骤失败。
+    :returns: 无。
+    :raises AssertionError: 顺序、脱敏或失败投影不符时抛出。
+    """
+
+    ingestion = _build_ingestion_runtime(
+        tmp_path / "fins-workspace",
+        executor=_HoldingExecutor(),
+        download_adapters={
+            ("sec", "US"): _OperationFailureDownloadAdapter(
+                RuntimeError("https://secret.invalid/?token=contact-canary /Users/private/raw.json")
+            )
+        },
+    )
+    result_spy = Mock(wraps=ingestion._emit_direct_result)
+    monkeypatch.setattr(ingestion, "_emit_direct_result", result_spy)
+    original_error = ingestion_runtime._LOGGER.error
+
+    def record_error(message: str, diagnostic: str) -> None:
+        """日志提交前核对 RESULT 已投递。
+
+        :param message: 固定事件标识模板。
+        :param diagnostic: 安全诊断。
+        :returns: 无。
+        :raises AssertionError: RESULT 尚未投递时抛出。
+        """
+
+        assert result_spy.call_count == 1
+        original_error(message, diagnostic)
+
+    monkeypatch.setattr(ingestion_runtime._LOGGER, "error", record_error)
+    if helper_failure:
+        def fail_type(_exc: Exception) -> tuple[str, str]:
+            """模拟共享 helper 内部故障。
+
+            :param _exc: 原始异常。
+            :returns: 不返回。
+            :raises RuntimeError: 始终抛出。
+            """
+
+            raise RuntimeError("token=helper-secret")
+
+        monkeypatch.setattr(runtime_log, "_safe_exception_type", fail_type)
+    with caplog.at_level(logging.ERROR, logger="dayu.fins.ingestion_runtime"):
+        events = await _collect_direct_events(ingestion.download(build_fins_download_request(ticker="AAPL")))
+    assert result_spy.call_count == 1
+    result = events[-1].result
+    assert result is not None
+    assert result.status is FinsResultStatus.FAILURE
+    assert result.failure is not None
+    assert result.failure.kind is FinsPublicFailureKind.EXECUTION
+    records = [record for record in caplog.records if "fins.download.unexpected_failure" in record.getMessage()]
+    assert len(records) == 1
+    assert records[0].levelno == logging.ERROR
+    assert records[0].exc_info is None
+    assert "contact-canary" not in caplog.text
+    assert "/Users/private" not in caplog.text
+    assert "token=" not in caplog.text
+    if helper_failure:
+        assert records[0].getMessage().endswith(
+            "exception_type=redacted custom_type=redacted stack=[unavailable]"
+        )
 
 
 @pytest.mark.asyncio
@@ -6128,6 +6258,7 @@ async def test_direct_download_projects_storage_and_execution_without_raw_text(
 )
 async def test_direct_download_preserves_every_preflight_reason(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
     storage_reason: SourceIntegrityPreflightReason,
     public_reason: FinsDownloadFailureReason,
 ) -> None:
@@ -6154,7 +6285,8 @@ async def test_direct_download_preserves_every_preflight_reason(
         executor=_HoldingExecutor(),
         download_adapters={("sec", "US"): _OperationFailureDownloadAdapter(SourceIntegrityPreflightError(storage_reason))},
     )
-    events = await _collect_direct_events(ingestion.download(build_fins_download_request(ticker="AAPL")))
+    with caplog.at_level(logging.ERROR, logger="dayu.fins.ingestion_runtime"):
+        events = await _collect_direct_events(ingestion.download(build_fins_download_request(ticker="AAPL")))
     result = events[-1].result
     assert result is not None
     assert result.error_kind is FinsErrorKind.STORAGE
@@ -6169,6 +6301,7 @@ async def test_direct_download_preserves_every_preflight_reason(
     serialized = str(result.failure.to_json_value())
     assert "https://" not in serialized
     assert "/Users/" not in serialized
+    assert "fins.download.unexpected_failure" not in caplog.text
 
 
 def test_download_public_failure_rejects_open_or_non_storage_reason() -> None:

@@ -27,6 +27,7 @@ from dayu.fins.direct_events import (
     FinsResultStatus,
     FinsResultSummary,
     FinsPublicFailure,
+    FinsPublicFailureKind,
 )
 from dayu.host.api import (
     HostTerminalStatus,
@@ -65,6 +66,7 @@ _FINS_EVENT_SUCCEEDED_PREFIX: Final[str] = "Fins succeeded"
 _FINS_SUMMARY_MAX_ITEMS: Final[int] = 8
 _FINS_TEXT_MAX_CHARS: Final[int] = 120
 _FINS_TRUNCATED_SUFFIX: Final[str] = "..."
+CLI_LOG_LOCATION_HINT: Final[str] = "请使用 --log-file PATH 重试并查看日志"
 
 
 def render_prompt_terminal_result(
@@ -495,6 +497,8 @@ def _print_download_failure(failure: FinsPublicFailure, stream: TextIO) -> None:
         ),
         file=stream,
     )
+    if failure.kind is FinsPublicFailureKind.EXECUTION:
+        print(CLI_LOG_LOCATION_HINT, file=stream)
 
 
 def _summary_parts(values: tuple[FinsEventDetail, ...]) -> tuple[str, ...]:

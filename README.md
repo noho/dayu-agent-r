@@ -190,6 +190,10 @@ dayu-cli prompt "总结主要风险" --ticker AAPL \
 `--log-file` 不会创建缺失的父目录；请先创建父目录。父目录不存在或目标无法打开时，
 CLI 会显示可操作的错误并退出 `1`，不会开始本次分析。
 
+下载、上传或预处理等财报命令遇到外层未知内部错误时，stderr 会显示固定提示
+`命令执行失败，请使用 --log-file PATH 重试并查看日志`。按提示为 `PATH` 选择可写文件，
+重新执行命令即可留存运行日志。
+
 ## 4. 问答与交互
 
 ### 4.1 单次问答
@@ -320,6 +324,10 @@ HK 的中期业绩可显示覆盖 H1，但不能代替独立中期报告消除 H
 日期窗口、overwrite/rebuild 状态，以及发现、下载、跳过、拒绝、失败和缺失期间信息；
 每个下载文档行还会显示来源声明的 `covered_fiscal_periods` 数组。
 下载显示 `classification="storage"`、`reason_code="unsafe_publication"` 时，请检查工作区来源状态并修复后重试；重复下载不会自行修复。
+下载失败详情显示 `classification="execution"` 时，详情后还会出现 §3.1 的
+`--log-file PATH` 提示；按该节选择可写文件并重新执行，可留存运行日志。并非每次此类
+失败都会产生未知异常诊断。下载未知异常的安全诊断只提供脱敏类型标签与有界的包内
+调用位置，不含原始异常消息或路径；其它普通运行日志仍可能包含用户路径。
 下载期间按下 `Ctrl-C` 会请求协作取消并等待当前操作收口；取消终态使用规范退出码
 `130`，不会用内部取消原因替代用户可见摘要。财报保存在
 `<workspace>/portfolio/<规范 ticker>/`，例如 AAPL 对应
@@ -390,7 +398,7 @@ files 集合内；文件数超过 100；或 `delete` 携带 `--files` / `--prima
 承诺只适用于这两个直接 filing 入口，不覆盖 `upload_filings_from` 的扫描与脚本生成元数据
 处理。
 
-上传终态摘要中的 `requested files` 是本次已校验的输入文件数，`stored files` 是本次成功发布的原始文件数；Docling 派生文件不重复计数。空文件、任一原始文件读取失败，或 filing primary / material 任一需要转换的文件内容无法成功转换时，整批上传失败且 `stored files` 为 `0`，不会把先处理成功的文件计为已保存；filing 失败时也不会回退为只保存原文件或 companions。stderr 会同时显示触发失败的文件名和有界原因。若 direct 命令遇到无法归入这些已知原因的内部异常，普通 stderr 只显示 `命令执行失败，请使用 --log-file PATH 重试并查看日志`；按提示为 `PATH` 选择可写文件并重新执行命令，即可在该文件中保留完整诊断。
+上传终态摘要中的 `requested files` 是本次已校验的输入文件数，`stored files` 是本次成功发布的原始文件数；Docling 派生文件不重复计数。空文件、任一原始文件读取失败，或 filing primary / material 任一需要转换的文件内容无法成功转换时，整批上传失败且 `stored files` 为 `0`，不会把先处理成功的文件计为已保存；filing 失败时也不会回退为只保存原文件或 companions。stderr 会同时显示触发失败的文件名和有界原因。
 
 三个上传命令的 `--action` 默认都是 `auto`。单份上传还可显式使用
 `create`、`update` 或 `delete`；批量脚本只会生成 `auto`、`create` 或 `update`。

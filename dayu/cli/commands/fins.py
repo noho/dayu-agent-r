@@ -36,6 +36,7 @@ from dayu.cli.exit_codes import (
     EXIT_USAGE_ERROR,
 )
 from dayu.cli.output import (
+    CLI_LOG_LOCATION_HINT,
     render_cli_error,
     render_fins_direct_cancel_requested,
     render_fins_direct_event,
@@ -101,7 +102,6 @@ _FINS_DIAGNOSTIC_TEXT_MAX_CHARS: Final[int] = 120
 _FINS_DIAGNOSTIC_DETAIL_MAX_ITEMS: Final[int] = 4
 _FINS_DIAGNOSTIC_TRUNCATED_SUFFIX: Final[str] = "..."
 _FINS_DIRECT_DEBUG_BASE_PART_COUNT: Final[int] = 2
-_FINS_DIRECT_UNKNOWN_FAILURE_MESSAGE: Final[str] = "命令执行失败，请使用 --log-file PATH 重试并查看日志"
 _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
 
@@ -213,12 +213,15 @@ def run_fins_direct_command(args: ParsedCliArgs) -> int:
         return EXIT_FAILURE
     except KeyboardInterrupt:
         return EXIT_KEYBOARD_INTERRUPT
-    except Exception:
-        _LOGGER.exception(
-            "Fins direct command failed; command=%s",
-            args.command_name,
-        )
-        render_cli_error(f"dayu-cli {args.command_name}: {_FINS_DIRECT_UNKNOWN_FAILURE_MESSAGE}")
+    except Exception as exc:
+        if args.command_name == COMMAND_DOWNLOAD:
+            _LOGGER.error(
+                "fins.download.command_unexpected_failure %s",
+                runtime_log.safe_exception_trace(exc, source_root=Path(__file__).parent.parent.parent),
+            )
+        else:
+            _LOGGER.exception("Fins direct command failed; command=%s", args.command_name)
+        render_cli_error(f"dayu-cli {args.command_name}: 命令执行失败，{CLI_LOG_LOCATION_HINT}")
         return EXIT_FAILURE
 
 
