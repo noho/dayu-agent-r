@@ -58,3 +58,8 @@ retry_class: none
 | 全仓/真实外网转换可用性 | assigned to later work unit；既有PR197完整验证/closeout；本slice受控验证不承诺provider质量 |
 
 下一入口**Sol仅planfix PV01 → 同版MiMo/Kimi窄re-review → accepted plan commit → implementation**。当前F3 planamend与F4报告修复文档可并行，三个源码范围只读；F7业务始终以用户现成裁决为准。
+
+
+## F7-PV01窄复审最终回写（20261001）
+
+MiMo26981/XNPxri/28turns与Kimi64366/Q2Zmb2/47turns均outer0/JSONsuccess/token完整逐字match，报告002227/002251可采；根26SHA/原件/精确1行→4行/逆替换/结构/独立真实noindex再核通过。PV01已修复，plan review/re-review gate pass、plan accepted，新plan5820a492…；下一accepted plan commit→implementation。详细summary_only/恢复/残余和共用源码排程见docs/gateflow/pr-197-r1-f7-plan-rereview-adjudication-20261001.md。产品尚未实施，原679/cov只是旧baseline，不代新源码门禁；F4Sol36只读输入任务未终态前不改CN源码。
