@@ -1,5 +1,23 @@
 # PR #197 审查 findings 修复：接续总控记录
 
+<!-- PR197_LIVE_GATE_STATUS_START -->
+## 当前执行状态（2026-10-01 01:59:21 本机读取）
+
+权威是用户现成裁决；旧历史记录保留，下表为当前入口。
+
+| WU | 当前入口 | 活动 runner / 后续 |
+| --- | --- | --- |
+| F2 | 局部闭环 | 不代表整个PR通过 |
+| F3 | A1/C02计划修复 | Sol34569 / yi22SR在途；21输入冻结，20只读；C01源码仍未修，计划gate待A1/C02 |
+| F4 | A1/N1/PV02窄复审待双审名额 | PV02报告修复根accepted；f17c95f4计划候选保留，产品未实施 |
+| F7 | 同版code review | MiMo40205 / oIiAXz、Kimi48517 / 4BjIBx同时在途；32输入；根741测试通过/fullpyright0，未accepted slice |
+| F5 / F6 | goal已有，尚未plan / 实施 | 共同CN源码串行 |
+| 原upload及独立WU队列 | 未顺带实施 | 按既有裁决和主队列依赖继续 |
+
+唯一开发主树codex/upload-material-oracle，main fac32ecbf未动；当前已提交head2a8c5d3e，未提交候选保留待审。外层终态与结构化结果均由根核验，自报pass不放行。所有runner显式主树绝对cwd、独立output/stderr、唯一label，review MiMo/Kimi并行；实际Kimi额度故障才ds-flash备份。根无关docscheckpoint允许HEAD推进，32与20相关只读SHA不放宽，共用CN源码当前不启动F4写入。
+<!-- PR197_LIVE_GATE_STATUS_END -->
+
+
 ## 授权、边界与起点
 
 - 用户重新交由当前总控继续交接 prompt，既有授权为修复首轮完整 PR review 的 F2～F7，再推进原 upload_material 队列；所有开发在 `/Users/leo/workspace/dayu-agent-r` 的 `codex/upload-material-oracle`，进入现有 draft PR #197，用户手工 merge。
@@ -344,3 +362,26 @@ F3 Sol88943与F7 Sol40745均已外层exit0、JSONLterminal/canary匹配，总控
 
 
 F4同版MiMo79430已outer0/JSONsuccess65turns/token匹配，summary_only关键证据由总控32SHA/保存输入及旧contract真实Fsprobe补核。报告235229可采；新F4-PR2-A1（低、accepted/未修复）须在plan明示allocated文档缺席→原分配ID，不补None制造changed；只保全已有规则。MiMo F2空索引防护因无实际合法caller误用证据rejected-with-reason，不加字段/误拒正常空库。独立artifact docs/gateflow/pr-197-r1-f4-rereview-mimo-adjudication-20261001.md；Kimi44800仍在途，保持32freeze/不放行。F3验证条款Sol1101/yhKwQY在途；F7窄双审preflight已ok（XNPxri/Q2Zmb2），尚未launch，待并发名额同时派发。
+
+
+F3验证条款Sol1101已outer0/59JSONLterminal/tokenmatch，七SHA/九原件和唯一验证段diff总控核验，作者证据accepted；PA01等待同版C01窄双审验证，源码仍未修。详docs/gateflow/pr-197-r1-f3-plan-quality-receipt-20261001.md。证据checkpoint b2b065fb19d6e1094094ad1f5e1613c36aab0c3d（九docs/519增/cachedcheck0）普通push7707outer0，PR197/live远端读回一致，mainfac32未动。F7窄复审两preflightok/26SHA首核match，已同时launch MiMo26981/XNPxri/report002227和Kimi64366/Q2Zmb2/report002251；F4Kimi44800仍在途。当前三路是F4Kimi+F7MiMo/Kimi审查，F3待审名额，不再说Sol在跑。所有runner显式主树绝对cwd/独立outputstderr，现成裁决优先、不操作main或新工作树。
+
+
+F4Kimi44800已outer0/JSONsuccess89turns/tokenmatch，报告235546可采；根独立Fsprobe0/60000旧算法对照0mismatch，仅runtime分析非新API/types证据。合并裁决docs/gateflow/pr-197-r1-f4-plan-rereview-adjudication-20261001.md：gate仍fail pendingF4-PR2-A1，缺席allocated文档必须返回原ID并在plan钉死；F2空index防护不采，N1company发布repair限定语作事实补充。下一Solplan文字/三态矩阵fix→窄双审→acceptedplancommit→实施。F7双窄审26981/64366仍在途，CN/storage源码冻结；F3 C01/PA01待双审名额。
+
+
+## F7-PV01窄复审最终回写（20261001）
+
+MiMo26981/XNPxri/28turns与Kimi64366/Q2Zmb2/47turns均outer0/JSONsuccess/token完整逐字match，报告002227/002251可采；根26SHA/原件/精确1行→4行/逆替换/结构/独立真实noindex再核通过。PV01已修复，plan review/re-review gate pass、plan accepted，新plan5820a492…；下一accepted plan commit→implementation。详细summary_only/恢复/残余和共用源码排程见docs/gateflow/pr-197-r1-f7-plan-rereview-adjudication-20261001.md。产品尚未实施，原679/cov只是旧baseline，不代新源码门禁；F4Sol36只读输入任务未终态前不改CN源码。
+
+
+F4Sol73295已outer0/90JSONLterminal/tokenmatch，35只读/36原件根核验在F7写源码前MATCH；plan仅三hunk，newf17c95f4…技术候选保留。但新增报告全文件no-index实际3（105/107行内嵌diff空白），作者围栏外检查未恢复门禁，新增F4-PV02 accepted/未修复/低，详docs/gateflow/pr-197-r1-f4-report-hygiene-adjudication-20261001.md。下一Sol只报告表示fix，不再改plan/source，随后A1/N1/PV02窄双审；当前不放行F4。F7 acceptedplancommit2a8c5d3e已普通push68691outer0/PR及live读回一致、mainfac32不动，下一approvedS1实施。F4旧35源码freeze现为历史已结束窗口；F7改源码后F4窄review重冻当前版本，不冒称旧SHA当前或重裁业务。F3双审9959/26494继续。
+
+
+F3新增审查发现登记：`docs/gateflow/pr-197-r1-f3-amendment-review-adjudication-20261001.md`。F3-PR2-A1解析后basename表述 / F3-C02样本间物理目标碰撞均先登记needs-more-evidence，根独立裁决；不把两路同意当直接根因证据，不顺带更改用户上传下载规则。
+
+
+根独立三路核收：F3新F3-PR2-A1/C02均accepted低/未修，A1只计划澄清，C02归F3-S2必要输入/产物完整性纠正，须F3closeout前完成，不投票改upload行为、不自动另要授权。详细裁决docs/gateflow/pr-197-r1-f3-amendment-review-adjudication-20261001.md。F4-PV02报告fix根26JSONL/两readonly三原件/完整两文件noindex1零输出accepted，旧失败保留；F4 gate仍待A1/N1/PV02窄双审。F7根源码候选SHA/原件/coverage/完整JSONL已核，唯一报告生成exit2已恢复，当前独立七模块pytest/fullpyright复跑在途；后续同版MiMo/Kimi code review。
+
+
+F7根当前独立741pass/3第三方warnings、fullpyright0，实施交付accepted仅候选可审查；独立receipt docs/gateflow/pr-197-r1-f7-implementation-receipt-20261001.md。现在MiMo40205/Kimi48517同时同版code review；Sol34569修F3计划A1/C02，无源码写权限。F3排程已校正为当前单S1输入增量的必要correctness计划修复，未approved future slice不作为gatepass依据；详F3amendment root裁决末节。
