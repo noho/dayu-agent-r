@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dayu.fins.upload_usage_contract import FinsUploadUsageCode, FinsUploadUsageError
+
 import asyncio
 import hashlib
 import json
@@ -35,11 +37,10 @@ from dayu.fins.domain.document_models import (
 )
 from dayu.fins.ticker_normalization import build_company_ticker_identity
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.upload_asset_plan import filing_original_storage_name, UploadAssetPlan
 from dayu.fins.ingestion_runtime import (
     FinsUploadFilingRequest,
     FinsUploadPipelineResult,
-    FinsUploadUsageCode,
-    FinsUploadUsageError,
     ValidatedFinsUploadFilingRequest,
 )
 from dayu.fins.pipelines.sec_pipeline import SecPipeline, SecPipelineUploadResult
@@ -47,7 +48,6 @@ from dayu.fins.pipelines.docling_upload_service import (
     DoclingUploadService,
     PreparedDoclingUpload,
     describe_prepared_filing_publication,
-    _build_filing_original_asset_identity,
 )
 from dayu.fins.pipelines.docling_process_converter import (
     DoclingConversionConfig,
@@ -76,7 +76,7 @@ from dayu.fins.storage import (
     SourceIntegrityStatus,
 )
 from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
-from dayu.fins.upload_format_contract import FinsUploadFilingFiles, FinsUploadMaterialFiles
+from dayu.fins.upload_format_contract import FinsUploadFilingFiles
 from dayu.fins.upload_repair_contract import ExistingSourceRepairDisposition
 from dayu.runtime.filelock import RuntimeFileLockError
 
@@ -344,7 +344,7 @@ class _PreparedIdentityRecordingDoclingUploadService(DoclingUploadService):
         document_id: str,
         internal_document_id: str,
         form_type: str,
-        selection: FinsUploadFilingFiles | FinsUploadMaterialFiles,
+        selection: FinsUploadFilingFiles | UploadAssetPlan,
         overwrite: bool,
         previous_meta: Mapping[str, JsonValue] | None,
         meta: Mapping[str, JsonValue],
@@ -1519,7 +1519,7 @@ async def test_upload_filing_stream_renamed_update_without_overwrite_replaces_co
         SourceKind.FILING,
     )
     file_names = sorted(meta.uri.split("/")[-1] for meta in pipeline._blob_repository.list_files(handle))
-    original_identity = _build_filing_original_asset_identity(new_file.resolve(strict=False))
+    original_identity = filing_original_storage_name(new_file.resolve(strict=False))
     assert file_names == sorted((original_identity, f"{original_identity}_docling.json"))
     assert pipeline._company_repository.get_company_meta("AAPL") == company_meta
     assert (
@@ -2183,7 +2183,7 @@ async def test_upload_filing_consumes_fresh_authoritative_file_selection(
 
     assert validator_calls == [request.request]
     assert calls == ["authoritative.docx"]
-    original_identity = _build_filing_original_asset_identity(authoritative_file.resolve(strict=False))
+    original_identity = filing_original_storage_name(authoritative_file.resolve(strict=False))
     assert stored_names == sorted((original_identity, f"{original_identity}_docling.json"))
 
 

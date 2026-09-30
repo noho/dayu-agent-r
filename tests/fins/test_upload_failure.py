@@ -24,6 +24,47 @@ from dayu.fins.upload_format_contract import (
     FinsUploadFormatError,
     FinsUploadFormatFailureKind,
 )
+from dayu.fins.upload_usage_contract import FinsUploadUsageCode, fins_upload_usage_failure
+
+
+def test_failure_message_slash_exception_is_exact_missing_files_template() -> None:
+    """仅既有固定 MISSING_FILES 文案允许动作分隔斜杠。
+
+    Args:
+        无。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 任意斜杠文案被接受或旧固定文案被拒绝时抛出。
+    """
+
+    allowed = fins_upload_usage_failure(FinsUploadUsageCode.MISSING_FILES).message
+    reason = FinsUploadFailureReason(
+        kind=FinsUploadFailureKind.USAGE,
+        code=FinsUploadFailureCode.MISSING_FILES,
+        message=allowed,
+        retry_hint=None,
+        file_label=None,
+    )
+    assert reason.message == allowed
+    with pytest.raises(ValueError, match="路径分隔符"):
+        FinsUploadFailureReason(
+            kind=FinsUploadFailureKind.USAGE,
+            code=FinsUploadFailureCode.MISSING_FILES,
+            message="create/update 其它消息",
+            retry_hint=None,
+            file_label=None,
+        )
+    with pytest.raises(ValueError, match="路径分隔符"):
+        FinsUploadFailureReason(
+            kind=FinsUploadFailureKind.USAGE,
+            code=FinsUploadFailureCode.ASSET_NAME_COLLISION,
+            message="冲突：/private/tmp/deck.pdf",
+            retry_hint=None,
+            file_label=None,
+        )
 
 
 @pytest.mark.parametrize("format_kind", tuple(FinsUploadFormatFailureKind))

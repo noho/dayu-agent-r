@@ -57,11 +57,15 @@ from dayu.fins.direct_events import (
 from dayu.fins.direct_events import ValidatedFinsEventStream
 from dayu.fins.download_contract import FinsDownloadRequest, FinsDownloadUsageError
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.upload_asset_plan import normalize_upload_asset_path
 from dayu.fins.ingestion_runtime import (
     FinsUploadFilingRequest,
-    FinsUploadUsageError,
+    FinsUploadMaterialRequest,
+    ValidatedFinsUploadMaterialRequest,
+    admit_fins_upload_material_request,
     ValidatedFinsUploadFilingRequest,
 )
+from dayu.fins.upload_usage_contract import FinsUploadUsageError
 from dayu.fins.upload_failure import FinsUploadPrevalidationError
 from dayu.fins.domain.filing_semantics import FiscalPeriod
 from dayu.fins.resolver import FmpCompanyInfoResolver
@@ -81,7 +85,6 @@ from dayu.fins.upload_batch import (
 )
 from dayu.fins.upload_format_contract import (
     FinsUploadFormatError,
-    FinsUploadMaterialFiles,
 )
 from dayu.service.fins_direct import (
     FinsDirectCommandService,
@@ -248,6 +251,7 @@ async def _run_fins_direct_command_async(args: ParsedCliArgs) -> int:
         args,
         workspace_root=workspace_root,
     )
+    upload_material_request = _prevalidate_upload_material_request(args)
     service = FINS_DIRECT_SERVICE_FACTORY(workspace_root)
     cancellation_token = _CliFinsCancellationToken()
     stream = _open_direct_stream(
@@ -256,6 +260,7 @@ async def _run_fins_direct_command_async(args: ParsedCliArgs) -> int:
         cancellation_token=cancellation_token,
         download_request=download_request,
         upload_filing_request=upload_filing_request,
+        upload_material_request=upload_material_request,
     )
     try:
         runtime_log.log_verbose(
@@ -541,6 +546,7 @@ def _open_direct_stream(
     cancellation_token: _CliFinsCancellationToken,
     download_request: FinsDownloadRequest | None,
     upload_filing_request: ValidatedFinsUploadFilingRequest | None,
+    upload_material_request: ValidatedFinsUploadMaterialRequest | None,
 ) -> ValidatedFinsEventStream:
     """按命令名打开 direct event stream。
 
@@ -571,8 +577,10 @@ def _open_direct_stream(
             cancellation_token=cancellation_token,
         )
     if args.command_name == COMMAND_UPLOAD_MATERIAL:
+        if upload_material_request is None:
+            raise AssertionError("upload_material command 缺少预校验请求")
         return _upload_material_stream(
-            args=args,
+            request=upload_material_request,
             service=service,
             cancellation_token=cancellation_token,
         )
@@ -688,11 +696,8 @@ def _prevalidate_upload_filing_request(
     request = FinsUploadFilingRequest(
         ticker=raw_ticker,
         action=args.action,
-        files=tuple(Path(raw_file).expanduser().resolve(strict=False) for raw_file in (args.files or ())),
-        primary_selectors=tuple(
-            Path(raw_selector).expanduser().resolve(strict=False)
-            for raw_selector in (args.primary or ())
-        ),
+        files=tuple(Path(raw_file) for raw_file in (args.files or ())),
+        primary_selectors=tuple(Path(raw_selector) for raw_selector in (args.primary or ())),
         fiscal_year=args.fiscal_year,
         fiscal_period=_optional_stripped_text(args.fiscal_period),
         amended=args.amended,
@@ -710,40 +715,25 @@ def _prevalidate_upload_filing_request(
 
 def _upload_material_stream(
     *,
-    args: ParsedCliArgs,
+    request: ValidatedFinsUploadMaterialRequest,
     service: FinsDirectCommandService,
     cancellation_token: _CliFinsCancellationToken,
 ) -> ValidatedFinsEventStream:
-    """打开 upload_material direct stream。
+    """用同一次 Fins 准入 handoff 打开 material direct stream。
 
-    :param args: argparse 已解析的 upload_material 参数。
-    :param service: Fins direct Service helper。
-    :param cancellation_token: 当前 operation 的取消 token。
-    :returns: Fins owner 已验证的 direct 事件流。
-    :raises CliFinsUsageError: ticker、forms 或文件路径非法时抛出。
-    :raises FinsUploadFormatError: 任一文件不具备 converter-required 格式时抛出。
+    Args:
+        request: CLI 已准入的 material handoff。
+        service: Fins direct Service helper。
+        cancellation_token: 当前 operation 的取消 token。
+
+    Returns:
+        Fins owner 已验证的 direct 事件流。
+
+    Raises:
+        Exception: Service 或 runtime 打开 stream 失败时透传。
     """
 
-    ticker = _parse_ticker_csv(args.ticker)
-    form_type = _single_optional_form(args.forms)
-    return service.upload_material(
-        ticker=ticker.canonical_ticker,
-        action=args.action,
-        files=_validated_upload_files(args.files).files,
-        form_type=form_type,
-        material_name=_optional_stripped_text(args.material_name),
-        document_id=_optional_stripped_text(_single_document_id(args.document_id)),
-        internal_document_id=_optional_stripped_text(args.internal_document_id),
-        fiscal_year=args.fiscal_year,
-        fiscal_period=_optional_stripped_text(args.fiscal_period),
-        amended=args.amended,
-        filing_date=_optional_material_date_text(args.filing_date),
-        report_date=_optional_material_date_text(args.report_date),
-        company_name=_optional_stripped_text(args.company_name),
-        ticker_aliases=ticker.accepted_aliases,
-        overwrite=args.overwrite,
-        cancellation_token=cancellation_token,
-    )
+    return service.upload_material(request, cancellation_token=cancellation_token)
 
 
 def _process_stream(
@@ -1116,26 +1106,71 @@ def _parse_ticker_csv(raw_value: str | None) -> CompanyTickerIdentity:
         raise CliFinsUsageError(str(exc)) from exc
 
 
-def _validated_upload_files(raw_files: list[str] | None) -> FinsUploadMaterialFiles:
-    """校验并解析 material upload 文件路径与转换格式。
+def _prevalidated_upload_paths(paths: tuple[Path, ...]) -> None:
+    """在 material 准入后保留 CLI 既有逐路径存在性校验与文案。
 
-    :param raw_files: CLI 收到的 ``--files`` 值。
-    :returns: Fins owner 产生的 material typed selection。
-    :raises CliFinsUsageError: 文件不存在或不是普通文件时抛出。
-    :raises FinsUploadFormatError: 任一文件不具备 converter-required 格式时抛出。
+    Args:
+        paths: 唯一资产规划 owner 已解析的路径。
+
+    Returns:
+        无。
+
+    Raises:
+        CliFinsUsageError: 文件不存在或不是普通文件时抛出。
     """
 
-    if raw_files is None:
-        return FinsUploadMaterialFiles.for_delete()
-    paths: list[Path] = []
-    for raw_file in raw_files:
-        path = Path(raw_file).expanduser().resolve(strict=False)
+    for path in paths:
         if not path.exists():
             raise CliFinsUsageError(_MISSING_UPLOAD_FILE_TEMPLATE.format(path=path))
         if not path.is_file():
             raise CliFinsUsageError(_UPLOAD_PATH_NOT_FILE_TEMPLATE.format(path=path))
-        paths.append(path)
-    return FinsUploadMaterialFiles.from_upsert_paths(tuple(paths))
+
+
+def _prevalidate_upload_material_request(
+    args: ParsedCliArgs,
+) -> ValidatedFinsUploadMaterialRequest | None:
+    """在 Service factory 前构造并准入 material request。
+
+    Args:
+        args: argparse 已解析的 direct command 参数。
+
+    Returns:
+        material 命令的不可变 handoff；其它命令返回 None。
+
+    Raises:
+        CliFinsUsageError: CLI 路径或参数非法时抛出。
+        FinsUploadUsageError: 资产数量或身份规划失败时抛出。
+        FinsUploadFormatError: 文件格式不受支持时抛出。
+    """
+
+    if args.command_name != COMMAND_UPLOAD_MATERIAL:
+        return None
+    ticker = _parse_ticker_csv(args.ticker)
+    request = FinsUploadMaterialRequest(
+        ticker=ticker.canonical_ticker,
+        action=args.action,
+        files=tuple(Path(raw_file) for raw_file in args.files or ()),
+        form_type=_single_optional_form(args.forms),
+        material_name=_optional_stripped_text(args.material_name),
+        document_id=_optional_stripped_text(_single_document_id(args.document_id)),
+        internal_document_id=_optional_stripped_text(args.internal_document_id),
+        fiscal_year=args.fiscal_year,
+        fiscal_period=_optional_stripped_text(args.fiscal_period),
+        amended=args.amended,
+        filing_date=_optional_material_date_text(args.filing_date),
+        report_date=_optional_material_date_text(args.report_date),
+        company_name=_optional_stripped_text(args.company_name),
+        ticker_aliases=ticker.accepted_aliases,
+        overwrite=args.overwrite,
+    )
+    validated = admit_fins_upload_material_request(request)
+    checked_paths = (
+        tuple(normalize_upload_asset_path(path) for path in request.files)
+        if validated.request.action == "delete"
+        else validated.file_selection.files
+    )
+    _prevalidated_upload_paths(checked_paths)
+    return validated
 
 
 def _normalized_text_tuple(

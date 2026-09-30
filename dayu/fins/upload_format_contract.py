@@ -20,7 +20,10 @@ from dayu.fins.direct_events import (
     canonicalize_fins_public_file_label,
     validate_fins_public_file_label,
 )
+from dayu.fins.storage.asset_filename_contract import DOCUMENT_SOURCE_CONTROL_FILENAMES
 
+MAX_FILING_UPLOAD_FILES: Final[int] = 100
+MAX_MATERIAL_UPLOAD_FILES: Final[int] = 100
 _XSD_COMPANION_SUFFIX: Final[str] = ".xsd"
 _FORMAT_ERROR_MESSAGE_MAX_CHARS: Final[int] = 240
 _PRIMARY_UNSUPPORTED_TEMPLATE: Final[str] = "财报主文件格式不受支持：{file_label}"
@@ -603,6 +606,7 @@ def project_fins_upload_format_text(
 
     suffixes = ", ".join(capability.primary_suffixes)
     companion_only_suffixes = ", ".join(sorted(capability.companion_only_suffixes))
+    control_names = "、".join(sorted(DOCUMENT_SOURCE_CONTROL_FILENAMES))
     filing_primary = _project_filing_primary_rules(
         files_label="--files",
         primary_label="--primary",
@@ -616,6 +620,7 @@ def project_fins_upload_format_text(
     )
     filing_files = (
         "auto/create/update 必须至少提供一个文件。已选主文件必须实际转换成功；"
+        f"filing 一次最多 {MAX_FILING_UPLOAD_FILES} 个文件；"
         "其余文件是仅原样保存、不转换的随附文件。"
         f"主文件支持后缀：{suffixes}；随附文件支持这些后缀以及 {companion_only_suffixes}，"
         f"且 {companion_only_suffixes} 只能作为随附文件。"
@@ -639,6 +644,11 @@ def project_fins_upload_format_text(
             f"upload_kind=filing 时，{filing_files}"
             f"upload_kind=material 时，{material_files}"
             "每个路径必须指向已存在、非空的普通文件。"
+            f"material 一次最多 {MAX_MATERIAL_UPLOAD_FILES} 个文件；不同路径的原件不能有相同完整文件名，"
+            f"文件名也不能与工作区控制文件（{control_names}）或本批原件及转换结果冲突；"
+            "大小写不同的文件名也可能冲突。"
+            "每个转换结果的文件名是完整原件文件名后追加 _docling.json，"
+            "例如 deck.txt 对应 deck.txt_docling.json；请在上传前避开这些冲突。"
         ),
         upload_tool_primary=(
             f"仅用于 upload_kind=filing：{upload_tool_primary_rules}"
@@ -657,6 +667,8 @@ FINS_UPLOAD_FORMAT_TEXT: Final[FinsUploadFormatTextProjection] = project_fins_up
 __all__: tuple[str, ...] = (
     "FINS_UPLOAD_FORMAT_CAPABILITY",
     "FINS_UPLOAD_FORMAT_TEXT",
+    "MAX_FILING_UPLOAD_FILES",
+    "MAX_MATERIAL_UPLOAD_FILES",
     "FinsUploadFileRole",
     "FinsUploadFilingFiles",
     "FinsUploadFormatCapability",

@@ -211,6 +211,8 @@ companions，并保持 material 全转换；CLI help、LLM-facing tool schema �
 requested/stored 只计算 original 输入。这是 deterministic owner-level 回归，不替代真实全格式
 fixture 矩阵或全量 CLI scenario evidence。
 
+上传资产规划回归运行 `tests/fins/test_upload_asset_plan.py`、`tests/fins/test_upload_usage_contract.py`、`tests/fins/test_storage_asset_filename_contract.py`，并结合 storage atomicity、SEC/CN/HK material stream 与 CLI 测试。它们核对 material 100/101 数量边界、完整原件名到 Docling 名的唯一对应、控制文件冲突、封闭 usage/public failure、三个 storage walker 的 exact 控制名行为，以及首事件前的共享准入；validated handoff 构造期断言请求/选择/计划一致，SEC/CN 同步委托与 raw stream 断言单次准入，Service/runner 断言对象身份，usage/CLI 断言安全 basename 定位，并以真实 tool JSON 和可达 CLI 输入覆盖反斜杠、NUL、未知用户目录、高代理名的封闭失败、控制名优先、零 observation/job/发布，以及 material 原有文件状态预检。同一 typed 规划 usage fact 有无异常 cause 的真实工具回归还固定 error、message、hint 一致，并验证普通请求类别与规划类别在共用 code 时仍可区分。新增 owner 与真实入口回归还覆盖路径循环的操作失败分类、delete raw 路径形状的封闭分类、等值独立转换条目的保序合同、裸资产计划构造不变量、控制名与重复原件名混合输入的双顺序优先级、混合不支持后缀时 planner/裸计划/CLI/tool 的同源原因与文案、裸 material 101 项、显式来源类型及 filing 计划误入 material 服务边界的零读取/转换/发布、usage 类别与专属 code 双向约束，以及工具 files schema 文案与数量上限的一致性。公开 handoff 回归覆盖手工构造和 validated SEC/CN 消费的同源日期与静态资产准入，也确认 material form/name 缺失时保持执行阶段的失败位置。受控 converter 测试单独核对 100 次调度。真实 CLI 数量与发布验证须另用隔离 workspace 运行，不由受控 converter 测试替代。
+
 运行 Tool Trace Analyzer、Service publication 与 CLI focused 回归：
 
 ```bash
@@ -480,7 +482,7 @@ raw request 保留 primary selector cardinality，static admission 在 workspace
 files/primary 的精确 failure precedence；validated typed contract 显式产生唯一 primary 与保序 companions。
 `.xsd` 只能作为 filing companion；legacy 与未选择格式不进入 primary 或 material conversion。CLI parser/help
 覆盖 append 型 `--primary` 及重复 occurrence 不丢失，direct command 覆盖 usage failure 在 Service factory
-前 exit `2` 且 workspace 零 mutation；upload tool schema/adapter 覆盖可选单值 primary、`files.maxItems=100`、
+前 exit `2` 且 workspace 零 mutation；upload tool schema/adapter 覆盖可选单值 primary、共享 `files.maxItems` 为 filing/material 两类上限的较大值及各类上限文案、
 material/delete 禁止 primary 与 observation start 前失败。batch scanner、SEC/CN workflow 与
 `DoclingUploadService` 均消费同一 owner projection。
 

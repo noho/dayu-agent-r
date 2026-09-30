@@ -49,6 +49,9 @@ from dayu.fins.ingestion_runtime import (
     FinsSourceDownloadAdapterRequest,
     FinsSourceDownloadAdapterResult,
     ValidatedFinsUploadFilingRequest,
+    ValidatedFinsUploadMaterialRequest,
+    FinsUploadMaterialRequest,
+    admit_fins_upload_material_request,
 )
 from dayu.fins.pipelines.docling_process_converter import DoclingConverter, ProcessDoclingConverter
 from dayu.fins.pipelines.docling_upload_service import DoclingUploadService
@@ -798,141 +801,107 @@ class SecPipeline:
 
     def upload_material(
         self,
-        ticker: str,
-        action: Optional[str],
-        form_type: str,
-        material_name: str,
-        files: Optional[list[Path]] = None,
-        document_id: Optional[str] = None,
-        internal_document_id: Optional[str] = None,
-        fiscal_year: Optional[int] = None,
-        fiscal_period: Optional[str] = None,
-        filing_date: Optional[str] = None,
-        report_date: Optional[str] = None,
-        company_id: Optional[str] = None,
-        company_name: Optional[str] = None,
-        ticker_aliases: Optional[list[str]] = None,
-        overwrite: bool = False,
+        request: FinsUploadMaterialRequest,
         *,
         cancellation_checker: CancellationToken | None = None,
     ) -> SecPipelineUploadResult:
-        """执行 SEC 材料上传并同步返回聚合结果。
+        """同步执行一次 raw material 准入与上传。
 
         Args:
-            ticker: 股票代码。
-            action: 可选动作类型。
-            form_type: 材料类型。
-            material_name: 材料名称。
-            files: 可选上传文件列表。
-            document_id: 可选文档 ID。
-            internal_document_id: 可选内部文档 ID。
-            fiscal_year: 可选财年。
-            fiscal_period: 可选财期。
-            filing_date: 可选 filing 日期。
-            report_date: 可选 report 日期。
-            company_id: 可选兼容字段。
-            company_name: 公司名称。
-            ticker_aliases: 可选 ticker alias。
-            overwrite: 是否覆盖。
-            cancellation_checker: 可选协作式取消检查器。
+            request: 原始 material 请求。
+            cancellation_checker: 可选取消检查器。
 
         Returns:
-            上传结果字典。
+            聚合上传结果。
 
         Raises:
-            RuntimeError: 当前线程已有事件循环时抛出。
+            FinsUploadUsageError: 资产规划违反调用方契约时抛出。
+            RuntimeError: 同步调用环境已有事件循环时抛出。
         """
 
         return _run_async_upload_sync(
             _collect_upload_result_from_events(
-                self.upload_material_stream(
-                    ticker=ticker,
-                    action=action,
-                    form_type=form_type,
-                    material_name=material_name,
-                    files=files,
-                    document_id=document_id,
-                    internal_document_id=internal_document_id,
-                    fiscal_year=fiscal_year,
-                    fiscal_period=fiscal_period,
-                    filing_date=filing_date,
-                    report_date=report_date,
-                    company_id=company_id,
-                    company_name=company_name,
-                    ticker_aliases=ticker_aliases,
-                    overwrite=overwrite,
-                    cancellation_checker=cancellation_checker,
-                ),
+                self.upload_material_stream(request, cancellation_checker=cancellation_checker),
                 stream_name="upload_material_stream",
             )
         )
 
     async def upload_material_stream(
         self,
-        ticker: str,
-        action: Optional[str],
-        form_type: str,
-        material_name: str,
-        files: Optional[list[Path]] = None,
-        document_id: Optional[str] = None,
-        internal_document_id: Optional[str] = None,
-        fiscal_year: Optional[int] = None,
-        fiscal_period: Optional[str] = None,
-        filing_date: Optional[str] = None,
-        report_date: Optional[str] = None,
-        company_id: Optional[str] = None,
-        company_name: Optional[str] = None,
-        ticker_aliases: Optional[list[str]] = None,
-        overwrite: bool = False,
+        request: FinsUploadMaterialRequest,
         *,
         cancellation_checker: CancellationToken | None = None,
     ) -> AsyncIterator["UploadMaterialEvent"]:
-        """执行流式 SEC 材料上传。
+        """在首个事件前准入 raw material 请求并执行流。
 
         Args:
-            ticker: 股票代码。
-            action: 可选动作类型。
-            form_type: 材料类型。
-            material_name: 材料名称。
-            files: 可选上传文件列表。
-            document_id: 可选文档 ID。
-            internal_document_id: 可选内部文档 ID。
-            fiscal_year: 可选财年。
-            fiscal_period: 可选财期。
-            filing_date: 可选 filing 日期。
-            report_date: 可选 report 日期。
-            company_id: 可选兼容字段。
-            company_name: 公司名称。
-            ticker_aliases: 可选 ticker alias。
-            overwrite: 是否覆盖。
-            cancellation_checker: 可选协作式取消检查器。
+            request: 原始 material 请求。
+            cancellation_checker: 可选取消检查器。
 
         Yields:
-            上传过程事件。
+            material 上传事件。
 
         Raises:
-            ValueError: 市场类型非法时抛出。
-            RuntimeError: 上传执行失败时抛出。
+            FinsUploadUsageError: 资产规划失败时抛出。
         """
 
+        validated = admit_fins_upload_material_request(request)
+        async for event in self.upload_material_validated_stream(
+            validated, cancellation_checker=cancellation_checker
+        ):
+            yield event
+
+    def upload_material_validated(
+        self,
+        request: ValidatedFinsUploadMaterialRequest,
+        *,
+        cancellation_checker: CancellationToken | None = None,
+    ) -> SecPipelineUploadResult:
+        """同步执行已经准入的 material 请求。
+
+        Args:
+            request: 同一次 Fins 准入的不可变 handoff。
+            cancellation_checker: 可选取消检查器。
+
+        Returns:
+            聚合上传结果。
+
+        Raises:
+            RuntimeError: 同步调用环境已有事件循环时抛出。
+        """
+
+        return _run_async_upload_sync(
+            _collect_upload_result_from_events(
+                self.upload_material_validated_stream(
+                    request, cancellation_checker=cancellation_checker
+                ),
+                stream_name="upload_material_validated_stream",
+            )
+        )
+
+    async def upload_material_validated_stream(
+        self,
+        request: ValidatedFinsUploadMaterialRequest,
+        *,
+        cancellation_checker: CancellationToken | None = None,
+    ) -> AsyncIterator["UploadMaterialEvent"]:
+        """复核并将 validated handoff 传给 SEC workflow。
+
+        Args:
+            request: 同一次 Fins 准入的不可变 handoff。
+            cancellation_checker: 可选取消检查器。
+
+        Yields:
+            material 上传事件。
+
+        Raises:
+            FinsUploadUsageError: handoff 静态准入或规划失败时抛出。
+            RuntimeError: workflow 执行失败时抛出。
+        """
+
+        request.validate()
         async for event in _run_upload_material_stream(
-            self,
-            ticker=ticker,
-            action=action,
-            form_type=form_type,
-            material_name=material_name,
-            files=files,
-            document_id=document_id,
-            internal_document_id=internal_document_id,
-            fiscal_year=fiscal_year,
-            fiscal_period=fiscal_period,
-            filing_date=filing_date,
-            report_date=report_date,
-            company_id=company_id,
-            company_name=company_name,
-            ticker_aliases=ticker_aliases,
-            overwrite=overwrite,
-            cancellation_checker=cancellation_checker,
+            self, request, cancellation_checker=cancellation_checker
         ):
             yield event
 

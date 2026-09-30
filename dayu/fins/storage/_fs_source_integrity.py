@@ -28,13 +28,13 @@ from dayu.fins.domain.enums import SourceKind
 
 from ._fs_identity import (
     _FILING_IDENTITY_NAMESPACE,
-    _IDENTITY_DESCRIPTOR_FILENAME,
     _MATERIAL_IDENTITY_NAMESPACE,
     _TICKER_IDENTITY_NAMESPACE,
     _identity_directory_path,
     _read_identity_descriptor,
     _require_external_identity,
 )
+from .asset_filename_contract import DOCUMENT_SOURCE_CONTROL_FILENAMES
 from ._fs_storage_utils import (
     _DOWNLOAD_REJECTIONS_FILENAME,
     _REJECTED_FILINGS_DIRNAME,
@@ -668,7 +668,7 @@ def _parse_declared_source_files(
             return None
         if (
             name != raw_name
-            or name in {_SOURCE_META_FILENAME, _IDENTITY_DESCRIPTOR_FILENAME}
+            or name in DOCUMENT_SOURCE_CONTROL_FILENAMES
             or name in names
         ):
             return None
@@ -855,7 +855,7 @@ def _validate_physical_structure(
         source_directory,
         action="枚举 source integrity document directory",
     ):
-        if child.name in {_SOURCE_META_FILENAME, _IDENTITY_DESCRIPTOR_FILENAME}:
+        if child.name in DOCUMENT_SOURCE_CONTROL_FILENAMES:
             continue
         child_state = _lstat_optional(child, action="检查 source integrity business entry")
         if child_state is None:

@@ -55,9 +55,9 @@ from dayu.fins.storage import (
     require_source_meta_is_deleted,
 )
 from dayu.fins.ticker_normalization import normalize_ticker
+from dayu.fins.upload_asset_plan import UploadAssetPair, UploadAssetPlan, plan_upload_assets
 from dayu.fins.upload_format_contract import (
     FinsUploadFilingFiles,
-    FinsUploadMaterialFiles,
 )
 from dayu.fins.upload_failure import (
     FinsUploadFailureError,
@@ -75,10 +75,6 @@ from dayu.fins.upload_repair_contract import (
 JsonObject: TypeAlias = dict[str, JsonValue]
 
 UPLOAD_ACTIONS: Final[frozenset[str]] = frozenset({"create", "update", "delete"})
-DOCLING_FILE_SUFFIX: Final[str] = "_docling.json"
-_FILING_ASSET_IDENTITY_NAMESPACE: Final[str] = "fins-upload-asset-v1"
-_FILING_ASSET_IDENTITY_SEPARATOR: Final[bytes] = b"\0"
-_FILING_ORIGINAL_ASSET_PREFIX: Final[str] = "original-"
 _FILING_PRIMARY_ROLE_FINGERPRINT_VERSION: Final[str] = "filing-primary-role-v2"
 _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
@@ -235,15 +231,6 @@ class _PreparedFilingAssetMutation(_PreparedAssetMutation):
             raise TypeError("initial skip disposition 必须是 FilingInitialSkipDisposition")
 
 
-@dataclass(frozen=True)
-class _UploadSelectionPreparation:
-    """Service 入口已收窄的有序 original 与转换输入。"""
-
-    ordered_files: tuple[Path, ...]
-    converter_inputs: tuple[Path, ...]
-    filing_primary: Path | None
-
-
 PreparedDoclingUpload: TypeAlias = UploadOperationResult | _PreparedDeleteMutation | _PreparedAssetMutation
 """Docling 转换完成后交给 top-level publication owner 的 typed plan。"""
 
@@ -376,7 +363,7 @@ class DoclingUploadService:
         document_id: str,
         internal_document_id: str,
         form_type: str,
-        selection: FinsUploadFilingFiles | FinsUploadMaterialFiles,
+        selection: FinsUploadFilingFiles | UploadAssetPlan,
         overwrite: bool,
         previous_meta: Mapping[str, JsonValue] | None,
         meta: Mapping[str, JsonValue],
@@ -392,7 +379,7 @@ class DoclingUploadService:
             document_id: 文档 ID。
             internal_document_id: 内部文档 ID。
             form_type: 文档 form type。
-            selection: 与 ``source_kind`` 一致的 typed 文件选择。
+            selection: material 必须提供准入后的资产计划，delete 提供空计划；filing 提供已判定主文件角色的权威选择。
             overwrite: 是否强制覆盖。
             previous_meta: caller 从当前 state owner 取得的 source meta。
             meta: 业务元数据字段。
@@ -404,32 +391,34 @@ class DoclingUploadService:
 
         Raises:
             KeyError: 既有 source meta 缺少 canonical ``is_deleted`` 时抛出。
-            ValueError: 参数非法，或既有 source meta 的 ``is_deleted`` 非布尔值时抛出。
+            TypeError: 资产计划字段或条目类型非法时抛出。
+            ValueError: 资产计划路径、名称、转换集合、动作或其它参数不一致，或既有 source meta 的 ``is_deleted`` 非布尔值时抛出。
             FileNotFoundError: 需要的文件或文档不存在时抛出。
             FileExistsError: create 目标已存在且不可覆盖时抛出。
             FinsUploadFailureError: filing 为空或无法转换时抛出 typed content failure。
             RuntimeError: 上传失败时抛出。
-            OSError: 仓储读写失败时抛出。
+            OSError: 资产计划路径解析出现循环、其它底层路径操作或仓储读写失败时抛出。
         """
 
-        selection_preparation = _prepare_upload_selection(
+        normalized_action = action.strip().lower()
+        if normalized_action not in UPLOAD_ACTIONS:
+            raise ValueError(f"不支持的 action: {action}")
+        asset_plan = _prepare_upload_asset_plan(
             source_kind=source_kind,
             selection=selection,
+            action=normalized_action,
         )
         if not isinstance(
             repair_disposition,
             (NoExistingSourceRepair, ExistingSourceAutoRepair),
         ):
             raise ValueError("repair_disposition 必须是封闭 repair contract")
-        normalized_action = action.strip().lower()
-        if normalized_action not in UPLOAD_ACTIONS:
-            raise ValueError(f"不支持的 action: {action}")
         if (
             normalized_action == "delete"
             and isinstance(repair_disposition, ExistingSourceAutoRepair)
         ):
             raise ValueError("delete 上传不得携带 existing source repair 授权")
-        is_empty = not selection_preparation.ordered_files
+        is_empty = not tuple(pair.path for pair in asset_plan.ordered_pairs)
         if normalized_action == "delete" and not is_empty:
             raise ValueError("delete 上传必须使用空文件 selection")
         if normalized_action != "delete" and is_empty:
@@ -453,7 +442,7 @@ class DoclingUploadService:
             )
 
         normalized_previous_meta = dict(previous_meta) if previous_meta is not None else None
-        validated_files = _validate_source_files(selection_preparation.ordered_files)
+        validated_files = _validate_source_files(tuple(pair.path for pair in asset_plan.ordered_pairs))
         precondition = evaluate_upload_overwrite_precondition(
             action=normalized_action,
             previous_meta=normalized_previous_meta,
@@ -467,13 +456,13 @@ class DoclingUploadService:
             return _build_cancelled_result(document_id=document_id, internal_document_id=internal_document_id)
 
         original_assets = self._build_original_assets(
-            validated_files,
+            asset_plan.ordered_pairs,
             source_kind=source_kind,
         )
         source_fingerprint = _build_upload_source_fingerprint(
             original_assets,
             source_kind=source_kind,
-            filing_primary=selection_preparation.filing_primary,
+            filing_primary_original_name=asset_plan.filing_primary_original_name,
         )
         initial_skip_disposition = FilingInitialSkipDisposition.NOT_ELIGIBLE
         if _can_skip_upload(
@@ -500,7 +489,7 @@ class DoclingUploadService:
 
         try:
             pending_assets, conversion_events, primary_document = await self._build_pending_assets(
-                selection_preparation,
+                asset_plan,
                 original_assets,
                 source_kind=source_kind,
                 cancellation=cancellation,
@@ -890,14 +879,14 @@ class DoclingUploadService:
 
     def _build_original_assets(
         self,
-        files: list[Path],
+        pairs: tuple[UploadAssetPair, ...],
         *,
         source_kind: SourceKind,
     ) -> list[_PendingFileAsset]:
         """构建原始上传文件资产列表。
 
         Args:
-            files: 源文件列表。
+            pairs: 保序的原件与派生资产身份。
             source_kind: filing 或 material 文档类型。
 
         Returns:
@@ -910,7 +899,8 @@ class DoclingUploadService:
         """
 
         assets: list[_PendingFileAsset] = []
-        for file_path in files:
+        for pair in pairs:
+            file_path = pair.path
             raw_data = file_path.read_bytes()
             if source_kind is SourceKind.FILING and raw_data == b"":
                 raw_basename = file_path.name
@@ -922,11 +912,7 @@ class DoclingUploadService:
                 raise FinsUploadFailureError(fins_upload_empty_input_failure(file_label))
             raw_sha256 = hashlib.sha256(raw_data).hexdigest()
             raw_content_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
-            asset_name = (
-                _build_filing_original_asset_identity(file_path)
-                if source_kind is SourceKind.FILING
-                else file_path.name
-            )
+            asset_name = pair.original_name
             assets.append(
                 _PendingFileAsset(
                     name=asset_name,
@@ -945,7 +931,7 @@ class DoclingUploadService:
 
     async def _build_pending_assets(
         self,
-        preparation: _UploadSelectionPreparation,
+        preparation: UploadAssetPlan,
         original_assets: list[_PendingFileAsset],
         *,
         source_kind: SourceKind,
@@ -954,7 +940,7 @@ class DoclingUploadService:
         """构建待上传资产列表与转换阶段事件。
 
         Args:
-            preparation: 入口 typed selection 投影的 ordered/converter inputs。
+            preparation: 已校验资产计划中的保序原件与转换输入。
             original_assets: 已读取完成的原始文件资产列表。
             source_kind: filing 或 material 文档类型。
             cancellation: 公共取消观察 token；``None`` 表示无取消源。
@@ -970,23 +956,16 @@ class DoclingUploadService:
             ValueError: preparation 与 ``original_assets`` 不一致时抛出。
         """
 
-        if len(preparation.ordered_files) != len(original_assets):
+        if len(preparation.ordered_pairs) != len(original_assets):
             raise ValueError("ordered_files 与 original_assets 数量不一致")
 
         assets = list(original_assets)
         conversion_events: list[UploadFileEventPayload] = []
         primary_document: str | None = None
-        for index, file_path in enumerate(preparation.converter_inputs):
-            if source_kind is SourceKind.FILING:
-                try:
-                    original_index = preparation.ordered_files.index(file_path)
-                except ValueError as exc:
-                    raise ValueError("filing converter input 必须精确命中 original") from exc
-            else:
-                if preparation.ordered_files[index] != file_path:
-                    raise ValueError("material converter_inputs 必须保持 ordered_files 的前缀顺序")
-                original_index = index
-            original_asset = original_assets[original_index]
+        originals_by_name = {asset.name: asset for asset in original_assets}
+        for pair in preparation.converter_pairs:
+            file_path = pair.path
+            original_asset = originals_by_name[pair.original_name]
             if _is_cancelled(cancellation):
                 raise DoclingConversionCancelledError()
             conversion_events.append(
@@ -1021,12 +1000,11 @@ class DoclingUploadService:
                 )
                 raise FinsUploadFailureError(failure) from exc
             docling_data = conversion.json_bytes
+            docling_name = pair.docling_name
             if source_kind is SourceKind.FILING:
-                docling_name = _build_filing_derived_asset_identity(original_asset.name)
                 original_filename = _require_filing_original_filename(original_asset)
-                derived_from = original_asset.name
+                derived_from = pair.original_name
             else:
-                docling_name = f"{file_path.stem}{DOCLING_FILE_SUFFIX}"
                 original_filename = None
                 derived_from = None
             if primary_document is None:
@@ -1468,89 +1446,55 @@ def rollback_prepared_upload_batch(
         raise
 
 
-def _prepare_upload_selection(
+def _prepare_upload_asset_plan(
     *,
     source_kind: SourceKind,
-    selection: FinsUploadFilingFiles | FinsUploadMaterialFiles,
-) -> _UploadSelectionPreparation:
-    """按 source kind 收窄 typed selection 并确定转换输入。
+    selection: FinsUploadFilingFiles | UploadAssetPlan,
+    action: str,
+) -> UploadAssetPlan:
+    """将 filing selection 或 material validated plan 收窄为唯一计划。
 
     Args:
-        source_kind: filing 或 material 来源类型。
-        selection: Fins role owner 产生的 typed selection。
+        source_kind: filing 或 material。
+        selection: filing 角色选择，或 material 准入后的计划。
+        action: 已规范化的 create、update 或 delete 动作。
 
     Returns:
-        保序 original 与 converter inputs。
+        转换和发布共用的不可变资产计划。
 
     Raises:
-        ValueError: source kind 与 selection 具体类型不一致时抛出。
+        ValueError: source kind 与输入类型或计划显式来源身份不一致时抛出。
     """
 
+    if source_kind is SourceKind.MATERIAL:
+        if not isinstance(selection, UploadAssetPlan):
+            raise ValueError("material selection 必须携带 validated asset plan")
+        selection.validate()
+        if selection.source_kind is not SourceKind.MATERIAL:
+            raise ValueError("material selection 必须携带 material 资产计划")
+        if action == "delete" and selection.ordered_pairs:
+            raise ValueError("delete 上传必须使用空文件 selection")
+        if action != "delete" and not selection.ordered_pairs:
+            raise ValueError("create/update 上传必须使用非空文件 selection")
+        return selection
     if source_kind is SourceKind.FILING:
         if not isinstance(selection, FinsUploadFilingFiles):
-            raise ValueError("filing source_kind 必须使用 filing selection")
-        ordered_files = selection.ordered_files
-        filing_primary = None if selection.is_empty else selection.require_primary()
-        converter_inputs = () if filing_primary is None else (filing_primary,)
-        return _UploadSelectionPreparation(
-            ordered_files=ordered_files,
-            converter_inputs=converter_inputs,
-            filing_primary=filing_primary,
+            raise ValueError("filing 必须携带 authoritative selection")
+        if action == "delete" and not selection.is_empty:
+            raise ValueError("delete 上传必须使用空文件 selection")
+        if action != "delete" and selection.is_empty:
+            raise ValueError("create/update 上传必须使用非空文件 selection")
+        operation: Literal["upsert", "delete"] = (
+            "delete" if selection.is_empty else "upsert"
         )
-    if source_kind is SourceKind.MATERIAL:
-        if not isinstance(selection, FinsUploadMaterialFiles):
-            raise ValueError("material source_kind 必须使用 material selection")
-        return _UploadSelectionPreparation(
-            ordered_files=selection.files,
-            converter_inputs=selection.files,
-            filing_primary=None,
+        _, plan = plan_upload_assets(
+            source_kind=SourceKind.FILING,
+            operation=operation,
+            files=selection.ordered_files,
+            filing_selection=selection,
         )
-    raise ValueError(f"不支持的 source_kind: {source_kind}")
-
-
-def _build_filing_original_asset_identity(normalized_path: Path) -> str:
-    """从已规范化绝对路径构建 filing original 仓储身份。
-
-    Args:
-        normalized_path: validated selection 提供的绝对规范路径。
-
-    Returns:
-        不含绝对路径明文、使用完整 SHA-256 的稳定文件身份。
-
-    Raises:
-        TypeError: 输入不是 ``Path`` 时抛出。
-        ValueError: 输入不是 absolute normalized path 时抛出。
-    """
-
-    if not isinstance(normalized_path, Path):
-        raise TypeError("filing asset identity 输入必须是 Path")
-    if not normalized_path.is_absolute() or normalized_path.resolve(strict=False) != normalized_path:
-        raise ValueError("filing asset identity 输入必须是 absolute normalized path")
-    digest_input = (
-        _FILING_ASSET_IDENTITY_NAMESPACE.encode("utf-8")
-        + _FILING_ASSET_IDENTITY_SEPARATOR
-        + normalized_path.as_posix().encode("utf-8")
-    )
-    path_digest = hashlib.sha256(digest_input).hexdigest()
-    return f"{_FILING_ORIGINAL_ASSET_PREFIX}{path_digest}{normalized_path.suffix.lower()}"
-
-
-def _build_filing_derived_asset_identity(original_identity: str) -> str:
-    """从 exact filing original identity 构建 Docling 派生身份。
-
-    Args:
-        original_identity: 同次 preparation 产生的 original 仓储身份。
-
-    Returns:
-        直接追加 Docling 后缀的派生身份。
-
-    Raises:
-        ValueError: original identity 为空或不属于 filing namespace 时抛出。
-    """
-
-    if not original_identity.startswith(_FILING_ORIGINAL_ASSET_PREFIX):
-        raise ValueError("filing derived identity 必须来自 exact original identity")
-    return f"{original_identity}{DOCLING_FILE_SUFFIX}"
+        return plan
+    raise ValueError("不支持的 source_kind")
 
 
 def _require_unique_filing_original_identities(assets: list[_PendingFileAsset]) -> None:
@@ -1652,14 +1596,14 @@ def _build_upload_source_fingerprint(
     assets: list[_PendingFileAsset],
     *,
     source_kind: SourceKind,
-    filing_primary: Path | None,
+    filing_primary_original_name: str | None,
 ) -> _UploadSourceFingerprint:
     """构建上传源指纹。
 
     Args:
         assets: 待上传资产列表。
         source_kind: filing 或 material 来源类型。
-        filing_primary: filing selection 的 authoritative primary；material 必须为 ``None``。
+        filing_primary_original_name: 资产计划中的 filing 主文件原件仓储身份；material 必须为 ``None``。
 
     Returns:
         指纹摘要与 identical-skip 安全性的 typed 结果。
@@ -1672,9 +1616,9 @@ def _build_upload_source_fingerprint(
     if source_kind is SourceKind.FILING:
         if not assets:
             raise ValueError("filing fingerprint 必须携带非空 originals")
-        if filing_primary is None:
+        if filing_primary_original_name is None:
             raise ValueError("filing fingerprint 必须携带 authoritative primary")
-        primary_identity = _build_filing_original_asset_identity(filing_primary)
+        primary_identity = filing_primary_original_name
         primary_matches = [asset for asset in assets if asset.name == primary_identity]
         if len(primary_matches) != 1:
             raise ValueError("filing primary identity 必须 exact 命中一个 original asset")
@@ -1721,7 +1665,7 @@ def _build_upload_source_fingerprint(
             payload = role_payload
             identical_skip_safe = primary_descriptor not in companion_descriptors
     elif source_kind is SourceKind.MATERIAL:
-        if filing_primary is not None:
+        if filing_primary_original_name is not None:
             raise ValueError("material fingerprint 不得携带 filing primary")
         payload = [
             {
@@ -2180,7 +2124,6 @@ def _text_meta(meta: Mapping[str, JsonValue], key: str) -> str:
 
 
 __all__ = [
-    "DOCLING_FILE_SUFFIX",
     "DoclingUploadService",
     "UPLOAD_ACTIONS",
     "UploadFileEventPayload",

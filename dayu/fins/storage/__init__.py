@@ -1,6 +1,7 @@
 """财报仓储子包导出。"""
 
 from .file_store import FileStore
+from .asset_filename_contract import DOCUMENT_SOURCE_CONTROL_FILENAMES
 from .fs_batching_repository import FsBatchingRepository
 from .fs_company_meta_repository import FsCompanyMetaRepository
 from .fs_document_blob_repository import FsDocumentBlobRepository
@@ -45,6 +46,7 @@ from .source_integrity import (
 from .source_meta_contract import require_source_meta_is_deleted
 
 __all__ = [
+    "DOCUMENT_SOURCE_CONTROL_FILENAMES",
     "BatchingRepositoryProtocol",
     "CompanyMetaRepositoryProtocol",
     "CompanyTickerAliasConflictError",

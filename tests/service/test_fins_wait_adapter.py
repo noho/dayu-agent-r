@@ -76,11 +76,10 @@ from dayu.fins.download_contract import (
     FinsDownloadRequest,
     FinsDownloadSource,
     FinsDownloadTerminalDisposition,
-    FinsDownloadTransportCategory,
 )
 from dayu.fins.ingestion_runtime import (
     FinsPreprocessRequest,
-    FinsUploadRequest,
+    FinsRuntimeUploadRequest,
 )
 from dayu.fins.ingestion.awaiting_resolution import AwaitingResolutionMode
 from dayu.fins.tools.download_tools import DOWNLOAD_TOOL_NAME
@@ -956,7 +955,7 @@ class _FakeObservationRuntime(FinsObservationRuntime):
 
     def start_observed_upload(
         self,
-        request: FinsUploadRequest,
+        request: FinsRuntimeUploadRequest,
         cancellation_token: CancellationToken,
     ) -> FinsObservationHandle:
         """启动上传 observation。
@@ -972,7 +971,7 @@ class _FakeObservationRuntime(FinsObservationRuntime):
 
     def prepare_observed_upload(
         self,
-        request: FinsUploadRequest,
+        request: FinsRuntimeUploadRequest,
         cancellation_token: CancellationToken,
     ) -> FinsObservationHandle:
         """登记上传 observation。

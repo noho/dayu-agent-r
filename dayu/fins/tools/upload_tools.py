@@ -23,15 +23,22 @@ from dayu.contracts.tool_outcome import (
 )
 from dayu.contracts.tool_result import ToolResultMeta
 from dayu.contracts.tool_schema import ToolFunctionSchema, ToolParametersSchema, ToolSchema
+from dayu.fins.upload_usage_contract import FinsUploadUsageCategory, FinsUploadUsageError
 from dayu.fins.ingestion_runtime import (
     FinsIngestionRuntime,
     FinsIngestionStartCancelledError,
     FinsUploadFilingRequest,
     FinsUploadMaterialRequest,
+    admit_fins_upload_filing_selection,
+    admit_fins_upload_material_request,
     FinsUploadRequest,
 )
 from dayu.fins.storage import CompanyTickerIdentityCorruptionError
-from dayu.fins.upload_format_contract import FINS_UPLOAD_FORMAT_TEXT
+from dayu.fins.upload_format_contract import (
+    FINS_UPLOAD_FORMAT_TEXT,
+    MAX_FILING_UPLOAD_FILES,
+    MAX_MATERIAL_UPLOAD_FILES,
+)
 from dayu.fins.tools._ingestion_tool_helpers import (
     _awaiting_outcome_from_observation_handle,
     _failed_outcome,
@@ -100,6 +107,15 @@ class FinsUploadToolCallable:
             return _cancelled_outcome(started_at)
         try:
             request = _upload_request_from_arguments(call.arguments)
+            if isinstance(request, FinsUploadMaterialRequest):
+                validated = admit_fins_upload_material_request(request)
+                for path in validated.file_selection.files:
+                    _validate_upload_file_path(path)
+                request = validated
+            else:
+                filing_selection = admit_fins_upload_filing_selection(request)
+                for path in filing_selection.ordered_files:
+                    _validate_upload_file_path(path)
             handle = self.runtime.prepare_observed_upload(
                 request,
                 cancellation_token=cancellation_token,
@@ -113,6 +129,18 @@ class FinsUploadToolCallable:
                 error=_ERROR_JOB_START_FAILED,
                 message="工作区公司代码身份数据损坏，上传任务未启动。",
                 hint="请修复工作区公司元数据后重试。",
+            )
+        except FinsUploadUsageError as exc:
+            return _failed_outcome(
+                tool_name=UPLOAD_TOOL_NAME,
+                started_at=started_at,
+                error=(
+                    exc.failure.code.value
+                    if exc.failure.category is FinsUploadUsageCategory.ASSET_PLAN
+                    else _ERROR_INVALID_ARGUMENT
+                ),
+                message=exc.failure.message,
+                hint=_INVALID_ARGUMENT_HINT,
             )
         except ValueError as exc:
             return _failed_outcome(
@@ -240,7 +268,7 @@ def _upload_parameters_schema() -> ToolParametersSchema:
             "type": "array",
             "description": FINS_UPLOAD_FORMAT_TEXT.upload_tool_files,
             "items": string_items_schema,
-            "maxItems": 100,
+            "maxItems": max(MAX_FILING_UPLOAD_FILES, MAX_MATERIAL_UPLOAD_FILES),
         },
         "primary": {
             "type": "string",
@@ -379,7 +407,7 @@ def _upload_primary_selectors_from_arguments(
         upload_kind: 已由请求 union 边界识别的上传类别。
 
     Returns:
-        filing 未提供 primary 时返回空 tuple，提供时返回单元素规范路径 tuple。
+        filing 未提供 primary 时返回空 tuple，提供时返回单元素原始路径 tuple。
 
     Raises:
         ValueError: primary 不是非空字符串，或 material 请求携带 primary 时抛出。
@@ -390,7 +418,7 @@ def _upload_primary_selectors_from_arguments(
         return ()
     if upload_kind == _UPLOAD_KIND_MATERIAL:
         raise ValueError(FINS_UPLOAD_FORMAT_TEXT.upload_tool_material_primary_failure)
-    return (Path(raw_primary).expanduser().resolve(strict=False),)
+    return (Path(raw_primary),)
 
 
 def _optional_raw_nullable_text(
@@ -470,7 +498,7 @@ def _upload_files_from_arguments(
         action: 已规范化上传动作。
 
     Returns:
-        已 resolve 的上传文件路径元组。
+        待唯一 admission owner 规范化的原始路径。
 
     Raises:
         ValueError: 文件参数类型、文件数量或文件状态非法时抛出。
@@ -483,28 +511,27 @@ def _upload_files_from_arguments(
         return ()
     if not raw_paths:
         raise ValueError("files must contain at least one path for auto, create or update uploads")
-    return tuple(_resolve_upload_file_path(raw_path) for raw_path in raw_paths)
+    return tuple(Path(raw_path) for raw_path in raw_paths)
 
 
-def _resolve_upload_file_path(raw_path: str) -> Path:
-    """解析并校验单个上传文件路径。
+def _validate_upload_file_path(candidate: Path) -> None:
+    """在 material admission 后或 filing 路径解析后检查原有文件状态。
 
     Args:
-        raw_path: 工具参数中的路径文本。
+        candidate: 已解析的上传文件路径。
 
     Returns:
-        已 resolve 的文件路径。
+        无。
 
     Raises:
         ValueError: 路径不是普通文件或文件为空时抛出。
+        OSError: 文件状态读取发生操作性失败时透传。
     """
 
-    candidate = Path(raw_path).expanduser().resolve(strict=False)
     if not candidate.is_file():
         raise ValueError("upload file path must point to an existing file")
     if candidate.stat().st_size <= 0:
         raise ValueError("upload file path must point to a non-empty file")
-    return candidate
 
 
 __all__ = [

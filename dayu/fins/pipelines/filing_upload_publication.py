@@ -18,9 +18,8 @@ from dayu.fins.company_metadata_warning import (
 )
 from dayu.fins.domain.company_meta_contract import CompanyMetaCommitOutcome
 from dayu.fins.domain.document_models import BatchToken
+from dayu.fins.upload_usage_contract import FinsUploadUsageCode, FinsUploadUsageError
 from dayu.fins.ingestion_runtime import (
-    FinsUploadUsageCode,
-    FinsUploadUsageError,
     ValidatedFinsUploadFilingRequest,
     validate_fins_upload_filing_request,
 )

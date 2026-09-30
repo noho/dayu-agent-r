@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dayu.fins.upload_usage_contract import FinsUploadUsageCode, FinsUploadUsageError, fins_upload_usage_failure
+
 import ast
 import io
 import asyncio
@@ -47,6 +49,12 @@ import dayu.fins.download_contract as download_contract
 from dayu.fins.downloaders.sec_downloader import SEC_USER_AGENT_ENV
 from dayu.fins.domain.company_meta_contract import CompanyMetaCommitOutcome
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.upload_asset_plan import FinsUploadAssetPlanError, FinsUploadAssetPlanReason, UploadAssetPair, UploadAssetPlan, filing_original_storage_name, upload_asset_path_identity
+from dayu.fins.upload_format_contract import (
+    FinsUploadFilingFiles,
+    FinsUploadMaterialFiles,
+    MAX_FILING_UPLOAD_FILES,
+)
 from dayu.fins import ingestion_runtime
 from dayu.fins.direct_events import (
     FINS_RESULT_EXIT_FAILURE,
@@ -55,6 +63,7 @@ from dayu.fins.direct_events import (
     FinsDownloadPublicSummary,
     canonicalize_fins_public_file_label,
     FinsDownloadFailureReason,
+    canonicalize_fins_rejected_file_label,
     FinsErrorKind,
     FinsEvent,
     FinsEventType,
@@ -127,19 +136,16 @@ from dayu.fins.ingestion_runtime import (
     FinsSourceDownloadAdapterRequest,
     FinsSourceDownloadAdapterResult,
     FinsUploadFilingRequest,
-    FinsUploadUsageFailure,
-    FinsUploadUsageCode,
-    FinsUploadUsageError,
     ValidatedFinsUploadFilingRequest,
+    ValidatedFinsUploadMaterialRequest,
+    admit_fins_upload_material_request,
     FinsUploadMaterialRequest,
     FinsUploadPipelineResult,
     FinsUploadResultSummary,
     FinsUploadRunner,
     FinsUploadTerminalDisposition,
-    fins_upload_usage_failure,
     validate_fins_upload_filing_request,
 )
-from dayu.fins.pipelines.docling_upload_service import _build_filing_original_asset_identity
 from dayu.fins.upload_failure import (
     FinsUploadFailureCode,
     FinsUploadFailureKind,
@@ -579,6 +585,8 @@ def test_failed_pipeline_result_rejects_unsafe_or_open_failure_json(
         ("财报正文.pdf", "输入文件（文件名已隐藏）"),
         ("line\nbreak.pdf", "输入文件（文件名已隐藏）"),
         ("report\u202ename.pdf", "输入文件（文件名已隐藏）"),
+        ("report\udc80name.pdf", "输入文件（文件名已隐藏）"),
+        ("report\ud800name.pdf", "输入文件（文件名已隐藏）"),
         (f"{'a' * 241}.pdf", "输入文件（文件名已隐藏）"),
     ),
 )
@@ -621,6 +629,8 @@ def test_public_file_label_owner_rejects_non_basename_input(pathful: str) -> Non
 
     with pytest.raises(ValueError):
         canonicalize_fins_public_file_label(pathful)
+
+    assert canonicalize_fins_rejected_file_label(pathful) == "输入文件（文件名已隐藏）"
 
 
 @pytest.mark.parametrize(
@@ -1185,7 +1195,7 @@ def test_filing_workflows_consume_only_typed_admission_failure_before_generic_ha
         (
             pipelines_root / "cn_pipeline.py",
             "CnPipeline",
-            "upload_material_stream",
+            "upload_material_validated_stream",
             ("Exception",),
         ),
     )
@@ -1395,139 +1405,6 @@ def _fail_if_static_admission_probes_path(file_path: Path) -> bool:
     """
 
     raise AssertionError(f"basename admission 前禁止探测文件系统：{file_path!s}")
-
-
-def test_fins_upload_usage_failure_mapping_is_closed_bounded_and_path_free() -> None:
-    """usage code 到可行动文案的 mapping 必须穷尽、短小且不泄漏路径。
-
-    Args:
-        无。
-
-    Returns:
-        无。
-
-    Raises:
-        AssertionError: code 集合、精确文案或安全边界漂移时抛出。
-    """
-
-    expected_codes = {
-        "empty_ticker",
-        "invalid_ticker",
-        "invalid_ticker_alias",
-        "invalid_source_kind",
-        "invalid_action",
-        "too_many_files",
-        "files_not_allowed_for_delete",
-        "duplicate_file_path",
-        "multiple_primary_selectors",
-        "missing_multi_file_primary",
-        "primary_not_in_files",
-        "primary_not_allowed_for_delete",
-        "missing_fiscal_year",
-        "invalid_fiscal_year",
-        "missing_fiscal_period",
-        "fiscal_period_too_long",
-        "unsupported_fiscal_period",
-        "invalid_filing_date",
-        "invalid_report_date",
-        "company_name_too_long",
-        "too_many_ticker_aliases",
-        "missing_files",
-        "invalid_file_basename",
-        "file_not_found",
-        "file_not_regular",
-        "company_name_required",
-        "create_target_exists",
-        "update_target_missing",
-        "existing_source_repair_requires_auto",
-    }
-    assert {code.value for code in FinsUploadUsageCode} == expected_codes
-    exact_messages = {
-        FinsUploadUsageCode.EMPTY_TICKER: "--ticker 不能为空，请提供公司代码",
-        FinsUploadUsageCode.INVALID_TICKER: "--ticker 无法识别，请提供有效公司代码",
-        FinsUploadUsageCode.MISSING_FISCAL_YEAR: "--fiscal-year 不能为空",
-        FinsUploadUsageCode.MISSING_FISCAL_PERIOD: "--fiscal-period 不能为空",
-        FinsUploadUsageCode.MISSING_FILES: "create/update 上传必须提供 --files",
-        FinsUploadUsageCode.FILES_NOT_ALLOWED_FOR_DELETE: "delete 不得提供 --files",
-        FinsUploadUsageCode.DUPLICATE_FILE_PATH: "--files 不能包含解析后相同的重复路径",
-        FinsUploadUsageCode.MULTIPLE_PRIMARY_SELECTORS: "--primary 只能指定一次",
-        FinsUploadUsageCode.MISSING_MULTI_FILE_PRIMARY: "多文件 filing 必须使用 --primary 明确指定主文件",
-        FinsUploadUsageCode.PRIMARY_NOT_IN_FILES: "--primary 必须精确匹配 --files 中的一个文件",
-        FinsUploadUsageCode.PRIMARY_NOT_ALLOWED_FOR_DELETE: "delete 不得提供 --primary",
-        FinsUploadUsageCode.INVALID_FILE_BASENAME: "上传文件名无效；请提供单个非空文件名",
-        FinsUploadUsageCode.COMPANY_NAME_REQUIRED: "当前公司缺少有效元数据；create/update 必须提供 --company-name",
-        FinsUploadUsageCode.INVALID_FISCAL_YEAR: "财年（fiscal_year）必须是 1000..9999 的整数",
-        FinsUploadUsageCode.INVALID_FILING_DATE: "披露日期（filing_date）必须是实际存在的 YYYY-MM-DD 日期",
-        FinsUploadUsageCode.INVALID_REPORT_DATE: "报告期日期（report_date）必须是实际存在的 YYYY-MM-DD 日期",
-        FinsUploadUsageCode.FISCAL_PERIOD_TOO_LONG: "--fiscal-period 长度不能超过 240 个字符",
-        FinsUploadUsageCode.UNSUPPORTED_FISCAL_PERIOD: "--fiscal-period 仅支持 FY、H1、Q1、Q2、Q3、Q4",
-        FinsUploadUsageCode.EXISTING_SOURCE_REPAIR_REQUIRES_AUTO: (
-            "目标 filing 不完整；请使用 auto 并提供完整文件重新上传"
-        ),
-    }
-    for code in FinsUploadUsageCode:
-        if code in {
-            FinsUploadUsageCode.FILE_NOT_FOUND,
-            FinsUploadUsageCode.FILE_NOT_REGULAR,
-        }:
-            failure = fins_upload_usage_failure(code, file_name="report.pdf")
-        else:
-            failure = fins_upload_usage_failure(code)
-        assert failure.code is code
-        assert 0 < len(failure.message) <= 240
-        assert "/Users/" not in failure.message
-        assert "\\" not in failure.message
-        if code in exact_messages:
-            assert failure.message == exact_messages[code]
-    for code in (
-        FinsUploadUsageCode.INVALID_FISCAL_YEAR,
-        FinsUploadUsageCode.INVALID_FILING_DATE,
-        FinsUploadUsageCode.INVALID_REPORT_DATE,
-    ):
-        assert "--" not in fins_upload_usage_failure(code).message
-
-    assert (
-        fins_upload_usage_failure(
-            FinsUploadUsageCode.FILE_NOT_FOUND,
-            file_name="report.pdf",
-        ).message
-        == "上传文件不存在：report.pdf"
-    )
-    assert (
-        fins_upload_usage_failure(
-            FinsUploadUsageCode.FILE_NOT_REGULAR,
-            file_name="report.pdf",
-        ).message
-        == "上传路径不是普通文件：report.pdf"
-    )
-
-
-def test_upload_usage_failure_fact_rejects_open_code_and_unbounded_message() -> None:
-    """usage public fact 必须自身校验 closed code union 与 240 字符消息上界。
-
-    Args:
-        无。
-
-    Returns:
-        无。
-
-    Raises:
-        AssertionError: 直接 dataclass 构造可绕过 closed/bounded invariant 时抛出。
-    """
-
-    invalid_code = cast(
-        FinsUploadUsageCode | FinsUploadFormatFailureKind,
-        "open_code",
-    )
-    with pytest.raises(TypeError, match="closed contract"):
-        FinsUploadUsageFailure(code=invalid_code, message="非法 code")
-    with pytest.raises(ValueError, match="不能为空"):
-        FinsUploadUsageFailure(code=FinsUploadUsageCode.EMPTY_TICKER, message="")
-    with pytest.raises(ValueError, match="长度上限"):
-        FinsUploadUsageFailure(
-            code=FinsUploadFormatFailureKind.PRIMARY_SUFFIX_UNSUPPORTED,
-            message="x" * 241,
-        )
 
 
 @pytest.mark.parametrize("ticker", ("AAPL", "600519", "0700.HK"))
@@ -2627,8 +2504,8 @@ def test_filing_path_identity_is_case_sensitive_and_does_not_merge_hardlinks(
         OSError: 测试平台无法创建 hardlink 时由 pytest 环境抛出。
     """
 
-    assert ingestion_runtime._fins_upload_path_identity(Path("/tmp/Report.pdf")) != (
-        ingestion_runtime._fins_upload_path_identity(Path("/tmp/report.pdf"))
+    assert upload_asset_path_identity(Path("/tmp/Report.pdf")) != (
+        upload_asset_path_identity(Path("/tmp/report.pdf"))
     )
     case_request = FinsUploadFilingRequest(
         ticker="AAPL",
@@ -2732,7 +2609,7 @@ def test_filing_file_count_limit_counts_raw_entries_before_duplicates(
         AssertionError: inclusive 上限或 raw-entry precedence 漂移时抛出。
     """
 
-    files = tuple(tmp_path / f"file-{index:03d}.txt" for index in range(100))
+    files = tuple(tmp_path / f"file-{index:03d}.txt" for index in range(MAX_FILING_UPLOAD_FILES))
     for path in files:
         path.write_text(path.name, encoding="utf-8")
     request = FinsUploadFilingRequest(
@@ -2751,20 +2628,24 @@ def test_filing_file_count_limit_counts_raw_entries_before_duplicates(
             reasons=(),
         ),
     )
-    assert len(accepted.file_selection.ordered_files) == 100
+    assert len(accepted.file_selection.ordered_files) == MAX_FILING_UPLOAD_FILES
     assert accepted.file_selection.primary == files[-1].resolve(strict=False)
+    public_selection = ingestion_runtime.admit_fins_upload_filing_selection(request)
+    assert public_selection == accepted.file_selection
+    assert isinstance(public_selection, FinsUploadFilingFiles)
 
     with pytest.raises(FinsUploadUsageError) as exc_info:
-        ingestion_runtime._filing_upload_request_identity(
+        ingestion_runtime.admit_fins_upload_filing_selection(
             FinsUploadFilingRequest(
                 ticker="AAPL",
-                files=(files[0],) * 101,
+                files=(files[0],) * (MAX_FILING_UPLOAD_FILES + 1),
                 fiscal_year=2024,
                 fiscal_period="FY",
                 company_name="Apple Inc.",
             )
         )
     assert exc_info.value.failure.code is FinsUploadUsageCode.TOO_MANY_FILES
+    assert str(MAX_FILING_UPLOAD_FILES) in exc_info.value.failure.message
 
 
 def test_filing_explicit_roles_control_primary_and_companion_suffixes(
@@ -4356,13 +4237,13 @@ class _FakeUploadRunner(FinsUploadRunner):
         """
 
         self.result_summary = result_summary
-        self.requests: list[ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest] = []
+        self.requests: list[ValidatedFinsUploadFilingRequest | ValidatedFinsUploadMaterialRequest] = []
         self.cancellation_checks: list[bool] = []
         self.cancellation_tokens: list[FinsJobCancellationChecker] = []
 
     def run_upload(
         self,
-        request: ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest,
+        request: ValidatedFinsUploadFilingRequest | ValidatedFinsUploadMaterialRequest,
         *,
         cancellation_checker: FinsJobCancellationChecker,
     ) -> FinsUploadResultSummary:
@@ -4415,7 +4296,7 @@ class _BarrierUploadRunner(FinsUploadRunner):
 
     def run_upload(
         self,
-        request: ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest,
+        request: ValidatedFinsUploadFilingRequest | ValidatedFinsUploadMaterialRequest,
         *,
         cancellation_checker: FinsJobCancellationChecker,
     ) -> FinsUploadResultSummary:
@@ -4436,7 +4317,7 @@ class _BarrierUploadRunner(FinsUploadRunner):
         if not self.release_summary.wait(timeout=1.0):
             raise TimeoutError("upload summary barrier 未释放")
         if self.observe_cancel_before_summary and cancellation_checker():
-            raw_request = request.request if isinstance(request, ValidatedFinsUploadFilingRequest) else request
+            raw_request = request.request
             return FinsUploadResultSummary(
                 source_kind=raw_request.source_kind,
                 status="cancelled",
@@ -4476,11 +4357,11 @@ class _BlockingArtifactUploadRunner(FinsUploadRunner):
         self.artifact_written = Event()
         self.allow_finish = Event()
         self.cancellation_checks: tuple[bool, ...] = ()
-        self.requests: tuple[ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest, ...] = ()
+        self.requests: tuple[ValidatedFinsUploadFilingRequest | ValidatedFinsUploadMaterialRequest, ...] = ()
 
     def run_upload(
         self,
-        request: ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest,
+        request: ValidatedFinsUploadFilingRequest | ValidatedFinsUploadMaterialRequest,
         *,
         cancellation_checker: FinsJobCancellationChecker,
     ) -> FinsUploadResultSummary:
@@ -4499,7 +4380,7 @@ class _BlockingArtifactUploadRunner(FinsUploadRunner):
         """
 
         self.requests = self.requests + (request,)
-        raw_request = request.request if isinstance(request, ValidatedFinsUploadFilingRequest) else request
+        raw_request = request.request
         batch = self.batching_repository.begin_batch(raw_request.ticker)
         try:
             original_name = f"{self.document_id}.md"
@@ -7977,6 +7858,45 @@ def test_start_upload_without_runner_writes_failed_terminal_record(tmp_path: Pat
     assert "production upload runner" in str(record.failure_summary["message"])
 
 
+def test_material_delete_raw_files_keep_authoritative_zero_count_in_job_and_progress(
+    tmp_path: Path,
+) -> None:
+    """delete 的 raw 文件仅作输入守卫，不成为持久摘要和进度的上传数量。
+
+    Args:
+        tmp_path: 隔离文件和运行时工作区。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: selection、job 或 progress 数量真源漂移时抛出。
+    """
+
+    upload_file = tmp_path / "raw.pdf"
+    upload_file.write_bytes(b"valid")
+    workspace_root = tmp_path / "fins-workspace"
+    executor = _HoldingExecutor()
+    runner = _FakeUploadRunner(FinsUploadResultSummary(
+        source_kind=SourceKind.MATERIAL, status="deleted",
+        requested_file_count=0, stored_file_count=0, deleted=True,
+    ))
+    runtime = _build_ingestion_runtime(workspace_root, executor=executor, upload_runner=runner)
+    start = runtime.start_upload(FinsUploadMaterialRequest(
+        ticker="AAPL", action="delete", files=(upload_file,),
+        document_id="aapl-investor-day", form_type="OTHER", material_name="Investor Day",
+    ))
+    queued = runtime.read_job(start.job_id)
+    assert queued.request_summary["file_count"] == 0
+    executor.run_all()
+    completed = runtime.read_job(start.job_id)
+    assert completed.result_summary["requested_file_count"] == 0
+    assert [event.payload["file_count"] for event in _progress_events(runtime, start.job_id)] == [0, 0]
+    assert len(runner.requests) == 1
+    assert isinstance(runner.requests[0], ValidatedFinsUploadMaterialRequest)
+    assert runner.requests[0].asset_plan.ordered_pairs == ()
+
+
 def test_start_upload_with_runner_writes_bounded_result_summary(tmp_path: Path) -> None:
     """上传 runner 结果应按有界 JSON 摘要写入 succeeded 终态。"""
 
@@ -8026,8 +7946,8 @@ def test_start_upload_with_runner_writes_bounded_result_summary(tmp_path: Path) 
     assert record.result_summary["document_version"] == "v2"
     assert record.result_summary["source_fingerprint"] == "sha256:abc123"
     assert len(runner.requests) == 1
-    assert isinstance(runner.requests[0], FinsUploadMaterialRequest)
-    assert runner.requests[0].action == "auto"
+    assert isinstance(runner.requests[0], ValidatedFinsUploadMaterialRequest)
+    assert runner.requests[0].request.action == "auto"
     assert runner.cancellation_checks == [False]
     assert [event.source_event_type for event in progress_events] == [
         "upload.started",
@@ -8114,7 +8034,7 @@ async def test_direct_upload_filing_success_publishes_fins_assets_without_host_o
     published_names = sorted(
         item.uri.rsplit("/", maxsplit=1)[-1] for item in default_runtime.blob_repository.list_files(source_handle)
     )
-    original_identity = _build_filing_original_asset_identity(upload_file.resolve(strict=False))
+    original_identity = filing_original_storage_name(upload_file.resolve(strict=False))
     derived_identity = f"{original_identity}_docling.json"
     assert source_meta["ingest_method"] == "upload"
     assert source_meta["primary_document"] == derived_identity
@@ -9316,7 +9236,7 @@ def test_default_runtime_start_upload_sec_filing_uses_production_runner(tmp_path
     assert record.status is FinsIngestionJobStatus.SUCCEEDED
     assert record.result_summary["source_kind"] == "filing"
     assert record.result_summary["status"] == "ok"
-    original_identity = _build_filing_original_asset_identity(filing_file.resolve(strict=False))
+    original_identity = filing_original_storage_name(filing_file.resolve(strict=False))
     derived_identity = f"{original_identity}_docling.json"
     assert record.result_summary["primary_document"] == derived_identity
     document_id = str(record.result_summary["document_id"])
@@ -9554,11 +9474,11 @@ def test_default_runtime_start_upload_cn_material_uses_production_runner(tmp_pat
     assert record.market == "CN"
     assert record.result_summary["source_kind"] == "material"
     assert record.result_summary["status"] == "ok"
-    assert record.result_summary["primary_document"] == "deck_docling.json"
+    assert record.result_summary["primary_document"] == "deck.pdf_docling.json"
     document_id = str(record.result_summary["document_id"])
     meta = ingestion.source_repository.get_source_meta("600519", document_id, SourceKind.MATERIAL)
     assert meta["material_name"] == "Deck"
-    assert meta["primary_document"] == "deck_docling.json"
+    assert meta["primary_document"] == "deck.pdf_docling.json"
 
 
 def test_upload_request_and_result_summaries_enforce_bounds(tmp_path: Path) -> None:
@@ -9797,10 +9717,13 @@ def test_upload_requests_use_source_kind_for_filing_material_discrimination(tmp_
     with pytest.raises(ValueError, match="material 上传请求必须使用 source_kind=material"):
         runtime.start_upload(FinsUploadMaterialRequest(ticker="AAPL", source_kind=SourceKind.FILING))
 
+    material_file = tmp_path / "material.pdf"
+    material_file.write_bytes(b"valid boundary input")
     material_start = runtime.start_upload(
         FinsUploadMaterialRequest(
             ticker="AAPL",
             source_kind=SourceKind.MATERIAL,
+            files=(material_file,),
             document_id="aapl-investor-day",
         )
     )
@@ -12075,11 +11998,11 @@ class _ForbiddenUploadRunner(FinsUploadRunner):
             无。
         """
 
-        self.requests: list[ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest] = []
+        self.requests: list[ValidatedFinsUploadFilingRequest | ValidatedFinsUploadMaterialRequest] = []
 
     def run_upload(
         self,
-        request: ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest,
+        request: ValidatedFinsUploadFilingRequest | ValidatedFinsUploadMaterialRequest,
         *,
         cancellation_checker: FinsJobCancellationChecker,
     ) -> FinsUploadResultSummary:
@@ -12677,3 +12600,251 @@ def _is_terminal_job_status(status: FinsIngestionJobStatus) -> bool:
         FinsIngestionJobStatus.FAILED,
         FinsIngestionJobStatus.CANCELLED,
     }
+
+
+def test_validated_material_handoff_rejects_cross_field_drift(tmp_path: Path) -> None:
+    """material handoff 构造时拒绝请求、选择和计划的可验证身份漂移。
+
+    Args:
+        tmp_path: 构造不同规范路径的隔离目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: handoff 接受矛盾事实时抛出。
+    """
+
+    paths = (tmp_path / "first.pdf", tmp_path / "second.pdf")
+    admitted = admit_fins_upload_material_request(
+        FinsUploadMaterialRequest(ticker="AAPL", files=paths)
+    )
+    assert tuple(pair.path for pair in admitted.asset_plan.ordered_pairs) == paths
+    wrong_selection = FinsUploadMaterialFiles.from_upsert_paths((paths[1], paths[0]))
+    with pytest.raises(ValueError, match="selection"):
+        replace(admitted, file_selection=wrong_selection)
+    with pytest.raises(ValueError, match="raw request"):
+        replace(admitted, request=replace(admitted.request, files=(paths[0],)))
+    shortened_pairs = admitted.asset_plan.ordered_pairs[:1]
+    with pytest.raises(ValueError, match="asset plan"):
+        replace(admitted, asset_plan=UploadAssetPlan(shortened_pairs, shortened_pairs, None, SourceKind.MATERIAL))
+    copied_pairs = tuple(list(admitted.asset_plan.ordered_pairs))
+    assert copied_pairs is not admitted.asset_plan.ordered_pairs
+    assert replace(
+        admitted, asset_plan=replace(admitted.asset_plan, converter_pairs=copied_pairs)
+    ).asset_plan.converter_pairs == admitted.asset_plan.ordered_pairs
+    with pytest.raises(ValueError, match="保序一致"):
+        replace(
+            admitted,
+            asset_plan=replace(admitted.asset_plan, converter_pairs=tuple(reversed(copied_pairs))),
+        )
+    with pytest.raises(ValueError, match="不得携带 filing 主文件身份"):
+        replace(admitted, asset_plan=replace(admitted.asset_plan, filing_primary_original_name="first.pdf"))
+    wrong_pair = UploadAssetPair(paths[0], "other.pdf", "other.pdf_docling.json")
+    wrong_pairs = (wrong_pair, admitted.asset_plan.ordered_pairs[1])
+    with pytest.raises(ValueError, match="身份不一致"):
+        replace(admitted, asset_plan=UploadAssetPlan(wrong_pairs, wrong_pairs, None, SourceKind.MATERIAL))
+
+    deleted = admit_fins_upload_material_request(
+        FinsUploadMaterialRequest(ticker="AAPL", action="delete", files=paths)
+    )
+    assert deleted.request.files == paths
+    assert deleted.file_selection.is_empty
+    with pytest.raises(ValueError, match="selection"):
+        replace(deleted, file_selection=admitted.file_selection)
+    with pytest.raises(ValueError, match="asset plan"):
+        replace(deleted, asset_plan=admitted.asset_plan)
+
+
+@pytest.mark.parametrize("action", ("create", "delete"))
+@pytest.mark.parametrize("field_name", ("form_type", "material_name"))
+@pytest.mark.parametrize("value", (None, "", " \t "))
+def test_material_identity_remains_outside_static_admission(
+    tmp_path: Path, action: str, field_name: str, value: str | None,
+) -> None:
+    """未实施 O05 时，静态准入保留原始身份和既有执行阶段规则。
+
+    Args:
+        tmp_path: 隔离资产路径。
+        action: create 或 delete。
+        field_name: 待替换的身份字段。
+        value: 缺失或空白原文。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 静态准入提前实施 O05 时抛出。
+    """
+
+    request = FinsUploadMaterialRequest(
+        ticker="AAPL", action=action,
+        files=(tmp_path / "deck.pdf",) if action == "create" else (),
+        form_type="OTHER", material_name="Deck",
+    )
+    request = replace(request, **{field_name: value})
+    validated = admit_fins_upload_material_request(request)
+    if field_name == "form_type":
+        assert validated.request.form_type == value
+    else:
+        assert validated.request.material_name == value
+    validated.validate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pipeline_type", (SecPipeline, CnPipeline))
+@pytest.mark.parametrize("field_name", ("form_type", "material_name"))
+async def test_material_missing_identity_keeps_workflow_failure_boundary(
+    pipeline_type: type[SecPipeline] | type[CnPipeline], field_name: str,
+) -> None:
+    """缺失身份通过静态准入后，仍在原有 SEC/CN workflow 位置失败。
+
+    Args:
+        pipeline_type: SEC 或 CN 公开 pipeline 类型。
+        field_name: 待移除的身份字段。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 身份被提前改成 typed 拒绝或进入事件流时抛出。
+    """
+
+    raw = FinsUploadMaterialRequest(
+        ticker="AAPL" if pipeline_type is SecPipeline else "600519",
+        action="delete", form_type="OTHER", material_name="Deck",
+    )
+    validated = admit_fins_upload_material_request(replace(raw, **{field_name: None}))
+    pipeline = object.__new__(pipeline_type)
+    events: list[str] = []
+    with pytest.raises(ValueError, match="material 上传必须提供 form_type 与 material_name"):
+        async for event in pipeline.upload_material_validated_stream(validated):
+            events.append(str(event))
+    assert events == []
+
+
+def test_material_handoff_constructor_reuses_static_admission_and_full_plan(tmp_path: Path) -> None:
+    """手工同值计划也不得绕过日期、ticker、动作与控制名准入。
+
+    Args:
+        tmp_path: 可规划资产路径的隔离目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 公开构造器接受非法请求时抛出。
+    """
+
+    raw = FinsUploadMaterialRequest(
+        ticker="AAPL", action="create", files=(tmp_path / "deck.pdf",),
+        form_type=" OTHER ", material_name=" Deck ",
+    )
+    valid = admit_fins_upload_material_request(raw)
+    assert valid.request.form_type == " OTHER "
+    assert valid.request.material_name == " Deck "
+    for changed, code in (
+        (replace(raw, filing_date="2024-02-30"), FinsUploadUsageCode.INVALID_FILING_DATE),
+        (replace(raw, report_date="2024-02-30"), FinsUploadUsageCode.INVALID_REPORT_DATE),
+        (replace(raw, ticker="bad ticker"), FinsUploadUsageCode.INVALID_TICKER),
+        (replace(raw, ticker_aliases=("bad alias",)), FinsUploadUsageCode.INVALID_TICKER_ALIAS),
+    ):
+        with pytest.raises(FinsUploadUsageError) as raised:
+            ValidatedFinsUploadMaterialRequest(changed, valid.file_selection, valid.asset_plan)
+        assert raised.value.failure.code is code
+    with pytest.raises(ValueError, match="upload_action"):
+        ValidatedFinsUploadMaterialRequest(
+            replace(raw, action="bogus"), valid.file_selection, valid.asset_plan
+        )
+    with pytest.raises(ValueError, match="source_kind=material"):
+        ValidatedFinsUploadMaterialRequest(
+            replace(raw, source_kind=SourceKind.FILING), valid.file_selection, valid.asset_plan
+        )
+    control = tmp_path / "meta.json"
+    pair = UploadAssetPair(control, control.name, f"{control.name}_docling.json")
+    with pytest.raises(FinsUploadAssetPlanError) as plan_error:
+        UploadAssetPlan((pair,), (pair,), None, SourceKind.MATERIAL)
+    assert plan_error.value.reason is FinsUploadAssetPlanReason.RESERVED_CONTROL_NAME
+    same_value_plan = UploadAssetPlan(
+        valid.asset_plan.ordered_pairs, valid.asset_plan.converter_pairs, None, SourceKind.MATERIAL
+    )
+    object.__setattr__(same_value_plan, "ordered_pairs", (pair,))
+    object.__setattr__(same_value_plan, "converter_pairs", (pair,))
+    with pytest.raises(FinsUploadUsageError) as raised:
+        ValidatedFinsUploadMaterialRequest(
+            replace(raw, files=(control,)),
+            FinsUploadMaterialFiles.from_upsert_paths((control,)),
+            same_value_plan,
+        )
+    assert raised.value.failure.code is FinsUploadUsageCode.RESERVED_CONTROL_NAME
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pipeline_type", (SecPipeline, CnPipeline))
+async def test_public_validated_material_entry_rechecks_handoff_before_first_event(
+    tmp_path: Path,
+    pipeline_type: type[SecPipeline] | type[CnPipeline],
+) -> None:
+    """公开 SEC/CN validated stream 对消费前漂移的 handoff 零事件拒绝。
+
+    Args:
+        tmp_path: 尚未建立的发布根目录。
+        pipeline_type: SEC 或 CN 公开 pipeline 类型。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法日期越过消费 owner 时抛出。
+    """
+
+    validated = admit_fins_upload_material_request(FinsUploadMaterialRequest(
+        ticker="AAPL" if pipeline_type is SecPipeline else "600519",
+        action="delete", form_type="OTHER", material_name="Deck",
+    ))
+    object.__setattr__(validated, "request", replace(validated.request, filing_date="2024-02-30"))
+    pipeline = object.__new__(pipeline_type)
+    events: list[str] = []
+    with pytest.raises(FinsUploadUsageError) as raised:
+        async for event in pipeline.upload_material_validated_stream(validated):
+            events.append(str(event))
+    assert raised.value.failure.code is FinsUploadUsageCode.INVALID_FILING_DATE
+    assert events == []
+    assert not (tmp_path / "portfolio").exists()
+
+
+def test_service_runtime_rechecks_validated_material_before_observation_or_job(tmp_path: Path) -> None:
+    """Service 接收的 handoff 在 observation、job 和材料发布前复核。
+
+    Args:
+        tmp_path: 尚未创建的工作区根目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 漂移的 handoff 创建生命周期事实时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    runtime, executor, state_repository, runner = _build_static_admission_guarded_runtime(workspace_root)
+    validated = admit_fins_upload_material_request(FinsUploadMaterialRequest(
+        ticker="AAPL", action="delete", form_type="OTHER", material_name="Deck",
+    ))
+    object.__setattr__(validated, "request", replace(validated.request, report_date="2024-02-30"))
+    before = _snapshot_runtime_workspace_tree(workspace_root)
+    for entrance in ("direct", "observation", "job"):
+        with pytest.raises(FinsUploadUsageError) as raised:
+            if entrance == "direct":
+                runtime.upload(validated)
+            elif entrance == "observation":
+                runtime.prepare_observed_upload(validated, _NeverCancelledToken())
+            else:
+                runtime.start_upload(validated)
+        assert raised.value.failure.code is FinsUploadUsageCode.INVALID_REPORT_DATE
+    assert state_repository.calls == []
+    assert state_repository.batch_calls == []
+    assert executor.operations == []
+    assert runner.requests == []
+    assert runtime._observations == {}
+    assert _snapshot_runtime_workspace_tree(workspace_root) == before

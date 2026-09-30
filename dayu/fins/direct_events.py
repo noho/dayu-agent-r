@@ -1114,6 +1114,28 @@ def canonicalize_fins_public_file_label(raw_basename: str) -> str:
     return raw_basename
 
 
+def canonicalize_fins_rejected_file_label(raw_basename: str) -> str:
+    """为已拒绝的原始文件名生成安全公开标签。
+
+    Args:
+        raw_basename: 规划失败关联路径的原始文件名。
+
+    Returns:
+        合法形状文件名的 canonical 标签，或固定隐藏标签。
+
+    Raises:
+        TypeError: 输入不是字符串时抛出。
+    """
+
+    if not isinstance(raw_basename, str):
+        raise TypeError("public file label 必须是字符串")
+    try:
+        _validate_public_file_basename_shape(raw_basename)
+    except ValueError:
+        return _HIDDEN_PUBLIC_FILE_LABEL
+    return canonicalize_fins_public_file_label(raw_basename)
+
+
 def validate_fins_public_file_label(value: str) -> None:
     """校验值属于 canonical public file label 的唯一接受集。
 
@@ -1164,7 +1186,7 @@ def _public_file_label_requires_hiding(value: str) -> bool:
         value: 已通过 basename shape 校验的文件名。
 
     Returns:
-        命中长度、Unicode control/format 或既有 public guard 时返回 ``True``。
+        命中长度、Unicode control/format/surrogate 或既有 public guard 时返回 ``True``。
 
     Raises:
         无。
@@ -1172,7 +1194,7 @@ def _public_file_label_requires_hiding(value: str) -> bool:
 
     if len(value) > _MAX_PUBLIC_FILE_LABEL_CHARS:
         return True
-    if any(unicodedata.category(character) in {"Cc", "Cf"} for character in value):
+    if any(unicodedata.category(character) in {"Cc", "Cf", "Cs"} for character in value):
         return True
     try:
         _validate_safe_text(
@@ -1274,5 +1296,6 @@ __all__: tuple[str, ...] = (
     "FinsResultSummary",
     "ValidatedFinsEventStream",
     "canonicalize_fins_public_file_label",
+    "canonicalize_fins_rejected_file_label",
     "validate_fins_public_file_label",
 )

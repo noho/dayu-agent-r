@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import copy
 import io
 import json
 import multiprocessing
@@ -116,6 +117,7 @@ _FilingCleanupCorruption = Literal[
     "rejected_meta",
     "rejected_symlink",
     "rejected_unexpected",
+    "rejected_artifact_unexpected",
     "filing_unexpected",
 ]
 _ProcessedCleanupCorruption = Literal[
@@ -1846,6 +1848,7 @@ def test_maintenance_owner_artifact_reads_cleanup_and_clear_are_guarded(tmp_path
         "rejected_meta",
         "rejected_symlink",
         "rejected_unexpected",
+        "rejected_artifact_unexpected",
         "filing_unexpected",
     ),
 )
@@ -1928,6 +1931,8 @@ def test_filing_clear_preflight_rejects_all_invalid_evidence_before_deletion(
         )
     elif corruption == "rejected_unexpected":
         (rejected_root / "unexpected-file").write_text("unexpected", encoding="utf-8")
+    elif corruption == "rejected_artifact_unexpected":
+        (rejected_dir / "unexpected-file").write_text("unexpected", encoding="utf-8")
     else:
         (filings_root / "unexpected-control").write_text("unexpected", encoding="utf-8")
 
@@ -9141,3 +9146,51 @@ def _raise_replace_error(
 
     del source, target
     raise error
+
+
+@pytest.mark.parametrize("control_name", ("meta.json", ".identity.json"))
+def test_source_integrity_walkers_share_exact_document_controls(
+    tmp_path: Path,
+    control_name: str,
+) -> None:
+    """声明 walker 拒绝控制名，物理 walker 跳过它们且仍检查业务文件。
+
+    Args:
+        tmp_path: 隔离仓储根。
+        control_name: 与业务资产同层的 exact 控制文件名。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 两个 walker 的 exact 行为漂移时抛出。
+    """
+
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    batch = batching.begin_batch("AAPL")
+    _create_complete_source(source, blob, batch=batch, document_id="control-target")
+    batching.commit_batch(batch)
+    source_dir, meta_path, _ = _integrity_source_paths(
+        repository_set.core,
+        document_id="control-target",
+        source_kind=SourceKind.FILING,
+    )
+    assert (source_dir / control_name).is_file()
+    complete = source.classify_source_integrity("AAPL", "control-target", SourceKind.FILING)
+    assert complete.status is SourceIntegrityStatus.COMPLETE
+    original_meta = _read_integrity_json(meta_path)
+    malformed_meta = copy.deepcopy(original_meta)
+    files = _integrity_meta_files(malformed_meta)
+    files[0]["name"] = control_name
+    _write_integrity_json(meta_path, malformed_meta)
+    declared = source.classify_source_integrity("AAPL", "control-target", SourceKind.FILING)
+    assert declared.status is SourceIntegrityStatus.UNSAFE
+    assert SourceIntegrityReason.FILE_DECLARATION_UNTRUSTED in declared.reasons
+    _write_integrity_json(meta_path, original_meta)
+    (source_dir / "unexpected-business.pdf").write_bytes(b"unexpected")
+    physical = source.classify_source_integrity("AAPL", "control-target", SourceKind.FILING)
+    assert physical.status is SourceIntegrityStatus.UNSAFE
+    assert SourceIntegrityReason.UNDECLARED_BUSINESS_FILE in physical.reasons

@@ -11,6 +11,8 @@ import pytest
 from dayu.fins.upload_format_contract import (
     FINS_UPLOAD_FORMAT_CAPABILITY,
     FINS_UPLOAD_FORMAT_TEXT,
+    MAX_MATERIAL_UPLOAD_FILES,
+    MAX_FILING_UPLOAD_FILES,
     FinsUploadFileRole,
     FinsUploadFilingFiles,
     FinsUploadFormatCapability,
@@ -298,6 +300,7 @@ def test_text_projection_is_self_contained_and_uses_exact_suffix_order() -> None
 
     expected_filing_text = (
         "auto/create/update 必须至少提供一个文件。已选主文件必须实际转换成功；"
+        f"filing 一次最多 {MAX_FILING_UPLOAD_FILES} 个文件；"
         "其余文件是仅原样保存、不转换的随附文件。"
         f"主文件支持后缀：{suffix_text}；随附文件支持这些后缀以及 .xsd，且 .xsd 只能作为随附文件。"
         ".xml 仅是 XBRL XML 候选，不代表任意 XML；主文件后缀通过只表示具备转换资格，不保证文件内容转换成功。"
@@ -316,6 +319,11 @@ def test_text_projection_is_self_contained_and_uses_exact_suffix_order() -> None
         f"upload_kind=filing 时，{expected_filing_text}"
         f"upload_kind=material 时，{expected_material_text}"
         "每个路径必须指向已存在、非空的普通文件。"
+        f"material 一次最多 {MAX_MATERIAL_UPLOAD_FILES} 个文件；不同路径的原件不能有相同完整文件名，"
+        "文件名也不能与工作区控制文件（.identity.json、meta.json）或本批原件及转换结果冲突；"
+        "大小写不同的文件名也可能冲突。"
+        "每个转换结果的文件名是完整原件文件名后追加 _docling.json，"
+        "例如 deck.txt 对应 deck.txt_docling.json；请在上传前避开这些冲突。"
     )
     expected_filing_primary_text = (
         "单文件 filing 可省略 --primary，省略时唯一文件就是主文件；"

@@ -1,6 +1,10 @@
 """CnPipeline download facade 行为测试。"""
-
 from __future__ import annotations
+
+from dayu.fins.upload_usage_contract import FinsUploadUsageCode, FinsUploadUsageError
+
+from dayu.fins.upload_format_contract import FinsUploadFormatError
+from dayu.fins.ingestion_runtime import FinsUploadMaterialRequest, ValidatedFinsUploadMaterialRequest
 
 import hashlib
 import json
@@ -23,12 +27,11 @@ from dayu.fins.downloaders.hkexnews_downloader import HkexnewsDiscoveryClient
 from dayu.fins.domain.document_models import CompanyMeta, now_iso8601
 from dayu.fins.ticker_normalization import build_company_ticker_identity
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.upload_asset_plan import filing_original_storage_name
 from dayu.fins.ingestion_runtime import (
     FinsDownloadProgressEvent,
     FinsUploadFilingRequest,
     FinsUploadPipelineResult,
-    FinsUploadUsageCode,
-    FinsUploadUsageError,
     ValidatedFinsUploadFilingRequest,
 )
 from dayu.fins.pipelines.cn_download_models import (
@@ -43,7 +46,6 @@ from dayu.fins.pipelines.cn_pipeline import (
     CnPipelineUploadResult,
     collect_cn_download_result_from_events,
 )
-from dayu.fins.pipelines.docling_upload_service import _build_filing_original_asset_identity
 from dayu.fins.pipelines.docling_process_converter import (
     DoclingConversionCancelledError,
     DoclingConversionConfig,
@@ -1113,16 +1115,7 @@ async def test_upload_material_stream_uploads_files_with_docling(tmp_path: Path)
 
     events = [
         event
-        async for event in pipeline.upload_material_stream(
-            ticker="600519",
-            action="create",
-            form_type="MATERIAL_OTHER",
-            material_name="Roadshow Deck",
-            files=[material_file],
-            company_name="贵州茅台",
-            ticker_aliases=["600519.SH", "MSFT", "V.BA"],
-            overwrite=False,
-        )
+        async for event in pipeline.upload_material_stream(FinsUploadMaterialRequest(ticker="600519", action="create", form_type="MATERIAL_OTHER", material_name="Roadshow Deck", files=(material_file,), company_name="贵州茅台", ticker_aliases=("600519.SH", "MSFT", "V.BA"), overwrite=False))
     ]
 
     assert [event.event_type for event in events] == [
@@ -1173,15 +1166,7 @@ async def test_upload_material_failure_uses_shared_typed_failure_owner(tmp_path:
 
     events = [
         event
-        async for event in pipeline.upload_material_stream(
-            ticker="600519",
-            action="create",
-            form_type="MATERIAL_OTHER",
-            material_name="Roadshow Deck",
-            files=[material_file],
-            company_name=None,
-            overwrite=False,
-        )
+        async for event in pipeline.upload_material_stream(FinsUploadMaterialRequest(ticker="600519", action="create", form_type="MATERIAL_OTHER", material_name="Roadshow Deck", files=(material_file,), company_name=None, overwrite=False))
     ]
 
     result = events[-1].payload["result"]
@@ -1278,28 +1263,9 @@ async def test_upload_material_unsupported_suffix_fails_before_reads_or_mutation
     monkeypatch.setattr(pipeline._batching_repository, "begin_batch", reject_batch)
     monkeypatch.setattr(Path, "read_bytes", reject_file_read)
 
-    events = [
-        event
-        async for event in pipeline.upload_material_stream(
-            ticker="600519",
-            action="create",
-            form_type="MATERIAL_OTHER",
-            material_name="Roadshow Deck",
-            files=[unsupported_file],
-            company_name="贵州茅台",
-        )
-    ]
-    result = events[-1].payload["result"]
-    assert isinstance(result, dict)
-
-    assert [event.event_type for event in events] == [UploadMaterialEventType.UPLOAD_FAILED]
-    assert result["failure"] == {
-        "kind": "usage",
-        "code": "unsupported_upload_format",
-        "message": "文件格式不受支持，请选择支持的文件后重试",
-        "retry_hint": "请查看上传帮助中的支持格式后重试",
-        "file_label": "deck.zip",
-    }
+    with pytest.raises(FinsUploadFormatError) as exc_info:
+        _ = [event async for event in pipeline.upload_material_stream(FinsUploadMaterialRequest(ticker="600519", action="create", form_type="MATERIAL_OTHER", material_name="Roadshow Deck", files=(unsupported_file,), company_name="贵州茅台"))]
+    assert exc_info.value.file_label == "deck.zip"
     assert converter.calls == 0
     assert not (tmp_path / "portfolio" / "600519").exists()
 
@@ -1329,16 +1295,7 @@ async def test_upload_material_alias_conflict_projects_exact_typed_terminal(tmp_
 
     events = [
         event
-        async for event in pipeline.upload_material_stream(
-            ticker="600519",
-            action="create",
-            form_type="MATERIAL_OTHER",
-            material_name="Roadshow Deck",
-            files=[material_file],
-            company_name="贵州茅台",
-            ticker_aliases=["MSFT"],
-            overwrite=False,
-        )
+        async for event in pipeline.upload_material_stream(FinsUploadMaterialRequest(ticker="600519", action="create", form_type="MATERIAL_OTHER", material_name="Roadshow Deck", files=(material_file,), company_name="贵州茅台", ticker_aliases=("MSFT",), overwrite=False))
     ]
 
     result = events[-1].payload["result"]
@@ -1435,7 +1392,7 @@ async def test_upload_filing_stream_auto_resolves_create_update_skip(tmp_path: P
         SourceKind.FILING,
     )
     file_names = sorted(meta.uri.split("/")[-1] for meta in pipeline._blob_repository.list_files(handle))
-    original_identity = _build_filing_original_asset_identity(renamed_file.resolve(strict=False))
+    original_identity = filing_original_storage_name(renamed_file.resolve(strict=False))
     assert file_names == sorted((original_identity, f"{original_identity}_docling.json"))
     assert [event.event_type for event in skip_events] == [
         UploadFilingEventType.UPLOAD_STARTED,
@@ -1851,7 +1808,7 @@ async def test_upload_filing_consumes_fresh_authoritative_file_selection(
 
     assert validator_calls == [request.request]
     assert converter.calls == 1
-    original_identity = _build_filing_original_asset_identity(authoritative_file.resolve(strict=False))
+    original_identity = filing_original_storage_name(authoritative_file.resolve(strict=False))
     assert stored_names == sorted((original_identity, f"{original_identity}_docling.json"))
 
 
@@ -2599,28 +2556,11 @@ async def test_upload_material_stream_overwrite_resets_single_document(tmp_path:
 
     create_events = [
         event
-        async for event in pipeline.upload_material_stream(
-            ticker="600519",
-            action=None,
-            form_type="MATERIAL_OTHER",
-            material_name="Deck",
-            files=[old_file],
-            company_name="贵州茅台",
-            ticker_aliases=["OLD"],
-        )
+        async for event in pipeline.upload_material_stream(FinsUploadMaterialRequest(ticker="600519", action="auto", form_type="MATERIAL_OTHER", material_name="Deck", files=(old_file,), company_name="贵州茅台", ticker_aliases=("OLD",)))
     ]
     overwrite_events = [
         event
-        async for event in pipeline.upload_material_stream(
-            ticker="600519",
-            action=None,
-            form_type="MATERIAL_OTHER",
-            material_name="Deck",
-            files=[new_file],
-            company_name="本次名称不应覆盖 fresh meta",
-            ticker_aliases=["NEW"],
-            overwrite=True,
-        )
+        async for event in pipeline.upload_material_stream(FinsUploadMaterialRequest(ticker="600519", action="auto", form_type="MATERIAL_OTHER", material_name="Deck", files=(new_file,), company_name="本次名称不应覆盖 fresh meta", ticker_aliases=("NEW",), overwrite=True))
     ]
     create_result = create_events[-1].payload["result"]
     overwrite_result = overwrite_events[-1].payload["result"]
@@ -2641,7 +2581,7 @@ async def test_upload_material_stream_overwrite_resets_single_document(tmp_path:
         SourceKind.MATERIAL,
     )
     file_names = sorted(meta.uri.split("/")[-1] for meta in pipeline._blob_repository.list_files(handle))
-    assert file_names == ["deck_new.pdf", "deck_new_docling.json"]
+    assert file_names == ["deck_new.pdf", "deck_new.pdf_docling.json"]
 
 
 @pytest.mark.parametrize(
@@ -2718,3 +2658,107 @@ def test_cn_hk_concurrent_identical_auto_has_one_publish_and_one_skip(
         first_request.document_id,
     )
     assert durable.source_integrity.status is SourceIntegrityStatus.COMPLETE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ticker", ("600519", "0700"))
+async def test_material_101_rejected_before_cn_hk_pipeline_dependencies(
+    tmp_path: Path, ticker: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """101 个真实普通文件在 CN/HK 首事件与仓储、转换依赖前 typed 拒绝。
+
+    Args:
+        tmp_path: 隔离输入路径。
+        ticker: CN 或 HK 代码。
+        monkeypatch: 记录 raw façade 的准入次数。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 数量拒绝晚于 pipeline 依赖时抛出。
+    """
+
+    files = tuple(tmp_path / f"part-{index:03d}.txt" for index in range(101))
+    for path in files:
+        path.write_text("material", encoding="utf-8")
+    pipeline = object.__new__(CnPipeline)
+    admissions: list[FinsUploadMaterialRequest] = []
+    original_admit = cn_pipeline_module.admit_fins_upload_material_request
+
+    def counted_admit(raw: FinsUploadMaterialRequest) -> ValidatedFinsUploadMaterialRequest:
+        """记录并执行真实 material 准入。
+
+        Args:
+            raw: 原始 material 请求。
+
+        Returns:
+            真实准入 handoff。
+
+        Raises:
+            FinsUploadUsageError: 数量违规时透传。
+        """
+
+        admissions.append(raw)
+        return original_admit(raw)
+
+    monkeypatch.setattr(cn_pipeline_module, "admit_fins_upload_material_request", counted_admit)
+    request = FinsUploadMaterialRequest(
+        ticker=ticker,
+        action="create",
+        form_type="FY",
+        material_name="Investor Day",
+        company_name="Test Company",
+        files=files,
+    )
+    with pytest.raises(FinsUploadUsageError) as exc_info:
+        async for _ in pipeline.upload_material_stream(request):
+            pytest.fail("101 个文件不应产生上传事件")
+    assert exc_info.value.failure.code is FinsUploadUsageCode.TOO_MANY_FILES
+    assert admissions == [request]
+
+
+def test_cn_material_sync_delegate_admits_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CN 同步 raw 委托只在底层 stream 做一次准入。
+
+    Args:
+        tmp_path: 构造超量输入的隔离目录。
+        monkeypatch: 记录真实准入调用。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 同步委托重复准入时抛出。
+    """
+
+    request = FinsUploadMaterialRequest(
+        ticker="600519", files=tuple(tmp_path / f"part-{index:03d}.pdf" for index in range(101)),
+    )
+    pipeline = object.__new__(CnPipeline)
+    admissions: list[FinsUploadMaterialRequest] = []
+    original_admit = cn_pipeline_module.admit_fins_upload_material_request
+
+    def counted_admit(raw: FinsUploadMaterialRequest) -> ValidatedFinsUploadMaterialRequest:
+        """记录并执行唯一真实准入。
+
+        Args:
+            raw: 同步入口传入的原始请求。
+
+        Returns:
+            真实准入 handoff。
+
+        Raises:
+            FinsUploadUsageError: 数量违规时透传。
+        """
+
+        admissions.append(raw)
+        return original_admit(raw)
+
+    monkeypatch.setattr(cn_pipeline_module, "admit_fins_upload_material_request", counted_admit)
+    with pytest.raises(FinsUploadUsageError) as exc_info:
+        pipeline.upload_material(request)
+    assert exc_info.value.failure.code is FinsUploadUsageCode.TOO_MANY_FILES
+    assert admissions == [request]

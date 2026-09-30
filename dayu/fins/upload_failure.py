@@ -18,7 +18,13 @@ from dayu.fins.storage import (
     CompanyTickerAliasConflictError,
     CompanyTickerIdentityCorruptionError,
 )
-from dayu.fins.upload_format_contract import FinsUploadFormatError
+from dayu.fins.upload_format_contract import FinsUploadFormatError, MAX_MATERIAL_UPLOAD_FILES
+from dayu.fins.upload_asset_plan import FinsUploadAssetPlanError, FinsUploadAssetPlanReason
+from dayu.fins.upload_usage_contract import (
+    FinsUploadUsageCode,
+    fins_upload_asset_plan_usage_failure,
+    fins_upload_usage_failure,
+)
 from dayu.runtime.filelock import RuntimeFileLockError
 
 _MAX_FAILURE_TEXT_CHARS: Final[int] = 240
@@ -38,6 +44,13 @@ class FinsUploadFailureCode(str, Enum):
     """上传失败的 closed public reason code。"""
 
     UNSUPPORTED_UPLOAD_FORMAT = "unsupported_upload_format"
+    MISSING_FILES = "missing_files"
+    TOO_MANY_FILES = "too_many_files"
+    DUPLICATE_FILE_PATH = "duplicate_file_path"
+    DUPLICATE_ORIGINAL_BASENAME = "duplicate_original_basename"
+    ASSET_NAME_COLLISION = "asset_name_collision"
+    RESERVED_CONTROL_NAME = "reserved_control_name"
+    INVALID_ASSET_NAME = "invalid_asset_name"
     DOCLING_CONVERTER_CONSTRUCTION = "docling_converter_construction"
     DOCLING_CONVERTER_EXECUTION = "docling_converter_execution"
     DOCLING_RESULT_SERIALIZATION = "docling_result_serialization"
@@ -177,7 +190,8 @@ _CONTENT_FAILURE_CODES: Final[frozenset[FinsUploadFailureCode]] = frozenset(
     (*_DOCLING_FAILURE_CODES.values(), FinsUploadFailureCode.EMPTY_INPUT_FILE)
 )
 _USAGE_FAILURE_CODES: Final[frozenset[FinsUploadFailureCode]] = frozenset(
-    {FinsUploadFailureCode.UNSUPPORTED_UPLOAD_FORMAT}
+    {FinsUploadFailureCode.UNSUPPORTED_UPLOAD_FORMAT,
+     *(FinsUploadFailureCode(reason.value) for reason in FinsUploadAssetPlanReason)}
 )
 _STORAGE_FAILURE_CODES: Final[frozenset[FinsUploadFailureCode]] = frozenset(
     {
@@ -229,6 +243,17 @@ def fins_upload_failure_from_exception(
         ValueError: ``file_label`` 未经过唯一 canonicalizer 时抛出。
     """
 
+    if isinstance(error, FinsUploadAssetPlanError):
+        usage, hint = fins_upload_asset_plan_usage_failure(
+            error, max_files=MAX_MATERIAL_UPLOAD_FILES
+        )
+        return FinsUploadFailureReason(
+            kind=FinsUploadFailureKind.USAGE,
+            code=FinsUploadFailureCode(error.reason.value),
+            message=usage.message,
+            retry_hint=hint,
+            file_label=error.file_label,
+        )
     if isinstance(error, FinsUploadFormatError):
         return FinsUploadFailureReason(
             kind=FinsUploadFailureKind.USAGE,
@@ -532,5 +557,11 @@ def _validate_failure_reason_text(value: str, field_name: str) -> None:
 
     if value == "" or len(value) > _MAX_FAILURE_TEXT_CHARS:
         raise ValueError(f"{field_name} 必须为 1..240 字符")
-    if any(ord(character) < 32 for character in value) or "/" in value or "\\" in value:
+    # 既有 MISSING_FILES 文案的 create/update 是固定动作枚举，不是路径。
+    allowed_action_message = fins_upload_usage_failure(FinsUploadUsageCode.MISSING_FILES).message
+    if (
+        any(ord(character) < 32 for character in value)
+        or ("/" in value and (field_name != "failure.message" or value != allowed_action_message))
+        or "\\" in value
+    ):
         raise ValueError(f"{field_name} 禁止控制字符或路径分隔符")

@@ -42,8 +42,9 @@ from dayu.fins.ingestion_runtime import (
     FinsPreprocessRequest,
     FinsUploadFilingRequest,
     FinsUploadMaterialRequest,
-    FinsUploadRequest,
     ValidatedFinsUploadFilingRequest,
+    ValidatedFinsUploadMaterialRequest,
+    admit_fins_upload_material_request,
     validate_fins_upload_filing_request,
 )
 from dayu.fins.domain.document_models import CompanyMeta, SourceDocumentRevision
@@ -71,7 +72,7 @@ class _FakeIngestionRuntime:
 
     download_requests: list[FinsDownloadRequest]
     preprocess_requests: list[FinsPreprocessRequest]
-    upload_requests: list[ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest]
+    upload_requests: list[ValidatedFinsUploadFilingRequest | ValidatedFinsUploadMaterialRequest]
     cancellation_tokens: list[CancellationToken | None]
     events: tuple[FinsEvent, ...]
     stream_error: Exception | None
@@ -147,7 +148,7 @@ class _FakeIngestionRuntime:
 
     def upload(
         self,
-        request: ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest,
+        request: ValidatedFinsUploadFilingRequest | ValidatedFinsUploadMaterialRequest,
         *,
         cancellation_token: CancellationToken | None = None,
     ) -> ValidatedFinsEventStream:
@@ -764,28 +765,12 @@ async def test_upload_methods_build_union_requests(tmp_path: Path) -> None:
         ),
     )
     await _collect_events(service.upload_filing(validated_filing_request))
-    await _collect_events(
-        service.upload_material(
-            ticker="MSFT",
-            action="create",
-            files=(material_file,),
-            form_type="8-K",
-            material_name="Investor Day",
-            document_id="doc-1",
-            internal_document_id="internal-1",
-            fiscal_year=2024,
-            fiscal_period="Q4",
-            filing_date="2025-02-01",
-            report_date="2024-12-31",
-            company_name="Microsoft",
-            ticker_aliases=("MS",),
-            overwrite=True,
-        )
-    )
+    validated_material_request = admit_fins_upload_material_request(FinsUploadMaterialRequest(ticker="MSFT", action="create", files=(material_file,), form_type="8-K", material_name="Investor Day", document_id="doc-1", internal_document_id="internal-1", fiscal_year=2024, fiscal_period="Q4", filing_date="2025-02-01", report_date="2024-12-31", company_name="Microsoft", ticker_aliases=("MS",), overwrite=True))
+    await _collect_events(service.upload_material(validated_material_request))
 
     assert runtime.upload_requests[0] is validated_filing_request
-    assert isinstance(runtime.upload_requests[1], FinsUploadMaterialRequest)
-    assert runtime.upload_requests[1] == FinsUploadMaterialRequest(
+    assert runtime.upload_requests[1] is validated_material_request
+    assert runtime.upload_requests[1].request == FinsUploadMaterialRequest(
         ticker="MSFT",
         source_kind=SourceKind.MATERIAL,
         action="create",

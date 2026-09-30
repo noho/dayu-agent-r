@@ -44,6 +44,11 @@ from dayu.fins.ingestion_runtime import (
     FinsSourceDownloadAdapterRequest,
     FinsSourceDownloadAdapterResult,
     ValidatedFinsUploadFilingRequest,
+    ValidatedFinsUploadMaterialRequest,
+    FinsUploadMaterialRequest,
+    FINS_UPLOAD_ACTION_AUTO,
+    admit_fins_upload_material_request,
+    validated_fins_upload_file_count,
 )
 from dayu.fins.domain.document_models import FinsIngestMethod
 from dayu.fins.domain.enums import SourceKind
@@ -110,7 +115,6 @@ from dayu.fins.storage import (
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
 from dayu.fins.ticker_normalization import normalize_ticker, try_normalize_ticker
-from dayu.fins.upload_format_contract import FinsUploadMaterialFiles
 from dayu.fins.upload_failure import (
     FinsUploadFailureError,
     FinsUploadFailureReason,
@@ -846,7 +850,7 @@ class CnPipeline:
                 "company_name": raw_request.company_name,
                 "ticker_aliases": _json_text_list(list(raw_request.ticker_aliases)),
                 "overwrite": raw_request.overwrite,
-                "file_count": len(raw_request.files),
+                "file_count": validated_fins_upload_file_count(authoritative_request),
             },
         )
         try:
@@ -978,123 +982,122 @@ class CnPipeline:
 
     def upload_material(
         self,
-        ticker: str,
-        action: Optional[str],
-        form_type: str,
-        material_name: str,
-        files: Optional[list[Path]] = None,
-        document_id: Optional[str] = None,
-        internal_document_id: Optional[str] = None,
-        fiscal_year: Optional[int] = None,
-        fiscal_period: Optional[str] = None,
-        filing_date: Optional[str] = None,
-        report_date: Optional[str] = None,
-        company_id: Optional[str] = None,
-        company_name: Optional[str] = None,
-        ticker_aliases: Optional[list[str]] = None,
-        overwrite: bool = False,
+        request: FinsUploadMaterialRequest,
         *,
         cancellation_checker: CancellationToken | None = None,
     ) -> CnPipelineUploadResult:
-        """执行 CN/HK 材料上传并同步返回聚合结果。
+        """同步准入 raw material 请求并执行 CN/HK 上传。
 
         Args:
-            ticker: 股票代码。
-            action: 可选动作类型。
-            form_type: 材料类型。
-            material_name: 材料名称。
-            files: 可选上传文件列表。
-            document_id: 可选文档 ID。
-            internal_document_id: 可选内部文档 ID。
-            fiscal_year: 可选财年。
-            fiscal_period: 可选财期。
-            filing_date: 可选披露日期。
-            report_date: 可选报告日期。
-            company_id: 可选兼容字段。
-            company_name: 公司名称。
-            ticker_aliases: 可选 ticker alias。
-            overwrite: 是否强制覆盖。
-            cancellation_checker: 可选协作式取消检查器。
+            request: 原始 material 请求。
+            cancellation_checker: 可选取消检查器。
 
         Returns:
-            上传结果字典。
+            聚合上传结果。
 
         Raises:
-            RuntimeError: 当前线程存在运行中的事件循环时抛出。
+            FinsUploadUsageError: 资产规划失败时抛出。
+            RuntimeError: 已有运行中事件循环时抛出。
         """
 
         return _run_async_upload_sync(
             collect_cn_upload_result_from_events(
-                self.upload_material_stream(
-                    ticker=ticker,
-                    action=action,
-                    form_type=form_type,
-                    material_name=material_name,
-                    files=files,
-                    document_id=document_id,
-                    internal_document_id=internal_document_id,
-                    fiscal_year=fiscal_year,
-                    fiscal_period=fiscal_period,
-                    filing_date=filing_date,
-                    report_date=report_date,
-                    company_id=company_id,
-                    company_name=company_name,
-                    ticker_aliases=ticker_aliases,
-                    overwrite=overwrite,
-                    cancellation_checker=cancellation_checker,
-                ),
+                self.upload_material_stream(request, cancellation_checker=cancellation_checker),
                 stream_name="upload_material_stream",
             )
         )
 
     async def upload_material_stream(
         self,
-        ticker: str,
-        action: Optional[str],
-        form_type: str,
-        material_name: str,
-        files: Optional[list[Path]] = None,
-        document_id: Optional[str] = None,
-        internal_document_id: Optional[str] = None,
-        fiscal_year: Optional[int] = None,
-        fiscal_period: Optional[str] = None,
-        filing_date: Optional[str] = None,
-        report_date: Optional[str] = None,
-        company_id: Optional[str] = None,
-        company_name: Optional[str] = None,
-        ticker_aliases: Optional[list[str]] = None,
-        overwrite: bool = False,
+        request: FinsUploadMaterialRequest,
         *,
         cancellation_checker: CancellationToken | None = None,
     ) -> AsyncIterator[UploadMaterialEvent]:
-        """执行流式 CN/HK 材料上传。
+        """在首个事件前准入 raw material 请求。
 
         Args:
-            ticker: 股票代码。
-            action: 可选动作类型。
-            form_type: 材料类型。
-            material_name: 材料名称。
-            files: 可选上传文件列表。
-            document_id: 可选文档 ID。
-            internal_document_id: 可选内部文档 ID。
-            fiscal_year: 可选财年。
-            fiscal_period: 可选财期。
-            filing_date: 可选披露日期。
-            report_date: 可选报告日期。
-            company_id: 可选兼容字段。
-            company_name: 公司名称。
-            ticker_aliases: 可选 ticker alias。
-            overwrite: 是否强制覆盖。
-            cancellation_checker: 可选协作式取消检查器。
+            request: 原始 material 请求。
+            cancellation_checker: 可选取消检查器。
 
         Yields:
-            上传过程事件流。
+            CN/HK material 上传事件。
 
         Raises:
-            RuntimeError: 上传执行失败时抛出。
+            FinsUploadUsageError: 资产规划失败时抛出。
         """
 
-        file_list = files or []
+        validated = admit_fins_upload_material_request(request)
+        async for event in self.upload_material_validated_stream(
+            validated, cancellation_checker=cancellation_checker
+        ):
+            yield event
+
+    def upload_material_validated(
+        self,
+        request: ValidatedFinsUploadMaterialRequest,
+        *,
+        cancellation_checker: CancellationToken | None = None,
+    ) -> CnPipelineUploadResult:
+        """同步执行已经准入的 CN/HK material 请求。
+
+        Args:
+            request: 同一次 Fins 准入的 handoff。
+            cancellation_checker: 可选取消检查器。
+
+        Returns:
+            聚合上传结果。
+
+        Raises:
+            RuntimeError: 已有运行中事件循环时抛出。
+        """
+
+        return _run_async_upload_sync(
+            collect_cn_upload_result_from_events(
+                self.upload_material_validated_stream(
+                    request, cancellation_checker=cancellation_checker
+                ),
+                stream_name="upload_material_validated_stream",
+            )
+        )
+
+    async def upload_material_validated_stream(
+        self,
+        request: ValidatedFinsUploadMaterialRequest,
+        *,
+        cancellation_checker: CancellationToken | None = None,
+    ) -> AsyncIterator[UploadMaterialEvent]:
+        """以同一资产计划执行 CN/HK material 上传。
+
+        Args:
+            request: 同一次 Fins 准入的 handoff。
+            cancellation_checker: 可选取消检查器。
+
+        Yields:
+            CN/HK material 上传事件。
+
+        Raises:
+            FinsUploadUsageError: handoff 静态准入或规划失败时抛出。
+            ValueError: handoff 或业务身份输入非法时抛出。
+        """
+
+        request.validate()
+        raw = request.request
+        ticker = raw.ticker
+        action = None if raw.action == FINS_UPLOAD_ACTION_AUTO else raw.action
+        form_type = raw.form_type
+        material_name = raw.material_name
+        if form_type is None or material_name is None:
+            raise ValueError("material 上传必须提供 form_type 与 material_name")
+        document_id = raw.document_id
+        internal_document_id = raw.internal_document_id
+        fiscal_year = raw.fiscal_year
+        fiscal_period = raw.fiscal_period
+        filing_date = raw.filing_date
+        report_date = raw.report_date
+        company_name = raw.company_name
+        ticker_aliases = list(raw.ticker_aliases)
+        overwrite = raw.overwrite
+        file_list = list(request.file_selection.files)
         normalized_ticker = _normalize_upload_ticker(ticker)
         normalized_company_id = build_upload_company_id(normalized_ticker)
         normalized_fiscal_period = str(fiscal_period or "").strip().upper() or None
@@ -1113,11 +1116,7 @@ class CnPipeline:
         requested_action = str(action or "").strip().lower() or None
         resolved_action: str | None = None
         try:
-            selection = (
-                FinsUploadMaterialFiles.for_delete()
-                if requested_action == "delete"
-                else FinsUploadMaterialFiles.from_upsert_paths(tuple(file_list))
-            )
+            selection = request.asset_plan
             previous_meta = self._safe_get_upload_document_meta(
                 normalized_ticker,
                 resolved_document_id,
@@ -1143,7 +1142,7 @@ class CnPipeline:
                     "company_name": company_name,
                     "ticker_aliases": _json_text_list(ticker_aliases),
                     "overwrite": overwrite,
-                    "file_count": len(file_list),
+                    "file_count": validated_fins_upload_file_count(request),
                 },
             )
             company_batch = self._batching_repository.begin_batch(normalized_ticker)

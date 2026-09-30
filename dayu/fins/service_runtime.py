@@ -16,13 +16,13 @@ from dayu.fins.ingestion_runtime import (
     FinsIngestionRuntime,
     FinsJobCancellationChecker,
     FinsUploadFilingRequest,
-    FinsUploadMaterialRequest,
+    ValidatedFinsUploadMaterialRequest,
     FinsUploadPipelineResult,
-    FinsUploadRequest,
     FinsUploadResultSummary,
     FinsUploadRunner,
     FsFinsIngestionJobStore,
     ValidatedFinsUploadFilingRequest,
+    validated_fins_upload_file_count,
     _filing_upload_request_identity,
     validate_fins_upload_filing_request,
 )
@@ -108,7 +108,7 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
 
     def run_upload(
         self,
-        request: ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest,
+        request: ValidatedFinsUploadFilingRequest | ValidatedFinsUploadMaterialRequest,
         *,
         cancellation_checker: FinsJobCancellationChecker,
     ) -> FinsUploadResultSummary:
@@ -127,12 +127,12 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
             OSError: 仓储读写失败时抛出。
         """
 
-        raw_request = request.request if isinstance(request, ValidatedFinsUploadFilingRequest) else request
+        raw_request = request.request
         if cancellation_checker():
             return FinsUploadResultSummary(
                 source_kind=raw_request.source_kind,
                 status="cancelled",
-                requested_file_count=len(raw_request.files),
+                requested_file_count=validated_fins_upload_file_count(request),
                 stored_file_count=0,
                 skip_reason="cancelled",
             )
@@ -143,11 +143,10 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
                 market=normalized.market,
                 cancellation_checker=cancellation_checker,
             )
-            return _upload_summary_from_result(request=raw_request, result=result)
-        if isinstance(request, FinsUploadMaterialRequest):
+            return _upload_summary_from_result(request=request, result=result)
+        if isinstance(request, ValidatedFinsUploadMaterialRequest):
             result = self._run_material_upload(
                 request=request,
-                ticker=normalized.canonical,
                 market=normalized.market,
                 cancellation_checker=cancellation_checker,
             )
@@ -198,16 +197,14 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
     def _run_material_upload(
         self,
         *,
-        request: FinsUploadMaterialRequest,
-        ticker: str,
+        request: ValidatedFinsUploadMaterialRequest,
         market: str,
         cancellation_checker: FinsJobCancellationChecker,
     ) -> FinsUploadPipelineResult:
-        """执行 material 上传 handoff。
+        """把同一次准入的 material handoff 交给对应市场 pipeline。
 
         Args:
-            request: material 上传请求。
-            ticker: canonical ticker。
+            request: 已准入 material 请求。
             market: 归一化市场。
             cancellation_checker: 协作式取消检查器。
 
@@ -215,89 +212,34 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
             typed pipeline 上传结果。
 
         Raises:
-            ValueError: 必填字段缺失或市场不支持时抛出。
+            ValueError: 市场不支持时抛出。
             RuntimeError: pipeline 上传失败时抛出。
-            OSError: 仓储读写失败时抛出。
         """
 
-        if request.form_type is None:
-            raise ValueError("material 上传必须提供 form_type")
-        if request.material_name is None:
-            raise ValueError("material 上传必须提供 material_name")
-        action = _pipeline_upload_action(request.action)
         if market == "US":
-            return FinsUploadPipelineResult.from_pipeline_json(
-                self.sec_pipeline.upload_material(
-                    ticker=ticker,
-                    action=action,
-                    form_type=request.form_type,
-                    material_name=request.material_name,
-                    files=list(request.files),
-                    document_id=request.document_id,
-                    internal_document_id=request.internal_document_id,
-                    fiscal_year=request.fiscal_year,
-                    fiscal_period=request.fiscal_period,
-                    filing_date=request.filing_date,
-                    report_date=request.report_date,
-                    company_name=request.company_name,
-                    ticker_aliases=list(request.ticker_aliases),
-                    overwrite=request.overwrite,
-                    cancellation_checker=cancellation_checker,
-                ),
-                source_kind=SourceKind.MATERIAL,
+            result = self.sec_pipeline.upload_material_validated(
+                request, cancellation_checker=cancellation_checker
             )
-        if market in {"CN", "HK"}:
-            return FinsUploadPipelineResult.from_pipeline_json(
-                self.cn_pipeline.upload_material(
-                    ticker=ticker,
-                    action=action,
-                    form_type=request.form_type,
-                    material_name=request.material_name,
-                    files=list(request.files),
-                    document_id=request.document_id,
-                    internal_document_id=request.internal_document_id,
-                    fiscal_year=request.fiscal_year,
-                    fiscal_period=request.fiscal_period,
-                    filing_date=request.filing_date,
-                    report_date=request.report_date,
-                    company_name=request.company_name,
-                    ticker_aliases=list(request.ticker_aliases),
-                    overwrite=request.overwrite,
-                    cancellation_checker=cancellation_checker,
-                ),
-                source_kind=SourceKind.MATERIAL,
+        elif market in {"CN", "HK"}:
+            result = self.cn_pipeline.upload_material_validated(
+                request, cancellation_checker=cancellation_checker
             )
-        raise ValueError(f"不支持的上传市场: {market}")
-
-
-def _pipeline_upload_action(action: str) -> str | None:
-    """把 runtime upload action 转换为 pipeline action。
-
-    Args:
-        action: runtime action。
-
-    Returns:
-        pipeline action；``auto`` 返回 ``None``。
-
-    Raises:
-        无。
-    """
-
-    normalized = action.strip().lower()
-    if normalized == "auto":
-        return None
-    return normalized
+        else:
+            raise ValueError(f"不支持的上传市场: {market}")
+        return FinsUploadPipelineResult.from_pipeline_json(
+            result, source_kind=SourceKind.MATERIAL
+        )
 
 
 def _upload_summary_from_result(
     *,
-    request: FinsUploadRequest,
+    request: ValidatedFinsUploadFilingRequest | ValidatedFinsUploadMaterialRequest,
     result: FinsUploadPipelineResult,
 ) -> FinsUploadResultSummary:
     """从 typed pipeline 上传结果构建 runtime 摘要。
 
     Args:
-        request: 上传请求。
+        request: 已验证的上传请求。
         result: typed pipeline 上传结果。
 
     Returns:
@@ -308,9 +250,9 @@ def _upload_summary_from_result(
     """
 
     return FinsUploadResultSummary(
-        source_kind=request.source_kind,
+        source_kind=request.request.source_kind,
         status=result.status,
-        requested_file_count=len(request.files),
+        requested_file_count=validated_fins_upload_file_count(request),
         stored_file_count=result.stored_file_count,
         document_id=result.document_id,
         internal_document_id=result.internal_document_id,
