@@ -44,7 +44,7 @@ Issue：`https://github.com/noho/dayu-agent-r/issues/198`。已接受的 S1 修 
 - 点号元数据与 UM-O03 的闭环增量此前已在 PR #197；核实时以线上 commit 与 review artifact 为准，不重复实施。
 - O04/O23 统一资产规划与文件名→Docling 文件名函数的已审代码随 `e215b446` 汇入；按主队列核对其 gate 边界和 O25 primary 选择后续工作，不在旧资产分支再开发。
 - 请求/身份链中的 O05/O06/O09/O10/O12/O16/O17 仍须按唯一 canonical form、日期与 company/source 身份 owner 的依赖顺序实施。O06 用户已选 `material_name` trim 后最多 240 Unicode 码点。O11 的已接受日期校验代码已受控重放到目标分支（`c4c83891`、`e698895a`），整合时保留其前置校验语义；不用再从旧 O11 分支搬代码。O17 是 form 单函数真源，O05 不能再建第二份。
-- O14/O15 的 published state guard 依赖 O12 同版公司/source 单 batch 与可信 COMPLETE tombstone；O18 amended 行为依赖 O12/O14/O15。用户已定同字节仅切 amended：无 `--overwrite` metadata-only 保留内容版本；带 `--overwrite` 强制重新转换并发布，版本按既有指纹规则保持。
+- O14/O15 的 published state guard 依赖 O12 同版状态读取、分阶段公司/材料 guard 与可信 COMPLETE tombstone；**公司与材料保持独立 publication**，合法公司提交后材料转换失败或取消仍保留公司事实，材料无权威 manifest 条目即未成功（O34）。旧“公司/source 单 batch”方案已撤销，不得恢复。O18 amended 行为依赖 O12/O14/O15。用户已定同字节仅切 amended：无 `--overwrite` metadata-only 保留内容版本；带 `--overwrite` 强制重新转换并发布，版本按既有指纹规则保持。
 - O20-F02 按受控 XBRL 支持推进：补齐 Docling/Arelle、taxonomy 和 OS 隔离，验证有效 instance，经 Docling 转换并登记 manifest 才算成功；Docling 抽取正确性归上游。纯合成 typed-member 崩溃已报上游 #4437。O21/O22 typed content failure、O33 同 identity 并发均有依赖，见主队列。
 - CNInfo 公开 `filing_date` 用户已定按中国本地披露日，仅修新发现/新下载；历史已发布迁移另议。它是 #198 验证中发现的独立 WU，不要改写 #198 S2 通过结论。
 
@@ -61,3 +61,18 @@ Issue：`https://github.com/noho/dayu-agent-r/issues/198`。已接受的 S1 修 
 ## 2026-09-30 接续进度（覆盖旧待修快照）
 
 F2两行测试作用域修复已获MiMo/Kimi同版复审和总控局部pass，模块431passed、系统1.1.408受影响文件及项目全量类型0；F3已生成未accepted计划，下一入口Planreview，四脚本尚未改。F4已持久化一致批量读取goal，依赖顺序待计划核实。完整PR仍修复中；F3～F7和原队列未闭环。以 `docs/gateflow/pr-197-review-repair-adjudication-20260930.md` 最新时间线及live Git/runner结果为准，不将旧“在途”或旧head当当前状态。
+
+### 20260930 接续最新 gate 状态（覆盖前述在途状态，不覆盖历史证据）
+
+- 目标分支/PR已推送checkpoint仍bb11ca2257f69ca588fe4d019fec1ee99eace3ce；main未动。只在主工作树开发约束仍有效。
+- F2局部修复及双路复审已通过并进入PR197；完整PR尚未通过。
+- F3 plan经首轮MiMo/Kimi提出A1～A4，Sol仅修文本/类型设计并提供fixartifact。总控独立精确类型检查2文件及离线形状保持验证通过；新plan SHA a88dcf8e...。当前MiMo/Kimi同版窄re-review在途，未acceptedplan/未实施，freeze及原件副本在workspace/tmp。
+- F4首轮两路planreview均fail，总控已纠正自己扩张的整run数学指标。B3持久duplicate影响被真实commit反例驳回；UNSAFE先typed拒绝/损坏原因投影迁移明确纳入，同source跨writer target-only既有局限F4-R01另留后续候选。Sol仅修F4plan在途；A1～A5和routes记录在pr-197-review-repair-adjudication-20260930.md及主队列，尚未实施。
+- F5/F6/F7 goal已登记，尚无acceptedplan/实施；原upload队列和其他WU仍保留，不顺带实现。下一总控先收在途结构化终态/逐项失败/canary/源码freeze，完成窄review后按Gateflow acceptedplancommit→implementation推进。
+- 当前执行方式仍runner子进程，gpt-6-sol plan/implement/fix，MiMo/Kimi双路同时review，总控独立裁决；Kimi真实quota不足才以ds-flash备份并登记。所有dispatch显式绝对cwd、唯一label/instance、独立output/stderr/last；源码冻结和HEAD依赖任务未结束前不提交改变head。
+
+### 最高接续约束：以用户现成裁决为准
+
+用户最新提醒明确“以我的现成裁决为准”。所有review与总控建议只能作为证据，不自行改写业务裁决。F4此前总控自定“HK损坏普通异常迁移为UNSAFE_PUBLICATION”已撤回为未授权建议，禁止实施；当前goal已更正，在途旧hash候选须收取并重新核scope。技术修复优先保全既有owner公开行为；真有新取舍须列出具体原/新行为与裁决来源交用户，未经裁决不推进该变化。历史artifact保留取证，最新总控末节/主队列状态为准。
+
+F3窄复审最新：MiMo215517与Kimi215618已终态pass/无materialfinding，总控独立七inputfreeze/源码/类型保持核对后判plan review gate pass/plan accepted（新plan SHA a88dcf8e...）；**产品未实施**。下一accepted plan commit→Sol implementation，等待仍依赖bb11HEAD的F4旧scope任务终态再提交。F7仅plan并行，相关源码SHA冻结，不能将它说成产品完成。

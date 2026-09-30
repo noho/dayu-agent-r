@@ -559,3 +559,49 @@ PR197-R1/F2 两行 owner 测试作用域修复经 MiMo/Kimi 同版复审，总�
 ## 2026-09-30 F4 依赖预备
 
 F4 的一致批量身份读取目标已登记 `docs/gateflow/pr-197-r1-f4-goal-20260930.md`，尚未plan/实施。F5可信年度证据可能依赖同一storage基础能力，须计划直接核实后决定是否将F4移到F5前；不得把F5实现顺带放进F4。
+
+## 2026-09-30 F7 目标登记
+
+F7status协议owner目标已登记 `docs/gateflow/pr-197-r1-f7-goal-20260930.md`，尚未plan/实施。完整producer词表必须先核实，不能只把三值移到新文件或追加兼容re-export；与F4/F5/F6同workflow修改必须串行。
+
+## 2026-09-30 F5 目标登记
+
+F5目标 `docs/gateflow/pr-197-r1-f5-goal-20260930.md` 已登记，尚未plan/实施；等待F4真实依赖核实。公开“不确定财期报告”必须由计划给明确owner/语义方案，不能伪造document ID或把unknown映射为missing；真正用户可见取舍由总控持具体方案澄清。
+
+## 2026-09-30 F6 目标与原因产生层登记
+
+F6目标 `docs/gateflow/pr-197-r1-f6-goal-20260930.md` 已登记，尚未plan/实施。直接证据确认post-repair新损坏也被workflow抛成RevisionConflict，与真实churn需owner区分，不能只改runtime分类/文案；mid-filing宽catch和已确认rows在同一已登记WU核对。原#198成功事实不改写。
+
+## 2026-09-30 F3 Planreview 首路修复项登记
+
+Kimi report `docs/reviews/plan-review-20260930-205348.md` 有三项plan修复：_manifest消费者后果缺审计、TypedDict必填键未明确、schema顶层Mapping计数类型矛盾。K1/K2已由总控直接核实accepted/未修复，K3在核具体落法，MiMo仍在途；冻结输入不变，不能实施。详见接续总控裁决。
+
+## 2026-09-30 F4 候选计划阻断
+
+Sol候选 `pr-197-r1-f4-plan-20260930.md` 非code-generation-ready，B1完整selected复杂度/发布后重验、B2其他document并发同source绑定、B3无可信meta的错误边界已登记。总控发现整批O(D+S)是自己接续goal新加指标、原F4未承诺，需Planreview核准最小范围后纠正，不为自加指标扩建存储架构。Sol终态及裁决见接续artifact，F4未实施。
+
+## 2026-09-30 F3 双路计划审查裁决
+
+MiMo/Kimi终态均有效，同版plan六文件冻结一致；总控plan gate fail，accepted/未修复A1类型闭合（含Kiminullable建议须修正）、A2_manifest消费者影响、A3A/B重复id/新helper检查、A4无闭包嵌套helper等价搬迁。详见接续裁决。下一入口Sol仅fix plan→同版双路re-review，不实施源码。
+
+## 2026-09-30 HANDOFF-F01 语义纠正
+
+总控直接核实handoff依赖行仍含已撤销O12公司/source单batch，accepted/已修复文档；现明确O34公司独立合法提交与材料同版guard，不回滚公司、不把无manifest材料当成功。证据 `docs/gateflow/pr-197-handoff-scope-correction-20260930.md`，产品未改，原WU状态不提前关闭。
+
+### 20260930 接续：F3 文本修后、F4 双路输入返回
+
+F3-PR1/A1～A4已由Sol修订候选plan/fix artifact（产品未实施），新SHA a88dcf8e...；总控独立2文件类型探针/离线形状保持验证通过。MiMo/Kimi同版窄re-review在途，plan gate尚未放行。F4双路首轮报告212523/212525均已返回fail，目标量化扩张须总控纠正，B3意见冲突须真实commit路径核验后裁决；当前不可实施。所有route/非零事件/冻结证据见pr-197-review-repair-adjudication-20260930.md。
+
+### F4-PR1 合并裁决登记
+
+A1修复goal自加数学指标/矛盾数据流（goal已更正、plan未修）；A2只防新旧快照回归，既有target-only跨writer局限登记F4-R01后续候选；A3不可信库存先typed拒绝，禁止None-as-MISSING、允许既有UNSAFE_PUBLICATION承接HK损坏普通异常，MiMo“持久duplicate”影响被真实commit反例驳回；A4成员资格/directstream/事件窗口边界需钉明；A5 F5依赖仅可信读取原语，不扩F4。全部plan项未修，总控artifact详记两route/canary/反例/裁决，不开始实施。
+
+### 用户现成裁决优先：F4-A3 权限纠正
+
+总控此前自定HK损坏普通异常→UNSAFE_PUBLICATION迁移已撤回为未授权建议，不能作为goal/计划/实现前提。F4-A3只保留UNSAFE不误作MISSING与既有契约不放宽的技术约束；优先同guard batch owner方案保全已裁行为/公开projection。若确实无法保全，具体差异交用户裁决后才可变更。goal最新steering使F4在途上一hash失效，终态收取后恢复输入/重新核scope；原证据不丢，F3复审冻结不受影响。详见总控裁决末节。
+
+F3窄复审MiMo215517已终态pass/无finding，Kimi仍在途，plan尚未通过；F7候选plan已派Sol10158、只文档/源码只读，用户现成status行为保持。F4上一goalhash任务14904仍在途，需恢复最新用户scope后才可再审。产品实施无新增。
+
+F3 MiMo215517/Kimi215618同版窄复审均有效、无新finding，总控独立核SHA/源码/类型保持后判plan review pass、A1～A4仅plan层闭合。F3产品未实施，下一acceptedplancommit→Sol五utils实施；待仍依赖旧HEAD的F4Sol结束再提交，不越gate。Kimi跨cwd PYTHONPATH OQ作为实施harness细节登记，不扩大goal。
+
+F4-PF-B01：Sol14904已终态blocked（goal用户steering后旧授权失效），仅25相关输入不变/产品零修改；新candidate0ebe...为旧scope历史不得实施/直接复审。新scope须保全现成错误/拒绝/继续语义，优先窄同guard batch meta owner接口，真实需要业务取舍才向用户给具体方案。临时privatehelper strict诊断未修，仅1file候选形状类型通过，不冒称全临时代码绿。F3下一acceptedplancheckpoint已无旧HEAD在途障碍。
