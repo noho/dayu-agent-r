@@ -544,3 +544,18 @@ ds-flash 的 HK 年度锚点 Open Question 由 MiMo 与总控升为 F5；mismatc
 - 2026-09-30 r8 MiMo 结构化有效、canary 匹配，报告 `docs/reviews/code-review-20260930-124624.md`，内容零新 material finding；ds-flash I-R29 已接受，所以 r8 双路虽有效但内容 gate 未过。总控在 I-R29 修后主树独立重跑 **1399 passed/1 skipped**、全量 pyright **0 errors/0 warnings**。待新同版双路复审后才能提交/推送；其它未实施 WU 不启动。
 - 2026-09-30 r9 同版 77 文件 MiMo/ds-flash 双路均结构化有效、canary 匹配、零新 material finding；报告 `docs/reviews/code-review-20260930-130612.md` 与 `docs/reviews/code-review-20260930-130001.md`。总控核证 I-R29 三行窄修及指定无回退项，资产 S1 待整合代码 gate 通过；主树 17 文件 **1399 passed/1 skipped**、全量 pyright **0 errors/0 warnings**。下一步只把已完成代码与历史裁决档案暂存、提交、推送至 `codex/upload-material-oracle` 并读回 PR #197；O05/O16/file-state/CNInfo 等未实施 WU 仍排在整合之后，不在本次提交中顺带实现。
 - 2026-09-30 整合提交 `e215b446da89bccfea4856aceaa6dce807659b57` 已普通推送到 `codex/upload-material-oracle`；远端 ref 与 PR #197 head 读回一致，PR OPEN/draft/base main、当时 MERGEABLE；本地/远端 main 均未动，仍 `fac32ecbf...`。233 文件包含所有本轮已完成资产代码、测试和历史裁决档案，提交后工作树干净。最终读回证据另见 `docs/gateflow/upload-material-local-branch-integration-audit-20260930.md`；未实施 WU 待本次分支整合完全落地后再单独推进。
+
+## 2026-09-30 主分支接续与审查路由变更
+
+- 用户重新交由当前总控继续，最新双路并行 review 改为 **MiMo/Kimi**；Sol 继续 plan/implement/fix。Kimi quota 不足时可按此前授权用 ds-flash 备份，原失败与切换必须记录。历史 MiMo/ds-flash 的有效门禁事实不改写。
+- 起点本地/远端/PR197 head 同为 `39216dd6`，主树干净，main 仍 `fac32ecbf`；旧 24 本地分支已按用户授权备份并删除，关联工作树保留 detached，不在旧树开发。后续所有开发仍只在主工作树 `codex/upload-material-oracle`。
+- F2 在当前代码第 6302 行由系统 pyright 1.1.408 直接复现可能未绑定；test owner 修复范围为既有组合矩阵断言作用域，当前为 PR review→fix，待 Sol 修复及 MiMo/Kimi 同版复审。总控 artifact：`docs/gateflow/pr-197-review-repair-adjudication-20260930.md`。F3～F7 继续为优先批次；尚未实施 WU 不顺带开展。
+- F2 候选总控独立 431 passed、全量项目 pyright0、系统1.1.408受影响文件pyright0；尚待 runner终态及 MiMo/Kimi同版复审。F3 goal `pr-197-r1-f3-goal-20260930.md` 已按原 accepted范围确认，下一项 Sol plan，仅参数化样本输入。
+
+## 2026-09-30 F2 局部复审结果
+
+PR197-R1/F2 两行 owner 测试作用域修复经 MiMo/Kimi 同版复审，总控完成外层退出/JSON/canary/冻结输入及独立验证裁决，局部 re-review pass；accepted commit待 F3 plan终态。详见 `docs/gateflow/pr-197-review-repair-adjudication-20260930.md`。完整 PR仍 fail/修复中；F3～F7及原未实施 WU未提前关闭。
+
+## 2026-09-30 F4 依赖预备
+
+F4 的一致批量身份读取目标已登记 `docs/gateflow/pr-197-r1-f4-goal-20260930.md`，尚未plan/实施。F5可信年度证据可能依赖同一storage基础能力，须计划直接核实后决定是否将F4移到F5前；不得把F5实现顺带放进F4。

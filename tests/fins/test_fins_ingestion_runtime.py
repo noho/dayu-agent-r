@@ -6298,8 +6298,8 @@ def test_failed_operation_accepts_only_valid_processed_document_dispositions() -
             replace(result, failure=None)
         with pytest.raises(ValueError, match="only valid for FAILURE"):
             replace(result, status=FinsResultStatus.SUCCESS, exit_code=FINS_RESULT_EXIT_SUCCESS)
-    with pytest.raises(ValueError, match="cannot contain cancelled disposition"):
-        replace(result, download=replace(zero, terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED))
+        with pytest.raises(ValueError, match="cannot contain cancelled disposition"):
+            replace(result, download=replace(zero, terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED))
 
 
 def test_initial_typed_download_job_saves_structured_zero_summary_and_safe_message(tmp_path: Path) -> None:
