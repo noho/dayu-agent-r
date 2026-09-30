@@ -8,14 +8,14 @@
 | WU | 当前入口 | 活动 runner / 后续 |
 | --- | --- | --- |
 | F2 | 局部闭环 | 不代表整个PR通过 |
-| F3 | A1/C02计划同版窄re-review | MiMo37382/beVOeR＋ds-flash59412/nSprNb，24readonly；plan38d11562，C01/C02源码未修 |
-| F4 | A1/N1/PV02窄复审待双审名额 | f17c95f4计划候选保留，PV02报告根accepted，产品未实施 |
-| F7 | accepted deepreview commit待创建 | MiMo27939/DS11340均outer0＋root aggregate pass；下一沿用draftPR197进入PR review，未finalcloseout |
-| F5 | plan候选在途 | Sol11838/afAcYs，34readonly SHA；只写计划，不实施共享CN源码 |
+| F3 | F3-PR3-A1计划文字fix | 原两路已outer0/根合并：A1/C02主体已修候选；Sol99211/e3CL7a仅文字fix，26readonly/27originals；源码未修 |
+| F4 | A1/N1/PV02同版窄re-review | MiMo56477/eRwdWW＋DS23813/mWvCxQ在途，41readonly/f17保持，源码未实施 |
+| F7 | PR review待审查名额 | accepted deepreview2cc2f5ed已push/readback；沿用draftPR197，下一PR review，未finalcloseout |
+| F5 | proposal待公开行为裁决 | Sol11838已outer0；根34SHA/77JSONL核收，Q1已问用户，Q2/Q3已技术裁决；N01/N02accepted未修 |
 | F6 | goal已有，尚未plan / 实施 | 共同CN源码串行 |
 | 原upload及独立WU队列 | 未顺带实施 | 按既有裁决和主队列依赖继续 |
 
-唯一开发主树codex/upload-material-oracle，main fac32ecbf未动；当前已提交本地/远端/PR head31473fe1，未提交候选保留待审。所有runner显式主树绝对cwd、独立output/stderr、唯一label，根核验真实外层退出/完整结构化结果/令牌/源码与validation后裁决。原Kimi47199 API403五小时quota硬拒收保留；尚无额度恢复证据，已授权ds-flash备份用于本组审查。无关docscheckpoint允许HEAD推进，但24/34相关只读SHA不放宽；F5在途时不启动F4共享CN写入。
+唯一开发主树codex/upload-material-oracle，main fac32ecbf未动；当前已提交本地/远端/PR head2cc2f5ed，未提交候选保留待审。所有runner显式主树绝对cwd、独立output/stderr、唯一label，根核验真实外层退出/完整结构化结果/令牌/源码与validation后裁决。原Kimi47199 API403五小时quota硬拒收保留；尚无额度恢复证据，已授权ds-flash备份用于本组审查。无关docscheckpoint允许HEAD推进，但F3 26/F4 41相关只读SHA不放宽；F5已退出，不把未accepted proposal当实施许可。
 <!-- PR197_LIVE_GATE_STATUS_END -->
 
 
@@ -693,3 +693,18 @@ F3计划fix根完整核收docs/gateflow/pr-197-r1-f3-plan-collision-receipt-2026
 ### 2026-10-01 03:22:15 F7 aggregate与下一组审查
 
 F7独立MiMo/授权ds-flash备份双审均outer0，根完整证据核验无新materialfinding，aggregate gate pass，详pr-197-r1-f7-aggregate-review-adjudication-20261001.md。Kimi403额度拒收保持。当前F3 A1/C02同版24SHA窄Planreview已独立派发37382/59412；Sol F5 11838仍仅计划34SHA，不写共享CN。F3代码未修、F4计划未accepted、F7 PR review与finalcloseout未完成，全PR不报通过。
+
+
+2026-10-01 03:27:05 已普通push并独立读回accepted F7 deepreview commit2cc2f5ed，本地/tracking/live/PR197同head、mainfac32未改。F7下一PR review仍待，原F3/F4/F5/F6及其它queue未顺带完成；三活动runner仍37382/59412/11838。
+
+
+2026-10-01 03:30:38 新修复项F3-PR3-A1低／accepted／未修（计划）：公共分组接口docstring OSError透传与判据ValueError补上下文互斥。DS59412 outer0/77turns/tokenmatch，根24SHA/报告/类型matrix核收；详docs/gateflow/pr-197-r1-f3-exception-contract-adjudication-20261001.md。MiMo37382仍在途，不动冻结plan/source，合并后Sol最小文字fix/窄re-review，不能因reviewerpass-with-risks而gatepass。
+
+
+2026-10-01 03:38:08 F5 Sol11838 outer0返回d3ce4805 proposal，根77JSONL/34live+original/token/fullreport/probe核验。N01低/N02中accepted未修，N03资料gap待核，独立登记docs/gateflow/pr-197-r1-f5-plan-adjudication-20261001.md。Q1混合已知/未知报告是否继续已知已具体异步问用户，Q2直接输入读取错误原样/Q3同证据集合一致及新冲突不猜由根按原goal收敛；依赖Q1的实现不启动。F3MiMo37382仍在途，DS59412新文字finding已登记；继续不依赖Q1的F3/F4。
+
+
+2026-10-01 03:41:37 F5仅proposal交付已终态，不占活动名额；两个空位已独立派F4 MiMo56477/eRwdWW＋授权DS备份23813/mWvCxQ同版窄re-review，41SHA及originals根派前保持。旧Kimi z7Je2f只有预检从未launch，不能报告完成。当前三活动均review：F3MiMo37382、F4MiMo56477/DS23813；F3计划writer等待前一路退出，F5依赖Q1待答，产品源码当前没有writer。
+
+
+2026-10-01 03:47:24 F3两路均outer0，MiMo49turns无新materialfinding，根全24SHA/report核收；DS低F3-PR3-A1依旧accepted未修，所以re-review gate未pass。Sol99211/e3CL7a现仅修该异常docstring/私有stat整体委托文字/真实来源行号，26readonly27originals冻结，不改源码。三活动为Sol99211与F4MiMo56477/DS23813；F5Q1待用户。
