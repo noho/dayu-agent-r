@@ -11,7 +11,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from types import TracebackType
-from typing import BinaryIO, Optional, cast
+from typing import BinaryIO, Literal, Optional, cast
 
 import pytest
 
@@ -1198,6 +1198,8 @@ def test_cn_bare_download_consumes_policy_for_query_filters_and_missing(tmp_path
     assert isinstance(start_dates, dict)
     assert set(start_dates) == {"FY", "H1", "Q1", "Q3"}
     assert result["missing_periods"] == ["FY", "H1", "Q1", "Q3"]
+    assert result["status"] == "ok"
+    assert type(result["status"]) is str
 
 
 def test_cn_bare_download_projects_actual_default_period_window_start_dates(
@@ -2372,7 +2374,18 @@ def test_cn_rebuild_producer_always_emits_required_missing_periods(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """零文档、匹配、失败文档与取消结果都由 producer 直接发必填字段。"""
+    """零文档、匹配、失败文档与取消结果直接保全顶层终态及必填字段。
+
+    Args:
+        tmp_path: 隔离真实仓储根。
+        monkeypatch: 仅在 source 读取边界构造缺失 form 的文档。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 顶层终态、文档失败行或必填字段漂移时抛出。
+    """
 
     empty_pipeline = _build_pipeline(
         tmp_path=tmp_path / "empty",
@@ -2390,6 +2403,8 @@ def test_cn_rebuild_producer_always_emits_required_missing_periods(
         pipeline_name="cn",
     )
     assert empty_result["missing_periods"] == []
+    assert empty_result["status"] == "ok"
+    assert type(empty_result["status"]) is str
 
     pipeline = _build_pipeline(
         tmp_path=tmp_path / "seeded",
@@ -2408,6 +2423,8 @@ def test_cn_rebuild_producer_always_emits_required_missing_periods(
         pipeline_name="cn",
     )
     assert matching_result["missing_periods"] == []
+    assert matching_result["status"] == "ok"
+    assert type(matching_result["status"]) is str
 
     original_get_meta = pipeline.source_repository.get_source_meta
 
@@ -2416,7 +2433,19 @@ def test_cn_rebuild_producer_always_emits_required_missing_periods(
         document_id: str,
         source_kind: SourceKind,
     ) -> dict[str, JsonValue]:
-        """返回删除必填 form_type 的 source meta。"""
+        """在读取边界返回删除必填 form_type 的合成文档元数据。
+
+        Args:
+            ticker: 当前股票代码。
+            document_id: 当前来源文档 ID。
+            source_kind: 来源种类。
+
+        Returns:
+            仅缺失 form_type 的元数据副本。
+
+        Raises:
+            OSError: 原仓储读取异常原样传播。
+        """
 
         meta = dict(original_get_meta(ticker, document_id, source_kind))
         meta.pop("form_type", None)
@@ -2434,6 +2463,8 @@ def test_cn_rebuild_producer_always_emits_required_missing_periods(
         pipeline_name="cn",
     )
     assert failed_result["missing_periods"] == []
+    assert failed_result["status"] == "ok"
+    assert type(failed_result["status"]) is str
     failed_filings = failed_result["filings"]
     assert isinstance(failed_filings, list)
     assert isinstance(failed_filings[0], dict)
@@ -2452,6 +2483,7 @@ def test_cn_rebuild_producer_always_emits_required_missing_periods(
         cancel_checker=lambda: True,
     )
     assert cancelled_result["status"] == "cancelled"
+    assert type(cancelled_result["status"]) is str
     assert cancelled_result["missing_periods"] == []
 
 
@@ -2517,6 +2549,173 @@ def test_cn_hk_bare_rebuild_is_local_only_and_always_has_empty_missing(
     assert filters["forms"] == expected_forms
     assert set(start_dates) == expected_discovery
     assert result["missing_periods"] == []
+    assert result["status"] == "ok"
+    assert type(result["status"]) is str
+    assert discovery.queries == []
+    assert discovery.download_calls == 0
+    assert converter.calls == 0
+
+    # 先用合成下载链路建立真实本地文档；取消测试必须命中文档循环，避免改变空库语义。
+    discovery.candidates = (_candidate(provider="cninfo" if market == "CN" else "hkexnews"),)
+    asyncio.run(_collect_events_async(
+        pipeline=pipeline, ticker=ticker, form_type="FY", start_date="2024", end_date="2026",
+        overwrite=False, start_is_explicit=True,
+    ))
+    assert pipeline.source_repository.list_source_document_ids(ticker, SourceKind.FILING)
+    prior_queries = tuple(discovery.queries)
+    prior_download_calls = discovery.download_calls
+    prior_converter_calls = converter.calls
+    cancelled_result = _cn_download_rebuild.rebuild_cn_download_artifacts(
+        host=pipeline, ticker=ticker, market=market, form_type=None,
+        start_date="2024", end_date="2026", overwrite=False,
+        pipeline_name="cn" if market == "CN" else "hk", cancel_checker=lambda: True,
+    )
+    assert cancelled_result["status"] == "cancelled"
+    assert type(cancelled_result["status"]) is str
+    assert cancelled_result["missing_periods"] == []
+    assert tuple(discovery.queries) == prior_queries
+    assert discovery.download_calls == prior_download_calls
+    assert converter.calls == prior_converter_calls
+
+
+@dataclass(frozen=True)
+class _RebuildFailureProbe:
+    """仅在仓储读取或取消检查边界提供预构造异常，不替换生产状态语义。"""
+
+    failure: Exception
+
+    def read_meta(self, ticker: str, document_id: str, source_kind: SourceKind) -> dict[str, JsonValue]:
+        """模拟仓储读失败并保留原异常对象。
+
+        Args:
+            ticker: 仓储调用的股票代码。
+            document_id: 来源文档 ID。
+            source_kind: 来源种类。
+
+        Returns:
+            不返回；读取边界始终抛出指定异常。
+
+        Raises:
+            Exception: 预构造的原始仓储异常。
+        """
+
+        del ticker, document_id, source_kind
+        raise self.failure
+
+    def check_cancel(self) -> bool:
+        """模拟非取消 checker 失败并保留原异常对象。
+
+        Args:
+            无。
+
+        Returns:
+            不返回；检查边界始终抛出指定异常。
+
+        Raises:
+            Exception: 预构造的非取消检查异常。
+        """
+
+        raise self.failure
+
+
+@pytest.mark.parametrize("market", ("CN", "HK"))
+@pytest.mark.parametrize("operation", ("read", "checker"))
+def test_cn_hk_rebuild_preserves_read_and_checker_failure_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    market: CnMarketKind,
+    operation: Literal["read", "checker"],
+) -> None:
+    """真实本地 rebuild 不把仓储或 checker 原异常转换成顶层结果。
+
+    Args:
+        tmp_path: 隔离真实仓储根。
+        monkeypatch: 仅读取边界注入原异常。
+        market: 待验证市场。
+        operation: 原样失败的边界。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 原异常 identity 或 local-only 行为漂移时抛出。
+    """
+
+    ticker = "600519" if market == "CN" else "0700"
+    discovery = _FakeDiscoveryClient(
+        temp_dir=tmp_path,
+        candidates=(_candidate(provider="cninfo" if market == "CN" else "hkexnews"),),
+    )
+    converter = _FakeConverter()
+    pipeline = _build_pipeline(
+        tmp_path=tmp_path, discovery=discovery, hk_discovery=discovery, converter=converter,
+    )
+    asyncio.run(_collect_events_async(
+        pipeline=pipeline, ticker=ticker, form_type="FY", start_date="2024", end_date="2026",
+        overwrite=False, start_is_explicit=True,
+    ))
+    prior_calls = (tuple(discovery.queries), discovery.download_calls, converter.calls)
+    expected = OSError("synthetic source read failure") if operation == "read" else ValueError(
+        "synthetic rebuild checker failure"
+    )
+    probe = _RebuildFailureProbe(expected)
+    if operation == "read":
+        monkeypatch.setattr(pipeline.source_repository, "get_source_meta", probe.read_meta)
+    with pytest.raises(type(expected)) as exc_info:
+        pipeline.download(
+            ticker=ticker, form_type="FY", start_date="2024", end_date="2026",
+            rebuild=True, start_is_explicit=True,
+            cancel_checker=probe.check_cancel if operation == "checker" else None,
+        )
+    assert exc_info.value is expected
+    assert (tuple(discovery.queries), discovery.download_calls, converter.calls) == prior_calls
+
+
+@pytest.mark.parametrize(
+    ("ticker", "form_type", "start_date", "end_date"),
+    (
+        ("invalid-ticker", "FY", "2024", "2026"),
+        ("600519", "invalid-form", "2024", "2026"),
+        ("600519", "FY", "2024-02-30", "2026"),
+        ("600519", "FY", "2024", "2026-02-30"),
+    ),
+)
+@pytest.mark.parametrize("rebuild", (False, True))
+def test_cn_workflow_early_invalid_parameters_remain_exceptions(
+    tmp_path: Path,
+    ticker: str,
+    form_type: str,
+    start_date: str,
+    end_date: str,
+    rebuild: bool,
+) -> None:
+    """非法 ticker、form 或日期在业务执行前抛错，不生成新终态结果。
+
+    Args:
+        tmp_path: 隔离真实仓储根。
+        ticker: 原始股票代码。
+        form_type: 原始财期参数。
+        start_date: 原始起始日期。
+        end_date: 原始结束日期。
+        rebuild: 是否走本地重建入口。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法参数被转换为结果或执行了 provider/converter 时抛出。
+    """
+
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=())
+    converter = _FakeConverter()
+    pipeline = _build_pipeline(
+        tmp_path=tmp_path, discovery=discovery, hk_discovery=discovery, converter=converter,
+    )
+    with pytest.raises(ValueError):
+        pipeline.download(
+            ticker=ticker, form_type=form_type, start_date=start_date, end_date=end_date,
+            rebuild=rebuild, start_is_explicit=True,
+        )
     assert discovery.queries == []
     assert discovery.download_calls == 0
     assert converter.calls == 0
@@ -2968,6 +3167,8 @@ def test_cn_post_repair_company_preswap_typed_spy_preserves_snapshot_and_chain(
     assert company_intents == [True]
     assert abort.cause is preflight_error
     assert abort.cause.__cause__ is cleanup_error
+    assert abort.result["status"] == "integrity_failed"
+    assert type(abort.result["status"]) is str
     rows = abort.result["filings"]
     assert isinstance(rows, list) and len(rows) == 1
     assert isinstance(rows[0], dict) and rows[0]["status"] == "downloaded"

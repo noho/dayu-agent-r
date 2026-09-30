@@ -16,8 +16,11 @@ from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.document_models import FinsIngestMethod, FilingUpdateRequest, now_iso8601
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.pipelines.cn_download_models import (
+    CN_DOWNLOAD_TERMINAL_CANCELLED,
+    CN_DOWNLOAD_TERMINAL_OK,
     CN_FISCAL_PERIOD_ORDER,
     CN_PIPELINE_DOWNLOAD_VERSION,
+    CnDownloadTerminalStatus,
     CnFiscalPeriod,
     CnMarketKind,
 )
@@ -109,10 +112,13 @@ def rebuild_cn_download_artifacts(
     if cancelled:
         note_values.append("cancelled")
     filing_values: list[JsonValue] = [filing for filing in filings]
+    terminal_status: CnDownloadTerminalStatus = (
+        CN_DOWNLOAD_TERMINAL_CANCELLED if cancelled else CN_DOWNLOAD_TERMINAL_OK
+    )
     result: JsonObject = {
         "pipeline": pipeline_name,
         "action": "download",
-        "status": "cancelled" if cancelled else "ok",
+        "status": terminal_status,
         "ticker": ticker,
         "company_info": {},
         "filters": {

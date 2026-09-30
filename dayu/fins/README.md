@@ -858,6 +858,8 @@ Read tools 的 schema、错误和结果字段必须面向 LLM 自解释。工具
 
 `FinsIngestionRuntime` 通过 typed `FinsDownloadRequest` 的 `(source, market)` 选择 `FinsSourceDownloadAdapter`。当前默认 runtime 注册 `(sec, US)` / `(auto, US)` 到同一个 SEC production adapter，注册 `(cninfo, CN)` / `(auto, CN)` 到同一个巨潮 production adapter，注册 `(hkexnews, HK)` / `(auto, HK)` 到同一个披露易 production adapter；没有匹配 adapter 时，download job 写入明确 failed 终态和 unsupported-source 摘要。下载成功路径只通过 source repository、blob repository 和 filing maintenance repository 写入 source docs 与 rejected filing artifacts；provider policy 与本地 rebuild 分支由来源 workflow 自己持有，adapter 不从 summary 或 capability 猜测执行模式。
 
+CN/HK workflow 与本地 rebuild 的 pipeline 终态由共享下载模型 `cn_download_models` 统一定义。普通结果入口只接受 `ok/cancelled`，私有完整性中止快照入口只接受 `integrity_failed`；两个入口验证各自子集后，复用同一纯文档摘要投影。
+
 ### Preprocess / process pipeline
 
 `start_preprocess` 从 source repository 选择已存在源文档，按 `document_ids`、`form_types`、`source_kind` 和 `rebuild_processed` 控制处理范围。单文档处理先取得 caller-owned batch，再读取一份 full source snapshot；processor、source meta、sections 与 tables 都消费该 snapshot，snapshot 在 commit 前关闭，commit 前失败只 rollback 一次，commit 开始后 caller 不二次 rollback。后台 pipeline 通过 processed repository create / update 写入 processed 产物；`rebuild_processed=false` 时跳过已有 processed 文档，`rebuild_processed=true` 时允许重建。

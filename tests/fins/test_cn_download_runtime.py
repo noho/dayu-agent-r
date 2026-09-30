@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path, PurePosixPath
+from typing import Literal
 
 import pytest
 
@@ -880,6 +882,160 @@ def test_cn_integrity_snapshot_has_separate_strict_projection_entry(tmp_path: Pa
         cn_pipeline_module._summary_from_integrity_abort(
             result, request=_cn_projection_request(), source_repository=repository
         )
+
+
+@pytest.mark.parametrize("entry", ("normal", "integrity"))
+@pytest.mark.parametrize(
+    ("status", "normal_accepted", "integrity_accepted"),
+    (
+        ("ok", True, False),
+        ("cancelled", True, False),
+        ("integrity_failed", False, True),
+        (" ok ", True, False),
+        (" cancelled ", True, False),
+        (" integrity_failed ", False, True),
+        ("failed", False, False),
+        ("error", False, False),
+        ("unknown", False, False),
+        ("OK", False, False),
+        ("Cancelled", False, False),
+        ("INTEGRITY_FAILED", False, False),
+    ),
+)
+def test_cn_terminal_projection_preserves_entry_subsets_and_strip(
+    tmp_path: Path,
+    entry: Literal["normal", "integrity"],
+    status: str,
+    normal_accepted: bool,
+    integrity_accepted: bool,
+) -> None:
+    """两个入口按独立字面量预期互拒交叉终态，并保留去空白与 JSON 形状。
+
+    Args:
+        tmp_path: 隔离真实仓储根。
+        entry: 普通结果或完整性快照入口。
+        status: 原协议文本或非法文本。
+        normal_accepted: 普通入口的独立预期。
+        integrity_accepted: 完整性入口的独立预期。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 合法子集、文本处理或序列化形状漂移时抛出。
+    """
+
+    result = _cn_projection_result([])
+    result["status"] = status
+    serialized = json.dumps(result)
+    assert json.loads(serialized) == result
+    assert type(result["status"]) is str
+    project = (
+        cn_pipeline_module._summary_from_pipeline_result if entry == "normal"
+        else cn_pipeline_module._summary_from_integrity_abort
+    )
+    accepted = normal_accepted if entry == "normal" else integrity_accepted
+    repository = FsSourceDocumentRepository(tmp_path)
+    if accepted:
+        summary = project(result, request=_cn_projection_request(), source_repository=repository)
+        assert summary.discovered_count == 0
+        assert summary.document_rows == ()
+        assert summary.missing_periods == ()
+    else:
+        with pytest.raises(ValueError, match="status 未封闭"):
+            project(result, request=_cn_projection_request(), source_repository=repository)
+    assert json.dumps(result) == serialized
+
+
+@pytest.mark.parametrize("entry", ("normal", "integrity"))
+@pytest.mark.parametrize(
+    ("present", "status"),
+    ((False, None), (True, None), (True, 1), (True, ""), (True, " \t\n")),
+)
+def test_cn_terminal_projection_rejects_missing_and_nontext_status(
+    tmp_path: Path,
+    entry: Literal["normal", "integrity"],
+    present: bool,
+    status: JsonValue,
+) -> None:
+    """两个入口都在业务摘要投影前拒绝缺失、非文本或空白终态。
+
+    Args:
+        tmp_path: 隔离真实仓储根。
+        entry: 待验证入口。
+        present: 是否保留 status 字段。
+        status: 待验证非法值。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 非法终态被接受时抛出。
+    """
+
+    result = _cn_projection_result([])
+    if present:
+        result["status"] = status
+    else:
+        del result["status"]
+    project = (
+        cn_pipeline_module._summary_from_pipeline_result if entry == "normal"
+        else cn_pipeline_module._summary_from_integrity_abort
+    )
+    with pytest.raises(ValueError, match="必填文本字段: status"):
+        project(result, request=_cn_projection_request(), source_repository=FsSourceDocumentRepository(tmp_path))
+
+
+@pytest.mark.parametrize("entry", ("normal", "integrity"))
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    (
+        ("ticker", "0700"),
+        ("filters", None),
+        ("missing_periods", [""]),
+        ("filings", ["invalid"]),
+        ("filings", [{"document_id": "fil-bad", "status": "downloaded"}]),
+        ("filings", [{
+            "document_id": "fil-bad", "status": "skipped", "form_type": "FY",
+            "reason_code": "already_downloaded_complete", "filing_date": "2025-04-01",
+            "report_date": None, "covered_fiscal_periods": [],
+        }]),
+        ("filings", [{
+            "document_id": "fil-unpublished", "status": "downloaded", "form_type": "FY",
+            "filing_date": "2025-04-01", "report_date": None, "covered_fiscal_periods": ["FY"],
+        }]),
+    ),
+)
+def test_cn_legal_terminal_does_not_bypass_summary_validation(
+    tmp_path: Path,
+    entry: Literal["normal", "integrity"],
+    field_name: str,
+    invalid_value: JsonValue,
+) -> None:
+    """合法终态不能绕过身份、筛选、行、覆盖财期或真实 locator 校验。
+
+    Args:
+        tmp_path: 隔离真实空仓储根。
+        entry: 待验证入口。
+        field_name: 要破坏的摘要字段。
+        invalid_value: 非法业务字段值。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 合法终态放宽其它契约时抛出。
+    """
+
+    result = _cn_projection_result([])
+    result["status"] = "ok" if entry == "normal" else "integrity_failed"
+    result[field_name] = invalid_value
+    project = (
+        cn_pipeline_module._summary_from_pipeline_result if entry == "normal"
+        else cn_pipeline_module._summary_from_integrity_abort
+    )
+    with pytest.raises((ValueError, FileNotFoundError)):
+        project(result, request=_cn_projection_request(), source_repository=FsSourceDocumentRepository(tmp_path))
 
 
 @pytest.mark.parametrize("invalid_missing_periods", [None, "FY", [""]])

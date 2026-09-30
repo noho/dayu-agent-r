@@ -22,6 +22,7 @@ propagate 与 disabled 状态，并关闭本测试新增的 logger handler，避
 下载测试使用真实隔离仓储核对完整旧缓存跳过、显式覆盖后的来源/文件指纹与清单一致性，以及再次增量跳过。
 
 下载终态测试还核对四种来源完整性预检原因全覆盖映射为 storage 分类、同源封闭公共原因及非盲目重试建议，并核对 JSON、CLI 与 Service wait 的固定失败原因显示；CN/HK 真实仓储用例分别覆盖首候选前 company pre-swap 零候选、单文档 Phase B 与 commit-time typed 中止、post-repair 已处理快照，以及 direct RESULT 与 job 持久摘要。
+共享模型终态测试锁定 `ok/cancelled/integrity_failed` 三值，并覆盖普通与完整性入口互拒、未知与非法值拒绝、去空白行为及 CN/HK 本地 rebuild 终态保全。
 安全诊断测试覆盖未知 download 的 RESULT 与日志先后顺序、脱敏类型指纹、有界包内帧、helper 内部故障降级、CLI 显式日志文件，以及 typed storage 和非异常文档失败不产生未知异常诊断。
 SEC 业绩补源回归：`pytest -q tests/fins/test_sec_earnings_repair.py tests/fins/test_sec_downloader.py tests/fins/test_sec_pipeline_download.py`。
 新增回归使用 `tests/fins/fixtures/sec_earnings_repair_v1` 中有来源与 hash 清单的真实 HTML 字节；

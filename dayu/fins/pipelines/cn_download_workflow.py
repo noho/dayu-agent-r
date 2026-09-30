@@ -20,7 +20,11 @@ from dayu.fins.pipelines.cn_download_filing_workflow import (
 )
 from dayu.fins.pipelines.cn_download_identity import resolve_cn_download_ids
 from dayu.fins.pipelines.cn_download_models import (
+    CN_DOWNLOAD_TERMINAL_CANCELLED,
+    CN_DOWNLOAD_TERMINAL_INTEGRITY_FAILED,
+    CN_DOWNLOAD_TERMINAL_OK,
     CnDownloadCancelledError,
+    CnDownloadTerminalStatus,
     CnCompanyProfile,
     CnFiscalPeriod,
     CnMarketKind,
@@ -51,7 +55,6 @@ from dayu.fins._log import Log
 from dayu.fins.ticker_normalization import ticker_to_company_id, try_normalize_ticker
 
 JsonObject: TypeAlias = dict[str, JsonValue]
-_INTEGRITY_FAILED_STATUS = "integrity_failed"
 _INTEGRITY_PREFLIGHT_REASON = "source_integrity_preflight"
 _INTEGRITY_PREFLIGHT_MESSAGE = "本地来源完整性预检失败"
 
@@ -453,7 +456,7 @@ async def run_cn_download_stream_impl(
     summary = _build_summary(filings=filings, elapsed_ms=elapsed_ms)
     result = _build_result(
         pipeline_name=pipeline_name,
-        status="cancelled" if final_cancelled else "ok",
+        status=CN_DOWNLOAD_TERMINAL_CANCELLED if final_cancelled else CN_DOWNLOAD_TERMINAL_OK,
         ticker=normalized_ticker,
         company_info=company_info,
         filters=_download_filters(period_policy, period_windows, window.end_date, overwrite),
@@ -555,7 +558,7 @@ def _integrity_abort(
     summary = _build_summary(filings=filings, elapsed_ms=int((time.perf_counter() - started_at) * 1000))
     result = _build_result(
         pipeline_name=pipeline_name,
-        status=_INTEGRITY_FAILED_STATUS,
+        status=CN_DOWNLOAD_TERMINAL_INTEGRITY_FAILED,
         ticker=ticker,
         company_info=company_info,
         filters=filters,
@@ -925,7 +928,7 @@ def _build_summary(*, filings: list[JsonObject], elapsed_ms: int) -> JsonObject:
 def _build_result(
     *,
     pipeline_name: str,
-    status: str,
+    status: CnDownloadTerminalStatus,
     ticker: str,
     reason_code: str | None = None,
     message: str | None = None,
@@ -941,7 +944,8 @@ def _build_result(
 
     Args:
         pipeline_name: 来源 pipeline 名称。
-        status: pipeline 终态。
+        status: 必填 pipeline 终态，取共享模型词表的 ok、cancelled 或
+            integrity_failed；调用方按普通结果或完整性中止选择对应值。
         ticker: canonical ticker。
         reason_code: 可选失败原因码。
         message: 可选失败说明。

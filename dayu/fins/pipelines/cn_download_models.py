@@ -26,6 +26,24 @@ CnMarketKind = Literal["CN", "HK"]
 """CN 下载链路覆盖的市场标识。``ticker_normalization.NormalizedTicker.market``
 取值 ``"CN"`` / ``"HK"`` / ``"US"``，本字面量是 CN 链路允许的子集。"""
 
+CnDownloadTerminalStatus: TypeAlias = Literal["ok", "cancelled", "integrity_failed"]
+"""CN/HK 下载与本地重建共享的 pipeline 终态；不表示每文档状态。"""
+
+CN_DOWNLOAD_TERMINAL_OK: Final[CnDownloadTerminalStatus] = "ok"
+"""普通下载或重建完成；文档是否成功由各行结果表达。"""
+
+CN_DOWNLOAD_TERMINAL_CANCELLED: Final[CnDownloadTerminalStatus] = "cancelled"
+"""普通下载或重建已取消，保留已处理文档摘要。"""
+
+CN_DOWNLOAD_TERMINAL_INTEGRITY_FAILED: Final[CnDownloadTerminalStatus] = "integrity_failed"
+"""私有完整性中止快照的终态，仅由完整性快照入口消费。"""
+
+CN_DOWNLOAD_NORMAL_TERMINAL_STATUSES: Final[tuple[CnDownloadTerminalStatus, ...]] = (
+    CN_DOWNLOAD_TERMINAL_OK,
+    CN_DOWNLOAD_TERMINAL_CANCELLED,
+)
+"""普通结果入口的合法终态子集，直接派生自同一词表。"""
+
 CnFiscalPeriod: TypeAlias = FiscalPeriod
 """CN/HK 财期类型别名，消费共享 domain 财期真源。
 
@@ -317,9 +335,14 @@ class DownloadedReportAsset:
 
 
 __all__ = [
+    "CN_DOWNLOAD_NORMAL_TERMINAL_STATUSES",
+    "CN_DOWNLOAD_TERMINAL_OK",
+    "CN_DOWNLOAD_TERMINAL_CANCELLED",
+    "CN_DOWNLOAD_TERMINAL_INTEGRITY_FAILED",
     "CN_FISCAL_PERIOD_ORDER",
     "CN_PIPELINE_DOWNLOAD_VERSION",
     "CnDownloadCancelledError",
+    "CnDownloadTerminalStatus",
     "CnCompanyProfile",
     "CnFilingStage",
     "CnFiscalPeriod",

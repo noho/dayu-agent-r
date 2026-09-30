@@ -52,7 +52,12 @@ from dayu.fins.ingestion_runtime import (
 )
 from dayu.fins.domain.document_models import FinsIngestMethod
 from dayu.fins.domain.enums import SourceKind
-from dayu.fins.pipelines.cn_download_models import CN_FISCAL_PERIOD_ORDER, CnMarketKind
+from dayu.fins.pipelines.cn_download_models import (
+    CN_DOWNLOAD_NORMAL_TERMINAL_STATUSES,
+    CN_DOWNLOAD_TERMINAL_INTEGRITY_FAILED,
+    CN_FISCAL_PERIOD_ORDER,
+    CnMarketKind,
+)
 from dayu.fins.pipelines.cn_download_pdf_gate import (
     CnDownloadPdfGateProtocol,
     NoopCnDownloadPdfGate,
@@ -61,7 +66,6 @@ from dayu.fins.pipelines.cn_download_protocols import (
     CnReportDiscoveryClientProtocol,
 )
 from dayu.fins.pipelines.cn_download_workflow import (
-    _INTEGRITY_FAILED_STATUS,
     CnDownloadIntegrityAbort,
     run_cn_download_stream_impl,
 )
@@ -130,8 +134,6 @@ _CN_FORMS_ADAPTER_JOINER: Final[str] = ","
 _CN_STATUS_DOWNLOADED: Final[str] = "downloaded"
 _CN_STATUS_SKIPPED: Final[str] = "skipped"
 _CN_STATUS_FAILED: Final[str] = "failed"
-_CN_TERMINAL_OK: Final[str] = "ok"
-_CN_TERMINAL_CANCELLED: Final[str] = "cancelled"
 _ADAPTER_PROGRESS_FILE_STARTED: Final[str] = "download.file_started"
 _ADAPTER_PROGRESS_FILE_COMPLETED: Final[str] = "download.file_completed"
 _ADAPTER_PROGRESS_FILE_SKIPPED: Final[str] = "download.file_skipped"
@@ -1441,7 +1443,7 @@ def _summary_from_pipeline_result(
     """
 
     status = _required_cn_text(result, "status")
-    if status not in {_CN_TERMINAL_OK, _CN_TERMINAL_CANCELLED}:
+    if status not in CN_DOWNLOAD_NORMAL_TERMINAL_STATUSES:
         raise ValueError(f"CN/HK 下载结果 terminal status 未封闭: {status}")
     return _project_cn_pipeline_summary(result, request=request, source_repository=source_repository)
 
@@ -1468,7 +1470,7 @@ def _summary_from_integrity_abort(
     """
 
     status = _required_cn_text(result, "status")
-    if status != _INTEGRITY_FAILED_STATUS:
+    if status != CN_DOWNLOAD_TERMINAL_INTEGRITY_FAILED:
         raise ValueError(f"CN/HK 完整性失败快照 status 未封闭: {status}")
     return _project_cn_pipeline_summary(result, request=request, source_repository=source_repository)
 
