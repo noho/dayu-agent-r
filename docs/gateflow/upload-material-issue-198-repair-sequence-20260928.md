@@ -605,3 +605,17 @@ F3窄复审MiMo215517已终态pass/无finding，Kimi仍在途，plan尚未通过
 F3 MiMo215517/Kimi215618同版窄复审均有效、无新finding，总控独立核SHA/源码/类型保持后判plan review pass、A1～A4仅plan层闭合。F3产品未实施，下一acceptedplancommit→Sol五utils实施；待仍依赖旧HEAD的F4Sol结束再提交，不越gate。Kimi跨cwd PYTHONPATH OQ作为实施harness细节登记，不扩大goal。
 
 F4-PF-B01：Sol14904已终态blocked（goal用户steering后旧授权失效），仅25相关输入不变/产品零修改；新candidate0ebe...为旧scope历史不得实施/直接复审。新scope须保全现成错误/拒绝/继续语义，优先窄同guard batch meta owner接口，真实需要业务取舍才向用户给具体方案。临时privatehelper strict诊断未修，仅1file候选形状类型通过，不冒称全临时代码绿。F3下一acceptedplancheckpoint已无旧HEAD在途障碍。
+
+F3 acceptedplancheckpoint60307c15已进入PR197，Sol74222实施五utils在途；F3产品未闭环。F4goal再按原裁决撤回trusted-inventory唯一技术路线强制，优先评估同guard复用原get_meta合同的更窄batch读取，禁止为API改变公开拒绝/错误/继续规则；F5能力需要不反向扩大F4。
+
+F7 Sol10158已终态返回candidate4473d2a5...，六inputSHA与真实producer/strip/类型正负例总控核对一致，未accepted/未实施。新增**F7-PV01（待修，低，报告事实）**：候选收尾将no-index子命令记exit0，实际组合命令最后0掩盖其差异exit1，无空白错误；证据与总控首次错误断言及恢复见独立artifact docs/gateflow/pr-197-r1-f7-plan-controller-evidence-20260930.md。下一MiMo/Kimi同版Planreview，随后Sol合并修事实记录及成立findings；不新增业务目标、不重派provider。当前F3源码/F4新用户scope计划仍在途。
+
+新增**F3-C01 accepted-candidate／未修复（低，输入/产物冲突）**：新合法 `_manifest.pdf` 的样本 digest 与固定 `digests/_manifest.json` 汇总同路径，真实CLI exit0却覆盖缓存、丢numbers。Sol已声明暂停源码实施、仍待终态；总控已读真实写入路径/受控证据，待冻结后独立复现。独立artifact docs/gateflow/pr-197-r1-f3-reserved-artifact-collision-20260930.md 已登记。下一优先最小相关入口预检拒绝而保留固定产物布局，先Sol修计划+MiMo/Kimi窄复审，不改上传业务裁决、不借此扩缓存鉴权或无关命名限制；不得宣称F3已修复。
+
+F3 Sol74222已终态（外层0/turn.completed/canary匹配），实施blocked；总控独立真实CLI反例证实C01、冻结八输入原件。C01现accepted未修，部分实现保留，不作slicepass。优先最小digest产物owner预检保持固定布局，属于原goal必要正确性，下一Sol先plan amendment+MiMo/Kimi窄复审，审后才代码fix；不改用户上传行为。F7同时双路Planreview已启动：MiMo55123/YJzFak/report230120、Kimi88992/bfovWJ/report230304，21相关输入冻结，独立output/stderr和绝对cwd；均在途未裁决。当前三路：F4Sol51450仅计划修订、F7MiMo/Kimi仅审查；F3不在跑。
+
+F4-PV01新增报告准确性修复项（低、未修）：Sol51450外层0/80JSONL terminalcompleted，原文件读取正确，但三处报告漏校验标记末位，与基准不匹配，按sub-agents硬拒收result rejected/task。22只读inputSHA仍匹配；候选技术内容保留为未验收，旧新原字节另备份，详docs/gateflow/pr-197-r1-f4-report-canary-adjudication-20260930.md。下一一次同provider窄报告修复，不改技术设计/源码/业务裁决，验证后才双路Planreview。F3 C01已派Sol88943/9dmnBf仅plan amendment，当前source/goal/artifact八输入冻结、原件保留；F7MiMo55123已外层0待完整收取裁决，Kimi88992仍在途，不作planpass。
+
+F4报告修复setup01未启动：预检机械规则将裁决文件名中的canary后缀加8位日期误识为旧token（脚本regex可核），正文未嵌旧校验值。按controller setup error登记，不占provider重试；保留原task，改为读取字节相同的临时controller-evidence副本、新label02，预检ok。当前唯一一次修复性重派已启动pr197-f4-reportfix-sol-20260930-02，托管91705，独立目录KELGKS/output/stderr/last，显式cwd主树，仅两文档报告区域/新报告artifact，不改技术设计/source。原51450 canary mismatch拒收不撤销。F3 Sol88943仅plan amendment、F7 Kimi88992仍审查；F7MiMo55123外层0/JSONsuccess54turns报告pass-with-risks，唯一已知PV01，待总控独立必需证据核验、双路未齐不放行。
+
+F7双路终态已收齐：MiMo55123/54turns和Kimi88992/56turns均外层0/JSONsuccess，各result+artifact校验token实际逐字匹配；Kimi标签加粗导致初次简单substring假阴性已按token独立核对纠正，不同于F4真实漏位。总控独立6模块679passed/3第三方warnings、四文件coverage均>80、21inputSHA不变。两技术报告均无新materialfinding，仅既有PV01未修，因此plan review gate仍fail待事实修复。完整合并裁决docs/gateflow/pr-197-r1-f7-plan-review-adjudication-20260930.md含summary_only局限/各warning/根取证/风险分类。已派Sol pr197-f7-planfix-sol-20260930-01，预检ok、托管40745/WrEfzE，仅plan事实修订/newfixartifact，source只读。当前三路Sol：F3planamend88943/9dmnBf、F4reportfix91705/KELGKS、F7planfix40745/WrEfzE；全部在途，不计acceptedplan/codepass。
