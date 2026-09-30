@@ -9,13 +9,13 @@
 | --- | --- | --- |
 | F2 | 局部闭环 | 不代表整个PR通过 |
 | F3 | F3-PR3-A1计划文字fix | 原两路已outer0/根合并：A1/C02主体已修候选；Sol99211/e3CL7a仅文字fix，26readonly/27originals；源码未修 |
-| F4 | A1/N1/PV02同版窄re-review | MiMo56477/eRwdWW＋DS23813/mWvCxQ在途，41readonly/f17保持，源码未实施 |
+| F4 | accepted plan commit待创建 | 两路均outer0，根41SHA/同源三hunk核定f17计划accepted；产品未实施 |
 | F7 | PR review待审查名额 | accepted deepreview2cc2f5ed已push/readback；沿用draftPR197，下一PR review，未finalcloseout |
 | F5 | proposal待公开行为裁决 | Sol11838已outer0；根34SHA/77JSONL核收，Q1已问用户，Q2/Q3已技术裁决；N01/N02accepted未修 |
 | F6 | goal已有，尚未plan / 实施 | 共同CN源码串行 |
 | 原upload及独立WU队列 | 未顺带实施 | 按既有裁决和主队列依赖继续 |
 
-唯一开发主树codex/upload-material-oracle，main fac32ecbf未动；当前已提交本地/远端/PR head2cc2f5ed，未提交候选保留待审。所有runner显式主树绝对cwd、独立output/stderr、唯一label，根核验真实外层退出/完整结构化结果/令牌/源码与validation后裁决。原Kimi47199 API403五小时quota硬拒收保留；尚无额度恢复证据，已授权ds-flash备份用于本组审查。无关docscheckpoint允许HEAD推进，但F3 26/F4 41相关只读SHA不放宽；F5已退出，不把未accepted proposal当实施许可。
+唯一开发主树codex/upload-material-oracle，main fac32ecbf未动；当前已提交本地/远端/PR head2cc2f5ed，未提交候选保留待审。所有runner显式主树绝对cwd、独立output/stderr、唯一label，根核验真实外层退出/完整结构化结果/令牌/源码与validation后裁决。原Kimi47199 API403五小时quota硬拒收保留；尚无额度恢复证据，已授权ds-flash备份用于本组审查。无关docscheckpoint允许HEAD推进，但F3 26相关只读SHA不放宽；F4双审已退出；F5已退出，不把未accepted proposal当实施许可。
 <!-- PR197_LIVE_GATE_STATUS_END -->
 
 
@@ -179,3 +179,9 @@ F7独立MiMo/授权ds-flash备份双审均outer0，根完整证据核验无新ma
 
 
 2026-10-01 03:47:24 F3两路均outer0，MiMo49turns无新materialfinding，根全24SHA/report核收；DS低F3-PR3-A1依旧accepted未修，所以re-review gate未pass。Sol99211/e3CL7a现仅修该异常docstring/私有stat整体委托文字/真实来源行号，26readonly27originals冻结，不改源码。三活动为Sol99211与F4MiMo56477/DS23813；F5Q1待用户。
+
+
+2026-10-01 04:01:33 F5-N03官方非空raw资料gap已补证，独立docs/gateflow/pr-197-r1-f5-official-raw-evidence-20261001.md登记两单日公开GET/精确hash/股票scope/生产协议解析。根错误预设官方九个月标题应unknown的assert1已披露恢复；实际无/有anchor均Q3，不能把该原raw冒称缺陷。未来合成变体明确标记，N01/N02产品仍未修/Q1仍待答，未写testsfixture或方案源码。F4DS23813 outer0根41SHA核收no material，Mimo56477仍在途，root拒其历史“314纯docs”错误旁白但当前输入身份实证有效。
+
+
+2026-10-01 04:12:01 F4 MiMo56477 outer0/58turns与DS23813 outer0/36turns同版窄审无新materialfinding；根41live+original/36历史原件/完整reports/diff/owner核定A1/N1/PV02已修，f17计划accepted，详pr-197-r1-f4-plan-narrow-adjudication-20261001.md。下一acceptedplancommit→Sol唯一S1实现，产品未修。F3Sol99211仍只文本fix，F5Q1待答；原用户规则不重裁。
