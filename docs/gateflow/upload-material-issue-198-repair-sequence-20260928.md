@@ -619,3 +619,15 @@ F4-PV01新增报告准确性修复项（低、未修）：Sol51450外层0/80JSON
 F4报告修复setup01未启动：预检机械规则将裁决文件名中的canary后缀加8位日期误识为旧token（脚本regex可核），正文未嵌旧校验值。按controller setup error登记，不占provider重试；保留原task，改为读取字节相同的临时controller-evidence副本、新label02，预检ok。当前唯一一次修复性重派已启动pr197-f4-reportfix-sol-20260930-02，托管91705，独立目录KELGKS/output/stderr/last，显式cwd主树，仅两文档报告区域/新报告artifact，不改技术设计/source。原51450 canary mismatch拒收不撤销。F3 Sol88943仅plan amendment、F7 Kimi88992仍审查；F7MiMo55123外层0/JSONsuccess54turns报告pass-with-risks，唯一已知PV01，待总控独立必需证据核验、双路未齐不放行。
 
 F7双路终态已收齐：MiMo55123/54turns和Kimi88992/56turns均外层0/JSONsuccess，各result+artifact校验token实际逐字匹配；Kimi标签加粗导致初次简单substring假阴性已按token独立核对纠正，不同于F4真实漏位。总控独立6模块679passed/3第三方warnings、四文件coverage均>80、21inputSHA不变。两技术报告均无新materialfinding，仅既有PV01未修，因此plan review gate仍fail待事实修复。完整合并裁决docs/gateflow/pr-197-r1-f7-plan-review-adjudication-20260930.md含summary_only局限/各warning/根取证/风险分类。已派Sol pr197-f7-planfix-sol-20260930-01，预检ok、托管40745/WrEfzE，仅plan事实修订/newfixartifact，source只读。当前三路Sol：F3planamend88943/9dmnBf、F4reportfix91705/KELGKS、F7planfix40745/WrEfzE；全部在途，不计acceptedplan/codepass。
+
+证据checkpoint b42bbea1e7ccc58561764c20d873214783283eb2（11份稳定docs，578增/1删，cachedcheck0）已普通pushgithub；托管77784 exit0，PR197 metadata独立readback及live ls-remote均匹配该head。PR仍OPEN/draft/base main；本地main/githubmain/live main/baseOID均fac32ecbff9bfe792b63ee9667c8697826b631f4。未提交五utils候选或三个在途plan/report；这是证据保存，不是acceptedplan/slicegate。三个在途任务允许已公告无关doccheckpoint改变HEAD，相关source/goal冻结不放宽；起止HEAD分别记录。当前下一入口仍收取88943/91705/40745完整终态、独立核验、再同版双路窄复审。
+
+F4报告修复91705已外层0/59条JSONL turn.completed/stderr空，本轮token在last+artifact逐字匹配。总控独立22inputSHA、原plan从##1至EOF技术正文逐字相同、两候选精确diff与三文件单独no-index检查（差异1且零输出）验证通过；F4-PV01报告修复已修复/接受该子任务，旧51450 mismatch rejected不撤销。新candidateSHA0080f24590b7ce4b6b8434c7a7d45d72bdb3cc26a63ab86fdd99f6a749a71cb8，userscopefix4cebc416...，newreport f410d144...；产品F4未实施，下一同版MiMo/Kimi完整窄scope Planreview。item21新报告嵌入diff空上下文引出10处trailing whitespace/exit3，改零上下文后独立1/零输出，原失败保留；其余item16/17/24为差异1。精确运行身份：该任务读取provider profile model=gpt-6.1-sol，总控只读model行复核一致，runner显式provider仍gpt-6-sol；不是总控改profile，不据当前配置补造历史各轮canonical model证据。当前F3planamend88943/F7planfix40745仍在途，下一需要两路审查的并发名额后同时派F4复审。
+
+
+## 20261001 现场续核（覆盖旧在途状态，保留历史）
+
+F3 Sol88943与F7 Sol40745均已外层exit0、JSONLterminal/canary匹配，总控独立SHA/原件/最小diff/必要合成probe核验，详docs/gateflow/pr-197-f3-f7-fix-receipt-20261001.md。F3新增F3-PA01（accepted/未修复/低）：amendment一句后续不跑全量pyright与原S1/AGENTS冲突，只由Sol修验证表述再同版C01窄审；不改用户现成业务裁决。C01代码仍未修、五utils候选保留。F7事实修订证据accepted但PV01等待双路窄审，产品未实施。F4 MiMo79430/G6DAKq与Kimi44800/S2fZDn同版plan复审仍在途，freeze32input不变，report235229/235546；无新quota故障，不切ds。唯一开发主树codex/upload-material-oracle，HEADb42，main不动；下一收取F4审查并继续F3/F7门禁，不把作者报告当gatepass。
+
+
+F4同版MiMo79430已outer0/JSONsuccess65turns/token匹配，summary_only关键证据由总控32SHA/保存输入及旧contract真实Fsprobe补核。报告235229可采；新F4-PR2-A1（低、accepted/未修复）须在plan明示allocated文档缺席→原分配ID，不补None制造changed；只保全已有规则。MiMo F2空索引防护因无实际合法caller误用证据rejected-with-reason，不加字段/误拒正常空库。独立artifact docs/gateflow/pr-197-r1-f4-rereview-mimo-adjudication-20261001.md；Kimi44800仍在途，保持32freeze/不放行。F3验证条款Sol1101/yhKwQY在途；F7窄双审preflight已ok（XNPxri/Q2Zmb2），尚未launch，待并发名额同时派发。

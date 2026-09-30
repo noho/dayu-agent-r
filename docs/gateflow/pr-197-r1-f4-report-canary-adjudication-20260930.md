@@ -45,3 +45,25 @@ retry_class: task
 reportfix label01预检失败，未启动：canary命名裁决文件的8位日期匹配了机械旧token regex，并非正文提供旧校验值。总控保留失败task、将同字节裁决复制到不触发文件名规则的临时controller-evidence.md供读取，新label02重新预检ok；未禁用检查、未改预检器。label01裁定setup_status fail/agent_status not_started/tool_evidence no/tool_trace not_required/required_evidence not_required/canary_status not_run/result_status not_assessed/retry_class setup，不占provider重试。
 
 唯一一次同provider实际恢复任务reportfix label02已启动，托管91705/run_dir KELGKS，独立output/stderr/last/新校验文件，显式cwd主树。当前在途，不填完成裁决；技术正文/源码冻结、旧失败原件保留。
+
+## 修复任务终态：报告修复已验证，旧拒收不撤销
+
+reportfix label02/托管91705已外层0，59有效JSONL turn.completed，stderr空，last和新artifact的本轮token逐字匹配。总控独立核22只读input、旧原件/技术正文零变化、全部精确diff和三文件单独no-index check1/无诊断。新candidate0080f245...可作下一同版审查输入，plan仍未accepted。新report首轮item21 exit3/10处trailing whitespace（嵌入diff空上下文）改零上下文后item24差异1/无输出，失败恢复已核；item16/17差异1无诊断。
+
+```yaml
+setup_status: ok
+agent_status: completed
+tool_evidence: yes
+tool_trace: complete
+required_evidence: complete
+canary_status: match
+result_status: accepted
+warnings:
+  - 新报告嵌入diff的空上下文空白诊断已修正并独立复核
+  - 差异exit1均无空白诊断，不冒称0
+  - provider gpt-6-sol配置实际model为gpt-6.1-sol，当前任务与总控只读配置核对一致
+evidence_gaps: []
+retry_class: none
+```
+
+F4-PV01报告修复最终状态已修复，接受新任务证据；原task mismatch rejected作为历史不撤销。此处只闭合报告准确性，不是F4产品或plan gatepass。新报告风险表的“later approved slice”不表示已有代码slice审批，总控归类为本WU后续计划审查/实施的必要义务，不能跳accepted plan gate。下一同版MiMo/Kimi Planreview。
