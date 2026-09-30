@@ -325,6 +325,7 @@ HK 的中期业绩可显示覆盖 H1，但不能代替独立中期报告消除 H
 下载、上传和预处理命令会显示执行进度及最终摘要。下载摘要包含规范 ticker、实际表单与
 日期窗口、overwrite/rebuild 状态，以及发现、下载、跳过、拒绝、失败和缺失期间信息；
 每个下载文档行还会显示来源声明的 `covered_fiscal_periods` 数组。
+工作区来源目录中的 `.DS_Store` 等点号普通文件和 `.claude` 等不含链接或特殊文件的点号目录会被忽略。
 下载显示 `classification="storage"`、`reason_code="unsafe_publication"` 时，请检查工作区来源状态并修复后重试；重复下载不会自行修复。
 下载失败详情显示 `classification="execution"` 时，详情后还会出现 §3.1 的
 `--log-file PATH` 提示；按该节选择可写文件并重新执行，可留存运行日志。并非每次此类
