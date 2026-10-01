@@ -3,17 +3,17 @@
 <!-- PR197_LIVE_GATE_STATUS_START -->
 ## 当前有效状态（2026-10-01）
 
-只在 `/Users/leo/workspace/dayu-agent-r` / `codex/upload-material-oracle` 开发；main `fac32ecbff` 未动。最近读回本地/远端/PR197 checkpoint `8e783c1a`，新增未过门禁候选不提交。用户授权全部 runner runtime/provider；现有 Sol plan/implement/fix、MiMo/Kimi 双审及真实 quota→DS 备份不变。所有调用绝对 cwd、新独立双流、no-persist/canary、root结构化和直接证据裁决。
+只在 `/Users/leo/workspace/dayu-agent-r` / `codex/upload-material-oracle` 开发；main `fac32ecbff` 未动。最近读回本地/远端/PR197 checkpoint `b1e5195a`，新增未过门禁候选不提交。用户授权全部 runner runtime/provider；现有 Sol plan/implement/fix、MiMo/Kimi 双审及真实 quota→DS 备份不变。所有调用绝对 cwd、新独立双流、no-persist/canary、root结构化和直接证据裁决。
 
 | WU | 当前状态 | 下一入口 |
 | --- | --- | --- |
 | F3 | accepted slice03e8b9b0已push，code gate已pass；完整aggregate MiMo50118/DS65682与PV01窄复审MiMo53684/DS14599全部终态独立核收，root裁决aggregate pass | accepted deepreview244056c5已push→最终同版PR review/closeout；详pr-197-r1-f3-aggregate-review-adjudication-20261001.md；F3 WU尚未最终完成 |
 | F4 | accepted slice75fec034 + aggregate87b5a642 已入PR | 最终同版 PR review/closeout |
 | F5 | 公开 mixed-known/unknown 财期 Q1 仍待具体用户选择；官方非空raw已补；N01/N02和F4真实API重绑定尚未实施 | 答复后 Sol planfix→双审→实施；不代选P1/P2 |
-| F6 | MiMo57480 outer0/96turns、Kimi2133 outer0/110turns已完整核收；root独立220身份、长hint探针及59nodes实际exit0；首轮code gate fail | A1显示上界/A2hint合同断言accepted未修，Sol8619唯一sourcewriter窄fix在途（CLI+2tests），其余18候选只读；fix后同版双路复审；21候选未提交，详pr-197-r1-f6-s1-code-review-adjudication-20261001.md |
+| F6 | 首轮双审/root fail后A1/A2由Sol8619完成三文件窄fix，root核收83JSONL/233身份/132artifact；1342tests/full783type0/CLI无排除85% | 修复候选待MiMo36619/Kimi92651同版365冻结窄re-review；无sourcewriter、原21候选未提交，code gate未pass；详pr-197-r1-f6-s1-review-fix-delivery-receipt-20261001.md |
 | F7 | accepted slice/aggregate 已入PR | 最终同版 PR review/closeout |
 
-当前唯一产品sourcewriter是Sol8619修F6 A1/A2，仅三文件；Sol13693已outer0/107JSONL/47commands交付最终CI预备proposal（36裁决映射/41冻结/85artifact），root核收交付但非accepted最终计划或真实CI；详upload-material-final-ci-preparation-delivery-receipt-20261001.md。旧MiMo57480/Kimi2133已成功终态核收，不再轮询。F6窄fix新freeze233current/originals（230current只读），原审查清单及全部失败/报告保留，未修复之前gate不得pass；句柄/output/stderr/freeze在 `workspace/tmp/pr197-controller-collection-20261001/active-runners.json`。
+当前无产品sourcewriter，活动runner仅MiMo36619/Kimi92651只读复审F6 A1/A2同版365冻结；Sol8619已终态核收，不再轮询。最终CI预备Sol13693交付proposal已保全b1e5195a，36裁决映射/41冻结/85artifact，非accepted最终计划/矩阵/registry或真实CI。所有原件与非零/恢复保留，F6 code gate须复审后root裁决，不以测试绿自动pass；句柄/output/stderr/freeze在 `workspace/tmp/pr197-controller-collection-20261001/active-runners.json`。
 
 原upload修复依既有依赖序列在F2–F7后推进。以用户现成裁决为准，新schema/历史迁移/业务选择不凭继续授权代猜。旧upload_material Raw用户确认已删除；31正式裁决/36项语义保留，不能编造旧Raw复核。**全部已批准修复后，在最终commit重建完整mandatory矩阵并跑真实CLI CI，正式确定/登记upload_material oracle、scenarios和readiness proof**；现有registry的Fins范围仅download/upload_filing，不能当material完成。权威合同 `upload-material-repair-scope-and-ci-closeout-20261001.md`。历史正文按时间保留，不覆盖本节最新状态。
 <!-- PR197_LIVE_GATE_STATUS_END -->
