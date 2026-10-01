@@ -1,29 +1,17 @@
 # PR #197 审查 findings 修复：接续总控记录
 
 <!-- PR197_LIVE_GATE_STATUS_START -->
-## 当前有效状态（2026-10-01，F5裁决后恢复全部任务）
+## 当前有效状态（F5具体裁决后继续全部任务）
 
-唯一开发工作树 `/Users/leo/workspace/dayu-agent-r`，唯一开发分支 `codex/upload-material-oracle`；所有开发/证据只进入现有 OPEN/draft PR197，用户手工 merge。accepted PR review commit `c305067fb7434b2fd0bc5a10398fc65ac600fce8` 已普通push/root读回；main本地/tracking/远端/base均 `fac32ecbff9bfe792b63ee9667c8697826b631f4` 未动。后续文档checkpoint以实时git/PR读回为准，不能沿用此hash充当前HEAD。
+唯一workspace `/Users/leo/workspace/dayu-agent-r` / branch `codex/upload-material-oracle`，所有代码/证据进入OPEN/draft PR197，用户手工merge。main保持fac32ecbff9bfe792b63ee9667c8697826b631f4；普通文档checkpoint不充最终产品或CLI验收。
 
-**F5 已获用户具体裁决并恢复推进**：先用同公司可信证据推断，仍失败则继续已知报告、明确列出不确定报告，不猜财期。详 `docs/gateflow/pr-197-r1-f5-user-decision-20261001.md`。Q1已解除，P1整请求写前失败不采；下一入口Sol固化当前真实源码上的最小完整计划→MiMo/Kimi同版并行Planreview。尚未实施，原upload队列仍待F5闭环后进入。
-
-| 项目 | 当前有效状态 | 下一入口 |
-| --- | --- | --- |
-| F1 | rejected-with-reason，非成立代码缺陷 | 不安排修复 |
-| F2 | bb11ca22 已修、双审/类型/推送完成；当前组合保全，修复闭环 | 本轮无后续动作 |
-| F3 | slice03e8b9b0 / aggregate244056c5 / PRreview c305067f / push读回 / draft-PR-pass / final closeout pass | completed，残余按原owner保留 |
-| F4 | slice75fec034 / aggregate87b5a642 / 同版PRreview及最终收口通过 | completed，同上 |
-| F5 | Q1已按用户裁决解除；原finding与N01/N02 accepted未修；官方非空Raw补证完；尚未实施 | Sol固化单一行为slice计划→同版双审→实施 |
-| F6 | slice4f0b5b04 / aggregate5fc5e4f0；AG-A1已修；同版PRreview及最终收口通过 | completed，同上 |
-| F7 | slice31473fe1 / aggregate2cc2f5ed；当前F6后共享workflow已核；PRreview及最终收口通过 | completed，同上 |
-
-最终收口 `docs/gateflow/pr-197-findings-except-f5-final-closeout-20261001.md`；正式PR裁决 `docs/reviews/pr-197-review-20261001-175653.md`。MiMo34356/授权quota备份DS72633均outer0、完整结构化及报告/canary已核；Kimi87412 outer1/API403原失败保全。root独立68current/originals、37精确blob、715全compare和37对应段；两路关键意见采纳，非关键clean/旧coverage/DSargv-exit缺口收窄，不另起报告修复循环。root真实1377passed/3既有warnings/exit0、全量pyright783checked/0error与当前37字节绑定；各原覆盖按owner字节和后续F6更新有效证据复用。本四WU scoped PR gate不是全715文件最终pass或merge readiness。
-
-F5新版候选195行已交付：Sol19367 outer0、104JSONL/42commands、canary match、45current+originals不变，仅两doc；不是plan pass。双路Kimi12721/MiMo2205均outer0并核收，58冻结输入不变；本轮plan review失败，当前 **plan fix** Sol18548外部runner在途，61冻结输入，仅写v2/集中fix说明，无产品writer。总控已登记 F5-V2-A1/A2/A3（合法未执行终态schema、同来源核心冲突保持协议错误、可信英文年度证据保留），destination为Sol一次集中planfix，补已确认report_date/source标记同步None与迁移/audit义务；详 `docs/gateflow/pr-197-r1-f5-plan-v2-review-adjudication-20261001.md`。原N01/N02保持accepted未修。用户要求全部任务继续，普通gate不停止；原upload仍F5闭环后实施。Sol39648粗分组候选仅后续proposal。
-
-后续WU默认一个完整可验证行为slice，仅真实依赖/风险/独立验收才拆并说明理由，不按文件/模块机械拆；同gate必要fix批量一轮交付+同版双审。Sol负责plan/implement/fix；MiMo/Kimi并行review，Kimi真实quota失败DS备份；用户授权所有runner runtime/provider不改变职责或现成业务裁决。每调用绝对cwd、独立output/stderr/no-persist/canary；root检查结构化及直接证据自行裁决。
-
-原17未实施标签+受控O20F02 XBRL、CI-PREP-A1候选/映射C02、最终真实CLI仍待。现有registry的Fins仅download/upload_filing，material正式登记未做。旧upload_material Raw用户确认已删除，31正式裁决/36语义保留，不补造Raw/hash。恢复并完成全部批准修复后，在真正最终commit重建完整mandatory矩阵、跑真实CLI、正式确定/登记material oracle/scenarios/readiness；不能用1377或局部PRreview替代。权威 `docs/gateflow/upload-material-repair-scope-and-ci-closeout-20261001.md`。#198已有closeout及授权comment，PR保留Closes，不重开/重发。
+- F2/F3/F4/F6/F7均已修复并完成同版组合PR审查及最终闭环，见 `docs/gateflow/pr-197-findings-except-f5-final-closeout-20261001.md`；1377组合回归通过，不等于最终完整CLI。
+- F5用户裁决：同公司可信证据能推断则推断，失败继续A且列出B未知、不猜财期。Q1已解除，授权完成全部任务，普通gate不停止。
+- F5计划A1/A2/A3经窄双审确认已修；A4共享HK日期来源owner补修已由同版MiMo23705/Kimi43186双审及root直接证据确认，202行v2 SHA e4b578807345593f0af6698189044963931b12ba5d13a76da94e553e581644d8，plan accepted。当前accepted plan checkpoint后进入单完整F5-S1；N01/N02尚未产品实施；详 `docs/gateflow/pr-197-r1-f5-plan-v2-review-adjudication-20261001.md`。
+- 下一入口：accepted plan checkpoint→Sol单完整F5-S1→代码双审/必要集中修复→aggregate/PRreview/closeout。日期来源CN/SEC边界及正常processed状态机不扩；A1–3不重开。
+- F5闭环后继续原17accepted标签和受控XBRL O20F02，默认完整行为增量不机械细分，分组proposal见 `docs/gateflow/upload-material-remaining-work-batching-preparation-20261001.md`；最终重建并跑完整真实CLI，确定material oracle/scenarios/readiness，不能以旧download/upload_filing registry或单测替代。
+- 原旧Raw用户确认已删除，不伪造Raw/hash；全部遵从用户现成36项裁决，真源 `docs/gateflow/upload-material-repair-scope-and-ci-closeout-20261001.md`。
+- $sub-agents runner子进程派发；Sol plan/implement/fix，MiMo/Kimi同时review，Kimi真实quota失败才DS备份；各调用显式绝对cwd、唯一label与独立output/stderr、preflight/no-persist/当前canary；root检查完整结构化、outer终态及直接证据自行裁决。新修复立即artifact及本三controller登记。
 
 <!-- PR197_LIVE_GATE_STATUS_END -->
 
