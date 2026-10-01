@@ -79,6 +79,10 @@
 
 ## 当前运行与Git
 
-- Sol22860：F4 A1/A2 fix；MiMo11067/Kimi61008：F3两句窄re-review。均显式绝对cwd/独立output/stderr/唯一label，root核结构化终态与真实来源后裁决。
+- Sol22860 / MiMo11067 / Kimi61008均outer0完成并根核收。F3 amendment pass待accepted commit和源码fix；F4 delivery accepted，794passed/fulltype0/八prod>=80，同版re-review next。
 - 最近实时local/tracking/live/PRhead同dc29c1fe5e173d9ef710cd7f44fd0889e0da46c9；PR OPEN/draft，main本地/live/base同fac32ecbff9bfe792b63ee9667c8697826b631f4。F3/F4未提交候选保全，仅codex/upload-material-oracle开发，未改main。
 - 本次不是整PRcloseout，没有整仓pytest/CI绿结论。当前已成立新findings均独立登记root F4 code-review adjudication及三份current入口。
+
+2026-10-01 09:09:14补充：文档证据保存commit 87dfbeae8625e34162812c06886610c37ba0f4e9 已普通push并live/PR/main读回；产品候选未accepted，不能把该docs checkpoint当源码修复完成。当前source Sol的九模块794 passed仅在途修后候选进展，全量类型首次4errors仍须恢复并最终收取，不作通过。
+
+root最新核收：首次4条新测试类型错误已实际修复，最终default full pyright0，794同版矩阵重跑通过；旧在途描述是历史，不作当前状态。F3两句双审与独立保全证明pass，C01/C02源码仍未修。F5 Q1待回答，不影响其它WU推进。详新F3 amendment final adjudication与F4 fix receipt。
