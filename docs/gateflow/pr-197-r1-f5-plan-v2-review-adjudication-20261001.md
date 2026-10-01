@@ -21,3 +21,27 @@ Sol19367 outer0；104可解析JSONL、42 completed command、turn.completed、�
 ## 技术裁决方向与未完事项
 
 有未知时overall FAILURE、job FAILED、CLI exit1、wait failed，同时保全已确认处理行及A发布后的partial摘要，符合用户“明确未知而继续A”的决定；待双审后根据实际owner核定，取消/原typed原因优先。单完整F5-S1，不按模块拆。原N01/N02仍accepted未修，原upload17标签+XBRL及最终真实CLI在F5闭环后继续。两路报告/完整JSON/外层终态/关键源证据收齐后才final gate裁决。
+
+## Kimi12721 终态与总控逐项裁决（MiMo2205仍在途）
+
+outer0，完整JSON subtype success/is_error false/terminal completed，83turns，无permission_denials，modelUsage kimi-k3[1m]，stderr仅精确非致命unrecognized_model，canary match。58current+originals root再核全匹配。报告 `docs/reviews/plan-review-20261001-190945.md`；独立核收凭据 `workspace/tmp/pr197-controller-collection-20261001/f5-plan-review-kimi-root-receipt.json`。Claude仅汇总，不能声称逐中间tool全部成功；关键引用已root直接读源码和owner测试，没跑产品测试。
+
+- **F5-V2-A2，中，accepted未修（Kimi01）**：候选§4把同sourceID核心事实冲突变成一条财期未知，但实际 `_deduplicate_hk_announcements` 明确raise ValueError，owner测试约721行也断言同源完整性错误。此冲突不是财期证据不足；保持原协议错误/原测试，不软化为unknown。destination本gate一次集中planfix；补§9回归。
+- **F5-V2-A3，低，accepted未修（Kimi02的有效部分）**：candidate排除副语言年度证据，会收窄现行先从全部去重raw汇总annual_ends、后排英文主候选的规则；保留可信英文原始年度截止日证据，但英文副本仍不生成主候选。destination同一集中planfix+同证据集合回归。Kimi声称local无language字段不采：root直接看到upsert持久化 `source_language=candidate.language`（约266行）。这里的修复依据是可信证据不应因语言丢失，不是该错误字段论据。
+- Kimi03（直接selector测试迁移清单）：§9已包含selection测试，机械pyright/pytest也会暴露；不单立material blocker。作为同轮实施/计划明确义务补六直接调用，保持核心冲突测试，不另开报告修复loop。
+- Q-A root最小技术裁决：远端unknown的existing_document_id恒None，source_id保真实provider来源引用；只在rebuild实际已知物理文档时带原ID。不新增未知canonical身份索引/分配/模糊反查，仅为可选定位不扩scope。
+- Q-B root技术裁决：既有period_resolution_version由当前owner升级为hk-period-v3，记录真实新语义，保留document/content版本；不新字段或历史迁移。
+- Q-C并入A1修正确实存在的 `_record_from_json` reader，绝非兼容别名。
+
+新增A2/A3及A1均先登记，MiMo返回后统一裁决并交Sol一次集中planfix；目前无planpass/实施，N01/N02仍未修。
+
+## MiMo2205 终态、组合门禁与集中修复范围
+
+MiMo outer0、有效JSON success/is_error false/terminal completed，95turns，modelUsage mimo-v2.6-pro[1m]，canary match，无permission_denials；stderr精确非致命模型识别警告。完整报告 `docs/reviews/plan-review-20261001-191824.md` 已读；核收 `workspace/tmp/pr197-controller-collection-20261001/f5-plan-review-mimo-root-receipt.json`。58 current+originals root再核全匹配，报告初始HEAD b3不充当前58af。Claude中间逐工具可见性仅summary，关键事实root已独立读。
+
+- MiMo F1与A2同根因，采纳“计划歧义需修”；不采“同来源核心冲突必须unknown继续A”：用户A/B裁决讨论财期推断，可信provider来源自身事实冲突属于原协议完整性，不能反向借该裁决弱化原错误。保持原ValueError与owner测试。MiMo条件性pass-with-risks不计gatepass。
+- MiMo OQ1 root技术裁决：已确定财期但原标题无唯一截止日时，当前report_date为None；同一次既有metadata事务把source/manifest/processed的report_date与report_date_source同步置None，不能公开None而durable保旧事实。`repository_protocols.FilingSourcePublicationIdentity.report_date`与inspector接受None，processed manifest从merged_meta同源投影。未知B仍不写源/processed，不混这两条路径。补known-no-end旧日期反例；不新enum字段/历史迁移。
+- root取证中两个猜测的storage文件路径rg不存在，实际protocol/inspector/processed core已定位直接读；复合outer0不抹去检索失败，无剩余证据gap。
+- 其余MiMo风险按v2已有owner/实施验收，不重复注册：366所有消费点、4096真实边界、取消/typed中止保全必须实测；超窗/过渡财年仍信息边界。
+
+**本轮plan review gate=failure，next entry=plan fix。** A1/A2/A3 accepted未修，N01/N02尚未产品修复。Sol一次集中修正v2，并显式落实原selector测试迁移、remote未知existingID=None、rebuild原真实ID、audit版本v3、总体unknown FAILURE+保全partial与取消优先。修正后同版MiMo/Kimi窄re-review这些关键差异及关联owner，不重读全部旧计划/全仓/已closedWU，不为报告元数据单开fixloop。作者仅plan，不产品写；accepted plan checkpoint后才F5-S1实现。
