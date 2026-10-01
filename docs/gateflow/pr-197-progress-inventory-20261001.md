@@ -14,10 +14,10 @@
 | WU | 完成了什么 | 还剩什么 |
 | --- | --- | --- |
 | F2 | owner修复/双审/验证/入PR | 由最终整PR验证覆盖 |
-| F3 分析脚本参数化 | 2983完整amendment已双路复审/root pass/accepted fe474并push | Sol33503修复交付核收；MiMo65815/Kimi87199同时code review在途→accepted slice/aggregate/PR review/closeout |
+| F3 分析脚本参数化 | 2983完整amendment已双路复审/root pass/accepted fe474并push | Sol33503修复交付核收；MiMo65815/Kimi87199均终态，root双路裁决已落盘，F3-CR1-A1低accepted未修→accepted slice/aggregate/PR review/closeout |
 | F4 HK身份批量读取 | A1/A2已修复/双路复审与root pass，794同版tests/type0/八prodfilecov>=80 | code-review及accepted slice75fec034已push/readback→aggregate/PR review/closeout |
 | F5 HK财期锚点一致性 | 目标/提案/官方非空raw补证；N01/N02已登记 | Q1未知财期是否继续确定报告待用户具体裁决→计划修订/审查→实现及后续全部门禁 |
-| F6 storage sibling错误公开语义 | Sol44460计划交付核收；F6-P1 SEC同根因已接受，Sol50829补计划在途 | 核收SEC补计划→双路planreview及后续全部门禁，shared源码串行 |
+| F6 storage sibling错误公开语义 | Sol44460计划交付核收；F6-P1 SEC同根因已接受，Sol50829补计划终态部分核收；F6-PV01由Sol31175窄修在途 | 核收SEC补计划→双路planreview及后续全部门禁，shared源码串行 |
 | F7 下载status唯一owner | 实现/双审/aggregate accepted，314/2cc已推 | 同一最终PR版本PR review及closeout；不能算完整WU已结束 |
 
 因此优先批次6项：F2局部闭合，5项仍待完整闭环。F3/F4不能把文字或代码候选算修复通过；F7剩收口不是重新实现。
@@ -96,3 +96,7 @@ F6-P1/OQ1：SEC postrepair仍需repair却抛版本冲突，且adapter缺typed已
 ## 整体最终门禁（用户重申）
 
 完成已裁决修复项及已批准PR197 findings后，重跑最终commit的完整真实CLI CI，核对/登记oracle与scenarios及readiness proof；用户明确当前正式registry仅完成download和upload，不含upload_material。待goal残余不自动当本轮必实施事项，各局部WU closeout不代表本大目标完成。详 `docs/gateflow/upload-material-repair-scope-and-ci-closeout-20261001.md`。
+
+F3-CR1-A1：root与Kimi同根因输入链接环，中文输入错误exit2合同未满足；已登记当前F3必要fix，未改源码，不创建额外WU。详 `docs/gateflow/pr-197-r1-f3-input-loop-review-adjudication-20261001.md`。
+
+2026-10-01最新门禁：F3双路代码审查已收齐，root `pr-197-r1-f3-s1-code-review-adjudication-20261001.md` 记录F3-CR1-A1 accepted未修→Sol窄fix；Unicode未建别名保持独立goal。F4 accepted slice已入PR，MiMo48266/Kimi10989整项aggregate双审在途。F6-PV01取证窄fix Sol31175在途；旧-01派发路径拼写setup错误、模型未启动，新-02恢复独立记录。最终真实CLI CI/oracle/scenarios约束不变，现有registry仅download/upload。

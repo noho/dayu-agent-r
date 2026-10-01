@@ -35,3 +35,7 @@
 ## 当前review中新观察的边界
 
 root受控四模块CLI探针发现循环链接out-root在Path.resolve处报RuntimeError/exit1而未进入中文argparse拒绝边界，记录在 `workspace/tmp/pr197-controller-collection-20261001/f3-out-root-loop-probe/commands.json`。仅登记为F3输入owner的review候选，未自创独立WU、未修改代码、未改变oracle；在当前code review中按已接受输入错误合同裁决必要性后才决定是否属于本F3最小fix。它不得以“发现新问题”无限扩本轮产品范围。
+
+## 2026-10-01 最新审查状态更新
+
+旧实时段仅为历史观察。当前已读回checkpoint4a3a28c5；F3双路审查终态，root独立证据已将输入链接环裁为现成F3合同必要修复F3-CR1-A1 accepted未修（非新WU），详正式code-review-adjudication。F4 aggregate MiMo48266/Kimi10989在途；F6旧SEC补计划终态部分核收，F6-PV01非空类型证据窄fix Sol31175在途。F5 Q1仍pending；最终真实CI/两个registry scope约束不变。
