@@ -47,3 +47,9 @@ retry_class: none
 - 最终PR描述与同版PR review/closeout：covered by later approved slice，owner=root PR197收口；旧隔离worktree描述必须按当前唯一开发树更新，现有Closes #198及已完成证据保留，不merge/main。
 
 下一入口：继续当前F6必要fix和同版双审；CI proposal后续按完整范围独立审查/最终重绑定。真实CI、正式material registry与readiness均未完成，不报告任务大目标完成。
+
+## 后续必要计划纠正索引（只登记，不修产品）
+
+`CI-PREP-A1`：proposal §6将“O03/F3 workspace与共享CLI入口”并列，容易误把PR197-R1-F3五个分析utils的输入路径修复当作dayu-cli workspace解析owner。root直接核F3 accepted slice只改五utils、O03真owner为`dayu.cli.workspace_root.resolve_workspace_root`；两个scope不同。裁决：accepted / 未修复 / 低，owner=最终CI计划的依赖映射，destination=该proposal下一次planfix/独立审查前纠正来源绑定。原O03共享CLI回归义务保留，不因纠正F3引用缩小场景范围；不派产品实现或另造WU。当前仅接受proposal交付，未接受最终计划，原proposal保持原件直到明确的planfix冻结。F6窄re-review输入不包含该CI计划，登记不改变365冻结。
+
+XBRL现有来源补充：root只读核repo AAPL instance仍在且hash等旧E01引用，根为XBRL instance，含4个typedMember、同目录8文件；只是已知上游4437候选，不是新的无typed正样本、完整taxonomy或部署成功证明。记录 `workspace/tmp/pr197-controller-collection-20261001/final-ci-xbrl-existing-source-candidate.json`。初始猜测gateflow glob未匹配导致zsh读命令未启动，已用rg --files定位实际artifact并恢复；不把旧Raw或旧临时证据存在性冒称已复核。后续真实输入/source与依赖gap仍按上文分类解除。
