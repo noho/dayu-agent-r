@@ -3,17 +3,17 @@
 <!-- PR197_LIVE_GATE_STATUS_START -->
 ## 当前有效状态（2026-10-01）
 
-只在 `/Users/leo/workspace/dayu-agent-r` / `codex/upload-material-oracle` 开发；main `fac32ecbff` 未动。最近读回本地/远端/PR197 checkpoint `06369c00`，新增未过门禁候选不提交。用户授权全部 runner runtime/provider；现有 Sol plan/implement/fix、MiMo/Kimi 双审及真实 quota→DS 备份不变。所有调用绝对 cwd、新独立双流、no-persist/canary、root结构化和直接证据裁决。
+只在 `/Users/leo/workspace/dayu-agent-r` / `codex/upload-material-oracle` 开发；main `fac32ecbff` 未动。最近读回本地/远端/PR197 checkpoint `a629e581`，新增未过门禁候选不提交。用户授权全部 runner runtime/provider；现有 Sol plan/implement/fix、MiMo/Kimi 双审及真实 quota→DS 备份不变。所有调用绝对 cwd、新独立双流、no-persist/canary、root结构化和直接证据裁决。
 
 | WU | 当前状态 | 下一入口 |
 | --- | --- | --- |
-| F3 | 同版 code re-review pass；MiMo7898 outer0/109turns完整报告，DS55704 outer0/121turns部分取证限制保留；root1978身份、42CLI/231断言/临时3files type0复核，C01/C02/输入环/PV01 accepted已修 | accepted slice03e8b9b0已push；完整五文件 aggregate MiMo50118在途、DS65682 outer0/77turns部分核收（真实9CLI为5x0/4x2、54PASS、type6files0；Kimi35525 quota失败保留）；F3-AG-PV01冻结误含并行F6根README，root在新tmp按同accepted slice固定README，DS14599 outer0/48turns窄复审及root1117/1116/5blob实核，PV01 accepted已修；完整aggregate仍待MiMo50118，详pr-197-r1-f3-aggregate-readme-rebind-receipt-20261001.md；详 pr-197-r1-f3-input-loop-code-final-adjudication-20261001.md；最终PRreview/closeout未完成 |
+| F3 | accepted slice03e8b9b0已push，code gate已pass；完整aggregate MiMo50118 outer0/75turns与DS65682 outer0/77turns，无产品materialfinding；root实际22probe/6CLI退出/2tmp type0及旧DS54/9/type6独立核收 | 旧共同freeze误含并行F6 README的PV01已DS14599与root核实修复；MiMo53684同新pinned清单窄复审在途，gate暂未pass；详pr-197-r1-f3-aggregate-readme-rebind-receipt-20261001.md，最终PRreview/closeout未完 |
 | F4 | accepted slice75fec034 + aggregate87b5a642 已入PR | 最终同版 PR review/closeout |
 | F5 | 公开 mixed-known/unknown 财期 Q1 仍待具体用户选择；官方非空raw已补；N01/N02和F4真实API重绑定尚未实施 | 答复后 Sol planfix→双审→实施；不代选P1/P2 |
-| F6 | 同版MiMo37469 outer0/69turns与DS22262 outer0/106turns已root核收；root124身份/真实source/tests/完整报告裁决plan re-review pass，A1–A4计划已修；DS列名建议拒绝、错误reason叙述纠正 | accepted plan a32ff820已push/readback；Sol69038 F6-S1实施在途，65current/original/44readonly，仅8prod/10tests/3README，最新1335受影响测试、八prod覆盖率>=80、delivery fulltype783/0均为在途证据，作者继续补真实SEC owner回归，产品未验收；详pr-197-r1-f6-plan-fix-rereview-adjudication-20261001.md |
+| F6 | accepted plan a32ff820已push；Sol69038 outer0/364JSONL交付候选经root65original/44readonly/21allowed核收，1338受影响测试pass、全量type783/0、八prod无排除cov>=80 | 同版220current/originals冻结，MiMo57480/Kimi2133代码双审在途；产品21候选未提交、gate未pass；详pr-197-r1-f6-s1-delivery-receipt-20261001.md |
 | F7 | accepted slice/aggregate 已入PR | 最终同版 PR review/closeout |
 
-当前唯一产品sourcewriter F6 Sol69038（8prod/10tests/3README）；F3 MiMo7898与Sol52703均已终态且root核收；F3 aggregate MiMo50118只读审查与F6实施并行；DS65682已终态。原1117清单仅README出现F6合法变更，五源码不变；新readme-rebind冻结保留同slice README snapshot及1116其它输入，原件不改，PV01已由DS14599窄复审及root独立核收修复，完整aggregate仍待MiMo终态；Kimi35525失败和DS备份详pr-197-r1-f3-aggregate-review-provider-failure-20261001.md。F3/F6交付接受不等于gatepass；旧两次Sol routing失败/39776认证恢复/各临时验证失败和恢复全保留。核收详 `pr-197-r1-f3-input-loop-fix-receipt-20261001.md`、`pr-197-r1-f6-plan-fix-receipt-20261001.md`；活动托管句柄及原输出位置在 `workspace/tmp/pr197-controller-collection-20261001/active-runners.json`。
+当前无产品sourcewriter。活动runner为F6 MiMo57480/Kimi2133同版只读code review，及F3 MiMo53684输入重绑定窄复审；旧MiMo50118/Sol69038/DS14599均已外层终态核收，不再轮询。所有原件及非零/恢复保留；F6 report关于ps无对应事件不采、input-end旧HEAD按窗口而非current理解，root明确登记。F3原README冲突及统计/类型取证口径修正在正式receipt中保全。交付核收不是gatepass；活动句柄/output/stderr/freeze位置在 `workspace/tmp/pr197-controller-collection-20261001/active-runners.json`。
 
 原upload修复依既有依赖序列在F2–F7后推进。以用户现成裁决为准，新schema/历史迁移/业务选择不凭继续授权代猜。旧upload_material Raw用户确认已删除；31正式裁决/36项语义保留，不能编造旧Raw复核。**全部已批准修复后，在最终commit重建完整mandatory矩阵并跑真实CLI CI，正式确定/登记upload_material oracle、scenarios和readiness proof**；现有registry的Fins范围仅download/upload_filing，不能当material完成。权威合同 `upload-material-repair-scope-and-ci-closeout-20261001.md`。历史正文按时间保留，不覆盖本节最新状态。
 <!-- PR197_LIVE_GATE_STATUS_END -->
