@@ -2,7 +2,7 @@
 
 日期2026-10-01；gate=code review；唯一工作树 `/Users/leo/workspace/dayu-agent-r` / `codex/upload-material-oracle`。accepted plan `a32ff820`；当前 PR197 checkpoint `244056c50a1cbbff2458a79bc5f3fcbde8086417`，draft/main不变。artifact path：`docs/gateflow/pr-197-r1-f6-s1-code-review-adjudication-20261001.md`。
 
-## 当前状态
+## 当前状态（首轮收集窗口）
 
 MiMo57480已托管outer exit0；Kimi2133仍在途，未取得退出码，不切provider、不重派。当前21候选文件未提交；code gate **尚未通过**。以下成立修复项立即持久登记，避免压缩丢失；等Kimi终态核收后才允许Sol唯一源码writer修改，以免破坏在途只读审查身份。
 
@@ -51,3 +51,30 @@ retry_class: none
 - 最终同版PR review/closeout及全部已批准修复后完整真实CLI CI、正式upload_material oracle/scenarios/readiness：covered by later approved slice，owner=root最终收口；本次离线取证不代该终点、旧Raw删除不伪造。
 
 下一入口：核收Kimi2133终态和完整报告，完成combined裁决；Sol唯一writer必要fix→MiMo/Kimi同版re-review→accepted slice。当前无产品writer，最终PR/CI尚未执行。
+
+## 双路终态后 combined 裁决（2026-10-01）
+
+Kimi2133已托管outer exit0，完整JSON subtype=success/is_error=false/110turns/permission_denials=[]，actual modelUsage=`kimi-k3[1m]`。独立输出/stderr在 `/private/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/sub-agents.AAW5hd/`；stderr仅精确unrecognized_model warning。完整报告 `docs/reviews/code-review-20261001-144502.md` SHA `f86c5fb4acf14444af3dae1b081949892ffd396d6f379ddef418f61e5f8f6ad7` 已全文读，报告canary与expected一致，220current/originals独立重核一致。
+
+Kimi原两组stdout真实34/25passed，但缺独立命令/exit落盘，不能用outer0代其内层退出。root从该独占cache核59个具体node，激活venv后使用独立cache/basetemp重跑：实际 **59passed / 3既有edgar warnings / exit0 / stderr空**，argv、双流、exit保存在 `f6-code-review-root/kimi59-root.*`，未修改原日志。这次小范围补齐必要退出证据，不重复全1338测试。Kimi三项探索失败均已解释恢复：两次空grep不证明缺实现；freeze current副本误当旧baseline产生ORIGINAL_MISMATCH，后preimplementation originals重新确认21baseline。root也已独立核65preimplementation originals。HEAD/status声明只适用a629首窗口，后root文档checkpoint不作候选源码漂移。
+
+```yaml
+setup_status: ok
+agent_status: completed
+tool_evidence: yes
+tool_trace: summary_only
+required_evidence: complete
+canary_status: match
+result_status: accepted
+warnings:
+  - 精确 unrecognized_model stderr warning
+  - Claude汇总流没有逐调用轨迹
+  - 原定向测试缺独立exit，root真实59node复跑补证，与原证据区分
+  - 两次空grep及基线原件误读均恢复，旧失败不抹去
+evidence_gaps: []
+retry_class: none
+```
+
+**最终首轮 code gate：fail / required fix，A1/A2仍accepted未修。** Kimi认为owner240上界足够、hint断言只是增强；root不采这两项非阻塞建议：公共安全上界与CLI显示上界属不同owner，plan C.7未授权移除既有显示行为，root已经同源复现；F6的核心恢复动作合同需独立断言，而不是所有入口和expected都用同映射自比。不改public240规则、不重新裁业务文案，不按两路票数放行。
+
+Kimi export字母序/旧透传fixture命名为纯清理，root rejected作为本轮修复；不涉及错误产品事实或倒逼兼容行为。其余独立job/storage/取消helper/test结构残余按上述分类携带，不借review扩目标。Kimi未提出其它必要修复。现在两reviewer均终态，下一入口是Sol唯一writer **只改CLI显示与两个对应测试文件**，不得扩到其它prod或README；修复后受影响测试、full pyright、当前改动CLI无排除cov>=80，保持其它七prod及其已核覆盖身份，随后同版MiMo/Kimi窄re-review。正式required findings及该gate失败记录保留，不以实施完成自判pass。
