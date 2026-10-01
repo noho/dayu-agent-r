@@ -41,3 +41,8 @@ P1称未知时公司也必须零写只是提案验证，不改写用户独立com
 ## 当前入口与排程
 
 F5处plan/proposal，非code-generation-ready、非accepted plan、未实施；Q1待用户，Q2/Q3技术已收敛，N01/N02需计划纳入，N03核证据。可以继续不依赖Q1的其它F3/F4工作，不以时间当回答/授权。下一依赖入口是用户Q1答复→Sol固化最小计划/登记既有新findings→同版Planreview/必要fix/re-review→acceptedplancommit→共同源码串行实施。README当前不改，原prospective职责记录待产品落地。无主干改动/newbranch/worktree/PRcomment。
+
+
+### F5-N03资料补证完成
+
+根两个精确单日官方公开GET取得非空200body，生产严格snapshot/raw/00700stockscope/hash验证均有效。详pr-197-r1-f5-official-raw-evidence-20261001.md及临时owner-validation.json；N03“非空原始raw缺失”gap解除，不是产品已修。原官方季度标题带三个月及九个月，无anchor已合法Q3；根首probe错误预设None断言1已恢复并披露，未造窄窗缺陷或改raw。未来fixture合成未知标题需标合成，原body/hash/provenance保持。Q1仍待用户，方案不实施。

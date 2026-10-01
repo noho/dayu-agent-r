@@ -1,21 +1,29 @@
 # PR #197 审查 findings 修复：接续总控记录
 
 <!-- PR197_LIVE_GATE_STATUS_START -->
-## 当前执行状态（2026-10-01 03:22:15 本机读取）
+## 当前执行状态（2026-10-01 09:04:42 本机读取）
 
 权威是用户现成裁决；旧历史记录保留，下表为当前入口。
 
 | WU | 当前入口 | 活动 runner / 后续 |
 | --- | --- | --- |
-| F2 | 局部闭环 | 不代表整个PR通过 |
-| F3 | F3-PR3-A1计划文字fix | 原两路已outer0/根合并：A1/C02主体已修候选；Sol99211/e3CL7a仅文字fix，26readonly/27originals；源码未修 |
-| F4 | accepted plan commit待创建 | 两路均outer0，根41SHA/同源三hunk核定f17计划accepted；产品未实施 |
-| F7 | PR review待审查名额 | accepted deepreview2cc2f5ed已push/readback；沿用draftPR197，下一PR review，未finalcloseout |
-| F5 | proposal待公开行为裁决 | Sol11838已outer0；根34SHA/77JSONL核收，Q1已问用户，Q2/Q3已技术裁决；N01/N02accepted未修 |
+| F2 | 局部闭环 | 不代表整个 PR 通过 |
+| F3 | 两句计划修复同版窄复审在途 | MiMo83589、DS74668已outer0；两路支持前轮文字修复并定位F3-PR4-A1。Sol18703亦已outer0，2983efa4候选根核收，MiMo11067/Kimi61008同版16输入窄双审在途，C01/C02源码仍未修 |
+| F4 | F4-S1 fix 在途 | Sol52404已outer0；14文件候选交付证据核收，788测试/fullpyright0/八生产文件覆盖率>=80仅为修前候选验证；根发现F4-CR1-A1中等accepted未修，代码不放行；MiMo55351/Kimi71117均outer0，根核收；A1及新A2测试合同均accepted未修，Sol22860当前S1fix在途（51输入/43readonly） |
+| F7 | PR review待稳定CN源码/审查名额 | accepted deepreview2cc2f5ed已push/readback，未finalcloseout |
+| F5 | proposal待公开行为裁决 | Q1单份unknown是否继续确定报告仍待用户；N01/N02accepted未修，N03官方raw补证完成；未实施 |
 | F6 | goal已有，尚未plan / 实施 | 共同CN源码串行 |
 | 原upload及独立WU队列 | 未顺带实施 | 按既有裁决和主队列依赖继续 |
 
-唯一开发主树codex/upload-material-oracle，main fac32ecbf未动；当前已提交本地/远端/PR head2cc2f5ed，未提交候选保留待审。所有runner显式主树绝对cwd、独立output/stderr、唯一label，根核验真实外层退出/完整结构化结果/令牌/源码与validation后裁决。原Kimi47199 API403五小时quota硬拒收保留；尚无额度恢复证据，已授权ds-flash备份用于本组审查。无关docscheckpoint允许HEAD推进，但F3 26相关只读SHA不放宽；F4双审已退出；F5已退出，不把未accepted proposal当实施许可。
+唯一开发主树codex/upload-material-oracle，main fac32ecbf未动；最后live核验local/tracking/live/PR head dc29c1fe，OPEN/draft，候选尚未提交并全部保全。本次托管18703真实exit0，旧三路及其后文档修复均已结束；新F4两路review均真实exit0并已核收；Kimi本轮可用。当前三路：Sol修F4、MiMo/Kimi只读审F3；产品候选尚未accepted。仅冻结F4实际候选，F3文档修复与其源文件写界不重叠。
+
+新增修复F4-CR1-A1必须在当前S1处理：真实Fs仓储创建并提交600层合法JSON，旧list/get与COMPLETE分类成功，新批量view的deepcopy抛RecursionError；证据docs/gateflow/pr-197-r1-f4-deep-json-adjudication-20261001.md及workspace/tmp/pr197-controller-collection-20261001/f4-deep-meta-probe.json。owner为storage观察副本，禁止下游catch/fallback/限深/跳过文档/改用户业务裁决。完整delivery裁决docs/gateflow/pr-197-r1-f4-s1-delivery-adjudication-20261001.md。F3剩余计划修复裁决docs/gateflow/pr-197-r1-f3-digest-exception-adjudication-20261001.md，不能将文字候选当源码已修。
+
+F4新review准备首次猜测不存在dayu/fins/adapter_failure_contract.py导致controller setup失败，尚未创建freeze或启动provider；部分原件保全，改以实际import真源定位后恢复，不计provider失败或重试。Kimi47199 quota403历史保留，没有由历史失败认定本轮额度必不足。根核真实退出/完整结构化结果/来源与验证后自行裁决，不以多数意见重裁业务。
+
+F4合并裁决docs/gateflow/pr-197-r1-f4-s1-code-review-adjudication-20261001.md：新增F4-CR1-A2低accepted未修，9340附近私有中间引用突变测试固化deepcopy，随A1当前S1改为公开owner合同断言；不是新业务裁决或新WU。MiMo报告51计数不采，根实际47逐件身份保持。
+
+用户最新指令：继续全部已授权WU，全部完成后再停下汇报；推进期只简报实际进展。原依赖优先顺序与现成业务裁决保持；F5 Q1仍待用户回答，不以继续授权代替具体公开行为裁决。
 <!-- PR197_LIVE_GATE_STATUS_END -->
 
 
