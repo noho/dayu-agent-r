@@ -14,3 +14,7 @@ root独立核1978身份、五源码实际最小diff和旧1098/287命令原件；
 DS交付暂部分采纳，所支持的源码结论必须由root直接证据和另一完整审查核定；不接受“全部my-harness均exit0/没有中间失败”的泛化。四类fixture断言/缓存计数/不可幂等失败、瞬态路径读取和OMP告警按报告保留；root新增配置错误也保留。取证脚本修复不需要重新裁业务oracle、变更accepted plan或创建新产品slice。
 
 当前next：F3同版MiMo终态、Sol窄取证fix/独立核收→综合code gate裁决；pass后才accepted slice/aggregate/最终PRreview。最终完整真实CLI CI/registry未完成。
+
+## PV01 后续核收（2026-10-01）
+
+Sol52703 已 outer0／89JSONL／turn.completed，root 独立核 11+11、989+989 身份与原 DS 566 件保全，并激活 venv 重新得到 strict 2files／0errors／exit0。F3-RR-PV01 改为 **accepted／已修复**；前述未修状态为时间线原记录。完整核收及非零命令说明见 `docs/gateflow/pr-197-r1-f3-rereview-evidence-fix-receipt-20261001.md`。MiMo7898 仍在途，产品 code gate 仍未通过；下一入口是 MiMo 终态核收和综合裁决。
