@@ -1,11 +1,11 @@
 # upload_material 修复阶段接手 prompt（#198 闭环后）
 
 <!-- PR197_LIVE_GATE_STATUS_START -->
-## 当前有效状态（2026-10-01，用户指定停点）
+## 当前有效状态（2026-10-01，F5裁决后恢复全部任务）
 
 唯一开发工作树 `/Users/leo/workspace/dayu-agent-r`，唯一开发分支 `codex/upload-material-oracle`；所有开发/证据只进入现有 OPEN/draft PR197，用户手工 merge。accepted PR review commit `c305067fb7434b2fd0bc5a10398fc65ac600fce8` 已普通push/root读回；main本地/tracking/远端/base均 `fac32ecbff9bfe792b63ee9667c8697826b631f4` 未动。后续文档checkpoint以实时git/PR读回为准，不能沿用此hash充当前HEAD。
 
-**当前停止执行：用户要求其它 PR review findings 闭环后停下，通俗解释并讨论 F5。不实施 F5，不启动后续原 upload 修复队列。**下一个业务入口是讨论 HK 混合 known/unknown 报告处置；没有具体选择时不得代选。停止不豁免F5原accepted未修项或最终真实CLI验收。
+**F5 已获用户具体裁决并恢复推进**：先用同公司可信证据推断，仍失败则继续已知报告、明确列出不确定报告，不猜财期。详 `docs/gateflow/pr-197-r1-f5-user-decision-20261001.md`。Q1已解除，P1整请求写前失败不采；下一入口Sol固化当前真实源码上的最小完整计划→MiMo/Kimi同版并行Planreview。尚未实施，原upload队列仍待F5闭环后进入。
 
 | 项目 | 当前有效状态 | 下一入口 |
 | --- | --- | --- |
@@ -13,13 +13,13 @@
 | F2 | bb11ca22 已修、双审/类型/推送完成；当前组合保全，修复闭环 | 本轮无后续动作 |
 | F3 | slice03e8b9b0 / aggregate244056c5 / PRreview c305067f / push读回 / draft-PR-pass / final closeout pass | completed，残余按原owner保留 |
 | F4 | slice75fec034 / aggregate87b5a642 / 同版PRreview及最终收口通过 | completed，同上 |
-| F5 | 未实施；原finding与N01/N02 accepted未修；官方非空Raw补证完；Q1未决 | 按用户要求讨论后再决定最小planfix/双审/实施 |
+| F5 | Q1已按用户裁决解除；原finding与N01/N02 accepted未修；官方非空Raw补证完；尚未实施 | Sol固化单一行为slice计划→同版双审→实施 |
 | F6 | slice4f0b5b04 / aggregate5fc5e4f0；AG-A1已修；同版PRreview及最终收口通过 | completed，同上 |
 | F7 | slice31473fe1 / aggregate2cc2f5ed；当前F6后共享workflow已核；PRreview及最终收口通过 | completed，同上 |
 
 最终收口 `docs/gateflow/pr-197-findings-except-f5-final-closeout-20261001.md`；正式PR裁决 `docs/reviews/pr-197-review-20261001-175653.md`。MiMo34356/授权quota备份DS72633均outer0、完整结构化及报告/canary已核；Kimi87412 outer1/API403原失败保全。root独立68current/originals、37精确blob、715全compare和37对应段；两路关键意见采纳，非关键clean/旧coverage/DSargv-exit缺口收窄，不另起报告修复循环。root真实1377passed/3既有warnings/exit0、全量pyright783checked/0error与当前37字节绑定；各原覆盖按owner字节和后续F6更新有效证据复用。本四WU scoped PR gate不是全715文件最终pass或merge readiness。
 
-所有runner终态已收取，无在途writer/reviewer。Sol39648只读交付已核75JSONL/33commands/17冻结+77实际读取exact5fc；粗分组候选 `docs/gateflow/upload-material-remaining-work-batching-preparation-20261001.md` 及核收receipt只作后续proposal，**不是accepted plan/新WU数量/实施授权**，不改变本次停点。
+此前组合审查及Sol39648只读交付均已终态核收；现Sol19367外部runner在途，仅固化F5 plan v2，45冻结输入无产品writer，未计accepted plan/codepass。用户最新明确继续完成全部已批准任务、简报实际进展；不是停在计划gate。原Sol39648粗分组候选 `docs/gateflow/upload-material-remaining-work-batching-preparation-20261001.md` 及核收receipt只作后续proposal，**不是accepted plan/新WU数量/实施授权**，不直接推进原队列门禁；F5闭环后按实际依赖进入。
 
 后续WU默认一个完整可验证行为slice，仅真实依赖/风险/独立验收才拆并说明理由，不按文件/模块机械拆；同gate必要fix批量一轮交付+同版双审。Sol负责plan/implement/fix；MiMo/Kimi并行review，Kimi真实quota失败DS备份；用户授权所有runner runtime/provider不改变职责或现成业务裁决。每调用绝对cwd、独立output/stderr/no-persist/canary；root检查结构化及直接证据自行裁决。
 
