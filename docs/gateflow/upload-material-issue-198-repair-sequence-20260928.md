@@ -3,14 +3,14 @@
 <!-- PR197_LIVE_GATE_STATUS_START -->
 ## 当前总控状态（2026-10-01，同一主工作树）
 
-用户授权完成已裁决修复项及后来明确批准的PR197 findings；待goal残余不自动纳入必实施范围。只在 `/Users/leo/workspace/dayu-agent-r` 的 `codex/upload-material-oracle` 开发，所有修复进PR197，用户手工merge。当前已独立核对local/tracking/live/PR checkpoint 854114a3，main fac32ecbff 未改。
+用户授权完成已裁决修复项及后来明确批准的PR197 findings；待goal残余不自动纳入必实施范围。只在 `/Users/leo/workspace/dayu-agent-r` 的 `codex/upload-material-oracle` 开发，所有修复进PR197，用户手工merge。当前已独立核对local/tracking/live/PR checkpoint 8000f54b（本次裁决docs尚未checkpoint），main fac32ecbff 未改。
 
 | WU | 当前有效状态 | 下一入口 |
 | --- | --- | --- |
 | F3 | Sol33503 outer0交付已root核收；原504+新增405断言、263子命令、类型0/0；五源码候选尚未提交 | MiMo65815/Kimi87199均outer0；root双路code gate裁决不通过，F3-CR1-A1输入链接环accepted未修；freeze35输入；Sol原-01/-02均服务路由超时失败；无source修改；用户已选择保留Sol等待服务恢复，随后同版复审/accepted slice/aggregate/PR/closeout |
 | F4 | MiMo6115/Kimi13577均outer0，root同版177身份核对与真实探针通过；A1/A2已修复、code-review pass | accepted slice75fec034已push/readback；MiMo48266/Kimi10989均outer0/rootaggregate pass；accepted deepreview87b5a642已保存；最终PRreview/closeout待做→PR review/closeout |
 | F5 | 官方非空raw补证完成，公开混合已知/未知财期Q1仍未收到具体选择，禁止擅自选P1/P2 | 答复后修plan再双审/实现；其它WU继续 |
-| F6 | Sol44460 outer0/66JSONL计划交付核收；F6-P1/OQ1 SEC同根因root accepted未修复，必要范围纳入F6 | Sol50829终态部分核收；F6-PV01取证窄fix Sol31175 outer0/rootaccepted已修复，MiMo25143/Kimi49742同版planreview在途；不增job schema |
+| F6 | proposal c5978746；F6-PV01已修复；MiMo25143 outer0/69turns核收，F6-PR1-A1（SEC取消/status及完成日志归属）/A2（CN postrepair三类型catch）root accepted未修 | plan gate不通过；Kimi49742 outer1/API403五小时额度拒收；ds-flash前两次自动审核deadline未启动，用户再授权后新-03/43581在途；Sol服务恢复后窄fix→同版双路复审；F6-P1产品仍未修，不增job schema |
 | F7 | accepted slice/aggregate已入PR，非完整WU完成 | 最终同版PR review/closeout |
 
 当前无source writer，F3实施因Sol服务连续两次失败等待Sol服务恢复。详 F3 `pr-197-r1-f3-s1-collision-fix-receipt-20261001.md`、F4 `pr-197-r1-f4-s1-fix-rereview-adjudication-20261001.md`；历史在途/旧失败不覆盖本节。原upload队列依用户顺序仍在F2–F7后；新goal/迁移/schema取舍不能用总体继续授权代猜。
@@ -23,7 +23,10 @@
 
 F3-CR1-A1（低）已即时登记：输入Path.resolve链接环错误逃逸中文exit2边界；root四模块真实CLI独立复现，属于现成F3合同必要修复，不扩新业务oracle/WU。详 `docs/gateflow/pr-197-r1-f3-input-loop-review-adjudication-20261001.md`；双路终态已收齐，统一Sol fix/双路复审，禁止跳过。
 
-F6-PV01（低）已登记accepted未修：SEC计划临时pyright实为0files空检查，root非空2file发现日期参数2类型错误。Sol补计划进程50829已outer0；当前Sol31175只修复制tmp probe/证据并纠正文案，不改产品、历史Raw或业务goal。详 `docs/gateflow/pr-197-r1-f6-probe-type-evidence-adjudication-20261001.md`。
+F6-PV01（低）已修复：Sol31175 outer0/69JSONL，root非空2files/0errors与3SECowner探针独立核收；原0files空绿及2errors保留。详 `pr-197-r1-f6-probe-type-fix-receipt-20261001.md`。新F6-PR1-A1/A2即刻登记，详 `pr-197-r1-f6-plan-review-adjudication-20261001.md`；不得把计划问题当产品已修。
+
+
+用户最新授权 $sub-agents 派发所有runtime/provider，不重复索取派发权限；现有Sol plan/implement/fix及用户保留Sol等待恢复选择继续有效。详 `pr-197-runner-runtime-provider-authorization-20261001.md`。旧upload_material Raw用户确认已删除；31份正式裁决/36项语义仍保留，最终commit完整新真实CLI CI与不可用历史lineage必须执行。
 
 <!-- PR197_LIVE_GATE_STATUS_END -->
 
@@ -735,3 +738,5 @@ F3唯一恢复性重试：Sol1929原-01已outer1/turn.failed，workspace routing
 F4 aggregate已root pass，201同版身份/两完整报告/真实39聚焦及原794验证证据核收；唯一超深盘外OQ按已接受getter异常合同裁为非当前阻塞，独立goal风险保全。详 `pr-197-r1-f4-aggregate-review-adjudication-20261001.md`，下一accepted deepreview commit再最终PRreview/closeout。F6 MiMo25143/Kimi49742计划双审在途，无source writer。
 
 用户最新具体答复已落盘：保留gpt-6-sol等待服务恢复、不切实现模型；旧upload_material CI根已删除，不再等路径。正式裁决不重开，最终commit重建完整mandatory矩阵/授权输入并重新真实CLI全证据，历史Raw不可用/旧digest引用与本轮实证分开登记，readiness不借原160执行。F4aggregate accepted deepreview87b5a642；F6双路计划审查继续。
+
+2026-10-01T11:47:05.726293+08:00 F6计划review核收：MiMo69turns/outer0，root110身份/canary/完整报告/关键source独立核验，F6-PR1-A1中、A2低accepted未修，冻结计划未改。Kimi五小时API403/outer1拒收；ds-flash两次自动审核deadline阻止启动已保全，用户明确再授权后新-03/43581同版只读审查在途。Sol保留等待服务恢复；当前无sourcewriter。详 `docs/gateflow/pr-197-r1-f6-plan-review-adjudication-20261001.md`。
