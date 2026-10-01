@@ -3,17 +3,17 @@
 <!-- PR197_LIVE_GATE_STATUS_START -->
 ## 当前有效状态（2026-10-01）
 
-只在 `/Users/leo/workspace/dayu-agent-r` / `codex/upload-material-oracle` 开发；main `fac32ecbff` 未动。最近读回本地/远端/PR197 checkpoint `aca21cf7`，新增未过门禁候选不提交。用户授权全部 runner runtime/provider；现有 Sol plan/implement/fix、MiMo/Kimi 双审及真实 quota→DS 备份不变。所有调用绝对 cwd、新独立双流、no-persist/canary、root结构化和直接证据裁决。
+只在 `/Users/leo/workspace/dayu-agent-r` / `codex/upload-material-oracle` 开发；main `fac32ecbff` 未动。最近读回本地/远端/PR197 checkpoint `244056c5`，新增未过门禁候选不提交。用户授权全部 runner runtime/provider；现有 Sol plan/implement/fix、MiMo/Kimi 双审及真实 quota→DS 备份不变。所有调用绝对 cwd、新独立双流、no-persist/canary、root结构化和直接证据裁决。
 
 | WU | 当前状态 | 下一入口 |
 | --- | --- | --- |
-| F3 | accepted slice03e8b9b0已push，code gate已pass；完整aggregate MiMo50118/DS65682与PV01窄复审MiMo53684/DS14599全部终态独立核收，root裁决aggregate pass | accepted deepreview commit/push→最终同版PR review/closeout；详pr-197-r1-f3-aggregate-review-adjudication-20261001.md；F3 WU尚未最终完成 |
+| F3 | accepted slice03e8b9b0已push，code gate已pass；完整aggregate MiMo50118/DS65682与PV01窄复审MiMo53684/DS14599全部终态独立核收，root裁决aggregate pass | accepted deepreview244056c5已push→最终同版PR review/closeout；详pr-197-r1-f3-aggregate-review-adjudication-20261001.md；F3 WU尚未最终完成 |
 | F4 | accepted slice75fec034 + aggregate87b5a642 已入PR | 最终同版 PR review/closeout |
 | F5 | 公开 mixed-known/unknown 财期 Q1 仍待具体用户选择；官方非空raw已补；N01/N02和F4真实API重绑定尚未实施 | 答复后 Sol planfix→双审→实施；不代选P1/P2 |
-| F6 | accepted plan a32ff820已push；Sol69038 outer0/364JSONL交付候选经root65original/44readonly/21allowed核收，1338受影响测试pass、全量type783/0、八prod无排除cov>=80 | 同版220current/originals冻结，MiMo57480/Kimi2133代码双审在途；产品21候选未提交、gate未pass；详pr-197-r1-f6-s1-delivery-receipt-20261001.md |
+| F6 | Sol69038交付核收；1338tests/full783type0/八prod无排除cov>=80；MiMo57480已outer0/96turns完整核收，root真实长hint探针验证 | F6-CR1-A1显示上界/A2hint合同断言accepted未修，已登记pr-197-r1-f6-s1-code-review-adjudication-20261001.md；Kimi2133仍在途，等终态combined裁决后Solfix→双审；21候选未提交，gate未pass |
 | F7 | accepted slice/aggregate 已入PR | 最终同版 PR review/closeout |
 
-当前无产品sourcewriter。活动runner仅F6 MiMo57480/Kimi2133同版只读code review；F3 MiMo53684已outer0/30turns核收，新1117live/original与五Git blob独立核验通过，已关闭输入重绑定修复；旧MiMo50118/Sol69038/DS14599均已终态，不再轮询。所有原件及非零/恢复保留；F6 report关于ps无对应事件不采、input-end旧HEAD按窗口而非current理解，root明确登记。F3原README冲突及统计/类型取证口径修正在正式receipt中保全。交付核收不是gatepass；活动句柄/output/stderr/freeze位置在 `workspace/tmp/pr197-controller-collection-20261001/active-runners.json`。
+当前无产品sourcewriter。活动runner为F6 Kimi2133同版只读code review，以及Sol13693为已批准最终CI准备只读覆盖/取证计划（41冻结，非正式矩阵/registry写入/CI执行）；MiMo57480已成功终态并登记两条必要修复，不再轮询；F3 aggregate已pass/push。当前F6输入220current/originals保持冻结，待Kimi结束才fix。所有原件/非零/恢复保留，具体句柄/output/stderr/freeze在 `workspace/tmp/pr197-controller-collection-20261001/active-runners.json`。
 
 原upload修复依既有依赖序列在F2–F7后推进。以用户现成裁决为准，新schema/历史迁移/业务选择不凭继续授权代猜。旧upload_material Raw用户确认已删除；31正式裁决/36项语义保留，不能编造旧Raw复核。**全部已批准修复后，在最终commit重建完整mandatory矩阵并跑真实CLI CI，正式确定/登记upload_material oracle、scenarios和readiness proof**；现有registry的Fins范围仅download/upload_filing，不能当material完成。权威合同 `upload-material-repair-scope-and-ci-closeout-20261001.md`。历史正文按时间保留，不覆盖本节最新状态。
 <!-- PR197_LIVE_GATE_STATUS_END -->
