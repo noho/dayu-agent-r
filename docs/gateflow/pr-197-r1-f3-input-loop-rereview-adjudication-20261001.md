@@ -18,3 +18,7 @@ DS交付暂部分采纳，所支持的源码结论必须由root直接证据和�
 ## PV01 后续核收（2026-10-01）
 
 Sol52703 已 outer0／89JSONL／turn.completed，root 独立核 11+11、989+989 身份与原 DS 566 件保全，并激活 venv 重新得到 strict 2files／0errors／exit0。F3-RR-PV01 改为 **accepted／已修复**；前述未修状态为时间线原记录。完整核收及非零命令说明见 `docs/gateflow/pr-197-r1-f3-rereview-evidence-fix-receipt-20261001.md`。MiMo7898 仍在途，产品 code gate 仍未通过；下一入口是 MiMo 终态核收和综合裁决。
+
+## 完整复审最终裁决
+
+MiMo7898 已 outer0、109turns，完整报告／42CLI／231断言／1978身份／临时3files type0由root核收。code re-review **pass**，既有accepted产品finding和PV01均已修；详 `pr-197-r1-f3-input-loop-code-final-adjudication-20261001.md`。下一入口 accepted slice commit→aggregate deepreview，不能将此写成整项closeout或最终真实CI通过。

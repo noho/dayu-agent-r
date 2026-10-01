@@ -3,17 +3,17 @@
 <!-- PR197_LIVE_GATE_STATUS_START -->
 ## 当前有效状态（2026-10-01）
 
-只在 `/Users/leo/workspace/dayu-agent-r` / `codex/upload-material-oracle` 开发；main `fac32ecbff` 未动。最近读回本地/远端/PR197 checkpoint `a32ff820`，新增未过门禁候选不提交。用户授权全部 runner runtime/provider；现有 Sol plan/implement/fix、MiMo/Kimi 双审及真实 quota→DS 备份不变。所有调用绝对 cwd、新独立双流、no-persist/canary、root结构化和直接证据裁决。
+只在 `/Users/leo/workspace/dayu-agent-r` / `codex/upload-material-oracle` 开发；main `fac32ecbff` 未动。最近读回本地/远端/PR197 checkpoint `b6fb33f7`，新增未过门禁候选不提交。用户授权全部 runner runtime/provider；现有 Sol plan/implement/fix、MiMo/Kimi 双审及真实 quota→DS 备份不变。所有调用绝对 cwd、新独立双流、no-persist/canary、root结构化和直接证据裁决。
 
 | WU | 当前状态 | 下一入口 |
 | --- | --- | --- |
-| F3 | Sol7594 outer0，111JSONL/实际canary；root39原件34只读/五最小源码增量/1098断言287CLI/783与11files类型零错误独立核收。输入环候选未提交，code gate尚未通过 | DS55704 outer0/121turns报告无新增产品finding，root1978身份/7实际临时files type0核查；F3-RR-PV01已由Sol52703修全新tmp副本，outer0/89JSONL；root独立11+11/989+989身份、DS566原件保全及strict2files零错误复核，accepted已修，详pr-197-r1-f3-rereview-evidence-fix-receipt-20261001.md。MiMo7898仍在途，详pr-197-r1-f3-input-loop-rereview-adjudication-20261001.md；之后 accepted slice/aggregate/最终PRreview/closeout |
+| F3 | 同版 code re-review pass；MiMo7898 outer0/109turns完整报告，DS55704 outer0/121turns部分取证限制保留；root1978身份、42CLI/231断言/临时3files type0复核，C01/C02/输入环/PV01 accepted已修 | accepted slice commit→完整五文件 aggregate deepreview；详 pr-197-r1-f3-input-loop-code-final-adjudication-20261001.md；最终PRreview/closeout未完成 |
 | F4 | accepted slice75fec034 + aggregate87b5a642 已入PR | 最终同版 PR review/closeout |
 | F5 | 公开 mixed-known/unknown 财期 Q1 仍待具体用户选择；官方非空raw已补；N01/N02和F4真实API重绑定尚未实施 | 答复后 Sol planfix→双审→实施；不代选P1/P2 |
 | F6 | 同版MiMo37469 outer0/69turns与DS22262 outer0/106turns已root核收；root124身份/真实source/tests/完整报告裁决plan re-review pass，A1–A4计划已修；DS列名建议拒绝、错误reason叙述纠正 | accepted plan a32ff820已push/readback；Sol69038 F6-S1实施在途，65current/original/44readonly，仅8prod/10tests/3README，产品未验收；详pr-197-r1-f6-plan-fix-rereview-adjudication-20261001.md |
 | F7 | accepted slice/aggregate 已入PR | 最终同版 PR review/closeout |
 
-当前唯一产品sourcewriter F6 Sol69038（8prod/10tests/3README）；F3 MiMo7898只读审查与F6实施并行，写入范围互斥；Sol52703窄tmp取证fix已终态且root核收。F3/F6交付接受不等于gatepass；旧两次Sol routing失败/39776认证恢复/各临时验证失败和恢复全保留。核收详 `pr-197-r1-f3-input-loop-fix-receipt-20261001.md`、`pr-197-r1-f6-plan-fix-receipt-20261001.md`；活动托管句柄及原输出位置在 `workspace/tmp/pr197-controller-collection-20261001/active-runners.json`。
+当前唯一产品sourcewriter F6 Sol69038（8prod/10tests/3README）；F3 MiMo7898与Sol52703均已终态且root核收；接下来F3 aggregate只读双审可与F6实施互斥并行。F3/F6交付接受不等于gatepass；旧两次Sol routing失败/39776认证恢复/各临时验证失败和恢复全保留。核收详 `pr-197-r1-f3-input-loop-fix-receipt-20261001.md`、`pr-197-r1-f6-plan-fix-receipt-20261001.md`；活动托管句柄及原输出位置在 `workspace/tmp/pr197-controller-collection-20261001/active-runners.json`。
 
 原upload修复依既有依赖序列在F2–F7后推进。以用户现成裁决为准，新schema/历史迁移/业务选择不凭继续授权代猜。旧upload_material Raw用户确认已删除；31正式裁决/36项语义保留，不能编造旧Raw复核。**全部已批准修复后，在最终commit重建完整mandatory矩阵并跑真实CLI CI，正式确定/登记upload_material oracle、scenarios和readiness proof**；现有registry的Fins范围仅download/upload_filing，不能当material完成。权威合同 `upload-material-repair-scope-and-ci-closeout-20261001.md`。历史正文按时间保留，不覆盖本节最新状态。
 <!-- PR197_LIVE_GATE_STATUS_END -->

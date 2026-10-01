@@ -1,30 +1,115 @@
-"""docling 2.127 升级 schema 层样本回归。
+"""显式样本的 Docling schema 回归。
 
-对样本库（只读）每份 ``fil_cn_*.pdf`` 执行生产转换路径并与其历史基线
-``fil_cn_*_docling.json``（docling 2.90 产物）逐项对比：
-
-- closed-JSON 校验（复用 ``_is_closed_json_value`` 真源）
-- 新产出可被 ``DoclingDocument.model_validate_json`` 解析
-- 历史基线可被 docling-core 2.96 的 ``load_from_json`` 解析（本层核心断言）
-- 顶层 key 集合 diff、texts/tables/pictures 计数与 schema version 对比
-
-产物写 ``workspace/tmp/docling-regression/``；结果按样本落盘，重跑自动跳过
-已完成样本，可分批续跑。
-
-:用法: python utils/docling_schema_regression.py [--limit N] [--samples stem1 stem2 ...]
-       [--parallel N] [--out DIR]
+用法：python -m utils.docling_schema_regression --sample-root DIR --manifest FILE --out DIR
+输入为 UTF-8 JSON 非空数组，仅允许 pdf/id/kind 字段。pdf 必需，为相对 sample-root 的非空字符串，使用 / 分隔且不得含 ..；id/kind 可省略，提供时必须为非空字符串（A/B 两者必需且 id 唯一）。例子：[{"pdf":"nested/example.pdf","id":"example-1","kind":"合成对照"}]。CLI sample-root/manifest/out 相对启动 cwd 解析，清单内 pdf 始终相对 sample-root；基线为 PDF 同目录 <stem>_docling.json。同 stem 跨运行结果/缓存仍直接复用，包括错误结果；更换输入或配置须使用新的 --out，不校验缓存来源。
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import sys
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+from typing import Final, NotRequired, Required, TypedDict, TypeAlias, cast
 
-SAMPLE_LIBRARY_ROOT = Path("/Users/leo/Documents/_2我的投资/workspace/portfolio")
+from dayu.contracts.json_value import JsonValue
+from dayu.documents import docling_runtime
+from docling_core.types.doc.document import DoclingDocument
+from dayu.fins.pipelines.docling_process_converter import _is_closed_json_value
+from utils.analysis_sample_inputs import baseline_json_path, load_samples, require_distinct_sample_targets, resolve_analysis_input_path
+
 DEFAULT_OUT_ROOT = Path(__file__).resolve().parents[1] / "workspace/tmp/docling-regression"
+_RESULT_DIRECTORY: Final[str] = "results"
+_RESULT_SUFFIX: Final[str] = ".json"
+
+
+def _schema_result_path(out_root: Path, stem: str) -> Path:
+    """推导既有 schema 结果路径，不读写文件。
+
+    :param out_root: 输出根目录。
+    :param stem: 已解析 PDF 的 stem。
+    :returns: results 子目录下的样本 JSON 路径。
+    :raises: 无；本函数只拼接路径。
+    """
+
+    return out_root / _RESULT_DIRECTORY / f"{stem}{_RESULT_SUFFIX}"
+
+
+class SchemaDocument(TypedDict):
+    """schema 有效输入视图；cast 不验证内容。"""
+
+    texts: NotRequired[list[JsonValue]]
+    tables: NotRequired[list[JsonValue]]
+    pictures: NotRequired[list[JsonValue]]
+    version: NotRequired[JsonValue]
+
+
+class ItemCounts(TypedDict):
+    """schema 三种条目计数。"""
+
+    texts: int
+    tables: int
+    pictures: int
+
+
+class SchemaSummaryFields(TypedDict, total=False):
+    """可包含异常前已写字段的单样本结果。"""
+
+    stem: Required[str]
+    closed_json: bool
+    new_parseable: bool
+    new_parse_error: str
+    base_parse_error: str
+    new_top_keys: list[str]
+    base_top_keys: list[str]
+    base_version: JsonValue
+    new_counts: ItemCounts
+    base_counts: ItemCounts
+    base_parseable: bool | None
+    top_key_diff: list[str] | None
+
+
+class SchemaPartialSummary(SchemaSummaryFields, total=False):
+    """构建中以及异常前可能写入的部分字段。"""
+
+    error: str
+    new_version: JsonValue
+
+
+class SchemaSuccessSummary(SchemaSummaryFields):
+    """无 error 的既有完成结果必有 new_version（值可为 null）。"""
+
+    new_version: Required[JsonValue]
+
+
+class SchemaErrorSummary(SchemaSummaryFields):
+    """error 必需，保留异常前可能写入的 version。"""
+
+    error: Required[str]
+    new_version: NotRequired[JsonValue]
+
+
+SchemaSummary: TypeAlias = SchemaSuccessSummary | SchemaErrorSummary
+
+
+class SchemaAggregate(TypedDict):
+    """既有磁盘汇总字段。"""
+
+    total: int
+    error_count: int
+    failed_stems: list[str]
+    closed_json_fail: int
+    new_parse_fail: int
+    base_parse_fail: int
+    top_key_diff_count: int
+    version_same_count: int
+    identical_count: int
+    new_version_distribution: dict[str, int]
+
+
+
 TOP_LEVEL_KEY_CANONICAL: tuple[str, ...] = (
     "body",
     "form_items",
@@ -42,32 +127,27 @@ TOP_LEVEL_KEY_CANONICAL: tuple[str, ...] = (
 )
 
 
-def _process_one(pdf_path_str: str, out_root_str: str) -> dict:
-    """转换单份样本并对比基线，返回结果摘要 dict。
+def _process_one(pdf_path: Path, baseline_path: Path, out_root: Path) -> SchemaSummary:
+    """转换单份显式样本并按原规则对比基线。
 
-    :param pdf_path_str: 样本 PDF 绝对路径字符串。
-    :param out_root_str: 产物根目录字符串。
-    :returns: 含逐项校验结果与计数的摘要；异常时返回 ``error`` 字段摘要。
-    :raises Exception: 不主动抛出，异常折叠进返回值。
+    :param pdf_path: 已解析并预检的 PDF 路径。
+    :param baseline_path: 同目录基线路径，可以不存在。
+    :param out_root: 已建立 results 子目录的输出根。
+    :returns: 完成结果联合，分析异常保留异常前字段并加入 error。
+    :raises OSError: 结果写盘失败；分析和转换异常按原规则折叠到 error。
     """
 
-    pdf_path = Path(pdf_path_str)
-    out_root = Path(out_root_str)
     stem = pdf_path.stem
-    result_path = out_root / "results" / f"{stem}.json"
-    baseline_path = pdf_path.with_name(f"{stem}_docling.json")
-    summary: dict = {"stem": stem}
+    result_path = _schema_result_path(out_root, stem)
+    summary: SchemaPartialSummary = {"stem": stem}
 
     try:
-        from dayu.fins.pipelines.docling_process_converter import _is_closed_json_value
-        from dayu.documents.docling_runtime import convert_pdf_bytes_with_docling
-        from docling_core.types.doc.document import DoclingDocument
 
         raw_bytes = pdf_path.read_bytes()
-        conversion = convert_pdf_bytes_with_docling(raw_bytes, stream_name=pdf_path.name)
-        exported = conversion.document.export_to_dict()
+        conversion = docling_runtime.convert_pdf_bytes_with_docling(raw_bytes, stream_name=pdf_path.name)
+        exported = cast(SchemaDocument, conversion.document.export_to_dict())
 
-        summary["closed_json"] = isinstance(exported, dict) and _is_closed_json_value(exported)
+        summary["closed_json"] = isinstance(exported, dict) and _is_closed_json_value(cast(JsonValue, exported))
 
         try:
             DoclingDocument.model_validate_json(json.dumps(exported, ensure_ascii=False))
@@ -85,7 +165,7 @@ def _process_one(pdf_path_str: str, out_root_str: str) -> dict:
         }
 
         if baseline_path.exists():
-            baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+            baseline = cast(SchemaDocument, json.loads(baseline_path.read_text(encoding="utf-8")))
             summary["base_top_keys"] = sorted(baseline.keys())
             summary["base_version"] = baseline.get("version")
             summary["base_counts"] = {
@@ -107,59 +187,61 @@ def _process_one(pdf_path_str: str, out_root_str: str) -> dict:
         summary["error"] = traceback.format_exc(limit=3)
 
     result_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    return summary
-
-
-def _collect_pdf_paths(samples: list[str] | None, limit: int | None) -> list[Path]:
-    """收集样本 PDF 路径（只读枚举样本库）。
-
-    :param samples: 指定 stem 列表；为 ``None`` 时枚举全部。
-    :param limit: 全量模式下最多处理的样本数；``None`` 为不限制。
-    :returns: 有序 PDF 路径列表。
-    :raises Exception: 样本库不可读时由 Path 抛出。
-    """
-
-    if samples:
-        paths = [
-            next(SAMPLE_LIBRARY_ROOT.rglob(f"{stem}.pdf"))
-            for stem in samples
-        ]
-        return paths
-    paths = sorted(SAMPLE_LIBRARY_ROOT.rglob("fil_cn_*.pdf"))
-    return paths[:limit]
+    return cast(SchemaSummary, summary)
 
 
 def main() -> int:
-    """执行回归并打印汇总。
+    """预检整份显式清单后执行原分析流程。
 
-    :returns: 全部成功返回 0，存在失败样本返回 1。
-    :raises Exception: 不主动抛出。
+    :param: 无显式参数；从命令行读取 root、manifest、out 与并行参数。
+    :returns: 成功返回 0，原分析失败返回 1。
+    :raises SystemExit: 缺失参数或目标冲突等输入错误以 2 退出，无分析写入。
+    :raises OSError, ValueError, KeyError, TypeError: 原分析读取、结构消费或结果写出错误按既有路径传播。
     """
 
-    parser = argparse.ArgumentParser(description="docling 2.127 schema 层样本回归")
-    parser.add_argument("--samples", nargs="*", default=None, help="指定 stem 列表（2.1 冒烟用）")
-    parser.add_argument("--limit", type=int, default=None, help="全量模式最多处理的样本数")
+    parser = argparse.ArgumentParser(epilog='输入为 UTF-8 JSON 非空数组，仅允许 pdf/id/kind 字段。pdf 必需，为相对 sample-root 的非空字符串，使用 / 分隔且不得含 ..；id/kind 可省略，提供时必须为非空字符串（A/B 两者必需且 id 唯一）。例子：[{"pdf":"nested/example.pdf","id":"example-1","kind":"合成对照"}]。CLI sample-root/manifest/out 相对启动 cwd 解析，清单内 pdf 始终相对 sample-root；基线为 PDF 同目录 <stem>_docling.json。同 stem 跨运行结果/缓存仍直接复用，包括错误结果；更换输入或配置须使用新的 --out，不校验缓存来源。', description="docling 2.127 schema 层样本回归")
     parser.add_argument("--parallel", type=int, default=2, help="并行 worker 数")
     parser.add_argument("--out", default=str(DEFAULT_OUT_ROOT), help="产物根目录")
-    args = parser.parse_args()
+    parser.add_argument("--sample-root", required=True, type=Path, help="样本根目录，相对启动 cwd")
+    parser.add_argument("--manifest", required=True, type=Path, help="UTF-8 非空 JSON 数组清单，pdf 相对样本根")
+    try:
+        args = parser.parse_args()
+    except SystemExit as exc:
+        if exc.code == 2:
+            print("schema 参数错误：必须显式提供 --sample-root 样本根和 --manifest 清单；其余参数请查看 --help。", file=sys.stderr)
+        raise
 
-    out_root = Path(args.out)
-    (out_root / "results").mkdir(parents=True, exist_ok=True)
-
-    pdf_paths = _collect_pdf_paths(args.samples, args.limit)
+    try:
+        samples = load_samples(args.sample_root, args.manifest)
+        out_root = resolve_analysis_input_path(Path(args.out), "输出根")
+        if args.parallel <= 0:
+            raise ValueError("--parallel 必须为正整数")
+        if out_root.exists() and not out_root.is_dir():
+            raise ValueError(f"输出根必须为目录: {out_root}")
+        for index, sample in enumerate(samples, start=1):
+            baseline = baseline_json_path(sample.pdf_path)
+            if baseline.exists() and not baseline.is_file():
+                raise ValueError(f"记录 {index} 基线路径不是文件: {baseline}")
+        require_distinct_sample_targets(
+            samples, [(_schema_result_path(out_root, sample.pdf_path.stem),) for sample in samples],
+        )
+    except (OSError, ValueError) as exc:
+        parser.error(f"schema 输入错误: {exc}")
+    (out_root / _RESULT_DIRECTORY).mkdir(parents=True, exist_ok=True)
+    pdf_paths = [sample.pdf_path for sample in samples]
     todo = [
         pdf_path
         for pdf_path in pdf_paths
-        if not (out_root / "results" / f"{pdf_path.stem}.json").exists()
+        if not _schema_result_path(out_root, pdf_path.stem).exists()
     ]
     print(f"样本总数 {len(pdf_paths)}，待处理 {len(todo)}（已完成 {len(pdf_paths) - len(todo)}）")
 
-    summaries: list[dict] = []
+    summaries: list[SchemaSummary] = []
     failed: list[str] = []
     if todo:
         with ProcessPoolExecutor(max_workers=args.parallel) as executor:
             future_map = {
-                executor.submit(_process_one, str(pdf_path), str(out_root)): pdf_path
+                executor.submit(_process_one, pdf_path, baseline_json_path(pdf_path), out_root): pdf_path
                 for pdf_path in todo
             }
             for index, future in enumerate(as_completed(future_map), start=1):
@@ -173,10 +255,10 @@ def main() -> int:
                     print(f"[{index}/{len(todo)}] OK {pdf_path.stem} "
                           f"new={summary.get('new_counts')} base={summary.get('base_counts')}")
 
-    # 汇总：合并落盘结果（含续跑历史）统计。
-    all_summaries: list[dict] = []
-    for result_path in sorted((out_root / "results").glob("*.json")):
-        all_summaries.append(json.loads(result_path.read_text(encoding="utf-8")))
+    # 汇总只覆盖本次清单，保留所选结果的续跑统计口径。
+    all_summaries: list[SchemaSummary] = []
+    for result_path in sorted(_schema_result_path(out_root, path.stem) for path in pdf_paths):
+        all_summaries.append(cast(SchemaSummary, json.loads(result_path.read_text(encoding="utf-8"))))
 
     error_count = sum(1 for s in all_summaries if "error" in s)
     closed_fail = sum(1 for s in all_summaries if "error" not in s and not s.get("closed_json"))
@@ -201,7 +283,7 @@ def main() -> int:
         if "error" not in s and s.get("new_version") is not None:
             version_values[str(s["new_version"])] = version_values.get(str(s["new_version"]), 0) + 1
 
-    summary_payload = {
+    summary_payload: SchemaAggregate = {
         "total": len(all_summaries),
         "error_count": error_count,
         "failed_stems": sorted(failed),

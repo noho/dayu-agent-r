@@ -1,73 +1,40 @@
-"""OCR 引擎 A/B 实测：双臂指标对比汇总。
+"""显式样本的 OCR 双臂指标比较。
 
-读取 ``ab_ocr_convert`` 产出的双臂 JSON 与样本库历史基线 ``*_docling.json``，
-计算并输出：
-
-- Arm V 与 Arm R 的全文相似度（difflib.SequenceMatcher ratio）
-- 各臂与历史基线（docling 2.90 产物）的全文相似度
-- 数字 token 多重集合对比：数量、交集率（Dice 系数
-  ``2*|A∩B| / (|A|+|B|)``，多重集交集取逐 token 最小计数）
-- 双臂差异摘录（最长 3 段）
-
-:用法: python utils/ab_ocr_compare.py --out <dir>
+用法：python -m utils.ab_ocr_compare --sample-root DIR --manifest FILE --out DIR
+输入为 UTF-8 JSON 非空数组，仅允许 pdf/id/kind 字段。pdf 必需，为相对 sample-root 的非空字符串，使用 / 分隔且不得含 ..；id/kind 可省略，提供时必须为非空字符串（A/B 两者必需且 id 唯一）。例子：[{"pdf":"nested/example.pdf","id":"example-1","kind":"合成对照"}]。CLI sample-root/manifest/out 相对启动 cwd 解析，清单内 pdf 始终相对 sample-root；基线为 PDF 同目录 <stem>_docling.json。同 stem 跨运行结果/缓存仍直接复用，包括错误结果；更换输入或配置须使用新的 --out，不校验缓存来源。
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import sys
 import re
 from collections import Counter
 from difflib import SequenceMatcher
 from pathlib import Path
+from typing import Final
 
-NUMBER_TOKEN_PATTERN = re.compile(r"-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?%?")
+from utils.analysis_sample_inputs import baseline_json_path, load_samples, require_distinct_sample_targets, resolve_analysis_input_path
 
-# 样本清单：5 份扫描件/图重财报（按文本层从少到多）+ 1 份有文本层对照。
-SAMPLES: tuple[dict[str, str], ...] = (
-    {
-        "id": "s01",
-        "pdf": "/Users/leo/Documents/_2我的投资/workspace/portfolio/9961/filings/id-9f7441a73aeb87c14f52b1fb3b43e4c3a71e8f1bec2465d2a9ab260e86cc3f2a/fil_cn_9c9acd3c777494515d34d6fd3e40b5b76c3433a2.pdf",
-        "kind": "扫描件",
-    },
-    {
-        "id": "s02",
-        "pdf": "/Users/leo/Documents/_2我的投资/workspace/portfolio/0300/filings/id-3ffcf0e1f056d9d2c8ae50a64df9911441edbadb1056dcbafc6abf27b2f7a7e2/fil_cn_5b5a4c6678e8796c94668db2b2ed41e70b8c3c66.pdf",
-        "kind": "扫描件",
-    },
-    {
-        "id": "s03",
-        "pdf": "/Users/leo/Documents/_2我的投资/workspace/portfolio/000333/filings/id-1784a4ab329e8271250c3fd976a53ff95fe0d6e5534e984debc3136b59457fb0/fil_cn_821200d15a9b0646f57f004804427e4476c66af5.pdf",
-        "kind": "扫描件",
-    },
-    {
-        "id": "s04",
-        "pdf": "/Users/leo/Documents/_2我的投资/workspace/portfolio/000333/filings/id-7907766b68d41cbcc8c11088b818859a4546f0cae472f6a54de1cb3a75ceccee/fil_cn_f151c6b703769c8efa62974b24e47c8a302c1d1a.pdf",
-        "kind": "扫描件",
-    },
-    {
-        "id": "s05",
-        "pdf": "/Users/leo/Documents/_2我的投资/workspace/portfolio/9898/filings/id-7b72197b118f313d9b17c2ec77bc466996cbf63e211c232d25518f0f702681cc/fil_cn_98a5a55ef92a4865cb6fd113b92edefbd7805798.pdf",
-        "kind": "扫描件",
-    },
-    {
-        "id": "c01",
-        "pdf": "/Users/leo/Documents/_2我的投资/workspace/portfolio/1179/filings/id-0b5397ad8e67880411d69f965b87597fcf07ef595612bc3f4b532cff34070779/fil_cn_11502836c8ff8c5a6bf5831012c6d8207f3989dd.pdf",
-        "kind": "文本层对照",
-    },
-)
+_ARM_R_DIRECTORY: Final[str] = "r"
+_ARM_V_DIRECTORY: Final[str] = "v"
+_ARM_SUFFIX: Final[str] = ".json"
 
 
-def _baseline_json_path(pdf_path: str) -> Path:
-    """推导样本对应的历史基线 json 路径。
+def _arm_paths(out_root: Path, stem: str) -> tuple[Path, Path]:
+    """推导普通 R/V 臂的既有输入路径，不读写文件。
 
-    :param pdf_path: 样本 PDF 路径。
-    :returns: 同目录 ``fil_cn_<hash>_docling.json`` 路径。
-    :raises Exception: 路径不存在时由调用方发现。
+    :param out_root: 双臂产物根目录。
+    :param stem: 已解析 PDF 的 stem。
+    :returns: 依次为普通 R 臂和 V 臂 JSON 路径。
+    :raises: 无；本函数只拼接路径。
     """
 
-    pdf_file = Path(pdf_path)
-    return pdf_file.with_name(f"{pdf_file.stem}_docling.json")
+    name = f"{stem}{_ARM_SUFFIX}"
+    return out_root / _ARM_R_DIRECTORY / name, out_root / _ARM_V_DIRECTORY / name
+
+NUMBER_TOKEN_PATTERN = re.compile(r"-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?%?")
 
 
 def _baseline_text(baseline_path: Path) -> str:
@@ -128,28 +95,53 @@ def _diff_excerpts(left_text: str, right_text: str, *, max_blocks: int = 3) -> l
 
 
 def main() -> int:
-    """汇总双臂指标并写 ``ab-summary.md``。
+    """预检整份显式清单后执行原分析流程。
 
-    :returns: 成功返回 0，缺产物或基线时返回 1。
-    :raises Exception: 不主动抛出，失败以退出码呈现。
+    :param: 无显式参数；从命令行读取 root、manifest、out 与并行参数。
+    :returns: 分析完成返回 0。
+    :raises SystemExit: 缺失参数或目标冲突等输入错误以 2 退出，无分析写入。
+    :raises OSError, ValueError, KeyError, TypeError: 原分析读取、结构消费或结果写出错误按既有路径传播。
     """
 
-    parser = argparse.ArgumentParser(description="OCR 引擎 A/B 指标汇总")
+    parser = argparse.ArgumentParser(epilog='输入为 UTF-8 JSON 非空数组，仅允许 pdf/id/kind 字段。pdf 必需，为相对 sample-root 的非空字符串，使用 / 分隔且不得含 ..；id/kind 可省略，提供时必须为非空字符串（A/B 两者必需且 id 唯一）。例子：[{"pdf":"nested/example.pdf","id":"example-1","kind":"合成对照"}]。CLI sample-root/manifest/out 相对启动 cwd 解析，清单内 pdf 始终相对 sample-root；基线为 PDF 同目录 <stem>_docling.json。同 stem 跨运行结果/缓存仍直接复用，包括错误结果；更换输入或配置须使用新的 --out，不校验缓存来源。', description="OCR 引擎 A/B 指标汇总")
     parser.add_argument("--out", required=True, help="ab_ocr_convert 产物目录")
-    args = parser.parse_args()
-    out_root = Path(args.out)
+    parser.add_argument("--sample-root", required=True, type=Path, help="样本根目录，相对启动 cwd")
+    parser.add_argument("--manifest", required=True, type=Path, help="UTF-8 非空 JSON 数组清单，pdf 相对样本根")
+    try:
+        args = parser.parse_args()
+    except SystemExit as exc:
+        if exc.code == 2:
+            print("A/B 参数错误：必须显式提供 --sample-root 样本根和 --manifest 清单；其余参数请查看 --help。", file=sys.stderr)
+        raise
+    try:
+        samples = load_samples(args.sample_root, args.manifest)
+        out_root = resolve_analysis_input_path(Path(args.out), "输出根")
+        if not out_root.is_dir():
+            raise ValueError(f"输出根必须为已存在目录: {out_root}")
+        ids: set[str] = set()
+        for index, sample in enumerate(samples, start=1):
+            if sample.sample_id is None or sample.kind is None:
+                raise ValueError(f"记录 {index} 缺少 A/B 必需 id/kind: {sample.pdf_path}")
+            if sample.sample_id in ids:
+                raise ValueError(f"记录 {index} A/B id 重复: {sample.sample_id} ({sample.pdf_path})")
+            ids.add(sample.sample_id)
+            for required_path in (baseline_json_path(sample.pdf_path), *_arm_paths(out_root, sample.pdf_path.stem)):
+                if not required_path.is_file():
+                    raise ValueError(f"记录 {index} 缺少必需文件: {required_path}")
+        require_distinct_sample_targets(
+            samples, [_arm_paths(out_root, sample.pdf_path.stem) for sample in samples],
+        )
+    except (OSError, ValueError) as exc:
+        parser.error(f"A/B 输入错误: {exc}")
 
     summary_lines: list[str] = ["# OCR 引擎 A/B 实测汇总\n"]
-    for sample in SAMPLES:
-        sample_id = sample["id"]
-        pdf_file = Path(sample["pdf"])
-        stem = pdf_file.stem
-        arm_r_path = out_root / "r" / f"{stem}.json"
-        arm_v_path = out_root / "v" / f"{stem}.json"
-        baseline_path = _baseline_json_path(sample["pdf"])
-        if not arm_r_path.exists() or not arm_v_path.exists():
-            print(f"[{sample_id}] 缺臂产物，跳过: {arm_r_path} / {arm_v_path}")
-            continue
+    for sample in samples:
+        sample_id = sample.sample_id
+        kind = sample.kind
+        assert sample_id is not None and kind is not None  # 完整预检保证报告身份为显式字符串。
+        pdf_file = sample.pdf_path
+        arm_r_path, arm_v_path = _arm_paths(out_root, pdf_file.stem)
+        baseline_path = baseline_json_path(pdf_file)
         arm_r = json.loads(arm_r_path.read_text(encoding="utf-8"))
         arm_v = json.loads(arm_v_path.read_text(encoding="utf-8"))
         baseline_text = _baseline_text(baseline_path)
@@ -165,7 +157,7 @@ def main() -> int:
         dice_r_base = _dice(counter_r, baseline_numbers)
         dice_v_base = _dice(counter_v, baseline_numbers)
 
-        summary_lines.append(f"## {sample_id}（{sample['kind']}，{pdf_file.name}）\n")
+        summary_lines.append(f"## {sample_id}（{kind}，{pdf_file.name}）\n")
         summary_lines.append("| 臂 | 文本长度 | 数字 token 数 | 引擎证据 | 耗时(s) |")
         summary_lines.append("|---|---|---|---|---|")
         for arm, payload in (("R (rapidocr)", arm_r), ("V (ocrmac)", arm_v)):
