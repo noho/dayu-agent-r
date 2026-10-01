@@ -18,7 +18,7 @@
 新finding登记：F6-P1（SEC仍待repair误报revision conflict及adapter缺typed部分摘要），accepted未修，owner SEC workflow/adapter与统一runtime；destination当前F6-S1计划修订/双审/实现。详 `docs/gateflow/pr-197-r1-f6-plan-delivery-adjudication-20261001.md`，不得遗漏或静默defer。
 
 
-**最终大目标（用户最新重申，必须执行）**：完成已批准修复后，在最终commit重跑完整真实CLI CI，按用户既有裁决核对/登记 `docs/cli_ci_oracles.json` 与 `docs/cli_ci_scenarios.json`，校验upload_material范围readiness proof；各WU单元测试、review/closeout不是整体终点。两个registry当前未含upload_material，不能借其它命令ready结论。权威约束详 `docs/gateflow/upload-material-repair-scope-and-ci-closeout-20261001.md`，用户裁决优先，禁止改oracle迎合实现；新业务取舍另待明确裁决。
+**最终大目标（用户最新重申，必须执行）**：完成已批准修复后，在最终commit重跑完整真实CLI CI，按用户既有裁决核对/登记 `docs/cli_ci_oracles.json` 与 `docs/cli_ci_scenarios.json`，校验upload_material范围readiness proof；各WU单元测试、review/closeout不是整体终点。用户明确现有registry仅完成download和upload，当前未含upload_material；该范围仍待本轮真实CI及正式登记，不能借既有ready结论。权威约束详 `docs/gateflow/upload-material-repair-scope-and-ci-closeout-20261001.md`，用户裁决优先，禁止改oracle迎合实现；新业务取舍另待明确裁决。
 
 <!-- PR197_LIVE_GATE_STATUS_END -->
 

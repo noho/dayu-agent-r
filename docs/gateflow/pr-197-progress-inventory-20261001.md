@@ -95,4 +95,4 @@ F6-P1/OQ1：SEC postrepair仍需repair却抛版本冲突，且adapter缺typed已
 
 ## 整体最终门禁（用户重申）
 
-完成已裁决修复项及已批准PR197 findings后，重跑最终commit的完整真实CLI CI，核对/登记oracle与scenarios及readiness proof；当前正式registry不含upload_material。待goal残余不自动当本轮必实施事项，各局部WU closeout不代表本大目标完成。详 `docs/gateflow/upload-material-repair-scope-and-ci-closeout-20261001.md`。
+完成已裁决修复项及已批准PR197 findings后，重跑最终commit的完整真实CLI CI，核对/登记oracle与scenarios及readiness proof；用户明确当前正式registry仅完成download和upload，不含upload_material。待goal残余不自动当本轮必实施事项，各局部WU closeout不代表本大目标完成。详 `docs/gateflow/upload-material-repair-scope-and-ci-closeout-20261001.md`。

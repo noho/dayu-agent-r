@@ -28,7 +28,7 @@
 
 ## 实时registry观察与当前工作
 
-root当前实际读取：两个正式registry字面status均ready，但 `oracles`/`scenarios` 当前没有 upload_material 条目。它们不能为新增upload_material范围提供ready证明；最终收口必须核对其scope并补正式登记及proof，不借用其它命令的ready结论。
+用户进一步明确：现有两个registry只完成download和upload；upload_material尚未完成正式登记和验收。root当前实际读取：两个正式registry字面status均ready，但 `oracles`/`scenarios` 当前没有 upload_material 条目。它们不能为新增upload_material范围提供ready证明；最终收口必须核对其scope并补正式登记及proof，不借用其它命令的ready结论。
 
 当前checkpoint `a821da03911d76796e7ca53de2f9a813a56d595a`，local/tracking/live/PR已独立readback一致、main不变；F4 slice75fec已推，aggregate待槽位；MiMo65815/Kimi87199正在审F3；Sol50829仅补F6计划。F5混合确定/不确定报告的Q1仍未收到具体选择；本次总目标澄清不等于选择其中一种。
 
