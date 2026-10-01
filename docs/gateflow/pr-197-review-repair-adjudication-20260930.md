@@ -3,19 +3,19 @@
 <!-- PR197_LIVE_GATE_STATUS_START -->
 ## 当前有效状态（2026-10-01）
 
-只在 `/Users/leo/workspace/dayu-agent-r` / `codex/upload-material-oracle` 开发；main `fac32ecbff` 未动。最近读回本地/远端/PR197 checkpoint `8328699a`，新增未过门禁候选不提交。用户授权全部 runner runtime/provider；现有 Sol plan/implement/fix、MiMo/Kimi 双审及真实 quota→DS 备份不变。所有调用绝对 cwd、新独立双流、no-persist/canary、root结构化和直接证据裁决。
+只在 `/Users/leo/workspace/dayu-agent-r` / `codex/upload-material-oracle` 开发；main `fac32ecbff` 未动。最近读回本地/远端/PR197 checkpoint `123fad5d`，新增未过门禁候选不提交。用户授权全部 runner runtime/provider；现有 Sol plan/implement/fix、MiMo/Kimi 双审及真实 quota→DS 备份不变。所有调用绝对 cwd、新独立双流、no-persist/canary、root结构化和直接证据裁决。
 
 | WU | 当前状态 | 下一入口 |
 | --- | --- | --- |
-| F3 | Sol7594 outer0，111JSONL/实际canary；root39原件34只读/五最小源码增量/1098断言287CLI/783与11files类型零错误独立核收。输入环候选未提交，code gate尚未通过 | 同版完整 code re-review 双路任务已准备未派；之后 accepted slice/aggregate/最终PRreview/closeout |
+| F3 | Sol7594 outer0，111JSONL/实际canary；root39原件34只读/五最小源码增量/1098断言287CLI/783与11files类型零错误独立核收。输入环候选未提交，code gate尚未通过 | DS55704 outer0/121turns报告无新增产品finding，root1978身份/7实际临时files type0核查；F3-RR-PV01弱类型取证脚本accepted未修，Sol52703只修全新tmp副本。MiMo7898仍在途，详pr-197-r1-f3-input-loop-rereview-adjudication-20261001.md；之后 accepted slice/aggregate/最终PRreview/closeout |
 | F4 | accepted slice75fec034 + aggregate87b5a642 已入PR | 最终同版 PR review/closeout |
 | F5 | 公开 mixed-known/unknown 财期 Q1 仍待具体用户选择；官方非空raw已补；N01/N02和F4真实API重绑定尚未实施 | 答复后 Sol planfix→双审→实施；不代选P1/P2 |
-| F6 | Sol40525 outer0，81JSONL/canary；root60原件59只读/45467历史字节/计划57ab修订证据核收。A1–A4待复审最终修复裁决，产品未实施 | MiMo37469与DS22262同版plan re-review在途；Kimi20208真实五小时quota403/outer1拒收，原件保全并授权备用；pass后accepted plan→Sol实施 |
+| F6 | 同版MiMo37469 outer0/69turns与DS22262 outer0/106turns已root核收；root124身份/真实source/tests/完整报告裁决plan re-review pass，A1–A4计划已修；DS列名建议拒绝、错误reason叙述纠正 | accepted plan commit→Sol F6-S1实施；仅8prod/10tests/3README，产品仍未修；详pr-197-r1-f6-plan-fix-rereview-adjudication-20261001.md |
 | F7 | accepted slice/aggregate 已入PR | 最终同版 PR review/closeout |
 
-当前无 source writer，仅 F6 双路只读审查。F3/F6交付接受不等于gatepass；旧两次Sol routing失败/39776认证恢复/各临时验证失败和恢复全保留。核收详 `pr-197-r1-f3-input-loop-fix-receipt-20261001.md`、`pr-197-r1-f6-plan-fix-receipt-20261001.md`；活动托管句柄及原输出位置在 `workspace/tmp/pr197-controller-collection-20261001/active-runners.json`。
+当前无 source writer；F3 MiMo7898只读审查与Sol52703窄tmp取证fix在途，F6待accepted plan后派唯一产品writer。F3/F6交付接受不等于gatepass；旧两次Sol routing失败/39776认证恢复/各临时验证失败和恢复全保留。核收详 `pr-197-r1-f3-input-loop-fix-receipt-20261001.md`、`pr-197-r1-f6-plan-fix-receipt-20261001.md`；活动托管句柄及原输出位置在 `workspace/tmp/pr197-controller-collection-20261001/active-runners.json`。
 
-原upload修复依既有依赖序列在F2–F7后推进。以用户现成裁决为准，新schema/历史迁移/业务选择不凭继续授权代猜。旧upload_material Raw用户确认已删除；31正式裁决/36项语义保留，不能编造旧Raw复核。**全部已批准修复后，在最终commit重建完整mandatory矩阵并跑真实CLI CI，正式确定/登记upload_material oracle、scenarios和readiness proof**；现有registry仅download/upload，不能当material完成。权威合同 `upload-material-repair-scope-and-ci-closeout-20261001.md`。历史正文按时间保留，不覆盖本节最新状态。
+原upload修复依既有依赖序列在F2–F7后推进。以用户现成裁决为准，新schema/历史迁移/业务选择不凭继续授权代猜。旧upload_material Raw用户确认已删除；31正式裁决/36项语义保留，不能编造旧Raw复核。**全部已批准修复后，在最终commit重建完整mandatory矩阵并跑真实CLI CI，正式确定/登记upload_material oracle、scenarios和readiness proof**；现有registry的Fins范围仅download/upload_filing，不能当material完成。权威合同 `upload-material-repair-scope-and-ci-closeout-20261001.md`。历史正文按时间保留，不覆盖本节最新状态。
 <!-- PR197_LIVE_GATE_STATUS_END -->
 
 
