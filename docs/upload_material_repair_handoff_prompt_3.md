@@ -3,24 +3,27 @@
 <!-- PR197_LIVE_GATE_STATUS_START -->
 ## 当前有效状态（2026-10-01）
 
-只在 `/Users/leo/workspace/dayu-agent-r` / `codex/upload-material-oracle` 开发；main `fac32ecbff` 未动。最近读回本地/远端/PR197 checkpoint `b1e5195a`，新增未过门禁候选不提交。用户授权全部 runner runtime/provider；现有 Sol plan/implement/fix、MiMo/Kimi 双审及真实 quota→DS 备份不变。所有调用绝对 cwd、新独立双流、no-persist/canary、root结构化和直接证据裁决。
+唯一开发工作树 `/Users/leo/workspace/dayu-agent-r`，唯一开发分支 `codex/upload-material-oracle`；已读回 checkpoint `5fc5e4f0c685c4a998a72ce4fbe02c3f889cf368`，main `fac32ecbff9bfe792b63ee9667c8697826b631f4` 未动。所有代码/证据进现有 OPEN/draft PR197，用户手工 merge。旧正文均为历史，不覆盖本节。
+
+**用户最新停止边界：F5 确为此前 PR review finding；先闭环其它 findings，然后停下，以通俗例子解释并讨论 F5。当前不实施 F5，不启动后续原 upload 队列。**最终全部修复后的真实 CLI CI/oracle/scenarios 目标仍保留，不能假报本轮完成。
 
 | WU | 当前状态 | 下一入口 |
 | --- | --- | --- |
-| F3 | accepted slice03e8b9b0已push，code gate已pass；完整aggregate MiMo50118/DS65682与PV01窄复审MiMo53684/DS14599全部终态独立核收，root裁决aggregate pass | accepted deepreview244056c5已push→最终同版PR review/closeout；详pr-197-r1-f3-aggregate-review-adjudication-20261001.md；F3 WU尚未最终完成 |
-| F4 | accepted slice75fec034 + aggregate87b5a642 已入PR | 最终同版 PR review/closeout |
-| F5 | 公开 mixed-known/unknown 财期 Q1 仍待具体用户选择；官方非空raw已补；N01/N02和F4真实API重绑定尚未实施 | 答复后 Sol planfix→双审→实施；不代选P1/P2 |
-| F6 | code及aggregate deepreview pass；AG-A1已修，经MiMo25203/Kimi91784同版窄审/root源码和AST独立核验 | 下一accepted deepreview commit/push→F3/F4/F6/F7一组同版组合PRreview/分别closeout；详pr-197-r1-f6-aggregate-final-adjudication-20261001.md |
-| F7 | accepted slice/aggregate 已入PR | 最终同版 PR review/closeout |
+| F1 | 原候选 rejected-with-reason；不成立代码缺陷 | 不安排修复 |
+| F2 | bb11ca22 已修、双审/类型通过、已入PR；本次组合核保全 | 随本组确认最终修复状态 |
+| F3 | slice03e8b9b0 / aggregate244056c5 已入PR；当前同版组合 PR review root pass，无新必修 | accepted PR review commit/push→draft-PR-pass→final closeout |
+| F4 | slice75fec034 / aggregate87b5a642 已入PR；当前组合按 F6 后共享文件核验，PR review pass | 同上 |
+| F5 | 未实施；known/unknown 公开处置 Q1 未决；N01/N02 未修；官方非空 raw 资料补证已完 | 其余 findings 闭环后按用户指令停下讨论，不代选 |
+| F6 | slice4f0b5b04 / aggregate5fc5e4f0 已入PR；AG-A1已修；当前 PR review pass | accepted PR review commit/push→draft-PR-pass→final closeout |
+| F7 | slice31473fe1 / aggregate2cc2f5ed 已入PR；当前共享 workflow owner/子集保全，PR review pass | 同上 |
 
-当前无在途runner/产品writer。F6两路窄审均outer0，root52冻结/报告/canary/同owner语义/执行AST与20blob保全已核；AG-A1已修，aggregate pass，待accepted deepreview commit/push。MiMo非关键取证声明部分采纳、scratch helper不采纳不提交，不为报告起修复循环。CI-PREP-A1文档候选独立审查仍待、C02映射候选needs-more-evidence；最终真实CLI CI、原队列及受控XBRL未实施；F5Q1仍pending。当前有效裁决pr-197-r1-f6-aggregate-final-adjudication-20261001.md。
+本组总控正式裁决：`docs/reviews/pr-197-review-20261001-175653.md`。MiMo34356（102 turns）/授权 quota 备份 ds-flash72633（122 turns）均 outer0、完整 JSON/report/canary 已核；Kimi87412 API403 quota 失败原件保留。root实核68 current+68 originals、37精确head blob、715全compare与37对应段逐字节同源。两路关键审查意见采纳；非关键声明收窄（MiMo clean/旧coverage、DS未交argv/exit及失败补录），不新开报告修复循环。root真实1377passed/3既有warnings/exit0与全量pyright783checked/0error原件同当前字节，未机械重跑。此仅四WU scoped PR gate，不是全部715文件最终pass。
 
-原upload修复依既有依赖序列在F2–F7后推进。以用户现成裁决为准，新schema/历史迁移/业务选择不凭继续授权代猜。旧upload_material Raw用户确认已删除；31正式裁决/36项语义保留，不能编造旧Raw复核。**全部已批准修复后，在最终commit重建完整mandatory矩阵并跑真实CLI CI，正式确定/登记upload_material oracle、scenarios和readiness proof**；现有registry的Fins范围仅download/upload_filing，不能当material完成。权威合同 `upload-material-repair-scope-and-ci-closeout-20261001.md`。历史正文按时间保留，不覆盖本节最新状态。
+Sol39648只读后续18label依赖/粗颗粒分组预备尚在途：不产品修改、不accepted plan、不推进原队列、不改变用户当前停止边界；待托管终态及结构化核收，不以在途说完成。输出候选 `docs/gateflow/upload-material-remaining-work-batching-preparation-20261001.md`。
 
-PR review入口组合回归已由root实际跑完：12testfiles/1377passed/3既有warnings/exit0，37source/docs首末SHA相同；详`docs/gateflow/pr-197-repair-bundle-integration-validation-20261001.md`。该证据不代替真正PRreview或最终真实CLI CI。最终输入当前可核限制见`docs/gateflow/upload-material-final-ci-input-status-20261001.md`（旧O20临时目录当前缺席；仓库typed-member fixture仅upstream复现候选）。
+后续 WU 默认单一完整可验证行为 slice；仅实际依赖/风险/独立验收才拆并说明理由，不按文件/模块机械拆。Sol负责plan/implement/fix，MiMo/Kimi同版并行review，Kimi真实额度失败用DS；均runner子进程、绝对cwd、独立output/stderr/no-persist/canary；root检查结构化结果及直接证据自行裁决，不两票自动通过。用户授权所有runtime/provider，不改变既有职责或业务裁决。
 
-
-用户最新约束：后续WU实施slice不要切得太细，默认一个完整可验证行为增量；只有明确依赖/风险或独立验收边界才拆并说明理由，不按文件/模块/文字机械拆。相关gate内修复合并交付/一组同版双审；非关键报告问题由root收窄声明，不新起报告修复循环。详`docs/gateflow/pr-197-execution-cost-correction-20261001.md`，后续所有plan/implement/fix及planreview派发必须交接。
+原17未实施标签及 O20F02受控XBRL依旧待修；CI-PREP-A1候选/映射C02也未终审。现有两个registry的Fins范围仅download/upload_filing，material未登记。旧upload_material Raw用户确认删除，31正式裁决/36项语义保留，不补造历史Raw或沿用旧digest冒称新证据。恢复并完成全部批准修复后，必须在最终commit重建完整mandatory矩阵、执行真实CLI、正式确定/登记material oracle/scenarios/readiness；不以pytest或本PR gate代替。authority为 `docs/gateflow/upload-material-repair-scope-and-ci-closeout-20261001.md`。#198已完成closeout/comment，不重开或重发。
 
 <!-- PR197_LIVE_GATE_STATUS_END -->
 
