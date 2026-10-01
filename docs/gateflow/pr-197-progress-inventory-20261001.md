@@ -99,4 +99,6 @@ F6-P1/OQ1：SEC postrepair仍需repair却抛版本冲突，且adapter缺typed已
 
 F3-CR1-A1：root与Kimi同根因输入链接环，中文输入错误exit2合同未满足；已登记当前F3必要fix，未改源码，不创建额外WU。详 `docs/gateflow/pr-197-r1-f3-input-loop-review-adjudication-20261001.md`。
 
-2026-10-01最新门禁：F3双路代码审查已收齐，root `pr-197-r1-f3-s1-code-review-adjudication-20261001.md` 记录F3-CR1-A1 accepted未修→Sol窄fix；Unicode未建别名保持独立goal。F4 accepted slice已入PR，MiMo48266/Kimi10989整项aggregate双审在途。F6-PV01取证窄fix Sol31175在途；旧-01派发路径拼写setup错误、模型未启动，新-02恢复独立记录。最终真实CLI CI/oracle/scenarios约束不变，现有registry仅download/upload。
+2026-10-01最新门禁：F3双路代码审查已收齐，root `pr-197-r1-f3-s1-code-review-adjudication-20261001.md` 记录F3-CR1-A1 accepted未修→Sol窄fix；Unicode未建别名保持独立goal。F4 accepted slice已入PR，MiMo48266/Kimi10989整项aggregate双审在途。F6-PV01取证窄fix Sol31175 outer0/rootaccepted已修复；旧-01派发路径拼写setup错误、模型未启动，新-02恢复独立记录。最终真实CLI CI/oracle/scenarios约束不变，现有registry仅download/upload。
+
+最新root receipt：F6-PV01已修复，69JSONL/outer0，实际两文件type0及三SECowner通过；F6plan当前c5978746仍proposal，双路planreview待两个槽位。F3 source Sol1929只修现成输入合同；F4aggregate MiMo48266/Kimi10989在途。
