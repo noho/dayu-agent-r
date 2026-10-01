@@ -192,7 +192,7 @@ class FinsPublicFailure:
         transport_category: provider/configuration 失败的 transport 分类。
         safe_message: 不含敏感 transport 内容的用户可读说明。
         retry_hint: 用户可读恢复建议。
-        reason_code: 下载来源预检的封闭公共原因；无细分原因时为空。
+        reason_code: 下载来源完整性失败的封闭公共原因；无细分原因时为空。
     """
 
     kind: FinsPublicFailureKind
