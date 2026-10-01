@@ -21,6 +21,8 @@ propagate 与 disabled 状态，并关闭本测试新增的 logger handler，避
 选择测试覆盖 Q1/Q3 同日形态优先、唯一正文保留、修订和日期优先级、英文/摘要排除及输入顺序稳定性；
 下载测试使用真实隔离仓储核对完整旧缓存跳过、显式覆盖后的来源/文件指纹与清单一致性，以及再次增量跳过。
 
+HK 身份与同窗元数据回归使用真实 Fs/tmp 仓储：`python -m pytest tests/fins/test_cn_download_identity.py tests/fins/test_fins_storage_atomicity.py tests/fins/test_cn_download_workflow.py tests/fins/test_cn_download_runtime.py tests/fins/test_hk_period_rebuild.py -q`。真实 reader/writer 与两个 publication rename barrier 验证同一 guard 内两份文档只能全 A 或全 B；同时核对有序成功前缀、原异常对象、锁释放、身份错误优先序、allocated 缺席与在场 None 的区别。深层 JSON 回归通过真实仓储提交 dict/list 形态的 8、300、600 层输入，迭代断言旧 get 与新 view 的内容保真、顶层只读、公开读取独立及跨发布旧观察不变；这些层数是回归样本，不是产品限值。工作流用例覆盖批初 accepted/repair 共享、start/stream/retry 新窗口、取消、ordinary/typed 失败与 direct/job 文档行守恒。批量元数据可读不代表来源完整性，完整性预检仍由原 storage owner 判定。
+
 下载终态测试还核对四种来源完整性预检原因全覆盖映射为 storage 分类、同源封闭公共原因及非盲目重试建议，并核对 JSON、CLI 与 Service wait 的固定失败原因显示；CN/HK 真实仓储用例分别覆盖首候选前 company pre-swap 零候选、单文档 Phase B 与 commit-time typed 中止、post-repair 已处理快照，以及 direct RESULT 与 job 持久摘要。
 共享模型终态测试锁定 `ok/cancelled/integrity_failed` 三值，并覆盖普通与完整性入口互拒、未知与非法值拒绝、去空白行为及 CN/HK 本地 rebuild 终态保全。
 安全诊断测试覆盖未知 download 的 RESULT 与日志先后顺序、脱敏类型指纹、有界包内帧、helper 内部故障降级、CLI 显式日志文件，以及 typed storage 和非异常文档失败不产生未知异常诊断。

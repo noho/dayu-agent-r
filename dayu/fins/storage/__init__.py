@@ -43,6 +43,7 @@ from .source_integrity import (
     classify_source_integrity_preflight,
     has_same_source_publication_identity,
 )
+from .source_meta_read import SourceMetaReadEntry, SourceMetaReadView
 from .source_meta_contract import require_source_meta_is_deleted
 
 __all__ = [
@@ -53,6 +54,8 @@ __all__ = [
     "CompanyTickerIdentityCorruptionError",
     "CompanyTickerIdentityCorruptionKind",
     "SourceDocumentRepositoryProtocol",
+    "SourceMetaReadEntry",
+    "SourceMetaReadView",
     "ProcessedDocumentRepositoryProtocol",
     "DocumentBlobRepositoryProtocol",
     "FILING_UPLOAD_ASSET_SOURCE_DOCLING",

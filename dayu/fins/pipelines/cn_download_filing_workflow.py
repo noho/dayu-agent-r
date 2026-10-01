@@ -40,7 +40,9 @@ from dayu.fins.pipelines.cn_download_source_upsert import (
     build_remote_fingerprint,
     commit_cn_filing_source_document,
 )
-from dayu.fins.pipelines.cn_download_identity import resolve_cn_download_ids
+from dayu.fins.pipelines.cn_download_identity import (
+    read_cn_download_identity_index, resolve_cn_download_ids,
+)
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.storage import (
     BatchingRepositoryProtocol,
@@ -161,7 +163,8 @@ async def run_cn_download_single_filing_stream(
     """
 
     _raise_if_cancelled(module=module, ticker=ticker, document_id="", cancel_checker=cancel_checker)
-    document_id, internal_document_id = resolve_cn_download_ids(ticker, candidate, source_repository)
+    identity_index = read_cn_download_identity_index(ticker, (candidate,), source_repository)
+    document_id, internal_document_id = resolve_cn_download_ids(ticker, candidate, identity_index)
     pdf_filename = f"{document_id}.pdf"
     docling_filename = f"{document_id}_docling.json"
     phase_a_integrity = source_repository.classify_source_integrity(

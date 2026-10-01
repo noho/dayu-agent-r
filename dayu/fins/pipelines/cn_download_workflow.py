@@ -18,7 +18,9 @@ from dayu.fins.pipelines.cn_download_filing_workflow import (
     project_cn_filing_failure,
     run_cn_download_single_filing_stream,
 )
-from dayu.fins.pipelines.cn_download_identity import resolve_cn_download_ids
+from dayu.fins.pipelines.cn_download_identity import (
+    CnDownloadIdentityIndex, read_cn_download_identity_index, resolve_cn_download_ids,
+)
 from dayu.fins.pipelines.cn_download_models import (
     CN_DOWNLOAD_TERMINAL_CANCELLED,
     CN_DOWNLOAD_TERMINAL_INTEGRITY_FAILED,
@@ -45,7 +47,6 @@ from dayu.fins.pipelines.cn_form_utils import (
 )
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.storage import (
-    SourceDocumentRepositoryProtocol,
     SelectedSourceRepairRequired,
     SourceIntegrityPreflightError,
     SourceIntegrityRevisionConflictError,
@@ -257,8 +258,11 @@ async def run_cn_download_stream_impl(
             period_windows=period_windows,
             use_default_business_limits=not start_is_explicit,
         )
+        initial_identity_index = read_cn_download_identity_index(
+            normalized_ticker, selected, host.source_repository,
+        )
         accepted_filing_ids = frozenset(
-            _candidate_document_id(normalized_ticker, candidate, host.source_repository) for candidate in selected
+            _candidate_document_id(normalized_ticker, candidate, initial_identity_index) for candidate in selected
         )
         preflight = classify_source_integrity_preflight(
             host.source_repository.list_source_integrity(normalized_ticker),
@@ -272,7 +276,7 @@ async def run_cn_download_stream_impl(
                 sorted(
                     selected,
                     key=lambda item: (
-                        _candidate_document_id(normalized_ticker, item, host.source_repository) != repair_document_id,
+                        _candidate_document_id(normalized_ticker, item, initial_identity_index) != repair_document_id,
                     ),
                 )
             )
@@ -295,7 +299,10 @@ async def run_cn_download_stream_impl(
                 notes.append("cancelled")
                 cancelled = True
                 break
-            document_id = _candidate_document_id(normalized_ticker, candidate, host.source_repository)
+            start_identity_index = read_cn_download_identity_index(
+                normalized_ticker, (candidate,), host.source_repository,
+            )
+            document_id = _candidate_document_id(normalized_ticker, candidate, start_identity_index)
             yield DownloadEvent(
                 event_type=DownloadEventType.FILING_STARTED,
                 ticker=normalized_ticker,
@@ -996,22 +1003,24 @@ def _build_result(
 def _candidate_document_id(
     ticker: str,
     candidate: CnReportCandidate,
-    repository: SourceDocumentRepositoryProtocol,
+    index: CnDownloadIdentityIndex,
 ) -> str:
-    """构建单候选真实 document_id；repository 为来源身份绑定仓储。
+    """从当前观察索引构建单候选真实 document_id。
 
     Args:
         ticker: 已归一化 ticker。
         candidate: 远端候选。
+        index: 本观察窗口的来源身份索引。
 
     Returns:
         与单 filing 阶段机一致的 source document ID。
 
     Raises:
-        无。
+        ValueError: 来源身份缺失、重复或索引 ticker 不符时抛出。
+        OSError: 原元数据读取失败时抛出。
     """
 
-    document_id, _ = resolve_cn_download_ids(ticker, candidate, repository)
+    document_id, _ = resolve_cn_download_ids(ticker, candidate, index)
     return document_id
 
 

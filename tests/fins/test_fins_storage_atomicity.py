@@ -17,6 +17,7 @@ from multiprocessing.connection import Connection
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Event
+from types import MappingProxyType
 from typing import BinaryIO, Literal, NoReturn, cast
 from unittest.mock import patch
 
@@ -9194,3 +9195,436 @@ def test_source_integrity_walkers_share_exact_document_controls(
     physical = source.classify_source_integrity("AAPL", "control-target", SourceKind.FILING)
     assert physical.status is SourceIntegrityStatus.UNSAFE
     assert SourceIntegrityReason.UNDECLARED_BUSINESS_FILE in physical.reasons
+
+
+class _MetaViewReadProbe:
+    """监视真实 core 的单窗读取并可在首份 get 后建立 reader barrier。"""
+
+    def __init__(self, core: FsStorageCore, *, block_first: bool = False) -> None:
+        """记录真实方法。参数：core 为 reader core；block_first 为暂停首份读取。返回：无。异常：无。"""
+        self.acquire = core._acquire_publication_guard
+        self.release = core._release_lock_token
+        self.list_ids = core._list_document_ids_unguarded
+        self.get_meta = core._get_source_meta_unguarded
+        self.block_first = block_first
+        self.acquire_entered = Event()
+        self.first_read = Event()
+        self.resume = Event()
+        self.acquires = 0
+        self.releases = 0
+        self.lists = 0
+        self.gets: list[str] = []
+        self.errors: list[ValueError | OSError] = []
+
+    def acquire_guard(self, ticker: str) -> RuntimeFileLockToken:
+        """调用真实 guard。参数：ticker 为范围。返回：真实 token。异常：原锁异常。"""
+        self.acquires += 1
+        self.acquire_entered.set()
+        return self.acquire(ticker)
+
+    def release_guard(self, token: RuntimeFileLockToken) -> None:
+        """释放真实 guard。参数：token 为能力。返回：无。异常：原锁异常。"""
+        self.releases += 1
+        self.release(token)
+
+    def list_documents(self, ticker: str, source_kind: SourceKind | None) -> list[str]:
+        """完整真实枚举。参数：ticker/source_kind 为范围。返回：原列表。异常：原枚举异常。"""
+        self.lists += 1
+        return self.list_ids(ticker, source_kind)
+
+    def read_meta(self, ticker: str, document_id: str, source_kind: SourceKind) -> dict[str, JsonValue]:
+        """真实 get 后可阻塞。参数：ticker/document_id/source_kind 为目标。返回：原 meta。异常：原读取异常或超时。"""
+        self.gets.append(document_id)
+        try:
+            meta = self.get_meta(ticker, document_id, source_kind)
+        except (ValueError, OSError) as error:
+            self.errors.append(error)
+            raise
+        if self.block_first and len(self.gets) == 1:
+            self.first_read.set()
+            if not self.resume.wait(timeout=5):
+                raise TimeoutError("meta reader barrier 未释放")
+        return meta
+
+    def install(self, monkeypatch: pytest.MonkeyPatch, core: FsStorageCore) -> None:
+        """安装真实调用包装。参数：monkeypatch/core 为监视目标。返回：无。异常：无。"""
+        monkeypatch.setattr(core, "_acquire_publication_guard", self.acquire_guard)
+        monkeypatch.setattr(core, "_release_lock_token", self.release_guard)
+        monkeypatch.setattr(core, "_list_document_ids_unguarded", self.list_documents)
+        monkeypatch.setattr(core, "_get_source_meta_unguarded", self.read_meta)
+
+
+class _MetaViewRenameBarrier:
+    """在真实 publication 两个 rename 之一阻塞 writer。"""
+
+    def __init__(self, core: FsStorageCore, paths: _BatchPaths, barrier: _PublicationBarrier) -> None:
+        """初始化。参数：core/paths 为真实 writer；barrier 为 rename 点。返回：无。异常：无。"""
+        self.replace = core._replace_directory
+        self.paths = paths
+        self.barrier = barrier
+        self.entered = Event()
+        self.resume = Event()
+
+    def __call__(self, source_path: Path, target_path: Path) -> None:
+        """阻塞后真实 rename。参数：source_path/target_path 为原路径。返回：无。异常：原 I/O 或超时。"""
+        selected = (
+            self.barrier == "target_to_backup" and source_path == self.paths.target_ticker_dir
+        ) or (
+            self.barrier == "staging_to_target" and source_path == self.paths.staging_ticker_dir
+        )
+        if selected:
+            self.entered.set()
+            if not self.resume.wait(timeout=5):
+                raise TimeoutError("meta writer rename barrier 未释放")
+        self.replace(source_path, target_path)
+
+
+def _stage_meta_view_pair(
+    source: FsSourceDocumentRepository, blob: FsDocumentBlobRepository,
+    batch: BatchToken, version: str, *, replace_existing: bool,
+) -> None:
+    """真实 staging 创建两份同版完整文档。
+
+    参数：source/blob 为真实仓储；batch 为能力；version 为业务观察值；replace_existing 为重建。
+    返回：无。异常：原仓储 I/O/输入异常。
+    """
+    for document_id in ("A", "B"):
+        if replace_existing:
+            source.reset_source_document("AAPL", document_id, SourceKind.FILING, batch=batch)
+        _create_complete_source(source, blob, batch=batch, document_id=document_id,
+                                business_meta={"version": version, "nested": {"items": [version]}})
+
+
+def test_meta_view_reader_guard_keeps_two_documents_all_a_then_all_b(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """reader 首 get barrier 阻止真实 B 发布，成功前缀不混合 A/B 且释放后可发布。
+
+    参数：tmp_path 为隔离根；monkeypatch 为真实方法监视。返回：无。异常：AssertionError/超时。
+    """
+    writer_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching = FsBatchingRepository(tmp_path, repository_set=writer_set)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=writer_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=writer_set)
+    a = batching.begin_batch("AAPL")
+    _stage_meta_view_pair(source, blob, a, "A", replace_existing=False)
+    batching.commit_batch(a)
+    b = batching.begin_batch("AAPL")
+    _stage_meta_view_pair(source, blob, b, "B", replace_existing=True)
+    reader_set = build_fs_repository_set(workspace_root=tmp_path)
+    reader = FsSourceDocumentRepository(tmp_path, repository_set=reader_set)
+    probe = _MetaViewReadProbe(reader_set.core, block_first=True)
+    probe.install(monkeypatch, reader_set.core)
+    writer_probe = _MetaViewReadProbe(writer_set.core)
+    monkeypatch.setattr(writer_set.core, "_acquire_publication_guard", writer_probe.acquire_guard)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        read = pool.submit(reader.read_source_meta_view, "AAPL", SourceKind.FILING)
+        assert probe.first_read.wait(timeout=5)
+        commit = pool.submit(batching.commit_batch, b)
+        try:
+            assert writer_probe.acquire_entered.wait(timeout=5)
+            assert not commit.done()
+            probe.resume.set()
+            view = read.result(timeout=5)
+            commit.result(timeout=5)
+        finally:
+            probe.resume.set()
+    assert [entry.source_meta["version"] for entry in view.entries] == ["A", "A"]
+    assert probe.acquires == probe.releases == probe.lists == 1
+    assert probe.gets == ["A", "B"] and view.read_error is None
+    assert isinstance(view.entries[0].source_meta, MappingProxyType)
+    probe.block_first = False
+    latest = reader.read_source_meta_view("AAPL", SourceKind.FILING)
+    assert [entry.source_meta["version"] for entry in latest.entries] == ["B", "B"]
+    assert probe.acquires == probe.releases == probe.lists == 2
+    # 独立公开 get 的嵌套变异不污染已有观察，也不污染下一次磁盘读取。
+    public_meta = reader.get_source_meta("AAPL", "A", SourceKind.FILING)
+    nested = public_meta["nested"]
+    assert isinstance(nested, dict)
+    nested["items"] = ["mutated"]
+    fresh_meta = reader.get_source_meta("AAPL", "A", SourceKind.FILING)
+    assert fresh_meta["nested"] == {"items": ["B"]}
+    assert [entry.source_meta["nested"] for entry in latest.entries] == [{"items": ["B"]}] * 2
+    assert [entry.source_meta["version"] for entry in view.entries] == ["A", "A"]
+    assert [entry.source_meta["nested"] for entry in view.entries] == [{"items": ["A"]}] * 2
+
+
+def _meta_view_nested_leaf(
+    value: JsonValue, depth: int, shape: Literal["dict", "list"],
+) -> dict[str, JsonValue]:
+    """迭代核对深层 JSON 的每层形态并返回末端业务字典，避免断言自身递归。
+
+    参数：value 为公开读取的 JSON 值；depth 为测试层数；shape 为每层容器形态。
+    返回：末端业务字典。异常：结构或深度不符时抛 AssertionError。
+    """
+    for _ in range(depth):
+        if shape == "dict":
+            assert isinstance(value, dict) and tuple(value) == ("child",)
+            value = value["child"]
+        else:
+            assert isinstance(value, list) and len(value) == 1
+            value = value[0]
+    assert isinstance(value, dict) and tuple(value) == ("items",)
+    return value
+
+
+@pytest.mark.parametrize("depth", (8, 300, 600))
+@pytest.mark.parametrize("shape", ("dict", "list"))
+def test_meta_view_committed_deep_json_preserves_public_observation_independence(
+    tmp_path: Path, depth: int, shape: Literal["dict", "list"],
+) -> None:
+    """真实提交深层合法 JSON，旧 get/新 view 保真、公开读取独立且跨发布稳定。
+
+    参数：tmp_path 为隔离仓储；depth 为已知反例及控制层数；shape 为 JSON 容器形态。
+    返回：无。异常：AssertionError 或真实仓储异常。
+    """
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    batching = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    nested: JsonValue = {"items": ["A", None, True, 7, 2.5]}
+    for _ in range(depth):
+        nested = {"child": nested} if shape == "dict" else [nested]
+    batch = batching.begin_batch("AAPL")
+    _create_complete_source(source, blob, batch=batch, document_id="deep",
+                            business_meta={"custom_nested": nested})
+    batching.commit_batch(batch)
+    assert source.classify_source_integrity("AAPL", "deep", SourceKind.FILING).status is SourceIntegrityStatus.COMPLETE
+    assert source.list_source_document_ids("AAPL", SourceKind.FILING) == ["deep"]
+    old_get = source.get_source_meta("AAPL", "deep", SourceKind.FILING)
+    view = source.read_source_meta_view("AAPL", SourceKind.FILING)
+    assert view.read_error is None and tuple(entry.document_id for entry in view.entries) == ("deep",)
+    business = view.entries[0].source_meta
+    assert source_integrity_owner_module._SOURCE_REVISION_META_FIELD not in business
+    assert isinstance(business, MappingProxyType)
+    expected: list[JsonValue] = ["A", None, True, 7, 2.5]
+    assert _meta_view_nested_leaf(old_get["custom_nested"], depth, shape)["items"] == expected
+    assert _meta_view_nested_leaf(business["custom_nested"], depth, shape)["items"] == expected
+    _meta_view_nested_leaf(old_get["custom_nested"], depth, shape)["items"] = ["mutated"]
+    fresh_get = source.get_source_meta("AAPL", "deep", SourceKind.FILING)
+    fresh_view = source.read_source_meta_view("AAPL", SourceKind.FILING)
+    assert fresh_view.read_error is None
+    fresh_business = fresh_view.entries[0].source_meta
+    assert _meta_view_nested_leaf(fresh_get["custom_nested"], depth, shape)["items"] == expected
+    assert _meta_view_nested_leaf(fresh_business["custom_nested"], depth, shape)["items"] == expected
+    assert _meta_view_nested_leaf(business["custom_nested"], depth, shape)["items"] == expected
+    # 比较引用只在测试内证明公开读取互相独立；消费者仍只读 view 的嵌套值。
+    assert _meta_view_nested_leaf(business["custom_nested"], depth, shape) is not _meta_view_nested_leaf(
+        fresh_business["custom_nested"], depth, shape,
+    )
+    assert _meta_view_nested_leaf(fresh_get["custom_nested"], depth, shape) is not _meta_view_nested_leaf(
+        fresh_business["custom_nested"], depth, shape,
+    )
+    next_nested: JsonValue = {"items": ["B"]}
+    for _ in range(depth):
+        next_nested = {"child": next_nested} if shape == "dict" else [next_nested]
+    next_batch = batching.begin_batch("AAPL")
+    source.reset_source_document("AAPL", "deep", SourceKind.FILING, batch=next_batch)
+    _create_complete_source(source, blob, batch=next_batch, document_id="deep",
+                            business_meta={"custom_nested": next_nested})
+    batching.commit_batch(next_batch)
+    assert source.classify_source_integrity("AAPL", "deep", SourceKind.FILING).status is SourceIntegrityStatus.COMPLETE
+    latest = source.read_source_meta_view("AAPL", SourceKind.FILING)
+    assert latest.read_error is None
+    assert _meta_view_nested_leaf(latest.entries[0].source_meta["custom_nested"], depth, shape)["items"] == ["B"]
+    assert _meta_view_nested_leaf(business["custom_nested"], depth, shape)["items"] == expected
+    assert _meta_view_nested_leaf(fresh_business["custom_nested"], depth, shape)["items"] == expected
+
+
+@pytest.mark.parametrize("barrier", ("target_to_backup", "staging_to_target"))
+def test_meta_view_reader_waits_at_real_writer_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, barrier: _PublicationBarrier,
+) -> None:
+    """两个真实 rename 中的 reader 等待后仅观察完整 B。
+
+    参数：tmp_path 为隔离根；monkeypatch 为监视；barrier 为 rename 点。
+    返回：无。异常：AssertionError/超时或原仓储异常。
+    """
+    writer_set = build_fs_repository_set(workspace_root=tmp_path)
+    batching = FsBatchingRepository(tmp_path, repository_set=writer_set)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=writer_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=writer_set)
+    a = batching.begin_batch("AAPL")
+    _stage_meta_view_pair(source, blob, a, "A", replace_existing=False)
+    batching.commit_batch(a)
+    b = batching.begin_batch("AAPL")
+    _stage_meta_view_pair(source, blob, b, "B", replace_existing=True)
+    pause = _MetaViewRenameBarrier(writer_set.core, _active_batch_paths(writer_set.core), barrier)
+    monkeypatch.setattr(writer_set.core, "_replace_directory", pause)
+    reader_set = build_fs_repository_set(workspace_root=tmp_path)
+    reader = FsSourceDocumentRepository(tmp_path, repository_set=reader_set)
+    probe = _MetaViewReadProbe(reader_set.core)
+    probe.install(monkeypatch, reader_set.core)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        commit = pool.submit(batching.commit_batch, b)
+        assert pause.entered.wait(timeout=5)
+        read = pool.submit(reader.read_source_meta_view, "AAPL", SourceKind.FILING)
+        try:
+            assert probe.acquire_entered.wait(timeout=5)
+            assert not read.done()
+            with pytest.raises(RuntimeError, match="已存在跨进程活动 batch"):
+                reader_set.core._acquire_lock_token(reader_set.core._publication_lock_path("AAPL"), blocking=False)
+            pause.resume.set()
+            commit.result(timeout=5)
+            view = read.result(timeout=5)
+        finally:
+            pause.resume.set()
+    assert [entry.source_meta["version"] for entry in view.entries] == ["B", "B"]
+    assert probe.acquires == probe.releases == probe.lists == 1
+    assert probe.gets == ["A", "B"]
+
+
+@pytest.mark.parametrize("corruption", ("malformed", "missing", "identity", "symlink"))
+def test_meta_view_success_prefix_original_error_and_lock_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, corruption: str,
+) -> None:
+    """真实坏 meta 仅返回成功前缀与原对象，未读后项且 guard 最终释放。
+
+    参数：tmp_path 为隔离根；monkeypatch 为真实调用监视；corruption 为损坏方式。
+    返回：无。异常：AssertionError 或原仓储异常。
+    """
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    batching = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    batch = batching.begin_batch("AAPL")
+    for document_id in ("A", "B", "Z"):
+        _create_complete_source(source, blob, batch=batch, document_id=document_id)
+    _create_complete_source(source, blob, batch=batch, document_id="M", source_kind=SourceKind.MATERIAL)
+    batching.commit_batch(batch)
+    ids = source.list_source_document_ids("AAPL", SourceKind.FILING)
+    full = source.read_source_meta_view("AAPL", SourceKind.FILING)
+    assert [entry.document_id for entry in full.entries] == ids == ["A", "B", "Z"]
+    for entry in full.entries:
+        assert entry.source_meta == source.get_source_meta("AAPL", entry.document_id, SourceKind.FILING)
+        assert source_integrity_owner_module._SOURCE_REVISION_META_FIELD not in entry.source_meta
+    meta_path = repository_set.core._source_meta_path_for_read("AAPL", "B", SourceKind.FILING)
+    original = meta_path.read_bytes()
+    if corruption == "malformed":
+        meta_path.write_bytes(b"{")
+    elif corruption == "missing":
+        meta_path.unlink()
+    elif corruption == "identity":
+        meta = _read_integrity_json(meta_path)
+        meta["document_id"] = "wrong"
+        _write_integrity_json(meta_path, meta)
+    else:
+        outside = tmp_path / "outside-meta.json"
+        outside.write_bytes(original)
+        meta_path.unlink()
+        meta_path.symlink_to(outside)
+    probe = _MetaViewReadProbe(repository_set.core)
+    probe.install(monkeypatch, repository_set.core)
+    view = source.read_source_meta_view("AAPL", SourceKind.FILING)
+    assert tuple(entry.document_id for entry in view.entries) == ("A",)
+    assert view.read_error is probe.errors[0]
+    assert type(view.read_error) is (FileNotFoundError if corruption == "missing" else ValueError)
+    assert probe.gets == ["A", "B"]
+    assert probe.acquires == probe.releases == probe.lists == 1
+    # 原 public get 仍即时抛同类同文本；batch 没有迁移为 typed integrity 错。
+    with pytest.raises(type(view.read_error)) as raised:
+        source.get_source_meta("AAPL", "B", SourceKind.FILING)
+    assert str(raised.value) == str(view.read_error)
+    writer_token = repository_set.core._acquire_lock_token(repository_set.core._publication_lock_path("AAPL"), blocking=False)
+    repository_set.core._release_lock_token(writer_token)
+
+
+def test_meta_view_empty_material_and_original_enumeration_rules(tmp_path: Path) -> None:
+    """空根与 kind 隔离沿用原枚举；隐藏项和普通文件仍被原 list 忽略。
+
+    参数：tmp_path 为隔离根。返回：无。异常：AssertionError 或原仓储异常。
+    """
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    assert source.read_source_meta_view("AAPL", SourceKind.FILING).entries == ()
+    batching = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    batch = batching.begin_batch("AAPL")
+    _create_complete_source(source, blob, batch=batch, document_id="material", source_kind=SourceKind.MATERIAL)
+    batching.commit_batch(batch)
+    assert source.read_source_meta_view("AAPL", SourceKind.FILING).entries == ()
+    view = source.read_source_meta_view("AAPL", SourceKind.MATERIAL)
+    assert tuple(entry.document_id for entry in view.entries) == ("material",)
+    root = repository_set.core._source_root_for_read("AAPL", SourceKind.MATERIAL)
+    (root / "ordinary.txt").write_text("ignored")
+    (root / ".hidden").symlink_to(tmp_path / "missing")
+    assert source.read_source_meta_view("AAPL", SourceKind.MATERIAL) == view
+    assert source.list_source_document_ids("AAPL", SourceKind.MATERIAL) == ["material"]
+
+
+@pytest.mark.parametrize("corruption", ("descriptor", "visible_symlink", "root_file", "root_symlink"))
+def test_meta_view_complete_list_failure_is_immediate_and_releases_guard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, corruption: str,
+) -> None:
+    """完整 list 出错时不读取任何 meta、不变成前缀，并释放真实 guard。
+
+    参数：tmp_path 为隔离根；monkeypatch 为监视；corruption 为枚举损坏。
+    返回：无。异常：AssertionError 或原仓储异常。
+    """
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    batching = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    batch = batching.begin_batch("AAPL")
+    _create_complete_source(source, blob, batch=batch, document_id="A")
+    _create_complete_source(source, blob, batch=batch, document_id="Z")
+    batching.commit_batch(batch)
+    root = repository_set.core._source_root_for_read("AAPL", SourceKind.FILING)
+    if corruption == "descriptor":
+        meta_path = repository_set.core._source_meta_path_for_read("AAPL", "Z", SourceKind.FILING)
+        _identity_descriptor_file(meta_path.parent).write_bytes(b"{")
+    elif corruption == "visible_symlink":
+        (root / "visible-link").symlink_to(tmp_path / "missing")
+    else:
+        root.rename(tmp_path / "saved-root")
+        if corruption == "root_file":
+            root.write_bytes(b"not directory")
+        else:
+            root.symlink_to(tmp_path / "saved-root", target_is_directory=True)
+    probe = _MetaViewReadProbe(repository_set.core)
+    probe.install(monkeypatch, repository_set.core)
+    with pytest.raises((ValueError, OSError)) as batch_error:
+        source.read_source_meta_view("AAPL", SourceKind.FILING)
+    assert not probe.gets and probe.acquires == probe.releases == probe.lists == 1
+    with pytest.raises(type(batch_error.value)) as public_error:
+        source.list_source_document_ids("AAPL", SourceKind.FILING)
+    assert str(batch_error.value) == str(public_error.value)
+
+
+class _UnexpectedMetaReadError:
+    """真实 get 完成后抛未声明错误，验证其不被包装为成功前缀。"""
+
+    def __init__(self, core: FsStorageCore) -> None:
+        """初始化。参数：core 为真实仓储。返回：无。异常：无。"""
+        self.read = core._get_source_meta_unguarded
+        self.error = RuntimeError("unexpected meta read")
+
+    def __call__(self, ticker: str, document_id: str, source_kind: SourceKind) -> dict[str, JsonValue]:
+        """先真实读取再抛原对象。参数：ticker/document_id/source_kind 为目标。返回：无。异常：RuntimeError。"""
+        self.read(ticker, document_id, source_kind)
+        raise self.error
+
+
+def test_meta_view_unexpected_get_error_propagates_original_and_releases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """非 ValueError/OSError 原样即时传播且释放真实 guard。
+
+    参数：tmp_path 为隔离根；monkeypatch 为错误注入。返回：无。异常：AssertionError。
+    """
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    batching = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    batch = batching.begin_batch("AAPL")
+    _create_complete_source(source, blob, batch=batch, document_id="A")
+    batching.commit_batch(batch)
+    error = _UnexpectedMetaReadError(repository_set.core)
+    probe = _MetaViewReadProbe(repository_set.core)
+    probe.install(monkeypatch, repository_set.core)
+    monkeypatch.setattr(repository_set.core, "_get_source_meta_unguarded", error)
+    with pytest.raises(RuntimeError) as raised:
+        source.read_source_meta_view("AAPL", SourceKind.FILING)
+    assert raised.value is error.error and probe.acquires == probe.releases == 1
+    token = repository_set.core._acquire_lock_token(repository_set.core._publication_lock_path("AAPL"), blocking=False)
+    repository_set.core._release_lock_token(token)

@@ -51,6 +51,7 @@ from dayu.fins.domain.document_models import (
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.ticker_normalization import normalize_ticker
 
+from .source_meta_read import SourceMetaReadView
 from .source_integrity import SourceIntegrityClassification, SourceIntegrityStatus
 
 
@@ -1062,6 +1063,29 @@ class SourceDocumentRepositoryProtocol(Protocol):
             ValueError: ticker、document ID、source kind 或 meta 内容非法时抛出。
             RuntimeFileLockError: publication guard 获取或释放失败时抛出。
             OSError: published I/O 失败时抛出。
+        """
+        ...
+
+    def read_source_meta_view(
+        self, ticker: str, source_kind: SourceKind,
+    ) -> SourceMetaReadView:
+        """在同一个 publication guard 内按原 list/get 规则读取源元数据。
+
+        Args:
+            ticker: exact external ticker。
+            source_kind: 必填的 filing 或 material 来源类型。
+
+        Returns:
+            完整有序枚举的成功元数据前缀及首个原 ValueError/OSError 对象；
+            read_error 为 None 才表示全部读取完成。元数据顶层只读，独立于
+            其他公开读取与后续发布；嵌套 JSON 由消费者只读使用，
+            不代表完整性或写授权。
+
+        Raises:
+            ValueError: 输入或完整枚举不合法时抛出。
+            OSError: 完整枚举的 I/O 失败时抛出。
+            RuntimeFileLockError: publication guard 获取或释放失败时抛出。
+            Exception: 非 ValueError/OSError 的元数据读取异常原样传播。
         """
         ...
 

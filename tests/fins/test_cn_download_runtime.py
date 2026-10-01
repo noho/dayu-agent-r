@@ -79,6 +79,8 @@ from dayu.fins.storage import (
     FsSourceDocumentRepository,
     SourceIntegrityClassification,
     SourceIntegrityStatus,
+    SourceMetaReadView,
+    SourceDocumentRepositoryProtocol,
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
 from dayu.fins.ticker_normalization import Exchange, NormalizedTicker
@@ -2253,3 +2255,134 @@ def test_cn_real_initial_whole_kind_preflight_uses_request_zero_summary(
         assert record.failure_summary["message"] == "本地来源完整性预检失败"
     assert discovery.download_calls == previous_download_calls
     assert pdf_path.read_bytes() == old_pdf
+
+
+class _RuntimeTwoIdentityCandidates:
+    """保持原 provider，仅增加另一财年的真实候选输入。"""
+
+    def __init__(self, discovery: _RuntimeFakeDiscoveryClient) -> None:
+        """初始化。参数：discovery 为最小 provider fake。返回：无。异常：无。"""
+        self.original = discovery.list_report_candidates
+
+    def __call__(
+        self, query: CnReportQuery, profile: CnCompanyProfile, *,
+        cancellation_checkpoint: Callable[[], None] | None = None,
+    ) -> tuple[CnReportCandidate, ...]:
+        """返回两个候选。参数：query/profile/cancellation_checkpoint 为原输入。返回：两年度候选。异常：原取消异常。"""
+        first = self.original(query, profile, cancellation_checkpoint=cancellation_checkpoint)[0]
+        return first, replace(first, source_id="next-year", fiscal_year=2023, filing_date="2024-04-08")
+
+
+class _RuntimeIdentityWindowCorruption:
+    """在真实 batch 新观察前损坏磁盘，并在下一窗口恢复 ordinary 错输入。"""
+
+    def __init__(
+        self, source: SourceDocumentRepositoryProtocol, meta: Path, corruption: str, window: int,
+    ) -> None:
+        """初始化。参数：source 为真实仓储；meta 为原文件；corruption 为实际损坏；window 为观察序号。返回：无。异常：原 I/O。"""
+        self.read = source.read_source_meta_view
+        self.meta, self.corruption, self.window = meta, corruption, window
+        self.original = meta.read_bytes()
+        self.views: list[SourceMetaReadView] = []
+
+    def __call__(self, ticker: str, source_kind: SourceKind) -> SourceMetaReadView:
+        """按实际窗口损坏/恢复后真实读。参数：ticker/source_kind 为范围。返回：真实观察。异常：原仓储异常。"""
+        current = len(self.views) + 1
+        if current == self.window:
+            if self.corruption == "missing":
+                self.meta.unlink()
+            elif self.corruption == "malformed":
+                self.meta.write_bytes(b"{")
+            else:
+                (self.meta.parent / "undeclared.bin").write_bytes(b"unsafe")
+        elif current == self.window + 1 and self.corruption != "unsafe":
+            self.meta.write_bytes(self.original)
+        view = self.read(ticker, source_kind)
+        self.views.append(view)
+        return view
+
+
+async def _collect_identity_runtime_download(
+    runtime: FinsIngestionRuntime,
+) -> list[FinsEvent]:
+    """收集真实 HK runtime direct 事件。
+
+    参数：runtime 为真实运行时。返回：完整事件。异常：原运行时未投影异常。
+    """
+    request = build_fins_download_request(ticker="0700", form_types=("FY",), start="2024-01-01", end="2026-12-31")
+    return [event async for event in runtime.download(request)]
+
+
+@pytest.mark.parametrize("entry", ("direct", "job"))
+@pytest.mark.parametrize("window", (1, 3))
+@pytest.mark.parametrize("corruption", ("malformed", "missing", "unsafe"))
+def test_hk_runtime_identity_windows_preserve_ordinary_typed_and_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str, window: int, corruption: str,
+) -> None:
+    """真实 meta 错保留 ordinary 投影/继续；raw 可读 UNSAFE 仍由原完整性 owner 拒绝，direct/job 同源。
+
+    参数：tmp_path 为隔离根；monkeypatch 为真实调用包装；entry 为入口；window 为 W0/stream；corruption 为损坏。
+    返回：无。异常：AssertionError 或真实仓储 I/O。
+    """
+    runtime, _cn, discovery, converter = _build_runtime_with_cn_hk_adapters(tmp_path)
+    request = build_fins_download_request(ticker="0700", form_types=("FY",), start="2024-01-01", end="2026-12-31")
+    initial = runtime.start_download(request)
+    record = runtime.read_job(initial.job_id)
+    assert record.status is FinsIngestionJobStatus.SUCCEEDED
+    ids = record.result_summary["written_document_ids"]
+    assert isinstance(ids, list) and isinstance(ids[0], str)
+    original_id = ids[0]
+    source = runtime.source_repository
+    meta_path = tmp_path / "workspace" / source.get_source_document_locator("0700", original_id, SourceKind.FILING) / "meta.json"
+    probe = _RuntimeIdentityWindowCorruption(source, meta_path, corruption, window)
+    monkeypatch.setattr(source, "read_source_meta_view", probe)
+    monkeypatch.setattr(discovery, "list_report_candidates", _RuntimeTwoIdentityCandidates(discovery))
+    downloads, conversions = discovery.download_calls, converter.calls
+    ordinary_stream = window == 3 and corruption != "unsafe"
+    if entry == "direct":
+        events = asyncio.run(_collect_identity_runtime_download(runtime))
+        results = [e.result for e in events if e.event_type is FinsEventType.RESULT]
+        assert len(results) == 1
+        result = results[0]
+        assert result is not None
+        if ordinary_stream:
+            assert result.status is FinsResultStatus.SUCCESS and result.failure is None
+            assert result.download is not None
+            assert result.download.downloaded_count == result.download.failed_count == 1
+            assert result.download.discovered_count == len(result.download.document_rows) == 2
+            assert result.download.document_rows[0].document_id == original_id
+            assert result.download.document_rows[0].reason_category == ("storage_failed" if corruption == "missing" else "filing_execution_failed")
+        else:
+            assert result.status is FinsResultStatus.FAILURE and result.failure is not None
+            kind = FinsPublicFailureKind.STORAGE if corruption in ("missing", "unsafe") else FinsPublicFailureKind.EXECUTION
+            assert result.failure.kind is kind
+            assert result.error_kind is (FinsErrorKind.STORAGE if kind is FinsPublicFailureKind.STORAGE else FinsErrorKind.EXECUTION)
+            assert result.failure.reason_code is (FinsDownloadFailureReason.UNSAFE_PUBLICATION if corruption == "unsafe" else None)
+            expected_hint = ("请检查并修复工作区来源状态后重试；重复下载不会自行修复。" if corruption == "unsafe" else
+                             "请确认工作区可读写后重新发起下载。" if corruption == "missing" else
+                             "请保存脱敏诊断并排查失败原因后重试。")
+            assert result.failure.retry_hint == expected_hint
+            if window == 3:
+                assert result.download is not None and result.download.failed_count == result.download.discovered_count == 1
+    else:
+        start = runtime.start_download(request)
+        final = runtime.read_job(start.job_id)
+        assert final.status is (FinsIngestionJobStatus.SUCCEEDED if ordinary_stream else FinsIngestionJobStatus.FAILED)
+        if ordinary_stream:
+            assert final.result_summary["downloaded_count"] == final.result_summary["failed_count"] == 1
+            assert final.result_summary["discovered_count"] == 2
+            written = final.result_summary["written_document_ids"]
+            assert isinstance(written, list) and len(written) == 1
+        else:
+            if corruption == "unsafe":
+                assert final.failure_summary["message"] == "本地来源完整性预检失败"
+            else:
+                # 普通 job 错走原 generic exception owner，保存 str(exc)，不迁移到 direct 文案。
+                assert probe.views[0].read_error is not None
+                assert final.failure_summary["message"] == str(probe.views[0].read_error)
+            if window == 3:
+                assert final.result_summary["discovered_count"] == final.result_summary["failed_count"] == 1
+    assert discovery.download_calls - downloads == converter.calls - conversions == int(ordinary_stream)
+    assert len(probe.views) == (5 if ordinary_stream else window)
+    if ordinary_stream or corruption == "unsafe":
+        assert meta_path.read_bytes() == probe.original

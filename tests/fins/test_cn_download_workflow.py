@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import json
 from collections.abc import AsyncGenerator, Callable
 from contextlib import AbstractContextManager
@@ -37,6 +38,7 @@ from dayu.fins.download_contract import (
     FinsDownloadSource,
     FinsDownloadTransportCategory,
 )
+from dayu.fins.pipelines.cn_download_identity import build_cn_download_identity_index, resolve_cn_download_ids
 from dayu.fins.pipelines import cn_download_workflow as _cn_download_workflow
 from dayu.fins.pipelines import cn_download_filing_workflow as _cn_download_filing_workflow
 from dayu.fins.pipelines import cn_download_models as _cn_download_models
@@ -53,7 +55,9 @@ from dayu.fins.pipelines.cn_download_models import (
     DownloadedReportAsset,
 )
 from dayu.fins.pipelines.cn_download_pdf_gate import CnDownloadPdfGateProtocol
-from dayu.fins.pipelines.cn_download_source_upsert import build_content_fingerprint, build_remote_fingerprint
+from dayu.fins.pipelines.cn_download_source_upsert import (
+    build_content_fingerprint, build_remote_fingerprint, build_cn_file_entry, commit_cn_filing_source_document,
+)
 from dayu.fins.pipelines.docling_process_converter import (
     DoclingConversionCancelledError,
     DoclingConversionConfig,
@@ -77,6 +81,7 @@ from dayu.fins.storage import (
     SourceIntegrityRevisionConflictError,
     SourceIntegrityReason,
     SourceIntegrityStatus,
+    SourceMetaReadView,
 )
 from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
 from dayu.fins.storage._fs_identity import _FILING_IDENTITY_NAMESPACE, _identity_directory_path
@@ -4447,3 +4452,413 @@ def test_cn_download_reports_missing_independent_quarter_outside_document_counts
     assert discovery.download_calls == 0
     assert converter.calls == 0
     assert DownloadEventType.FILING_COMPLETED not in {event.event_type for event in events}
+
+
+class _IdentityObservationSourceRepository(FsSourceDocumentRepository):
+    """仅监视真实 batch 观察与原 public 身份读取调用。"""
+
+    def __init__(self, root: Path, repository_set: _FsRepositorySet) -> None:
+        """初始化。参数：root/repository_set 为真实仓储。返回：无。异常：原初始化异常。"""
+        super().__init__(root, repository_set=repository_set)
+        self.views: list[SourceMetaReadView] = []
+        self.public_lists = 0
+        self.public_gets = 0
+        self.reset_calls = 0
+        self.corrupt_before_window: int | None = None
+        self.corrupt_meta: Path | None = None
+
+    def read_source_meta_view(self, ticker: str, source_kind: SourceKind) -> SourceMetaReadView:
+        """读取真实新窗口。参数：ticker/source_kind 为范围。返回：真实观察。异常：原读取异常。"""
+        if self.corrupt_before_window == len(self.views) + 1:
+            assert self.corrupt_meta is not None
+            self.corrupt_meta.write_bytes(b"{")
+        view = super().read_source_meta_view(ticker, source_kind)
+        self.views.append(view)
+        return view
+
+    def list_source_document_ids(self, ticker: str, source_kind: SourceKind) -> list[str]:
+        """监视原 public list。参数：ticker/source_kind 为范围。返回：真实列表。异常：原读取异常。"""
+        self.public_lists += 1
+        return super().list_source_document_ids(ticker, source_kind)
+
+    def get_source_meta(self, ticker: str, document_id: str, source_kind: SourceKind) -> DocumentMeta:
+        """监视原 public get。参数：ticker/document_id/source_kind 为目标。返回：原 meta。异常：原读取异常。"""
+        self.public_gets += 1
+        return super().get_source_meta(ticker, document_id, source_kind)
+
+
+    def reset_source_document(self, ticker: str, document_id: str, source_kind: SourceKind, *, batch: BatchToken) -> None:
+        """监视真实 reset。参数：ticker/document_id/source_kind 为目标；batch 为能力。返回：无。异常：原仓储异常。"""
+        self.reset_calls += 1
+        super().reset_source_document(ticker, document_id, source_kind, batch=batch)
+
+
+def _publish_identity_binding(
+    writer: CnPipeline, ticker: str, candidate: CnReportCandidate,
+    document_id: str, internal_id: str, *, remove_id: str | None,
+) -> None:
+    """独立真实 writer 发布新绑定，使用原 blob/source/manifest owner。
+
+    参数：writer 为独立仓储宿主；ticker/candidate 为来源；document_id/internal_id 为新身份；remove_id 为旧目标。
+    返回：无。异常：原仓储/commit 异常。
+    """
+    batch = writer.batching_repository.begin_batch(ticker)
+    if remove_id is not None:
+        writer.source_repository.reset_source_document(ticker, remove_id, SourceKind.FILING, batch=batch)
+    handle = SourceHandle(ticker=ticker, document_id=document_id, source_kind=SourceKind.FILING.value)
+    pdf_name, docling_name = f"{document_id}.pdf", f"{document_id}_docling.json"
+    pdf = writer.blob_repository.store_file(handle, pdf_name, io.BytesIO(_PDF_BYTES), batch=batch, content_type="application/pdf")
+    docling = writer.blob_repository.store_file(handle, docling_name, io.BytesIO(_DOCLING_BYTES), batch=batch, content_type="application/json")
+    commit_cn_filing_source_document(
+        source_repository=writer.source_repository, processed_repository=writer.processed_repository,
+        ticker=ticker, document_id=document_id, internal_document_id=internal_id, primary_document=docling_name,
+        file_entries=[build_cn_file_entry(filename=pdf_name, file_meta=pdf, source_label="original"),
+                      build_cn_file_entry(filename=docling_name, file_meta=docling, source_label="docling")],
+        candidate=candidate,
+        profile=CnCompanyProfile(provider="hkexnews", company_id="HKEX:7609", company_name="腾讯控股", ticker=ticker),
+        pdf_sha256=hashlib.sha256(_PDF_BYTES).hexdigest(), remote_fingerprint=build_remote_fingerprint(candidate),
+        source_fingerprint=build_content_fingerprint(pdf_bytes=_PDF_BYTES, docling_json_bytes=_DOCLING_BYTES),
+        previous_completed_meta=None, source_meta_exists=False, batch=batch,
+    )
+    writer.batching_repository.commit_batch(batch)
+
+
+async def _collect_hk_identity_events(
+    pipeline: CnPipeline, events: list[DownloadEvent], *,
+    after_event: Callable[[DownloadEvent], None] | None = None,
+    overwrite: bool = False, cancel_checker: Callable[[], bool] | None = None,
+) -> None:
+    """收集真实 HK 流并在用户事件边界运行测试 writer。
+
+    参数：pipeline 为真实宿主；events 为收集器；after_event 为事件边界动作；overwrite/cancel_checker 为原输入。
+    返回：无。异常：原 pipeline 异常；已发生事件保存在 events。
+    """
+    async for event in pipeline.download_stream(
+        ticker="0700", form_type="FY", start_date="2024", end_date="2026",
+        overwrite=overwrite, start_is_explicit=True, cancel_checker=cancel_checker,
+    ):
+        events.append(event)
+        if after_event is not None:
+            after_event(event)
+
+
+class _IdentityStartWriter:
+    """在首个 start yield 后通过独立 writer 改变绑定或实际损坏 meta。"""
+
+    def __init__(self, root: Path, writer: CnPipeline, candidate: CnReportCandidate, old_id: str, operation: str) -> None:
+        """初始化。参数：root 为隔离根；writer/candidate/old_id 为目标；operation 为动作。返回：无。异常：无。"""
+        self.root = root
+        self.writer, self.candidate, self.old_id, self.operation = writer, candidate, old_id, operation
+        self.ran = False
+
+    def __call__(self, event: DownloadEvent) -> None:
+        """执行一次 writer。参数：event 为已发事件。返回：无。异常：原仓储异常。"""
+        if event.event_type is not DownloadEventType.FILING_STARTED or self.ran:
+            return
+        self.ran = True
+        if self.operation == "rebind":
+            _publish_identity_binding(self.writer, "0700", self.candidate, "rebound", "internal-rebound", remove_id=self.old_id)
+        else:
+            locator = self.writer.source_repository.get_source_document_locator("0700", self.old_id, SourceKind.FILING)
+            meta = self.root / locator / "meta.json"
+            if self.operation == "missing":
+                meta.unlink()
+            else:
+                meta.write_bytes(b"{")
+
+
+@pytest.mark.parametrize("second_run", (False, True))
+def test_hk_identity_windows_count_and_previous_meta_are_separate(tmp_path: Path, second_run: bool) -> None:
+    """全 HK 两候选 batch=1+2n；下一 filing 观察前一 publication，原 previous_meta get 单列。
+
+    参数：tmp_path 为隔离根；second_run 为已有来源增量路径。返回：无。异常：AssertionError。
+    """
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    source = _IdentityObservationSourceRepository(tmp_path, repository_set)
+    candidates = (_candidate(provider="hkexnews", source_id="first", fiscal_year=2025),
+                  _candidate(provider="hkexnews", source_id="second", fiscal_year=2024))
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=candidates)
+    pipeline = _build_pipeline(tmp_path=tmp_path, discovery=_FakeDiscoveryClient(tmp_path, ()),
+                               hk_discovery=discovery, converter=_FakeConverter(), repository_set=repository_set,
+                               source_repository=source)
+    if second_run:
+        asyncio.run(_collect_hk_identity_events(pipeline, []))
+        source.views.clear()
+        source.public_lists = source.public_gets = 0
+    events: list[DownloadEvent] = []
+    asyncio.run(_collect_hk_identity_events(pipeline, events))
+    assert len(source.views) == 5
+    assert source.public_lists == 0
+    assert source.public_gets == (2 if second_run else 0)
+    assert [len(view.entries) for view in source.views] == ([2, 2, 2, 2, 2] if second_run else [0, 0, 0, 1, 1])
+    starts = [event.document_id for event in events if event.event_type is DownloadEventType.FILING_STARTED]
+    terminals = [event.document_id for event in events if event.event_type is DownloadEventType.FILING_COMPLETED]
+    assert starts == terminals and len(starts) == 2
+    summary = _final_result(events)["summary"]
+    assert isinstance(summary, dict)
+    assert {key: summary[key] for key in ("total", "downloaded", "skipped", "failed")} == {
+        "total": 2, "downloaded": 0 if second_run else 2, "skipped": 2 if second_run else 0, "failed": 0,
+    }
+
+
+@pytest.mark.parametrize("operation", ("rebind", "malformed", "missing"))
+def test_hk_stream_reads_fresh_after_start_yield(tmp_path: Path, operation: str) -> None:
+    """start 后真实 writer 改变绑定时 stream 新读；坏 meta 保持 ordinary failure 并继续。
+
+    参数：tmp_path 为隔离根；operation 为真实 writer 动作。返回：无。异常：AssertionError。
+    """
+    candidate = _candidate(provider="hkexnews", source_id="first", fiscal_year=2025)
+    second = _candidate(provider="hkexnews", source_id="second", fiscal_year=2024)
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    source = _IdentityObservationSourceRepository(tmp_path, repository_set)
+    pipeline = _build_pipeline(tmp_path=tmp_path, discovery=_FakeDiscoveryClient(tmp_path, ()),
+        hk_discovery=_FakeDiscoveryClient(tmp_path, (candidate,)), converter=_FakeConverter(),
+        repository_set=repository_set, source_repository=source)
+    asyncio.run(_collect_hk_identity_events(pipeline, []))
+    old_id = source.views[-1].entries[0].document_id if source.views[-1].entries else build_cn_filing_ids(
+        ticker="0700", form_type="FY", fiscal_year=2025, fiscal_period="FY", amended=False)[0]
+    discovery = _FakeDiscoveryClient(tmp_path, (candidate, second))
+    follow = _build_pipeline(tmp_path=tmp_path, discovery=_FakeDiscoveryClient(tmp_path, ()),
+        hk_discovery=discovery, converter=_FakeConverter(), repository_set=repository_set, source_repository=source)
+    writer = _build_pipeline(tmp_path=tmp_path, discovery=_FakeDiscoveryClient(tmp_path, ()), converter=_FakeConverter())
+    hook = _IdentityStartWriter(tmp_path, writer, candidate, old_id, operation)
+    source.views.clear()
+    events: list[DownloadEvent] = []
+    if operation == "rebind":
+        asyncio.run(_collect_hk_identity_events(follow, events, after_event=hook))
+        assert len(source.views) == 5
+        assert source.views[1].entries[0].document_id == old_id
+        assert source.views[2].entries[0].document_id == "rebound"
+        starts = [e.document_id for e in events if e.event_type is DownloadEventType.FILING_STARTED]
+        terminals = [e.document_id for e in events if e.event_type is DownloadEventType.FILING_COMPLETED]
+        assert starts[0] == old_id and terminals[0] == "rebound"
+        assert _final_result(events)["status"] == "ok"
+        assert source.get_source_meta("0700", "rebound", SourceKind.FILING)["internal_document_id"] == "internal-rebound"
+    else:
+        # stream 内当前 ordinary failure 已记录；下一 start 在原 try 外再次遭遇坏 meta。
+        with pytest.raises(FileNotFoundError if operation == "missing" else ValueError):
+            asyncio.run(_collect_hk_identity_events(follow, events, after_event=hook))
+        failed = [e for e in events if e.event_type is DownloadEventType.FILING_FAILED]
+        assert len(failed) == 1 and failed[0].document_id == old_id
+        row = failed[0].payload["filing_result"]
+        assert isinstance(row, dict)
+        assert row["reason_code"] == ("storage_failed" if operation == "missing" else "filing_execution_failed")
+        assert len([e for e in events if e.event_type is DownloadEventType.FILING_STARTED]) == 1
+        assert discovery.download_calls == 0
+        assert len(source.views) == 4
+
+
+class _IdentityChurnConverter:
+    """转换边界用独立真实 writer 改 target revision，保留各轮 PDF/Docling acquisition。"""
+
+    def __init__(self, writer: CnPipeline, candidate: CnReportCandidate, changes: int) -> None:
+        """初始化。参数：writer 为独立仓储；candidate 为目标；changes 为发布轮数。返回：无。异常：无。"""
+        self.writer, self.candidate, self.changes = writer, candidate, changes
+        self.calls = 0
+        self.document_id = build_cn_filing_ids(ticker="0700", form_type="FY", fiscal_year=candidate.fiscal_year,
+                                               fiscal_period="FY", amended=False)[0]
+
+    async def convert_to_json_bytes(
+        self, input_bytes: bytes, stream_name: str, *, config: DoclingConversionConfig,
+        cancellation: CancellationToken | None,
+    ) -> DoclingConversionResult:
+        """返回分轮 payload 并发布 revision。参数：input_bytes/stream_name/config/cancellation 为原转换输入。
+
+        返回：本轮 Docling 资产。异常：真实 writer 发布异常。
+        """
+        self.calls += 1
+        if self.calls <= self.changes:
+            _publish_identity_binding(self.writer, "0700", self.candidate, self.document_id,
+                                      f"internal-{self.calls}", remove_id=None if self.calls == 1 else self.document_id)
+        payload = json.dumps({"round": self.calls}).encode()
+        return DoclingConversionResult(json_bytes=payload, size=len(payload), sha256=hashlib.sha256(payload).hexdigest())
+
+
+@pytest.mark.parametrize("changes", (1, 2, 3))
+def test_hk_retry_rounds_read_fresh_and_discard_old_assets(tmp_path: Path, changes: int) -> None:
+    """真实 target churn 使 round0/1/2 新观察，耗尽仍普通 failure，成功仅提交最后 payload。
+
+    参数：tmp_path 为隔离根；changes 为独立 publication 次数。返回：无。异常：AssertionError。
+    """
+    candidate = _candidate(provider="hkexnews", source_id="retry", fiscal_year=2025)
+    writer = _build_pipeline(tmp_path=tmp_path, discovery=_FakeDiscoveryClient(tmp_path, ()), converter=_FakeConverter())
+    converter = _IdentityChurnConverter(writer, candidate, changes)
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    source = _IdentityObservationSourceRepository(tmp_path, repository_set)
+    discovery = _FakeDiscoveryClient(tmp_path, (candidate,))
+    pipeline = _build_pipeline(tmp_path=tmp_path, discovery=_FakeDiscoveryClient(tmp_path, ()), hk_discovery=discovery,
+                               converter=converter, repository_set=repository_set, source_repository=source)
+    events: list[DownloadEvent] = []
+    asyncio.run(_collect_hk_identity_events(pipeline, events, overwrite=True))
+    rounds = min(changes + 1, 3)
+    assert len(source.views) == 1 + 2 + rounds - 1
+    assert converter.calls == discovery.download_calls == rounds
+    assert source.views[2].entries == ()
+    for i, view in enumerate(source.views[3:], start=1):
+        assert view.entries[0].source_meta["internal_document_id"] == f"internal-{i}"
+    assert len([e for e in events if e.event_type is DownloadEventType.FILING_STARTED]) == 1
+    terminals = [e for e in events if e.event_type in (DownloadEventType.FILING_COMPLETED, DownloadEventType.FILING_FAILED)]
+    assert len(terminals) == 1
+    row = terminals[0].payload["filing_result"]
+    assert isinstance(row, dict)
+    assert row["status"] == ("failed" if changes == 3 else "downloaded")
+    if changes == 3:
+        assert row["reason_code"] == "filing_execution_failed"
+    else:
+        handle = source.get_source_handle("0700", converter.document_id, SourceKind.FILING)
+        assert json.loads(pipeline.blob_repository.read_file_bytes(handle, f"{converter.document_id}_docling.json")) == {"round": rounds}
+        assert source.get_source_meta("0700", converter.document_id, SourceKind.FILING)["internal_document_id"] == f"internal-{changes}"
+    assert _final_result(events)["status"] == "ok"
+
+
+@pytest.mark.parametrize("corruption", ("unsafe", "malformed", "missing"))
+def test_hk_direct_stream_preserves_raw_binding_then_original_rejection(
+    tmp_path: Path, corruption: str,
+) -> None:
+    """无 ticker preflight 的 direct stream 保留 raw 可读身份，Phase A 拒绝或原 get 错不修改旧发布。
+
+    参数：tmp_path 为隔离根；corruption 为实际文件损坏。返回：无。异常：AssertionError。
+    """
+    candidate = _candidate(provider="hkexnews")
+    writer = _build_pipeline(tmp_path=tmp_path, discovery=_FakeDiscoveryClient(tmp_path, ()), converter=_FakeConverter())
+    _publish_identity_binding(writer, "600519", candidate, "A-original", "internal-original", remove_id=None)
+    _publish_identity_binding(writer, "600519", replace(candidate, source_id="sibling"), "Z-sibling", "internal-sibling", remove_id=None)
+    sibling_locator = writer.source_repository.get_source_document_locator("600519", "Z-sibling", SourceKind.FILING)
+    original_locator = writer.source_repository.get_source_document_locator("600519", "A-original", SourceKind.FILING)
+    if corruption == "unsafe":
+        (tmp_path / original_locator / "undeclared.bin").write_bytes(b"unsafe")
+    elif corruption == "malformed":
+        (tmp_path / sibling_locator / "meta.json").write_bytes(b"{")
+    else:
+        (tmp_path / sibling_locator / "meta.json").unlink()
+    before = {p.relative_to(tmp_path): p.read_bytes() for p in (tmp_path / "portfolio").rglob("*") if p.is_file()}
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    source = _IdentityObservationSourceRepository(tmp_path, repository_set)
+    discovery = _FakeDiscoveryClient(tmp_path, (candidate,))
+    converter = _FakeConverter()
+    pipeline = _build_pipeline(tmp_path=tmp_path, discovery=discovery, converter=converter,
+                               repository_set=repository_set, source_repository=source)
+    expected = SourceIntegrityPreflightError if corruption == "unsafe" else (ValueError if corruption == "malformed" else FileNotFoundError)
+    with pytest.raises(expected) as raised:
+        _collect_single_filing_events(pipeline=pipeline, candidate=candidate)
+    assert len(source.views) == 1
+    if corruption == "unsafe":
+        assert resolve_cn_download_ids("600519", candidate, build_cn_download_identity_index(source.views[0])) == ("A-original", "internal-original")
+        assert isinstance(raised.value, SourceIntegrityPreflightError)
+        assert raised.value.reason is SourceIntegrityPreflightReason.UNSAFE_PUBLICATION
+    else:
+        assert raised.value is source.views[0].read_error
+    assert source.reset_calls == discovery.download_calls == converter.calls == 0
+    assert before == {p.relative_to(tmp_path): p.read_bytes() for p in (tmp_path / "portfolio").rglob("*") if p.is_file()}
+
+
+def test_hk_repair_sort_reuses_w0_and_company_gate_keeps_original_order(tmp_path: Path) -> None:
+    """批初 accepted/repair 排序共享一次 W0，真实修复先于 clean 候选且 company gate 不前移。
+
+    参数：tmp_path 为隔离根。返回：无。异常：AssertionError 或原仓储异常。
+    """
+    first = _candidate(provider="hkexnews", source_id="clean", fiscal_year=2025)
+    repair = _candidate(provider="hkexnews", source_id="repair", fiscal_year=2024)
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    source = _IdentityObservationSourceRepository(tmp_path, repository_set)
+    discovery = _FakeDiscoveryClient(tmp_path, (first, repair))
+    pipeline = _build_pipeline(tmp_path=tmp_path, discovery=_FakeDiscoveryClient(tmp_path, ()), hk_discovery=discovery,
+                               converter=_FakeConverter(), repository_set=repository_set, source_repository=source)
+    asyncio.run(_collect_hk_identity_events(pipeline, []))
+    repair_id = build_cn_filing_ids(ticker="0700", form_type="FY", fiscal_year=2024, fiscal_period="FY", amended=False)[0]
+    locator = source.get_source_document_locator("0700", repair_id, SourceKind.FILING)
+    (tmp_path / locator / f"{repair_id}_docling.json").unlink()
+    source.views.clear()
+    events: list[DownloadEvent] = []
+    asyncio.run(_collect_hk_identity_events(pipeline, events))
+    assert len(source.views) == 5
+    assert [e.document_id for e in events if e.event_type is DownloadEventType.FILING_STARTED][0] == repair_id
+    assert source.classify_source_integrity("0700", repair_id, SourceKind.FILING).status is SourceIntegrityStatus.COMPLETE
+    summary = _final_result(events)["summary"]
+    assert isinstance(summary, dict) and summary["downloaded"] == summary["skipped"] == 1 and summary["failed"] == 0
+
+
+@pytest.mark.parametrize("prior_row", (False, True))
+def test_hk_start_read_error_stays_outside_filing_try_and_keeps_prior_events(tmp_path: Path, prior_row: bool) -> None:
+    """start 新读出错不造当前 start/failed，也不改造已有 rows 为 typed partial abort。
+
+    参数：tmp_path 为隔离根；prior_row 为首份已成功事件路径。返回：无。异常：AssertionError。
+    """
+    first = _candidate(provider="hkexnews", source_id="first", fiscal_year=2025)
+    second = _candidate(provider="hkexnews", source_id="second", fiscal_year=2024)
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    source = _IdentityObservationSourceRepository(tmp_path, repository_set)
+    pipeline = _build_pipeline(tmp_path=tmp_path, discovery=_FakeDiscoveryClient(tmp_path, ()),
+                               hk_discovery=_FakeDiscoveryClient(tmp_path, (first, second)), converter=_FakeConverter(),
+                               repository_set=repository_set, source_repository=source)
+    asyncio.run(_collect_hk_identity_events(pipeline, []))
+    first_id = build_cn_filing_ids(ticker="0700", form_type="FY", fiscal_year=2025, fiscal_period="FY", amended=False)[0]
+    source.corrupt_meta = tmp_path / source.get_source_document_locator("0700", first_id, SourceKind.FILING) / "meta.json"
+    source.views.clear()
+    source.corrupt_before_window = 4 if prior_row else 2
+    events: list[DownloadEvent] = []
+    with pytest.raises(ValueError) as raised:
+        asyncio.run(_collect_hk_identity_events(pipeline, events))
+    assert raised.value is source.views[-1].read_error
+    assert len([e for e in events if e.event_type is DownloadEventType.FILING_STARTED]) == int(prior_row)
+    assert len([e for e in events if e.event_type is DownloadEventType.FILING_COMPLETED]) == int(prior_row)
+    assert not [e for e in events if e.event_type in (DownloadEventType.FILING_FAILED, DownloadEventType.PIPELINE_COMPLETED)]
+
+
+class _IdentityStartCancel:
+    """在 start 事件处发出取消，证明 stream 入口先取消后读取。"""
+
+    def __init__(self, state: _CancelState) -> None:
+        """初始化。参数：state 为原取消 token。返回：无。异常：无。"""
+        self.state = state
+
+    def __call__(self, event: DownloadEvent) -> None:
+        """start 时取消。参数：event 为原事件。返回：无。异常：无。"""
+        if event.event_type is DownloadEventType.FILING_STARTED:
+            self.state.cancelled = True
+
+
+class _IdentityCancelError:
+    """保留调用者取消或普通 checker 错误的原对象。"""
+
+    def __init__(self, error: RuntimeError) -> None:
+        """初始化。参数：error 为原对象。返回：无。异常：无。"""
+        self.error = error
+
+    def __call__(self) -> bool:
+        """抛原 checker 错。参数：无。返回：无。异常：原 RuntimeError 子类。"""
+        raise self.error
+
+
+def test_hk_cancel_after_start_suppresses_stream_identity_read(tmp_path: Path) -> None:
+    """start 后取消只观察 W0/start，不读 stream，结果保留 cancelled 与零 rows。
+
+    参数：tmp_path 为隔离根。返回：无。异常：AssertionError。
+    """
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    source = _IdentityObservationSourceRepository(tmp_path, repository_set)
+    discovery = _FakeDiscoveryClient(tmp_path, (_candidate(provider="hkexnews"),))
+    pipeline = _build_pipeline(tmp_path=tmp_path, discovery=_FakeDiscoveryClient(tmp_path, ()), hk_discovery=discovery,
+                               converter=_FakeConverter(), repository_set=repository_set, source_repository=source)
+    state = _CancelState()
+    events: list[DownloadEvent] = []
+    asyncio.run(_collect_hk_identity_events(pipeline, events, after_event=_IdentityStartCancel(state), cancel_checker=state))
+    assert len(source.views) == 2 and discovery.download_calls == 0
+    assert _final_result(events)["status"] == "cancelled"
+    assert _final_result(events)["filings"] == []
+    assert not [e for e in events if e.event_type in (DownloadEventType.FILING_COMPLETED, DownloadEventType.FILING_FAILED)]
+
+
+@pytest.mark.parametrize("error", [CnDownloadCancelledError("same cancel"), RuntimeError("checker failure")])
+def test_hk_direct_cancel_and_checker_error_precede_identity_read(tmp_path: Path, error: RuntimeError) -> None:
+    """direct 取消/非取消 checker 错保持原对象，均先于新身份读取。
+
+    参数：tmp_path 为隔离根；error 为调用者对象。返回：无。异常：AssertionError。
+    """
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    source = _IdentityObservationSourceRepository(tmp_path, repository_set)
+    pipeline = _build_pipeline(tmp_path=tmp_path, discovery=_FakeDiscoveryClient(tmp_path, ()), converter=_FakeConverter(),
+                               repository_set=repository_set, source_repository=source)
+    with pytest.raises(type(error)) as raised:
+        _collect_single_filing_events(pipeline=pipeline, candidate=_candidate(provider="hkexnews"), cancel_checker=_IdentityCancelError(error))
+    assert raised.value is error and not source.views

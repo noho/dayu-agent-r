@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 from typing import Optional
 
 from dayu.contracts.json_value import JsonValue
@@ -73,6 +74,7 @@ from ._fs_storage_utils import (
     _write_json,
 )
 from .repository_protocols import SourceSnapshotProtocol
+from .source_meta_read import SourceMetaReadEntry, SourceMetaReadView
 from .source_integrity import (
     SourceIntegrityClassification,
     SourceIntegrityPreflightError,
@@ -588,6 +590,53 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         finally:
             self._release_lock_token(guard_token)
 
+    def read_source_meta_view(
+        self, ticker: str, source_kind: SourceKind,
+    ) -> SourceMetaReadView:
+        """在同一个 publication guard 内按原 list/get 规则读取源元数据。
+
+        Args:
+            ticker: exact external ticker。
+            source_kind: 必填的 filing 或 material 来源类型。
+
+        Returns:
+            完整有序枚举的成功元数据前缀及首个原 ValueError/OSError 对象；
+            read_error 为 None 才表示全部读取完成。每份元数据来自本次独立
+            JSON 解析，顶层只读；嵌套 JSON 由消费者只读使用，独立于其他
+            公开读取与后续发布，不代表完整性或写授权。
+
+        Raises:
+            ValueError: 输入或完整枚举不合法时抛出。
+            OSError: 完整枚举的 I/O 失败时抛出。
+            RuntimeFileLockError: publication guard 获取或释放失败时抛出。
+            Exception: 非 ValueError/OSError 的元数据读取异常原样传播。
+        """
+
+        external_ticker = _require_external_identity(ticker, field_name="ticker")
+        normalized_source_kind = _normalize_source_kind(source_kind)
+        guard_token = self._acquire_publication_guard(external_ticker)
+        try:
+            # 完整枚举先于所有 get；不得将 list 失败变为元数据前缀。
+            document_ids = self._list_document_ids_unguarded(external_ticker, normalized_source_kind)
+            entries: list[SourceMetaReadEntry] = []
+            read_error: ValueError | OSError | None = None
+            for document_id in document_ids:
+                try:
+                    meta = self._get_source_meta_unguarded(
+                        external_ticker, document_id, normalized_source_kind,
+                    )
+                except (ValueError, OSError) as error:
+                    read_error = error
+                    break
+                # getter 每次解析独立 JSON 树并生成业务字典，无其他公开持有者；
+                # 直接包装可保全独立观察，避免递归复制新增合法 JSON 的拒绝。
+                entries.append(SourceMetaReadEntry(document_id, MappingProxyType(meta)))
+            return SourceMetaReadView(
+                external_ticker, normalized_source_kind, tuple(entries), read_error,
+            )
+        finally:
+            self._release_lock_token(guard_token)
+
     def classify_source_integrity(
         self,
         ticker: str,
@@ -803,7 +852,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         external_ticker: str,
         external_document_id: str,
         normalized_source_kind: SourceKind,
-    ) -> DocumentMeta:
+    ) -> dict[str, JsonValue]:
         """在 caller 已持 publication guard 时读取 source meta。
 
         Args:
