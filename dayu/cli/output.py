@@ -18,6 +18,7 @@ from dayu.cli.exit_codes import (
     EXIT_SUCCESS,
 )
 from dayu.cli.session_identity import display_identity_from_slot
+from dayu.contracts.json_value import JsonValue
 from dayu.fins.direct_events import (
     FinsDownloadPublicDocument,
     FinsDownloadPublicSummary,
@@ -476,29 +477,44 @@ def _download_document_line(row: FinsDownloadPublicDocument) -> str:
 
 
 def _print_download_failure(failure: FinsPublicFailure, stream: TextIO) -> None:
-    """机械投影 closed typed download failure。
+    """从单次公共 JSON 投影按既有 CLI 上界显示下载失败。
 
     :param failure: runtime 构造的 public failure。
     :param stream: 输出流。
     :returns: ``None``。
+    :raises TypeError: 公共投影的文本字段不是字符串时抛出。
     :raises OSError: 输出流写入失败时由底层 ``print`` 透传。
     """
 
-    transport = _EMPTY_CELL if failure.transport_category is None else failure.transport_category.value
-    reason = _EMPTY_CELL if failure.reason_code is None else failure.reason_code.value
+    projection = failure.to_json_value()
+    transport = _EMPTY_CELL if projection["transport_category"] is None else projection["transport_category"]
+    reason = _EMPTY_CELL if projection["reason_code"] is None else projection["reason_code"]
     print(
         (
             "Fins failure detail: "
-            f"classification={_bounded_json_text(failure.kind.value)} "
-            f"source={_bounded_json_text(failure.source.value)} "
-            f"transport={_bounded_json_text(transport)} "
-            f"reason_code={_bounded_json_text(reason)} "
-            f"retry_hint={_bounded_json_text(failure.retry_hint)}"
+            f"classification={_download_failure_json_text(projection['classification'])} "
+            f"source={_download_failure_json_text(projection['source'])} "
+            f"transport={_download_failure_json_text(transport)} "
+            f"reason_code={_download_failure_json_text(reason)} "
+            f"retry_hint={_download_failure_json_text(projection['retry_hint'])}"
         ),
         file=stream,
     )
-    if failure.kind is FinsPublicFailureKind.EXECUTION:
+    if projection["classification"] == FinsPublicFailureKind.EXECUTION.value:
         print(CLI_LOG_LOCATION_HINT, file=stream)
+
+
+def _download_failure_json_text(value: JsonValue) -> str:
+    """严格收窄公共失败文本后复用 CLI 有界编码。
+
+    :param value: 已承诺为文本的公共字段；可空字段已投影为既有空单元格。
+    :returns: 按 CLI 显示上界截断并编码的 JSON 字符串。
+    :raises TypeError: 公共文本字段不是字符串时抛出。
+    """
+
+    if not isinstance(value, str):
+        raise TypeError("下载失败公共文本字段必须为字符串")
+    return _bounded_json_text(value)
 
 
 def _summary_parts(values: tuple[FinsEventDetail, ...]) -> tuple[str, ...]:

@@ -50,13 +50,15 @@ from dayu.fins.storage import (
     SelectedSourceRepairRequired,
     SourceIntegrityPreflightError,
     SourceIntegrityRevisionConflictError,
+    SourceIntegrityRepairRequiredError,
     classify_source_integrity_preflight,
 )
 from dayu.fins._log import Log
 from dayu.fins.ticker_normalization import ticker_to_company_id, try_normalize_ticker
 
 JsonObject: TypeAlias = dict[str, JsonValue]
-_INTEGRITY_PREFLIGHT_REASON = "source_integrity_preflight"
+_INTEGRITY_FAILED_REASON = "source_integrity_failed"
+_INTEGRITY_FAILED_MESSAGE = "本地来源完整性状态阻止文档处理"
 _INTEGRITY_PREFLIGHT_MESSAGE = "本地来源完整性预检失败"
 
 
@@ -65,7 +67,7 @@ class CnDownloadIntegrityAbort(Exception):
 
     def __init__(
         self,
-        cause: SourceIntegrityPreflightError | SourceIntegrityRevisionConflictError,
+        cause: SourceIntegrityPreflightError | SourceIntegrityRevisionConflictError | SourceIntegrityRepairRequiredError,
         result: JsonObject,
     ) -> None:
         """保存同一 workflow owner 产生的失败事实。
@@ -78,9 +80,11 @@ class CnDownloadIntegrityAbort(Exception):
             无。
 
         Raises:
-            无。
+            TypeError: cause 不属于封闭完整性异常集合时抛出。
         """
 
+        if not isinstance(cause, SourceIntegrityPreflightError | SourceIntegrityRevisionConflictError | SourceIntegrityRepairRequiredError):
+            raise TypeError("下载中止原因必须是封闭完整性异常")
         super().__init__(_INTEGRITY_PREFLIGHT_MESSAGE)
         self.cause = cause
         self.result = result
@@ -351,12 +355,12 @@ async def run_cn_download_stream_impl(
                 notes.append("cancelled")
                 cancelled = True
                 break
-            except SourceIntegrityPreflightError as exc:
+            except (SourceIntegrityPreflightError, SourceIntegrityRevisionConflictError) as exc:
                 failed_item = _build_candidate_failed_result(
                     document_id=document_id,
                     candidate=candidate,
-                    reason_code=_INTEGRITY_PREFLIGHT_REASON,
-                    reason_message=_INTEGRITY_PREFLIGHT_MESSAGE,
+                    reason_code=_INTEGRITY_FAILED_REASON,
+                    reason_message=_INTEGRITY_FAILED_MESSAGE,
                 )
                 filings.append(failed_item)
                 yield DownloadEvent(
@@ -409,8 +413,8 @@ async def run_cn_download_stream_impl(
                         rejected_filing_ids=frozenset(),
                     )
                     if isinstance(post_repair, SelectedSourceRepairRequired):
-                        raise SourceIntegrityRevisionConflictError
-                except (SourceIntegrityPreflightError, SourceIntegrityRevisionConflictError) as exc:
+                        raise SourceIntegrityRepairRequiredError()
+                except (SourceIntegrityPreflightError, SourceIntegrityRevisionConflictError, SourceIntegrityRepairRequiredError) as exc:
                     raise _integrity_abort(
                         cause=exc,
                         started_at=started_at,
@@ -530,7 +534,7 @@ def _download_filters(
 
 def _integrity_abort(
     *,
-    cause: SourceIntegrityPreflightError | SourceIntegrityRevisionConflictError,
+    cause: SourceIntegrityPreflightError | SourceIntegrityRevisionConflictError | SourceIntegrityRepairRequiredError,
     started_at: float,
     pipeline_name: str,
     ticker: str,

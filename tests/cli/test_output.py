@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import io
+import asyncio
+import json
+from pathlib import Path
 from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
 
+from dayu.cli import output as cli_output
 from dayu.cli.exit_codes import EXIT_FAILURE, EXIT_KEYBOARD_INTERRUPT, EXIT_SUCCESS
 from dayu.cli.output import (
     render_cli_error,
@@ -44,7 +48,9 @@ from dayu.fins.download_contract import (
     FinsDownloadEffectiveFilters,
     FinsDownloadSource,
     FinsDownloadTerminalDisposition,
+    build_fins_download_request,
 )
+from tests.fins.test_fins_ingestion_runtime import _build_real_sec_integrity_runtime, _collect_direct_events
 from dayu.host.api import HostFinalAnswerView, HostTerminalStatus
 from dayu.service.entrypoint_runtime import (
     EntrypointRunTerminalResult,
@@ -310,6 +316,108 @@ def test_fins_download_failure_projects_typed_rows_missing_periods_and_recovery(
     assert execution_stderr.getvalue().count("请使用 --log-file PATH 重试并查看日志") == 1
 
 
+@pytest.mark.parametrize(
+    ("hint", "expected_hint"),
+    (
+        ("请稍后重试。", '"请稍后重试。"'),
+        (
+            "提" * cli_output._FINS_TEXT_MAX_CHARS,
+            '"' + "提" * cli_output._FINS_TEXT_MAX_CHARS + '"',
+        ),
+        (
+            "提" * (cli_output._FINS_TEXT_MAX_CHARS + 1),
+            '"' + "提" * (cli_output._FINS_TEXT_MAX_CHARS - len("...")) + '..."',
+        ),
+        (
+            "提" * (cli_output._FINS_TEXT_MAX_CHARS * 2),
+            '"' + "提" * (cli_output._FINS_TEXT_MAX_CHARS - len("...")) + '..."',
+        ),
+    ),
+    ids=("short", "120", "121", "240"),
+)
+def test_fins_download_failure_preserves_cli_text_bound_and_public_json(
+    hint: str,
+    expected_hint: str,
+) -> None:
+    """真实失败渲染保持 CLI 显示上界和完整公共恢复建议。
+
+    :param hint: 合法短文本、显示上界及超过显示上界的公共恢复建议。
+    :param expected_hint: 按既有显示合同独立构造的带引号期望文本。
+    :returns: ``None``。
+    :raises AssertionError: 有界显示、空单元格、渠道或公共 JSON 发生漂移时抛出。
+    """
+
+    failure = FinsPublicFailure(
+        kind=FinsPublicFailureKind.EXECUTION,
+        source=FinsDownloadSource.SEC,
+        transport_category=None,
+        safe_message="下载执行失败",
+        retry_hint=hint,
+    )
+    expected_public = {
+        "classification": "execution",
+        "source": "sec",
+        "transport_category": None,
+        "message": "下载执行失败",
+        "retry_hint": hint,
+        "reason_code": None,
+    }
+    assert failure.to_json_value() == expected_public
+    event = FinsEvent(
+        event_type=FinsEventType.RESULT,
+        operation_kind=FinsOperationKind.DOWNLOAD,
+        message="下载失败",
+        emitted_at=datetime.now(timezone.utc),
+        ticker="AAPL",
+        filing_kind=None,
+        document_label=None,
+        progress=None,
+        result=FinsResultSummary(
+            status=FinsResultStatus.FAILURE,
+            exit_code=FINS_RESULT_EXIT_FAILURE,
+            title="下载失败",
+            details=(),
+            error_kind=FinsErrorKind.EXECUTION,
+            error_message=failure.safe_message,
+            download=FinsDownloadPublicSummary(
+                source=FinsDownloadSource.SEC,
+                canonical_ticker="AAPL",
+                effective_filters=FinsDownloadEffectiveFilters(
+                    form_types=("10-K",),
+                    start_date=None,
+                    end_date=None,
+                    overwrite_existing=False,
+                    rebuild_local_artifacts=False,
+                ),
+                discovered_count=1,
+                downloaded_count=0,
+                skipped_count=0,
+                rejected_count=0,
+                failed_count=1,
+                document_rows=(),
+                missing_periods=(),
+                omitted_count=1,
+                terminal_disposition=FinsDownloadTerminalDisposition.FAILED,
+            ),
+            failure=failure,
+        ),
+    )
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+
+    render_fins_direct_event(event, stdout=stdout, stderr=stderr)
+
+    assert stdout.getvalue() == ""
+    lines = stderr.getvalue().splitlines()
+    detail = next(line for line in lines if line.startswith("Fins failure detail: "))
+    assert detail == (
+        'Fins failure detail: classification="execution" source="sec" '
+        'transport="-" reason_code="-" retry_hint=' + expected_hint
+    )
+    assert lines.count("请使用 --log-file PATH 重试并查看日志") == 1
+    assert failure.to_json_value() == expected_public
+
+
 def test_prompt_and_interactive_render_non_cancelled_terminal_matrix() -> None:
     """prompt/interactive 对成功、缺回答、失败与 lost 使用固定公共投影。
 
@@ -507,3 +615,33 @@ def _cancelled_terminal(cancel_reason: str | None) -> EntrypointRunTerminalResul
         cancel_reason=cancel_reason,
         watcher_failure_message=None,
     )
+
+
+@pytest.mark.parametrize("scenario", ("postrepair", "churn"))
+def test_download_integrity_failure_renders_public_projection(tmp_path: Path, scenario: str) -> None:
+    """真实 SEC RESULT 的失败字段由 CLI 机械 JSON 展示，渠道与摘要保全。
+
+    参数：tmp_path 为隔离根；scenario 为真实状态。返回：无。异常：断言失败抛出 AssertionError。
+    """
+    runtime, _executor, _pipeline = _build_real_sec_integrity_runtime(tmp_path, scenario)
+    request = build_fins_download_request(ticker="AAPL", form_types=("10-K", "6-K"),
+        start="2025-01-01", end="2025-12-31", overwrite_existing=scenario == "churn")
+    events = asyncio.run(_collect_direct_events(runtime.download(request)))
+    terminal = events[-1]
+    assert terminal.result is not None and terminal.result.failure is not None
+    assert terminal.result.download is not None
+    projection = terminal.result.failure.to_json_value()
+    stdout, stderr = io.StringIO(), io.StringIO()
+    render_fins_direct_event(terminal, stdout=stdout, stderr=stderr)
+    rendered = stderr.getvalue()
+    assert stdout.getvalue() == ""
+    for key, label in (("classification", "classification"), ("source", "source"),
+        ("reason_code", "reason_code"), ("retry_hint", "retry_hint")):
+        assert f"{label}={json.dumps(projection[key], ensure_ascii=False)}" in rendered
+    message = projection["message"]
+    assert isinstance(message, str) and message in rendered
+    assert "downloaded=1" in rendered
+    assert "failed=0" in rendered if scenario == "postrepair" else "failed=1" in rendered
+    assert "请使用 --log-file" not in rendered
+    assert "/Users/" not in rendered and "://" not in rendered
+    print(rendered)

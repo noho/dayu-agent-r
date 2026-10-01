@@ -80,10 +80,12 @@ from dayu.fins.storage import (
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
 from dayu.fins.upload_failure import fins_upload_failure_from_exception
 from dayu.service.fins_direct import (
+    FinsDirectCommandService,
     FINS_DIRECT_EXIT_FAILURE,
     FINS_DIRECT_EXIT_KEYBOARD_INTERRUPT,
     FINS_DIRECT_EXIT_SUCCESS,
 )
+from tests.fins.test_fins_ingestion_runtime import _build_real_sec_integrity_runtime
 
 _NOW: datetime = datetime(2026, 6, 16, tzinfo=timezone.utc)
 _UNPARSABLE_PDF_BYTES = b"not a PDF"
@@ -4908,3 +4910,50 @@ def test_material_cli_path_precheck_keeps_existing_usage_before_service(
     assert captured.out == ""
     assert captured.err == f"dayu-cli upload_material: {expected}\n"
     service_factory.assert_not_called()
+
+
+class _RealSecIntegrityServiceFactory:
+    """给真实 CLI 装配真实 runtime，仅下载器资产为离线合成。"""
+
+    def __init__(self, runtime: ingestion_runtime.FinsIngestionRuntime) -> None:
+        """保存授权工作区的真实 runtime。
+
+        参数：runtime 为真实运行时。返回：无。异常：无。
+        """
+        self.runtime = runtime
+
+    def __call__(self, workspace_root: Path) -> FinsDirectCommandService:
+        """提供真实 Service 消费入口。
+
+        参数：workspace_root 为 CLI 规范化工作区。返回：真实 direct Service。异常：无。
+        """
+        del workspace_root
+        return FinsDirectCommandService(self.runtime)
+
+
+@pytest.mark.parametrize("scenario", ("postrepair", "churn"))
+def test_fins_download_sec_integrity_failure_preserves_summary(
+    tmp_path: Path, scenario: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """CLI 主入口执行真实 SEC adapter 后返回失败并保全文档摘要和安全原因。
+
+    参数：tmp_path 为隔离根；scenario 为真实状态；monkeypatch 为 Service 装配；capsys 为输出观察器。
+    返回：无。异常：断言失败抛出 AssertionError。
+    """
+    runtime, _executor, pipeline = _build_real_sec_integrity_runtime(tmp_path, scenario)
+    monkeypatch.setattr(fins_command, "FINS_DIRECT_SERVICE_FACTORY", _RealSecIntegrityServiceFactory(runtime))
+    args = ["download", "--base", str(tmp_path), "--ticker", "AAPL", "--forms", "10-K", "6-K",
+        "--start", "2025-01-01", "--end", "2025-12-31"]
+    if scenario == "churn":
+        args.append("--overwrite")
+    code = cli_main.main(tuple(args))
+    captured = capsys.readouterr()
+    assert code == EXIT_FAILURE, captured.err
+    reason = "source_repair_required" if scenario == "postrepair" else "source_revision_conflict"
+    message = "本地来源仍需修复，本次下载已停止" if scenario == "postrepair" else "本地来源版本持续变化，本次下载已停止"
+    assert f'reason_code="{reason}"' in captured.err and message in captured.err
+    assert "downloaded=1" in captured.err
+    assert ("failed=0" if scenario == "postrepair" else "failed=1") in captured.err
+    assert str(tmp_path) not in captured.err and "://" not in captured.err
+    assert pipeline.source_repository.classify_source_integrity("AAPL", "fil_0000000000-25-000001", SourceKind.FILING).status is SourceIntegrityStatus.COMPLETE
+    print(captured.err)

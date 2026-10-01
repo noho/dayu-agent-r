@@ -79,6 +79,7 @@ from dayu.fins.storage import (
     SourceIntegrityPreflightError,
     SourceIntegrityPreflightReason,
     SourceIntegrityRevisionConflictError,
+    SourceIntegrityRepairRequiredError,
     SourceIntegrityReason,
     SourceIntegrityStatus,
     SourceMetaReadView,
@@ -2981,7 +2982,7 @@ def test_cn_phase_b_real_preflight_aborts_with_confirmed_prior_filing(
     assert isinstance(rows, list)
     assert [row["status"] for row in rows if isinstance(row, dict)] == ["downloaded", "failed"]
     assert isinstance(rows[1], dict)
-    assert rows[1]["reason_code"] == "source_integrity_preflight"
+    assert rows[1]["reason_code"] == "source_integrity_failed"
     assert [event.event_type for event in events].count(DownloadEventType.FILING_FAILED) == 1
     assert DownloadEventType.PIPELINE_COMPLETED not in [event.event_type for event in events]
     assert batching.commit_calls == 2
@@ -3256,11 +3257,11 @@ def test_cn_second_filing_real_commit_tree_preflight_keeps_first_publication(
         pipeline.source_repository.get_source_document_locator("600519", second_id, SourceKind.FILING)
 
 
-def test_cn_mid_filing_revision_conflict_injection_remains_ordinary_failure(
+def test_cn_mid_filing_revision_conflict_injection_aborts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """受控单 filing 冲突仅证明 workflow 宽 catch 继续候选的已知残余。
+    """受控边界冲突保原因并中止，后续候选不得执行。
 
     Args:
         tmp_path: 独立仓储根。
@@ -3270,7 +3271,7 @@ def test_cn_mid_filing_revision_conflict_injection_remains_ordinary_failure(
         无。
 
     Raises:
-        AssertionError: 宽 catch 行为或第二候选处理发生变化时抛出。
+        AssertionError: 中止链或未执行候选事实失守时抛出。
     """
 
     discovery = _FakeDiscoveryClient(
@@ -3308,12 +3309,15 @@ def test_cn_mid_filing_revision_conflict_injection_remains_ordinary_failure(
         return real_classify(ticker, document_id, source_kind)
 
     monkeypatch.setattr(source, "classify_source_integrity", first_phase_a_conflict)
-    result = _final_result(_collect_events(pipeline, start_is_explicit=True))
+    with pytest.raises(_cn_download_workflow.CnDownloadIntegrityAbort) as exc_info:
+        _collect_events(pipeline, start_is_explicit=True)
+    assert isinstance(exc_info.value.cause, SourceIntegrityRevisionConflictError)
+    assert exc_info.value.__cause__ is exc_info.value.cause
+    result = exc_info.value.result
     rows = result["filings"]
-    assert isinstance(rows, list) and len(rows) == 2
+    assert isinstance(rows, list) and len(rows) == 1
     assert isinstance(rows[0], dict) and rows[0]["status"] == "failed"
-    assert rows[0]["reason_code"] == "filing_execution_failed"
-    assert isinstance(rows[1], dict) and rows[1]["status"] == "downloaded"
+    assert rows[0]["reason_code"] == "source_integrity_failed"
     assert injected == [True]
 
 
@@ -3321,7 +3325,7 @@ def test_cn_post_repair_real_second_selected_source_conflict_preserves_first_row
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """repair 后另一 selected source 真正变坏时显式 revision conflict 保留已确认行。
+    """repair 后另一 selected source 真正变坏时显式仍需修复原因 保留已确认行。
 
     Args:
         tmp_path: 独立真实仓储根。
@@ -3382,7 +3386,7 @@ def test_cn_post_repair_real_second_selected_source_conflict_preserves_first_row
         _collect_events(pipeline, start_is_explicit=True)
     abort = exc_info.value
     assert len(calls) == 2
-    assert isinstance(abort.cause, SourceIntegrityRevisionConflictError)
+    assert isinstance(abort.cause, SourceIntegrityRepairRequiredError)
     assert abort.__cause__ is abort.cause
     rows = abort.result["filings"]
     assert isinstance(rows, list) and len(rows) == 1
@@ -4676,7 +4680,7 @@ class _IdentityChurnConverter:
 
 @pytest.mark.parametrize("changes", (1, 2, 3))
 def test_hk_retry_rounds_read_fresh_and_discard_old_assets(tmp_path: Path, changes: int) -> None:
-    """真实 target churn 使 round0/1/2 新观察，耗尽仍普通 failure，成功仅提交最后 payload。
+    """真实 target churn 使 round0/1/2 新观察，耗尽 typed 中止，成功仅提交最后 payload。
 
     参数：tmp_path 为隔离根；changes 为独立 publication 次数。返回：无。异常：AssertionError。
     """
@@ -4689,7 +4693,14 @@ def test_hk_retry_rounds_read_fresh_and_discard_old_assets(tmp_path: Path, chang
     pipeline = _build_pipeline(tmp_path=tmp_path, discovery=_FakeDiscoveryClient(tmp_path, ()), hk_discovery=discovery,
                                converter=converter, repository_set=repository_set, source_repository=source)
     events: list[DownloadEvent] = []
-    asyncio.run(_collect_hk_identity_events(pipeline, events, overwrite=True))
+    if changes == 3:
+        with pytest.raises(_cn_download_workflow.CnDownloadIntegrityAbort) as raised:
+            asyncio.run(_collect_hk_identity_events(pipeline, events, overwrite=True))
+        assert isinstance(raised.value.cause, SourceIntegrityRevisionConflictError)
+        assert raised.value.__cause__ is raised.value.cause
+        assert raised.value.result["status"] == "integrity_failed"
+    else:
+        asyncio.run(_collect_hk_identity_events(pipeline, events, overwrite=True))
     rounds = min(changes + 1, 3)
     assert len(source.views) == 1 + 2 + rounds - 1
     assert converter.calls == discovery.download_calls == rounds
@@ -4703,12 +4714,15 @@ def test_hk_retry_rounds_read_fresh_and_discard_old_assets(tmp_path: Path, chang
     assert isinstance(row, dict)
     assert row["status"] == ("failed" if changes == 3 else "downloaded")
     if changes == 3:
-        assert row["reason_code"] == "filing_execution_failed"
+        assert row["reason_code"] == "source_integrity_failed"
     else:
         handle = source.get_source_handle("0700", converter.document_id, SourceKind.FILING)
         assert json.loads(pipeline.blob_repository.read_file_bytes(handle, f"{converter.document_id}_docling.json")) == {"round": rounds}
         assert source.get_source_meta("0700", converter.document_id, SourceKind.FILING)["internal_document_id"] == f"internal-{changes}"
-    assert _final_result(events)["status"] == "ok"
+    if changes != 3:
+        assert _final_result(events)["status"] == "ok"
+    else:
+        assert not any(e.event_type is DownloadEventType.PIPELINE_COMPLETED for e in events)
 
 
 @pytest.mark.parametrize("corruption", ("unsafe", "malformed", "missing"))

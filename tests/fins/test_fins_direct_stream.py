@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from dayu.fins.download_contract import build_fins_download_request
+from dayu.fins.direct_events import FinsDownloadFailureReason
+from tests.fins.test_fins_ingestion_runtime import _build_real_sec_integrity_runtime
+
 import asyncio
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
@@ -827,3 +832,25 @@ async def test_validated_stream_terminal_result_after_clean_exhaustion_is_same_o
     assert stream.terminal_result is summary
     assert observation.generator_exit_calls == 0
     assert observation.finally_calls == 1
+
+
+@pytest.mark.parametrize("scenario", ("postrepair", "churn"))
+@pytest.mark.asyncio
+async def test_real_sec_integrity_result_keeps_validated_terminal_owner(tmp_path: Path, scenario: str) -> None:
+    """真实 typed abort 的公开失败仍由单一 validated RESULT owner 收口。
+
+    参数：tmp_path 为隔离根；scenario 为真实状态。返回：无。异常：断言失败抛出 AssertionError。
+    """
+    runtime, _executor, _pipeline = _build_real_sec_integrity_runtime(tmp_path, scenario)
+    request = build_fins_download_request(ticker="AAPL", form_types=("10-K", "6-K"),
+        start="2025-01-01", end="2025-12-31", overwrite_existing=scenario == "churn")
+    stream = runtime.download(request)
+    events = [event async for event in stream]
+    terminals = [event.result for event in events if event.event_type is FinsEventType.RESULT]
+    assert len(terminals) == 1 and events[-1].result is terminals[0]
+    assert stream.terminal_result is terminals[0]
+    result = terminals[0]
+    assert result is not None and result.failure is not None and result.download is not None
+    assert result.status is FinsResultStatus.FAILURE
+    assert result.failure.reason_code is (FinsDownloadFailureReason.SOURCE_REPAIR_REQUIRED if scenario == "postrepair" else FinsDownloadFailureReason.SOURCE_REVISION_CONFLICT)
+    assert result.download.downloaded_count == 1 and result.download.omitted_count == 0

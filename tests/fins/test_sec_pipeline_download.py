@@ -76,6 +76,7 @@ from dayu.fins.domain.filing_semantics import (
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.processors.registry import build_fins_processor_registry
 from dayu.fins.pipelines.sec_download_event_mapping import DownloadFileResult
+from dayu.fins.pipelines.sec_download_workflow import SecDownloadIntegrityAbort
 from dayu.fins.pipelines.sec_pipeline import (
     SEC_PIPELINE_DOWNLOAD_VERSION,
     SecPipeline as _SecPipeline,
@@ -90,6 +91,7 @@ from dayu.fins.storage import (
     SourceIntegrityClassification,
     SourceIntegrityPreflightError,
     SourceIntegrityPreflightReason,
+    SourceIntegrityRepairRequiredError,
     SourceIntegrityReason,
     SourceIntegrityStatus,
 )
@@ -6186,12 +6188,92 @@ def test_sec_selected_repair_that_6k_policy_rejects_fails_before_mutation(
         processor_registry=build_fins_processor_registry(),
     )
 
-    with pytest.raises(SourceIntegrityPreflightError) as exc_info:
+    with pytest.raises(SecDownloadIntegrityAbort) as exc_info:
         pipeline.download(ticker="TCOM", overwrite=False, start_is_explicit=False)
 
-    assert exc_info.value.reason is SourceIntegrityPreflightReason.SELECTED_REJECTED_REPAIR_REQUIRED
+    abort = exc_info.value
+    assert isinstance(abort.cause, SourceIntegrityPreflightError)
+    assert abort.__cause__ is abort.cause
+    assert abort.cause.reason is SourceIntegrityPreflightReason.SELECTED_REJECTED_REPAIR_REQUIRED
+    summary = abort.result["summary"]
+    assert isinstance(summary, dict) and summary["total"] == summary["failed"] == 1
+    rows = abort.result["filings"]
+    assert isinstance(rows, list) and len(rows) == 1
+    assert isinstance(rows[0], dict) and rows[0]["status"] == "failed"
     assert meta_path.read_bytes() == old_meta
     assert payload_path.read_bytes() == old_payload
     assert not _company_meta_path(tmp_path, "TCOM").exists()
     assert not _download_rejections_path(tmp_path, "TCOM").exists()
     assert not _rejected_meta_path(tmp_path, "TCOM", document_id).exists()
+
+
+class _PostrepairNewDamageInventory:
+    """在 repair 终态之后制造同长度 digest 损坏，真实 classifier 负责分类。"""
+
+    def __init__(self, source: SourceDocumentRepositoryProtocol, payload: Path) -> None:
+        """保存原仓储读取和目标合成文件。
+
+        参数：source 为真实仓储；payload 为第二来源字节。返回：无。异常：无。
+        """
+        self.read = source.list_source_integrity
+        self.payload = payload
+        self.views: list[tuple[SourceIntegrityClassification, ...]] = []
+
+    def __call__(self, ticker: str) -> tuple[SourceIntegrityClassification, ...]:
+        """第二次枚举前损坏第二来源，保留原 revision 和真实 reasons。
+
+        参数：ticker 为公司。返回：真实完整性 inventory。异常：文件操作传播 OSError。
+        """
+        if len(self.views) == 1:
+            self.payload.write_bytes(b"x" * len(self.payload.read_bytes()))
+        result = self.read(ticker)
+        self.views.append(result)
+        return result
+
+
+def test_sec_postrepair_new_corruption_aborts_after_confirmed_repair(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """两个真实来源中首个修复确认后第二个 digest 损坏，原首事实保全。
+
+    参数：tmp_path 为隔离根；monkeypatch 为枚举观察装配。返回：无。异常：断言失败抛出 AssertionError。
+    """
+    first_id, second_id, tail_id = ("fil_0000000000-25-000001", "fil_0000000000-25-000002", "fil_0000000000-25-000003")
+    first_meta = _seed_complete_sec_source(workspace_root=tmp_path, document_id=first_id)
+    second_meta = _seed_complete_sec_source(workspace_root=tmp_path, document_id=second_id)
+    first_payload = first_meta.parent / "sample-10k.htm"
+    first_payload.unlink()
+    submissions: dict[str, JsonValue] = {"filings": {"recent": {
+        "form": ["10-K", "10-K", "10-K"], "filingDate": ["2025-02-01", "2025-02-02", "2025-02-03"],
+        "reportDate": ["2024-12-31", "2024-12-31", "2024-12-31"],
+        "accessionNumber": [first_id[4:], second_id[4:], tail_id[4:]],
+        "primaryDocument": ["sample-10k.htm", "sample-10k.htm", "sample-10k.htm"]}, "files": []}}
+    descriptor = RemoteFileDescriptor(name="sample-10k.htm", source_url="https://synthetic.invalid/offline.htm",
+        http_etag="offline-v1", http_last_modified=None, remote_size=None, http_status=200)
+    repaired_payload = b"<html>offline repair</html>"
+    downloader = StubDownloader(submissions=submissions, remote_files=[descriptor],
+        download_results=[{"name": descriptor.name, "status": "downloaded", "source_url": descriptor.source_url}],
+        content_by_name={descriptor.name: repaired_payload})
+    pipeline = SecPipeline(workspace_root=tmp_path, downloader=downloader, processor_registry=build_fins_processor_registry())
+    observation = _PostrepairNewDamageInventory(pipeline.source_repository, second_meta.parent / "sample-10k.htm")
+    monkeypatch.setattr(pipeline.source_repository, "list_source_integrity", observation)
+    with pytest.raises(SecDownloadIntegrityAbort) as raised:
+        pipeline.download(ticker="AAPL", form_type="10-K", start_date="2025-01-01", end_date="2025-12-31", start_is_explicit=True)
+    abort = raised.value
+    assert isinstance(abort.cause, SourceIntegrityRepairRequiredError) and abort.__cause__ is abort.cause
+    assert len(observation.views) == 2
+    initial_second = next(item for item in observation.views[0] if item.document_id == second_id)
+    after_second = next(item for item in observation.views[1] if item.document_id == second_id)
+    assert initial_second.status is SourceIntegrityStatus.COMPLETE
+    assert after_second.status is SourceIntegrityStatus.REPAIR_REQUIRED
+    assert after_second.revision == initial_second.revision
+    assert after_second.reasons == (SourceIntegrityReason.DIGEST_MISMATCH,)
+    rows = abort.result["filings"]
+    assert isinstance(rows, list) and len(rows) == 1
+    assert isinstance(rows[0], dict) and rows[0]["document_id"] == first_id and rows[0]["status"] == "downloaded"
+    summary = abort.result["summary"]
+    assert isinstance(summary, dict) and (summary["total"], summary["downloaded"], summary["failed"]) == (1, 1, 0)
+    assert first_payload.read_bytes() == repaired_payload
+    assert pipeline.source_repository.classify_source_integrity("AAPL", first_id, SourceKind.FILING).status is SourceIntegrityStatus.COMPLETE
+    assert downloader.list_filing_files_call_count == 1
+    assert not _company_meta_path(tmp_path, "AAPL").exists()
+    assert tail_id not in {item.document_id for item in observation.views[-1]}
+    print(json.dumps({"snapshot": abort.result, "before_revision": str(initial_second.revision), "after_revision": str(after_second.revision), "after_reasons": [item.value for item in after_second.reasons]}, ensure_ascii=False))

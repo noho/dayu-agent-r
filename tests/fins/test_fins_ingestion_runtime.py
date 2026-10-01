@@ -105,7 +105,9 @@ from dayu.fins.ingestion_events import (
 from dayu.fins.ingestion.observation_handle import (
     FinsObservationStatus,
 )
-from dayu.fins.storage import SourceIntegrityPreflightError, SourceIntegrityPreflightReason
+from dayu.fins.storage import SourceIntegrityPreflightError, SourceIntegrityPreflightReason, SourceIntegrityRepairRequiredError, SourceIntegrityRevisionConflictError, SourceIntegrityStatus
+from dayu.fins.pipelines.sec_pipeline import SecDownloadAdapter, SecPipeline
+from tests.fins.test_sec_pipeline_download_stream import _build_sec_integrity_scenario, _INTEGRITY_FIRST, _INTEGRITY_SECOND, _INTEGRITY_TAIL
 from dayu.fins.domain.document_models import (
     BatchToken,
     CompanyMeta,
@@ -1966,6 +1968,7 @@ def test_raw_runtime_unsafe_prevalidation_creates_no_job_observation_or_mutation
     assert runner.requests == []
     assert runtime._observations == {}
     assert _snapshot_runtime_workspace_tree(workspace_root) == before
+
     jobs_root = workspace_root / ".dayu" / "fins_ingestion" / "jobs"
     assert not jobs_root.exists() or tuple(jobs_root.glob("*.json")) == ()
 
@@ -6158,7 +6161,13 @@ async def test_direct_download_preserves_every_preflight_reason(
     """
 
     assert set(ingestion_runtime._SOURCE_INTEGRITY_PUBLIC_REASONS) == set(SourceIntegrityPreflightReason)
-    assert set(ingestion_runtime._SOURCE_INTEGRITY_PUBLIC_REASONS.values()) == set(FinsDownloadFailureReason)
+    assert set(ingestion_runtime._SOURCE_INTEGRITY_PUBLIC_REASONS.values()) == {
+        FinsDownloadFailureReason.MULTIPLE_REPAIR_REQUIRED,
+        FinsDownloadFailureReason.UNSELECTED_REPAIR_REQUIRED,
+        FinsDownloadFailureReason.SELECTED_REJECTED_REPAIR_REQUIRED,
+        FinsDownloadFailureReason.UNSAFE_PUBLICATION,
+    }
+    assert set(ingestion_runtime._SOURCE_INTEGRITY_PUBLIC_REASONS.values()) < set(FinsDownloadFailureReason)
     assert ingestion_runtime._SOURCE_INTEGRITY_PUBLIC_REASONS[storage_reason] is public_reason
     assert storage_reason.value == public_reason.value
     ingestion = _build_ingestion_runtime(
@@ -12848,3 +12857,99 @@ def test_service_runtime_rechecks_validated_material_before_observation_or_job(t
     assert runner.requests == []
     assert runtime._observations == {}
     assert _snapshot_runtime_workspace_tree(workspace_root) == before
+
+
+def _build_real_sec_integrity_runtime(root: Path, scenario: str) -> tuple[ingestion_runtime.FinsIngestionRuntime, _HoldingExecutor, SecPipeline]:
+    """使用真实 SEC adapter 和共享 Fs 装配离线 runtime。
+
+    参数：root 为隔离工作区；scenario 为真实损坏或改版场景。
+    返回：runtime、延迟执行器和 pipeline。异常：仓储装配失败传播 OSError/ValueError。
+    """
+    pipeline, _downloader, _source, _batching = _build_sec_integrity_scenario(root, scenario)
+    executor = _HoldingExecutor()
+    runtime = _build_ingestion_runtime(root, executor=executor,
+        download_adapters={("sec", "US"): SecDownloadAdapter(pipeline=pipeline)})
+    return runtime, executor, pipeline
+
+
+@pytest.mark.parametrize("scenario", ("postrepair", "churn"))
+@pytest.mark.parametrize("mode", ("direct", "job"))
+def test_sec_integrity_failure_public_and_job_conservation(tmp_path: Path, scenario: str, mode: str, caplog: pytest.LogCaptureFixture) -> None:
+    """真实 SEC owner 失败在 direct/job 保安全原因和独立文档事实。
+
+    参数：tmp_path 为隔离根；scenario 为真实状态；mode 为入口；caplog 为日志观察器。
+    返回：无。异常：断言失败抛出 AssertionError。
+    """
+    runtime, executor, pipeline = _build_real_sec_integrity_runtime(tmp_path, scenario)
+    request = build_fins_download_request(ticker="AAPL", form_types=("10-K", "6-K"),
+        start="2025-01-01", end="2025-12-31", overwrite_existing=scenario == "churn")
+    cause = SourceIntegrityRepairRequiredError() if scenario == "postrepair" else SourceIntegrityRevisionConflictError()
+    expected = ingestion_runtime._download_public_failure_from_exception(cause, request=request)
+    with caplog.at_level(logging.ERROR, logger="dayu.fins.ingestion_runtime"):
+        if mode == "direct":
+            events = asyncio.run(_collect_direct_events(runtime.download(request)))
+            result = events[-1].result
+            assert result is not None and result.status is FinsResultStatus.FAILURE
+            assert result.error_kind is FinsErrorKind.STORAGE and result.error_message == expected.safe_message
+            assert result.failure is not None and result.failure == expected and result.download is not None
+            assert result.download.downloaded_count == 1
+            assert result.download.rejected_count == result.download.failed_count == (0 if scenario == "postrepair" else 1)
+            assert result.download.document_rows[0].document_id == _INTEGRITY_FIRST
+            assert result.download.omitted_count == 0
+            public = result.failure.to_json_value()
+            print(json.dumps({"scenario": scenario, "mode": mode, "failure": public, "download": result.download.to_json_value()}, ensure_ascii=False))
+        else:
+            start = runtime.start_download(request)
+            executor.run_all()
+            record = runtime.read_job(start.job_id)
+            assert record.status is FinsIngestionJobStatus.FAILED
+            assert record.failure_summary == {"message": expected.safe_message}
+            assert record.result_summary["downloaded_count"] == 1
+            assert record.result_summary["rejected_count"] == record.result_summary["failed_count"] == (0 if scenario == "postrepair" else 1)
+            assert record.result_summary["written_document_ids"] == [_INTEGRITY_FIRST]
+            assert record.result_summary["omitted_written_document_count"] == 0
+            assert record.result_summary["terminal_disposition"] == ("succeeded" if scenario == "postrepair" else "partial_failure")
+            print(json.dumps({"scenario": scenario, "mode": mode, "message": record.failure_summary, "summary": record.result_summary}, ensure_ascii=False))
+    assert "fins.download.unexpected_failure" not in caplog.text
+    assert pipeline.source_repository.classify_source_integrity("AAPL", _INTEGRITY_FIRST, SourceKind.FILING).status is SourceIntegrityStatus.COMPLETE
+    tail_inventory = pipeline.source_repository.list_source_integrity("AAPL")
+    assert _INTEGRITY_TAIL not in {item.document_id for item in tail_inventory}
+    if scenario == "postrepair":
+        assert pipeline.source_repository.classify_source_integrity("AAPL", _INTEGRITY_SECOND, SourceKind.FILING).status is SourceIntegrityStatus.REPAIR_REQUIRED
+
+
+@pytest.mark.parametrize("source", tuple(FinsDownloadSource))
+@pytest.mark.parametrize("case", (*tuple(SourceIntegrityPreflightReason), "churn", "repair", "unknown"))
+def test_download_integrity_failure_closed_source_projection(source: FinsDownloadSource, case: SourceIntegrityPreflightReason | str) -> None:
+    """三来源穷尽投影四预检、两个 sibling 与未知异常，不按来源猜语义。
+
+    参数：source 为真实三来源；case 为封闭原因或未知对照。返回：无。
+    异常：原因、安全文案或独立恢复动作合同漂移时抛出 AssertionError。
+    """
+    ticker = {FinsDownloadSource.SEC: "AAPL", FinsDownloadSource.CNINFO: "600519", FinsDownloadSource.HKEXNEWS: "0700"}[source]
+    request = build_fins_download_request(ticker=ticker)
+    assert request.source is source
+    if isinstance(case, SourceIntegrityPreflightReason):
+        exc = SourceIntegrityPreflightError(case)
+        reason = ingestion_runtime._SOURCE_INTEGRITY_PUBLIC_REASONS[case]
+    elif case == "churn":
+        exc = SourceIntegrityRevisionConflictError()
+        reason = FinsDownloadFailureReason.SOURCE_REVISION_CONFLICT
+    elif case == "repair":
+        exc = SourceIntegrityRepairRequiredError()
+        reason = FinsDownloadFailureReason.SOURCE_REPAIR_REQUIRED
+    else:
+        exc = RuntimeError("synthetic secret /Users/private token=x https://private.invalid")
+        reason = None
+    failure = ingestion_runtime._download_public_failure_from_exception(exc, request=request)
+    if case == "churn":
+        assert failure.safe_message == "本地来源版本持续变化，本次下载已停止"
+        assert failure.retry_hint == "请等待其它来源写入完成后重新发起下载；若仍失败，请检查并发写入。"
+    elif case == "repair":
+        assert failure.safe_message == "本地来源仍需修复，本次下载已停止"
+        assert failure.retry_hint == "请检查并修复工作区来源状态后重新发起下载；不要仅按并发冲突反复重试。"
+    assert failure.source is source and failure.reason_code is reason
+    assert failure.kind is (FinsPublicFailureKind.EXECUTION if case == "unknown" else FinsPublicFailureKind.STORAGE)
+    assert set(failure.to_json_value()) == {"classification", "source", "transport_category", "message", "retry_hint", "reason_code"}
+    assert all(part not in json.dumps(failure.to_json_value()) for part in ("/Users", "https://", "token=", "synthetic secret"))
+    assert set(ingestion_runtime._DOWNLOAD_PUBLIC_ERROR_KINDS) == set(FinsPublicFailureKind)

@@ -41,6 +41,9 @@ from dayu.fins.ingestion_runtime import (
     FinsIngestionJobStatus,
     FinsIngestionRuntime,
     FinsSourceDownloadAdapterRequest,
+    FinsSourceDownloadAdapter,
+    FinsSourceDownloadAdapterResult,
+    FinsSourceDownloadAdapterFailure,
     FsFinsIngestionJobStore,
 )
 from dayu.fins import ingestion_runtime as ingestion_runtime_module
@@ -79,11 +82,14 @@ from dayu.fins.storage import (
     FsSourceDocumentRepository,
     SourceIntegrityClassification,
     SourceIntegrityStatus,
+    SourceIntegrityRevisionConflictError,
+    SourceIntegrityRepairRequiredError,
     SourceMetaReadView,
     SourceDocumentRepositoryProtocol,
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
 from dayu.fins.ticker_normalization import Exchange, NormalizedTicker
+from dayu.fins.pipelines.cn_download_workflow import CnDownloadIntegrityAbort
 
 _PDF_BYTES = b"%PDF-1.7\n" + b"1" * 2048
 _DOCLING_BYTES = b'{"document": "runtime-ok"}'
@@ -2037,7 +2043,7 @@ def test_cn_post_repair_real_second_source_revision_conflict_preserves_public_su
     monkeypatch: pytest.MonkeyPatch,
     entry: str,
 ) -> None:
-    """第二 selected source 的真实 revision conflict 保留 repair 文档并沿既有执行分类投影。
+    """第二 selected source 的真实损坏保留 repair 文档并投影仍需修复原因。
 
     Args:
         tmp_path: 独立真实仓储根。
@@ -2131,6 +2137,7 @@ def test_cn_post_repair_real_second_source_revision_conflict_preserves_public_su
         return inventory
 
     monkeypatch.setattr(source, "list_source_integrity", second_source_changes_after_repair)
+    observer = _observe_cn_integrity_adapter(runtime)
     if entry == "direct":
         async def collect() -> list[FinsEvent]:
             """收集真实 adapter/runtime 的 direct 终态。
@@ -2152,16 +2159,16 @@ def test_cn_post_repair_real_second_source_revision_conflict_preserves_public_su
         assert len(results) == 1
         result = results[0]
         assert result is not None and result.status is FinsResultStatus.FAILURE
-        assert result.error_kind is FinsErrorKind.EXECUTION
+        assert result.error_kind is FinsErrorKind.STORAGE
         assert result.download is not None
         assert result.download.terminal_disposition is FinsDownloadTerminalDisposition.SUCCEEDED
         assert result.download.discovered_count == result.download.downloaded_count == 1
         assert result.download.skipped_count == result.download.rejected_count == result.download.failed_count == 0
         assert [row.document_id for row in result.download.document_rows] == [repair_id]
         assert result.failure is not None
-        assert result.failure.kind is FinsPublicFailureKind.EXECUTION
-        assert result.failure.reason_code is None
-        assert result.failure.safe_message == "下载执行失败"
+        assert result.failure.kind is FinsPublicFailureKind.STORAGE
+        assert result.failure.reason_code is FinsDownloadFailureReason.SOURCE_REPAIR_REQUIRED
+        assert result.failure.safe_message == "本地来源仍需修复，本次下载已停止"
         assert result.error_message == result.failure.safe_message
     else:
         start = runtime.start_download(request)
@@ -2173,7 +2180,8 @@ def test_cn_post_repair_real_second_source_revision_conflict_preserves_public_su
         assert record.result_summary["rejected_count"] == record.result_summary["failed_count"] == 0
         assert record.result_summary["written_document_ids"] == [repair_id]
         assert record.result_summary["omitted_written_document_count"] == 0
-        assert record.failure_summary == {"message": "下载执行失败"}
+        assert record.failure_summary == {"message": "本地来源仍需修复，本次下载已停止"}
+    _assert_cn_original_integrity_chain(observer, repair_required=True)
     assert len(calls) == 2
     assert second_statuses == [SourceIntegrityStatus.REPAIR_REQUIRED]
     assert repair_pdf.read_bytes() == original_repair
@@ -2386,3 +2394,164 @@ def test_hk_runtime_identity_windows_preserve_ordinary_typed_and_rows(
     assert len(probe.views) == (5 if ordinary_stream else window)
     if ordinary_stream or corruption == "unsafe":
         assert meta_path.read_bytes() == probe.original
+
+
+class _ThreeCnIntegrityCandidates:
+    """复用真实候选输入规则，只增加三个独立年度的离线候选。"""
+
+    def __init__(self, discovery: _RuntimeFakeDiscoveryClient) -> None:
+        """保存原候选查询。
+
+        参数：discovery 为离线 discovery。返回：无。异常：无。
+        """
+        self.original = discovery.list_report_candidates
+
+    def __call__(self, query: CnReportQuery, profile: CnCompanyProfile, *,
+        cancellation_checkpoint: Callable[[], None] | None = None) -> tuple[CnReportCandidate, ...]:
+        """返回三个年度候选。
+
+        参数：query/profile 为真实输入；cancellation_checkpoint 为取消检查。
+        返回：2025/2024/2023 候选。异常：原检查异常原样传播。
+        """
+        first = self.original(query, profile, cancellation_checkpoint=cancellation_checkpoint)[0]
+        return (first, replace(first, source_id="integrity-second", fiscal_year=2024, filing_date="2025-04-01"),
+            replace(first, source_id="integrity-tail", fiscal_year=2023, filing_date="2024-04-01"))
+
+
+class _RealCnIdentityChurn:
+    """第二文档转换期间由独立真实 writer 改 publication identity。"""
+
+    def __init__(self, root: Path, target: str, converter: _RuntimeFakeConversionRunner) -> None:
+        """保存共享 writer 仓储与原离线转换器。
+
+        参数：root 为真实隔离仓储；target 为第二文档；converter 为离线转换器。
+        返回：无。异常：装配失败传播 OSError。
+        """
+        shared = build_fs_repository_set(workspace_root=root)
+        self.writer = FsSourceDocumentRepository(root, repository_set=shared)
+        self.batching = FsBatchingRepository(root, repository_set=shared)
+        self.target = target
+        self.original = converter.convert_to_json_bytes
+        self.rounds = 0
+
+    async def __call__(self, input_bytes: bytes, stream_name: str, *, config: DoclingConversionConfig,
+        cancellation: CancellationToken | None) -> DoclingConversionResult:
+        """转换返回前真实改版，驱动原三轮 identity budget。
+
+        参数：input_bytes/stream_name 为转换输入；config 为配置；cancellation 为取消 token。
+        返回：原离线转换结果。异常：真实发布失败传播 OSError/ValueError。
+        """
+        if stream_name == f"{self.target}.pdf":
+            self.rounds += 1
+            meta = self.writer.get_source_meta("600519", self.target, SourceKind.FILING)
+            meta["source_fingerprint"] = f"synthetic-cn-revision-{self.rounds}"
+            batch = self.batching.begin_batch("600519")
+            try:
+                self.writer.replace_source_meta("600519", self.target, SourceKind.FILING, meta, batch=batch)
+            except BaseException:
+                self.batching.rollback_batch(batch)
+                raise
+            self.batching.commit_batch(batch)
+        return await self.original(input_bytes, stream_name, config=config, cancellation=cancellation)
+
+
+@pytest.mark.parametrize("entry", ("direct", "job"))
+def test_cn_real_churn_preserves_success_prefix_and_stops_tail(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str) -> None:
+    """真实 CN success→第二文档三轮 churn→第三不执行，生产 adapter 保摘要。
+
+    参数：tmp_path 为隔离根；monkeypatch 为离线输入装配；entry 为 direct/job。
+    返回：无。异常：断言失败抛出 AssertionError。
+    """
+    runtime, discovery, _hk, converter = _build_runtime_with_cn_hk_adapters(tmp_path)
+    monkeypatch.setattr(discovery, "list_report_candidates", _ThreeCnIntegrityCandidates(discovery))
+    request = build_fins_download_request(ticker="600519", form_types=("FY",), start="2024-01-01", end="2026-12-31", overwrite_existing=True)
+    seed = runtime.start_download(request)
+    assert runtime.read_job(seed.job_id).status is FinsIngestionJobStatus.SUCCEEDED
+    first_id, _ = build_cn_filing_ids(ticker="600519", form_type="FY", fiscal_year=2025, fiscal_period="FY", amended=False)
+    second_id, _ = build_cn_filing_ids(ticker="600519", form_type="FY", fiscal_year=2024, fiscal_period="FY", amended=False)
+    tail_id, _ = build_cn_filing_ids(ticker="600519", form_type="FY", fiscal_year=2023, fiscal_period="FY", amended=False)
+    churn = _RealCnIdentityChurn(tmp_path / "workspace", second_id, converter)
+    monkeypatch.setattr(converter, "convert_to_json_bytes", churn)
+    before_downloads = discovery.download_calls
+    tail_before = runtime.source_repository.get_source_meta("600519", tail_id, SourceKind.FILING)
+    observer = _observe_cn_integrity_adapter(runtime)
+    if entry == "direct":
+        events = asyncio.run(_consume_cn_runtime_direct(runtime, request))
+        result = events[-1].result
+        assert result is not None and result.status is FinsResultStatus.FAILURE
+        assert result.error_kind is FinsErrorKind.STORAGE
+        assert result.failure is not None and result.failure.reason_code is FinsDownloadFailureReason.SOURCE_REVISION_CONFLICT
+        assert result.download is not None and result.download.terminal_disposition is FinsDownloadTerminalDisposition.PARTIAL_FAILURE
+        assert (result.download.discovered_count, result.download.downloaded_count, result.download.failed_count) == (2, 1, 1)
+        assert [row.document_id for row in result.download.document_rows] == [first_id, second_id]
+        print(json.dumps({"failure": result.failure.to_json_value(), "download": result.download.to_json_value()}, ensure_ascii=False))
+    else:
+        start = runtime.start_download(request)
+        record = runtime.read_job(start.job_id)
+        assert record.status is FinsIngestionJobStatus.FAILED
+        assert record.failure_summary == {"message": "本地来源版本持续变化，本次下载已停止"}
+        assert (record.result_summary["discovered_count"], record.result_summary["downloaded_count"], record.result_summary["failed_count"]) == (2, 1, 1)
+        assert record.result_summary["terminal_disposition"] == "partial_failure"
+        assert record.result_summary["written_document_ids"] == [first_id]
+    _assert_cn_original_integrity_chain(observer, repair_required=False)
+    assert churn.rounds == 3
+    assert discovery.download_calls - before_downloads == 4
+    assert runtime.source_repository.get_source_meta("600519", tail_id, SourceKind.FILING) == tail_before
+    assert runtime.source_repository.classify_source_integrity("600519", first_id, SourceKind.FILING).status is SourceIntegrityStatus.COMPLETE
+
+
+async def _consume_cn_runtime_direct(runtime: FinsIngestionRuntime, request: ingestion_runtime_module.FinsDownloadRequest) -> list[FinsEvent]:
+    """收集真实 direct 事件，保留公共终态。
+
+    参数：runtime 为运行时；request 为真实请求。返回：事件列表。异常：异常原样传播。
+    """
+    return [event async for event in runtime.download(request)]
+
+
+class _CnIntegrityAdapterObservation(FinsSourceDownloadAdapter):
+    """只观察真实生产 adapter 失败，原 cause/chain/result 不变。"""
+
+    def __init__(self, original: FinsSourceDownloadAdapter) -> None:
+        """保存真实 adapter。
+
+        参数：original 为已装配生产 adapter。返回：无。异常：无。
+        """
+        self.original = original
+        self.failures: list[FinsSourceDownloadAdapterFailure] = []
+
+    def download(self, request: FinsSourceDownloadAdapterRequest) -> FinsSourceDownloadAdapterResult:
+        """执行原调用并记录真实 typed 失败对象。
+
+        参数：request 为原请求。返回：原结果。异常：原失败原样传播。
+        """
+        try:
+            return self.original.download(request)
+        except FinsSourceDownloadAdapterFailure as exc:
+            self.failures.append(exc)
+            raise
+
+
+def _observe_cn_integrity_adapter(runtime: FinsIngestionRuntime) -> _CnIntegrityAdapterObservation:
+    """在测试装配边界登记透明观察器。
+
+    参数：runtime 为真实运行时。返回：观察器。异常：缺失装配时抛出 KeyError。
+    """
+    adapters = dict(runtime.download_adapters)
+    observer = _CnIntegrityAdapterObservation(adapters[(CN_DOWNLOAD_SOURCE, "CN")])
+    adapters[(CN_DOWNLOAD_SOURCE, "CN")] = observer
+    runtime.download_adapters = adapters
+    return observer
+
+
+def _assert_cn_original_integrity_chain(observer: _CnIntegrityAdapterObservation, *, repair_required: bool) -> None:
+    """断言产生层、workflow 和 production adapter 原 cause 对象相同。
+
+    参数：observer 为透明观察器；repair_required 区分新损坏与真正 churn。
+    返回：无。异常：断言失败抛出 AssertionError。
+    """
+    assert len(observer.failures) == 1
+    adapter_failure = observer.failures[0]
+    abort = adapter_failure.__cause__
+    assert isinstance(abort, CnDownloadIntegrityAbort)
+    assert abort.cause is adapter_failure.cause and abort.__cause__ is abort.cause
+    assert isinstance(abort.cause, SourceIntegrityRepairRequiredError if repair_required else SourceIntegrityRevisionConflictError)

@@ -48,6 +48,7 @@ from dayu.fins.ingestion_runtime import (
     FinsSourceDownloadAdapter,
     FinsSourceDownloadAdapterRequest,
     FinsSourceDownloadAdapterResult,
+    FinsSourceDownloadAdapterFailure,
     ValidatedFinsUploadFilingRequest,
     ValidatedFinsUploadMaterialRequest,
     FinsUploadMaterialRequest,
@@ -96,6 +97,7 @@ from dayu.fins.pipelines.sec_download_state import (
     has_current_download_version,
 )
 from dayu.fins.pipelines.sec_download_workflow import (
+    SecDownloadIntegrityAbort,
     SecDownloadWorkflowHost as _SecDownloadWorkflowHost,
     run_download_stream_impl as _run_download_stream_impl,
 )
@@ -390,6 +392,7 @@ async def collect_download_result_from_events(
 
     Raises:
         RuntimeError: 事件流未产生完成事件时抛出。
+        SecDownloadIntegrityAbort: 原样传播工作流 typed 中止及确认快照。
     """
 
     async for event in events:
@@ -1760,27 +1763,34 @@ class SecDownloadAdapter(FinsSourceDownloadAdapter):
         Raises:
             ValueError: ticker 市场或表单过滤非法时抛出。
             RuntimeError: SEC 下载失败时抛出。
+            FinsSourceDownloadAdapterFailure: 封闭完整性失败携带严格确认摘要时抛出。
         """
 
         if request.normalized_ticker.market != "US":
             raise ValueError(f"SEC 下载仅支持 US market，当前 market={request.normalized_ticker.market}")
         if request.source is not FinsDownloadSource.SEC:
             raise ValueError(f"SEC 下载来源不匹配: source={request.source.value}")
-        result = _run_async_download_sync(
-            collect_download_result_from_events(
-                self._pipeline.download_stream(
-                    ticker=request.normalized_ticker.canonical,
-                    form_type=_form_type_from_adapter_request(request.form_types),
-                    start_date=request.date_range.start_text,
-                    end_date=request.date_range.end_text,
-                    overwrite=request.overwrite_existing,
-                    rebuild=request.rebuild_local_artifacts,
-                    start_is_explicit=request.date_range.start_is_explicit,
-                    cancel_checker=request.cancellation_checker,
-                ),
-                progress_sink=request.progress_sink,
+        try:
+            result = _run_async_download_sync(
+                collect_download_result_from_events(
+                    self._pipeline.download_stream(
+                        ticker=request.normalized_ticker.canonical,
+                        form_type=_form_type_from_adapter_request(request.form_types),
+                        start_date=request.date_range.start_text,
+                        end_date=request.date_range.end_text,
+                        overwrite=request.overwrite_existing,
+                        rebuild=request.rebuild_local_artifacts,
+                        start_is_explicit=request.date_range.start_is_explicit,
+                        cancel_checker=request.cancellation_checker,
+                    ),
+                    progress_sink=request.progress_sink,
+                )
             )
-        )
+        except SecDownloadIntegrityAbort as exc:
+            summary = _summary_from_pipeline_result(
+                exc.result, request=request, source_repository=self._pipeline.source_repository,
+            )
+            raise FinsSourceDownloadAdapterFailure(exc.cause, summary) from exc
         persisted_summary = _summary_from_pipeline_result(
             cast(dict[str, JsonValue], result),
             request=request,

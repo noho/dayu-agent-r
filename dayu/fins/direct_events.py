@@ -172,12 +172,14 @@ class FinsPublicFailureKind(str, Enum):
 
 
 class FinsDownloadFailureReason(str, Enum):
-    """下载来源完整性预检的封闭公共失败原因。"""
+    """下载来源完整性预检、版本冲突和仍需修复的封闭公共失败原因。"""
 
     MULTIPLE_REPAIR_REQUIRED = "multiple_repair_required"
     UNSELECTED_REPAIR_REQUIRED = "unselected_repair_required"
     SELECTED_REJECTED_REPAIR_REQUIRED = "selected_rejected_repair_required"
     UNSAFE_PUBLICATION = "unsafe_publication"
+    SOURCE_REVISION_CONFLICT = "source_revision_conflict"
+    SOURCE_REPAIR_REQUIRED = "source_repair_required"
 
 
 @dataclass(frozen=True, slots=True)

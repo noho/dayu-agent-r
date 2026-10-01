@@ -121,6 +121,7 @@ from dayu.fins.storage import (
     SourceIntegrityPreflightError,
     SourceIntegrityPreflightReason,
     SourceIntegrityRevisionConflictError,
+    SourceIntegrityRepairRequiredError,
     SourceIntegrityStatus,
 )
 from dayu.fins.pipelines.docling_upload_service import (
@@ -608,7 +609,7 @@ class FinsSourceDownloadAdapterFailure(Exception):
 
     def __init__(
         self,
-        cause: SourceIntegrityPreflightError | SourceIntegrityRevisionConflictError,
+        cause: SourceIntegrityPreflightError | SourceIntegrityRevisionConflictError | SourceIntegrityRepairRequiredError,
         persisted_summary: _FinsDownloadResultSummary,
     ) -> None:
         """保存 source adapter 的失败快照。
@@ -624,7 +625,7 @@ class FinsSourceDownloadAdapterFailure(Exception):
             TypeError: 原异常不是封闭完整性类型时抛出。
         """
 
-        if not isinstance(cause, SourceIntegrityPreflightError | SourceIntegrityRevisionConflictError):
+        if not isinstance(cause, SourceIntegrityPreflightError | SourceIntegrityRevisionConflictError | SourceIntegrityRepairRequiredError):
             raise TypeError("adapter failure cause must be a source integrity exception")
         super().__init__("下载来源完整性中止")
         self.cause = cause
@@ -4329,10 +4330,6 @@ class FinsIngestionRuntime:
             producer(context)
         except Exception as exc:
             cause = _download_exception_cause(exc)
-            error_kind = _classify_direct_error(
-                cause,
-                operation_kind=context.direct_operation_kind,
-            )
             typed_summary = exc.persisted_summary if isinstance(exc, FinsSourceDownloadAdapterFailure) else None
             download_summary = (
                 None
@@ -4352,6 +4349,11 @@ class FinsIngestionRuntime:
                     cause,
                     request=context.download_request,
                 )
+            )
+            error_kind = (
+                _DOWNLOAD_PUBLIC_ERROR_KINDS[public_failure.kind]
+                if public_failure is not None
+                else _classify_direct_error(cause)
             )
             self._emit_direct_result(
                 context,
@@ -4988,7 +4990,7 @@ class FinsIngestionRuntime:
             self._save_succeeded(latest, summary.to_json_summary())
         except _UnsupportedDownloadSourceError as exc:
             self._save_download_unsupported(job_id, request=request, message=str(exc))
-        except (FinsSourceDownloadAdapterFailure, SourceIntegrityPreflightError) as exc:
+        except (FinsSourceDownloadAdapterFailure, SourceIntegrityPreflightError, SourceIntegrityRevisionConflictError, SourceIntegrityRepairRequiredError) as exc:
             self._save_typed_download_failure(job_id, request=request, exc=exc)
         except Exception as exc:
             self._save_failed_from_exception(job_id, exc)
@@ -4998,14 +5000,14 @@ class FinsIngestionRuntime:
         job_id: str,
         *,
         request: FinsDownloadRequest,
-        exc: FinsSourceDownloadAdapterFailure | SourceIntegrityPreflightError,
+        exc: FinsSourceDownloadAdapterFailure | SourceIntegrityPreflightError | SourceIntegrityRevisionConflictError | SourceIntegrityRepairRequiredError,
     ) -> None:
         """用与 direct 同源的安全失败及已验证摘要保存 typed job。
 
         Args:
             job_id: 后台任务标识。
             request: 当前下载请求。
-            exc: 私有部分摘要或初始请求级预检失败。
+            exc: 私有部分摘要或初始请求级封闭完整性失败。
 
         Returns:
             无。
@@ -6905,6 +6907,13 @@ _SOURCE_INTEGRITY_PUBLIC_REASONS: Final[Mapping[SourceIntegrityPreflightReason, 
     SourceIntegrityPreflightReason.UNSAFE_PUBLICATION: FinsDownloadFailureReason.UNSAFE_PUBLICATION,
 }
 
+_DOWNLOAD_PUBLIC_ERROR_KINDS: Final[Mapping[FinsPublicFailureKind, FinsErrorKind]] = {
+    FinsPublicFailureKind.STORAGE: FinsErrorKind.STORAGE,
+    FinsPublicFailureKind.EXECUTION: FinsErrorKind.EXECUTION,
+    FinsPublicFailureKind.CONFIGURATION: FinsErrorKind.PROVIDER,
+    FinsPublicFailureKind.PROVIDER_TRANSPORT: FinsErrorKind.PROVIDER,
+}
+
 
 def _download_exception_cause(exc: Exception) -> Exception:
     """在 Fins 边界唯一解出 adapter 持有的原始 typed cause。
@@ -6971,6 +6980,24 @@ def _download_public_failure_from_exception(
             safe_message="本地来源完整性预检失败",
             retry_hint="请检查并修复工作区来源状态后重试；重复下载不会自行修复。",
             reason_code=_SOURCE_INTEGRITY_PUBLIC_REASONS[exc.reason],
+        )
+    if isinstance(exc, SourceIntegrityRevisionConflictError):
+        return FinsPublicFailure(
+            kind=FinsPublicFailureKind.STORAGE,
+            source=request.source,
+            transport_category=None,
+            safe_message="本地来源版本持续变化，本次下载已停止",
+            retry_hint="请等待其它来源写入完成后重新发起下载；若仍失败，请检查并发写入。",
+            reason_code=FinsDownloadFailureReason.SOURCE_REVISION_CONFLICT,
+        )
+    if isinstance(exc, SourceIntegrityRepairRequiredError):
+        return FinsPublicFailure(
+            kind=FinsPublicFailureKind.STORAGE,
+            source=request.source,
+            transport_category=None,
+            safe_message="本地来源仍需修复，本次下载已停止",
+            retry_hint="请检查并修复工作区来源状态后重新发起下载；不要仅按并发冲突反复重试。",
+            reason_code=FinsDownloadFailureReason.SOURCE_REPAIR_REQUIRED,
         )
     if isinstance(exc, OSError):
         return FinsPublicFailure(
@@ -7157,14 +7184,11 @@ def _optional_upload_result_bool(result: Mapping[str, JsonValue], key: str) -> b
 
 def _classify_direct_error(
     exc: Exception,
-    *,
-    operation_kind: FinsOperationKind,
 ) -> FinsErrorKind:
     """把 runtime 异常归类为 direct error kind。
 
     Args:
         exc: runtime 异常。
-        operation_kind: 当前 direct operation。
 
     Returns:
         direct 失败分类。
@@ -7176,10 +7200,6 @@ def _classify_direct_error(
     exc = _download_exception_cause(exc)
     if isinstance(exc, FinsDownloadProviderError):
         return FinsErrorKind.PROVIDER
-    if operation_kind is FinsOperationKind.DOWNLOAD:
-        if isinstance(exc, OSError | SourceIntegrityPreflightError):
-            return FinsErrorKind.STORAGE
-        return FinsErrorKind.EXECUTION
     if isinstance(exc, _UnsupportedDownloadSourceError | ValueError | FileNotFoundError):
         return FinsErrorKind.USER_INPUT
     if isinstance(exc, OSError):

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import asyncio
+from typing import NoReturn
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -76,10 +78,13 @@ from dayu.fins.download_contract import (
     FinsDownloadRequest,
     FinsDownloadSource,
     FinsDownloadTerminalDisposition,
+    build_fins_download_request,
 )
+from tests.fins.test_fins_ingestion_runtime import _build_real_sec_integrity_runtime, _NeverCancelledToken
 from dayu.fins.ingestion_runtime import (
     FinsPreprocessRequest,
     FinsRuntimeUploadRequest,
+    FsFinsIngestionJobStore,
 )
 from dayu.fins.ingestion.awaiting_resolution import AwaitingResolutionMode
 from dayu.fins.tools.download_tools import DOWNLOAD_TOOL_NAME
@@ -1088,3 +1093,42 @@ def _accepted_ack() -> ToolAwaitingAcceptedAck:
         result_digest="digest-1",
         idempotency_record_ref="idempotency-1",
     )
+
+
+def _reject_integrity_wait_job_read(self: FsFinsIngestionJobStore, job_id: str) -> NoReturn:
+    """拒绝 observation 流程误读 durable job。
+
+    参数：self 为实际 store；job_id 为意外读取标识。返回：不返回。异常：始终抛出 AssertionError。
+    """
+    del self
+    raise AssertionError(f"observation 不得读取 job: {job_id}")
+
+
+@pytest.mark.parametrize("scenario", ("postrepair", "churn"))
+def test_wait_download_integrity_failure_matches_process_observation(
+    tmp_path: Path, scenario: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """真实 prepare/activate/poll RESULT 进入 wait，公共 JSON 与计数原样同源。
+
+    参数：tmp_path 为隔离根；scenario 为真实状态；monkeypatch 为 job 读取拒绝 guard。
+    返回：无。异常：断言失败抛出 AssertionError。
+    """
+    runtime, executor, _pipeline = _build_real_sec_integrity_runtime(tmp_path, scenario)
+    monkeypatch.setattr(type(runtime.job_store), "read_job", _reject_integrity_wait_job_read)
+    request = build_fins_download_request(ticker="AAPL", form_types=("10-K", "6-K"),
+        start="2025-01-01", end="2025-12-31", overwrite_existing=scenario == "churn")
+    handle = runtime.prepare_observed_download(request, cancellation_token=_NeverCancelledToken())
+    runtime.activate_observation(handle)
+    executor.run_all()
+    observation = asyncio.run(runtime.poll_observation(handle))
+    result = observation.result
+    assert result is not None and result.status is FinsResultStatus.FAILURE
+    assert result.failure is not None and result.download is not None
+    poll = FinsIngestionWaitPollAdapter(runtime=runtime).poll_wait(_wait_snapshot(handle.handle_id, DOWNLOAD_TOOL_NAME))
+    assert isinstance(poll, WaitPollReady) and isinstance(poll.outcome, ResolveWaitFailedOutcome)
+    message = json.loads(poll.outcome.result.message)
+    assert message["failure"] == result.failure.to_json_value()
+    assert message["download"] == result.download.to_json_value()
+    assert message["download"]["omitted_count"] == 0
+    assert poll.outcome.result.hint == result.failure.retry_hint
+    print(json.dumps({"scenario": scenario, "wait": message}, ensure_ascii=False))

@@ -327,6 +327,7 @@ HK 的中期业绩可显示覆盖 H1，但不能代替独立中期报告消除 H
 每个下载文档行还会显示来源声明的 `covered_fiscal_periods` 数组。
 工作区来源目录中的 `.DS_Store` 等点号普通文件和 `.claude` 等不含链接或特殊文件的点号目录会被忽略。
 下载显示 `classification="storage"`、`reason_code="unsafe_publication"` 时，请检查工作区来源状态并修复后重试；重复下载不会自行修复。
+显示 `reason_code="source_revision_conflict"` 时，请等待其它来源写入完成后重新下载；持续失败时检查并发写入。显示 `reason_code="source_repair_required"` 时，请先检查并修复工作区来源状态，再重新下载，避免仅按并发冲突反复重试。失败输出中的文档摘要保留本次已经处理的结果，整体失败不表示先前成功文档丢失。
 下载失败详情显示 `classification="execution"` 时，详情后还会出现 §3.1 的
 `--log-file PATH` 提示；按该节选择可写文件并重新执行，可留存运行日志。并非每次此类
 失败都会产生未知异常诊断。下载未知异常的安全诊断只提供脱敏类型标签与有界的包内

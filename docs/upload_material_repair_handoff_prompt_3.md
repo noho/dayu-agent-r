@@ -10,10 +10,10 @@
 | F3 | accepted slice03e8b9b0已push，code gate已pass；完整aggregate MiMo50118/DS65682与PV01窄复审MiMo53684/DS14599全部终态独立核收，root裁决aggregate pass | accepted deepreview244056c5已push→最终同版PR review/closeout；详pr-197-r1-f3-aggregate-review-adjudication-20261001.md；F3 WU尚未最终完成 |
 | F4 | accepted slice75fec034 + aggregate87b5a642 已入PR | 最终同版 PR review/closeout |
 | F5 | 公开 mixed-known/unknown 财期 Q1 仍待具体用户选择；官方非空raw已补；N01/N02和F4真实API重绑定尚未实施 | 答复后 Sol planfix→双审→实施；不代选P1/P2 |
-| F6 | 首轮双审/root fail后A1/A2由Sol8619完成三文件窄fix，root核收83JSONL/233身份/132artifact；1342tests/full783type0/CLI无排除85% | 修复候选待MiMo36619/Kimi92651同版365冻结窄re-review；无sourcewriter、原21候选未提交，code gate未pass；详pr-197-r1-f6-s1-review-fix-delivery-receipt-20261001.md |
+| F6 | A1/A2修复同版MiMo36619/Kimi92651已终态root核收；code gate pass，1342tests/full783type0/CLI无排除85% | accepted slice commit→push读回→整体双路aggregate；详pr-197-r1-f6-s1-code-final-adjudication-20261001.md；21源码候选本checkpoint前未提交 |
 | F7 | accepted slice/aggregate 已入PR | 最终同版 PR review/closeout |
 
-当前无产品sourcewriter，活动runner仅MiMo36619/Kimi92651只读复审F6 A1/A2同版365冻结；Sol8619已终态核收，不再轮询。最终CI预备Sol13693交付proposal已保全b1e5195a，36裁决映射/41冻结/85artifact，非accepted最终计划/矩阵/registry或真实CI。所有原件与非零/恢复保留，F6 code gate须复审后root裁决，不以测试绿自动pass；句柄/output/stderr/freeze在 `workspace/tmp/pr197-controller-collection-20261001/active-runners.json`。
+当前无产品sourcewriter或活动runner；F6两路窄复审均已终态，root365身份/完整报告/双流退出和源码核验后裁code gate pass。Kimi早期失败patch原流保全声明已驳回，关键最终补丁/测试身份完整，不补造证据。最终CI预备proposal已保全b1e5195a，CI-PREP-A1依赖绑定文字错误accepted未修，不属产品WU；非accepted最终计划/矩阵或真实CI。下一F6 accepted slice→aggregate→最终PRreview/closeout，句柄历史见 `workspace/tmp/pr197-controller-collection-20261001/active-runners.json`。
 
 原upload修复依既有依赖序列在F2–F7后推进。以用户现成裁决为准，新schema/历史迁移/业务选择不凭继续授权代猜。旧upload_material Raw用户确认已删除；31正式裁决/36项语义保留，不能编造旧Raw复核。**全部已批准修复后，在最终commit重建完整mandatory矩阵并跑真实CLI CI，正式确定/登记upload_material oracle、scenarios和readiness proof**；现有registry的Fins范围仅download/upload_filing，不能当material完成。权威合同 `upload-material-repair-scope-and-ci-closeout-20261001.md`。历史正文按时间保留，不覆盖本节最新状态。
 <!-- PR197_LIVE_GATE_STATUS_END -->

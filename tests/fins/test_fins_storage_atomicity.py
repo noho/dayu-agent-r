@@ -9628,3 +9628,20 @@ def test_meta_view_unexpected_get_error_propagates_original_and_releases(
     assert raised.value is error.error and probe.acquires == probe.releases == 1
     token = repository_set.core._acquire_lock_token(repository_set.core._publication_lock_path("AAPL"), blocking=False)
     repository_set.core._release_lock_token(token)
+
+
+def test_source_integrity_repair_required_error_contract() -> None:
+    """公共 storage 修复异常无 payload，并与真实版本冲突语义分离。
+
+    参数：无。返回：无。异常：断言失败抛出 AssertionError。
+    """
+    from dayu.fins.storage import SourceIntegrityRepairRequiredError, SourceIntegrityRevisionConflictError
+    from dayu.fins.storage.source_integrity import SourceIntegrityRepairRequiredError as OwnerError
+    error = SourceIntegrityRepairRequiredError()
+    assert SourceIntegrityRepairRequiredError is OwnerError
+    assert isinstance(error, RuntimeError)
+    assert str(error) == "来源仍需修复，当前操作不能继续"
+    assert error.__dict__ == {}
+    assert not isinstance(error, SourceIntegrityRevisionConflictError)
+    assert str(SourceIntegrityRevisionConflictError()) == "source publication identity 已变化，无法安全应用预取结果"
+    pytest.raises(TypeError, SourceIntegrityRepairRequiredError, "unexpected-payload")
