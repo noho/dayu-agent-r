@@ -1,6 +1,6 @@
 # PR197 当前完成项与剩余执行清单
 
-核对时间：2026-10-01 09:04:42。最新用户要求继续全部授权WU，全部完成后再停下汇报，期间简报实际进展；用户现成裁决为准。本文计数区分产品修复标签、已确认WU和待goal残余候选，不把每个review finding算新WU，不重复计F4/F5/F6/F7的独立owner名称。
+核对时间：2026-10-01；最新有效checkpoint 75fec034，local/tracking/live/PR独立读回一致。最新用户要求继续全部授权WU，全部完成后再停下汇报，期间简报实际进展；用户现成裁决为准。本文计数区分产品修复标签、已确认WU和待goal残余候选，不把每个review finding算新WU，不重复计F4/F5/F6/F7的独立owner名称。
 
 ## 已交付入PR的成果
 
@@ -14,10 +14,10 @@
 | WU | 完成了什么 | 还剩什么 |
 | --- | --- | --- |
 | F2 | owner修复/双审/验证/入PR | 由最终整PR验证覆盖 |
-| F3 分析脚本参数化 | 初步五utils实现保全；计划几轮纠正，最新2983两句候选核收 | 当前MiMo/Kimi窄复审→accepted amendment→C01固定汇总冲突/C02物理cache别名sourcefix→code/aggregate/PR review/closeout |
-| F4 HK身份批量读取 | accepted plan dc29；14文件实现候选，788修前测试/type0/八filecov>=80；两路code-review已收 | Sol当前S1修A1深JSON/A2测试契约→同版复审/修后tests/type/cov→accepted slice→aggregate/PR review/closeout |
+| F3 分析脚本参数化 | 2983完整amendment已双路复审/root pass/accepted fe474并push | Sol33503修复交付核收；MiMo65815/Kimi87199同时code review在途→accepted slice/aggregate/PR review/closeout |
+| F4 HK身份批量读取 | A1/A2已修复/双路复审与root pass，794同版tests/type0/八prodfilecov>=80 | code-review及accepted slice75fec034已push/readback→aggregate/PR review/closeout |
 | F5 HK财期锚点一致性 | 目标/提案/官方非空raw补证；N01/N02已登记 | Q1未知财期是否继续确定报告待用户具体裁决→计划修订/审查→实现及后续全部门禁 |
-| F6 storage sibling错误公开语义 | 已有目标与直接证据 | plan及后续全部门禁，sharedCN源码串行 |
+| F6 storage sibling错误公开语义 | Sol44460计划交付核收；F6-P1 SEC同根因已接受，Sol50829补计划在途 | 核收SEC补计划→双路planreview及后续全部门禁，shared源码串行 |
 | F7 下载status唯一owner | 实现/双审/aggregate accepted，314/2cc已推 | 同一最终PR版本PR review及closeout；不能算完整WU已结束 |
 
 因此优先批次6项：F2局部闭合，5项仍待完整闭环。F3/F4不能把文字或代码候选算修复通过；F7剩收口不是重新实现。
@@ -86,3 +86,9 @@
 2026-10-01 09:09:14补充：文档证据保存commit 87dfbeae8625e34162812c06886610c37ba0f4e9 已普通push并live/PR/main读回；产品候选未accepted，不能把该docs checkpoint当源码修复完成。当前source Sol的九模块794 passed仅在途修后候选进展，全量类型首次4errors仍须恢复并最终收取，不作通过。
 
 root最新核收：首次4条新测试类型错误已实际修复，最终default full pyright0，794同版矩阵重跑通过；旧在途描述是历史，不作当前状态。F3两句双审与独立保全证明pass，C01/C02源码仍未修。F5 Q1待回答，不影响其它WU推进。详新F3 amendment final adjudication与F4 fix receipt。
+
+2026-10-01T09:31:22：accepted F3 amendment commit fe47438c已普通push，31682独立读回local/tracking/live/PR一致、main未动；新Sol33503修F3、MiMo6115/Kimi13577审F4在途。
+
+## 最新必要修复登记
+
+F6-P1/OQ1：SEC postrepair仍需repair却抛版本冲突，且adapter缺typed已处理摘要保全；root实源核证accepted未修复。owner SEC workflow/adapter + runtime唯一public projection；当前F6-S1计划增补，不是新增业务取舍，不新durable schema。Sol50829 source只读补计划。详 `docs/gateflow/pr-197-r1-f6-plan-delivery-adjudication-20261001.md`。

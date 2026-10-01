@@ -1,23 +1,22 @@
 # upload_material 修复阶段接手 prompt（#198 闭环后）
 
 <!-- PR197_LIVE_GATE_STATUS_START -->
-## 当前执行状态（2026-10-01 root 终态核收）
+## 当前总控状态（2026-10-01，同一主工作树）
 
-用户现成裁决优先；开发唯一主树 codex/upload-material-oracle，main fac32ecbf未动。local/tracking/live/PR最后读回87dfbeae、OPEN/draft。旧历史保留，本节当前入口为准。
+用户授权继续全部既有WU；只在 `/Users/leo/workspace/dayu-agent-r` 的 `codex/upload-material-oracle` 开发，所有修复进PR197，用户手工merge。当前local/tracking/live/PR checkpoint 75fec034，main fac32ecbff 未改。
 
-| WU | 当前入口 | 实际证据与后续 |
+| WU | 当前有效状态 | 下一入口 |
 | --- | --- | --- |
-| F2 | 局部闭环 | 不代表整个PR通过 |
-| F3 | accepted plan commit → 同S1 source fix | MiMo11067/Kimi61008均outer0，16current/16originals/15before-two及正逆两替换根复核；F3-PR4-A1已修，整个amendment pass；C01/C02产品未修 |
-| F4 | fix后同版re-review | Sol22860 outer0/76JSONL，51originals/43readonly保全；794passed/fullpyright0/八prod>=80交付根核收，A1/A2已修候选待双路复审，不提前代码pass |
-| F5 | Q1公开行为待用户 | 财期不确定报告是否单列并继续确定报告（建议）或写前整体失败；N01/N02未修，N03官方raw补证完成；不猜Q1、不沿用旧财期 |
-| F6 | plan | 已有goal及owner预检，共同CN源码写串行；wait读lightweight observation，durable job新schema不顺带扩入 |
-| F7 | PR review | accepted aggregate2cc2f5ed已push；未finalcloseout |
-| 原upload/独立队列 | 依赖推进 | 不在其它WU顺带实施 |
+| F3 | Sol33503 outer0交付已root核收；原504+新增405断言、263子命令、类型0/0；五源码候选尚未提交 | MiMo65815/Kimi87199同时只读完整S1 code review，freeze35输入；后续fix/accepted slice/aggregate/PR/closeout |
+| F4 | MiMo6115/Kimi13577均outer0，root同版177身份核对与真实探针通过；A1/A2已修复、code-review pass | accepted slice75fec034已push/readback→aggregate deepreview→PR review/closeout |
+| F5 | 官方非空raw补证完成，公开混合已知/未知财期Q1仍未收到具体选择，禁止擅自选P1/P2 | 答复后修plan再双审/实现；其它WU继续 |
+| F6 | Sol44460 outer0/66JSONL计划交付核收；F6-P1/OQ1 SEC同根因root accepted未修复，必要范围纳入F6 | Sol50829只读源码补SEC计划与摘要owner（41输入/40readonly），再同版双路planreview；不增job schema |
+| F7 | accepted slice/aggregate已入PR，非完整WU完成 | 最终同版PR review/closeout |
 
-新核收artifact：docs/gateflow/pr-197-r1-f3-amendment-final-adjudication-20261001.md；docs/gateflow/pr-197-r1-f4-s1-fix-receipt-20261001.md。所有三路已托管真实终态，无活动runner；待下一轮派发。F4重新冻结只含自身输入，不含将进入sourcefix的F3无关utils/plan，保障单sourcewriter及双路readonly审查无冲突。
+当前没有源码writer。详 F3 `pr-197-r1-f3-s1-collision-fix-receipt-20261001.md`、F4 `pr-197-r1-f4-s1-fix-rereview-adjudication-20261001.md`；历史在途/旧失败不覆盖本节。原upload队列依用户顺序仍在F2–F7后；新goal/迁移/schema取舍不能用总体继续授权代猜。
 
-用户要求继续全部已授权WU，全部完成再停，期间简报实际进展。F5 Q1无回答仍不代猜；其它工作继续。F4-R01需新goal/裁决、R02later性能owner保持原分类。F6owner证据 docs/gateflow/pr-197-r1-f6-owner-preflight-evidence-20261001.md。19docs证据checkpoint87df已push/readback；其本身不代表F3/F4产品闭环。
+新finding登记：F6-P1（SEC仍待repair误报revision conflict及adapter缺typed部分摘要），accepted未修，owner SEC workflow/adapter与统一runtime；destination当前F6-S1计划修订/双审/实现。详 `docs/gateflow/pr-197-r1-f6-plan-delivery-adjudication-20261001.md`，不得遗漏或静默defer。
+
 <!-- PR197_LIVE_GATE_STATUS_END -->
 
 
