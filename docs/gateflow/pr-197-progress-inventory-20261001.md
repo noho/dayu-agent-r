@@ -1,6 +1,6 @@
 # PR197 当前完成项与剩余执行清单
 
-核对时间：2026-10-01；最新有效checkpoint 75fec034，local/tracking/live/PR独立读回一致。最新用户要求继续全部授权WU，全部完成后再停下汇报，期间简报实际进展；用户现成裁决为准。本文计数区分产品修复标签、已确认WU和待goal残余候选，不把每个review finding算新WU，不重复计F4/F5/F6/F7的独立owner名称。
+核对时间：2026-10-01；最新已核验checkpoint a821da03，local/tracking/live/PR独立读回一致。最新用户要求继续全部授权WU，全部完成后再停下汇报，期间简报实际进展；用户现成裁决为准。本文计数区分产品修复标签、已确认WU和待goal残余候选，不把每个review finding算新WU，不重复计F4/F5/F6/F7的独立owner名称。
 
 ## 已交付入PR的成果
 
@@ -92,3 +92,7 @@ root最新核收：首次4条新测试类型错误已实际修复，最终defaul
 ## 最新必要修复登记
 
 F6-P1/OQ1：SEC postrepair仍需repair却抛版本冲突，且adapter缺typed已处理摘要保全；root实源核证accepted未修复。owner SEC workflow/adapter + runtime唯一public projection；当前F6-S1计划增补，不是新增业务取舍，不新durable schema。Sol50829 source只读补计划。详 `docs/gateflow/pr-197-r1-f6-plan-delivery-adjudication-20261001.md`。
+
+## 整体最终门禁（用户重申）
+
+完成已裁决修复项及已批准PR197 findings后，重跑最终commit的完整真实CLI CI，核对/登记oracle与scenarios及readiness proof；当前正式registry不含upload_material。待goal残余不自动当本轮必实施事项，各局部WU closeout不代表本大目标完成。详 `docs/gateflow/upload-material-repair-scope-and-ci-closeout-20261001.md`。

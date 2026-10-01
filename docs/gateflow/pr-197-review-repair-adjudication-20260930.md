@@ -3,7 +3,7 @@
 <!-- PR197_LIVE_GATE_STATUS_START -->
 ## 当前总控状态（2026-10-01，同一主工作树）
 
-用户授权继续全部既有WU；只在 `/Users/leo/workspace/dayu-agent-r` 的 `codex/upload-material-oracle` 开发，所有修复进PR197，用户手工merge。当前local/tracking/live/PR checkpoint 75fec034，main fac32ecbff 未改。
+用户授权完成已裁决修复项及后来明确批准的PR197 findings；待goal残余不自动纳入必实施范围。只在 `/Users/leo/workspace/dayu-agent-r` 的 `codex/upload-material-oracle` 开发，所有修复进PR197，用户手工merge。当前已独立核对local/tracking/live/PR checkpoint a821da03，main fac32ecbff 未改。
 
 | WU | 当前有效状态 | 下一入口 |
 | --- | --- | --- |
@@ -16,6 +16,9 @@
 当前没有源码writer。详 F3 `pr-197-r1-f3-s1-collision-fix-receipt-20261001.md`、F4 `pr-197-r1-f4-s1-fix-rereview-adjudication-20261001.md`；历史在途/旧失败不覆盖本节。原upload队列依用户顺序仍在F2–F7后；新goal/迁移/schema取舍不能用总体继续授权代猜。
 
 新finding登记：F6-P1（SEC仍待repair误报revision conflict及adapter缺typed部分摘要），accepted未修，owner SEC workflow/adapter与统一runtime；destination当前F6-S1计划修订/双审/实现。详 `docs/gateflow/pr-197-r1-f6-plan-delivery-adjudication-20261001.md`，不得遗漏或静默defer。
+
+
+**最终大目标（用户最新重申，必须执行）**：完成已批准修复后，在最终commit重跑完整真实CLI CI，按用户既有裁决核对/登记 `docs/cli_ci_oracles.json` 与 `docs/cli_ci_scenarios.json`，校验upload_material范围readiness proof；各WU单元测试、review/closeout不是整体终点。两个registry当前未含upload_material，不能借其它命令ready结论。权威约束详 `docs/gateflow/upload-material-repair-scope-and-ci-closeout-20261001.md`，用户裁决优先，禁止改oracle迎合实现；新业务取舍另待明确裁决。
 
 <!-- PR197_LIVE_GATE_STATUS_END -->
 
