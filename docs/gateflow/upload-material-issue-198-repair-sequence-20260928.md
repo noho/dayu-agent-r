@@ -19,7 +19,7 @@
 
 最终收口 `docs/gateflow/pr-197-findings-except-f5-final-closeout-20261001.md`；正式PR裁决 `docs/reviews/pr-197-review-20261001-175653.md`。MiMo34356/授权quota备份DS72633均outer0、完整结构化及报告/canary已核；Kimi87412 outer1/API403原失败保全。root独立68current/originals、37精确blob、715全compare和37对应段；两路关键意见采纳，非关键clean/旧coverage/DSargv-exit缺口收窄，不另起报告修复循环。root真实1377passed/3既有warnings/exit0、全量pyright783checked/0error与当前37字节绑定；各原覆盖按owner字节和后续F6更新有效证据复用。本四WU scoped PR gate不是全715文件最终pass或merge readiness。
 
-此前组合审查及Sol39648只读交付均已终态核收；现Sol19367外部runner在途，仅固化F5 plan v2，45冻结输入无产品writer，未计accepted plan/codepass。用户最新明确继续完成全部已批准任务、简报实际进展；不是停在计划gate。原Sol39648粗分组候选 `docs/gateflow/upload-material-remaining-work-batching-preparation-20261001.md` 及核收receipt只作后续proposal，**不是accepted plan/新WU数量/实施授权**，不直接推进原队列门禁；F5闭环后按实际依赖进入。
+F5新版候选195行已交付：Sol19367 outer0、104JSONL/42commands、canary match、45current+originals不变，仅两doc；不是plan pass。当前 **plan review**，MiMo2205/Kimi12721同版58项冻结并行在途，无产品writer。总控已发现并登记 F5-V2-A1（合法未执行FAILED/CANCELLED与全面terminal schema要求冲突），destination为本gate收齐双审后一轮集中planfix；详 `docs/gateflow/pr-197-r1-f5-plan-v2-review-adjudication-20261001.md`。原N01/N02保持accepted未修。用户要求全部任务继续，普通gate不停止；原upload仍F5闭环后实施。Sol39648粗分组候选仅后续proposal。
 
 后续WU默认一个完整可验证行为slice，仅真实依赖/风险/独立验收才拆并说明理由，不按文件/模块机械拆；同gate必要fix批量一轮交付+同版双审。Sol负责plan/implement/fix；MiMo/Kimi并行review，Kimi真实quota失败DS备份；用户授权所有runner runtime/provider不改变职责或现成业务裁决。每调用绝对cwd、独立output/stderr/no-persist/canary；root检查结构化及直接证据自行裁决。
 
