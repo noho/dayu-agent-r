@@ -102,3 +102,11 @@ F3-CR1-A1：root与Kimi同根因输入链接环，中文输入错误exit2合同�
 2026-10-01最新门禁：F3双路代码审查已收齐，root `pr-197-r1-f3-s1-code-review-adjudication-20261001.md` 记录F3-CR1-A1 accepted未修→Sol窄fix；Unicode未建别名保持独立goal。F4 accepted slice已入PR，MiMo48266/Kimi10989整项aggregate双审在途。F6-PV01取证窄fix Sol31175 outer0/rootaccepted已修复；旧-01派发路径拼写setup错误、模型未启动，新-02恢复独立记录。最终真实CLI CI/oracle/scenarios约束不变，现有registry仅download/upload。
 
 最新root receipt：F6-PV01已修复，69JSONL/outer0，实际两文件type0及三SECowner通过；F6plan当前c5978746仍proposal，双路planreview待两个槽位。F3 source Sol1929只修现成输入合同；F4aggregate MiMo48266/Kimi10989在途。
+
+F3唯一恢复性重试：Sol1929原-01已outer1/turn.failed，workspace routing discovery timed out，39当前/原件全保全且无工具写入。root失败裁决 `pr-197-r1-f3-provider-timeout-recovery-20261001.md` 已登记；新-02 Sol4394在途，同provider唯一一次恢复性重试、不扩scope。F4双审仍独立；F6planreview任务55输入已准备等两个slots。
+
+当前F3实施阻塞：Sol-02/4394再次outer1，唯一恢复性重试耗尽、无工具/source修改，用户路由具体选择pending。失败证据 `pr-197-r1-f3-provider-timeout-recovery-20261001.md`；旧真实CI证据根在本机未定位，独立gap `upload-material-final-ci-evidence-location-gap-20261001.md` 已落盘，待路径信息。F4双审/F6planreview等独立事项继续，未宣布全部完成。
+
+F4 aggregate已root pass，201同版身份/两完整报告/真实39聚焦及原794验证证据核收；唯一超深盘外OQ按已接受getter异常合同裁为非当前阻塞，独立goal风险保全。详 `pr-197-r1-f4-aggregate-review-adjudication-20261001.md`，下一accepted deepreview commit再最终PRreview/closeout。F6 MiMo25143/Kimi49742计划双审在途，无source writer。
+
+用户最新具体答复已落盘：保留gpt-6-sol等待服务恢复、不切实现模型；旧upload_material CI根已删除，不再等路径。正式裁决不重开，最终commit重建完整mandatory矩阵/授权输入并重新真实CLI全证据，历史Raw不可用/旧digest引用与本轮实证分开登记，readiness不借原160执行。F4aggregate accepted deepreview87b5a642；F6双路计划审查继续。

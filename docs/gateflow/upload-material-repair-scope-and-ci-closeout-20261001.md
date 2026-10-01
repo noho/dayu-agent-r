@@ -21,7 +21,7 @@
 1. 完成上述已批准修复及必要review fix，按Gateflow核验测试/类型/README、同版双审及总控裁决；所有成果进入唯一 `codex/upload-material-oracle`，PR197保持draft、用户merge、main不动。
 2. 解析最终被测commit SHA，核对local/tracking/live/PR head一致；只读CI验证快照不承担开发。冻结本次场景定义、用户裁决引用、输入/corpus digest和执行policy。
 3. 遵循 `docs/cli_ci.md`，为本次upload_material完整mandatory范围新建真实CLI evidence run。范围/profile由实际inventory和readiness proof重新校验；不得用旧registry_status、局部smoke、mock单元测试或历史160次执行代替当前完整真实CI。受影响其它命令按实际依赖纳入回归，并明确范围；不悄悄重写已冻结其它命令oracle。
-4. 保全command、stdout/stderr、exit、screen、文件系统前后、workspace/log/DB/Trace/process/durable等必需真实证据；明确attempted/executed/not-run/blocked/gap，旧Raw保持原字节，新run显式supersede lineage。
+4. 保全本次command、stdout/stderr、exit、screen、文件系统前后、workspace/log/DB/Trace/process/durable等必需真实证据；明确attempted/executed/not-run/blocked/gap。可用旧Raw保持原字节；用户已确认旧upload_material证据根已删除，不能宣称已保全或已复核历史SHA，新run明确登记旧证据不可用及supersede lineage。
 5. 将新实际结果逐项映射到用户已经接受的裁决：违反既有oracle即failure并最小修复/必要复跑；真正未裁新行为记oracle-review-required/needs-more-evidence，禁止自行选新业务语义。
 6. 依据用户裁决与新证据正式登记/核对 `docs/cli_ci_oracles.json` 与 `docs/cli_ci_scenarios.json`、accepted版本/稳定predicate映射/场景覆盖/readiness proof。新版本替代需保留旧版本及lineage，不原地篡改旧oracle。完成判断必须含完整mandatory矩阵及proof核验，不能只报tests绿或PR MERGEABLE。
 7. 汇报最终修复项状态、CI primary verdict、oracle/scenarios映射及readiness、仍有明确owner的残余和必要待裁项，用户手工merge。以上任一步未完成不得报告本大目标完成。
@@ -39,3 +39,9 @@ root受控四模块CLI探针发现循环链接out-root在Path.resolve处报Runti
 ## 2026-10-01 最新审查状态更新
 
 旧实时段仅为历史观察。当前已读回checkpoint4a3a28c5；F3双路审查终态，root独立证据已将输入链接环裁为现成F3合同必要修复F3-CR1-A1 accepted未修（非新WU），详正式code-review-adjudication。F4 aggregate MiMo48266/Kimi10989在途；F6旧SEC补计划终态部分核收，F6-PV01非空类型证据窄fix Sol31175在途。F5 Q1仍pending；最终真实CI/两个registry scope约束不变。
+
+## 最新用户具体选择
+
+Sol服务连续两次routing timeout后，用户选择保留gpt-6-sol并等待服务恢复，禁止自切实现模型；独立MiMo/Kimi审查继续。F4aggregate已rootpass/accepted deepreview87b5a642，F6双路planreview在途。
+
+用户确认旧CI证据目录已删除。正式裁决仍为真源，不重做裁决；修复完成后重建完整当前mandatory矩阵、重新采集授权输入并执行全套真实CLI证据。原160次执行/旧digest仅保留历史引用，不作为本轮verified evidence或readiness证明。详 `upload-material-final-ci-evidence-location-gap-20261001.md` 最新用户答复段。这个调整不缩小mandatory范围，不豁免最终CI，不改业务oracle。
