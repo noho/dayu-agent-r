@@ -55,7 +55,7 @@ CANARY=gpt-6-sol-b05d3e9b
 |---|---|---|---|
 | O01 [合并裁决 §UM-O01](../reviews/upload-material-um-o01-o06-oracle-adjudication.md) L28–36 | help 发现公开面，不证明业务可省略或转换成功；内部 ID 按 O07 删除 | root/leaf help，所有公开参数/别名/default/choices；删除参数用正面 inventory deletion 证明 | help+parser 身份；旧 internal ID 场景不保留 coverage 数字，移除要求的拒绝补证与 current scenario 删除分开处理 |
 | O02 [§UM-O02](../reviews/upload-material-um-o01-o06-oracle-adjudication.md) L38–52 | 已裁 usage 类拒绝 exit2、普通输出无 traceback；重复 scalar 最后值生效 | ticker 缺失/空/路径型、未知/移除选项、choice/int/value 缺失、文件缺失/目录/不支持、多 forms、日志冲突；合法对照/两次 scalar 次序 | parser 与实际有效请求/零发布；不能外推所有新 typed 业务失败的 exit |
-| O03 [§UM-O03/F01](../reviews/upload-material-um-o01-o06-oracle-adjudication.md) L54–75 | 正常路径指向相应 workspace；regular-file base 在 path owner 给可操作错误 | fresh/已有目录、默认 cwd、相对/绝对、别名、重复 base、空格/Unicode、CI 内 symlink、普通文件、链接环 | E、原普通文件字节不变；O03-F01/F3 及最终路径 owner；越出 CI 根的真实操作禁止 |
+| O03 [§UM-O03/F01](../reviews/upload-material-um-o01-o06-oracle-adjudication.md) L54–75 | 正常路径指向相应 workspace；regular-file base 在 path owner 给可操作错误 | fresh/已有目录、默认 cwd、相对/绝对、别名、重复 base、空格/Unicode、CI 内 symlink、普通文件、链接环 | E、原普通文件字节不变；O03-F01，owner=`dayu.cli.workspace_root.resolve_workspace_root`；PR197-R1-F3 的分析 utils 显式输入路径修复不属此依赖；越出 CI 根的真实操作禁止 |
 | O04 [§UM-O04/F01](../reviews/upload-material-um-o01-o06-oracle-adjudication.md) L77–92；O23 L37–45 | 数量/重复 path、basename、规划后真实资产冲突在转换前 typed 拒绝；同 stem 不同 basename 可合法 | 0/1、最终公共上限 N−1/N/N+1（当前 N=100）、重复 path、同 basename 不同父目录、同 stem/不同 stem、original-derived 交叉冲突、逆序、控制名/大小写碰撞 | 无转换/无发布与安全原因；O04/O23 同一 planner 合并 claim，不注册两套冲突规则 |
 | O05 [§UM-O05/F01](../reviews/upload-material-um-o01-o06-oracle-adjudication.md) L94–110 | form/name 无条件业务必填，开始上传前拒绝缺失/空 | 每种 action 的缺失、空、trim 后空；有效对照；配 missing target 验证输入优先级 | 无 upload.started、无材料发布；O05，与公司条件必填区别 |
 | O06 [§UM-O06/F01](../reviews/upload-material-um-o01-o06-oracle-adjudication.md) L112–122；本轮用户选择 | material_name trim 后最多 240 Unicode 码点，不静默截断 | 239/240/241、前后空白、中文/非 BMP、组合字符分解序列；合法公司/文件隔离混杂 | 名称/ID/meta/LLM 投影同源，超限零发布；O06。计数是码点，不能换成字节/字素 |
@@ -152,7 +152,7 @@ O04/O23 同一资产规划合同；O07/O08 同一内部ID删除和公开ID断言
 
 | 触发owner/gate | 受影响命令/lane | 后续证据和范围 |
 |---|---|---|
-| O03/F3 workspace与共享CLI入口 | upload_material、upload_filing、download、process/process_filing/process_material；upload_filings_from输出路径按final路径owner | 相对/default/alias/regular-file/链接环前置拒绝、有效对照，原文件不变；F3 accepted不在本轮重跑产品测试 |
+| O03 workspace与共享CLI入口（owner：`dayu.cli.workspace_root.resolve_workspace_root`） | upload_material、upload_filing、download、process/process_filing/process_material；upload_filings_from输出路径按final路径owner | 相对/default/alias/regular-file/链接环前置拒绝、有效对照，原文件不变；PR197-R1-F3 是五个分析 utils 的显式输入路径修复，code/aggregate accepted，与本行 workspace owner 独立；本轮不重跑产品测试 |
 | O04/O23/O25资产选择/命名/primary | upload_filing、material、upload_filings_from生成material请求 | filing唯一primary+companions不误全转换；同名/真实derived冲突；batch生成exact argv/selector再由真实CLI消费。脚本生成成功不是上传成功 |
 | O13/O14/O15/O18/O33共享source动作/version/publication | upload_filing、material；download对相同source/integrity提交边界 | delete幂等/restore/overwrite/missing/并发/指纹、manifest；不用material语义覆盖filing独立来源ID或已冻oracle |
 | O21/O22/shared failure label及F6 typed reason | download CN/SEC及必要HK映射、upload_filing/material、direct与awaiting | owner产生真实conflict/empty/content，screen/typed stream/LLM投影一致；21候选只确定潜在影响，不证明通过。CN新披露日跨日对照，历史迁移不做 |

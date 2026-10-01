@@ -13,7 +13,7 @@
 | F6 | code gate pass；accepted slice4f0b5b04已普通push/PR读回；1342tests/full783type0/CLI无排除85% | MiMo32884/Kimi60739整体368冻结aggregate在途；下一accepted deepreview→最终PR review/closeout |
 | F7 | accepted slice/aggregate 已入PR | 最终同版 PR review/closeout |
 
-当前无产品sourcewriter。F6 MiMo32884/Kimi60739独立同版整体aggregate在途；Sol7371仅修非重叠CI-PREP-A1计划文档映射，不执行CI或原队列产品实现。F6代码已进入PR197/本地/远端4f0b5b04；旧失败/报告保留，Kimi早期patch失败raw保全声明被驳回，关键最终证据已独立核。最终CI预备proposal不是accepted最终计划/矩阵/registry/readiness或真实CI；实际句柄见 `workspace/tmp/pr197-controller-collection-20261001/active-runners.json`。
+当前无产品sourcewriter。F6 MiMo32884/Kimi60739独立同版整体aggregate在途；Sol7371已outer0/root核收CI-PREP-A1两行文档修复候选，独立审查仍待；CI-PREP-C02映射候选needs-more-evidence已登记planfix-receipt。未执行CI或原队列产品实现。F6代码已进入PR197/本地/远端4f0b5b04；旧失败/报告保留，Kimi早期patch失败raw保全声明被驳回，关键最终证据已独立核。最终CI预备proposal不是accepted最终计划/矩阵/registry/readiness或真实CI；实际句柄见 `workspace/tmp/pr197-controller-collection-20261001/active-runners.json`。
 
 原upload修复依既有依赖序列在F2–F7后推进。以用户现成裁决为准，新schema/历史迁移/业务选择不凭继续授权代猜。旧upload_material Raw用户确认已删除；31正式裁决/36项语义保留，不能编造旧Raw复核。**全部已批准修复后，在最终commit重建完整mandatory矩阵并跑真实CLI CI，正式确定/登记upload_material oracle、scenarios和readiness proof**；现有registry的Fins范围仅download/upload_filing，不能当material完成。权威合同 `upload-material-repair-scope-and-ci-closeout-20261001.md`。历史正文按时间保留，不覆盖本节最新状态。
 <!-- PR197_LIVE_GATE_STATUS_END -->
