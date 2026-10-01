@@ -35,3 +35,13 @@ root独立数据 `workspace/tmp/pr197-controller-collection-20261001/f6-aggregat
 - 全部批准修复后完整真实CLI CI、正式material oracle/scenarios/readiness和最终同版PRreview/closeout：covered by later approved slice（root收口），尚未执行。
 
 当前下一入口：收MiMo32884完整终态→combined总控裁决，未取得退出前保持source冻结，不因运行久中断。F6未final closeout、所有WU未完成。
+
+## 双路终态后 combined 裁决
+
+MiMo32884已托管outer0，runtimeclaude/providermimo/actualmodelmimo-v2.6-pro[1m]，完整JSON success/is_error=false/76turns/permission_denials=[]，canary逐字匹配，stderr仅精确unrecognized_model warning。完整报告 `docs/reviews/code-review-20261001-160049.md` SHA `f5bdb6fc26c51047b9541def8583e8712f32207112652611fc5d1abea6952e50` 已全文读。独立run `/private/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/sub-agents.fawFRN/`。root再次368current+368originals、21acceptedblob相同，读取5ledger实际stdout/stderr/innerexit和两pytest精确argv/hash。9+27=36passed/exit0；banned scan grep1且双流无诊断为预期无匹配。inline AST/identity命令仅缩略描述，不能冒称完整可重放trace；root实际代码/身份独立核验补足必要证据。模型以outer遥测为准，报告HEAD552是历史窗口，不是当前8b905697。
+
+**首轮aggregate decision：fail / required fix。** MiMo未提出新实质finding，不按票数否定Kimi单项；root维持F6-AG-A1 accepted未修，依据同owner enum/runtime分支与acceptedplan docstring承诺。没有其它本gate accepted未修项。既有A1/A2维持已修；原报告与失败记录保留。现在两reviewer都已终态，允许Sol唯一writer仅修direct_events.py该一行属性文档，不更改字段、校验、序列化、业务文本、tests或README。
+
+对应验证：精确一行/单文件diff、原件/readonly byte identity、移除该类docstring后的执行AST不变；激活venv受影响public-contract测试与fullpyright。文档-only不为字符串写镜像测试、不借此重跑1342大矩阵；覆盖率以执行AST与同一行映射不变说明复用原89.0380无排除数据，其他七prod精确SHA不变。若发现任何可执行差异则停止，不偷渡至本fix。修复交付后同版MiMo/Kimi窄re-review，核一行语义与原完整21slice意见适用性，再由root最终aggregate裁决；窄复审不能冒称重新完整走读。
+
+下一入口：Sol AG-A1契约docstring窄fix→独立同版双路re-review→accepted deepreview commit/push→最终同版PRreview/closeout。最终真实CLI CI/material registry仍待全部批准修复完成后执行。本gate普通失败是自动必要fix转移，不因低严重度忽略、不等待重复用户批准。

@@ -10,10 +10,10 @@
 | F3 | accepted slice03e8b9b0已push，code gate已pass；完整aggregate MiMo50118/DS65682与PV01窄复审MiMo53684/DS14599全部终态独立核收，root裁决aggregate pass | accepted deepreview244056c5已push→最终同版PR review/closeout；详pr-197-r1-f3-aggregate-review-adjudication-20261001.md；F3 WU尚未最终完成 |
 | F4 | accepted slice75fec034 + aggregate87b5a642 已入PR | 最终同版 PR review/closeout |
 | F5 | 公开 mixed-known/unknown 财期 Q1 仍待具体用户选择；官方非空raw已补；N01/N02和F4真实API重绑定尚未实施 | 答复后 Sol planfix→双审→实施；不代选P1/P2 |
-| F6 | code gate pass；accepted slice4f0b5b04已普通push/PR读回；1342tests/full783type0/CLI无排除85% | Kimi60739终态root核收，F6-AG-A1契约属性docstring遗漏accepted未修；MiMo32884仍在途，gate未pass，详pr-197-r1-f6-aggregate-review-adjudication-20261001.md |
+| F6 | code gate pass；accepted slice4f0b5b04已普通push/PR读回；1342tests/full783type0/CLI无排除85% | 两路aggregate均终态root核收，combined fail/required docfix F6-AG-A1；下一Sol一行owner文档fix→双路同版窄复审，详pr-197-r1-f6-aggregate-review-adjudication-20261001.md |
 | F7 | accepted slice/aggregate 已入PR | 最终同版 PR review/closeout |
 
-当前无产品sourcewriter。F6 aggregate MiMo32884仍在途，Kimi60739已outer0/root核收并登记AG-A1；待两路终态后Sol窄fix，不提前破坏368源码冻结；Sol7371已outer0/root核收CI-PREP-A1两行文档修复候选，独立审查仍待；CI-PREP-C02映射候选needs-more-evidence已登记planfix-receipt。未执行CI或原队列产品实现。F6代码已进入PR197/本地/远端4f0b5b04；旧失败/报告保留，Kimi早期patch失败raw保全声明被驳回，关键最终证据已独立核。最终CI预备proposal不是accepted最终计划/矩阵/registry/readiness或真实CI；实际句柄见 `workspace/tmp/pr197-controller-collection-20261001/active-runners.json`。
+当前无产品sourcewriter。F6 aggregate两路已终态，AG-A1 accepted未修，下一Sol唯一writer一行契约docstring窄fix；Sol7371已outer0/root核收CI-PREP-A1两行文档修复候选，独立审查仍待；CI-PREP-C02映射候选needs-more-evidence已登记planfix-receipt。未执行CI或原队列产品实现。F6代码已进入PR197/本地/远端4f0b5b04；旧失败/报告保留，Kimi早期patch失败raw保全声明被驳回，关键最终证据已独立核。最终CI预备proposal不是accepted最终计划/矩阵/registry/readiness或真实CI；实际句柄见 `workspace/tmp/pr197-controller-collection-20261001/active-runners.json`。
 
 原upload修复依既有依赖序列在F2–F7后推进。以用户现成裁决为准，新schema/历史迁移/业务选择不凭继续授权代猜。旧upload_material Raw用户确认已删除；31正式裁决/36项语义保留，不能编造旧Raw复核。**全部已批准修复后，在最终commit重建完整mandatory矩阵并跑真实CLI CI，正式确定/登记upload_material oracle、scenarios和readiness proof**；现有registry的Fins范围仅download/upload_filing，不能当material完成。权威合同 `upload-material-repair-scope-and-ci-closeout-20261001.md`。历史正文按时间保留，不覆盖本节最新状态。
 <!-- PR197_LIVE_GATE_STATUS_END -->
