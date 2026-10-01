@@ -45,3 +45,9 @@ root受控四模块CLI探针发现循环链接out-root在Path.resolve处报Runti
 Sol服务连续两次routing timeout后，用户选择保留gpt-6-sol并等待服务恢复，禁止自切实现模型；独立MiMo/Kimi审查继续。F4aggregate已rootpass/accepted deepreview87b5a642，F6双路planreview在途。
 
 用户确认旧CI证据目录已删除。正式裁决仍为真源，不重做裁决；修复完成后重建完整当前mandatory矩阵、重新采集授权输入并执行全套真实CLI证据。原160次执行/旧digest仅保留历史引用，不作为本轮verified evidence或readiness证明。详 `upload-material-final-ci-evidence-location-gap-20261001.md` 最新用户答复段。这个调整不缩小mandatory范围，不豁免最终CI，不改业务oracle。
+
+## 最新核对补记（2026-10-01，文档checkpoint123fad5d）
+
+旧状态段为时间线，不覆盖主queue/handoff的最新门禁。Sol认证路由已由39776真实runner核收恢复；F3输入环fix7594与F6计划fix40525均已outer0并由root独立核收，仍须同版复审。当前F6 MiMo37469及F3 MiMo7898/DS55704在途；DS F6报告22262已核收部分叙述，其枚举测试列名建议因计划已有明确迁移合同被拒绝，错误SEC reason对应由真实源码纠正。F4/F7已accepted slice/aggregate，最终PRreview/closeout待做；F5 Q1仍未答，不能代选。
+
+registry 的“只有download/upload”准确指当前 **Fins命令范围**，不是全registry没有其它命令：实际6条oracle还包含init/prompt/interactive；1328条scenario按真实顶层command计数为init59、prompt388、interactive612、download101、upload_filing168。root实际核对oracle.scope.command与scenario.command均无upload_material正式条目。不得用不存在的scenario.scope字段判断覆盖，也不得把字面引用算正式登记。整体修复、完整真实CLI CI、正式upload_material登记和readiness终点均未完成。
