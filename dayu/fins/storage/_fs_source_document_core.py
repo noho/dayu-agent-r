@@ -569,6 +569,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
 
         Raises:
             FileNotFoundError: 对应来源目录下的 meta.json 不存在时抛出。
+            CompanyTickerIdentityCorruptionError: published ticker 身份损坏时原样抛出。
             ValueError: 元数据文件内容非法时抛出。
             RuntimeFileLockError: publication guard 获取或释放失败时抛出。
             OSError: published meta 读取失败时抛出。
@@ -674,6 +675,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             公开读取与后续发布，不代表完整性或写授权。
 
         Raises:
+            CompanyTickerIdentityCorruptionError: published ticker 身份损坏时在枚举阶段抛出。
             ValueError: 输入或完整枚举不合法时抛出。
             OSError: 完整枚举的 I/O 失败时抛出。
             RuntimeFileLockError: publication guard 获取或释放失败时抛出。
@@ -932,12 +934,15 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             source meta。
 
         Raises:
-            FileNotFoundError: source meta 不存在或 source 已删除时抛出。
-            ValueError: meta 内容非法时抛出。
+            FileNotFoundError: source meta 不存在时抛出；逻辑删除仍可读取原始元数据。
+            CompanyTickerIdentityCorruptionError: published ticker 身份损坏时原样抛出。
+            ValueError: 文档 descriptor、source root 或 meta 内容非法时抛出。
+            OSError: published tree 读取失败时原样抛出。
         """
 
+        ticker_dir = self._ticker_dir_for_read(external_ticker)
         return self._get_source_meta_at_root(
-            external_ticker, external_document_id, normalized_source_kind, self._target_ticker_dir(external_ticker),
+            external_ticker, external_document_id, normalized_source_kind, ticker_dir,
         )
 
     def _get_persisted_source_meta_unguarded(
@@ -1219,6 +1224,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             已排序文档 ID 列表。
 
         Raises:
+            CompanyTickerIdentityCorruptionError: published ticker 身份损坏时原样抛出。
             ValueError: ticker、source kind、descriptor 或 source root 不合法时抛出。
             RuntimeFileLockError: publication guard 获取或释放失败时抛出。
             OSError: 读取目录失败时抛出。
@@ -1247,11 +1253,12 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             已排序文档 ID 列表。
 
         Raises:
+            CompanyTickerIdentityCorruptionError: published ticker 身份损坏时原样抛出。
             ValueError: descriptor 或 source root 不合法时抛出。
             OSError: 读取目录失败时抛出。
         """
 
-        ticker_dir = self._target_ticker_dir(normalized_ticker)
+        ticker_dir = self._ticker_dir_for_read(normalized_ticker)
         if source_kind is not None:
             return self._list_source_ids_at_root(ticker_dir, source_kind)
         filings = self._list_source_ids_at_root(ticker_dir, SourceKind.FILING)

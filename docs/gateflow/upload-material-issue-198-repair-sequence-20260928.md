@@ -1,16 +1,13 @@
 # upload_material 裁决修复与 issue #198：依赖顺序
 
 <!-- PR197_LIVE_GATE_STATUS_START -->
-## 当前总控状态（2026-10-02T10:55:26.181796+08:00）
+## 当前总控状态（aggregate最终核收）
 
-- 唯一开发主树 `/Users/leo/workspace/dayu-agent-r` / `codex/upload-material-oracle`；main不动，不创建其它branch/worktree/clone/detached。现有PR197保持OPEN/draft，用户手工merge。
-- F1 rejected；F2/F3/F4/F6/F7已闭环进PR，证据 pr-197-findings-except-f5-final-closeout-20261001.md。
-- F5仍单完整F5-S1，严格用户“推断失败继续A、明确B未知、不猜财期”；IV01–05均已修并正式同版双审/复审，总控 code gate PASS。完整裁决 pr-197-r1-f5-s1-code-review-final-adjudication-20261002.md。
-- 最新实现1703pass/fullpyright0/23生产>=80；root41pass，MiMo121pass+103probe/fulltypes0，MiMo-flash110pass/probe/fulltypes0。六官方Raw及关键验证原件正式可Git移交。没有丢弃旧失败/裁决/源码，历史在原artifact和 pr-197-controller-live-status-history-20261002.md。
-- 当前无活动runner/产品writer。下一动作accepted F5-S1 commit→aggregate deepreview→现有draftPR push→PR review/fix/re-review→accepted PRreview commit/push→final closeout/handoff。尚未aggregate/PR/finalcloseout pass，不冒称readiness。
-- 最新路由 `$sub-agents` runner子进程；gpt-6-sol plan/implement/fix，MiMo/MiMo-flash同时独立review，root总控裁决；显式绝对cwd、全新独立output/stderr、完整结构化/tool/exit/current读取和源码核准。历史Kimi/DS原证据不改。
-- 用户最新停止点：闭环PR findings后更新handoff prompt3并停。本轮不实施原upload17标签/受控XBRL/最终真实CLI CI及material oracle/scenarios；准备文档仅proposal，新Agent最终head重绑正式计划/审查后执行。
-- Gateflow按完整可验证行为增量尽量少slice，默认避免WU>3且超过需说明，不按文件/owner/finding机械切；减少slice不得跳/合/重排gates。既有裁决优先，任何成立新修复立即登记artifact与三controller。
+- 唯一主树codex/upload-material-oracle；local source0d8+已复审AG01五件delta，remote/PR3a待普通push，mainfac32未动。
+- F1 rejected；F2/F3/F4/F6/F7已闭环，F5单完整S1/IV01–05/AG01均已修。aggregate双路MiMo/MiMo-flash终态outer0，root全工具及86+37SHA核准，aggregatepass见 pr-197-r1-f5-aggregate-review-final-adjudication-20261002.md。1747passed/fullpyright0/23prod>=80，未执行最终CLI。
+- 无活动runner/产品writer；下一accepted deepreview commit→普通push已有draftPR197→精确OID正式PRreview→acceptedPRreviewcommit/push→finalcloseout/handoff后停。不冒PRgate/full715/最终CI通过。
+- `$sub-agents`外部runner，gpt-6-sol plan/implement/fix，MiMo/MiMo-flash双路独立并行review，绝对cwd、独立output/stderr、root结构化核收自行裁决。Gateflow完整行为slice尽量少/默认避免WU>3并解释，不按文件模块owner机械拆。
+- 原17标签+受控XBRL+最终真实CLI/materialoracle/scenarios交新Agent；7prepared为proposal，未实施。
 <!-- PR197_LIVE_GATE_STATUS_END -->
 
 

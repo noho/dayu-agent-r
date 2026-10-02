@@ -85,3 +85,231 @@
 - **当前唯一writer**：MiMo86817/MiMo-flash57771均outer0并完成root裁决；IV01–04确认已修，IV05唯一成立的新finding。Sol62127已启动同F5-S1必要codefix，90输入/6允许文件，不新slice/不实施原队列。完整审查裁决 pr-197-r1-f5-code-review-root-adjudication-20261002.md；当前无gatepass/未提交。
 - **最新 IV05 作者终态**：Sol62127 outer0/root核收90current/85readonly/90originals；1703pass/fullpyright0/23生产>=80。五文件集中修复，业务data不改；正式MiMo74472/MiMo-flash17916同版re-review在途（freeze4260ccb8），无产品writer，未codepass/commit。核收 pr-197-r1-f5-iv05-author-root-acceptance-20261002.md。
 <!-- PR197_LIVE_GATE_STATUS_END -->
+
+## Aggregate AG01核实后替换的旧活动块（历史，不是当前指令）
+
+来源 `docs/gateflow/pr-197-review-repair-adjudication-20260930.md`；旧块SHA256 `030900f62fa42ed062b478a7f313e91ee25e84961d13406ebcd9b5f4a0d74c98`。
+
+```markdown
+<!-- PR197_LIVE_GATE_STATUS_START -->
+## 当前总控状态（2026-10-02T10:55:26.181796+08:00）
+
+- 唯一开发主树 `/Users/leo/workspace/dayu-agent-r` / `codex/upload-material-oracle`；main不动，不创建其它branch/worktree/clone/detached。现有PR197保持OPEN/draft，用户手工merge。
+- F1 rejected；F2/F3/F4/F6/F7已闭环进PR，证据 pr-197-findings-except-f5-final-closeout-20261001.md。
+- F5仍单完整F5-S1，严格用户“推断失败继续A、明确B未知、不猜财期”；IV01–05均已修并正式同版双审/复审，总控 code gate PASS。完整裁决 pr-197-r1-f5-s1-code-review-final-adjudication-20261002.md。
+- 最新实现1703pass/fullpyright0/23生产>=80；root41pass，MiMo121pass+103probe/fulltypes0，MiMo-flash110pass/probe/fulltypes0。六官方Raw及关键验证原件正式可Git移交。没有丢弃旧失败/裁决/源码，历史在原artifact和 pr-197-controller-live-status-history-20261002.md。
+- 当前无活动runner/产品writer。下一动作accepted F5-S1 commit→aggregate deepreview→现有draftPR push→PR review/fix/re-review→accepted PRreview commit/push→final closeout/handoff。尚未aggregate/PR/finalcloseout pass，不冒称readiness。
+- 最新路由 `$sub-agents` runner子进程；gpt-6-sol plan/implement/fix，MiMo/MiMo-flash同时独立review，root总控裁决；显式绝对cwd、全新独立output/stderr、完整结构化/tool/exit/current读取和源码核准。历史Kimi/DS原证据不改。
+- 用户最新停止点：闭环PR findings后更新handoff prompt3并停。本轮不实施原upload17标签/受控XBRL/最终真实CLI CI及material oracle/scenarios；准备文档仅proposal，新Agent最终head重绑正式计划/审查后执行。
+- Gateflow按完整可验证行为增量尽量少slice，默认避免WU>3且超过需说明，不按文件/owner/finding机械切；减少slice不得跳/合/重排gates。既有裁决优先，任何成立新修复立即登记artifact与三controller。
+- **当前aggregate在途**：accepted F5-S1 commit `0d8de8cb6bfdf490b6d790611e9547bb48d44560`；MiMo55260与MiMo-flash38354同时只读审查，freeze fa2fdee9 / 77输入+11验证；产品46及代码依赖与已验证1703版逐字相同，现无产品writer。PR当前仍3a，aggregate通过后普通push；不冒称本地/远端已同步或最终pass。
+- **新增F5-AG01**：MiMo aggregate报告published读root从严格ticker identity校验改成仅路径计算，坏descriptor被当空/正常。needs-more-evidence/未修，中；owner storage published-read边界；同F5aggregate集中fix，不另WU/slice。独立登记 pr-197-r1-f5-aggregate-identity-read-finding-20261002.md；root独立复现中，MiMo-flash仍在途，冻结产品不改/未aggregatepass。
+<!-- PR197_LIVE_GATE_STATUS_END -->
+```
+
+来源 `docs/gateflow/upload-material-issue-198-repair-sequence-20260928.md`；旧块SHA256 `030900f62fa42ed062b478a7f313e91ee25e84961d13406ebcd9b5f4a0d74c98`。
+
+```markdown
+<!-- PR197_LIVE_GATE_STATUS_START -->
+## 当前总控状态（2026-10-02T10:55:26.181796+08:00）
+
+- 唯一开发主树 `/Users/leo/workspace/dayu-agent-r` / `codex/upload-material-oracle`；main不动，不创建其它branch/worktree/clone/detached。现有PR197保持OPEN/draft，用户手工merge。
+- F1 rejected；F2/F3/F4/F6/F7已闭环进PR，证据 pr-197-findings-except-f5-final-closeout-20261001.md。
+- F5仍单完整F5-S1，严格用户“推断失败继续A、明确B未知、不猜财期”；IV01–05均已修并正式同版双审/复审，总控 code gate PASS。完整裁决 pr-197-r1-f5-s1-code-review-final-adjudication-20261002.md。
+- 最新实现1703pass/fullpyright0/23生产>=80；root41pass，MiMo121pass+103probe/fulltypes0，MiMo-flash110pass/probe/fulltypes0。六官方Raw及关键验证原件正式可Git移交。没有丢弃旧失败/裁决/源码，历史在原artifact和 pr-197-controller-live-status-history-20261002.md。
+- 当前无活动runner/产品writer。下一动作accepted F5-S1 commit→aggregate deepreview→现有draftPR push→PR review/fix/re-review→accepted PRreview commit/push→final closeout/handoff。尚未aggregate/PR/finalcloseout pass，不冒称readiness。
+- 最新路由 `$sub-agents` runner子进程；gpt-6-sol plan/implement/fix，MiMo/MiMo-flash同时独立review，root总控裁决；显式绝对cwd、全新独立output/stderr、完整结构化/tool/exit/current读取和源码核准。历史Kimi/DS原证据不改。
+- 用户最新停止点：闭环PR findings后更新handoff prompt3并停。本轮不实施原upload17标签/受控XBRL/最终真实CLI CI及material oracle/scenarios；准备文档仅proposal，新Agent最终head重绑正式计划/审查后执行。
+- Gateflow按完整可验证行为增量尽量少slice，默认避免WU>3且超过需说明，不按文件/owner/finding机械切；减少slice不得跳/合/重排gates。既有裁决优先，任何成立新修复立即登记artifact与三controller。
+- **当前aggregate在途**：accepted F5-S1 commit `0d8de8cb6bfdf490b6d790611e9547bb48d44560`；MiMo55260与MiMo-flash38354同时只读审查，freeze fa2fdee9 / 77输入+11验证；产品46及代码依赖与已验证1703版逐字相同，现无产品writer。PR当前仍3a，aggregate通过后普通push；不冒称本地/远端已同步或最终pass。
+- **新增F5-AG01**：MiMo aggregate报告published读root从严格ticker identity校验改成仅路径计算，坏descriptor被当空/正常。needs-more-evidence/未修，中；owner storage published-read边界；同F5aggregate集中fix，不另WU/slice。独立登记 pr-197-r1-f5-aggregate-identity-read-finding-20261002.md；root独立复现中，MiMo-flash仍在途，冻结产品不改/未aggregatepass。
+<!-- PR197_LIVE_GATE_STATUS_END -->
+```
+
+来源 `docs/upload_material_repair_handoff_prompt_3.md`；旧块SHA256 `030900f62fa42ed062b478a7f313e91ee25e84961d13406ebcd9b5f4a0d74c98`。
+
+```markdown
+<!-- PR197_LIVE_GATE_STATUS_START -->
+## 当前总控状态（2026-10-02T10:55:26.181796+08:00）
+
+- 唯一开发主树 `/Users/leo/workspace/dayu-agent-r` / `codex/upload-material-oracle`；main不动，不创建其它branch/worktree/clone/detached。现有PR197保持OPEN/draft，用户手工merge。
+- F1 rejected；F2/F3/F4/F6/F7已闭环进PR，证据 pr-197-findings-except-f5-final-closeout-20261001.md。
+- F5仍单完整F5-S1，严格用户“推断失败继续A、明确B未知、不猜财期”；IV01–05均已修并正式同版双审/复审，总控 code gate PASS。完整裁决 pr-197-r1-f5-s1-code-review-final-adjudication-20261002.md。
+- 最新实现1703pass/fullpyright0/23生产>=80；root41pass，MiMo121pass+103probe/fulltypes0，MiMo-flash110pass/probe/fulltypes0。六官方Raw及关键验证原件正式可Git移交。没有丢弃旧失败/裁决/源码，历史在原artifact和 pr-197-controller-live-status-history-20261002.md。
+- 当前无活动runner/产品writer。下一动作accepted F5-S1 commit→aggregate deepreview→现有draftPR push→PR review/fix/re-review→accepted PRreview commit/push→final closeout/handoff。尚未aggregate/PR/finalcloseout pass，不冒称readiness。
+- 最新路由 `$sub-agents` runner子进程；gpt-6-sol plan/implement/fix，MiMo/MiMo-flash同时独立review，root总控裁决；显式绝对cwd、全新独立output/stderr、完整结构化/tool/exit/current读取和源码核准。历史Kimi/DS原证据不改。
+- 用户最新停止点：闭环PR findings后更新handoff prompt3并停。本轮不实施原upload17标签/受控XBRL/最终真实CLI CI及material oracle/scenarios；准备文档仅proposal，新Agent最终head重绑正式计划/审查后执行。
+- Gateflow按完整可验证行为增量尽量少slice，默认避免WU>3且超过需说明，不按文件/owner/finding机械切；减少slice不得跳/合/重排gates。既有裁决优先，任何成立新修复立即登记artifact与三controller。
+- **当前aggregate在途**：accepted F5-S1 commit `0d8de8cb6bfdf490b6d790611e9547bb48d44560`；MiMo55260与MiMo-flash38354同时只读审查，freeze fa2fdee9 / 77输入+11验证；产品46及代码依赖与已验证1703版逐字相同，现无产品writer。PR当前仍3a，aggregate通过后普通push；不冒称本地/远端已同步或最终pass。
+- **新增F5-AG01**：MiMo aggregate报告published读root从严格ticker identity校验改成仅路径计算，坏descriptor被当空/正常。needs-more-evidence/未修，中；owner storage published-read边界；同F5aggregate集中fix，不另WU/slice。独立登记 pr-197-r1-f5-aggregate-identity-read-finding-20261002.md；root独立复现中，MiMo-flash仍在途，冻结产品不改/未aggregatepass。
+<!-- PR197_LIVE_GATE_STATUS_END -->
+```
+
+
+## Sol aggregate fix派发前旧活动块：docs/gateflow/pr-197-review-repair-adjudication-20260930.md
+
+SHA256 `7ff1e8c06b573217289ba5ff5778f298b68c53441f19b7efcb1f4e8007fd2399`，历史不是当前指令。
+
+```markdown
+<!-- PR197_LIVE_GATE_STATUS_START -->
+## 当前总控状态（2026-10-02T11:56:26.088088+08:00）
+
+- 唯一主树 `/Users/leo/workspace/dayu-agent-r` / `codex/upload-material-oracle`；main不动、不创建branch/worktree/clone/detached。PR197 OPEN/draft，用户手工merge。
+- F1 rejected；F2/F3/F4/F6/F7已闭环进PR，见 `pr-197-findings-except-f5-final-closeout-20261001.md`。F5单完整S1 code review/fix/re-review pass，accepted commit `0d8de8cb6bfdf490b6d790611e9547bb48d44560`，IV01–05已修；同公司可信年度能推断则推断，失败保A列B未知不猜财期，用户裁决不重开。
+- 当前未完成gate：F5 aggregate deepreview / fix / re-review。MiMo55260已outer0并root核收，唯一material项 F5-AG01 已root真实Fs独立复现并裁 accepted/未修复/中（published reads绕tickerdescriptor校验）；正式artifact `pr-197-r1-f5-aggregate-identity-read-finding-20261002.md`，关键原件 `evidence/pr197-f5-aggregate-20261002/`。
+- 唯一活动runner：MiMo-flash38354只读aggregate审查，freeze77源码+11验证原件无漂移。Sol AG01集中fix预检已ok但尚未启动；待审查终态解除读取租约后派发，不并发改冻结产品、不另切slice。
+- 当前S1源码真实1703pass/3warnings/fullpyright0/23生产单文件>=80；是已验证字节的历史code证据，AG01改生产后需重新验证，不能把旧结果冒新pass。六官方Raw/源及旧失败、裁决历史均保全。
+- local HEAD0d8de8cb；live远端/PR197 head3a836a46，main local/remote/basefac32未动。等aggregate accepted再普通push；不冒称现在同步、PR gate/readiness/finalcloseout pass。
+- 最新 `$sub-agents` runner：gpt-6-sol plan/implement/fix，MiMo/MiMo-flash同时独立review，总控自行裁决；绝对cwd、独立output/stderr、managedexit/fullstructured/tools/errors/current校验及源码验证。旧Kimi/DS历史不改。
+- 用户停点：闭环PRreview findings，更新handoff3后停。原17upload标签/受控XBRL/最终真实CLI CI/material oracle与scenarios全部交新Agent；七preparations仅proposal未accepted/实施。
+- Gateflow slice按完整可验证行为增量、尽量少，默认避免WU>3且超过说明原因，不按file/module/owner/finding机械拆；减少slice不跳/合/重排gates。所有成立修复立即登记artifact与总队列，不为非关键文案另开loop。
+
+<!-- PR197_LIVE_GATE_STATUS_END -->
+```
+
+## Sol aggregate fix派发前旧活动块：docs/gateflow/upload-material-issue-198-repair-sequence-20260928.md
+
+SHA256 `7ff1e8c06b573217289ba5ff5778f298b68c53441f19b7efcb1f4e8007fd2399`，历史不是当前指令。
+
+```markdown
+<!-- PR197_LIVE_GATE_STATUS_START -->
+## 当前总控状态（2026-10-02T11:56:26.088088+08:00）
+
+- 唯一主树 `/Users/leo/workspace/dayu-agent-r` / `codex/upload-material-oracle`；main不动、不创建branch/worktree/clone/detached。PR197 OPEN/draft，用户手工merge。
+- F1 rejected；F2/F3/F4/F6/F7已闭环进PR，见 `pr-197-findings-except-f5-final-closeout-20261001.md`。F5单完整S1 code review/fix/re-review pass，accepted commit `0d8de8cb6bfdf490b6d790611e9547bb48d44560`，IV01–05已修；同公司可信年度能推断则推断，失败保A列B未知不猜财期，用户裁决不重开。
+- 当前未完成gate：F5 aggregate deepreview / fix / re-review。MiMo55260已outer0并root核收，唯一material项 F5-AG01 已root真实Fs独立复现并裁 accepted/未修复/中（published reads绕tickerdescriptor校验）；正式artifact `pr-197-r1-f5-aggregate-identity-read-finding-20261002.md`，关键原件 `evidence/pr197-f5-aggregate-20261002/`。
+- 唯一活动runner：MiMo-flash38354只读aggregate审查，freeze77源码+11验证原件无漂移。Sol AG01集中fix预检已ok但尚未启动；待审查终态解除读取租约后派发，不并发改冻结产品、不另切slice。
+- 当前S1源码真实1703pass/3warnings/fullpyright0/23生产单文件>=80；是已验证字节的历史code证据，AG01改生产后需重新验证，不能把旧结果冒新pass。六官方Raw/源及旧失败、裁决历史均保全。
+- local HEAD0d8de8cb；live远端/PR197 head3a836a46，main local/remote/basefac32未动。等aggregate accepted再普通push；不冒称现在同步、PR gate/readiness/finalcloseout pass。
+- 最新 `$sub-agents` runner：gpt-6-sol plan/implement/fix，MiMo/MiMo-flash同时独立review，总控自行裁决；绝对cwd、独立output/stderr、managedexit/fullstructured/tools/errors/current校验及源码验证。旧Kimi/DS历史不改。
+- 用户停点：闭环PRreview findings，更新handoff3后停。原17upload标签/受控XBRL/最终真实CLI CI/material oracle与scenarios全部交新Agent；七preparations仅proposal未accepted/实施。
+- Gateflow slice按完整可验证行为增量、尽量少，默认避免WU>3且超过说明原因，不按file/module/owner/finding机械拆；减少slice不跳/合/重排gates。所有成立修复立即登记artifact与总队列，不为非关键文案另开loop。
+
+<!-- PR197_LIVE_GATE_STATUS_END -->
+```
+
+## Sol aggregate fix派发前旧活动块：docs/upload_material_repair_handoff_prompt_3.md
+
+SHA256 `7ff1e8c06b573217289ba5ff5778f298b68c53441f19b7efcb1f4e8007fd2399`，历史不是当前指令。
+
+```markdown
+<!-- PR197_LIVE_GATE_STATUS_START -->
+## 当前总控状态（2026-10-02T11:56:26.088088+08:00）
+
+- 唯一主树 `/Users/leo/workspace/dayu-agent-r` / `codex/upload-material-oracle`；main不动、不创建branch/worktree/clone/detached。PR197 OPEN/draft，用户手工merge。
+- F1 rejected；F2/F3/F4/F6/F7已闭环进PR，见 `pr-197-findings-except-f5-final-closeout-20261001.md`。F5单完整S1 code review/fix/re-review pass，accepted commit `0d8de8cb6bfdf490b6d790611e9547bb48d44560`，IV01–05已修；同公司可信年度能推断则推断，失败保A列B未知不猜财期，用户裁决不重开。
+- 当前未完成gate：F5 aggregate deepreview / fix / re-review。MiMo55260已outer0并root核收，唯一material项 F5-AG01 已root真实Fs独立复现并裁 accepted/未修复/中（published reads绕tickerdescriptor校验）；正式artifact `pr-197-r1-f5-aggregate-identity-read-finding-20261002.md`，关键原件 `evidence/pr197-f5-aggregate-20261002/`。
+- 唯一活动runner：MiMo-flash38354只读aggregate审查，freeze77源码+11验证原件无漂移。Sol AG01集中fix预检已ok但尚未启动；待审查终态解除读取租约后派发，不并发改冻结产品、不另切slice。
+- 当前S1源码真实1703pass/3warnings/fullpyright0/23生产单文件>=80；是已验证字节的历史code证据，AG01改生产后需重新验证，不能把旧结果冒新pass。六官方Raw/源及旧失败、裁决历史均保全。
+- local HEAD0d8de8cb；live远端/PR197 head3a836a46，main local/remote/basefac32未动。等aggregate accepted再普通push；不冒称现在同步、PR gate/readiness/finalcloseout pass。
+- 最新 `$sub-agents` runner：gpt-6-sol plan/implement/fix，MiMo/MiMo-flash同时独立review，总控自行裁决；绝对cwd、独立output/stderr、managedexit/fullstructured/tools/errors/current校验及源码验证。旧Kimi/DS历史不改。
+- 用户停点：闭环PRreview findings，更新handoff3后停。原17upload标签/受控XBRL/最终真实CLI CI/material oracle与scenarios全部交新Agent；七preparations仅proposal未accepted/实施。
+- Gateflow slice按完整可验证行为增量、尽量少，默认避免WU>3且超过说明原因，不按file/module/owner/finding机械拆；减少slice不跳/合/重排gates。所有成立修复立即登记artifact与总队列，不为非关键文案另开loop。
+
+<!-- PR197_LIVE_GATE_STATUS_END -->
+```
+
+## Aggregate re-review开始前旧活动块：docs/gateflow/pr-197-review-repair-adjudication-20260930.md
+
+历史，SHA256 `d0f969323df92f2f3b1d3c7e27df47b49d3187d31c4820b0ffa3e930c1b57569`。
+
+```markdown
+<!-- PR197_LIVE_GATE_STATUS_START -->
+## 当前总控状态（2026-10-02T12:38:25.967389+08:00）
+
+- F1 rejected；F2/F3/F4/F6/F7已闭环；F5单完整S1 accepted commit0d8de8cb（IV01–05已修），用户财期裁决不重开。
+- 当前gate F5 aggregate fix/re-review：初审双路均terminal，MiMo55260与MiMo-flash38354已root逐条核收；唯一成立项AG01 accepted/未修复，published读缺tickerdescriptor原严格校验，root真实Fs完整A/B独立复现。详`pr-197-r1-f5-aggregate-initial-root-adjudication-20261002.md`、`pr-197-r1-f5-aggregate-identity-read-finding-20261002.md`、正式evidence目录。
+- 唯一活动runner/产品writer为Sol17484（pr197-f5-aggregate-fix-sol-20261002-01），在主树集中修AG01owner及判别回归；两审已结束读取租约，root只核旧事件/报告与不变依赖，不并发改源码。改后新22完整回归/fullpyright/23覆盖须核准，1703旧证据不冒新pass。
+- 下一未完成动作：作者交付/root核收→同版MiMo/MiMo-flash双路aggregate复审→accepteddeepreviewcommit→普通push现有draftPR197→正式PRreview/fix/re-review→acceptedPRreviewcommit/push→finalcloseout/handoff后停。后续审查按精确delta+逐件samebytes复用已审面，CLI原生effort medium；不跳/合/重排gates。
+- 唯一主树 /Users/leo/workspace/dayu-agent-r / codex/upload-material-oracle；main local/remote/basefac32未动，不新branch/worktree/clone/detached；local0d8，live远端/PR197仍3a。OPEN/draft，用户手工merge，尚未aggregate/PR/finalcloseout/readiness pass。
+- `$sub-agents`外部runner，gpt-6-sol plan/implement/fix，MiMo/MiMo-flash同时独立review，root自行裁决；绝对cwd、独立output/stderr、真实managedexit/fullstructured/tools/current读取及源码验证。所有成立修复artifact先登记。
+- 用户停点闭环PRfindings后交接；原17upload/XBRL/最终真实CLI及material oracle/scenarios均留新Agent，七prepared资料仅proposal未accepted/实施。Gateflow最少完整行为slice，不按file/module/owner/finding机械拆，默认避免WU>3且超过解释；既有裁决优先。
+
+<!-- PR197_LIVE_GATE_STATUS_END -->
+```
+
+## Aggregate re-review开始前旧活动块：docs/gateflow/upload-material-issue-198-repair-sequence-20260928.md
+
+历史，SHA256 `ecb24b4d17ac90e8d966310e4ac0a9eff71c7107a7e62b8f8fda928a02719a5d`。
+
+```markdown
+<!-- PR197_LIVE_GATE_STATUS_START -->
+## 当前总控状态（2026-10-02T12:38:25.968400+08:00）
+
+- F1 rejected；F2/F3/F4/F6/F7已闭环；F5单完整S1 accepted commit0d8de8cb（IV01–05已修），用户财期裁决不重开。
+- 当前gate F5 aggregate fix/re-review：初审双路均terminal，MiMo55260与MiMo-flash38354已root逐条核收；唯一成立项AG01 accepted/未修复，published读缺tickerdescriptor原严格校验，root真实Fs完整A/B独立复现。详`pr-197-r1-f5-aggregate-initial-root-adjudication-20261002.md`、`pr-197-r1-f5-aggregate-identity-read-finding-20261002.md`、正式evidence目录。
+- 唯一活动runner/产品writer为Sol17484（pr197-f5-aggregate-fix-sol-20261002-01），在主树集中修AG01owner及判别回归；两审已结束读取租约，root只核旧事件/报告与不变依赖，不并发改源码。改后新22完整回归/fullpyright/23覆盖须核准，1703旧证据不冒新pass。
+- 下一未完成动作：作者交付/root核收→同版MiMo/MiMo-flash双路aggregate复审→accepteddeepreviewcommit→普通push现有draftPR197→正式PRreview/fix/re-review→acceptedPRreviewcommit/push→finalcloseout/handoff后停。后续审查按精确delta+逐件samebytes复用已审面，CLI原生effort medium；不跳/合/重排gates。
+- 唯一主树 /Users/leo/workspace/dayu-agent-r / codex/upload-material-oracle；main local/remote/basefac32未动，不新branch/worktree/clone/detached；local0d8，live远端/PR197仍3a。OPEN/draft，用户手工merge，尚未aggregate/PR/finalcloseout/readiness pass。
+- `$sub-agents`外部runner，gpt-6-sol plan/implement/fix，MiMo/MiMo-flash同时独立review，root自行裁决；绝对cwd、独立output/stderr、真实managedexit/fullstructured/tools/current读取及源码验证。所有成立修复artifact先登记。
+- 用户停点闭环PRfindings后交接；原17upload/XBRL/最终真实CLI及material oracle/scenarios均留新Agent，七prepared资料仅proposal未accepted/实施。Gateflow最少完整行为slice，不按file/module/owner/finding机械拆，默认避免WU>3且超过解释；既有裁决优先。
+
+<!-- PR197_LIVE_GATE_STATUS_END -->
+```
+
+## Aggregate re-review开始前旧活动块：docs/upload_material_repair_handoff_prompt_3.md
+
+历史，SHA256 `6a9c7e9586cb67e53c5bc03565d9326f0d3ffde56c76836a958b6e06845912e1`。
+
+```markdown
+<!-- PR197_LIVE_GATE_STATUS_START -->
+## 当前总控状态（2026-10-02T12:38:25.968925+08:00）
+
+- F1 rejected；F2/F3/F4/F6/F7已闭环；F5单完整S1 accepted commit0d8de8cb（IV01–05已修），用户财期裁决不重开。
+- 当前gate F5 aggregate fix/re-review：初审双路均terminal，MiMo55260与MiMo-flash38354已root逐条核收；唯一成立项AG01 accepted/未修复，published读缺tickerdescriptor原严格校验，root真实Fs完整A/B独立复现。详`pr-197-r1-f5-aggregate-initial-root-adjudication-20261002.md`、`pr-197-r1-f5-aggregate-identity-read-finding-20261002.md`、正式evidence目录。
+- 唯一活动runner/产品writer为Sol17484（pr197-f5-aggregate-fix-sol-20261002-01），在主树集中修AG01owner及判别回归；两审已结束读取租约，root只核旧事件/报告与不变依赖，不并发改源码。改后新22完整回归/fullpyright/23覆盖须核准，1703旧证据不冒新pass。
+- 下一未完成动作：作者交付/root核收→同版MiMo/MiMo-flash双路aggregate复审→accepteddeepreviewcommit→普通push现有draftPR197→正式PRreview/fix/re-review→acceptedPRreviewcommit/push→finalcloseout/handoff后停。后续审查按精确delta+逐件samebytes复用已审面，CLI原生effort medium；不跳/合/重排gates。
+- 唯一主树 /Users/leo/workspace/dayu-agent-r / codex/upload-material-oracle；main local/remote/basefac32未动，不新branch/worktree/clone/detached；local0d8，live远端/PR197仍3a。OPEN/draft，用户手工merge，尚未aggregate/PR/finalcloseout/readiness pass。
+- `$sub-agents`外部runner，gpt-6-sol plan/implement/fix，MiMo/MiMo-flash同时独立review，root自行裁决；绝对cwd、独立output/stderr、真实managedexit/fullstructured/tools/current读取及源码验证。所有成立修复artifact先登记。
+- 用户停点闭环PRfindings后交接；原17upload/XBRL/最终真实CLI及material oracle/scenarios均留新Agent，七prepared资料仅proposal未accepted/实施。Gateflow最少完整行为slice，不按file/module/owner/finding机械拆，默认避免WU>3且超过解释；既有裁决优先。
+
+<!-- PR197_LIVE_GATE_STATUS_END -->
+```
+
+## 2026-10-02T13:16:59.286911 / docs/gateflow/pr-197-review-repair-adjudication-20260930.md
+
+原块 SHA256 `ece830c808c8c55cdb69c322addbde13da5c6fe73fb32ad6eb8cb20befb70c83`；以下逐字历史，不是当前入口。
+
+<!-- PR197_LIVE_GATE_STATUS_START -->
+## 当前总控状态（2026-10-02T13:05:55.460821+08:00）
+
+- 唯一主树/branch /Users/leo/workspace/dayu-agent-r / codex/upload-material-oracle；mainfac32未动，不新branch/worktree/clone/detached，PR197 OPEN/draft、用户merge；local0d8、livePR/远端3a，尚未同步更新F5源码。
+- F1 rejected；F2/F3/F4/F6/F7已闭环。F5单完整S1 accepted0d8，IV01–05已修，用户“能推断则推断，失败保A列B未知不猜”及窗口裁决不重开。
+- 当前gate F5 aggregate fix/re-review：唯一成立AG01代码候选已修并root核收，正式作者/根因/核收见 pr-197-r1-f5-aggregate-fix-implementation-20261002.md、aggregate-identity-read-finding、aggregate-fix-author-root-acceptance。最终1747pass/3warnings/fullpyright0/23production>=80，root独立44pass，75readonly+11旧验证未动；正式新验证原件 evidence/pr197-f5-aggregate-fix-20261002/。
+- 当前仅MiMo31581/MiMo-flash83919同时独立只读复审（86source，validation37；freeze8237a42a），无产品writer；AG01最终状态待复审，未aggregatepass。审查聚焦5件fixdelta+必要集成，unchanged面逐件samebytes复用，原生effort medium，完整tool/exit/current读取核准后root独裁。
+- 下一：同版复审收取裁决→accepteddeepreviewcommit→普通push现有draftPR197→精确OID PRreview/fix/re-review→acceptedPRreviewcommit/push→finalcloseout/handoff后停。不跳/合/重排门禁，不冒真实CLI/全715PR/readiness pass。
+- `$sub-agents`外部runner，gpt-6-sol plan/implement/fix，MiMo/MiMo-flash两路同时独立review，总控自行裁决；绝对cwd、新独立output/stderr、managed终态/全structured/error和源码验证。禁ps/pgrep/kill-0，模型未暴露则unknown，不以profile或进程补造。
+- 原17upload标签/受控XBRL/最终真实CLI＋material oracle/scenarios交新Agent；7prepared资料未accepted/实施。Gateflow按完整可验证行为增量尽量少slice，默认避免WU>3且超过解释，不按file/module/owner/finding机械拆；必要修复立即artifact登记，同WU集中收尾，既有裁决优先。
+<!-- PR197_LIVE_GATE_STATUS_END -->
+
+## 2026-10-02T13:16:59.286911 / docs/gateflow/upload-material-issue-198-repair-sequence-20260928.md
+
+原块 SHA256 `717cd799705c4868f80043bc330ace186132710e2ac77b5b193e14da44dd7c4f`；以下逐字历史，不是当前入口。
+
+<!-- PR197_LIVE_GATE_STATUS_START -->
+## 当前总控状态（2026-10-02T13:05:55.462008+08:00）
+
+- 唯一主树/branch /Users/leo/workspace/dayu-agent-r / codex/upload-material-oracle；mainfac32未动，不新branch/worktree/clone/detached，PR197 OPEN/draft、用户merge；local0d8、livePR/远端3a，尚未同步更新F5源码。
+- F1 rejected；F2/F3/F4/F6/F7已闭环。F5单完整S1 accepted0d8，IV01–05已修，用户“能推断则推断，失败保A列B未知不猜”及窗口裁决不重开。
+- 当前gate F5 aggregate fix/re-review：唯一成立AG01代码候选已修并root核收，正式作者/根因/核收见 pr-197-r1-f5-aggregate-fix-implementation-20261002.md、aggregate-identity-read-finding、aggregate-fix-author-root-acceptance。最终1747pass/3warnings/fullpyright0/23production>=80，root独立44pass，75readonly+11旧验证未动；正式新验证原件 evidence/pr197-f5-aggregate-fix-20261002/。
+- 当前仅MiMo31581/MiMo-flash83919同时独立只读复审（86source，validation37；freeze8237a42a），无产品writer；AG01最终状态待复审，未aggregatepass。审查聚焦5件fixdelta+必要集成，unchanged面逐件samebytes复用，原生effort medium，完整tool/exit/current读取核准后root独裁。
+- 下一：同版复审收取裁决→accepteddeepreviewcommit→普通push现有draftPR197→精确OID PRreview/fix/re-review→acceptedPRreviewcommit/push→finalcloseout/handoff后停。不跳/合/重排门禁，不冒真实CLI/全715PR/readiness pass。
+- `$sub-agents`外部runner，gpt-6-sol plan/implement/fix，MiMo/MiMo-flash两路同时独立review，总控自行裁决；绝对cwd、新独立output/stderr、managed终态/全structured/error和源码验证。禁ps/pgrep/kill-0，模型未暴露则unknown，不以profile或进程补造。
+- 原17upload标签/受控XBRL/最终真实CLI＋material oracle/scenarios交新Agent；7prepared资料未accepted/实施。Gateflow按完整可验证行为增量尽量少slice，默认避免WU>3且超过解释，不按file/module/owner/finding机械拆；必要修复立即artifact登记，同WU集中收尾，既有裁决优先。
+<!-- PR197_LIVE_GATE_STATUS_END -->
+
+## 2026-10-02T13:16:59.286911 / docs/upload_material_repair_handoff_prompt_3.md
+
+原块 SHA256 `3494d2578b1785931b9ecf8786fb2b1e89bda8df4fd4b4e6686265492edb6905`；以下逐字历史，不是当前入口。
+
+<!-- PR197_LIVE_GATE_STATUS_START -->
+## 当前总控状态（2026-10-02T13:05:55.462710+08:00）
+
+- 唯一主树/branch /Users/leo/workspace/dayu-agent-r / codex/upload-material-oracle；mainfac32未动，不新branch/worktree/clone/detached，PR197 OPEN/draft、用户merge；local0d8、livePR/远端3a，尚未同步更新F5源码。
+- F1 rejected；F2/F3/F4/F6/F7已闭环。F5单完整S1 accepted0d8，IV01–05已修，用户“能推断则推断，失败保A列B未知不猜”及窗口裁决不重开。
+- 当前gate F5 aggregate fix/re-review：唯一成立AG01代码候选已修并root核收，正式作者/根因/核收见 pr-197-r1-f5-aggregate-fix-implementation-20261002.md、aggregate-identity-read-finding、aggregate-fix-author-root-acceptance。最终1747pass/3warnings/fullpyright0/23production>=80，root独立44pass，75readonly+11旧验证未动；正式新验证原件 evidence/pr197-f5-aggregate-fix-20261002/。
+- 当前仅MiMo31581/MiMo-flash83919同时独立只读复审（86source，validation37；freeze8237a42a），无产品writer；AG01最终状态待复审，未aggregatepass。审查聚焦5件fixdelta+必要集成，unchanged面逐件samebytes复用，原生effort medium，完整tool/exit/current读取核准后root独裁。
+- 下一：同版复审收取裁决→accepteddeepreviewcommit→普通push现有draftPR197→精确OID PRreview/fix/re-review→acceptedPRreviewcommit/push→finalcloseout/handoff后停。不跳/合/重排门禁，不冒真实CLI/全715PR/readiness pass。
+- `$sub-agents`外部runner，gpt-6-sol plan/implement/fix，MiMo/MiMo-flash两路同时独立review，总控自行裁决；绝对cwd、新独立output/stderr、managed终态/全structured/error和源码验证。禁ps/pgrep/kill-0，模型未暴露则unknown，不以profile或进程补造。
+- 原17upload标签/受控XBRL/最终真实CLI＋material oracle/scenarios交新Agent；7prepared资料未accepted/实施。Gateflow按完整可验证行为增量尽量少slice，默认避免WU>3且超过解释，不按file/module/owner/finding机械拆；必要修复立即artifact登记，同WU集中收尾，既有裁决优先。
+<!-- PR197_LIVE_GATE_STATUS_END -->

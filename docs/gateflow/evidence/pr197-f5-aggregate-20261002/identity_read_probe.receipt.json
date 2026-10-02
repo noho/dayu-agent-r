@@ -1,0 +1,10 @@
+{
+  "first_setup_exit": 1,
+  "first_setup_reason": "script entry sys.path lacks repo tests; PYTHONPATH explicit corrected before fresh real probe",
+  "successful_probe_exit": 0,
+  "command": "source .venv/bin/activate; PYTHONPATH=/Users/leo/workspace/dayu-agent-r python workspace/tmp/pr197-f5-aggregate-20261002/root-validation/identity_read_probe.py /Users/leo/workspace/dayu-agent-r/workspace/tmp/pr197-f5-aggregate-20261002/root-validation/identity-probe-workspace-02",
+  "output_sha256": "079c558062173b539fbc6667924b07b8c3337f24a6a29d67a4befc7ffdfade35",
+  "stderr_bytes": 0,
+  "decision": "accepted / 未修复 F5-AG01",
+  "published_source_unchanged": true
+}

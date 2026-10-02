@@ -6,25 +6,36 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.domain.document_models import SourceDocumentStateChangeRequest
 from dayu.fins.downloaders import hkexnews_downloader as hk
 from dayu.fins.pipelines.cn_download_models import CnReportPeriodProjection, CnReportHeadMeta, HkexnewsRawAnnouncement
 from dayu.fins.pipelines.cn_report_selection import (
     hk_annual_end_date, local_hk_annual_ends, resolve_hk_report_period, select_hkexnews_report_candidates,
 )
 from dayu.fins.pipelines.hk_fiscal_calendar import relevant_annual_end_dates
-from dayu.fins.storage import FsBatchingRepository, FsDocumentBlobRepository, FsSourceDocumentRepository, SourceIntegrityStatus
+from dayu.fins.storage import (
+    CompanyTickerIdentityCorruptionError, FsBatchingRepository, FsDocumentBlobRepository,
+    FsSourceDocumentRepository, SourceIntegrityPreflightError, SourceIntegrityPreflightReason,
+    SourceIntegrityStatus,
+)
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
 from tests.fins.test_cn_report_selection import _hk_query, _hk_raw, _head_meta
 from tests.fins.test_fins_storage_atomicity import (
     _stage_meta_view_pair, _MetaViewRenameBarrier, _PublicationBarrier, _active_batch_paths,
+    _create_complete_source, _identity_descriptor_file,
 )
 
 _CAPTURE = Path(__file__).resolve().parent / "fixtures/hk_f5_official_raw"
+_TickerCorruption = Literal["missing", "malformed", "symlink", "wrong_canonical"]
+_PUBLISHED_TICKER_CORRUPTIONS: tuple[_TickerCorruption, ...] = (
+    "missing", "malformed", "symlink", "wrong_canonical",
+)
 _OFFICIAL_ASSET_HASHES: tuple[tuple[str, str], ...] = (
     ("annual-results.body", "62582cfbfa1aaeb588971f339bbbb33767420528718b916877d0e05d0c6cb94a"),
     ("annual-results.json", "f9e81c7005ec04e34c66779f45cd14fa3d3c17f961994f018471befb20c21fcf"),
@@ -33,6 +44,155 @@ _OFFICIAL_ASSET_HASHES: tuple[tuple[str, str], ...] = (
     ("owner-validation.json", "bb1ef2ffc5211ffbcdd87d28a119aa59b1b07e6c6b89b5ac4813f1d497160660"),
     ("result.json", "27a633a3bde1c1c26bd01d62d52e03b405e4d8e286fbdc7d628e5ddd94004f56"),
 )
+
+
+def _damage_published_ticker_descriptor(ticker_dir: Path, corruption: _TickerCorruption) -> None:
+    """仅损坏已发布 ticker descriptor，保留来源文档和 manifest 原字节。
+
+    参数：ticker_dir 为真实发布公司目录；corruption 为损坏形态。
+    返回：无。
+    异常：descriptor 不唯一时断言失败；文件操作异常原样传播。
+    """
+    descriptor = _identity_descriptor_file(ticker_dir)
+    if corruption == "missing":
+        descriptor.unlink()
+    elif corruption == "malformed":
+        descriptor.write_text("{}", encoding="utf-8")
+    elif corruption == "symlink":
+        outside = ticker_dir.parent.parent / "outside-descriptor.json"
+        outside.write_bytes(descriptor.read_bytes())
+        descriptor.unlink()
+        descriptor.symlink_to(outside)
+    else:
+        payload: JsonValue = json.loads(descriptor.read_text(encoding="utf-8"))
+        assert isinstance(payload, dict)
+        payload["external_identity"] = "MSFT"
+        descriptor.write_text(json.dumps(payload), encoding="utf-8")
+
+
+@pytest.mark.parametrize("corruption", _PUBLISHED_TICKER_CORRUPTIONS)
+@pytest.mark.parametrize("kind", (SourceKind.FILING, SourceKind.MATERIAL))
+@pytest.mark.parametrize("reader", ("get", "view", "list", "list_all"))
+def test_published_source_reads_reject_ticker_descriptor_corruption(
+    tmp_path: Path, corruption: _TickerCorruption, kind: SourceKind, reader: str,
+) -> None:
+    """正式发布完整来源后，三个读入口均由 ticker 身份 owner 拒绝损坏。
+
+    参数：tmp_path 为真实仓储根；corruption 为 ticker 损坏；kind 为来源类型；reader 为入口。
+    返回：无。
+    异常：错误类别漂移、损坏被当正常读取或 guard 未释放时断言失败。
+    """
+    repo = build_fs_repository_set(workspace_root=tmp_path)
+    batching = FsBatchingRepository(tmp_path, repository_set=repo)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repo)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repo)
+    batch = batching.begin_batch("AAPL")
+    _create_complete_source(source, blob, batch=batch, document_id="A", source_kind=kind)
+    batching.commit_batch(batch)
+    ticker_dir = tmp_path / "portfolio" / "AAPL"
+    descriptor = _identity_descriptor_file(ticker_dir)
+    original_descriptor = descriptor.read_bytes()
+    original_meta = source.get_source_meta("AAPL", "A", kind)
+    assert source.classify_source_integrity("AAPL", "A", kind).status is SourceIntegrityStatus.COMPLETE
+    _damage_published_ticker_descriptor(ticker_dir, corruption)
+    with pytest.raises(CompanyTickerIdentityCorruptionError) as raised:
+        if reader == "get":
+            source.get_source_meta("AAPL", "A", kind)
+        elif reader == "view":
+            source.read_source_meta_view("AAPL", kind)
+        elif reader == "list":
+            source.list_source_document_ids("AAPL", kind)
+        else:
+            repo.core.list_document_ids("AAPL")
+    assert raised.value.kind == "invalid_descriptor"
+    # 修复同一 ticker descriptor 后使用独立 core 写者，证明异常路径释放 publication guard。
+    if descriptor.is_symlink():
+        descriptor.unlink()
+    descriptor.write_bytes(original_descriptor)
+    fresh_batching = FsBatchingRepository(tmp_path)
+    next_batch = fresh_batching.begin_batch("AAPL")
+    fresh_batching.rollback_batch(next_batch)
+    assert source.get_source_meta("AAPL", "A", kind) == original_meta
+
+
+@pytest.mark.parametrize("corruption", _PUBLISHED_TICKER_CORRUPTIONS)
+@pytest.mark.parametrize("kind", (SourceKind.FILING, SourceKind.MATERIAL))
+def test_ticker_corruption_preserves_locator_integrity_and_staging_contracts(
+    tmp_path: Path, corruption: _TickerCorruption, kind: SourceKind,
+) -> None:
+    """published 身份、whole-kind 和真实 staging 各保留原错误/能力边界。
+
+    参数：tmp_path 为真实根；corruption 为 ticker 损坏；kind 为来源类型。
+    返回：无。
+    异常：locator typed kind、whole-kind unsafe 或 staging 独立性漂移时断言失败。
+    """
+    repo = build_fs_repository_set(workspace_root=tmp_path)
+    batching = FsBatchingRepository(tmp_path, repository_set=repo)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repo)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repo)
+    batch = batching.begin_batch("AAPL")
+    _create_complete_source(source, blob, batch=batch, document_id="A", source_kind=kind)
+    batching.commit_batch(batch)
+    staging_batch = batching.begin_batch("AAPL")
+    _create_complete_source(source, blob, batch=staging_batch, document_id="B", source_kind=kind)
+    try:
+        _damage_published_ticker_descriptor(tmp_path / "portfolio" / "AAPL", corruption)
+        with pytest.raises(CompanyTickerIdentityCorruptionError) as locator_error:
+            source.get_source_document_locator("AAPL", "A", kind)
+        assert locator_error.value.kind == "invalid_descriptor"
+        with pytest.raises(SourceIntegrityPreflightError) as integrity_error:
+            source.read_source_meta_integrity_view("AAPL", kind, batch=None)
+        assert integrity_error.value.reason is SourceIntegrityPreflightReason.UNSAFE_PUBLICATION
+        staged = source.read_source_meta_integrity_view("AAPL", kind, batch=staging_batch)
+        assert [entry.document_id for entry in staged] == ["A", "B"]
+        assert all(entry.integrity.status is SourceIntegrityStatus.COMPLETE for entry in staged)
+    finally:
+        batching.rollback_batch(staging_batch)
+    with pytest.raises(ValueError):
+        source.read_source_meta_integrity_view("AAPL", kind, batch=staging_batch)
+
+
+@pytest.mark.parametrize("kind", (SourceKind.FILING, SourceKind.MATERIAL))
+def test_published_source_normal_missing_complete_and_deleted_controls(tmp_path: Path, kind: SourceKind) -> None:
+    """正常不存在、完整来源及逻辑删除保持 raw 读取与完整性分类原契约。
+
+    参数：tmp_path 为真实根；kind 为来源类型。
+    返回：无。
+    异常：正常缺席误报 ticker corruption 或原分类/完整元数据漂移时断言失败。
+    """
+    repo = build_fs_repository_set(workspace_root=tmp_path)
+    batching = FsBatchingRepository(tmp_path, repository_set=repo)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repo)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repo)
+    assert source.list_source_document_ids("AAPL", kind) == []
+    assert repo.core.list_document_ids("AAPL") == []
+    assert source.read_source_meta_view("AAPL", kind).entries == ()
+    assert source.read_source_meta_integrity_view("AAPL", kind, batch=None) == ()
+    with pytest.raises(FileNotFoundError):
+        source.get_source_meta("AAPL", "absent", kind)
+    batch = batching.begin_batch("AAPL")
+    _create_complete_source(source, blob, batch=batch, document_id="A", source_kind=kind)
+    batching.commit_batch(batch)
+    meta = source.get_source_meta("AAPL", "A", kind)
+    assert source.read_source_meta_view("AAPL", kind).entries[0].source_meta == meta
+    complete = source.read_source_meta_integrity_view("AAPL", kind, batch=None)
+    assert complete[0].source_meta == meta
+    assert complete[0].integrity.status is SourceIntegrityStatus.COMPLETE
+    assert source.classify_source_integrity("AAPL", "absent", kind).status is SourceIntegrityStatus.MISSING
+    with pytest.raises(FileNotFoundError):
+        source.get_source_meta("AAPL", "absent", kind)
+    batch = batching.begin_batch("AAPL")
+    source.delete_source_document(SourceDocumentStateChangeRequest(ticker="AAPL", document_id="A", source_kind=kind.value), batch=batch)
+    batching.commit_batch(batch)
+    deleted = source.get_source_meta("AAPL", "A", kind)
+    assert deleted["is_deleted"] is True
+    assert source.list_source_document_ids("AAPL", kind) == ["A"]
+    assert source.read_source_meta_view("AAPL", kind).entries[0].source_meta == deleted
+    deleted_entry = source.read_source_meta_integrity_view("AAPL", kind, batch=None)[0]
+    assert deleted_entry.source_meta == deleted
+    # 物理完整性与逻辑删除是独立事实；删除不等于物理缺席。
+    assert deleted_entry.integrity.status is SourceIntegrityStatus.COMPLETE
+    assert source.classify_source_integrity("AAPL", "A", kind).status is SourceIntegrityStatus.COMPLETE
 
 
 @pytest.mark.parametrize("distance", (365, 366, 367))

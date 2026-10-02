@@ -104,6 +104,8 @@ source published revision 由 complete-source mutation owner 在每次 source cr
 
 `SourceDocumentRepositoryProtocol.read_source_meta_view(ticker, source_kind)` 在一个 publication guard 内沿用原 list/get 规则完整有序枚举、读取元数据，返回成功前缀及首个原读取异常。每份元数据来自本次独立 JSON 解析并提供顶层只读映射，独立于其他公开读取与后续发布；嵌套 JSON 由消费者只读使用，不承诺深冻结。这项批量观察不承诺来源完整性、可信 revision 或写入授权。公开单文档 get/list 的契约保持不变。
 
+published source get/list 和上述元数据观察先严格解析 ticker 身份；已存在的 ticker descriptor 损坏时原样抛出 `CompanyTickerIdentityCorruptionError`，观察入口在枚举阶段拒绝，不把损坏表示为空列表或成功前缀。ticker 正常不存在时 list 仍返回空列表，单文档不存在仍为 `FileNotFoundError`。同窗完整性观察使用显式 published 根或真实 batch staging 根，whole-kind inspector 对 ticker 根损坏仍保留 `unsafe_publication`，staging 不读取 published 身份状态。
+
 HK 下载身份 owner 每个观察窗口只建立一次来源与财期索引，纯查询保留缺内部身份、读取错误、重复来源与财期直接比较的原优先序。批初 accepted 集合和 repair 排序共享观察；filing-start、单 filing stream 与每次内部 retry 分别读取新窗口。取消、Phase A/B、post-repair inspection、previous_meta 和 commit 的原边界保持，因此观察结果不会跨 publication 成为后续写授权，也不消除完整性 owner 的全树扫描。
 
 `SourceDocumentRepositoryProtocol.read_source_snapshot(...)` 是 storage-owned 单文档一致读取边界。snapshot 只接受 storage 已分类为 `COMPLETE` 的 source；`REPAIR_REQUIRED` 或 `UNSAFE` 统一以固定、无路径的异常拒绝，不由 read runtime 重判原因。light snapshot 在同一 publication guard 下返回 exact identity、typed source kind、完整 source meta、provenance、persisted revision、完整有序文件描述符与 primary filename，不暴露 published path 或 local URI；full snapshot 从同一次 inspection 与 guard 内打开的全部 regular file descriptors 复制到 snapshot 私有临时树，并在复制后核对同一 source kind 的 persisted revision、identity descriptor 与 deletion state。真实 publication 变化可由 storage 内部有界重取，持续变化抛出不携带 path/key/revision 的 typed consistency error。snapshot 必须显式关闭且 close 幂等，关闭后其 `Source` 不可再读，full snapshot 的 `materialize()` 只返回临时树路径。

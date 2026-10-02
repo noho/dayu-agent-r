@@ -23,6 +23,8 @@ F5 完整 owner 回归：`python -m pytest tests/fins/test_f5_result_contract.py
 窗口回归覆盖外窗远端年度不能改变未知或触发 HEAD、宽窗可以供证、可信本地年度在窄窗仍供证及英文年度/同 ID 冲突。真实 Fs job 写入、回读和原子成功入口拒绝 SUCCEEDED+未知，保留合法 FAILED/CANCELLED/真空成功、无未知正常 partial 和收口异常 typed 摘要；CLI 取消摘要保持 stderr 与退出码 130，无下载摘要保持原提示。
 CLI 下载引用回归覆盖确认文档 ID、未知来源引用与既有文档 ID 共用完整 JSON 字面量，特殊字符及 240 码点 Unicode 身份可逆且不产生额外行；真实 adapter/observation/wait/CLI 链继续核对已确认 A、未知 B、原计数、失败/取消通道与退出码，并保留 wait JSON 原引用。
 
+`test_f5_storage_calendar.py` 通过正式发布的真实 filing/material 覆盖 ticker descriptor 缺失、畸形、symlink、错误 canonical 身份：published get/list/meta view 拒绝损坏，locator 与 whole-kind 完整性观察保留各自原错误类别，真实 open staging 独立于 published 损坏。正常缺席、完整来源、逻辑删除及异常后锁释放均有控制断言。`test_cn_download_workflow.py` 核对真实已发布根在 filing 空枚举或无匹配来源时，CN rebuild 仍拒绝损坏，不返回正常空命中；这些用例不替换仓储 owner。
+
 巨潮正文/全文选择与覆盖补源回归：`python -m pytest tests/fins/test_cn_report_selection.py tests/fins/test_cninfo_downloader.py tests/fins/test_cn_download_workflow.py -q`。
 选择测试覆盖 Q1/Q3 同日形态优先、唯一正文保留、修订和日期优先级、英文/摘要排除及输入顺序稳定性；
 下载测试使用真实隔离仓储核对完整旧缓存跳过、显式覆盖后的来源/文件指纹与清单一致性，以及再次增量跳过。

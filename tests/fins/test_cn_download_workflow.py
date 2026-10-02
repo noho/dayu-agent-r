@@ -75,6 +75,7 @@ from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.storage import FsBatchingRepository, FsCompanyMetaRepository, FsDocumentBlobRepository
 from dayu.fins.storage import FsFilingMaintenanceRepository, FsProcessedDocumentRepository
 from dayu.fins.storage import (
+    CompanyTickerIdentityCorruptionError,
     FsSourceDocumentRepository,
     SourceIntegrityClassification,
     SourceIntegrityPreflightError,
@@ -88,6 +89,7 @@ from dayu.fins.storage import (
 )
 from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
 from dayu.fins.storage._fs_identity import _FILING_IDENTITY_NAMESPACE, _identity_directory_path
+from tests.fins.test_fins_storage_atomicity import _create_complete_source, _identity_descriptor_file
 
 _PDF_BYTES = b"%PDF-1.7\n" + b"0" * 2048
 _DOCLING_BYTES = b'{"document": "ok"}'
@@ -2378,6 +2380,57 @@ def test_hk_bare_rebuild_includes_local_optional_quarter_without_provider_io(
         )
         == source_docling_before
     )
+
+
+@pytest.mark.parametrize("unmatched_filing", (False, True))
+def test_cn_rebuild_empty_matches_reject_published_ticker_corruption(
+    tmp_path: Path, unmatched_filing: bool,
+) -> None:
+    """真实发布公司根损坏时，CN rebuild 不得返回正常空命中。
+
+    参数：tmp_path 为隔离真实仓储根；unmatched_filing 控制有无非 download 来源 filing。
+    返回：无。
+    异常：损坏被空枚举/空匹配掩盖、错误 kind 或来源原字节漂移时断言失败。
+    """
+    discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=())
+    converter = _FakeConverter()
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    pipeline = _build_pipeline(
+        tmp_path=tmp_path, discovery=discovery, converter=converter,
+        repository_set=repository_set, source_repository=source, blob_repository=blob,
+    )
+    batch = pipeline.batching_repository.begin_batch("600519")
+    _create_complete_source(
+        source, blob, batch=batch,
+        ticker="600519", document_id="control",
+        source_kind=SourceKind.FILING if unmatched_filing else SourceKind.MATERIAL,
+    )
+    pipeline.batching_repository.commit_batch(batch)
+    normal = _cn_download_rebuild.rebuild_cn_download_artifacts(
+        host=pipeline, ticker="600519", market="CN", form_type="FY",
+        start_date="2024", end_date="2026", overwrite=False, pipeline_name="cn",
+    )
+    assert normal["status"] == "ok" and normal["filings"] == []
+    ticker_dir = tmp_path / "portfolio" / "600519"
+    descriptor = _identity_descriptor_file(ticker_dir)
+    descriptor.write_text("{}", encoding="utf-8")
+    original_source_bytes = {
+        path.relative_to(ticker_dir): path.read_bytes()
+        for path in ticker_dir.rglob("*") if path.is_file() and path != descriptor
+    }
+    with pytest.raises(CompanyTickerIdentityCorruptionError) as raised:
+        _cn_download_rebuild.rebuild_cn_download_artifacts(
+            host=pipeline, ticker="600519", market="CN", form_type="FY",
+            start_date="2024", end_date="2026", overwrite=False, pipeline_name="cn",
+        )
+    assert raised.value.kind == "invalid_descriptor"
+    assert {
+        path.relative_to(ticker_dir): path.read_bytes()
+        for path in ticker_dir.rglob("*") if path.is_file() and path != descriptor
+    } == original_source_bytes
+    assert discovery.queries == [] and discovery.download_calls == 0 and converter.calls == 0
 
 
 def test_cn_rebuild_producer_always_emits_required_missing_periods(

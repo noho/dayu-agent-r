@@ -1,0 +1,11 @@
+{
+  "files": 86,
+  "validation": 37,
+  "all_match_at_root_collection": true,
+  "managed_outer_exit": {
+    "31581": 0,
+    "83919": 0
+  },
+  "freeze_sha256": "8237a42afa4aa681560980bb9473c9910168a80e5fc4e3834c067aa0a611b632",
+  "note": "核收后治理状态回写改变 finding 文档是历史冻结后的合法更新，产品源码不变。"
+}

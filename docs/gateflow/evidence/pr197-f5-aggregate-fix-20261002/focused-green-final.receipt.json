@@ -1,0 +1,38 @@
+{
+  "argv": [
+    "/Users/leo/workspace/dayu-agent-r/.venv/bin/python",
+    "-m",
+    "pytest",
+    "tests/fins/test_f5_storage_calendar.py",
+    "tests/fins/test_cn_download_workflow.py",
+    "-k",
+    "ticker_descriptor_corruption or ticker_corruption_preserves or normal_missing_complete_and_deleted_controls or empty_matches_reject_published_ticker_corruption",
+    "-q",
+    "--tb=short",
+    "-o",
+    "cache_dir=/Users/leo/workspace/dayu-agent-r/workspace/tmp/pr197-f5-aggregate-fix-sol-20261002-01/validation/focused-cache"
+  ],
+  "cwd": "/Users/leo/workspace/dayu-agent-r",
+  "python": "3.11.15 (main, Mar  3 2026, 00:52:57) [Clang 17.0.0 (clang-1700.6.3.2)]",
+  "env": {
+    "VIRTUAL_ENV": "/Users/leo/workspace/dayu-agent-r/.venv",
+    "PATH": "/Users/leo/workspace/dayu-agent-r/.venv/bin:/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex-path:/Users/leo/.codex/tmp/arg0/codex-arg0Y5DWMe:/Users/leo/.codex/tmp/arg0/codex-arg0bnQM21:/opt/homebrew/Caskroom/miniconda/base/bin:/Users/leo/bin:/Users/leo/.local/bin:/opt/homebrew/bin:/Users/leo/workspace/python:/usr/local/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin:/pkg/env/global/bin:/Library/TeX/texbin:/opt/homebrew/Caskroom/miniconda/base/bin:/Users/leo/bin:/Users/leo/.local/bin:/opt/homebrew/bin:/Users/leo/workspace/python:/Applications/iTerm.app/Contents/Resources/utilities:/opt/homebrew/share/android-commandlinetools/ndk/29.0.14206865:/opt/homebrew/share/android-commandlinetools/platform-tools:/opt/homebrew/share/android-commandlinetools/ndk/29.0.14206865:/opt/homebrew/share/android-commandlinetools/platform-tools",
+    "COVERAGE_FILE": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/pr197-f5-aggregate-fix-sol-20261002-01/validation/focused-green-final.coverage-data",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONPATH": null
+  },
+  "activation": "source .venv/bin/activate",
+  "exit_code": 0,
+  "duration_wall_s": 1.973491907119751,
+  "input_files_unchanged": true,
+  "stdout": {
+    "path": "workspace/tmp/pr197-f5-aggregate-fix-sol-20261002-01/validation/focused-green-final.stdout",
+    "bytes": 115,
+    "sha256": "ec1f59d8773ac2e649756d8371ad304d089d3b690083c825614be390c6c399d1"
+  },
+  "stderr": {
+    "path": "workspace/tmp/pr197-f5-aggregate-fix-sol-20261002-01/validation/focused-green-final.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+}
