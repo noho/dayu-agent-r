@@ -572,7 +572,7 @@ Download request wrapper 保留原始日期的首尾空白清理、`YYYY` / `YYY
 
 Preprocess result summary 使用同一个 typed status helper 判定业务成功或失败。`skipped_count` 只表示已支持但因已有 processed 产物等原因跳过的文档；无可用 processor 的文档单独计入 `not_supported_count` 与 `not_supported_document_ids`，不会混入 skipped。
 
-Direct stream 入口 `download(...)` / `preprocess(...)` / `upload(...)` 是 plain `def`，立即返回 `ValidatedFinsEventStream`。raw bridge 只转发 producer 事件；validator 是“恰好一个且最后一个 `RESULT`”的唯一 Fins owner：它缓存首个 `RESULT`，直到 raw source 正常耗尽后才发布，并在 clean exhaustion 后通过 `terminal_result` 返回同一个 `FinsResultSummary` 实例。缺少 `RESULT`、重复 `RESULT` 或 `RESULT` 后仍出现事件分别抛出同一 typed `FinsDirectStreamProtocolError` contract，Service 与 CLI 只机械消费，不再次扫描或重建错误。成功、失败和取消的合法业务 `RESULT` 仍保持明确终态，不会被改写成 protocol error。Download direct stream 的用户可见进度来自 source-specific downloader / pipeline 事件，再由 adapter 按业务对象粒度通过 runtime progress sink 投影为 direct progress；SEC 当前按 filing 输出，CN/HK 当前按报告下载与转换流程输出。CLI / Service 只展示 direct event 给出的 `stage`、`message` 和 `document_label`，不得从 summary、文件名或日志推断下载进度。Download terminal summary 的 `downloaded`、`skipped`、`rejected` 与 `failed` 是同一批候选 filing 的互斥分类；`total` / `discovered` 必须等于这些分类之和，除非后续 schema 显式增加非互斥指标并在 LLM-facing 文本中说明。Direct event 不包含 job id、sequence、cursor、resume token、sidecar path、绝对路径、provider raw payload 或财报正文。
+Direct stream 入口 `download(...)` / `preprocess(...)` / `upload(...)` 是 plain `def`，立即返回 `ValidatedFinsEventStream`。raw bridge 只转发 producer 事件；validator 是“恰好一个且最后一个 `RESULT`”的唯一 Fins owner：它缓存首个 `RESULT`，直到 raw source 正常耗尽后才发布，并在 clean exhaustion 后通过 `terminal_result` 返回同一个 `FinsResultSummary` 实例。缺少 `RESULT`、重复 `RESULT` 或 `RESULT` 后仍出现事件分别抛出同一 typed `FinsDirectStreamProtocolError` contract，Service 与 CLI 只机械消费，不再次扫描或重建错误。成功、失败和取消的合法业务 `RESULT` 仍保持明确终态，不会被改写成 protocol error。Download direct stream 的用户可见进度来自 source-specific downloader / pipeline 事件，再由 adapter 按业务对象粒度通过 runtime progress sink 投影为 direct progress；SEC 当前按 filing 输出，CN/HK 当前按报告下载与转换流程输出。CLI / Service 只展示 direct event 给出的 `stage`、`message` 和 `document_label`，不得从 summary、文件名或日志推断下载进度。Download terminal summary 的 `downloaded`、`skipped`、`rejected`、`failed` 与 `uncertain` 是同一发现集合的互斥分类；`discovered` 等于五项之和，文档行只包含已确认处理，未知报告独立表达。Direct event 不包含 job id、sequence、cursor、resume token、sidecar path、绝对路径、provider raw payload 或财报正文。
 
 Legacy job helpers 仍保留 `start_*`、`read_job(...)`、`read_job_events(...)` 和 `request_cancel(...)`。每个 legacy ingestion job 可追加 JSONL event sidecar，路径与 job record 同属 `<workspace_root>/.dayu/fins_ingestion/jobs`。该路径是 legacy runtime foundation，不是 Service direct 或 awaiting tool 的公共观察边界。
 
@@ -592,18 +592,24 @@ fingerprint 由本轮远端描述符按原契约计算，文件集合变化会�
 
 HK 财期语义由 report selection owner 同时供 discovery 与本地 rebuild 使用。三个月只表示长度；
 明确季度和累计期间须相互一致，日期推季度需同公司邻近年度截止日支持，财年采用结束年份。
-不使用披露日期推断财年或季度；多日期、季度冲突、年度截止日变化及缺少依据均失败关闭。
+不使用披露日期推断财年或季度；同公司 COMPLETE 原始 download 来源标题（含可信英文年度标题）与本次远端窗口年度事实共同供证，统一使用 366 天邻近规则。远年证据不压制当前明确季度；相关真实冲突、多日期或缺少依据进入未知集合，不分配身份或执行 PDF/转换，已确认候选继续处理。
+远端年度证据与主候选来自同一查询日期窗口；响应中的外窗年度不供证，可信本地年度不按本次窄窗披露日期过滤。同来源 ID 冲突仍先按完整响应拒绝。
 report/results 的 identity 与 coverage 契约保持不变。新下载保留原始分类和可解析的截止日。
 
 HK 本地 rebuild 在 ticker writer lock 内读取来源证据并重投影财期，按旧或新 identity 与披露日期
 选定目标，同事务同步 source/filing manifest 和已有 processed 财期索引。正文、内容 fingerprint、
 remote fingerprint 和内容版本保持不变；元数据 revision 可变化。重复执行无变化时回滚空事务。
-取消或仓储异常回滚本次暂存；单文档依据不足报告失败并保留原文档。来源不完整时不执行财期纠正。
+commit 前取消或仓储异常回滚本次暂存；commit 后取消保留已发布事实。未知报告保留全部原资产，结果不携旧财期标签；有确认更新及未知时只提交确认更新。来源不完整时不执行财期纠正。确定财期但原标题无唯一截止日时，source、已有 processed 及相关 manifest 在同一事务显式清空日期与日期来源；正常 HK 发布与 rebuild 复用同一日期来源 helper，普通下载仍只沿原规则标记 processed 重处理。财期审计版本为 hk-period-v3，内容版本不因元数据纠正提升。
 新下载保存 provider category；旧缓存缺该字段时仅从原始标题识别 report/results 家族。
 已有 HK 来源优先按 provider/source ID 绑定原文档身份；纠正后的 ID 占用了其它真实期间的旧分配位置时，
 新来源按 provider/source ID 分配独立身份。普通增量遇到财期不一致明确要求 rebuild，不能把新候选财期当作已持久化状态。
 
-Download terminal 由同一个 typed `FinsResultSummary` 收口：成功、失败与取消具有固定 status/exit code，downloaded、skipped、rejected 与 failed 对同一候选集合互斥且守恒，并携带有界文档明细和缺失期间。每个 `FinsDownloadDocumentResult` 与 public document row 都必填 `covered_fiscal_periods`；CN/HK 原样投影 workflow coverage，SEC 与不适用来源显式投影空 tuple/JSON array。CLI、Service、awaiting observation 与 legacy job projection 只消费该 terminal truth，不从日志、文件树或 provider payload 重建结果。SEC transport 在首个 HTTP 请求前要求显式 User-Agent 或 `SEC_USER_AGENT`；缺失身份、provider failure、取消与完整性失败均按封闭类型进入 download terminal，不用隐式 provider fallback 伪造成功。
+Download terminal 由同一个 typed `FinsResultSummary` 收口：成功、失败与取消具有固定 status/exit code，downloaded、skipped、rejected、failed 与 uncertain 对同一发现集合互斥且守恒，并携带有界文档明细和缺失期间。每个 `FinsDownloadDocumentResult` 与 public document row 都必填 `covered_fiscal_periods`；CN/HK 原样投影 workflow coverage，SEC 与不适用来源显式投影空 tuple/JSON array。CLI、Service、awaiting observation 与 legacy job projection 只消费该 terminal truth，不从日志、文件树或 provider payload 重建结果。SEC transport 在首个 HTTP 请求前要求显式 User-Agent 或 `SEC_USER_AGENT`；缺失身份、provider failure、取消与完整性失败均按封闭类型进入 download terminal，不用隐式 provider fallback 伪造成功。
+
+公开结果与 durable download 摘要共用未知报告投影：已确认行与未知行各最多 10，省略数独立；durable JSON 预算为 4096 字符，优先保留首条未知并缩短真实 written ID 前缀，绝不裁断引用。未知数大于零时整体 failure/job FAILED，已发布 A 的摘要保留为 partial_failure；取消与 typed 完整性原因优先。fresh download job 尚未形成 typed 结果时允许空 JSON 对象（包括发现前失败/开始前取消）；正常真空查询及已有 typed 结果必须保存完整新 schema，缺字段拒绝。store 在锁内选择调用方正常/取消两投影，禁止从 JSON 重算取消事实或清空已有结果。
+job record 的共用读写校验拒绝下载 SUCCEEDED 与非零未知数并存；该规则不改变没有未知报告的原正常部分下载语义，也不拒绝收口异常后的 FAILED 完整摘要。CLI 取消终态继续消费已有 public 下载摘要。
+
+`read_source_meta_integrity_view` 同一稳定根内先完整枚举并严格读取所有 raw meta，再一次 whole-kind inspection；published 使用短 publication guard，open batch 使用同 core/ticker staging capability。原读取异常原对象传播，不能把 F4 成功前缀拼成可信年度证据。
 
 本地来源完整性预检的四种原因、真实来源版本持续变化和复查后仍需修复，由 download runtime 唯一映射为 storage 公共失败的封闭 `reason_code`、安全说明与恢复建议。版本变化使用 `source_revision_conflict`，仍需修复使用 `source_repair_required`；两者分别要求等待写入结束或先检查修复来源，不能混用恢复动作。CLI、direct 与 process observation wait 消费同一 public failure；后台 job 现有失败字段仅保存同源安全 message 与 typed result_summary，不保存结构化 reason/hint。
 CN/HK 与 SEC workflow 在已开始文档的封闭完整性失败时，以原 cause 和已确认行快照中止；adapter 严格投影该快照，不从事件、日志或库存重建已处理结果。当前文档未形成终态时只登记一次 failed 行，不添加未开始候选。postrepair 仍损坏只保留已确认 repair 行，不把成功文档改写为失败；已独立发布的公司与拒绝事实保留。首候选前的整体预检失败使用请求级零候选摘要。SEC 正常完成与 typed 中止共用行计数构造，取消保留 cancelled，完成日志及完成事件仅由正常调用方产生；中止私有快照的 ok 是现成行快照形状，操作失败由 typed 异常表达。文档摘要终态与整体操作失败分别表达。

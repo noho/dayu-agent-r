@@ -2050,6 +2050,7 @@ def _build_sec_typed_summary(
         canonical_ticker=ticker,
         effective_filters=filters,
         document_rows=rows,
+        uncertain_reports=(),
         missing_periods=(),
     )
 

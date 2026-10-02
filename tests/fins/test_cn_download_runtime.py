@@ -7,7 +7,7 @@ import hashlib
 import json
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
@@ -54,6 +54,7 @@ from dayu.fins.pipelines.cn_download_models import (
     CnMarketKind,
     CnCompanyProfile,
     CnReportCandidate,
+    CnReportDiscoveryResult,
     CnReportPeriodProjection,
     CnReportQuery,
     DownloadedReportAsset,
@@ -195,7 +196,7 @@ def _cn_projection_result(filings: JsonValue) -> dict[str, JsonValue]:
             "skipped": 999,
             "failed": 999,
         },
-    }
+     "uncertain_reports": []}
 
 
 class _ImmediateExecutor(FinsIngestionExecutor):
@@ -257,8 +258,9 @@ class _RuntimeFakeDiscoveryClient:
         query: CnReportQuery,
         profile: CnCompanyProfile,
         *,
+        local_annual_ends: tuple[date, ...],
         cancellation_checkpoint: Callable[[], None] | None = None,
-    ) -> tuple[CnReportCandidate, ...]:
+    ) -> CnReportDiscoveryResult:
         """返回固定年度报告候选。
 
         Args:
@@ -279,7 +281,7 @@ class _RuntimeFakeDiscoveryClient:
             cancellation_checkpoint()
         fiscal_year = 2025 if query.market == "CN" else 2024
         filing_date = "2026-04-01" if query.market == "CN" else "2025-04-08"
-        return (
+        return CnReportDiscoveryResult(candidates=(
             CnReportCandidate(
                 provider="hkexnews" if query.market == "HK" else "cninfo",
                 source_id=self.source_id,
@@ -294,7 +296,7 @@ class _RuntimeFakeDiscoveryClient:
                 etag=f'"{self.source_id}-v1"',
                 last_modified="Wed, 01 Apr 2026 00:00:00 GMT",
             ),
-        )
+        ), uncertain_reports=())
 
     def download_report_pdf(self, candidate: CnReportCandidate) -> DownloadedReportAsset:
         """返回内存 PDF 资产。
@@ -453,7 +455,7 @@ class _RecordingPipeline(CnPipeline):
                 "reused_downloads": 0,
                 "converted": 0,
             },
-        }
+         "uncertain_reports": []}
 
     async def download_stream(
         self,
@@ -876,20 +878,20 @@ def test_cn_integrity_snapshot_has_separate_strict_projection_entry(tmp_path: Pa
         )
     summary = cn_pipeline_module._summary_from_integrity_abort(
         result, request=_cn_projection_request(), source_repository=repository
-    )
+    , uncertain_reports=())
     assert summary.failed_count == 1
     assert summary.discovered_count == 1
     result["status"] = "ok"
     with pytest.raises(ValueError, match="失败快照 status 未封闭"):
         cn_pipeline_module._summary_from_integrity_abort(
             result, request=_cn_projection_request(), source_repository=repository
-        )
+        , uncertain_reports=())
     result["status"] = "integrity_failed"
     result["filings"] = [{"document_id": "fil-bad", "status": "downloaded"}]
     with pytest.raises(ValueError):
         cn_pipeline_module._summary_from_integrity_abort(
             result, request=_cn_projection_request(), source_repository=repository
-        )
+        , uncertain_reports=())
 
 
 @pytest.mark.parametrize("entry", ("normal", "integrity"))
@@ -945,13 +947,13 @@ def test_cn_terminal_projection_preserves_entry_subsets_and_strip(
     accepted = normal_accepted if entry == "normal" else integrity_accepted
     repository = FsSourceDocumentRepository(tmp_path)
     if accepted:
-        summary = project(result, request=_cn_projection_request(), source_repository=repository)
+        summary = (cn_pipeline_module._summary_from_pipeline_result(result, request=_cn_projection_request(), source_repository=repository) if entry == "normal" else cn_pipeline_module._summary_from_integrity_abort(result, request=_cn_projection_request(), source_repository=repository, uncertain_reports=()))
         assert summary.discovered_count == 0
         assert summary.document_rows == ()
         assert summary.missing_periods == ()
     else:
         with pytest.raises(ValueError, match="status 未封闭"):
-            project(result, request=_cn_projection_request(), source_repository=repository)
+            (cn_pipeline_module._summary_from_pipeline_result(result, request=_cn_projection_request(), source_repository=repository) if entry == "normal" else cn_pipeline_module._summary_from_integrity_abort(result, request=_cn_projection_request(), source_repository=repository, uncertain_reports=()))
     assert json.dumps(result) == serialized
 
 
@@ -991,7 +993,7 @@ def test_cn_terminal_projection_rejects_missing_and_nontext_status(
         else cn_pipeline_module._summary_from_integrity_abort
     )
     with pytest.raises(ValueError, match="必填文本字段: status"):
-        project(result, request=_cn_projection_request(), source_repository=FsSourceDocumentRepository(tmp_path))
+        (cn_pipeline_module._summary_from_pipeline_result(result, request=_cn_projection_request(), source_repository=FsSourceDocumentRepository(tmp_path)) if entry == "normal" else cn_pipeline_module._summary_from_integrity_abort(result, request=_cn_projection_request(), source_repository=FsSourceDocumentRepository(tmp_path), uncertain_reports=()))
 
 
 @pytest.mark.parametrize("entry", ("normal", "integrity"))
@@ -1043,7 +1045,7 @@ def test_cn_legal_terminal_does_not_bypass_summary_validation(
         else cn_pipeline_module._summary_from_integrity_abort
     )
     with pytest.raises((ValueError, FileNotFoundError)):
-        project(result, request=_cn_projection_request(), source_repository=FsSourceDocumentRepository(tmp_path))
+        (cn_pipeline_module._summary_from_pipeline_result(result, request=_cn_projection_request(), source_repository=FsSourceDocumentRepository(tmp_path)) if entry == "normal" else cn_pipeline_module._summary_from_integrity_abort(result, request=_cn_projection_request(), source_repository=FsSourceDocumentRepository(tmp_path), uncertain_reports=()))
 
 
 @pytest.mark.parametrize("invalid_missing_periods", [None, "FY", [""]])
@@ -1587,7 +1589,7 @@ def test_initial_company_commit_real_preswap_preflight_keeps_zero_request_summar
         expected = ingestion_runtime_module._empty_download_summary_from_request(
             request, terminal_disposition=FinsDownloadTerminalDisposition.FAILED
         )
-        assert record.result_summary == expected.to_json_summary()
+        assert record.result_summary == expected.to_json_summary(max_json_chars=4096)
         assert record.failure_summary["message"] == "本地来源完整性预检失败"
     assert staged_intents == [True]
     assert validation_visits == [True]
@@ -1627,8 +1629,9 @@ def test_cn_real_phase_b_abort_keeps_published_document_in_result_and_job(
         query: CnReportQuery,
         profile: CnCompanyProfile,
         *,
+        local_annual_ends: tuple[date, ...],
         cancellation_checkpoint: Callable[[], None] | None = None,
-    ) -> tuple[CnReportCandidate, ...]:
+    ) -> CnReportDiscoveryResult:
         """返回两个不同文档 ID 的候选。
 
         Args:
@@ -1643,8 +1646,8 @@ def test_cn_real_phase_b_abort_keeps_published_document_in_result_and_job(
             无。
         """
 
-        first = original_list(query, profile, cancellation_checkpoint=cancellation_checkpoint)[0]
-        return (first, replace(first, source_id="cn-runtime-b2", fiscal_year=2024, filing_date="2025-04-01"))
+        first = original_list(query, profile, cancellation_checkpoint=cancellation_checkpoint, local_annual_ends=local_annual_ends).candidates[0]
+        return CnReportDiscoveryResult(candidates=(first, replace(first, source_id="cn-runtime-b2", fiscal_year=2024, filing_date="2025-04-01")), uncertain_reports=())
 
     def download_second_with_stray(candidate: CnReportCandidate) -> DownloadedReportAsset:
         """在第二候选 Phase A 后创建未发布 exact target。
@@ -1748,8 +1751,9 @@ def test_hk_real_commit_preflight_uses_same_partial_failure_route(
         query: CnReportQuery,
         profile: CnCompanyProfile,
         *,
+        local_annual_ends: tuple[date, ...],
         cancellation_checkpoint: Callable[[], None] | None = None,
-    ) -> tuple[CnReportCandidate, ...]:
+    ) -> CnReportDiscoveryResult:
         """给 HK 来源增加第二个不同年份的候选。
 
         Args:
@@ -1764,8 +1768,8 @@ def test_hk_real_commit_preflight_uses_same_partial_failure_route(
             无。
         """
 
-        first = original_list(query, profile, cancellation_checkpoint=cancellation_checkpoint)[0]
-        return (first, replace(first, source_id="hk-runtime-b2", fiscal_year=2023, filing_date="2024-04-08"))
+        first = original_list(query, profile, cancellation_checkpoint=cancellation_checkpoint, local_annual_ends=local_annual_ends).candidates[0]
+        return CnReportDiscoveryResult(candidates=(first, replace(first, source_id="hk-runtime-b2", fiscal_year=2023, filing_date="2024-04-08")), uncertain_reports=())
 
     def root_stray_after_first(candidate: CnReportCandidate) -> DownloadedReportAsset:
         """在第二次真实 commit 的 whole-tree 校验前创建 root 外来文件。
@@ -1878,8 +1882,9 @@ def test_cn_post_repair_abort_then_same_request_skips_complete_source_and_downlo
         query: CnReportQuery,
         profile: CnCompanyProfile,
         *,
+        local_annual_ends: tuple[date, ...],
         cancellation_checkpoint: Callable[[], None] | None = None,
-    ) -> tuple[CnReportCandidate, ...]:
+    ) -> CnReportDiscoveryResult:
         """从中止请求起提供原候选及尚未发布的第二候选。
 
         Args:
@@ -1894,11 +1899,11 @@ def test_cn_post_repair_abort_then_same_request_skips_complete_source_and_downlo
             无。
         """
 
-        first_candidate = original_candidates(query, profile, cancellation_checkpoint=cancellation_checkpoint)[0]
-        return (
+        first_candidate = original_candidates(query, profile, cancellation_checkpoint=cancellation_checkpoint, local_annual_ends=local_annual_ends).candidates[0]
+        return CnReportDiscoveryResult(candidates=(
             first_candidate,
             replace(first_candidate, source_id="cn-runtime-b2", fiscal_year=2024, filing_date="2025-04-01"),
-        )
+        ), uncertain_reports=())
 
     def record_download(candidate: CnReportCandidate) -> DownloadedReportAsset:
         """观察真实 workflow 是否调用远端传输。
@@ -2064,8 +2069,9 @@ def test_cn_post_repair_real_second_source_revision_conflict_preserves_public_su
         query: CnReportQuery,
         profile: CnCompanyProfile,
         *,
+        local_annual_ends: tuple[date, ...],
         cancellation_checkpoint: Callable[[], None] | None = None,
-    ) -> tuple[CnReportCandidate, ...]:
+    ) -> CnReportDiscoveryResult:
         """返回两份身份财期不同且都会被选中的真实仓储候选。
 
         Args:
@@ -2080,8 +2086,8 @@ def test_cn_post_repair_real_second_source_revision_conflict_preserves_public_su
             无。
         """
 
-        first = original_candidates(query, profile, cancellation_checkpoint=cancellation_checkpoint)[0]
-        return (first, replace(first, source_id="cn-runtime-b2", fiscal_year=2024, filing_date="2025-04-01"))
+        first = original_candidates(query, profile, cancellation_checkpoint=cancellation_checkpoint, local_annual_ends=local_annual_ends).candidates[0]
+        return CnReportDiscoveryResult(candidates=(first, replace(first, source_id="cn-runtime-b2", fiscal_year=2024, filing_date="2025-04-01")), uncertain_reports=())
 
     monkeypatch.setattr(discovery, "list_report_candidates", list_two)
     request = build_fins_download_request(
@@ -2259,7 +2265,7 @@ def test_cn_real_initial_whole_kind_preflight_uses_request_zero_summary(
         start = runtime.start_download(request)
         record = runtime.read_job(start.job_id)
         assert record.status is FinsIngestionJobStatus.FAILED
-        assert record.result_summary == expected.to_json_summary()
+        assert record.result_summary == expected.to_json_summary(max_json_chars=4096)
         assert record.failure_summary["message"] == "本地来源完整性预检失败"
     assert discovery.download_calls == previous_download_calls
     assert pdf_path.read_bytes() == old_pdf
@@ -2274,11 +2280,12 @@ class _RuntimeTwoIdentityCandidates:
 
     def __call__(
         self, query: CnReportQuery, profile: CnCompanyProfile, *,
+        local_annual_ends: tuple[date, ...],
         cancellation_checkpoint: Callable[[], None] | None = None,
-    ) -> tuple[CnReportCandidate, ...]:
+    ) -> CnReportDiscoveryResult:
         """返回两个候选。参数：query/profile/cancellation_checkpoint 为原输入。返回：两年度候选。异常：原取消异常。"""
-        first = self.original(query, profile, cancellation_checkpoint=cancellation_checkpoint)[0]
-        return first, replace(first, source_id="next-year", fiscal_year=2023, filing_date="2024-04-08")
+        first = self.original(query, profile, cancellation_checkpoint=cancellation_checkpoint, local_annual_ends=local_annual_ends).candidates[0]
+        return CnReportDiscoveryResult(candidates=(first, replace(first, source_id="next-year", fiscal_year=2023, filing_date="2024-04-08")), uncertain_reports=())
 
 
 class _RuntimeIdentityWindowCorruption:
@@ -2407,15 +2414,16 @@ class _ThreeCnIntegrityCandidates:
         self.original = discovery.list_report_candidates
 
     def __call__(self, query: CnReportQuery, profile: CnCompanyProfile, *,
-        cancellation_checkpoint: Callable[[], None] | None = None) -> tuple[CnReportCandidate, ...]:
+        local_annual_ends: tuple[date, ...],
+        cancellation_checkpoint: Callable[[], None] | None = None) -> CnReportDiscoveryResult:
         """返回三个年度候选。
 
         参数：query/profile 为真实输入；cancellation_checkpoint 为取消检查。
         返回：2025/2024/2023 候选。异常：原检查异常原样传播。
         """
-        first = self.original(query, profile, cancellation_checkpoint=cancellation_checkpoint)[0]
-        return (first, replace(first, source_id="integrity-second", fiscal_year=2024, filing_date="2025-04-01"),
-            replace(first, source_id="integrity-tail", fiscal_year=2023, filing_date="2024-04-01"))
+        first = self.original(query, profile, cancellation_checkpoint=cancellation_checkpoint, local_annual_ends=local_annual_ends).candidates[0]
+        return CnReportDiscoveryResult(candidates=(first, replace(first, source_id="integrity-second", fiscal_year=2024, filing_date="2025-04-01"),
+            replace(first, source_id="integrity-tail", fiscal_year=2023, filing_date="2024-04-01")), uncertain_reports=())
 
 
 class _RealCnIdentityChurn:

@@ -514,10 +514,18 @@ def _cancelled_outcome(tool_name: str, snapshot: FinsObservationSnapshot) -> Res
     :raises ValueError: outcome 字段非法时由底层契约抛出。
     """
 
+    result = _required_result(snapshot)
+    message = wait_cancelled_message()
+    if result.download is not None:
+        message = json.dumps({
+            "operation": snapshot.handle.operation_kind.value, "status": result.status.value,
+            "title": result.title, "download": result.download.to_json_value(),
+            "scope_note": _DOWNLOAD_FAILURE_SCOPE_MESSAGE,
+        }, ensure_ascii=False, sort_keys=True)
     return ResolveWaitCancelledOutcome(
         result=ToolCancelledOutcome(
             reason=TOOL_CANCELLED_REASON_HOST_CANCELLED,
-            message=wait_cancelled_message(),
+            message=message,
             hint=wait_cancelled_hint(),
             meta=_result_meta(tool_name, snapshot),
         ),
@@ -589,7 +597,7 @@ def _completed_result_value(
     return value
 
 
-_DOWNLOAD_FAILURE_SCOPE_MESSAGE = "下载摘要只统计已处理文档；整体下载操作失败，请按失败原因和处理建议处理。"
+_DOWNLOAD_FAILURE_SCOPE_MESSAGE = "文档计数统计已确认处理，未知报告单列；整体状态不撤销已发布文档。"
 
 
 def _failure_message(result: FinsResultSummary) -> str:

@@ -68,9 +68,11 @@ from dayu.fins.download_contract import (
     FinsDownloadSource,
     FinsDownloadTerminalDisposition,
     FinsDownloadTransportCategory,
+    validate_download_json_summary,
 )
 from dayu.fins.direct_event_text import (
     direct_download_no_source_documents_message,
+    direct_download_uncertain_period_message,
     direct_failure_message,
     direct_preprocess_no_requested_documents_message,
     direct_progress_message,
@@ -2107,6 +2109,7 @@ class FinsIngestionJobStore(Protocol):
         job_id: str,
         *,
         result_summary: dict[str, JsonValue],
+        cancelled_result_summary: dict[str, JsonValue] | None,
         finished_at: str,
     ) -> FinsIngestionJobRecord:
         """按当前取消状态原子保存 succeeded 或 cancelled 终态。
@@ -2114,6 +2117,7 @@ class FinsIngestionJobStore(Protocol):
         Args:
             job_id: opaque job id。
             result_summary: succeeded 终态的有界业务结果摘要。
+            cancelled_result_summary: 已有 typed 结果的取消投影；尚无结果或非 download 为 None。
             finished_at: 本次终态写入时间。
 
         Returns:
@@ -2130,12 +2134,14 @@ class FinsIngestionJobStore(Protocol):
         self,
         job_id: str,
         *,
+        result_summary: dict[str, JsonValue] | None,
         finished_at: str,
     ) -> FinsIngestionJobRecord:
         """仅当当前 job 非终态时原子保存 cancelled 终态。
 
         Args:
             job_id: opaque job id。
+            result_summary: 调用方取消投影；尚无业务结果或非 download 为 None。
             finished_at: 本次 cancelled 终态写入时间。
 
         Returns:
@@ -2181,7 +2187,8 @@ class FinsIngestionJobStore(Protocol):
         job_id: str,
         *,
         failure_summary: dict[str, JsonValue],
-        result_summary: dict[str, JsonValue],
+        result_summary: dict[str, JsonValue] | None,
+        cancelled_result_summary: dict[str, JsonValue] | None,
         finished_at: str,
     ) -> FinsIngestionJobRecord:
         """按当前状态原子保存 failed 或 cancelled 终态。
@@ -2189,7 +2196,8 @@ class FinsIngestionJobStore(Protocol):
         Args:
             job_id: opaque job id。
             failure_summary: failed 终态的有界失败摘要。
-            result_summary: failed 终态的有界业务结果摘要。
+            result_summary: failed 终态的完整摘要；未形成 typed 结果为 None。
+            cancelled_result_summary: 对应取消投影；非 download 或尚无结果为 None。
             finished_at: 本次终态写入时间。
 
         Returns:
@@ -2971,6 +2979,7 @@ class FsFinsIngestionJobStore:
         job_id: str,
         *,
         result_summary: dict[str, JsonValue],
+        cancelled_result_summary: dict[str, JsonValue] | None,
         finished_at: str,
     ) -> FinsIngestionJobRecord:
         """按当前取消状态原子保存 succeeded 或 cancelled 终态。
@@ -2978,6 +2987,7 @@ class FsFinsIngestionJobStore:
         Args:
             job_id: opaque job id。
             result_summary: succeeded 终态的有界业务结果摘要。
+            cancelled_result_summary: 已有 typed 结果的取消投影；尚无结果或非 download 为 None。
             finished_at: 本次终态写入时间。
 
         Returns:
@@ -2990,11 +3000,18 @@ class FsFinsIngestionJobStore:
             ValueError: job id、record 或摘要字段非法时抛出。
         """
 
-        _assert_bounded_summary(result_summary, "result_summary")
+        if result_summary is not None:
+            _assert_bounded_summary(result_summary, "result_summary")
         with file_lock(self.root_dir / _LOCK_FILE_NAME):
             record = self._read_record_locked(job_id)
             if record.status in _TERMINAL_STATUSES:
                 return record
+            if record.operation_kind is FinsIngestionOperationKind.DOWNLOAD and (record.result_summary or result_summary):
+                if cancelled_result_summary is None or not cancelled_result_summary:
+                    raise ValueError("已有 download 业务结果必须提供取消投影")
+                validate_download_json_summary(cancelled_result_summary)
+                if cancelled_result_summary["terminal_disposition"] != FinsDownloadTerminalDisposition.CANCELLED.value:
+                    raise ValueError("取消投影必须由 typed owner 覆盖为 cancelled")
             if record.cancellation_requested or record.status is FinsIngestionJobStatus.CANCELLING:
                 cancelled = replace(
                     record,
@@ -3002,6 +3019,8 @@ class FsFinsIngestionJobStore:
                     updated_at=finished_at,
                     finished_at=finished_at,
                     cancellation_requested=True,
+                    result_summary=_terminal_job_result_projection(record, cancelled_result_summary, preserve_current=True, typed_result_exists=result_summary is not None and bool(result_summary)),
+                    failure_summary=dict(_EMPTY_SUMMARY),
                 )
                 self._write_record_locked(cancelled)
                 return cancelled
@@ -3020,12 +3039,14 @@ class FsFinsIngestionJobStore:
         self,
         job_id: str,
         *,
+        result_summary: dict[str, JsonValue] | None,
         finished_at: str,
     ) -> FinsIngestionJobRecord:
         """仅当当前 job 非终态时原子保存 cancelled 终态。
 
         Args:
             job_id: opaque job id。
+            result_summary: 调用方取消投影；尚无业务结果或非 download 为 None。
             finished_at: 本次 cancelled 终态写入时间。
 
         Returns:
@@ -3048,6 +3069,8 @@ class FsFinsIngestionJobStore:
                 updated_at=finished_at,
                 finished_at=finished_at,
                 cancellation_requested=True,
+                result_summary=_terminal_job_result_projection(record, result_summary, preserve_current=True, typed_result_exists=False),
+                failure_summary=dict(_EMPTY_SUMMARY),
             )
             self._write_record_locked(cancelled)
             return cancelled
@@ -3112,7 +3135,8 @@ class FsFinsIngestionJobStore:
         job_id: str,
         *,
         failure_summary: dict[str, JsonValue],
-        result_summary: dict[str, JsonValue],
+        result_summary: dict[str, JsonValue] | None,
+        cancelled_result_summary: dict[str, JsonValue] | None,
         finished_at: str,
     ) -> FinsIngestionJobRecord:
         """按当前状态原子保存 failed 或 cancelled 终态。
@@ -3120,7 +3144,8 @@ class FsFinsIngestionJobStore:
         Args:
             job_id: opaque job id。
             failure_summary: failed 终态的有界失败摘要。
-            result_summary: failed 终态的有界业务结果摘要。
+            result_summary: failed 终态的完整摘要；未形成 typed 结果为 None。
+            cancelled_result_summary: 对应取消投影；非 download 或尚无结果为 None。
             finished_at: 本次终态写入时间。
 
         Returns:
@@ -3135,11 +3160,18 @@ class FsFinsIngestionJobStore:
         """
 
         _assert_bounded_summary(failure_summary, "failure_summary")
-        _assert_bounded_summary(result_summary, "result_summary")
+        if result_summary is not None:
+            _assert_bounded_summary(result_summary, "result_summary")
         with file_lock(self.root_dir / _LOCK_FILE_NAME):
             record = self._read_record_locked(job_id)
             if record.status in _TERMINAL_STATUSES:
                 return record
+            if record.operation_kind is FinsIngestionOperationKind.DOWNLOAD and (record.result_summary or result_summary):
+                if cancelled_result_summary is None or not cancelled_result_summary:
+                    raise ValueError("已有 download 业务结果必须提供取消投影")
+                validate_download_json_summary(cancelled_result_summary)
+                if cancelled_result_summary["terminal_disposition"] != FinsDownloadTerminalDisposition.CANCELLED.value:
+                    raise ValueError("取消投影必须由 typed owner 覆盖为 cancelled")
             if record.cancellation_requested or record.status is FinsIngestionJobStatus.CANCELLING:
                 cancelled = replace(
                     record,
@@ -3147,6 +3179,8 @@ class FsFinsIngestionJobStore:
                     updated_at=finished_at,
                     finished_at=finished_at,
                     cancellation_requested=True,
+                    result_summary=_terminal_job_result_projection(record, cancelled_result_summary, preserve_current=True, typed_result_exists=result_summary is not None and bool(result_summary)),
+                    failure_summary=dict(_EMPTY_SUMMARY),
                 )
                 self._write_record_locked(cancelled)
                 return cancelled
@@ -3155,7 +3189,7 @@ class FsFinsIngestionJobStore:
                 status=FinsIngestionJobStatus.FAILED,
                 updated_at=finished_at,
                 finished_at=finished_at,
-                result_summary=result_summary,
+                result_summary=_terminal_job_result_projection(record, result_summary, preserve_current=False, typed_result_exists=False),
                 failure_summary=failure_summary,
             )
             self._write_record_locked(failed)
@@ -4411,19 +4445,19 @@ class FinsIngestionRuntime:
             },
         )
         if context.cancellation_checker():
-            self._emit_direct_cancelled_result(context)
+            self._emit_direct_cancelled_result(context, download_summary=None)
             return
         summary = self._execute_download_request(context, normalized, request)
-        if context.cancellation_checker():
-            self._emit_direct_cancelled_result(context)
+        if summary.terminal_disposition is FinsDownloadTerminalDisposition.CANCELLED or context.cancellation_checker():
+            self._emit_direct_cancelled_result(context, download_summary=summary)
             return
-        if summary.failed_count > 0 and summary.downloaded_count == 0 and summary.rejected_count == 0:
+        if summary.uncertain_count > 0 or (summary.failed_count > 0 and summary.downloaded_count == 0 and summary.rejected_count == 0):
             failure = FinsPublicFailure(
                 kind=FinsPublicFailureKind.EXECUTION,
                 source=summary.source,
                 transport_category=None,
-                safe_message=direct_download_no_source_documents_message(),
-                retry_hint="请检查文档失败分类后重试；若持续失败，请检查运行日志中的脱敏分类。",
+                safe_message=(direct_download_uncertain_period_message() if summary.uncertain_count else direct_download_no_source_documents_message()),
+                retry_hint=("请补齐可信年度截止日资料后重试。" if summary.uncertain_count else "请检查文档失败分类后重试；若持续失败，请检查运行日志中的脱敏分类。"),
             )
             self._emit_direct_result(
                 context,
@@ -4478,11 +4512,11 @@ class FinsIngestionRuntime:
             },
         )
         if context.cancellation_checker():
-            self._emit_direct_cancelled_result(context)
+            self._emit_direct_cancelled_result(context, download_summary=None)
             return
         summary = self._execute_preprocess_request(context, request)
         if context.cancellation_checker():
-            self._emit_direct_cancelled_result(context)
+            self._emit_direct_cancelled_result(context, download_summary=None)
             return
         if summary.result_status() is FinsPreprocessResultStatus.FAILED:
             self._emit_direct_result(
@@ -4530,7 +4564,7 @@ class FinsIngestionRuntime:
             payload=_upload_context_request_progress_payload(context, request),
         )
         if context.cancellation_checker():
-            self._emit_direct_cancelled_result(context)
+            self._emit_direct_cancelled_result(context, download_summary=None)
             return
         if self.upload_runner is None:
             self._emit_direct_result(
@@ -4624,7 +4658,7 @@ class FinsIngestionRuntime:
                 request_summary=request_summary,
             )
             if _is_start_cancelled(cancellation_token):
-                return _job_start_from_record(self._save_cancelled(start.record))
+                return _job_start_from_record(self._save_cancelled(start.record, result_summary=None))
             self.executor.submit(
                 start.job_id,
                 lambda: self._run_download_job(
@@ -4679,7 +4713,7 @@ class FinsIngestionRuntime:
                 request_summary=request_summary,
             )
             if _is_start_cancelled(cancellation_token):
-                return _job_start_from_record(self._save_cancelled(start.record))
+                return _job_start_from_record(self._save_cancelled(start.record, result_summary=None))
             self.executor.submit(
                 start.job_id,
                 lambda: self._run_preprocess_job(
@@ -4735,7 +4769,7 @@ class FinsIngestionRuntime:
                 request_summary=request_summary,
             )
             if _is_start_cancelled(cancellation_token):
-                return _job_start_from_record(self._save_cancelled(start.record))
+                return _job_start_from_record(self._save_cancelled(start.record, result_summary=None))
             self.executor.submit(
                 start.job_id,
                 lambda: self._run_upload_job(
@@ -4933,18 +4967,19 @@ class FinsIngestionRuntime:
             summary = self._execute_preprocess_request(context, request)
             latest = self.job_store.read_job(job_id)
             if latest.cancellation_requested or latest.status is FinsIngestionJobStatus.CANCELLING:
-                self._save_cancelled(latest)
+                self._save_cancelled(latest, result_summary=None)
                 return
             if summary.result_status() is FinsPreprocessResultStatus.FAILED:
                 self._save_failed(
                     latest,
                     message=direct_preprocess_no_requested_documents_message(),
                     result_summary=summary.to_json_summary(),
+                    cancelled_result_summary=None,
                 )
                 return
-            self._save_succeeded(latest, summary.to_json_summary())
+            self._save_succeeded(latest, summary.to_json_summary(), cancelled_result_summary=None)
         except Exception as exc:
-            self._save_failed_from_exception(job_id, exc)
+            self._save_failed_from_exception(job_id, exc, result_summary=None, cancelled_result_summary=None)
 
     def _run_download_job(
         self,
@@ -4967,6 +5002,7 @@ class FinsIngestionRuntime:
             无。所有业务与运行时异常都会转换为 terminal job record。
         """
 
+        summary: _FinsDownloadResultSummary | None = None
         try:
             record = self._mark_job_running_or_cancelled(job_id)
             if record.status in _TERMINAL_STATUSES:
@@ -4977,23 +5013,28 @@ class FinsIngestionRuntime:
             )
             summary = self._execute_download_request(context, normalized, request)
             latest = self.job_store.read_job(job_id)
-            if latest.cancellation_requested or latest.status is FinsIngestionJobStatus.CANCELLING:
-                self._save_cancelled(latest)
+            if summary.terminal_disposition is FinsDownloadTerminalDisposition.CANCELLED or latest.cancellation_requested or latest.status is FinsIngestionJobStatus.CANCELLING:
+                self._save_cancelled(latest, result_summary=_cancelled_download_json_summary(summary))
                 return
-            if summary.failed_count > 0 and summary.downloaded_count == 0 and summary.rejected_count == 0:
+            if summary.uncertain_count > 0 or (summary.failed_count > 0 and summary.downloaded_count == 0 and summary.rejected_count == 0):
                 self._save_failed(
                     latest,
-                    message=direct_download_no_source_documents_message(),
-                    result_summary=summary.to_json_summary(),
+                    message=(direct_download_uncertain_period_message() if summary.uncertain_count else direct_download_no_source_documents_message()),
+                    result_summary=summary.to_json_summary(max_json_chars=_MAX_SUMMARY_JSON_CHARS),
+                    cancelled_result_summary=_cancelled_download_json_summary(summary),
                 )
                 return
-            self._save_succeeded(latest, summary.to_json_summary())
+            self._save_succeeded(latest, summary.to_json_summary(max_json_chars=_MAX_SUMMARY_JSON_CHARS), cancelled_result_summary=_cancelled_download_json_summary(summary))
         except _UnsupportedDownloadSourceError as exc:
             self._save_download_unsupported(job_id, request=request, message=str(exc))
         except (FinsSourceDownloadAdapterFailure, SourceIntegrityPreflightError, SourceIntegrityRevisionConflictError, SourceIntegrityRepairRequiredError) as exc:
             self._save_typed_download_failure(job_id, request=request, exc=exc)
         except Exception as exc:
-            self._save_failed_from_exception(job_id, exc)
+            self._save_failed_from_exception(
+                job_id, exc,
+                result_summary=None if summary is None else summary.to_json_summary(max_json_chars=_MAX_SUMMARY_JSON_CHARS),
+                cancelled_result_summary=None if summary is None else _cancelled_download_json_summary(summary),
+            )
 
     def _save_typed_download_failure(
         self,
@@ -5029,7 +5070,7 @@ class FinsIngestionRuntime:
             record = self.job_store.read_job(job_id)
             if record.status in _TERMINAL_STATUSES:
                 return
-            self._save_failed(record, message=failure.safe_message, result_summary=summary.to_json_summary())
+            self._save_failed(record, message=failure.safe_message, result_summary=summary.to_json_summary(max_json_chars=_MAX_SUMMARY_JSON_CHARS), cancelled_result_summary=_cancelled_download_json_summary(summary))
         except Exception:
             _LOGGER.warning("fins.download.typed_failed_record_save_failed")
 
@@ -5070,6 +5111,7 @@ class FinsIngestionRuntime:
                             file_label=None,
                         ),
                     ).to_json_summary(),
+                    cancelled_result_summary=None,
                 )
                 return
             context = self._job_execution_context(
@@ -5092,6 +5134,7 @@ class FinsIngestionRuntime:
             if disposition is FinsUploadTerminalDisposition.CANCELLED:
                 saved = self.job_store.save_cancelled_if_active(
                     job_id,
+                    result_summary=None,
                     finished_at=finished_at,
                 )
             else:
@@ -5123,7 +5166,7 @@ class FinsIngestionRuntime:
                 )
             self._append_terminal_job_event_warn(saved)
         except Exception as exc:
-            self._save_failed_from_exception(job_id, exc)
+            self._save_failed_from_exception(job_id, exc, result_summary=None, cancelled_result_summary=None)
 
     def _mark_job_running_or_cancelled(self, job_id: str) -> FinsIngestionJobRecord:
         """把 queued job 标记为 running，或按取消请求收口为 cancelled。
@@ -5487,6 +5530,7 @@ class FinsIngestionRuntime:
                 rebuild_local_artifacts=request.rebuild_local_artifacts,
             ),
             document_rows=rows,
+            uncertain_reports=(),
             missing_periods=(),
         )
         self._emit_context_progress(
@@ -5936,12 +5980,15 @@ class FinsIngestionRuntime:
         self,
         record: FinsIngestionJobRecord,
         result_summary: dict[str, JsonValue],
+        *,
+        cancelled_result_summary: dict[str, JsonValue] | None,
     ) -> FinsIngestionJobRecord:
         """保存 succeeded 终态。
 
         Args:
             record: 当前 job record。
             result_summary: 有界业务结果摘要。
+            cancelled_result_summary: 下载的完整取消投影，非 download 为 None。
 
         Returns:
             更新后的 job record。
@@ -5956,16 +6003,18 @@ class FinsIngestionRuntime:
         saved = self.job_store.save_succeeded_or_cancelled(
             record.job_id,
             result_summary=result_summary,
+            cancelled_result_summary=cancelled_result_summary,
             finished_at=now,
         )
         self._append_terminal_job_event_warn(saved)
         return saved
 
-    def _save_cancelled(self, record: FinsIngestionJobRecord) -> FinsIngestionJobRecord:
+    def _save_cancelled(self, record: FinsIngestionJobRecord, *, result_summary: dict[str, JsonValue] | None) -> FinsIngestionJobRecord:
         """保存 cancelled 终态。
 
         Args:
             record: 当前 job record。
+            result_summary: 调用方取消投影；尚无结果或非 download 为 None。
 
         Returns:
             更新后的 job record。
@@ -5975,7 +6024,7 @@ class FinsIngestionRuntime:
         """
 
         now = _utc_now()
-        saved = self.job_store.save_cancelled_if_active(record.job_id, finished_at=now)
+        saved = self.job_store.save_cancelled_if_active(record.job_id, result_summary=result_summary, finished_at=now)
         self._append_terminal_job_event_warn(saved)
         return saved
 
@@ -5984,14 +6033,16 @@ class FinsIngestionRuntime:
         record: FinsIngestionJobRecord,
         *,
         message: str,
-        result_summary: dict[str, JsonValue] | None = None,
+        result_summary: dict[str, JsonValue] | None,
+        cancelled_result_summary: dict[str, JsonValue] | None,
     ) -> FinsIngestionJobRecord:
         """保存 failed 终态。
 
         Args:
             record: 当前 job record。
             message: 有界失败说明。
-            result_summary: 可选业务结果摘要。
+            result_summary: 未形成 typed 结果时为 None，否则为完整业务摘要。
+            cancelled_result_summary: 对应取消投影；非 download 或尚无结果为 None。
 
         Returns:
             更新后的 job record。
@@ -6009,13 +6060,14 @@ class FinsIngestionRuntime:
             )
         }
         _assert_bounded_summary(failure_summary, "failure_summary")
-        final_result = result_summary or dict(_EMPTY_SUMMARY)
-        _assert_bounded_summary(final_result, "result_summary")
+        if result_summary is not None:
+            _assert_bounded_summary(result_summary, "result_summary")
         now = _utc_now()
         saved = self.job_store.save_failed_or_cancelled_if_active(
             record.job_id,
             failure_summary=failure_summary,
-            result_summary=final_result,
+            result_summary=result_summary,
+            cancelled_result_summary=cancelled_result_summary,
             finished_at=now,
         )
         self._append_terminal_job_event_warn(saved)
@@ -6052,7 +6104,8 @@ class FinsIngestionRuntime:
                 result_summary=_empty_download_summary_from_request(
                     request,
                     terminal_disposition=FinsDownloadTerminalDisposition.FAILED,
-                ).to_json_summary(),
+                ).to_json_summary(max_json_chars=_MAX_SUMMARY_JSON_CHARS),
+                cancelled_result_summary=_cancelled_download_json_summary(_empty_download_summary_from_request(request, terminal_disposition=FinsDownloadTerminalDisposition.FAILED)),
             )
         except Exception as terminal_exc:
             _LOGGER.warning(
@@ -6063,12 +6116,14 @@ class FinsIngestionRuntime:
             )
             return
 
-    def _save_failed_from_exception(self, job_id: str, exc: Exception) -> None:
+    def _save_failed_from_exception(self, job_id: str, exc: Exception, *, result_summary: dict[str, JsonValue] | None, cancelled_result_summary: dict[str, JsonValue] | None) -> None:
         """把后台异常转换为 failed job record。
 
         Args:
             job_id: opaque job id。
             exc: 后台执行异常。
+            result_summary: 已返回 typed 结果的正常投影；尚无结果为 None。
+            cancelled_result_summary: 同一 typed 结果的取消投影；尚无结果为 None。
 
         Returns:
             无。
@@ -6081,7 +6136,7 @@ class FinsIngestionRuntime:
             record = self.job_store.read_job(job_id)
             if record.status in _TERMINAL_STATUSES:
                 return
-            self._save_failed(record, message=str(exc) or type(exc).__name__)
+            self._save_failed(record, message=str(exc) or type(exc).__name__, result_summary=result_summary, cancelled_result_summary=cancelled_result_summary)
         except Exception as terminal_exc:
             _LOGGER.warning(
                 "fins.ingestion.failed_terminalization_failed job_id=%s error_type=%s original_error_type=%s",
@@ -6341,11 +6396,12 @@ class FinsIngestionRuntime:
         )
         _put_direct_queue(context, event)
 
-    def _emit_direct_cancelled_result(self, context: _FinsIngestionExecutionContext) -> None:
+    def _emit_direct_cancelled_result(self, context: _FinsIngestionExecutionContext, *, download_summary: _FinsDownloadResultSummary | None) -> None:
         """向 direct stream 投递取消 RESULT。
 
         Args:
             context: direct stream 执行上下文。
+            download_summary: 已返回的 typed 下载结果；尚未执行或非 download 为 None。
 
         Returns:
             无。
@@ -6367,9 +6423,9 @@ class FinsIngestionRuntime:
                 None
                 if context.download_request is None
                 else _public_download_summary(
-                    _empty_download_summary_from_request(
-                        context.download_request,
-                        terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED,
+                    replace(download_summary, terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED)
+                    if download_summary is not None else _empty_download_summary_from_request(
+                        context.download_request, terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED,
                     )
                 )
             ),
@@ -6572,7 +6628,7 @@ def _direct_result_event(
             error_kind=FinsErrorKind.CANCELLED,
             fallback_message=None,
         )
-        download = (
+        download = replace(download, terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED) if download is not None else (
             None
             if context.download_request is None
             else _public_download_summary(
@@ -6844,7 +6900,8 @@ def _public_download_summary(
         )
         for row in summary.document_rows[:FINS_DOWNLOAD_PUBLIC_MAX_DOCUMENT_ROWS]
     )
-    omitted_count = summary.discovered_count - len(public_rows)
+    omitted_count = len(summary.document_rows) - len(public_rows)
+    uncertain_reports = summary.public_uncertain_reports(max_json_chars=_MAX_SUMMARY_JSON_CHARS)
     return FinsDownloadPublicSummary(
         source=summary.source,
         canonical_ticker=summary.canonical_ticker,
@@ -6854,6 +6911,9 @@ def _public_download_summary(
         skipped_count=summary.skipped_count,
         rejected_count=summary.rejected_count,
         failed_count=summary.failed_count,
+        uncertain_count=summary.uncertain_count,
+        uncertain_reports=uncertain_reports,
+        omitted_uncertain_count=summary.uncertain_count - len(uncertain_reports),
         document_rows=public_rows,
         missing_periods=summary.missing_periods,
         omitted_count=omitted_count,
@@ -6894,6 +6954,8 @@ def _empty_download_summary_from_request(
         skipped_count=0,
         rejected_count=0,
         failed_count=0,
+        uncertain_count=0,
+        uncertain_reports=(),
         document_rows=(),
         terminal_disposition=terminal_disposition,
         missing_periods=(),
@@ -8268,7 +8330,7 @@ def _download_completed_progress_type(summary: _FinsDownloadResultSummary) -> st
         无。
     """
 
-    if summary.failed_count > 0:
+    if summary.failed_count + summary.uncertain_count > 0:
         return _PROGRESS_DOWNLOAD_COMPLETED_WITH_FAILURES
     return _PROGRESS_DOWNLOAD_COMPLETED
 
@@ -8862,6 +8924,40 @@ def _validate_event_read_window(*, after_sequence: int, limit: int) -> None:
         raise ValueError("limit 超出 Fins ingestion job event 读取上限")
 
 
+def _terminal_job_result_projection(
+    record: FinsIngestionJobRecord,
+    result_summary: dict[str, JsonValue] | None,
+    *,
+    preserve_current: bool,
+    typed_result_exists: bool,
+) -> dict[str, JsonValue]:
+    """在 store 锁内选择调用方的终态投影，不从 JSON 推导取消事实。
+
+    参数：record 为当前记录；result_summary 为调用方投影或尚未产生结果的 None；
+        preserve_current 表示非 download 取消保留原摘要；typed_result_exists 表示本次已形成业务结果。
+    返回：要持久化的完整摘要，未形成 download 结果时为空字典。
+    异常：已有 download 结果却缺投影抛 ValueError；预算或 schema 错误原样抛出。
+    """
+    if result_summary is not None:
+        if record.operation_kind is FinsIngestionOperationKind.DOWNLOAD and not result_summary and (record.result_summary or typed_result_exists):
+            raise ValueError("已有 download 业务结果不得降为空摘要")
+        _assert_bounded_summary(result_summary, "result_summary")
+        return result_summary
+    if record.operation_kind is FinsIngestionOperationKind.DOWNLOAD and (record.result_summary or typed_result_exists):
+        raise ValueError("已有 download 业务结果，必须提供对应终态投影")
+    return record.result_summary if preserve_current else dict(_EMPTY_SUMMARY)
+
+
+def _cancelled_download_json_summary(summary: _FinsDownloadResultSummary) -> dict[str, JsonValue]:
+    """从完整 typed 结果产生取消投影，保留已发布与未知事实。
+
+    参数：summary 为已形成的完整下载结果。
+    返回：只覆盖终态的有界新 schema JSON。
+    异常：typed 不变量或预算不足抛 ValueError。
+    """
+    return replace(summary, terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED).to_json_summary(max_json_chars=_MAX_SUMMARY_JSON_CHARS)
+
+
 def _record_to_json(record: FinsIngestionJobRecord) -> dict[str, JsonValue]:
     """把 job record 转换为 JSON-compatible 字典。
 
@@ -8948,7 +9044,7 @@ def _validate_record_operation_fields(record: FinsIngestionJobRecord) -> None:
         无。
 
     Raises:
-        ValueError: 操作类型与 source 或 source_kind 字段组合不一致时抛出。
+        ValueError: 操作类型、来源身份、业务摘要或 job 终态相互矛盾时抛出。
     """
 
     if record.operation_kind is FinsIngestionOperationKind.DOWNLOAD:
@@ -8956,6 +9052,16 @@ def _validate_record_operation_fields(record: FinsIngestionJobRecord) -> None:
             raise ValueError("download job record 必须包含 source")
         if record.source_kind is not None:
             raise ValueError("download job record 不得包含 source_kind")
+        if record.result_summary:
+            validate_download_json_summary(record.result_summary)
+            if record.result_summary["source"] != record.source or record.result_summary["ticker"] != record.normalized_ticker:
+                raise ValueError("download summary identity differs from job")
+            if record.status is FinsIngestionJobStatus.SUCCEEDED and record.result_summary["uncertain_count"] != 0:
+                raise ValueError("成功下载任务不得包含未确认财期的报告")
+            if record.status is FinsIngestionJobStatus.CANCELLED and record.result_summary["terminal_disposition"] != FinsDownloadTerminalDisposition.CANCELLED.value:
+                raise ValueError("cancelled download requires caller cancelled projection")
+        elif record.status is FinsIngestionJobStatus.SUCCEEDED:
+            raise ValueError("succeeded download requires complete typed summary")
         return
     if record.operation_kind is FinsIngestionOperationKind.PREPROCESS:
         if record.source is not None:

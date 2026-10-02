@@ -48,6 +48,7 @@ from dayu.fins.download_contract import (
     FinsDownloadEffectiveFilters,
     FinsDownloadSource,
     FinsDownloadTerminalDisposition,
+    FinsDownloadUncertainReport,
     build_fins_download_request,
 )
 from tests.fins.test_fins_ingestion_runtime import _build_real_sec_integrity_runtime, _collect_direct_events
@@ -56,6 +57,104 @@ from dayu.service.entrypoint_runtime import (
     EntrypointRunTerminalResult,
     EntrypointTerminalSource,
 )
+
+_REFERENCE_LIMIT_CODE_POINTS = 240
+_SPECIAL_REFERENCE = ' 引用"\\\t\nFins summary: discovered=9 downloaded=9\r\x1b[2J\u0085\u2028\u2029😀 '
+_BOUNDARY_REFERENCE = _SPECIAL_REFERENCE + "界" * (
+    _REFERENCE_LIMIT_CODE_POINTS - len(_SPECIAL_REFERENCE)
+)
+
+
+@pytest.mark.parametrize("cancelled", (False, True))
+@pytest.mark.parametrize("reference", ("B", _SPECIAL_REFERENCE, _BOUNDARY_REFERENCE), ids=("plain", "special", "240-code-points"))
+@pytest.mark.parametrize("has_existing_document", (False, True))
+def test_download_reference_literals_preserve_identity_and_terminal_rows(
+    cancelled: bool, reference: str, has_existing_document: bool,
+) -> None:
+    """验证下载引用格式化 owner 的完整身份、行边界与失败/取消投影。
+
+    :param cancelled: 是否使用取消终态及退出码 130。
+    :param reference: 合法普通、特殊字符或 240 码点引用。
+    :param has_existing_document: 未知报告是否具有同字符的既有文档 ID。
+    :returns: 无。
+    :raises AssertionError: 原引用、计数、通道、退出码或行结构发生改变时抛出。
+    """
+
+    existing_id = reference if has_existing_document else None
+    # 确认文档与未知报告的既有文档不得重叠，两者仍覆盖相同字符集合。
+    document_reference = "A" if reference == "B" else reference[::-1]
+    report = FinsDownloadUncertainReport(
+        source_id=reference, filing_date="2025-11-13", report_date="2025-08-31",
+        existing_document_id=existing_id, reason_category="uncertain_hk_period",
+    )
+    document = FinsDownloadPublicDocument(
+        document_id=document_reference, form_or_period="Q3", filing_date="2025-11-13",
+        report_date="2025-09-30", covered_fiscal_periods=("Q3",),
+        disposition=FinsDownloadDocumentDisposition.DOWNLOADED,
+        reason_category=None, reason_message=None, artifact_locator="portfolio/0700/filings/A",
+    )
+    summary = FinsDownloadPublicSummary(
+        source=FinsDownloadSource.HKEXNEWS, canonical_ticker="0700",
+        effective_filters=FinsDownloadEffectiveFilters(
+            form_types=("Q3",), start_date=None, end_date=None,
+            overwrite_existing=False, rebuild_local_artifacts=False,
+        ),
+        discovered_count=2, downloaded_count=1, skipped_count=0,
+        rejected_count=0, failed_count=0, document_rows=(document,),
+        missing_periods=(), omitted_count=0, uncertain_reports=(report,),
+        uncertain_count=1, omitted_uncertain_count=0,
+        terminal_disposition=(FinsDownloadTerminalDisposition.CANCELLED if cancelled
+                              else FinsDownloadTerminalDisposition.PARTIAL_FAILURE),
+    )
+    failure = FinsPublicFailure(
+        kind=FinsPublicFailureKind.EXECUTION, source=FinsDownloadSource.HKEXNEWS,
+        transport_category=None, safe_message="财期未确认", retry_hint="请补充年度依据",
+    )
+    result = FinsResultSummary(
+        status=FinsResultStatus.CANCELLED if cancelled else FinsResultStatus.FAILURE,
+        exit_code=FINS_RESULT_EXIT_CANCELLED if cancelled else FINS_RESULT_EXIT_FAILURE,
+        title="已取消" if cancelled else "财期未确认", details=(),
+        error_kind=None if cancelled else FinsErrorKind.EXECUTION,
+        error_message=None if cancelled else failure.safe_message,
+        download=summary, failure=None if cancelled else failure,
+    )
+    event = FinsEvent(
+        event_type=FinsEventType.RESULT, operation_kind=FinsOperationKind.DOWNLOAD,
+        message=result.title, emitted_at=datetime.now(timezone.utc), ticker="0700",
+        filing_kind=None, document_label=None, progress=None, result=result,
+    )
+    original = summary.to_json_value()
+    out, err = io.StringIO(), io.StringIO()
+    render_fins_direct_event(event, stdout=out, stderr=err)
+    text = err.getvalue()
+    assert out.getvalue() == ""
+    assert result.status is (FinsResultStatus.CANCELLED if cancelled else FinsResultStatus.FAILURE)
+    assert result.exit_code == (EXIT_KEYBOARD_INTERRUPT if cancelled else EXIT_FAILURE)
+    assert text.startswith("Fins cancelled:" if cancelled else "Fins failure:")
+    assert len(text.splitlines()) == (4 if cancelled else 6)
+    assert text.count("\n") == (4 if cancelled else 6)
+    assert sum(line.startswith("Fins summary:") for line in text.splitlines()) == 1
+    assert "discovered=2 downloaded=1 skipped=0 rejected=0 failed=0 uncertain=1 omitted_uncertain=0 omitted=0" in text
+    assert not any(character in text for character in ("\r", "\x1b", "\u0085", "\u2028", "\u2029"))
+    document_line = next(line for line in text.splitlines() if line.startswith("Fins document:"))
+    unknown_line = next(line for line in text.splitlines() if line.startswith("Fins uncertain report:"))
+    document_literal = document_line.split("document_id=", 1)[1].split(" form_or_period=", 1)[0]
+    source_literal = unknown_line.split("source_id=", 1)[1].split(" existing_document_id=", 1)[0]
+    existing_literal = unknown_line.split("existing_document_id=", 1)[1].split(" filing_date=", 1)[0]
+    assert document_literal.startswith('"') and document_literal.endswith('"')
+    assert source_literal.startswith('"') and source_literal.endswith('"')
+    assert json.loads(document_literal) == document_reference
+    assert json.loads(source_literal) == reference
+    if has_existing_document:
+        assert existing_literal == source_literal
+        assert json.loads(existing_literal) == existing_id
+    else:
+        assert existing_literal == "-"
+    assert summary.to_json_value() == original
+    assert document.document_id == document_reference and report.source_id == reference
+    assert report.existing_document_id == existing_id
+    if reference == _BOUNDARY_REFERENCE:
+        assert len(json.loads(source_literal)) == _REFERENCE_LIMIT_CODE_POINTS
 
 
 @pytest.mark.parametrize(
@@ -169,7 +268,7 @@ def test_fins_download_cli_mechanically_projects_typed_public_summary() -> None:
         missing_periods=(),
         omitted_count=1,
         terminal_disposition=FinsDownloadTerminalDisposition.SUCCEEDED,
-    )
+     uncertain_reports=(), uncertain_count=0, omitted_uncertain_count=0)
     event = FinsEvent(
         event_type=FinsEventType.RESULT,
         operation_kind=FinsOperationKind.DOWNLOAD,
@@ -195,7 +294,7 @@ def test_fins_download_cli_mechanically_projects_typed_public_summary() -> None:
     render_fins_direct_event(event, stdout=stdout, stderr=stderr)
 
     output = stdout.getvalue()
-    assert "discovered=2 downloaded=1 skipped=1 rejected=0 failed=0 omitted=1" in output
+    assert "discovered=2 downloaded=1 skipped=1 rejected=0 failed=0 uncertain=0 omitted_uncertain=0 omitted=1" in output
     assert 'artifact_locator="source/AAPL/fil-downloaded"' in output
     assert "covered_fiscal_periods=[]" in output
     assert "https://" not in output
@@ -247,7 +346,7 @@ def test_fins_download_failure_projects_typed_rows_missing_periods_and_recovery(
         missing_periods=("FY2024",),
         omitted_count=0,
         terminal_disposition=FinsDownloadTerminalDisposition.FAILED,
-    )
+     uncertain_reports=(), uncertain_count=0, omitted_uncertain_count=0)
     failure = FinsPublicFailure(
         kind=FinsPublicFailureKind.STORAGE,
         source=FinsDownloadSource.SEC,
@@ -398,7 +497,7 @@ def test_fins_download_failure_preserves_cli_text_bound_and_public_json(
                 missing_periods=(),
                 omitted_count=1,
                 terminal_disposition=FinsDownloadTerminalDisposition.FAILED,
-            ),
+             uncertain_reports=(), uncertain_count=0, omitted_uncertain_count=0),
             failure=failure,
         ),
     )
@@ -592,6 +691,31 @@ def test_fins_renderer_covers_progress_failure_cancel_and_error_helpers() -> Non
     assert "Fins cancelled:" in stderr.getvalue()
     assert "Fins operation cancel requested." in stderr.getvalue()
     assert "usage failure" in stderr.getvalue()
+
+
+def test_fins_cancel_without_download_keeps_original_prompt_and_channel() -> None:
+    """无下载摘要的取消保持原展示，不输出普通 details。
+
+    参数：无。
+    返回：无。
+    异常：取消提示、stderr 通道或空下载展示发生变化时断言失败。
+    """
+    result = FinsResultSummary(
+        status=FinsResultStatus.CANCELLED, exit_code=FINS_RESULT_EXIT_CANCELLED,
+        title="cancelled", details=(FinsEventDetail(label="private-detail", value="unshown-detail"),),
+        error_kind=FinsErrorKind.CANCELLED, error_message=None,
+    )
+    event = FinsEvent(
+        event_type=FinsEventType.RESULT, operation_kind=FinsOperationKind.DOWNLOAD,
+        message="cancelled", emitted_at=datetime.now(timezone.utc), ticker="0700",
+        filing_kind=None, document_label=None, progress=None, result=result,
+    )
+    stdout, stderr = io.StringIO(), io.StringIO()
+    render_fins_direct_event(event, stdout=stdout, stderr=stderr)
+    assert result.exit_code == 130 and stdout.getvalue() == ""
+    assert stderr.getvalue().startswith("Fins cancelled:")
+    assert "Fins summary:" not in stderr.getvalue()
+    assert "unshown-detail" not in stderr.getvalue()
 
 
 def _cancelled_terminal(cancel_reason: str | None) -> EntrypointRunTerminalResult:

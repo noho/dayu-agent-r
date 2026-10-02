@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Final, Literal, Optional, TypeAlias
 
 from dayu.fins.domain.filing_semantics import FiscalPeriod
+from dayu.fins.download_contract import FinsDownloadUncertainReport
 
 CnMarketKind = Literal["CN", "HK"]
 """CN 下载链路覆盖的市场标识。``ticker_normalization.NormalizedTicker.market``
@@ -335,6 +336,7 @@ class DownloadedReportAsset:
 
 
 __all__ = [
+    "CnReportDiscoveryResult",
     "CN_DOWNLOAD_NORMAL_TERMINAL_STATUSES",
     "CN_DOWNLOAD_TERMINAL_OK",
     "CN_DOWNLOAD_TERMINAL_CANCELLED",
@@ -357,3 +359,11 @@ __all__ = [
     "DownloadedReportAsset",
     "HkexnewsRawAnnouncement",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class CnReportDiscoveryResult:
+    """完整发现的确定候选与独立未知来源；两个集合均必填，不做身份分配。"""
+
+    candidates: tuple[CnReportCandidate, ...]
+    uncertain_reports: tuple[FinsDownloadUncertainReport, ...]

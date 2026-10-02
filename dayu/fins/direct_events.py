@@ -25,6 +25,11 @@ from dayu.fins.download_contract import (
     FinsDownloadSource,
     FinsDownloadTerminalDisposition,
     FinsDownloadTransportCategory,
+    FinsDownloadUncertainReport,
+    FINS_DOWNLOAD_PUBLIC_MAX_DOCUMENT_ROWS,
+    FINS_DOWNLOAD_PUBLIC_MAX_TEXT_CHARS,
+    download_terminal_disposition_from_counts,
+    validate_download_uncertain_reports,
 )
 from dayu.fins.domain.filing_semantics import FISCAL_PERIODS
 
@@ -319,7 +324,7 @@ class FinsDownloadPublicDocument:
         _validate_safe_text(
             self.document_id,
             field_name="download.row.document_id",
-            max_chars=_MAX_DOCUMENT_LABEL_CHARS,
+            max_chars=FINS_DOWNLOAD_PUBLIC_MAX_TEXT_CHARS,
             allow_empty=False,
         )
         _validate_optional_safe_text(self.form_or_period, "download.row.form_or_period")
@@ -397,6 +402,9 @@ class FinsDownloadPublicSummary:
     skipped_count: int
     rejected_count: int
     failed_count: int
+    uncertain_count: int
+    uncertain_reports: tuple[FinsDownloadUncertainReport, ...]
+    omitted_uncertain_count: int
     document_rows: tuple[FinsDownloadPublicDocument, ...]
     missing_periods: tuple[str, ...]
     omitted_count: int
@@ -435,13 +443,26 @@ class FinsDownloadPublicSummary:
             self.rejected_count,
             self.failed_count,
             self.omitted_count,
+            self.uncertain_count,
+            self.omitted_uncertain_count,
         )
-        if any(count < 0 for count in counts):
+        if any(type(count) is not int or count < 0 for count in counts):
             raise ValueError("download public counts must be non-negative")
-        if self.discovered_count != sum(counts[1:5]):
+        if self.discovered_count != sum(counts[1:5]) + self.uncertain_count:
             raise ValueError("public discovered_count must equal disposition counts")
-        if len(self.document_rows) + self.omitted_count != self.discovered_count:
+        if len(self.document_rows) + self.omitted_count + self.uncertain_count != self.discovered_count:
             raise ValueError("document_rows plus omitted_count must equal discovered_count")
+        validate_download_uncertain_reports(self.source, self.uncertain_reports)
+        if len(self.uncertain_reports) + self.omitted_uncertain_count != self.uncertain_count:
+            raise ValueError("public uncertain omission must conserve reports")
+        if len(self.uncertain_reports) > FINS_DOWNLOAD_PUBLIC_MAX_DOCUMENT_ROWS or len(self.document_rows) > FINS_DOWNLOAD_PUBLIC_MAX_DOCUMENT_ROWS:
+            raise ValueError("public lists exceed row limit")
+        if self.uncertain_count and not self.uncertain_reports:
+            raise ValueError("public unknown reports must retain at least one report")
+        if self.source is not FinsDownloadSource.HKEXNEWS and self.uncertain_count:
+            raise ValueError("non-HK source cannot contain uncertain counts")
+        if {r.document_id for r in self.document_rows} & {r.existing_document_id for r in self.uncertain_reports}:
+            raise ValueError("public known and uncertain IDs overlap")
         for row in self.document_rows:
             if not isinstance(row, FinsDownloadPublicDocument):
                 raise TypeError("document_rows must contain FinsDownloadPublicDocument")
@@ -459,17 +480,18 @@ class FinsDownloadPublicSummary:
             visible_counts[disposition] > total_counts[disposition] for disposition in FinsDownloadDocumentDisposition
         ):
             raise ValueError("visible document disposition count exceeds total count")
-        expected_terminal = _download_terminal_disposition(
+        expected_terminal = download_terminal_disposition_from_counts(
             downloaded_count=self.downloaded_count,
             rejected_count=self.rejected_count,
             failed_count=self.failed_count,
+            uncertain_count=self.uncertain_count,
         )
         # 公开对象只允许表达 adapter 启动前的零候选失败/取消，不接受伪造的 partial。
         empty_terminal_override = self.discovered_count == 0 and self.terminal_disposition in {
             FinsDownloadTerminalDisposition.FAILED,
             FinsDownloadTerminalDisposition.CANCELLED,
         }
-        if self.terminal_disposition is not expected_terminal and not empty_terminal_override:
+        if self.terminal_disposition is not expected_terminal and not empty_terminal_override and self.terminal_disposition is not FinsDownloadTerminalDisposition.CANCELLED:
             raise ValueError("terminal_disposition does not match public counts")
         for period in self.missing_periods:
             _validate_safe_text(
@@ -505,8 +527,11 @@ class FinsDownloadPublicSummary:
                 "skipped": self.skipped_count,
                 "rejected": self.rejected_count,
                 "failed": self.failed_count,
+                "uncertain": self.uncertain_count,
             },
             "documents": [row.to_json_value() for row in self.document_rows],
+            "uncertain_reports": [report.to_json_value() for report in self.uncertain_reports],
+            "omitted_uncertain_count": self.omitted_uncertain_count,
             "missing_periods": list(self.missing_periods),
             "omitted_count": self.omitted_count,
             "terminal_disposition": self.terminal_disposition.value,
@@ -685,7 +710,7 @@ class FinsResultSummary:
             elif self.status is FinsResultStatus.CANCELLED:
                 if self.download.terminal_disposition is not FinsDownloadTerminalDisposition.CANCELLED:
                     raise ValueError("cancelled download result requires cancelled disposition")
-            elif self.download.terminal_disposition in {
+            elif self.download.uncertain_count or self.download.terminal_disposition in {
                 FinsDownloadTerminalDisposition.FAILED,
                 FinsDownloadTerminalDisposition.CANCELLED,
             }:
@@ -1248,33 +1273,6 @@ def _validate_safe_text(
         raise ValueError(f"{field_name} contains an absolute path")
     if _ABSOLUTE_WINDOWS_PATH_PATTERN.search(value):
         raise ValueError(f"{field_name} contains an absolute path")
-
-
-def _download_terminal_disposition(
-    *,
-    downloaded_count: int,
-    rejected_count: int,
-    failed_count: int,
-) -> FinsDownloadTerminalDisposition:
-    """从 public counts 机械派生下载终态。
-
-    Args:
-        downloaded_count: 下载成功数。
-        rejected_count: 业务拒绝数。
-        failed_count: 下载失败数。
-
-    Returns:
-        与 owner-level summary 相同规则的终态分类。
-
-    Raises:
-        无。
-    """
-
-    if failed_count == 0:
-        return FinsDownloadTerminalDisposition.SUCCEEDED
-    if downloaded_count == 0 and rejected_count == 0:
-        return FinsDownloadTerminalDisposition.FAILED
-    return FinsDownloadTerminalDisposition.PARTIAL_FAILURE
 
 
 __all__: tuple[str, ...] = (

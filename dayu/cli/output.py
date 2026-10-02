@@ -250,6 +250,8 @@ def render_fins_direct_event(
             _fins_event_line(_FINS_EVENT_CANCELLED_PREFIX, event),
             file=effective_stderr,
         )
+        if event.result.download is not None:
+            _print_terminal_business_summary(event.result, effective_stderr)
         return
 
     print(
@@ -437,17 +439,39 @@ def _print_download_summary(summary: FinsDownloadPublicSummary, stream: TextIO) 
             f"skipped={summary.skipped_count} "
             f"rejected={summary.rejected_count} "
             f"failed={summary.failed_count} "
+            f"uncertain={summary.uncertain_count} "
+            f"omitted_uncertain={summary.omitted_uncertain_count} "
             f"omitted={summary.omitted_count}"
         ),
         file=stream,
     )
     for row in summary.document_rows:
         print(_download_document_line(row), file=stream)
+    for report in summary.uncertain_reports:
+        print(
+            f"Fins uncertain report: source={summary.source.value} source_id={_download_reference_literal(report.source_id)} "
+            f"existing_document_id={_download_reference_literal(report.existing_document_id)} "
+            f"filing_date={report.filing_date or _EMPTY_CELL} report_date={report.report_date or _EMPTY_CELL} "
+            f"reason={report.reason_message}",
+            file=stream,
+        )
     if summary.missing_periods:
         print(
             "Fins missing periods: " + _bounded_json_text(",".join(summary.missing_periods)),
             file=stream,
         )
+
+
+def _download_reference_literal(value: str | None) -> str:
+    """把下载引用完整编码为不会改变终端行结构的 JSON 字符串字面量。
+
+    :param value: 原始引用；``None`` 使用既有空单元约定。
+    :returns: 可通过 JSON 解码还原原引用的字面量，或空单元标记。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    # ASCII 转义同时隔离 Unicode 行分隔符；不截断或归一化业务身份。
+    return _EMPTY_CELL if value is None else json.dumps(value, ensure_ascii=True)
 
 
 def _download_document_line(row: FinsDownloadPublicDocument) -> str:
@@ -460,7 +484,7 @@ def _download_document_line(row: FinsDownloadPublicDocument) -> str:
 
     parts = [
         "Fins document:",
-        f"document_id={_bounded_json_text(row.document_id)}",
+        f"document_id={_download_reference_literal(row.document_id)}",
         f"form_or_period={_bounded_json_text(row.form_or_period or _EMPTY_CELL)}",
         f"filing_date={_bounded_json_text(row.filing_date or _EMPTY_CELL)}",
         f"report_date={_bounded_json_text(row.report_date or _EMPTY_CELL)}",

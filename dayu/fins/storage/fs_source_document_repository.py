@@ -29,7 +29,7 @@ from dayu.fins.domain.enums import SourceKind
 from ._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
 from .file_store import FileStore
 from .repository_protocols import SourceDocumentRepositoryProtocol, SourceSnapshotProtocol
-from .source_meta_read import SourceMetaReadView
+from .source_meta_read import SourceMetaIntegrityReadEntry, SourceMetaReadView
 from .source_integrity import SourceIntegrityClassification
 
 
@@ -546,6 +546,18 @@ class FsSourceDocumentRepository(SourceDocumentRepositoryProtocol):
         """
 
         return self._repository_set.core.get_source_meta(ticker, document_id, source_kind)
+
+    def read_source_meta_integrity_view(
+        self, ticker: str, source_kind: SourceKind, *, batch: BatchToken | None,
+    ) -> tuple[SourceMetaIntegrityReadEntry, ...]:
+        """读取同一稳定根内的完整原始元数据和完整性分类。
+
+        参数：ticker 为公司身份；source_kind 为来源；batch 为同 core/ticker 的
+            open capability，None 时持短 publication guard。
+        返回：完整有序观察，每份独立 JSON 树顶层只读，嵌套值仅供只读消费。
+        异常：校验 ValueError、原读取 OSError、完整性异常及锁异常原样传播。
+        """
+        return self._repository_set.core.read_source_meta_integrity_view(ticker, source_kind, batch=batch)
 
     def read_source_meta_view(
         self, ticker: str, source_kind: SourceKind,

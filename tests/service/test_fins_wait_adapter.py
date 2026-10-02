@@ -377,7 +377,7 @@ def test_fins_wait_adapter_projects_same_typed_download_object() -> None:
         missing_periods=(),
         omitted_count=0,
         terminal_disposition=FinsDownloadTerminalDisposition.SUCCEEDED,
-    )
+     uncertain_reports=(), uncertain_count=0, omitted_uncertain_count=0)
     result = FinsResultSummary(
         status=FinsResultStatus.SUCCESS,
         exit_code=FINS_RESULT_EXIT_SUCCESS,
@@ -465,7 +465,7 @@ def test_fins_wait_adapter_failure_contains_same_typed_download_and_failure() ->
         missing_periods=(),
         omitted_count=0,
         terminal_disposition=FinsDownloadTerminalDisposition.SUCCEEDED,
-    )
+     uncertain_reports=(), uncertain_count=0, omitted_uncertain_count=0)
     failure = FinsPublicFailure(
         kind=FinsPublicFailureKind.STORAGE,
         source=FinsDownloadSource.SEC,
@@ -506,7 +506,7 @@ def test_fins_wait_adapter_failure_contains_same_typed_download_and_failure() ->
     assert message_value["status"] == "failure"
     assert message_value["download"] == download.to_json_value()
     assert message_value["failure"] == failure.to_json_value()
-    assert message_value["scope_note"] == "下载摘要只统计已处理文档；整体下载操作失败，请按失败原因和处理建议处理。"
+    assert message_value["scope_note"] == "文档计数统计已确认处理，未知报告单列；整体状态不撤销已发布文档。"
     download_value = message_value["download"]
     assert isinstance(download_value, Mapping)
     assert download_value["terminal_disposition"] == "succeeded"
@@ -535,7 +535,7 @@ def test_fins_wait_adapter_failure_contains_same_typed_download_and_failure() ->
         _failure_message(replace(result, failure=revision_failure, error_kind=FinsErrorKind.EXECUTION))
     )
     assert revision_message["failure"]["reason_code"] is None
-    assert revision_message["scope_note"] == "下载摘要只统计已处理文档；整体下载操作失败，请按失败原因和处理建议处理。"
+    assert revision_message["scope_note"] == "文档计数统计已确认处理，未知报告单列；整体状态不撤销已发布文档。"
 
 
 def test_fins_wait_poll_adapter_rejects_failed_result_without_message() -> None:

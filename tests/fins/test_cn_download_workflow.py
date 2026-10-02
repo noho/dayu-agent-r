@@ -9,7 +9,7 @@ import json
 from collections.abc import AsyncGenerator, Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from types import TracebackType
 from typing import BinaryIO, Literal, Optional, cast
@@ -49,6 +49,7 @@ from dayu.fins.pipelines.cn_download_models import (
     CnFiscalPeriod,
     CnMarketKind,
     CnReportCandidate,
+    CnReportDiscoveryResult,
     CnReportPeriodProjection,
     CnReportQuery,
     CnSourceProvider,
@@ -83,6 +84,7 @@ from dayu.fins.storage import (
     SourceIntegrityReason,
     SourceIntegrityStatus,
     SourceMetaReadView,
+    SourceMetaIntegrityReadEntry,
 )
 from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
 from dayu.fins.storage._fs_identity import _FILING_IDENTITY_NAMESPACE, _identity_directory_path
@@ -428,8 +430,9 @@ class _FakeDiscoveryClient:
         query: CnReportQuery,
         profile: CnCompanyProfile,
         *,
+        local_annual_ends: tuple[date, ...],
         cancellation_checkpoint: Callable[[], None] | None = None,
-    ) -> tuple[CnReportCandidate, ...]:
+    ) -> CnReportDiscoveryResult:
         """返回测试候选。
 
         Args:
@@ -453,7 +456,7 @@ class _FakeDiscoveryClient:
             except RuntimeError as exc:
                 self.checkpoint_errors.append(exc)
                 raise
-        return self.candidates
+        return CnReportDiscoveryResult(candidates=self.candidates, uncertain_reports=())
 
     def download_report_pdf(self, candidate: CnReportCandidate) -> DownloadedReportAsset:
         """返回内存 PDF 下载资产。
@@ -2303,6 +2306,7 @@ def test_hk_bare_rebuild_includes_local_optional_quarter_without_provider_io(
         fiscal_period="Q2",
         provider="hkexnews",
     )
+    hk_candidate = replace(hk_candidate, title="2024年第二季度業績", category_text="季度業績")
     hk_discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(hk_candidate,))
     converter = _FakeConverter()
     pipeline = _build_pipeline(
@@ -2608,6 +2612,11 @@ class _RebuildFailureProbe:
         del ticker, document_id, source_kind
         raise self.failure
 
+    def read_integrity(self, ticker: str, source_kind: SourceKind, *, batch: BatchToken | None) -> tuple[SourceMetaIntegrityReadEntry, ...]:
+        """参数为同窗读取范围和 batch；返回不发生；抛出指定原始读取异常。"""
+        del ticker, source_kind, batch
+        raise self.failure
+
     def check_cancel(self) -> bool:
         """模拟非取消 checker 失败并保留原异常对象。
 
@@ -2666,7 +2675,10 @@ def test_cn_hk_rebuild_preserves_read_and_checker_failure_identity(
     )
     probe = _RebuildFailureProbe(expected)
     if operation == "read":
-        monkeypatch.setattr(pipeline.source_repository, "get_source_meta", probe.read_meta)
+        if market == "HK":
+            monkeypatch.setattr(pipeline.source_repository, "read_source_meta_integrity_view", probe.read_integrity)
+        else:
+            monkeypatch.setattr(pipeline.source_repository, "get_source_meta", probe.read_meta)
     with pytest.raises(type(expected)) as exc_info:
         pipeline.download(
             ticker=ticker, form_type="FY", start_date="2024", end_date="2026",

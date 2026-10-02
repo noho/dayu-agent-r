@@ -1562,7 +1562,7 @@ def test_sec_integrity_abort_adapter_preserves_cause_and_summary(tmp_path: Path,
     assert "美股下载完成" not in caplog.text
     assert _INTEGRITY_TAIL[4:].replace("-", "") not in downloader.requested
     assert source.classify_source_integrity("AAPL", _INTEGRITY_FIRST, SourceKind.FILING).status is SourceIntegrityStatus.COMPLETE
-    print(json.dumps({"scenario": scenario, "snapshot": abort.result, "typed": summary.to_json_summary()}, ensure_ascii=False))
+    print(json.dumps({"scenario": scenario, "snapshot": abort.result, "typed": summary.to_json_summary(max_json_chars=4096)}, ensure_ascii=False))
 
 
 class _SecCancelControl:
@@ -1700,10 +1700,10 @@ def test_integrity_abort_causes_are_closed(tmp_path: Path) -> None:
     for cause in (SourceIntegrityPreflightError(SourceIntegrityPreflightReason.UNSAFE_PUBLICATION),
                   SourceIntegrityRevisionConflictError(), SourceIntegrityRepairRequiredError()):
         assert SecDownloadIntegrityAbort(cause, {}).cause is cause
-        assert CnDownloadIntegrityAbort(cause, {}).cause is cause
+        assert CnDownloadIntegrityAbort(cause, {}, uncertain_reports=()).cause is cause
         assert FinsSourceDownloadAdapterFailure(cause, raised.value.persisted_summary).cause is cause
     pytest.raises(TypeError, SecDownloadIntegrityAbort, ValueError("synthetic"), {})
-    pytest.raises(TypeError, CnDownloadIntegrityAbort, ValueError("synthetic"), {})
+    pytest.raises(TypeError, CnDownloadIntegrityAbort, ValueError("synthetic"), {}, uncertain_reports=())
     pytest.raises(TypeError, FinsSourceDownloadAdapterFailure, ValueError("synthetic"), raised.value.persisted_summary)
 
 

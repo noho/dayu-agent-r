@@ -1,18 +1,16 @@
 # upload_material 裁决修复与 issue #198：依赖顺序
 
 <!-- PR197_LIVE_GATE_STATUS_START -->
-## 当前有效状态（F5具体裁决后继续全部任务）
+## 当前总控状态（2026-10-02T10:55:26.181796+08:00）
 
-唯一workspace `/Users/leo/workspace/dayu-agent-r` / branch `codex/upload-material-oracle`，所有代码/证据进入OPEN/draft PR197，用户手工merge。main保持fac32ecbff9bfe792b63ee9667c8697826b631f4；普通文档checkpoint不充最终产品或CLI验收。
-
-- F2/F3/F4/F6/F7均已修复并完成同版组合PR审查及最终闭环，见 `docs/gateflow/pr-197-findings-except-f5-final-closeout-20261001.md`；1377组合回归通过，不等于最终完整CLI。
-- F5用户裁决：同公司可信证据能推断则推断，失败继续A且列出B未知、不猜财期。Q1已解除，授权完成全部任务，普通gate不停止。
-- F5计划A1/A2/A3经窄双审确认已修；A4共享HK日期来源owner补修已由同版MiMo23705/Kimi43186双审及root直接证据确认，202行v2 SHA e4b578807345593f0af6698189044963931b12ba5d13a76da94e553e581644d8，plan accepted。当前accepted plan checkpoint后进入单完整F5-S1；N01/N02尚未产品实施；详 `docs/gateflow/pr-197-r1-f5-plan-v2-review-adjudication-20261001.md`。
-- 下一入口：accepted plan checkpoint→Sol单完整F5-S1→代码双审/必要集中修复→aggregate/PRreview/closeout。日期来源CN/SEC边界及正常processed状态机不扩；A1–3不重开。
-- F5闭环后继续原17accepted标签和受控XBRL O20F02，默认完整行为增量不机械细分，分组proposal见 `docs/gateflow/upload-material-remaining-work-batching-preparation-20261001.md`；最终重建并跑完整真实CLI，确定material oracle/scenarios/readiness，不能以旧download/upload_filing registry或单测替代。
-- 原旧Raw用户确认已删除，不伪造Raw/hash；全部遵从用户现成36项裁决，真源 `docs/gateflow/upload-material-repair-scope-and-ci-closeout-20261001.md`。
-- $sub-agents runner子进程派发；Sol plan/implement/fix，MiMo/Kimi同时review，Kimi真实quota失败才DS备份；各调用显式绝对cwd、唯一label与独立output/stderr、preflight/no-persist/当前canary；root检查完整结构化、outer终态及直接证据自行裁决。新修复立即artifact及本三controller登记。
-
+- 唯一开发主树 `/Users/leo/workspace/dayu-agent-r` / `codex/upload-material-oracle`；main不动，不创建其它branch/worktree/clone/detached。现有PR197保持OPEN/draft，用户手工merge。
+- F1 rejected；F2/F3/F4/F6/F7已闭环进PR，证据 pr-197-findings-except-f5-final-closeout-20261001.md。
+- F5仍单完整F5-S1，严格用户“推断失败继续A、明确B未知、不猜财期”；IV01–05均已修并正式同版双审/复审，总控 code gate PASS。完整裁决 pr-197-r1-f5-s1-code-review-final-adjudication-20261002.md。
+- 最新实现1703pass/fullpyright0/23生产>=80；root41pass，MiMo121pass+103probe/fulltypes0，MiMo-flash110pass/probe/fulltypes0。六官方Raw及关键验证原件正式可Git移交。没有丢弃旧失败/裁决/源码，历史在原artifact和 pr-197-controller-live-status-history-20261002.md。
+- 当前无活动runner/产品writer。下一动作accepted F5-S1 commit→aggregate deepreview→现有draftPR push→PR review/fix/re-review→accepted PRreview commit/push→final closeout/handoff。尚未aggregate/PR/finalcloseout pass，不冒称readiness。
+- 最新路由 `$sub-agents` runner子进程；gpt-6-sol plan/implement/fix，MiMo/MiMo-flash同时独立review，root总控裁决；显式绝对cwd、全新独立output/stderr、完整结构化/tool/exit/current读取和源码核准。历史Kimi/DS原证据不改。
+- 用户最新停止点：闭环PR findings后更新handoff prompt3并停。本轮不实施原upload17标签/受控XBRL/最终真实CLI CI及material oracle/scenarios；准备文档仅proposal，新Agent最终head重绑正式计划/审查后执行。
+- Gateflow按完整可验证行为增量尽量少slice，默认避免WU>3且超过需说明，不按文件/owner/finding机械切；减少slice不得跳/合/重排gates。既有裁决优先，任何成立新修复立即登记artifact与三controller。
 <!-- PR197_LIVE_GATE_STATUS_END -->
 
 
@@ -731,3 +729,7 @@ F4 aggregate已root pass，201同版身份/两完整报告/真实39聚焦及原7
 2026-10-01T12:00:57.508887+08:00 Sol正常路由只读恢复实测39776 outer0/7合法events，真实cat0/canary/turn.completed，rootaccepted，可恢复原指定模型。旧Sol失败批次不回写通过；F3五source与F6plan窄fix下一独立新派发，owner写范围互斥。详 `docs/gateflow/pr-197-sol-routing-recovery-receipt-20261001.md`。
 
 2026-10-01T12:05:11.450958+08:00 恢复后新派发：F3 Sol7594 /sub-agents.Fnnmua，39current/original/34readonly，唯一产品writer五utils；F6 Sol40525 /sub-agents.vfHnDP，60current/original/59readonly，只修当前计划前缀/新报告/tmp。两任务scope互斥，新独立output/stderr/last、绝对cwd、no-persist/canary；非冻结rootdocs checkpoint不算身份漂移。原失败不改通过，尚无终态/验收。
+
+## 最新审查路由（2026-10-02，覆盖旧路由）
+
+用户指定双路同时并行审查改为 **MiMo / MiMo-flash**；gpt-6-sol负责plan/implement/fix，总控读取全部结构化结果和真实证据后独立裁决。全部通过 `$sub-agents` runner 子进程，显式绝对workspace，独立output/stderr、当前canary/no-persist。历史Kimi及ds-flash记录保持原样，后续不再默认派Kimi。

@@ -11,7 +11,7 @@ import json
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from threading import Barrier
 
@@ -37,6 +37,7 @@ from dayu.fins.ingestion_runtime import (
 from dayu.fins.pipelines.cn_download_models import (
     CnCompanyProfile,
     CnReportCandidate,
+    CnReportDiscoveryResult,
     CnReportPeriodProjection,
     CnReportQuery,
     DownloadedReportAsset,
@@ -352,8 +353,9 @@ class _PipelineDownloadFakeDiscoveryClient:
         query: CnReportQuery,
         profile: CnCompanyProfile,
         *,
+        local_annual_ends: tuple[date, ...],
         cancellation_checkpoint: Callable[[], None] | None = None,
-    ) -> tuple[CnReportCandidate, ...]:
+    ) -> CnReportDiscoveryResult:
         """返回一份固定 FY 候选。
 
         Args:
@@ -388,7 +390,7 @@ class _PipelineDownloadFakeDiscoveryClient:
                 last_modified="Wed, 01 Apr 2026 00:00:00 GMT",
             ),
         )
-        return self.candidates if self.candidates is not None else default_candidates
+        return CnReportDiscoveryResult(candidates=self.candidates if self.candidates is not None else default_candidates, uncertain_reports=())
 
     def download_report_pdf(self, candidate: CnReportCandidate) -> DownloadedReportAsset:
         """返回内存 PDF 资产。
@@ -446,8 +448,9 @@ class _PipelineDownloadFakeHkDiscoveryClient:
         query: CnReportQuery,
         profile: CnCompanyProfile,
         *,
+        local_annual_ends: tuple[date, ...],
         cancellation_checkpoint: Callable[[], None] | None = None,
-    ) -> tuple[CnReportCandidate, ...]:
+    ) -> CnReportDiscoveryResult:
         """返回一份固定 HK FY 候选。
 
         Args:
@@ -466,7 +469,7 @@ class _PipelineDownloadFakeHkDiscoveryClient:
         self.cancellation_checkpoints.append(cancellation_checkpoint)
         if cancellation_checkpoint is not None:
             cancellation_checkpoint()
-        return (
+        return CnReportDiscoveryResult(candidates=(
             CnReportCandidate(
                 provider="hkexnews",
                 source_id="HK1",
@@ -481,7 +484,7 @@ class _PipelineDownloadFakeHkDiscoveryClient:
                 etag='"hk-v1"',
                 last_modified="Tue, 08 Apr 2025 00:00:00 GMT",
             ),
-        )
+        ), uncertain_reports=())
 
     def download_report_pdf(self, candidate: CnReportCandidate) -> DownloadedReportAsset:
         """返回内存 PDF 资产。

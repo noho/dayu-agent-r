@@ -13,6 +13,9 @@ from functools import partial
 from typing import TypeAlias, cast
 
 from dayu.contracts.json_value import JsonValue
+from dayu.fins.domain.enums import SourceKind
+from dayu.fins.download_contract import FinsDownloadSource, FinsDownloadUncertainReport, validate_download_uncertain_reports
+from dayu.fins.pipelines.cn_report_selection import local_hk_annual_ends
 from dayu.fins.pipelines.cn_download_company_meta import stage_company_meta_for_cn_download
 from dayu.fins.pipelines.cn_download_filing_workflow import (
     project_cn_filing_failure,
@@ -69,12 +72,14 @@ class CnDownloadIntegrityAbort(Exception):
         self,
         cause: SourceIntegrityPreflightError | SourceIntegrityRevisionConflictError | SourceIntegrityRepairRequiredError,
         result: JsonObject,
+        uncertain_reports: tuple[FinsDownloadUncertainReport, ...],
     ) -> None:
         """保存同一 workflow owner 产生的失败事实。
 
         Args:
             cause: 原始完整性异常。
             result: 已处理文档的私有失败快照。
+            uncertain_reports: 独立完整 typed 未知 tuple；无未知显式为空。
 
         Returns:
             无。
@@ -88,6 +93,8 @@ class CnDownloadIntegrityAbort(Exception):
         super().__init__(_INTEGRITY_PREFLIGHT_MESSAGE)
         self.cause = cause
         self.result = result
+        validate_download_uncertain_reports(FinsDownloadSource.HKEXNEWS, uncertain_reports)
+        self.uncertain_reports = uncertain_reports
 
 
 async def run_cn_download_stream_impl(
@@ -235,8 +242,14 @@ async def run_cn_download_stream_impl(
     notes: list[str] = []
     company_info: JsonObject = {}
     missing_periods: tuple[str, ...] = ()
+    uncertain_reports: tuple[FinsDownloadUncertainReport, ...] = ()
     try:
         _raise_if_cancelled(module=module, ticker=normalized_ticker, document_id="", cancel_checker=cancel_checker)
+        local_ends = ()
+        if market == "HK":
+            entries = host.source_repository.read_source_meta_integrity_view(normalized_ticker, SourceKind.FILING, batch=None)
+            local_ends = tuple(sorted(set(local_hk_annual_ends(entries).values())))
+            _raise_if_cancelled(module=module, ticker=normalized_ticker, document_id="", cancel_checker=cancel_checker)
         profile = discovery.resolve_company(query)
         _raise_if_cancelled(module=module, ticker=normalized_ticker, document_id="", cancel_checker=cancel_checker)
         company_info = {
@@ -251,14 +264,20 @@ async def run_cn_download_stream_impl(
             ticker=normalized_ticker,
             payload=company_info,
         )
-        candidates = discovery.list_report_candidates(
+        discovery_result = discovery.list_report_candidates(
             query,
             profile,
+            local_annual_ends=local_ends,
             cancellation_checkpoint=cancellation_checkpoint,
         )
         _raise_if_cancelled(module=module, ticker=normalized_ticker, document_id="", cancel_checker=cancel_checker)
+        uncertain_reports = tuple(
+            report for report in discovery_result.uncertain_reports
+            if report.filing_date is not None and any(w.start_date <= report.filing_date <= w.end_date for w in period_windows)
+        )
+        validate_download_uncertain_reports(FinsDownloadSource.HKEXNEWS if market == "HK" else FinsDownloadSource.CNINFO, uncertain_reports)
         selected = _select_candidates_for_a4(
-            candidates,
+            discovery_result.candidates,
             period_windows=period_windows,
             use_default_business_limits=not start_is_explicit,
         )
@@ -284,7 +303,7 @@ async def run_cn_download_stream_impl(
                     ),
                 )
             )
-        missing_periods = _resolve_missing_periods(
+        missing_periods = () if uncertain_reports else _resolve_missing_periods(
             period_policy.missing_eligible_periods,
             selected,
         )
@@ -380,6 +399,7 @@ async def run_cn_download_stream_impl(
                     notes=notes,
                     filings=filings,
                     missing_periods=missing_periods,
+                    uncertain_reports=uncertain_reports,
                 ) from exc
             except Exception as exc:
                 reason_code, reason_message = project_cn_filing_failure(exc)
@@ -426,6 +446,7 @@ async def run_cn_download_stream_impl(
                         notes=notes,
                         filings=filings,
                         missing_periods=missing_periods,
+                        uncertain_reports=uncertain_reports,
                     ) from exc
                 _raise_if_cancelled(
                     module=module,
@@ -452,6 +473,7 @@ async def run_cn_download_stream_impl(
                         notes=notes,
                         filings=filings,
                         missing_periods=missing_periods,
+                        uncertain_reports=uncertain_reports,
                     ) from exc
                 repair_gate_completed = True
     except CnDownloadCancelledError:
@@ -475,6 +497,7 @@ async def run_cn_download_stream_impl(
         notes=notes,
         filings=filings,
         missing_periods=missing_periods,
+        uncertain_reports=uncertain_reports,
         summary=summary,
     )
     Log.info(
@@ -544,6 +567,7 @@ def _integrity_abort(
     notes: list[str],
     filings: list[JsonObject],
     missing_periods: tuple[str, ...],
+    uncertain_reports: tuple[FinsDownloadUncertainReport, ...],
 ) -> CnDownloadIntegrityAbort:
     """仅从已处理 filing 真源冻结完整性中止快照。
 
@@ -558,6 +582,7 @@ def _integrity_abort(
         notes: 当前业务说明。
         filings: 已确认终态 filing 列表。
         missing_periods: 来源缺失财期。
+        uncertain_reports: 发现时取得的完整 typed 未知集合，不写入封闭 integrity result。
 
     Returns:
         携带原异常和严格同源快照的私有中止。
@@ -577,9 +602,10 @@ def _integrity_abort(
         notes=notes,
         filings=filings,
         missing_periods=missing_periods,
+        uncertain_reports=uncertain_reports,
         summary=summary,
     )
-    return CnDownloadIntegrityAbort(cause, result)
+    return CnDownloadIntegrityAbort(cause, result, uncertain_reports)
 
 
 def _publish_cn_company_after_repair(
@@ -941,6 +967,7 @@ def _build_result(
     pipeline_name: str,
     status: CnDownloadTerminalStatus,
     ticker: str,
+    uncertain_reports: tuple[FinsDownloadUncertainReport, ...],
     reason_code: str | None = None,
     message: str | None = None,
     company_info: JsonObject | None = None,
@@ -958,6 +985,7 @@ def _build_result(
         status: 必填 pipeline 终态，取共享模型词表的 ok、cancelled 或
             integrity_failed；调用方按普通结果或完整性中止选择对应值。
         ticker: canonical ticker。
+        uncertain_reports: 全量独立未知报告；与已确认 filings 分开投影，不猜其财期。
         reason_code: 可选失败原因码。
         message: 可选失败说明。
         company_info: 公司业务事实。
@@ -978,7 +1006,7 @@ def _build_result(
     warning_values: list[JsonValue] = list(warnings or [])
     note_values: list[JsonValue] = list(notes or [])
     filing_values: list[JsonValue] = list(filings or [])
-    return {
+    result: JsonObject = {
         "pipeline": pipeline_name,
         "action": "download",
         "status": status,
@@ -1002,6 +1030,13 @@ def _build_result(
             "converted": 0,
         },
     }
+
+    if status != CN_DOWNLOAD_TERMINAL_INTEGRITY_FAILED:
+        result["uncertain_reports"] = [report.to_json_value() for report in uncertain_reports]
+    raw_summary = result["summary"]
+    if isinstance(raw_summary, dict):
+        raw_summary["uncertain_count"] = len(uncertain_reports)
+    return result
 
 
 def _candidate_document_id(

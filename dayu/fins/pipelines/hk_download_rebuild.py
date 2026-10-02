@@ -1,18 +1,19 @@
 """在既有本地 rebuild 入口内重投影港股财期；仅发布元数据。"""
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.document_models import FilingUpdateRequest, ProcessedUpdateRequest
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.pipelines.cn_download_protocols import CnDownloadWorkflowHost
 from dayu.fins.pipelines.cn_form_utils import PeriodDownloadWindow
-from dayu.fins.pipelines.cn_report_selection import resolve_hk_report_period
-from dayu.fins.pipelines.hk_fiscal_calendar import annual_end_dates, report_end_date
+from dayu.fins.pipelines.cn_report_selection import resolve_hk_report_period, local_hk_annual_ends
+from dayu.fins.pipelines.hk_fiscal_calendar import report_end_date, hk_report_date_source
+from dayu.fins.download_contract import FinsDownloadUncertainReport
 from dayu.fins.storage import SourceIntegrityStatus
 
-_PERIOD_VERSION = "hk-period-v2"
+_PERIOD_VERSION = "hk-period-v3"
 
 
 def rebuild_hk_periods(
@@ -20,96 +21,84 @@ def rebuild_hk_periods(
     ticker: str,
     windows: tuple[PeriodDownloadWindow, ...],
     cancel_checker: Callable[[], bool] | None,
-) -> tuple[list[dict[str, JsonValue]], bool]:
+) -> tuple[list[dict[str, JsonValue]], tuple[FinsDownloadUncertainReport, ...], bool]:
     """从同公司本地来源标题重投影财期，并原子同步 source/manifest/processed 索引。
 
     参数：host 为仓储宿主；ticker 为公司；windows 按旧或新身份圈定范围；
-        cancel_checker 为取消检查。返回：逐文档结果及取消状态。
+        cancel_checker 为取消检查。
+    返回：已确认逐文档结果、独立未知 tuple 及取消状态；未知不携带旧财期标签。
     异常：仓储或校验异常透传且回滚；commit 自己负责提交失败清理。
     """
+    if cancel_checker is not None and cancel_checker():
+        return [], (), True
     batch = host.batching_repository.begin_batch(ticker)
     filings: list[dict[str, JsonValue]] = []
+    uncertain: list[FinsDownloadUncertainReport] = []
     changed = False
     cancelled = False
     try:
-        # 先取得 ticker writer lock 再读取，避免并发重建用锁外旧 meta 覆盖新状态。
-        metas = {
-            doc: dict(host.source_repository.get_source_meta(ticker, doc, SourceKind.FILING))
-            for doc in host.source_repository.list_source_document_ids(ticker, SourceKind.FILING)
-        }
+        # writer capability 的 staging 是 raw 与完整性唯一根，不拼接 published 观察。
+        entries = host.source_repository.read_source_meta_integrity_view(ticker, SourceKind.FILING, batch=batch)
+        if cancel_checker is not None and cancel_checker():
+            host.batching_repository.rollback_batch(batch)
+            return [], (), True
+        anchors = local_hk_annual_ends(entries)
+        ends = tuple(sorted(set(anchors.values())))
         sources = {
-            doc: meta
-            for doc, meta in metas.items()
-            if meta.get("source_provider") == "hkexnews"
-            and meta.get("ingest_method") == "download"
-            and meta.get("is_deleted") is False
+            entry.document_id: entry for entry in entries
+            if entry.source_meta.get("source_provider") == "hkexnews"
+            and entry.source_meta.get("ingest_method") == "download"
+            and entry.source_meta.get("is_deleted") is False
         }
-        anchors = {
-            doc: str(meta.get("source_title", ""))
-            for doc, meta in sources.items()
-            if annual_end_dates((str(meta.get("source_title", "")),))
-            and host.source_repository.classify_staged_source_integrity(
-                ticker, doc, SourceKind.FILING, batch=batch
-            ).status
-            is SourceIntegrityStatus.COMPLETE
-        }
-        ends = annual_end_dates(tuple(anchors.values()))
-        for document_id, meta in sources.items():
+        for document_id, entry in sources.items():
+            meta = entry.source_meta
             if cancel_checker is not None and cancel_checker():
                 cancelled = True
                 break
-            title = str(meta.get("source_title", ""))
+            title = _required_meta_text(meta, "source_title")
             # 老缓存未存分类时，只使用标题本身的 report/results 事实，不复用旧季度猜分类。
-            category = str(meta.get("source_category") or title)
+            raw_category = meta.get("source_category")
+            if raw_category is not None and not isinstance(raw_category, str):
+                raise ValueError("source_category must be text or null")
+            category = raw_category or title
             facts = resolve_hk_report_period(title=title, category_text=category, annual_ends=ends)
             period = facts[1].identity_period if facts is not None else None
-            filing_date = str(meta.get("filing_date", ""))
+            filing_date = _required_meta_text(meta, "filing_date")
             if not any(
                 w.fiscal_period in (meta.get("fiscal_period"), period) and w.start_date <= filing_date <= w.end_date
                 for w in windows
             ):
                 continue
+            end = report_end_date(title)
+            report_date = end.isoformat() if end is not None else None
+            if facts is None:
+                uncertain.append(FinsDownloadUncertainReport(
+                    source_id=_required_meta_text(meta, "source_id"), filing_date=filing_date,
+                    report_date=report_date, existing_document_id=document_id, reason_category="uncertain_hk_period",
+                ))
+                continue
+            year, projection = facts
             result: dict[str, JsonValue] = {
-                "document_id": document_id,
-                "internal_document_id": meta.get("internal_document_id"),
-                "form_type": meta.get("form_type"),
-                "filing_date": filing_date,
-                "report_date": meta.get("report_date"),
-                "covered_fiscal_periods": meta.get("covered_fiscal_periods"),
-                "status": "failed",
-                "downloaded_files": 0,
-                "skipped_files": 0,
-                "failed_files": [],
-                "has_xbrl": False,
-                "rebuild": True,
+                "document_id": document_id, "internal_document_id": meta["internal_document_id"],
+                "form_type": projection.identity_period, "filing_date": filing_date, "report_date": report_date,
+                "covered_fiscal_periods": list(projection.covered_periods),
+                "status": "failed", "downloaded_files": 0, "skipped_files": 0,
+                "failed_files": [], "has_xbrl": False, "rebuild": True,
             }
             filings.append(result)
-            if facts is None:
-                result.update(
-                    reason_code="uncertain_hk_period",
-                    reason_message="财期依据不足或冲突，保留原文档；需补齐明确年度截止日来源后重试",
-                )
-                continue
-            integrity = host.source_repository.classify_staged_source_integrity(
-                ticker,
-                document_id,
-                SourceKind.FILING,
-                batch=batch,
-            )
+            integrity = entry.integrity
             if integrity.status is not SourceIntegrityStatus.COMPLETE:
                 result.update(reason_code="incomplete_source", reason_message="本地来源不完整，不能仅纠正财期")
                 continue
-            year, projection = facts
-            end = report_end_date(title)
             updates: dict[str, JsonValue] = {
                 "form_type": projection.identity_period,
                 "fiscal_period": projection.identity_period,
                 "report_kind": projection.identity_period,
                 "fiscal_year": year,
                 "covered_fiscal_periods": list(projection.covered_periods),
-                "report_date": end.isoformat() if end is not None else meta.get("report_date"),
+                "report_date": report_date,
                 "fiscal_year_source": "source_title_and_annual_end",
-                "report_date_source": "source_title" if end is not None else meta.get("report_date_source"),
+                "report_date_source": hk_report_date_source(report_date),
                 "period_resolution_version": _PERIOD_VERSION,
                 "period_resolution_sources": [doc for doc in sorted(anchors)],
             }
@@ -122,14 +111,15 @@ def rebuild_hk_periods(
             if all(meta.get(key) == value for key, value in updates.items()):
                 result.update(reason_code="period_metadata_current", reason_message="财期元数据已一致，无需更新")
                 continue
-            meta.update(updates)
+            updated_meta = dict(meta)
+            updated_meta.update(updates)
             host.source_repository.update_source_document(
                 FilingUpdateRequest(
                     ticker=ticker,
                     document_id=document_id,
-                    internal_document_id=str(meta["internal_document_id"]),
+                    internal_document_id=_required_meta_text(meta, "internal_document_id"),
                     form_type=projection.identity_period,
-                    meta=meta,
+                    meta=updated_meta,
                 ),
                 SourceKind.FILING,
                 batch=batch,
@@ -151,7 +141,7 @@ def rebuild_hk_periods(
                     ProcessedUpdateRequest(
                         ticker=ticker,
                         document_id=document_id,
-                        internal_document_id=str(meta["internal_document_id"]),
+                        internal_document_id=_required_meta_text(meta, "internal_document_id"),
                         source_kind=SourceKind.FILING.value,
                         form_type=projection.identity_period,
                         meta=updates,
@@ -174,4 +164,19 @@ def rebuild_hk_periods(
                     result.update(status="failed", reason_code="cancelled", reason_message="取消，元数据纠正已回滚")
     else:
         host.batching_repository.commit_batch(batch)
-    return filings, cancelled
+    if not cancelled and cancel_checker is not None and cancel_checker():
+        cancelled = True
+    return filings, tuple(sorted(uncertain, key=lambda r: (r.filing_date or "", r.source_id, r.existing_document_id or ""))), cancelled
+
+
+def _required_meta_text(meta: Mapping[str, JsonValue], key: str) -> str:
+    """读取重建所需的来源必填文本。
+
+    参数：meta 为来源元数据；key 为必填字段名。
+    返回：未经转换的非空原文本。
+    异常：缺字段时原样抛 KeyError；空或非文本值抛 ValueError。
+    """
+    value = meta[key]
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"HK source {key} must be non-empty text")
+    return value

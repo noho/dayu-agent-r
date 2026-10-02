@@ -74,7 +74,7 @@ from ._fs_storage_utils import (
     _write_json,
 )
 from .repository_protocols import SourceSnapshotProtocol
-from .source_meta_read import SourceMetaReadEntry, SourceMetaReadView
+from .source_meta_read import SourceMetaIntegrityReadEntry, SourceMetaReadEntry, SourceMetaReadView
 from .source_integrity import (
     SourceIntegrityClassification,
     SourceIntegrityPreflightError,
@@ -590,6 +590,74 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         finally:
             self._release_lock_token(guard_token)
 
+    def read_source_meta_integrity_view(
+        self, ticker: str, source_kind: SourceKind, *, batch: BatchToken | None,
+    ) -> tuple[SourceMetaIntegrityReadEntry, ...]:
+        """读取同一稳定根内的完整原始元数据和完整性分类。
+
+        参数：ticker 为公司身份；source_kind 为来源；batch 为同 core/ticker 的
+            open capability，None 时持短 publication guard。
+        返回：完整有序观察，每份独立 JSON 树顶层只读，嵌套值仅供只读消费。
+        异常：校验 ValueError、原读取 OSError、完整性异常及锁异常原样传播。
+        """
+        external_ticker = _require_external_identity(ticker, field_name="ticker")
+        kind = _normalize_source_kind(source_kind)
+        if batch is not None:
+            state = self._resolve_active_batch(batch, external_ticker)
+            return self._read_source_meta_integrity_at_root(external_ticker, kind, state.staging_ticker_dir)
+        guard = self._acquire_publication_guard(external_ticker)
+        try:
+            return self._read_source_meta_integrity_at_root(external_ticker, kind, self._target_ticker_dir(external_ticker))
+        finally:
+            self._release_lock_token(guard)
+
+    def _read_source_meta_integrity_at_root(
+        self, ticker: str, kind: SourceKind, ticker_dir: Path,
+    ) -> tuple[SourceMetaIntegrityReadEntry, ...]:
+        """在调用方已稳定的根内严格读取全部来源事实。
+
+        参数：ticker 为公司外部身份；kind 为来源类型；ticker_dir 为已持锁的发布根或 staging 根。
+        返回：有序完整同窗观察，每份原始 JSON 与该根完整性分类绑定。
+        异常：原始 JSON、身份、I/O 和完整性检查异常原样传播，不返回成功前缀。"""
+        ids = self._list_source_ids_at_root(ticker_dir, kind)
+        # 所有 raw 解析先于 inspector，保全 JSON 错误原对象，不能降级为无年度证据。
+        metas = tuple(self._get_source_meta_at_root(ticker, doc, kind, ticker_dir) for doc in ids)
+        inspection = _inspect_source_kind_unguarded(
+            ticker=ticker, source_kind=kind, ticker_dir=ticker_dir,
+            source_root=ticker_dir / _source_dir_name(kind), requested_document_id=None,
+        )
+        classifications = {item.classification.document_id: item.classification for item in inspection.inventory}
+        return tuple(
+            SourceMetaIntegrityReadEntry(doc, MappingProxyType(meta), classifications[doc])
+            for doc, meta in zip(ids, metas, strict=True)
+        )
+
+    def _list_source_ids_at_root(self, ticker_dir: Path, kind: SourceKind) -> list[str]:
+        """从稳定根枚举来源外部身份。
+
+        参数：ticker_dir 为稳定公司根；kind 为来源类型。
+        返回：有序来源文档 ID 列表。
+        异常：descriptor 校验 ValueError 和 I/O 异常原样传播。"""
+        root = self._storage_subdirectory_for_read(ticker_dir, _source_dir_name(kind))
+        namespace = _FILING_IDENTITY_NAMESPACE if kind is SourceKind.FILING else _MATERIAL_IDENTITY_NAMESPACE
+        return _list_external_identities(root, namespace)
+
+    def _get_source_meta_at_root(
+        self, ticker: str, document_id: str, kind: SourceKind, ticker_dir: Path,
+    ) -> dict[str, JsonValue]:
+        """从显式稳定根严格读取原始业务元数据。
+
+        参数：ticker 为公司外部身份；document_id 为文档外部身份；kind 为来源类型；
+            ticker_dir 为已稳定的公司根。
+        返回：本次独立解析的原始业务 JSON 字典。
+        异常：JSON/身份校验 ValueError 与 I/O 异常原样传播。"""
+        root = self._storage_subdirectory_for_read(ticker_dir, _source_dir_name(kind))
+        namespace = _FILING_IDENTITY_NAMESPACE if kind is SourceKind.FILING else _MATERIAL_IDENTITY_NAMESPACE
+        meta = _read_json_object(_identity_directory_for_read(root, namespace, document_id) / "meta.json")
+        if meta.get("ticker") != ticker or meta.get("document_id") != document_id or meta.get("source_kind") != kind.value:
+            raise ValueError("source meta 与 identity descriptor/source kind 不一致")
+        return _source_meta_without_revision(meta)
+
     def read_source_meta_view(
         self, ticker: str, source_kind: SourceKind,
     ) -> SourceMetaReadView:
@@ -868,12 +936,9 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             ValueError: meta 内容非法时抛出。
         """
 
-        persisted_meta = self._get_persisted_source_meta_unguarded(
-            external_ticker,
-            external_document_id,
-            normalized_source_kind,
+        return self._get_source_meta_at_root(
+            external_ticker, external_document_id, normalized_source_kind, self._target_ticker_dir(external_ticker),
         )
-        return _source_meta_without_revision(persisted_meta)
 
     def _get_persisted_source_meta_unguarded(
         self,
@@ -1186,24 +1251,11 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             OSError: 读取目录失败时抛出。
         """
 
-        if source_kind == SourceKind.FILING:
-            return _list_external_identities(
-                self._source_root_for_read(normalized_ticker, SourceKind.FILING),
-                _FILING_IDENTITY_NAMESPACE,
-            )
-        if source_kind == SourceKind.MATERIAL:
-            return _list_external_identities(
-                self._source_root_for_read(normalized_ticker, SourceKind.MATERIAL),
-                _MATERIAL_IDENTITY_NAMESPACE,
-            )
-        filings = _list_external_identities(
-            self._source_root_for_read(normalized_ticker, SourceKind.FILING),
-            _FILING_IDENTITY_NAMESPACE,
-        )
-        materials = _list_external_identities(
-            self._source_root_for_read(normalized_ticker, SourceKind.MATERIAL),
-            _MATERIAL_IDENTITY_NAMESPACE,
-        )
+        ticker_dir = self._target_ticker_dir(normalized_ticker)
+        if source_kind is not None:
+            return self._list_source_ids_at_root(ticker_dir, source_kind)
+        filings = self._list_source_ids_at_root(ticker_dir, SourceKind.FILING)
+        materials = self._list_source_ids_at_root(ticker_dir, SourceKind.MATERIAL)
         return sorted(set(filings + materials))
 
     def has_source_storage_root(self, ticker: str, source_kind: SourceKind) -> bool:

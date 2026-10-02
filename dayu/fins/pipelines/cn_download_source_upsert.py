@@ -12,6 +12,7 @@ import hashlib
 from typing import TypeAlias
 
 from dayu.contracts.json_value import JsonValue
+from dayu.fins.pipelines.hk_fiscal_calendar import hk_report_date_source
 from dayu.fins.domain.document_models import (
     BatchToken,
     FinsIngestMethod,
@@ -235,7 +236,13 @@ def _build_base_meta(
     profile: CnCompanyProfile,
     previous_completed_meta: JsonObject | None = None,
 ) -> JsonObject:
-    """构建 CN/HK source meta 公共字段。"""
+    """构建 CN/HK source meta 公共字段。
+
+    参数：ticker 为规范公司身份；document_id/internal_document_id 为已分配的稳定文档身份；
+        candidate 为已确认的来源候选；profile 为来源公司事实；
+        previous_completed_meta 为前版已完成元数据，None 表示首次写入。
+    返回：由候选直接日期和共享来源 owner 产生的 source 元数据字典。
+    异常：公司身份或来源 provider 非法时抛 ValueError。"""
 
     company_id = ticker_to_company_id(normalize_ticker(ticker))
     now = now_iso8601()
@@ -252,7 +259,7 @@ def _build_base_meta(
         "fiscal_period": candidate.period_projection.identity_period,
         "covered_fiscal_periods": list(candidate.period_projection.covered_periods),
         "fiscal_year_source": _FISCAL_YEAR_SOURCE,
-        "report_date_source": "source_title" if candidate.report_date is not None else _REPORT_DATE_SOURCE,
+        "report_date_source": hk_report_date_source(candidate.report_date) if candidate.provider == "hkexnews" else ("source_title" if candidate.report_date is not None else _REPORT_DATE_SOURCE),
         "report_kind": candidate.period_projection.identity_period,
         "report_date": candidate.report_date,
         "filing_date": candidate.filing_date,

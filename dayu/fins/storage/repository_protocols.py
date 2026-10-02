@@ -51,7 +51,7 @@ from dayu.fins.domain.document_models import (
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.ticker_normalization import normalize_ticker
 
-from .source_meta_read import SourceMetaReadView
+from .source_meta_read import SourceMetaIntegrityReadEntry, SourceMetaReadView
 from .source_integrity import SourceIntegrityClassification, SourceIntegrityStatus
 
 
@@ -1063,6 +1063,18 @@ class SourceDocumentRepositoryProtocol(Protocol):
             ValueError: ticker、document ID、source kind 或 meta 内容非法时抛出。
             RuntimeFileLockError: publication guard 获取或释放失败时抛出。
             OSError: published I/O 失败时抛出。
+        """
+        ...
+
+    def read_source_meta_integrity_view(
+        self, ticker: str, source_kind: SourceKind, *, batch: BatchToken | None,
+    ) -> tuple[SourceMetaIntegrityReadEntry, ...]:
+        """读取同一稳定根内的完整原始元数据和完整性分类。
+
+        参数：ticker 为公司身份；source_kind 为来源；batch 为同 core/ticker 的
+            open capability，None 时持短 publication guard。
+        返回：完整有序观察，每份独立 JSON 树顶层只读，嵌套值仅供只读消费。
+        异常：校验 ValueError、原读取 OSError、完整性异常及锁异常原样传播。
         """
         ...
 

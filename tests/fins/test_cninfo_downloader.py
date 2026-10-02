@@ -410,7 +410,7 @@ def test_list_report_candidates_filters_blocklisted_titles() -> None:
             discovery_periods=("FY",),
         ),
         profile,
-    )
+     local_annual_ends=()).candidates
 
     assert len(candidates) == 1
     only = candidates[0]
@@ -469,7 +469,7 @@ def test_list_report_candidates_filters_english_quarterly_report_title() -> None
         discovery_periods=("Q3",),
     )
     profile = client.resolve_company(query)
-    candidates = client.list_report_candidates(query, profile)
+    candidates = client.list_report_candidates(query, profile, local_annual_ends=()).candidates
 
     assert [candidate.source_id for candidate in candidates] == ["Q3_CN"]
 
@@ -520,7 +520,7 @@ def test_list_report_candidates_prefers_full_fy_over_later_report_notice() -> No
         discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
-    candidates = client.list_report_candidates(query, profile)
+    candidates = client.list_report_candidates(query, profile, local_annual_ends=()).candidates
 
     assert [candidate.source_id for candidate in candidates] == ["FULL"]
 
@@ -549,7 +549,7 @@ def test_list_report_candidates_returns_empty_for_cninfo_independent_q2_q4() -> 
 
     client = _build_client(handler)
     profile = client.resolve_company(query)
-    candidates = client.list_report_candidates(query, profile)
+    candidates = client.list_report_candidates(query, profile, local_annual_ends=()).candidates
 
     assert candidates == ()
     assert query_calls == 0
@@ -610,7 +610,7 @@ def test_list_report_candidates_prefers_a_share_fy_over_later_h_share_notice() -
         discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
-    candidates = client.list_report_candidates(query, profile)
+    candidates = client.list_report_candidates(query, profile, local_annual_ends=()).candidates
 
     assert [candidate.source_id for candidate in candidates] == ["A1"]
 
@@ -655,7 +655,7 @@ def test_list_report_candidates_raises_on_failed_period_query() -> None:
     profile = client.resolve_company(query)
 
     with pytest.raises(FinsDownloadProviderError) as exc_info:
-        client.list_report_candidates(query, profile)
+        client.list_report_candidates(query, profile, local_annual_ends=()).candidates
 
     assert exc_info.value.source is FinsDownloadSource.CNINFO
     assert exc_info.value.transport_category is FinsDownloadTransportCategory.HTTP_STATUS
@@ -684,7 +684,7 @@ def test_list_report_candidates_raises_when_period_query_fails() -> None:
     profile = client.resolve_company(query)
 
     with pytest.raises(FinsDownloadProviderError) as exc_info:
-        client.list_report_candidates(query, profile)
+        client.list_report_candidates(query, profile, local_annual_ends=()).candidates
 
     assert exc_info.value.transport_category is FinsDownloadTransportCategory.HTTP_STATUS
     assert exc_info.value.retryable is True
@@ -742,7 +742,7 @@ def test_list_report_candidates_filters_non_pdf_and_other_sec_code() -> None:
         discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
-    candidates = client.list_report_candidates(query, profile)
+    candidates = client.list_report_candidates(query, profile, local_annual_ends=()).candidates
 
     assert [candidate.source_id for candidate in candidates] == ["A1"]
 
@@ -787,7 +787,7 @@ def test_list_report_candidates_amended_takes_priority() -> None:
         discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
-    candidates = client.list_report_candidates(query, profile)
+    candidates = client.list_report_candidates(query, profile, local_annual_ends=()).candidates
 
     assert len(candidates) == 1
     assert candidates[0].source_id == "A2"
@@ -840,7 +840,7 @@ def test_list_report_candidates_keeps_one_per_year_for_fy() -> None:
         discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
-    candidates = client.list_report_candidates(query, profile)
+    candidates = client.list_report_candidates(query, profile, local_annual_ends=()).candidates
 
     assert [c.fiscal_year for c in candidates] == [2024, 2023, 2022]
     assert [c.source_id for c in candidates] == ["A1", "A2", "A3"]
@@ -892,7 +892,7 @@ def test_list_report_candidates_picks_amended_per_year_without_dropping_other_ye
         discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
-    candidates = client.list_report_candidates(query, profile)
+    candidates = client.list_report_candidates(query, profile, local_annual_ends=()).candidates
 
     assert [(c.fiscal_year, c.source_id, c.amended) for c in candidates] == [
         (2024, "A2", True),
@@ -949,7 +949,7 @@ def test_list_report_candidates_handles_pagination() -> None:
         discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
-    candidates = client.list_report_candidates(query, profile)
+    candidates = client.list_report_candidates(query, profile, local_annual_ends=()).candidates
 
     # 两条 announcement 同 fiscal_period=FY，但属于不同 fiscal_year；
     # 按 (period, fiscal_year) 分组去重 -> 两条都保留，按年份降序排。
@@ -992,7 +992,7 @@ def test_list_report_candidates_head_failure_softly_degrades() -> None:
         discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
-    candidates = client.list_report_candidates(query, profile)
+    candidates = client.list_report_candidates(query, profile, local_annual_ends=()).candidates
 
     assert len(candidates) == 1
     only = candidates[0]
@@ -1021,7 +1021,7 @@ def test_list_report_candidates_empty_when_no_announcements() -> None:
         discovery_periods=("FY", "H1"),
     )
     profile = client.resolve_company(query)
-    candidates = client.list_report_candidates(query, profile)
+    candidates = client.list_report_candidates(query, profile, local_annual_ends=()).candidates
 
     assert candidates == ()
 
@@ -1049,7 +1049,7 @@ def test_list_report_candidates_treats_null_announcements_as_empty() -> None:
         discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
-    candidates = client.list_report_candidates(query, profile)
+    candidates = client.list_report_candidates(query, profile, local_annual_ends=()).candidates
 
     assert candidates == ()
 
@@ -1106,7 +1106,7 @@ def test_list_report_candidates_null_empty_period_does_not_block_other_periods()
         discovery_periods=("FY", "H1", "Q1", "Q3"),
     )
     profile = client.resolve_company(query)
-    candidates = client.list_report_candidates(query, profile)
+    candidates = client.list_report_candidates(query, profile, local_annual_ends=()).candidates
 
     assert len(candidates) == 1
     only = candidates[0]
@@ -1137,7 +1137,7 @@ def test_list_report_candidates_missing_announcements_key_raises() -> None:
     profile = client.resolve_company(query)
 
     with pytest.raises(FinsDownloadProviderError) as exc_info:
-        client.list_report_candidates(query, profile)
+        client.list_report_candidates(query, profile, local_annual_ends=()).candidates
 
     assert exc_info.value.source is FinsDownloadSource.CNINFO
     assert exc_info.value.transport_category is FinsDownloadTransportCategory.PROTOCOL
@@ -1180,7 +1180,7 @@ def test_list_report_candidates_non_list_announcements_raises(
     profile = client.resolve_company(query)
 
     with pytest.raises(FinsDownloadProviderError) as exc_info:
-        client.list_report_candidates(query, profile)
+        client.list_report_candidates(query, profile, local_annual_ends=()).candidates
 
     assert exc_info.value.transport_category is FinsDownloadTransportCategory.PROTOCOL
     assert exc_info.value.safe_message == "巨潮来源返回的公告列表格式不符合预期"
@@ -1209,7 +1209,7 @@ def test_list_report_candidates_invalid_profile_provider_raises() -> None:
                 discovery_periods=("FY",),
             ),
             bogus_profile,
-        )
+         local_annual_ends=()).candidates
 
 
 def test_list_report_candidates_uses_per_period_category() -> None:
@@ -1236,7 +1236,7 @@ def test_list_report_candidates_uses_per_period_category() -> None:
         discovery_periods=("FY", "H1", "Q1", "Q3"),
     )
     profile = client.resolve_company(query)
-    client.list_report_candidates(query, profile)
+    client.list_report_candidates(query, profile, local_annual_ends=()).candidates
 
     # URL-encoded 分号 -> %3B
     assert sorted(seen_categories) == sorted(
@@ -1285,7 +1285,7 @@ def test_list_report_candidates_calls_same_checkpoint_around_each_period_post() 
         query,
         profile,
         cancellation_checkpoint=checkpoint,
-    )
+     local_annual_ends=()).candidates
 
     assert candidates == ()
     assert events == [
@@ -1349,7 +1349,7 @@ def test_list_report_candidates_calls_checkpoint_around_every_paginated_post() -
         query,
         profile,
         cancellation_checkpoint=checkpoint,
-    )
+     local_annual_ends=()).candidates
 
     assert events == ["CP1", "POST(1)", "CP2", "CP3", "POST(2)", "CP4"]
 
@@ -1423,7 +1423,7 @@ def test_list_report_candidates_preserves_cancel_identity_and_stops_next_period(
             query,
             profile,
             cancellation_checkpoint=checkpoint,
-        )
+         local_annual_ends=()).candidates
 
     assert exc_info.value is expected
     assert events == expected_events
@@ -1466,7 +1466,7 @@ def test_list_report_candidates_preserves_checkpoint_failure_identity() -> None:
             query,
             profile,
             cancellation_checkpoint=checkpoint,
-        )
+         local_annual_ends=()).candidates
 
     assert exc_info.value is expected
     assert exc_info.value.__cause__ is original
@@ -1688,7 +1688,7 @@ def test_announcement_time_milliseconds_is_normalized() -> None:
         discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
-    candidates = client.list_report_candidates(query, profile)
+    candidates = client.list_report_candidates(query, profile, local_annual_ends=()).candidates
 
     assert candidates[0].filing_date == "2025-04-03"
 
@@ -1923,7 +1923,7 @@ def test_serialize_query_payload_structure_assertion() -> None:
         discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
-    client.list_report_candidates(query, profile)
+    client.list_report_candidates(query, profile, local_annual_ends=()).candidates
 
     assert seen_payload["stock"] == "002594,gssz0002594"
     assert seen_payload["column"] == "szse"

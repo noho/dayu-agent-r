@@ -13,6 +13,7 @@ from collections.abc import Callable
 from typing import TypeAlias
 
 from dayu.contracts.json_value import JsonValue
+from dayu.fins.download_contract import FinsDownloadUncertainReport
 from dayu.fins.domain.document_models import FinsIngestMethod, FilingUpdateRequest, now_iso8601
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.pipelines.cn_download_models import (
@@ -79,8 +80,9 @@ def rebuild_cn_download_artifacts(
     )
     started_at = time.perf_counter()
     filings: list[JsonObject] = []
+    uncertain_reports: tuple[FinsDownloadUncertainReport, ...] = ()
     if market == "HK":
-        filings, cancelled = rebuild_hk_periods(host, ticker, period_windows, cancel_checker)
+        filings, uncertain_reports, cancelled = rebuild_hk_periods(host, ticker, period_windows, cancel_checker)
     else:
         document_ids = host.source_repository.list_source_document_ids(ticker, SourceKind.FILING)
         cancelled = False
@@ -104,7 +106,7 @@ def rebuild_cn_download_artifacts(
             )
     elapsed_ms = int((time.perf_counter() - started_at) * 1000)
     warnings: list[str] = []
-    if not filings:
+    if not filings and not uncertain_reports:
         warnings.append("未匹配到可重建的已下载 CN/HK filings")
     form_values: list[JsonValue] = [period for period in period_policy.effective_periods]
     warning_values: list[JsonValue] = [warning for warning in warnings]
@@ -131,9 +133,13 @@ def rebuild_cn_download_artifacts(
         "warnings": warning_values,
         "notes": note_values,
         "filings": filing_values,
+        "uncertain_reports": [report.to_json_value() for report in uncertain_reports],
         "missing_periods": [],
         "summary": _build_rebuild_summary(filings=filings, elapsed_ms=elapsed_ms),
     }
+    raw_summary = result["summary"]
+    if isinstance(raw_summary, dict):
+        raw_summary["uncertain_count"] = len(uncertain_reports)
     return result
 
 

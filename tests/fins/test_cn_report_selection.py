@@ -115,7 +115,7 @@ def test_hk_selection_uses_annual_announcements_before_period_filtering() -> Non
             ),
         ),
         read_head_meta=_head_meta,
-    )
+     local_annual_ends=()).candidates
     assert [(c.source_id, c.fiscal_year, c.period_projection.identity_period) for c in candidates] == [
         ("quarter", 2025, "Q3")
     ]
@@ -128,7 +128,7 @@ def test_hk_no_disclosure_year_fallback_or_changed_year_end_guess() -> None:
             query=_hk_query(("Q1",)),
             announcements=(_hk_raw(document_id="no-year", title="第一季度業績", category_text="季度業績"),),
             read_head_meta=_head_meta,
-        )
+         local_annual_ends=()).candidates
         == ()
     )
     assert (
@@ -499,7 +499,7 @@ def test_hkexnews_selection_filters_english_and_infers_periods() -> None:
             ),
         ),
         read_head_meta=_head_meta,
-    )
+     local_annual_ends=()).candidates
 
     assert [(item.source_id, item.fiscal_year, item.period_projection.identity_period) for item in candidates] == [
         ("Q2_ZH", 2025, "Q2"),
@@ -538,7 +538,7 @@ def test_hkexnews_selection_groups_by_year_and_prefers_amended() -> None:
             ),
         ),
         read_head_meta=_head_meta,
-    )
+     local_annual_ends=()).candidates
 
     assert [(item.source_id, item.period_projection.identity_period, item.amended) for item in candidates] == [
         ("H1_REVISED", "H1", True)
@@ -587,7 +587,7 @@ def test_hkexnews_selection_uses_category_first_then_category_and_title_period_f
             ),
         ),
         read_head_meta=_head_meta,
-    )
+     local_annual_ends=()).candidates
 
     assert len(candidates) == 1
     assert candidates[0].period_projection.identity_period == expected_identity
@@ -625,7 +625,7 @@ def test_hkexnews_selection_rejects_ambiguous_family_or_period_facts(
         query=_hk_query(("FY", "H1", "Q1", "Q2", "Q3", "Q4")),
         announcements=(_hk_raw(document_id="GENERIC_AMBIGUOUS", title=title, category_text=category_text),),
         read_head_meta=_head_meta,
-    )
+     local_annual_ends=()).candidates
 
     assert candidates == ()
 
@@ -685,7 +685,7 @@ def test_hkexnews_selection_projects_four_generic_materials_to_distinct_identiti
             _hk_raw(document_id="REPORT_FY", title="2025 年度報告", category_text="年報"),
         ),
         read_head_meta=_head_meta,
-    )
+     local_annual_ends=()).candidates
 
     assert [candidate.source_id for candidate in candidates] == [
         "REPORT_FY",
@@ -739,4 +739,4 @@ def test_hkexnews_selection_fails_closed_on_same_source_id_fact_conflict() -> No
                 _hk_raw(document_id="CONFLICT", title="2025 全年業績", category_text="末期業績"),
             ),
             read_head_meta=_head_meta,
-        )
+         local_annual_ends=()).candidates

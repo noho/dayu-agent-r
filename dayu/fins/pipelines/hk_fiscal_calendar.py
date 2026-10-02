@@ -5,6 +5,10 @@ from __future__ import annotations
 import calendar
 import re
 from datetime import date
+from typing import Literal
+
+_ANNUAL_NEIGHBOR_DAYS = 366
+_REPORT_DATE_SOURCE: Literal["source_title"] = "source_title"
 
 _DIGITS = dict(zip("零〇一二三四五六七八九", "00123456789", strict=True))
 _MONTHS = (
@@ -102,7 +106,7 @@ def fiscal_quarter_at(end: date, annual_ends: tuple[date, ...]) -> tuple[int, in
     返回：财年及季度；没有依据、变更年结日、非月末或不在季度边界返回 None。
     异常：无。仅支持有邻近依据的规则月末财年，不猜测过渡期或 52/53 周财年。
     """
-    nearby = tuple(d for d in annual_ends if abs((d - end).days) <= 366)
+    nearby = relevant_annual_end_dates(end, annual_ends)
     if not nearby or len({d.month for d in nearby}) != 1:
         return None
     if any(d.day != calendar.monthrange(d.year, d.month)[1] for d in (*nearby, end)):
@@ -112,3 +116,21 @@ def fiscal_quarter_at(end: date, annual_ends: tuple[date, ...]) -> tuple[int, in
     if offset % 3:
         return None
     return end.year + int(end.month > month), (offset // 3 if offset else 4)
+
+
+def relevant_annual_end_dates(end: date, annual_ends: tuple[date, ...]) -> tuple[date, ...]:
+    """选择现有财政日历规则的邻近年度证据。
+
+    参数：end 为报告直接截止日；annual_ends 为同公司年度截止日证据。
+    返回：距离 end 不超过 366 天的去重有序日期 tuple。
+    异常：无。"""
+    return tuple(sorted({d for d in annual_ends if abs((d - end).days) <= _ANNUAL_NEIGHBOR_DAYS}))
+
+
+def hk_report_date_source(report_date: str | None) -> Literal["source_title"] | None:
+    """将标题已解析日期投影为同源日期来源。
+
+    参数：report_date 为本模块已解析的 ISO 日期或 None，不重新解析。
+    返回：有日期时为 source_title，无日期时为 None。
+    异常：无。"""
+    return _REPORT_DATE_SOURCE if report_date is not None else None

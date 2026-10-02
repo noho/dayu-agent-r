@@ -1,0 +1,20 @@
+{
+  "status": "original validation bytes before code checkpoint; not final material CLI campaign",
+  "files": {
+    "docs/gateflow/evidence/pr197-f5-final-20261002/pyright.receipt.json": "85bf97b119cce2197b24797cc43620728043a8067eaafc682e2ad4e2d67eddbf",
+    "docs/gateflow/evidence/pr197-f5-final-20261002/complete.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "docs/gateflow/evidence/pr197-f5-final-20261002/complete.stdout": "5179c89f131b5a2a1a6f36e8c45e856b0a6f5aca98e19e55e505ccd60a094b6a",
+    "docs/gateflow/evidence/pr197-f5-final-20261002/pyright.command.json": "b7d64720a8bf53cfb2cda75c2a2c9f281d3b29ac248e60e4548488d4953b9978",
+    "docs/gateflow/evidence/pr197-f5-final-20261002/coverage-23-production.json": "bae6ab2fa3ee02a9ed2fb19616e90815e45b9d68c70bacc95a61ecb7a260e034",
+    "docs/gateflow/evidence/pr197-f5-final-20261002/final-source-manifest.json": "8fcc732a3313e2f990b177885b27189658f7c8cfef20ebaf1745a20b3ea27adb",
+    "docs/gateflow/evidence/pr197-f5-final-20261002/pyright.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "docs/gateflow/evidence/pr197-f5-final-20261002/complete.command.json": "9708499d74f9144eb23cba14c872b5b589b265e11064ccff72a44eed8cef4789",
+    "docs/gateflow/evidence/pr197-f5-final-20261002/complete.receipt.json": "e4157f9ff51b1bd381046bd5dbc1399aa5f056c8ebc6d06824c09e7aff4027a5",
+    "docs/gateflow/evidence/pr197-f5-final-20261002/pyright.stdout.json": "53141c923956bfabb9c08cf5d0183172a178b7acd7aea2bc56f55015347f2a89"
+  },
+  "raw_stdout_envelope": {
+    "path": "docs/gateflow/evidence/pr197-f5-final-20261002/pyright.stdout.json",
+    "decoded_sha256": "46a6c7834c9080ada23a415afd925abecc37d531f5c6e3d14ad0a7ff579096cb",
+    "exact_original_bytes_preserved": true
+  }
+}

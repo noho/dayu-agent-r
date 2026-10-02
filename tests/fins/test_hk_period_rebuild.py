@@ -268,7 +268,7 @@ def test_hk_rebuild_cancellation_rolls_back_all_metadata(tmp_path: Path, monkeyp
         return handle
 
     monkeypatch.setattr(pipeline.source_repository, "update_source_document", stage_then_cancel)
-    filings, was_cancelled = rebuild_hk_periods(
+    filings, uncertain, was_cancelled = rebuild_hk_periods(
         pipeline,
         "3690",
         (PeriodDownloadWindow(fiscal_period="Q1", start_date="2024-01-01", end_date="2026-12-31"),),

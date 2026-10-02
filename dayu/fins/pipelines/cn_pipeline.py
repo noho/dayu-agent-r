@@ -7,6 +7,7 @@ Host、tool/provider 装配不在本 Slice 内。
 """
 
 from __future__ import annotations
+from dataclasses import replace
 
 import asyncio
 import logging
@@ -34,6 +35,8 @@ from dayu.fins.download_contract import (
     FinsDownloadDocumentResult,
     FinsDownloadEffectiveFilters,
     FinsDownloadResultSummary,
+    FinsDownloadUncertainReport,
+    FinsDownloadTerminalDisposition,
     FinsDownloadSource,
 )
 from dayu.fins.ingestion_runtime import (
@@ -54,6 +57,7 @@ from dayu.fins.domain.document_models import FinsIngestMethod
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.pipelines.cn_download_models import (
     CN_DOWNLOAD_NORMAL_TERMINAL_STATUSES,
+    CN_DOWNLOAD_TERMINAL_CANCELLED,
     CN_DOWNLOAD_TERMINAL_INTEGRITY_FAILED,
     CN_FISCAL_PERIOD_ORDER,
     CnMarketKind,
@@ -1388,6 +1392,7 @@ class CnDownloadAdapter(FinsSourceDownloadAdapter):
         except CnDownloadIntegrityAbort as exc:
             persisted_summary = _summary_from_integrity_abort(
                 exc.result,
+                uncertain_reports=exc.uncertain_reports,
                 request=request,
                 source_repository=self._pipeline.source_repository,
             )
@@ -1445,13 +1450,17 @@ def _summary_from_pipeline_result(
     status = _required_cn_text(result, "status")
     if status not in CN_DOWNLOAD_NORMAL_TERMINAL_STATUSES:
         raise ValueError(f"CN/HK 下载结果 terminal status 未封闭: {status}")
-    return _project_cn_pipeline_summary(result, request=request, source_repository=source_repository)
+    return _project_cn_pipeline_summary(
+        result, request=request, source_repository=source_repository,
+        uncertain_reports=tuple(FinsDownloadUncertainReport.from_json_value(item) for item in _required_cn_mapping_list(result, "uncertain_reports")),
+    )
 
 
 def _summary_from_integrity_abort(
     result: Mapping[str, JsonValue],
     *,
     request: FinsSourceDownloadAdapterRequest,
+    uncertain_reports: tuple[FinsDownloadUncertainReport, ...],
     source_repository: SourceDocumentRepositoryProtocol,
 ) -> FinsDownloadResultSummary:
     """严格验证私有失败状态后投影同一已处理文档快照。
@@ -1459,6 +1468,7 @@ def _summary_from_integrity_abort(
     Args:
         result: workflow 给出的失败快照。
         request: 原下载请求。
+        uncertain_reports: typed 中止携带的完整独立未知集合。
         source_repository: 文档 locator 真源。
 
     Returns:
@@ -1472,7 +1482,7 @@ def _summary_from_integrity_abort(
     status = _required_cn_text(result, "status")
     if status != CN_DOWNLOAD_TERMINAL_INTEGRITY_FAILED:
         raise ValueError(f"CN/HK 完整性失败快照 status 未封闭: {status}")
-    return _project_cn_pipeline_summary(result, request=request, source_repository=source_repository)
+    return _project_cn_pipeline_summary(result, request=request, source_repository=source_repository, uncertain_reports=uncertain_reports)
 
 
 def _project_cn_pipeline_summary(
@@ -1480,12 +1490,14 @@ def _project_cn_pipeline_summary(
     *,
     request: FinsSourceDownloadAdapterRequest,
     source_repository: SourceDocumentRepositoryProtocol,
+    uncertain_reports: tuple[FinsDownloadUncertainReport, ...],
 ) -> FinsDownloadResultSummary:
     """在各入口已验证 status 后复用唯一纯文档投影。
 
     Args:
         result: workflow 结果。
         request: 原下载请求。
+        uncertain_reports: 由正常解码或 typed 中止提供的完整独立未知集合。
         source_repository: 文档 locator 真源。
 
     Returns:
@@ -1510,13 +1522,15 @@ def _project_cn_pipeline_summary(
     )
     missing_periods = _required_cn_text_list(result, "missing_periods")
     filters = _project_cn_effective_filters(result, request=request)
-    return FinsDownloadResultSummary.from_document_rows(
+    summary = FinsDownloadResultSummary.from_document_rows(
         source=request.source,
         canonical_ticker=ticker,
         effective_filters=filters,
         document_rows=rows,
+        uncertain_reports=uncertain_reports,
         missing_periods=missing_periods,
     )
+    return replace(summary, terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED) if result["status"] == CN_DOWNLOAD_TERMINAL_CANCELLED else summary
 
 
 def _project_cn_document_row(

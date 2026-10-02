@@ -3453,7 +3453,7 @@ def _typed_download_summary(
             rebuild_local_artifacts=rebuild_local_artifacts,
         ),
         document_rows=rows,
-    )
+     uncertain_reports=())
 
 
 def test_public_download_json_preserves_cn_coverage_and_sec_empty_array() -> None:
@@ -3492,7 +3492,7 @@ def test_public_download_json_preserves_cn_coverage_and_sec_empty_array() -> Non
         ),
         document_rows=(cn_row,),
         missing_periods=("FY", "H1"),
-    )
+     uncertain_reports=())
     sec_summary = _typed_download_summary(canonical_ticker="AAPL", skipped_ids=("fil-sec",))
 
     cn_json = ingestion_runtime._public_download_summary(cn_summary).to_json_value()
@@ -5006,6 +5006,7 @@ class _ClaimRaceJobStore:
         job_id: str,
         *,
         result_summary: dict[str, JsonValue],
+        cancelled_result_summary: dict[str, JsonValue] | None,
         finished_at: str,
     ) -> ingestion_runtime.FinsIngestionJobRecord:
         """按当前取消状态保存 succeeded 或 cancelled 终态。
@@ -5050,6 +5051,7 @@ class _ClaimRaceJobStore:
         self,
         job_id: str,
         *,
+        result_summary: dict[str, JsonValue] | None,
         finished_at: str,
     ) -> ingestion_runtime.FinsIngestionJobRecord:
         """仅当当前测试 job 非终态时保存 cancelled 终态。
@@ -5129,7 +5131,8 @@ class _ClaimRaceJobStore:
         job_id: str,
         *,
         failure_summary: dict[str, JsonValue],
-        result_summary: dict[str, JsonValue],
+        result_summary: dict[str, JsonValue] | None,
+        cancelled_result_summary: dict[str, JsonValue] | None,
         finished_at: str,
     ) -> ingestion_runtime.FinsIngestionJobRecord:
         """按当前测试 job 状态保存 failed 或 cancelled 终态。
@@ -5166,7 +5169,7 @@ class _ClaimRaceJobStore:
             updated_at=finished_at,
             finished_at=finished_at,
             failure_summary=failure_summary,
-            result_summary=result_summary,
+            result_summary={} if result_summary is None else result_summary,
         )
         self._record = failed
         return failed
@@ -6264,7 +6267,7 @@ def test_failed_operation_accepts_only_valid_processed_document_dispositions() -
         missing_periods=(),
         omitted_count=0,
         terminal_disposition=FinsDownloadTerminalDisposition.FAILED,
-    )
+     uncertain_reports=(), uncertain_count=0, omitted_uncertain_count=0)
     downloaded = FinsDownloadPublicDocument(
         document_id="fil-confirmed", form_or_period="10-K", filing_date=None,
         report_date=None, covered_fiscal_periods=(),
@@ -6342,7 +6345,7 @@ def test_initial_typed_download_job_saves_structured_zero_summary_and_safe_messa
         request, terminal_disposition=FinsDownloadTerminalDisposition.FAILED
     )
     assert record.status is FinsIngestionJobStatus.FAILED
-    assert record.result_summary == expected.to_json_summary()
+    assert record.result_summary == expected.to_json_summary(max_json_chars=4096)
     assert record.failure_summary["message"] == "本地来源完整性预检失败"
 
 
@@ -6383,6 +6386,7 @@ def test_typed_download_job_second_save_failure_logs_only_fixed_event(
     def fail_save(
         record: FinsIngestionJobRecord,
         *,
+        cancelled_result_summary: dict[str, JsonValue] | None,
         message: str,
         result_summary: dict[str, JsonValue] | None = None,
     ) -> FinsIngestionJobRecord:
@@ -6456,7 +6460,7 @@ def test_download_summary_zero_candidate_terminal_override_matrix(
             document_rows=(),
             terminal_disposition=terminal,
             missing_periods=(),
-        )
+         uncertain_reports=(), uncertain_count=0)
 
     if is_allowed:
         summary = build_summary()
@@ -6466,15 +6470,11 @@ def test_download_summary_zero_candidate_terminal_override_matrix(
             build_summary()
 
 
-def test_terminal_derivation_asserts_impossible_mixed_failure_counts() -> None:
-    """defensive discovered_count witness 非正时必须 assert，不得静默 fallback。"""
-
-    with pytest.raises(AssertionError, match="discovered_count"):
-        download_contract._terminal_disposition_from_counts(
-            discovered_count=0,
-            downloaded_count=1,
-            rejected_count=0,
-            failed_count=1,
+def test_terminal_derivation_rejects_illegal_counts() -> None:
+    """参数无；返回无；owner 接受负数或 bool 计数时断言失败。"""
+    with pytest.raises(ValueError, match="counts"):
+        download_contract.download_terminal_disposition_from_counts(
+            downloaded_count=-1, rejected_count=0, failed_count=1, uncertain_count=0,
         )
 
 
@@ -9762,7 +9762,7 @@ def test_result_summaries_allow_slash_in_document_ids() -> None:
         internal_document_id="sec/aapl-2024-10ka-internal",
     )
 
-    assert download_summary.to_json_summary()["written_document_ids"] == ["sec/aapl-2024-10ka"]
+    assert download_summary.to_json_summary(max_json_chars=4096)["written_document_ids"] == ["sec/aapl-2024-10ka"]
     assert preprocess_summary.to_json_summary()["processed_document_ids"] == ["processed/aapl-2024-10ka"]
     assert upload_summary.to_json_summary()["document_id"] == "sec/aapl-2024-10ka"
     assert upload_summary.to_json_summary()["internal_document_id"] == "sec/aapl-2024-10ka-internal"
@@ -11017,7 +11017,7 @@ def test_save_cancelled_does_not_overwrite_current_terminal_record(tmp_path: Pat
     )
     ingestion.job_store.save_job(terminal_record)
 
-    saved = ingestion._save_cancelled(start.record)
+    saved = ingestion._save_cancelled(start.record, result_summary=None)
     reloaded = ingestion.read_job(start.job_id)
 
     assert saved.status is FinsIngestionJobStatus.SUCCEEDED
@@ -11042,7 +11042,7 @@ def test_save_failed_uses_current_cancelling_record_instead_of_stale_active_reco
         start.record,
         message="late failure",
         result_summary={"processed_count": 1},
-    )
+     cancelled_result_summary=None)
     reloaded = ingestion.read_job(start.job_id)
 
     assert cancelling.status is FinsIngestionJobStatus.CANCELLING
@@ -11505,6 +11505,7 @@ def test_start_download_cancel_immediately_before_success_terminalization_writes
         store: ingestion_runtime.FsFinsIngestionJobStore,
         job_id: str,
         *,
+        cancelled_result_summary: dict[str, JsonValue] | None,
         result_summary: dict[str, JsonValue],
         finished_at: str,
     ) -> ingestion_runtime.FinsIngestionJobRecord:
@@ -11527,7 +11528,7 @@ def test_start_download_cancel_immediately_before_success_terminalization_writes
 
         del store
         ingestion.request_cancel(job_id)
-        return original_save(job_id, result_summary=result_summary, finished_at=finished_at)
+        return original_save(job_id, result_summary=result_summary, cancelled_result_summary=cancelled_result_summary, finished_at=finished_at)
 
     monkeypatch.setattr(
         ingestion_runtime.FsFinsIngestionJobStore,
@@ -11542,7 +11543,9 @@ def test_start_download_cancel_immediately_before_success_terminalization_writes
     assert len(adapter.requests) == 1
     assert record.status is FinsIngestionJobStatus.CANCELLED
     assert record.cancellation_requested
-    assert record.result_summary == {}
+    assert record.result_summary["downloaded_count"] == 1
+    assert record.result_summary["terminal_disposition"] == "cancelled"
+    assert record.result_summary["written_document_ids"]
 
 
 def test_runners_return_for_preterminalized_jobs_without_executing(
@@ -11565,7 +11568,7 @@ def test_runners_return_for_preterminalized_jobs_without_executing(
             download_start.record,
             status=FinsIngestionJobStatus.SUCCEEDED,
             finished_at=download_start.record.updated_at,
-            result_summary={"sentinel": True},
+            result_summary=_typed_download_summary().to_json_summary(max_json_chars=4096),
         )
     )
 
@@ -11615,7 +11618,7 @@ def test_runners_return_for_preterminalized_jobs_without_executing(
     preprocess_record = preprocess_ingestion.read_job(preprocess_start.job_id)
 
     assert download_adapter.requests == []
-    assert download_record.result_summary == {"sentinel": True}
+    assert download_record.result_summary == _typed_download_summary().to_json_summary(max_json_chars=4096)
     assert preprocess_execute_calls == 0
     assert preprocess_record.result_summary == {"sentinel": True}
 
@@ -11740,6 +11743,7 @@ def test_save_failed_from_exception_logs_secondary_job_store_failure(
         store: ingestion_runtime.FsFinsIngestionJobStore,
         job_id: str,
         *,
+        cancelled_result_summary: dict[str, JsonValue] | None,
         failure_summary: dict[str, JsonValue],
         result_summary: dict[str, JsonValue],
         finished_at: str,
@@ -11770,7 +11774,7 @@ def test_save_failed_from_exception_logs_secondary_job_store_failure(
     )
 
     with caplog.at_level(logging.WARNING, logger="dayu.fins.ingestion_runtime"):
-        ingestion._save_failed_from_exception(start.job_id, RuntimeError("primary failure"))
+        ingestion._save_failed_from_exception(start.job_id, RuntimeError("primary failure"), result_summary=None, cancelled_result_summary=None)
 
     assert "fins.ingestion.failed_terminalization_failed" in caplog.text
     assert f"job_id={start.job_id}" in caplog.text

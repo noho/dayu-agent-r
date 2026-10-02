@@ -1,0 +1,55 @@
+{
+  "capture_proofs": [
+    {
+      "case": "annual-results",
+      "strict_protocol_verified": true,
+      "rows": 2,
+      "has_next_row": false,
+      "canonical_scope_match": "00700",
+      "body_sha256": "62582cfbfa1aaeb588971f339bbbb33767420528718b916877d0e05d0c6cb94a",
+      "normalized_titles": [
+        "截至二零二四年十二月三十一日止年度末期股息",
+        "截至二零二四年十二月三十一日止年度全年業績公佈"
+      ]
+    },
+    {
+      "case": "quarter-results",
+      "strict_protocol_verified": true,
+      "rows": 1,
+      "has_next_row": false,
+      "canonical_scope_match": "00700",
+      "body_sha256": "0d6bbb3ba351b9a8cdd1966dea75234efb9dbfdb686fba89a289cd5924b59f32",
+      "normalized_titles": [
+        "截至二零二五年九月三十日止三個月及九個月業績公佈"
+      ]
+    }
+  ],
+  "real_raw_resolver_observations": [
+    {
+      "case": "no-anchor",
+      "facts": {
+        "fiscal_year": 2025,
+        "identity_period": "Q3",
+        "covered_periods": [
+          "Q3"
+        ]
+      }
+    },
+    {
+      "case": "official-annual",
+      "facts": {
+        "fiscal_year": 2025,
+        "identity_period": "Q3",
+        "covered_periods": [
+          "Q3"
+        ]
+      }
+    }
+  ],
+  "annual_ends": [
+    "2024-12-31"
+  ],
+  "quarter_report_end": "2025-09-30",
+  "failure_and_recovery": "first owner-validation command exit1 on assumed no-anchor None assertion; now record actual production output, do not alter official body/title or call it counterexample",
+  "scope": "exact two official GET responses; no HEAD/PDF/Docling, no publication; not historical crawler"
+}
