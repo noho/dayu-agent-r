@@ -1,0 +1,17 @@
+{
+  "checks": 139,
+  "mismatches": 0,
+  "files": 91,
+  "validation": 37,
+  "snapshot": 9,
+  "source_head": "3d0d390206739a8bb255dee517b5b61bfc4497b6",
+  "base": "fac32ecbff9bfe792b63ee9667c8697826b631f4",
+  "managed_outer_exits": {
+    "79386": 0,
+    "28118": 0
+  },
+  "no_product_dirty": true,
+  "source_matches_reviewed_aggregate": true,
+  "compare_complete846_normalized_equal": true,
+  "checks_state": "no checks reported, not CI pass"
+}

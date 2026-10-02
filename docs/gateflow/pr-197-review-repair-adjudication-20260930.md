@@ -1,13 +1,13 @@
 # PR #197 审查 findings 修复：接续总控记录
 
 <!-- PR197_LIVE_GATE_STATUS_START -->
-## 当前总控状态（aggregate最终核收）
+## 当前总控状态（F5正式PR review裁决通过）
 
-- 唯一主树codex/upload-material-oracle；local source0d8+已复审AG01五件delta，remote/PR3a待普通push，mainfac32未动。
-- F1 rejected；F2/F3/F4/F6/F7已闭环，F5单完整S1/IV01–05/AG01均已修。aggregate双路MiMo/MiMo-flash终态outer0，root全工具及86+37SHA核准，aggregatepass见 pr-197-r1-f5-aggregate-review-final-adjudication-20261002.md。1747passed/fullpyright0/23prod>=80，未执行最终CLI。
-- 无活动runner/产品writer；下一accepted deepreview commit→普通push已有draftPR197→精确OID正式PRreview→acceptedPRreviewcommit/push→finalcloseout/handoff后停。不冒PRgate/full715/最终CI通过。
-- `$sub-agents`外部runner，gpt-6-sol plan/implement/fix，MiMo/MiMo-flash双路独立并行review，绝对cwd、独立output/stderr、root结构化核收自行裁决。Gateflow完整行为slice尽量少/默认避免WU>3并解释，不按文件模块owner机械拆。
-- 原17标签+受控XBRL+最终真实CLI/materialoracle/scenarios交新Agent；7prepared为proposal，未实施。
+- 唯一主树codex/upload-material-oracle，审定source head3d0d3902，本地/远端/PR已同步该源码；mainfac32未动，PR OPEN/draft用户merge。F1 rejected；F2/F3/F4/F6/F7已闭环；F5单完整S1 accepted0d8、aggregate accepted3d0，IV01–05/AG01已修。
+- 正式PR review双路MiMo79386/MiMo-flash28118均outer0已完整收取，root139身份项/全工具及必要组合独立裁决pass，见 docs/reviews/pr-197-review-20261002-root-adjudication.md。无活动runner/产品writer。
+- 下个未完成gate：acceptedPRreviewcommit→普通push/readback→draft-PR-pass→finalcloseout/handoff3完整替换后停。尚未push这次PRreview文档，不提前closeout。当前1747受影响回归/fullpyright0/23prod>=80同字节有效；GHchecks无记录，全PR846未逐行验收，原证据EOF卫生项及最终真实CLI待后续。
+- `$sub-agents`runner，gpt-6-sol plan/implement/fix、MiMo/MiMo-flash独立同时并行review，绝对cwd/独立outputstderr/managed终态及完整structured结果root自行裁决。Gateflow以完整可验证行为增量尽量少slice，默认避免WU>3且超过解释，不按文件模块owner机械拆，成立修复立即登记artifact。
+- 原17upload标签+受控XBRL+最终真实CLI/materialoracle/scenarios交新Agent；7prepared是proposal，不当accepted计划或已实施。
 <!-- PR197_LIVE_GATE_STATUS_END -->
 
 
