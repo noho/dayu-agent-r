@@ -1,14 +1,17 @@
 # PR #197 审查 findings 修复：接续总控记录
 
 <!-- PR197_LIVE_GATE_STATUS_START -->
-## 当前总控状态（F5正式PR review裁决通过）
+## 当前总控状态（review findings最终closeout / 用户指定交接停止）
 
-- 唯一主树codex/upload-material-oracle，审定source head3d0d3902，本地/远端/PR已同步该源码；mainfac32未动，PR OPEN/draft用户merge。F1 rejected；F2/F3/F4/F6/F7已闭环；F5单完整S1 accepted0d8、aggregate accepted3d0，IV01–05/AG01已修。
-- 正式PR review双路MiMo79386/MiMo-flash28118均outer0已完整收取，root139身份项/全工具及必要组合独立裁决pass，见 docs/reviews/pr-197-review-20261002-root-adjudication.md。无活动runner/产品writer。
-- 下个未完成gate：acceptedPRreviewcommit→普通push/readback→draft-PR-pass→finalcloseout/handoff3完整替换后停。尚未push这次PRreview文档，不提前closeout。当前1747受影响回归/fullpyright0/23prod>=80同字节有效；GHchecks无记录，全PR846未逐行验收，原证据EOF卫生项及最终真实CLI待后续。
-- `$sub-agents`runner，gpt-6-sol plan/implement/fix、MiMo/MiMo-flash独立同时并行review，绝对cwd/独立outputstderr/managed终态及完整structured结果root自行裁决。Gateflow以完整可验证行为增量尽量少slice，默认避免WU>3且超过解释，不按文件模块owner机械拆，成立修复立即登记artifact。
-- 原17upload标签+受控XBRL+最终真实CLI/materialoracle/scenarios交新Agent；7prepared是proposal，不当accepted计划或已实施。
+- F1 rejected；F2/F3/F4/F5/F6/F7已修并完成finalcloseout。F5单完整S1 accepted0d8、aggregate/source3d0、正式PRreview `4a370a4fd8ca82de8f01fa8ea58aa83ddd92b192` 已普通push/readback，local/tracking/remote/PR一致；mainfac32未动，PR OPEN/draft用户merge。
+- 真源 pr-197-review-findings-final-closeout-20261002.md / docs/upload_material_repair_handoff_prompt_3.md（完整替换，旧字节已保全）。无活动runner/产品writer，本輪按最新用户stop交接，不实施后续队列。最后closeout/handoff/prepared保全提交是docs-only，接手实时核最终Githead；不是新CLIrun。
+- 验证1747受影响回归/fullpyright0/23prod>=80及双路/root独裁同版有效；GHchecks无记录，846并未全逐行验收，原证据EOF卫生项及最终真实CLI/materialoracle/scenarios待后续。
+- 下一位从G1正式plan接续，17标签+受控XBRL建议6完整WU，7prepared仅候选。现成裁决优先；$sub-agents runner，gpt-6-sol plan/implement/fix，MiMo/MiMo-flash两路同时独立review，绝对cwd/独立双流/完整structured由root独裁。
+- Gateflow完整可验证行为slice尽量少/默认避免WU>3且超过解释，禁止按文件模块owner机械拆；成立修复即artifact登记，不为nit另开loop。
 <!-- PR197_LIVE_GATE_STATUS_END -->
+
+## 以下是历史执行流水（只记录当时状态，当前入口以上方有效状态和新handoff为准）
+
 
 
 ## 授权、边界与起点

@@ -1,0 +1,12 @@
+{
+  "accepted_PRreview": "4a370a4fd8ca82de8f01fa8ea58aa83ddd92b192",
+  "reviewed_source_head": "3d0d390206739a8bb255dee517b5b61bfc4497b6",
+  "local_tracking_live_PR_equal": true,
+  "main_local_tracking_live_base": "fac32ecbff9bfe792b63ee9667c8697826b631f4",
+  "no_source_or_test_change_after_review": true,
+  "PR": "OPEN/draft",
+  "push_managed": 46890,
+  "push_outer_exit": 0,
+  "gate": "draft-PR-pass, next finalcloseout",
+  "closing_keyword_count": 1
+}
