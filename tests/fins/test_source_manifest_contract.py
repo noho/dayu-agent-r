@@ -1,6 +1,11 @@
 """材料 manifest 严格主源投影与真实 Fs 发布/内容失败链回归。"""
 from __future__ import annotations
 
+from dayu.fins.storage import FsBatchingRepository, FsCompanyMetaRepository, FsSourceDocumentRepository, FsDocumentBlobRepository, FsFilingMaintenanceRepository, FsFilingUploadStateRepository, FsProcessedDocumentRepository
+from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
+
+from dayu.fins.storage import FsMaterialUploadStateRepository
+
 from docling_core.types.doc.document import DoclingDocument
 from docling_core.types.doc.labels import DocItemLabel
 
@@ -22,7 +27,7 @@ from dayu.fins.pipelines.docling_upload_service import build_material_ids
 from dayu.fins.processors.registry import build_fins_processor_registry
 from dayu.fins.storage import FsSourceDocumentRepository, FsBatchingRepository, FsCompanyMetaRepository
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
-from dayu.fins.storage.source_manifest_contract import project_material_manifest_item
+from dayu.fins.storage.source_manifest_contract import project_filing_manifest_item, project_material_manifest_item
 from dayu.fins.storage.source_meta_contract import require_material_source_meta_primary_document
 from dayu.fins.storage._fs_source_integrity import validate_material_source_primary
 from dayu.fins.upload_failure import FinsUploadFailureError, fins_upload_failure_from_exception, fins_upload_empty_input_failure
@@ -69,7 +74,7 @@ def test_typed_failure_preserves_object_and_label() -> None:
 async def test_role_publish_a_b_b_and_snapshot(tmp_path: Path) -> None:
     """参数：真实隔离仓储根；返回：无；异常：断言失败；稳定身份 v1/v2/v2、全部转换与新旧 snapshot 主源一致。"""
     converter = _Converter()
-    pipeline = SecPipeline(workspace_root=tmp_path, processor_registry=build_fins_processor_registry(), docling_converter=converter)
+    pipeline = SecPipeline(workspace_root=tmp_path, processor_registry=build_fins_processor_registry(), docling_converter=converter,  material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
     repository = FsSourceDocumentRepository(tmp_path)
     a, b = tmp_path / "a.txt", tmp_path / "b.md"
     a.write_bytes(b"original a"); b.write_bytes(b"original b")
@@ -121,7 +126,7 @@ async def _upload(pipeline: SecPipeline, request: FinsUploadMaterialRequest) -> 
 async def test_empty_original_before_any_conversion(tmp_path: Path, empty_position: int) -> None:
     """参数：真实根与单空/空前/空后位置；返回：无；异常：断言失败；零转换/零材料发布，合法公司保持。"""
     converter = _Converter()
-    pipeline = SecPipeline(workspace_root=tmp_path, processor_registry=build_fins_processor_registry(), docling_converter=converter)
+    pipeline = SecPipeline(workspace_root=tmp_path, processor_registry=build_fins_processor_registry(), docling_converter=converter,  material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
     empty, valid = tmp_path / "empty.txt", tmp_path / "valid.txt"
     empty.write_bytes(b""); valid.write_bytes(b"valid")
     paths = (empty,) if empty_position == 0 else (empty, valid) if empty_position == 1 else (valid, empty)
@@ -139,7 +144,7 @@ async def test_empty_original_before_any_conversion(tmp_path: Path, empty_positi
 @pytest.mark.parametrize("role", (None, "original", "docling"))
 def test_exact_declared_docling_member(tmp_path: Path, role: str | None) -> None:
     """参数：真实声明目录及角色；返回：无；异常：断言失败；不能仅字符串 primary 相等就接受原件。"""
-    meta: dict[str, JsonValue] = {"primary_document": "a.json", "files": [{"name": "a.json", "uri": "local://a.json", "source": role}]}
+    meta: dict[str, JsonValue] = {"amended": False, "primary_document": "a.json", "files": [{"name": "a.json", "uri": "local://a.json", "source": role}]}
     if role == "docling":
         validate_material_source_primary(source_meta=meta, source_directory=tmp_path)
     else:
@@ -150,7 +155,8 @@ def test_exact_declared_docling_member(tmp_path: Path, role: str | None) -> None
 @pytest.mark.asyncio
 async def test_material_replace_and_public_primary_are_strict(tmp_path: Path) -> None:
     """参数：真实新库；返回：无；异常：断言失败；strict 主源拒绝原件/缺字段/类型，replace 零发布，public primary 不 strip 或猜文件。"""
-    pipeline = SecPipeline(workspace_root=tmp_path, processor_registry=build_fins_processor_registry(), docling_converter=_Converter())
+    repository_set = build_fs_repository_set(workspace_root=tmp_path, create_directories=False)
+    pipeline = SecPipeline(workspace_root=tmp_path, processor_registry=build_fins_processor_registry(), docling_converter=_Converter(),  material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=repository_set), batching_repository=FsBatchingRepository(tmp_path, repository_set=repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=repository_set),)
     path = tmp_path / "source.txt"
     path.write_bytes(b"source")
     raw = FinsUploadMaterialRequest(ticker="AAPL", files=(path,), form_type="OTHER", material_name="Strict", company_name="Apple Inc.")
@@ -198,7 +204,7 @@ async def test_material_corrupt_original_in_each_position_has_no_partial_publica
     good.write_bytes(b"controlled valid contents")
     corrupt.write_bytes(b"corrupt document")
     converter = _Converter(failing_name=corrupt.name)
-    pipeline = SecPipeline(workspace_root=tmp_path, processor_registry=build_fins_processor_registry(), docling_converter=converter)
+    pipeline = SecPipeline(workspace_root=tmp_path, processor_registry=build_fins_processor_registry(), docling_converter=converter,  material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
     files = (corrupt, good) if failed_first else (good, corrupt)
     request = FinsUploadMaterialRequest(ticker="AAPL", files=files, primary_selectors=(good,),
         form_type="OTHER", material_name="Failure Position", company_name="Apple Inc.")
@@ -212,3 +218,23 @@ async def test_material_corrupt_original_in_each_position_has_no_partial_publica
     assert converter.calls == ([corrupt.name] if failed_first else [good.name, corrupt.name])
     assert FsSourceDocumentRepository(tmp_path).list_source_document_ids("AAPL", SourceKind.MATERIAL) == []
     assert FsCompanyMetaRepository(tmp_path).get_company_meta("AAPL").company_name == "Apple Inc."
+
+
+@pytest.mark.parametrize("source_kind", (SourceKind.FILING, SourceKind.MATERIAL))
+@pytest.mark.parametrize("deleted", (False, True))
+def test_manifest_deletion_uses_strict_storage_fact(source_kind: SourceKind, deleted: bool) -> None:
+    """参数：来源类别与删除事实；返回：无；异常：断言失败；两类manifest不自行默认删除状态。"""
+    meta: dict[str, JsonValue] = {"amended": False,
+        "document_id": "doc", "internal_document_id": "doc", "ingest_method": "upload",
+        "source_provider": "user_upload", "ingest_complete": True,
+        "primary_document": "a.txt_docling.json", "is_deleted": deleted,
+    }
+    project = project_filing_manifest_item if source_kind is SourceKind.FILING else project_material_manifest_item
+    assert project(meta).is_deleted is deleted
+    del meta["is_deleted"]
+    with pytest.raises(KeyError):
+        project(meta)
+    for wrong in (None, 0, "false"):
+        meta["is_deleted"] = wrong
+        with pytest.raises(ValueError):
+            project(meta)

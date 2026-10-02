@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from dayu.fins.storage import FsBatchingRepository, FsCompanyMetaRepository, FsSourceDocumentRepository, FsDocumentBlobRepository, FsFilingMaintenanceRepository, FsFilingUploadStateRepository, FsProcessedDocumentRepository
+from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
+
+from dayu.fins.storage import FsMaterialUploadStateRepository
+
 import asyncio
 import hashlib
 import io
@@ -942,7 +947,7 @@ def _build_pipeline(
         hk_discovery_client=hk_discovery,
         pdf_download_gate=pdf_download_gate,
         docling_converter=converter,
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=repository_set),)
 
 
 def _collect_events(

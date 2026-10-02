@@ -92,6 +92,7 @@ from dayu.fins.storage.repository_protocols import (
     BatchingRepositoryProtocol,
     SourceSnapshotConsistencyError,
 )
+from dayu.fins.storage.source_integrity import SourceIntegrityRepairRequiredError
 from dayu.fins.storage._fs_storage_utils import (
     _local_path_from_uri,
     _normalize_entry_name,
@@ -1590,7 +1591,7 @@ def test_processed_owner_public_crud_mark_list_delete_and_clear(tmp_path: Path) 
                 internal_document_id=document_id,
                 source_kind=SourceKind.FILING.value,
                 form_type="10-K",
-                meta={"fiscal_year": 2024, "fiscal_period": "FY"},
+                meta={"amended": False, "fiscal_year": 2024, "fiscal_period": "FY"},
                 sections=[],
                 tables=[],
             ),
@@ -1629,7 +1630,7 @@ def test_processed_owner_public_crud_mark_list_delete_and_clear(tmp_path: Path) 
             internal_document_id="processed-one",
             source_kind=SourceKind.FILING.value,
             form_type="10-Q",
-            meta={"fiscal_year": 2025, "fiscal_period": "Q1"},
+            meta={"amended": False, "fiscal_year": 2025, "fiscal_period": "Q1"},
             sections=[{"section_id": "part-1"}],
             tables=[],
         ),
@@ -2216,7 +2217,7 @@ def test_source_owner_material_update_delete_restore_replace_and_reset(tmp_path:
             internal_document_id="material-owner",
             form_type="EX-99",
             primary_document="material-owner.txt",
-            meta={
+            meta={"amended": False,
                 "ingest_method": "upload",
                 "source_provider": "user_upload",
                 "material_name": "Investor presentation",
@@ -2238,7 +2239,7 @@ def test_source_owner_material_update_delete_restore_replace_and_reset(tmp_path:
             internal_document_id="material-owner",
             form_type="EX-99.1",
             primary_document="material-owner.txt",
-            meta={
+            meta={"amended": False,
                 "ingest_method": "upload",
                 "source_provider": "user_upload",
                 "material_name": "Updated presentation",
@@ -2289,6 +2290,110 @@ def test_source_owner_material_update_delete_restore_replace_and_reset(tmp_path:
     batching.commit_batch(reset_batch)
     with pytest.raises(FileNotFoundError):
         source.get_source_meta("AAPL", "material-owner", SourceKind.MATERIAL)
+
+
+@pytest.mark.parametrize("kind", (SourceKind.FILING, SourceKind.MATERIAL))
+def test_source_owner_healthy_redelete_preserves_all_published_bytes(tmp_path: Path, kind: SourceKind) -> None:
+    """参数：独占新库与来源类型；返回：无；异常：断言失败；首删/重删/恢复/再删沿真实owner。"""
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    batching = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    batch = batching.begin_batch("AAPL")
+    _create_complete_source(source, blob, batch=batch, document_id="strict-delete", source_kind=kind)
+    batching.commit_batch(batch)
+    request = SourceDocumentStateChangeRequest("AAPL", "strict-delete", kind.value)
+    batch = batching.begin_batch("AAPL")
+    source.delete_source_document(request, batch=batch)
+    batching.commit_batch(batch)
+    first = source.get_source_meta("AAPL", "strict-delete", kind)
+    first_integrity = source.classify_source_integrity("AAPL", "strict-delete", kind)
+    first_bytes = published_tree_sha256(tmp_path, "AAPL")
+    assert first_integrity.status is SourceIntegrityStatus.COMPLETE
+    batch = batching.begin_batch("AAPL")
+    source.delete_source_document(request, batch=batch)
+    batching.commit_batch(batch)
+    assert published_tree_sha256(tmp_path, "AAPL") == first_bytes
+    assert source.classify_source_integrity("AAPL", "strict-delete", kind) == first_integrity
+    assert source.get_source_meta("AAPL", "strict-delete", kind) == first
+    batch = batching.begin_batch("AAPL")
+    source.restore_source_document(request, batch=batch)
+    batching.commit_batch(batch)
+    restored = source.get_source_meta("AAPL", "strict-delete", kind)
+    assert restored["is_deleted"] is False and restored["deleted_at"] is None
+    assert restored["first_ingested_at"] == first["first_ingested_at"]
+    batch = batching.begin_batch("AAPL")
+    source.delete_source_document(request, batch=batch)
+    batching.commit_batch(batch)
+    assert source.get_source_meta("AAPL", "strict-delete", kind)["is_deleted"] is True
+    assert source.classify_source_integrity("AAPL", "strict-delete", kind).revision != first_integrity.revision
+
+
+@pytest.mark.parametrize("kind", (SourceKind.FILING, SourceKind.MATERIAL))
+@pytest.mark.parametrize("delete", (False, True))
+@pytest.mark.parametrize("wrong", (None, 0, "false"))
+def test_source_owner_deletion_rejects_nonbool_before_rewrite(tmp_path: Path, kind: SourceKind, delete: bool, wrong: JsonValue) -> None:
+    """参数：真实新库/来源/动作/坏值；返回：无；异常：断言失败；双方向不修坏删除事实。"""
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    batching = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    batch = batching.begin_batch("AAPL")
+    _create_complete_source(source, blob, batch=batch, document_id="bad-deletion", source_kind=kind)
+    batching.commit_batch(batch)
+    directory = tmp_path / source.get_source_document_locator("AAPL", "bad-deletion", kind)
+    path = directory / "meta.json"
+    good = _read_integrity_json(path)
+    request = SourceDocumentStateChangeRequest("AAPL", "bad-deletion", kind.value)
+    mutate = source.delete_source_document if delete else source.restore_source_document
+    for missing in (False, True):
+        bad = dict(good)
+        if missing:
+            del bad["is_deleted"]
+        else:
+            bad["is_deleted"] = wrong
+        path.write_text(json.dumps(bad))
+        before = published_tree_sha256(tmp_path, "AAPL")
+        batch = batching.begin_batch("AAPL")
+        try:
+            with pytest.raises(KeyError if missing else ValueError):
+                mutate(request, batch=batch)
+        finally:
+            batching.rollback_batch(batch)
+        assert published_tree_sha256(tmp_path, "AAPL") == before
+
+
+@pytest.mark.parametrize("kind", (SourceKind.FILING, SourceKind.MATERIAL))
+@pytest.mark.parametrize("damage", ("missing_original", "missing_manifest", "bad_manifest"))
+def test_source_owner_redelete_rejects_damaged_tombstone(tmp_path: Path, kind: SourceKind, damage: str) -> None:
+    """参数：真实新库/来源/损坏类型；返回：无；异常：断言失败；重删不能借no-op绕过完整性。"""
+    repository_set = build_fs_repository_set(workspace_root=tmp_path)
+    source = FsSourceDocumentRepository(tmp_path, repository_set=repository_set)
+    batching = FsBatchingRepository(tmp_path, repository_set=repository_set)
+    blob = FsDocumentBlobRepository(tmp_path, repository_set=repository_set)
+    batch = batching.begin_batch("AAPL")
+    _create_complete_source(source, blob, batch=batch, document_id="bad-tombstone", source_kind=kind)
+    batching.commit_batch(batch)
+    request = SourceDocumentStateChangeRequest("AAPL", "bad-tombstone", kind.value)
+    batch = batching.begin_batch("AAPL")
+    source.delete_source_document(request, batch=batch)
+    batching.commit_batch(batch)
+    directory = tmp_path / source.get_source_document_locator("AAPL", "bad-tombstone", kind)
+    manifest = directory.parent / ("filing_manifest.json" if kind is SourceKind.FILING else "material_manifest.json")
+    if damage == "missing_original":
+        (directory / "bad-tombstone.txt").unlink()
+    elif damage == "missing_manifest":
+        manifest.unlink()
+    else:
+        manifest.write_text('{"ticker": "AAPL", "documents": false}')
+    before = published_tree_sha256(tmp_path, "AAPL")
+    batch = batching.begin_batch("AAPL")
+    try:
+        with pytest.raises(SourceIntegrityPreflightError if damage == "bad_manifest" else SourceIntegrityRepairRequiredError):
+            source.delete_source_document(request, batch=batch)
+    finally:
+        batching.rollback_batch(batch)
+    assert published_tree_sha256(tmp_path, "AAPL") == before
 
 
 def test_primary_uri_owner_requires_exact_explicit_primary_name() -> None:
@@ -2637,7 +2742,7 @@ def test_existing_source_and_processed_handles_share_blob_contract(tmp_path: Pat
                 internal_document_id="annual-report",
                 source_kind=SourceKind.FILING.value,
                 form_type="10-K",
-                meta={},
+                meta={"amended": False, },
                 sections=[],
                 tables=[],
             ),
@@ -2669,7 +2774,7 @@ def test_existing_source_and_processed_handles_share_blob_contract(tmp_path: Pat
                 internal_document_id="annual-report",
                 form_type="10-K",
                 primary_document="report.md_docling.json",
-                meta={
+                meta={"amended": False,
                     "ingest_method": "upload",
                     "source_provider": "user_upload",
                 },
@@ -4102,7 +4207,7 @@ def test_concurrent_composed_source_read_and_delayed_open_do_not_self_deadlock(
             internal_document_id="composed-read",
             form_type="10-K",
             primary_document="composed-read.txt",
-            meta={
+            meta={"amended": False,
                 "ingest_method": "upload",
                 "source_provider": "user_upload",
             },
@@ -4450,7 +4555,7 @@ def test_complete_validator_rejects_identity_descriptor_symlink_and_mismatch(
             form_type="10-K",
             primary_document="report.htm",
             files=[file_meta],
-            meta={
+            meta={"amended": False,
                 "ingest_method": "download",
                 "source_provider": "sec_edgar",
                 "source_fingerprint": "descriptor-fingerprint",
@@ -4569,7 +4674,7 @@ def test_filename_absolute_and_local_uri_attacks_remain_rejected_for_opaque_docu
                     sha256=file_meta.sha256,
                 )
             ],
-            meta={
+            meta={"amended": False,
                 "ingest_method": "download",
                 "source_provider": "sec_edgar",
                 "source_fingerprint": "security-fingerprint",
@@ -6033,7 +6138,7 @@ def _source_request(document_id: str, *, ticker: str = "AAPL") -> SourceDocument
         internal_document_id=document_id,
         form_type="10-K",
         primary_document=f"{document_id}.txt",
-        meta={
+        meta={"amended": False,
             "ingest_method": "upload",
             "source_provider": "user_upload",
         },
@@ -6209,7 +6314,7 @@ def _create_complete_source(
             internal_document_id=document_id,
             form_type="10-K" if source_kind is SourceKind.FILING else "EX-99",
             primary_document=primary_document,
-            meta={
+            meta={"amended": False,
                 **(business_meta or {}),
                 "ingest_method": "upload",
                 "source_provider": "user_upload",
@@ -7529,7 +7634,7 @@ def test_declared_dotfile_remains_a_business_source_file(
         SourceDocumentUpsertRequest(
             ticker="AAPL", document_id=document_id, internal_document_id=document_id,
             form_type="EX-99", primary_document=filename,
-            meta={"ingest_method": "upload", "source_provider": "user_upload"},
+            meta={"amended": False, "ingest_method": "upload", "source_provider": "user_upload"},
             file_entries=[{"name": filename, "uri": file_meta.uri, "etag": file_meta.etag,
                            "last_modified": file_meta.last_modified, "size": file_meta.size,
                            "content_type": file_meta.content_type, "sha256": file_meta.sha256, "source": "docling",
@@ -8756,7 +8861,7 @@ def _stage_snapshot_version(
             internal_document_id=f"snapshot-doc-{version}",
             form_type="10-K",
             primary_document=primary_name,
-            meta={
+            meta={"amended": False,
                 "ingest_method": "upload" if version == "A" else "download",
                 "source_provider": "user_upload" if version == "A" else "sec_edgar",
                 "version_marker": version,

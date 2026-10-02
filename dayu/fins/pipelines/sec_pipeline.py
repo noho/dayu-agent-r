@@ -160,6 +160,7 @@ from dayu.fins.storage import (
     FsDocumentBlobRepository,
     FsFilingMaintenanceRepository,
     FsFilingUploadStateRepository,
+    MaterialUploadStateRepositoryProtocol,
     FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
     ProcessedDocumentRepositoryProtocol,
@@ -489,6 +490,7 @@ class SecPipeline:
     def __init__(
         self,
         *,
+        material_upload_state_repository: MaterialUploadStateRepositoryProtocol,
         processor_registry: ProcessorRegistry,
         workspace_root: Optional[Path] = None,
         downloader: Optional[SecDownloader] = None,
@@ -507,6 +509,7 @@ class SecPipeline:
         """初始化 SEC 下载管线。
 
         Args:
+            material_upload_state_repository: 必传材料状态仓储，必须与写入仓储共享同一个 core。
             processor_registry: Fins 文档处理器注册表。
             workspace_root: Fins 工作区根目录。
             downloader: 可选 SEC 下载器实例。
@@ -569,6 +572,7 @@ class SecPipeline:
             self._workspace_root,
             repository_set=repository_set,
         )
+        self._material_upload_state_repository = material_upload_state_repository
         self._processor_registry = processor_registry
         self._user_agent = user_agent
         self._sleep_seconds = sleep_seconds
@@ -854,7 +858,7 @@ class SecPipeline:
         if normalized.market != "US":
             raise ValueError(f"SecPipeline 仅支持 US，当前 market={normalized.market}")
         build_upload_company_id(normalized.canonical)
-        validated = admit_fins_upload_material_request(request)
+        validated = admit_fins_upload_material_request(request, state_repository=self._material_upload_state_repository)
         async for event in self.upload_material_validated_stream(
             validated, cancellation_checker=cancellation_checker
         ):
@@ -2285,6 +2289,7 @@ def _required_sec_bool(value: Mapping[str, JsonValue], key: str) -> bool:
 def build_sec_download_adapter(
     *,
     workspace_root: Path,
+    material_upload_state_repository: MaterialUploadStateRepositoryProtocol,
     processor_registry: ProcessorRegistry,
     batching_repository: BatchingRepositoryProtocol,
     company_repository: CompanyMetaRepositoryProtocol,
@@ -2300,6 +2305,7 @@ def build_sec_download_adapter(
 
     Args:
         workspace_root: Fins 工作区根目录。
+        material_upload_state_repository: 同组装配传入的材料状态仓储，不能另建独立 core。
         processor_registry: 文档处理器注册表。
         batching_repository: batch lifecycle 仓储。
         company_repository: 公司元数据仓储。
@@ -2319,6 +2325,7 @@ def build_sec_download_adapter(
     """
 
     pipeline = SecPipeline(
+        material_upload_state_repository=material_upload_state_repository,
         processor_registry=processor_registry,
         workspace_root=workspace_root,
         batching_repository=batching_repository,

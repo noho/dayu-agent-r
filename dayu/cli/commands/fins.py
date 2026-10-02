@@ -47,6 +47,7 @@ from dayu.cli.upload_script import (
     publish_upload_script,
     render_upload_script,
 )
+from dayu.fins.service_runtime import prevalidate_fins_upload_material_request_for_workspace
 from dayu.cli.workspace_root import resolve_workspace_root
 from dayu.fins.direct_events import (
     FinsDirectStreamProtocolError,
@@ -62,7 +63,6 @@ from dayu.fins.ingestion_runtime import (
     FinsUploadFilingRequest,
     FinsUploadMaterialRequest,
     ValidatedFinsUploadMaterialRequest,
-    admit_fins_upload_material_request,
     validate_fins_upload_material_action_files,
     ValidatedFinsUploadFilingRequest,
 )
@@ -1166,7 +1166,7 @@ def _prevalidate_upload_material_request(
         ticker_aliases=ticker.accepted_aliases,
         overwrite=args.overwrite,
     )
-    validated = admit_fins_upload_material_request(request)
+    validated = prevalidate_fins_upload_material_request_for_workspace(request, workspace_root=resolve_workspace_root(args.workspace_root, error_factory=CliFinsUsageError))
     _prevalidated_upload_paths(validated.file_selection.files)
     return validated
 

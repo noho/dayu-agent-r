@@ -36,8 +36,8 @@ from dayu.fins.domain.enums import SourceKind
 from dayu.fins.xbrl_file_discovery import has_xbrl_instance
 
 from .local_file_source import LocalFileSource
-from .source_manifest_contract import project_material_manifest_item
-from .source_meta_contract import require_material_source_meta_primary_document
+from .source_manifest_contract import project_filing_manifest_item, project_material_manifest_item
+from .source_meta_contract import require_material_source_meta_primary_document, require_source_meta_is_deleted
 from ._fs_source_integrity import (
     validate_material_source_primary,
     _SOURCE_REVISION_META_FIELD,
@@ -81,6 +81,8 @@ from .source_meta_read import SourceMetaIntegrityReadEntry, SourceMetaReadEntry,
 from .source_integrity import (
     SourceIntegrityClassification,
     SourceIntegrityPreflightError,
+    SourceIntegrityPreflightReason,
+    SourceIntegrityRepairRequiredError,
     SourceIntegrityRepairBlockedError,
     SourceIntegrityRepairBlockedReason,
     SourceIntegrityRevisionConflictError,
@@ -140,6 +142,39 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
     """源文档（filing / material）操作 mixin。"""
 
     # ========== material CRUD ==========
+
+    def update_material_amended(self, *, batch: BatchToken, document_id: str, amended: bool) -> None:
+        """只修改当前材料修订标记及仓储维护事实。
+
+        Args:
+            batch: 已登记材料条件的 writer capability。
+            document_id: 与登记目标一致的文档 ID。
+            amended: 显式真实 bool。
+
+        Returns:
+            无，仍属于 staged mutation。
+
+        Raises:
+            ValueError: capability、标记或目标非法。
+            SourceIntegrityRevisionConflictError: stage 前事实漂移。
+            OSError: 严格读写失败。
+        """
+        if type(amended) is not bool:
+            raise ValueError("材料 amended 必须 bool")
+        state = self._resolve_active_batch(batch, batch.ticker)
+        if state.material_preconditions is None or state.material_preconditions[0].source_integrity.document_id != document_id:
+            raise ValueError("材料 metadata mutation 必须已登记同目标条件")
+        expected, company = state.material_preconditions
+        fresh = self._read_material_state_unguarded(batch.ticker, document_id, state.staging_ticker_dir)
+        self._require_material_state_matches(fresh, expected, company)
+        if fresh.source_integrity.status is not SourceIntegrityStatus.COMPLETE or fresh.source_meta is None or require_source_meta_is_deleted(fresh.source_meta):
+            raise ValueError("材料 metadata mutation 只允许健康 active")
+        # writer 稳定视图中读取同一已校验元数据，保留可序列化 canonical JSON；不从投影重算业务字段。
+        meta = _read_json_object(self._source_meta_path(batch.ticker, document_id, SourceKind.MATERIAL, state))
+        meta["amended"] = amended
+        meta["updated_at"] = now_iso8601()
+        self.replace_source_meta(batch.ticker, document_id, SourceKind.MATERIAL, meta, batch=batch)
+
 
     def create_material(
         self,
@@ -1124,7 +1159,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         if normalized_source_kind == SourceKind.FILING:
             self._upsert_filing_manifest(
                 state,
-                [FilingManifestItem.from_source_meta(normalized_meta)],
+                [project_filing_manifest_item(normalized_meta)],
             )
         else:
             self._upsert_material_manifest(
@@ -1925,7 +1960,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         if source_kind == SourceKind.FILING:
             self._upsert_filing_manifest(
                 state,
-                [FilingManifestItem.from_source_meta(merged_meta)],
+                [project_filing_manifest_item(merged_meta)],
             )
         else:
             self._upsert_material_manifest(
@@ -1967,8 +2002,12 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             更新后的文档句柄。
 
         Raises:
+            KeyError: 既有源元数据缺少 is_deleted 时抛出。
             FileNotFoundError: 文档不存在。
             ValueError: ticker、document identity、descriptor 或 source meta 不合法时抛出。
+            SourceIntegrityRepairRequiredError: 重删目标或其 manifest 仍需修复时抛出。
+            SourceIntegrityPreflightError: 重删目标完整性不可信时抛出。
+            RuntimeError: exact inspector 未返回目标时抛出。
             OSError: 写入失败。
         """
 
@@ -1987,29 +2026,47 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             raise FileNotFoundError(f"文档不存在: ticker={external_ticker} document_id={external_document_id}")
 
         meta = _read_json_object(meta_path)
-        meta["is_deleted"] = deleted
-        meta["deleted_at"] = now_iso8601() if deleted else None
-        meta["updated_at"] = now_iso8601()
-        meta = _prepare_complete_source_meta(
-            meta,
-            ticker=external_ticker,
-            document_id=external_document_id,
-            source_kind=source_kind,
-        )
-        if source_kind is SourceKind.MATERIAL:
-            validate_material_source_primary(source_meta=meta, source_directory=meta_path.parent)
-        _write_json(meta_path, meta)
-
-        if source_kind == SourceKind.FILING:
-            self._upsert_filing_manifest(
-                state,
-                [FilingManifestItem.from_source_meta(meta)],
+        current_deleted = require_source_meta_is_deleted(meta)
+        if deleted and current_deleted:
+            # 同一个 writer view 的完整事实才允许重删 no-op；损坏不能借删除修复。
+            inspection = _inspect_source_kind_unguarded(
+                ticker=external_ticker,
+                source_kind=source_kind,
+                ticker_dir=state.staging_ticker_dir,
+                source_root=self._source_root(external_ticker, source_kind, state),
+                requested_document_id=external_document_id,
             )
+            target = inspection.target
+            if target is None:
+                raise RuntimeError("重删完整性检查缺少 exact target")
+            if target.classification.status is SourceIntegrityStatus.REPAIR_REQUIRED:
+                raise SourceIntegrityRepairRequiredError()
+            if target.classification.status is not SourceIntegrityStatus.COMPLETE:
+                raise SourceIntegrityPreflightError(SourceIntegrityPreflightReason.UNSAFE_PUBLICATION)
         else:
-            self._upsert_material_manifest(
-                state,
-                [project_material_manifest_item(meta)],
+            meta["is_deleted"] = deleted
+            meta["deleted_at"] = now_iso8601() if deleted else None
+            meta["updated_at"] = now_iso8601()
+            meta = _prepare_complete_source_meta(
+                meta,
+                ticker=external_ticker,
+                document_id=external_document_id,
+                source_kind=source_kind,
             )
+            if source_kind is SourceKind.MATERIAL:
+                validate_material_source_primary(source_meta=meta, source_directory=meta_path.parent)
+            _write_json(meta_path, meta)
+
+            if source_kind == SourceKind.FILING:
+                self._upsert_filing_manifest(
+                    state,
+                    [project_filing_manifest_item(meta)],
+                )
+            else:
+                self._upsert_material_manifest(
+                    state,
+                    [project_material_manifest_item(meta)],
+                )
 
         file_payloads = _extract_file_payloads(meta)
         return DocumentHandle(

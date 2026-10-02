@@ -17,13 +17,13 @@ from typing import Final, cast
 
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.document_models import (
-    FilingManifestItem,
     FinsIngestMethod,
     FinsSourceProvider,
     SourceDocumentProvenance,
     SourceDocumentRevision,
 )
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.domain.filing_semantics import FiscalPeriod, FISCAL_PERIODS
 
 from ._fs_identity import (
     _FILING_IDENTITY_NAMESPACE,
@@ -52,9 +52,11 @@ from .repository_protocols import (
     FilingUploadAssetSource,
     FilingUploadPublicationIdentity,
     SourceSnapshotFileDescriptor,
+    MaterialUploadOriginalDescriptor,
+    MaterialUploadPublicationIdentity,
 )
-from .source_manifest_contract import project_material_manifest_item
-from .source_meta_contract import require_material_source_meta_primary_document
+from .source_manifest_contract import project_filing_manifest_item, project_material_manifest_item
+from .source_meta_contract import require_material_source_meta_primary_document, require_material_source_meta_amended, require_source_meta_is_deleted
 from .source_integrity import (
     SourceIntegrityClassification,
     SourceIntegrityPreflightError,
@@ -1256,7 +1258,7 @@ def _canonical_manifest_item(
     """
 
     item = (
-        FilingManifestItem.from_source_meta(persisted_meta).to_dict()
+        project_filing_manifest_item(persisted_meta).to_dict()
         if source_kind is SourceKind.FILING
         else project_material_manifest_item(persisted_meta).to_dict()
     )
@@ -2049,3 +2051,53 @@ __all__ = [
     "_inspect_source_kind_unguarded",
     "_require_complete_source_for_snapshot_unguarded",
 ]
+
+
+def _project_material_upload_publication_identity(inspection: _SourcePublicationInspection) -> MaterialUploadPublicationIdentity | None:
+    """参数：同次 exact inspection；返回：完整上传材料身份或非上传 None；异常：非法 required 事实拒绝。"""
+    if inspection.classification.status is not SourceIntegrityStatus.COMPLETE:
+        return None
+    provenance = inspection.provenance
+    if provenance is None or provenance.ingest_method is not FinsIngestMethod.UPLOAD or provenance.source_provider is not FinsSourceProvider.USER_UPLOAD:
+        return None
+    meta = inspection.business_meta
+    if meta is None or inspection.primary_document is None:
+        raise RuntimeError("完整材料缺业务事实")
+    text: dict[str, str] = {}
+    for name in ("internal_document_id", "form_type", "material_name", "source_fingerprint", "document_version"):
+        value = meta[name]
+        if not isinstance(value, str) or not value:
+            raise ValueError("材料身份 required 文本非法")
+        text[name] = value
+    year = meta["fiscal_year"]
+    period = meta["fiscal_period"]
+    if year is not None and type(year) is not int:
+        raise ValueError("材料年度非法")
+    if period is not None and (not isinstance(period, str) or period not in FISCAL_PERIODS):
+        raise ValueError("材料期间非法")
+    declarations = meta["files"]
+    if not isinstance(declarations, list):
+        raise ValueError("材料文件声明非法")
+    original_names: set[str] = set()
+    for item in declarations:
+        if isinstance(item, Mapping) and item.get("source") == "original":
+            name = item["name"]
+            if not isinstance(name, str):
+                raise ValueError("材料原件名称非法")
+            original_names.add(name)
+    originals: list[MaterialUploadOriginalDescriptor] = []
+    for item in inspection.files:
+        descriptor = item.descriptor
+        if descriptor.name not in original_names:
+            continue
+        if descriptor.sha256 is None or descriptor.size is None:
+            raise ValueError("材料原件缺摘要或大小")
+        originals.append(MaterialUploadOriginalDescriptor(descriptor.name, descriptor.sha256, descriptor.size, "original"))
+    return MaterialUploadPublicationIdentity(
+        ticker=inspection.classification.ticker, document_id=inspection.classification.document_id,
+        internal_document_id=text["internal_document_id"], form_type=text["form_type"], material_name=text["material_name"],
+        fiscal_year=cast(int | None, year), fiscal_period=cast(FiscalPeriod | None, period),
+        source_fingerprint=text["source_fingerprint"], primary_document=inspection.primary_document,
+        originals=tuple(originals), amended=require_material_source_meta_amended(meta),
+        is_deleted=require_source_meta_is_deleted(meta), document_version=text["document_version"],
+    )

@@ -1,5 +1,6 @@
 """财报仓储子包导出。"""
 
+from .fs_material_upload_state_repository import FsMaterialUploadStateRepository
 from .file_store import FileStore
 from .asset_filename_contract import DOCUMENT_SOURCE_CONTROL_FILENAMES
 from .fs_batching_repository import FsBatchingRepository
@@ -11,6 +12,7 @@ from .fs_processed_document_repository import FsProcessedDocumentRepository
 from .fs_source_document_repository import FsSourceDocumentRepository
 from .local_file_store import LocalFileStore
 from .repository_protocols import (
+    MaterialUploadOriginalDescriptor, MaterialUploadPublicationIdentity, MaterialUploadPublishedState, MaterialUploadStateRepositoryProtocol,
     BatchingRepositoryProtocol,
     CompanyMetaRepositoryProtocol,
     CompanyTickerAliasConflictError,
@@ -48,6 +50,7 @@ from .source_meta_read import SourceMetaIntegrityReadEntry, SourceMetaReadEntry,
 from .source_meta_contract import require_source_meta_is_deleted
 
 __all__ = [
+    "FsMaterialUploadStateRepository", "MaterialUploadOriginalDescriptor", "MaterialUploadPublicationIdentity", "MaterialUploadPublishedState", "MaterialUploadStateRepositoryProtocol",
     "DOCUMENT_SOURCE_CONTROL_FILENAMES",
     "BatchingRepositoryProtocol",
     "CompanyMetaRepositoryProtocol",

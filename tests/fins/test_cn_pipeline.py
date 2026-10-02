@@ -1,12 +1,18 @@
 """CnPipeline download facade 行为测试。"""
 from __future__ import annotations
 
+from dayu.fins.storage import FsBatchingRepository, FsCompanyMetaRepository, FsSourceDocumentRepository, FsDocumentBlobRepository, FsFilingMaintenanceRepository, FsFilingUploadStateRepository, FsProcessedDocumentRepository
+from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
+
+from dayu.fins.storage import FsMaterialUploadStateRepository, MaterialUploadStateRepositoryProtocol
+
 from dayu.fins.upload_usage_contract import FinsUploadUsageCode, FinsUploadUsageError
 
 from dayu.fins.upload_format_contract import FinsUploadFormatError
 from dayu.fins.ingestion_runtime import FinsUploadMaterialRequest, ValidatedFinsUploadMaterialRequest
 
 import hashlib
+from unittest.mock import patch
 import json
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -315,7 +321,7 @@ def _tracking_cn_pipeline(
             repository_set=repository_set,
         ),
         docling_converter=converter or _PipelineDownloadFakeConversionRunner(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(workspace_root, repository_set=repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(workspace_root, repository_set=repository_set), processed_repository=FsProcessedDocumentRepository(workspace_root, repository_set=repository_set),)
     return pipeline, batching, company, source
 
 
@@ -722,7 +728,7 @@ def test_download_runs_cn_workflow_with_injected_discovery_client(tmp_path: Path
         workspace_root=tmp_path,
         cn_discovery_client=discovery,
         docling_converter=runner,
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
     cancel_checker = _never_cancel
 
     result = pipeline.download(
@@ -765,7 +771,7 @@ def test_default_hk_discovery_client_is_hkexnews(tmp_path: Path) -> None:
 
     pipeline = CnPipeline(
         workspace_root=tmp_path,
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
 
     assert isinstance(pipeline.hk_discovery_client, HkexnewsDiscoveryClient)
 
@@ -789,7 +795,7 @@ def test_download_runs_hk_workflow_with_injected_discovery_client(tmp_path: Path
         workspace_root=tmp_path,
         hk_discovery_client=discovery,
         docling_converter=runner,
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
     cancel_checker = _never_cancel
 
     result = pipeline.download(
@@ -842,7 +848,7 @@ async def test_download_stream_runs_cn_workflow_with_injected_discovery_client(
         workspace_root=tmp_path,
         cn_discovery_client=discovery,
         docling_converter=runner,
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
 
     events = [
         event
@@ -895,7 +901,7 @@ async def test_hk_adapter_progress_sink_projects_conversion_lifecycle(tmp_path: 
         workspace_root=tmp_path,
         hk_discovery_client=_PipelineDownloadFakeHkDiscoveryClient(temp_dir=tmp_path),
         docling_converter=_PipelineDownloadFakeConversionRunner(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
     progress_events: list[FinsDownloadProgressEvent] = []
 
     result = await collect_cn_download_result_from_events(
@@ -961,7 +967,7 @@ def test_download_non_explicit_nonempty_start_keeps_default_business_limit(tmp_p
         workspace_root=tmp_path,
         cn_discovery_client=discovery,
         docling_converter=runner,
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
 
     result = pipeline.download(
         ticker="000001",
@@ -1062,7 +1068,7 @@ async def test_upload_filing_stream_refreshes_stale_company_meta(tmp_path: Path)
     pipeline = CnPipeline(
         workspace_root=tmp_path,
         docling_converter=_PipelineDownloadFakeConversionRunner(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
     _seed_cn_upload_company_meta(
         pipeline=pipeline,
         company_name="旧贵州茅台",
@@ -1112,7 +1118,7 @@ async def test_upload_material_stream_uploads_files_with_docling(tmp_path: Path)
     pipeline = CnPipeline(
         workspace_root=tmp_path,
         docling_converter=_PipelineDownloadFakeConversionRunner(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
     material_file = tmp_path / "deck.pdf"
     material_file.write_text("demo cn material", encoding="utf-8")
 
@@ -1163,14 +1169,15 @@ async def test_upload_material_failure_uses_shared_typed_failure_owner(tmp_path:
     pipeline = CnPipeline(
         workspace_root=tmp_path,
         docling_converter=_PipelineDownloadFakeConversionRunner(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
     material_file = tmp_path / "deck.pdf"
     material_file.write_text("demo cn material", encoding="utf-8")
 
-    events = [
-        event
-        async for event in pipeline.upload_material_stream(FinsUploadMaterialRequest(ticker="600519", action="create", form_type="MATERIAL_OTHER", material_name="Roadshow Deck", files=(material_file,), company_name=None, overwrite=False))
-    ]
+    with patch("dayu.fins.pipelines.material_upload_publication.stage_upload_company_meta_decision", side_effect=RuntimeError("company stage probe")):
+        events = [
+            event
+            async for event in pipeline.upload_material_stream(FinsUploadMaterialRequest(ticker="600519", action="create", form_type="MATERIAL_OTHER", material_name="Roadshow Deck", files=(material_file,), company_name="Apple Inc.", overwrite=False))
+        ]
 
     result = events[-1].payload["result"]
     assert isinstance(result, dict)
@@ -1209,7 +1216,7 @@ async def test_upload_material_unsupported_suffix_fails_before_reads_or_mutation
     pipeline = CnPipeline(
         workspace_root=tmp_path,
         docling_converter=converter,
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
     unsupported_file = tmp_path / "deck.zip"
     unsupported_file.write_bytes(b"not read")
 
@@ -1290,7 +1297,7 @@ async def test_upload_material_alias_conflict_projects_exact_typed_terminal(tmp_
     pipeline = CnPipeline(
         workspace_root=tmp_path,
         docling_converter=_PipelineDownloadFakeConversionRunner(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
     existing = pipeline._batching_repository.begin_batch("MSFT")
     pipeline._batching_repository.commit_batch(existing)
     material_file = tmp_path / "deck.pdf"
@@ -1335,7 +1342,7 @@ async def test_upload_filing_stream_auto_resolves_create_update_skip(tmp_path: P
     pipeline = CnPipeline(
         workspace_root=tmp_path,
         docling_converter=_PipelineDownloadFakeConversionRunner(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
     filing_file = tmp_path / "annual.pdf"
     renamed_file = tmp_path / "renamed-annual.pdf"
     filing_file.write_text("demo cn filing", encoding="utf-8")
@@ -1853,7 +1860,7 @@ async def test_upload_filing_storage_and_generic_failures_use_distinct_typed_cat
     pipeline = CnPipeline(
         workspace_root=tmp_path,
         docling_converter=_FailingCnUploadConverter(error),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
     filing_file = tmp_path / "annual.pdf"
     filing_file.write_text("demo cn filing", encoding="utf-8")
     request = _validated_cn_filing_request(
@@ -2050,7 +2057,7 @@ async def test_upload_filing_conversion_cancelled_has_zero_stored_count(tmp_path
     pipeline = CnPipeline(
         workspace_root=tmp_path,
         docling_converter=_FailingCnUploadConverter(DoclingConversionCancelledError()),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
     filing_file = tmp_path / "annual.pdf"
     filing_file.write_text("demo cn filing", encoding="utf-8")
     request = _validated_cn_filing_request(
@@ -2155,7 +2162,7 @@ async def test_hk_upload_filing_facade_consumes_typed_request_and_fresh_snapshot
     pipeline = CnPipeline(
         workspace_root=tmp_path,
         docling_converter=_PipelineDownloadFakeConversionRunner(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
     filing_file = tmp_path / "annual-hk.pdf"
     filing_file.write_text("demo hk filing", encoding="utf-8")
     request = prevalidate_fins_upload_filing_request_for_workspace(
@@ -2551,7 +2558,7 @@ async def test_upload_material_stream_overwrite_resets_single_document(tmp_path:
     pipeline = CnPipeline(
         workspace_root=tmp_path,
         docling_converter=_PipelineDownloadFakeConversionRunner(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
     old_file = tmp_path / "deck_old.pdf"
     new_file = tmp_path / "deck_new.pdf"
     old_file.write_text("old material", encoding="utf-8")
@@ -2686,10 +2693,11 @@ async def test_material_101_rejected_before_cn_hk_pipeline_dependencies(
     for path in files:
         path.write_text("material", encoding="utf-8")
     pipeline = object.__new__(CnPipeline)
+    pipeline._material_upload_state_repository = FsMaterialUploadStateRepository(tmp_path)
     admissions: list[FinsUploadMaterialRequest] = []
     original_admit = cn_pipeline_module.admit_fins_upload_material_request
 
-    def counted_admit(raw: FinsUploadMaterialRequest) -> ValidatedFinsUploadMaterialRequest:
+    def counted_admit(raw: FinsUploadMaterialRequest, *, state_repository: MaterialUploadStateRepositoryProtocol) -> ValidatedFinsUploadMaterialRequest:
         """记录并执行真实 material 准入。
 
         Args:
@@ -2703,7 +2711,7 @@ async def test_material_101_rejected_before_cn_hk_pipeline_dependencies(
         """
 
         admissions.append(raw)
-        return original_admit(raw)
+        return original_admit(raw, state_repository=state_repository)
 
     monkeypatch.setattr(cn_pipeline_module, "admit_fins_upload_material_request", counted_admit)
     request = FinsUploadMaterialRequest(
@@ -2739,12 +2747,13 @@ def test_cn_material_sync_delegate_admits_once(
 
     request = FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck",
         ticker="600519", files=tuple(tmp_path / f"part-{index:03d}.pdf" for index in range(101)),
-    )
+     company_name="Apple Inc.",)
     pipeline = object.__new__(CnPipeline)
+    pipeline._material_upload_state_repository = FsMaterialUploadStateRepository(tmp_path)
     admissions: list[FinsUploadMaterialRequest] = []
     original_admit = cn_pipeline_module.admit_fins_upload_material_request
 
-    def counted_admit(raw: FinsUploadMaterialRequest) -> ValidatedFinsUploadMaterialRequest:
+    def counted_admit(raw: FinsUploadMaterialRequest, *, state_repository: MaterialUploadStateRepositoryProtocol) -> ValidatedFinsUploadMaterialRequest:
         """记录并执行唯一真实准入。
 
         Args:
@@ -2758,7 +2767,7 @@ def test_cn_material_sync_delegate_admits_once(
         """
 
         admissions.append(raw)
-        return original_admit(raw)
+        return original_admit(raw, state_repository=state_repository)
 
     monkeypatch.setattr(cn_pipeline_module, "admit_fins_upload_material_request", counted_admit)
     with pytest.raises(FinsUploadUsageError) as exc_info:

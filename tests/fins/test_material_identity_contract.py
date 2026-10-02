@@ -1,6 +1,8 @@
 """材料身份、静态首错、一次路径解析及公开入口的 owner 契约测试。"""
 from __future__ import annotations
 
+from dayu.fins.storage import FsMaterialUploadStateRepository
+
 from datetime import datetime
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.service_runtime import DefaultFinsRuntime
@@ -19,6 +21,7 @@ from dayu.fins.pipelines.docling_upload_service import build_material_ids
 from dayu.fins.upload_usage_contract import FinsUploadUsageCode, FinsUploadUsageError, FinsUploadUsageCategory
 from dayu.fins import upload_asset_plan
 from dayu.fins.tools.upload_tools import _upload_request_from_arguments
+from dayu.fins.storage.repository_protocols import MaterialUploadOriginalDescriptor, MaterialUploadPublicationIdentity
 
 
 @pytest.mark.parametrize("action", ("auto", "create", "update", "delete"))
@@ -26,11 +29,11 @@ from dayu.fins.tools.upload_tools import _upload_request_from_arguments
 @pytest.mark.parametrize("field,code", (("form_type", FinsUploadUsageCode.MISSING_FORM_TYPE), ("material_name", FinsUploadUsageCode.MISSING_MATERIAL_NAME)))
 def test_required_identity_before_seed(action: str, missing: str | None, field: str, code: FinsUploadUsageCode, tmp_path: Path) -> None:
     """参数：动作、缺失值、字段及原因/隔离根；返回：无；异常：断言失败；非法身份不能计算 seed 或读取目标。"""
-    raw = FinsUploadMaterialRequest(ticker="AAPL", action=action, files=() if action == "delete" else (tmp_path / "a.txt",), form_type=" other ", material_name="Deck")
+    raw = FinsUploadMaterialRequest(ticker="AAPL", action=action, files=() if action == "delete" else (tmp_path / "a.txt",), form_type=" other ", material_name="Deck",  company_name="Apple Inc.",)
     raw = replace(raw, form_type=missing) if field == "form_type" else replace(raw, material_name=missing)
     with patch("dayu.fins.pipelines.docling_upload_service.hashlib.sha1", side_effect=AssertionError("非法输入计算 seed")):
         with pytest.raises(FinsUploadUsageError) as raised:
-            admit_fins_upload_material_request(raw)
+            admit_fins_upload_material_request(raw,  state_repository=FsMaterialUploadStateRepository(tmp_path),)
     assert raised.value.failure.code is code
     assert raised.value.failure.category is FinsUploadUsageCategory.REQUEST
     assert raised.value.failure.hint
@@ -89,9 +92,9 @@ def test_once_normalization_and_pure_replace(tmp_path: Path) -> None:
     a.write_text("a"); b.write_text("b")
     link = tmp_path / "selected.txt"
     link.symlink_to(b)
-    raw = FinsUploadMaterialRequest(ticker="AAPL", files=(a, b), primary_selectors=(link,), form_type=" other ", material_name=" Deck ")
+    raw = FinsUploadMaterialRequest(ticker="AAPL", files=(a, b), primary_selectors=(link,), form_type=" other ", material_name=" Deck ",  company_name="Apple Inc.",)
     with patch.object(upload_asset_plan, "normalize_upload_asset_path", wraps=upload_asset_plan.normalize_upload_asset_path) as normalize:
-        valid = admit_fins_upload_material_request(raw)
+        valid = admit_fins_upload_material_request(raw,  state_repository=FsMaterialUploadStateRepository(tmp_path),)
         assert normalize.call_count == 3
         valid.validate()
         assert replace(valid) == valid
@@ -109,29 +112,29 @@ def test_selection_and_first_error(files: int, selectors: int, code: str, tmp_pa
     """参数：文件数/选择数/原因与隔离根；返回：无；异常：断言失败；纯选择封闭分类及 exact 成员要求。"""
     paths = tuple(tmp_path / f"{i}.txt" for i in range(files))
     selected = tuple(tmp_path / "outside.txt" for _ in range(selectors))
-    raw = FinsUploadMaterialRequest(ticker="AAPL", files=paths, primary_selectors=selected, form_type="OTHER", material_name="Deck")
+    raw = FinsUploadMaterialRequest(ticker="AAPL", files=paths, primary_selectors=selected, form_type="OTHER", material_name="Deck",  company_name="Apple Inc.",)
     with pytest.raises(FinsUploadUsageError) as raised:
-        admit_fins_upload_material_request(raw)
+        admit_fins_upload_material_request(raw,  state_repository=FsMaterialUploadStateRepository(tmp_path),)
     assert raised.value.failure.code.value == code
     assert raised.value.failure.category is FinsUploadUsageCategory.REQUEST
     if code == "missing_multi_file_primary":
         assert raised.value.failure.message == "多文件材料必须明确指定唯一主文件"
     bad = replace(raw, files=tuple(tmp_path / f"{i}.txt" for i in range(101)))
     with pytest.raises(FinsUploadUsageError) as raised:
-        admit_fins_upload_material_request(bad)
+        admit_fins_upload_material_request(bad,  state_repository=FsMaterialUploadStateRepository(tmp_path),)
     assert raised.value.failure.code is FinsUploadUsageCode.TOO_MANY_FILES
     assert raised.value.failure.category is FinsUploadUsageCategory.ASSET_PLAN
 
 
 def test_delete_rejects_paths_without_io(tmp_path: Path) -> None:
     """参数：不存在的目标路径根；返回：无；异常：断言失败；删除组合错误不触 filesystem。"""
-    raw = FinsUploadMaterialRequest(ticker="AAPL", action="delete", files=(tmp_path / "missing.txt",), form_type="OTHER", material_name="Deck")
+    raw = FinsUploadMaterialRequest(ticker="AAPL", action="delete", files=(tmp_path / "missing.txt",), form_type="OTHER", material_name="Deck",  company_name="Apple Inc.",)
     with patch.object(upload_asset_plan, "normalize_upload_asset_path", side_effect=AssertionError("删除组合解析路径")):
         with pytest.raises(FinsUploadUsageError) as raised:
-            admit_fins_upload_material_request(raw)
+            admit_fins_upload_material_request(raw,  state_repository=FsMaterialUploadStateRepository(tmp_path),)
         assert raised.value.failure.code is FinsUploadUsageCode.FILES_NOT_ALLOWED_FOR_DELETE
         with pytest.raises(FinsUploadUsageError) as raised:
-            admit_fins_upload_material_request(replace(raw, files=(), primary_selectors=(tmp_path / "missing.txt",)))
+            admit_fins_upload_material_request(replace(raw, files=(), primary_selectors=(tmp_path / "missing.txt",)),  state_repository=FsMaterialUploadStateRepository(tmp_path),)
         assert raised.value.failure.code is FinsUploadUsageCode.PRIMARY_NOT_ALLOWED_FOR_DELETE
 
 
@@ -151,7 +154,7 @@ def test_real_runtime_static_identity_has_no_lifecycle_side_effect(
     default = DefaultFinsRuntime.create(workspace_root=tmp_path)
     runtime = default.get_ingestion_runtime()
     raw = FinsUploadMaterialRequest(ticker="AAPL", action=action,
-        files=() if action == "delete" else (tmp_path / "never-read.txt",), form_type="OTHER", material_name="Deck")
+        files=() if action == "delete" else (tmp_path / "never-read.txt",), form_type="OTHER", material_name="Deck",  company_name="Apple Inc.",)
     if field == "form": raw = replace(raw, form_type="  ")
     elif field == "name": raw = replace(raw, material_name=None)
     elif field == "year": raw = replace(raw, fiscal_year=True)
@@ -219,9 +222,9 @@ def test_material_selector_is_exact_and_keeps_occurrences(tmp_path: Path, select
     a, b = tmp_path / "a.txt", tmp_path / "b.txt"
     selectors = (tmp_path / "outside" / "a.txt",) if selector_case == "same_basename_outside" else (a, a)
     request = FinsUploadMaterialRequest(ticker="AAPL", files=(a, b), primary_selectors=selectors,
-                                       form_type="OTHER", material_name="Deck")
+                                       form_type="OTHER", material_name="Deck",  company_name="Apple Inc.",)
     with pytest.raises(FinsUploadUsageError) as error:
-        admit_fins_upload_material_request(request)
+        admit_fins_upload_material_request(request,  state_repository=FsMaterialUploadStateRepository(tmp_path),)
     assert error.value.failure.category is FinsUploadUsageCategory.REQUEST
     expected = (FinsUploadUsageCode.PRIMARY_NOT_IN_FILES if selector_case == "same_basename_outside"
                 else FinsUploadUsageCode.MULTIPLE_PRIMARY_SELECTORS)
@@ -262,7 +265,7 @@ def test_identity_tool_path_projection_preserves_raw_text(tmp_path: Path) -> Non
     raw = _upload_request_from_arguments(arguments)
     assert isinstance(raw, FinsUploadMaterialRequest)
     with pytest.raises(FinsUploadUsageError) as raised:
-        admit_fins_upload_material_request(raw)
+        admit_fins_upload_material_request(raw,  state_repository=FsMaterialUploadStateRepository(tmp_path),)
     assert raised.value.failure.code is FinsUploadUsageCode.PRIMARY_NOT_IN_FILES
 
 
@@ -271,3 +274,25 @@ def test_identity_tool_files_lexical_boundary(files: JsonValue) -> None:
     """参数：词法非法 JSON 文件列表；返回：无；异常：断言失败；保留既有数组/非空字符串约束。"""
     with pytest.raises(ValueError, match="files must"):
         _upload_request_from_arguments({"upload_kind": "material", "files": files})
+
+
+def test_publication_identity_constructor_owns_canonical_original_order() -> None:
+    """参数：无；返回：无；异常：断言失败；公共值构造与 replace 共用规范顺序，主源独立且拒重复/空集合。"""
+    a = MaterialUploadOriginalDescriptor('a.txt', 'a' * 64, 1, 'original')
+    b = MaterialUploadOriginalDescriptor('b.txt', 'b' * 64, 2, 'original')
+    inputs = (b, a)
+    identity = MaterialUploadPublicationIdentity(
+        ticker='AAPL', document_id='m1', internal_document_id='m1', form_type='OTHER',
+        material_name='Deck', fiscal_year=None, fiscal_period=None, source_fingerprint='c' * 64,
+        primary_document='a.txt_docling.json', originals=inputs, amended=False,
+        is_deleted=False, document_version='v1',
+    )
+    assert identity.originals == (a, b) and inputs == (b, a)
+    assert identity == replace(identity, originals=(b, a))
+    assert identity.primary_document == 'a.txt_docling.json'
+    assert identity != replace(identity, primary_document='b.txt_docling.json')
+    assert identity != replace(identity, originals=(a, replace(b, sha256='d' * 64)))
+    assert identity != replace(identity, amended=True)
+    for invalid in ((), (a, a)):
+        with pytest.raises(ValueError):
+            replace(identity, originals=invalid)

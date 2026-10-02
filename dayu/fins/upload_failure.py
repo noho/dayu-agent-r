@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dayu.fins.domain.enums import SourceKind
+
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -21,7 +23,7 @@ from dayu.fins.storage import (
 from dayu.fins.upload_format_contract import FinsUploadFormatError, MAX_MATERIAL_UPLOAD_FILES
 from dayu.fins.upload_asset_plan import FinsUploadAssetPlanError, FinsUploadAssetPlanReason
 from dayu.fins.upload_usage_contract import (
-    FinsUploadUsageCode,
+    FinsUploadUsageError, FinsUploadUsageCode,
     fins_upload_asset_plan_usage_failure,
     fins_upload_usage_failure,
 )
@@ -50,6 +52,9 @@ class FinsUploadFailureCode(str, Enum):
     INVALID_MATERIAL_FISCAL_YEAR = "invalid_material_fiscal_year"
     EMPTY_DOCUMENT_ID = "empty_document_id"
     DOCUMENT_ID_MISMATCH = "document_id_mismatch"
+    CREATE_TARGET_EXISTS = "create_target_exists"
+    UPDATE_TARGET_MISSING = "update_target_missing"
+    DELETE_TARGET_MISSING = "delete_target_missing"
     MISSING_FILES = "missing_files"
     TOO_MANY_FILES = "too_many_files"
     DUPLICATE_FILE_PATH = "duplicate_file_path"
@@ -196,7 +201,7 @@ _CONTENT_FAILURE_CODES: Final[frozenset[FinsUploadFailureCode]] = frozenset(
     (*_DOCLING_FAILURE_CODES.values(), FinsUploadFailureCode.EMPTY_INPUT_FILE)
 )
 _USAGE_FAILURE_CODES: Final[frozenset[FinsUploadFailureCode]] = frozenset(
-    {FinsUploadFailureCode.MISSING_FORM_TYPE,FinsUploadFailureCode.MISSING_MATERIAL_NAME,FinsUploadFailureCode.MATERIAL_NAME_TOO_LONG,FinsUploadFailureCode.INVALID_MATERIAL_FISCAL_YEAR,FinsUploadFailureCode.EMPTY_DOCUMENT_ID,FinsUploadFailureCode.DOCUMENT_ID_MISMATCH, FinsUploadFailureCode.UNSUPPORTED_UPLOAD_FORMAT,
+    {FinsUploadFailureCode.MISSING_FORM_TYPE,FinsUploadFailureCode.MISSING_MATERIAL_NAME,FinsUploadFailureCode.MATERIAL_NAME_TOO_LONG,FinsUploadFailureCode.INVALID_MATERIAL_FISCAL_YEAR,FinsUploadFailureCode.EMPTY_DOCUMENT_ID,FinsUploadFailureCode.DOCUMENT_ID_MISMATCH, FinsUploadFailureCode.UNSUPPORTED_UPLOAD_FORMAT, FinsUploadFailureCode.CREATE_TARGET_EXISTS, FinsUploadFailureCode.UPDATE_TARGET_MISSING, FinsUploadFailureCode.DELETE_TARGET_MISSING,
      *(FinsUploadFailureCode(reason.value) for reason in FinsUploadAssetPlanReason)}
 )
 _STORAGE_FAILURE_CODES: Final[frozenset[FinsUploadFailureCode]] = frozenset(
@@ -251,6 +256,8 @@ def fins_upload_failure_from_exception(
 
     if isinstance(error, FinsUploadFailureError):
         return error.failure
+    if isinstance(error, FinsUploadUsageError) and error.failure.code in {FinsUploadUsageCode.CREATE_TARGET_EXISTS, FinsUploadUsageCode.UPDATE_TARGET_MISSING, FinsUploadUsageCode.DELETE_TARGET_MISSING}:
+        return FinsUploadFailureReason(kind=FinsUploadFailureKind.USAGE, code=FinsUploadFailureCode(error.failure.code.value), message=error.failure.message, retry_hint=error.failure.hint, file_label=error.failure.file_label)
     if isinstance(error, FinsUploadAssetPlanError):
         usage = fins_upload_asset_plan_usage_failure(
             error, max_files=MAX_MATERIAL_UPLOAD_FILES
@@ -385,24 +392,32 @@ def fins_upload_prevalidation_corruption_failure() -> FinsUploadFailureReason:
     )
 
 
-def fins_upload_source_integrity_unsafe_failure() -> FinsUploadFailureReason:
-    """构造目标 filing 无法安全自动修复的 closed public reason。
+def fins_upload_source_integrity_unsafe_failure(*, source_kind: SourceKind) -> FinsUploadFailureReason:
+    """构造目标材料或 filing 无法安全受理的 closed public reason。
 
     Args:
-        无。
+        source_kind: 明确的材料或 filing 类型，不能从错误文本推断。
 
     Returns:
         不含路径、revision 或内部 reason 的 storage failure reason。
 
     Raises:
-        无。
+        ValueError: 来源类型非法时抛出。
     """
 
+    if source_kind is SourceKind.FILING:
+        message = "工作区中的目标 filing 状态不完整且无法安全自动修复"
+        retry_hint = "请先修复工作区 source 状态后再重试"
+    elif source_kind is SourceKind.MATERIAL:
+        message = "工作区中的目标材料状态不完整，无法安全上传"
+        retry_hint = "请先修复工作区中的材料文件与索引后重试"
+    else:
+        raise ValueError("上传完整性错误缺少合法来源类型")
     return FinsUploadFailureReason(
         kind=FinsUploadFailureKind.STORAGE,
         code=FinsUploadFailureCode.SOURCE_INTEGRITY_UNSAFE,
-        message="工作区中的目标 filing 状态不完整且无法安全自动修复",
-        retry_hint="请先修复工作区 source 状态后再重试",
+        message=message,
+        retry_hint=retry_hint,
         file_label=None,
     )
 
@@ -429,23 +444,29 @@ def fins_upload_source_revision_stale_failure() -> FinsUploadFailureReason:
     )
 
 
-def fins_upload_source_publication_conflict_failure() -> FinsUploadFailureReason:
+def fins_upload_source_publication_conflict_failure(*, source_kind: SourceKind) -> FinsUploadFailureReason:
     """构造 preparation 期间其它请求已发布目标的 closed public reason。
 
     Args:
-        无。
+        source_kind: 实际材料或 filing 来源，不从异常或 payload 推断。
 
     Returns:
         不含路径、ticker、document、revision、fingerprint 或异常文本的 storage failure reason。
 
     Raises:
-        无。
+        ValueError: 来源类型非法时抛出。
     """
 
+    if source_kind is SourceKind.FILING:
+        message = "目标 filing 在上传准备期间已由另一请求发布，本次上传未提交"
+    elif source_kind is SourceKind.MATERIAL:
+        message = "目标材料在上传准备期间已发生变化，本次材料上传未提交"
+    else:
+        raise ValueError("上传冲突缺少合法来源类型")
     return FinsUploadFailureReason(
         kind=FinsUploadFailureKind.STORAGE,
         code=FinsUploadFailureCode.SOURCE_PUBLICATION_CONFLICT,
-        message="目标 filing 在上传准备期间已由另一请求发布，本次上传未提交",
+        message=message,
         retry_hint="请基于最新目标状态重新发起上传",
         file_label=None,
     )

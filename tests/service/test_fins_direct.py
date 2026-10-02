@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dayu.fins.storage import FsMaterialUploadStateRepository
+
 import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator
 from datetime import date, datetime, timezone
@@ -765,7 +767,7 @@ async def test_upload_methods_build_union_requests(tmp_path: Path) -> None:
         ),
     )
     await _collect_events(service.upload_filing(validated_filing_request))
-    validated_material_request = admit_fins_upload_material_request(FinsUploadMaterialRequest(ticker="MSFT", action="create", files=(material_file,), form_type="8-K", material_name="Investor Day", fiscal_year=2024, fiscal_period="Q4", filing_date="2025-02-01", report_date="2024-12-31", company_name="Microsoft", ticker_aliases=("MS",), overwrite=True))
+    validated_material_request = admit_fins_upload_material_request(FinsUploadMaterialRequest(ticker="MSFT", action="create", files=(material_file,), form_type="8-K", material_name="Investor Day", fiscal_year=2024, fiscal_period="Q4", filing_date="2025-02-01", report_date="2024-12-31", company_name="Microsoft", ticker_aliases=("MS",), overwrite=True),  state_repository=FsMaterialUploadStateRepository(tmp_path),)
     await _collect_events(service.upload_material(validated_material_request))
 
     assert runtime.upload_requests[0] is validated_filing_request

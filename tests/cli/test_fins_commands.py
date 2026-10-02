@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dayu.fins.storage import FsMaterialUploadStateRepository
+
 from dayu.fins.pipelines.docling_upload_service import build_material_ids
 from dayu.fins.storage import FsCompanyMetaRepository
 
@@ -2883,6 +2885,8 @@ def test_upload_commands_map_args_and_validate_files(
         cli_main.main(
             (
                 "upload_material",
+                "--base", str(tmp_path / "workspace"),
+                "--company-name", "Apple Inc.",
                 "--ticker",
                 "AAPL,MSFT",
                 "--forms",
@@ -2929,7 +2933,7 @@ def test_upload_commands_map_args_and_validate_files(
             amended=False,
             filing_date=None,
             report_date=None,
-            company_name=None,
+            company_name="Apple Inc.",
             ticker_aliases=("MSFT",),
             overwrite=False,
         )
@@ -2974,6 +2978,8 @@ def test_upload_material_cli_rejects_padded_dates_before_service(
     exit_code = cli_main.main(
         (
             "upload_material",
+                "--base", str(tmp_path / "workspace"),
+                "--company-name", "Apple Inc.",
             "--ticker",
             "AAPL",
             "--forms",
@@ -3133,7 +3139,7 @@ def test_upload_material_cli_mixed_name_and_format_uses_plan_reason(
         path.parent.mkdir()
         path.write_bytes(b"input")
     with pytest.raises(FinsUploadUsageError) as raised:
-        admit_fins_upload_material_request(FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="AAPL", files=paths))
+        admit_fins_upload_material_request(FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="AAPL", files=paths,  company_name="Apple Inc.",),  state_repository=FsMaterialUploadStateRepository(tmp_path),)
     assert raised.value.failure.code.value == expected_code
     assert raised.value.failure.message == expected_message
     exit_code = cli_main.main((
@@ -3179,8 +3185,8 @@ def test_real_cli_long_duplicate_basename_is_typed_usage_without_publication(
     second.write_bytes(b"second")
     with pytest.raises(FinsUploadUsageError) as raised:
         admit_fins_upload_material_request(
-            FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", primary_selectors=(first,), ticker="AAPL", files=(first, second))
-        )
+            FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", primary_selectors=(first,), ticker="AAPL", files=(first, second),  company_name="Apple Inc.",)
+        ,  state_repository=FsMaterialUploadStateRepository(tmp_path),)
     assert raised.value.failure.code is FinsUploadUsageCode.DUPLICATE_ORIGINAL_BASENAME
 
     workspace_root = tmp_path / "fresh-workspace"
@@ -3239,8 +3245,8 @@ def test_real_cli_backslash_basename_is_typed_usage_without_publication(
     upload_file.write_bytes(b"content")
     with pytest.raises(FinsUploadUsageError) as raised:
         admit_fins_upload_material_request(
-            FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="AAPL", files=(upload_file,))
-        )
+            FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="AAPL", files=(upload_file,),  company_name="Apple Inc.",)
+        ,  state_repository=FsMaterialUploadStateRepository(tmp_path),)
     assert raised.value.failure.code is FinsUploadUsageCode.INVALID_ASSET_NAME
 
     workspace_root = tmp_path / "fresh-workspace"
@@ -3290,8 +3296,8 @@ def test_real_cli_unknown_home_uses_planner_usage_without_publication(
     raw_name = "~dayu_assets_nonexistent_user_20260929/report.txt"
     with pytest.raises(FinsUploadUsageError) as raised:
         admit_fins_upload_material_request(
-            FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="AAPL", files=(Path(raw_name),))
-        )
+            FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="AAPL", files=(Path(raw_name),),  company_name="Apple Inc.",)
+        ,  state_repository=FsMaterialUploadStateRepository(tmp_path),)
     assert raised.value.failure.code is FinsUploadUsageCode.INVALID_ASSET_NAME
     workspace_root = tmp_path / "fresh-workspace"
     repository_root = Path(__file__).resolve().parents[2]
@@ -3955,7 +3961,7 @@ def test_non_download_unknown_command_keeps_original_traceback(
                 status="ok",
                 requested_file_count=2,
                 stored_file_count=2,
-            ),
+             published_amended=None,),
             "stdout",
             "",
         ),
@@ -3965,7 +3971,7 @@ def test_non_download_unknown_command_keeps_original_traceback(
                 status="deleted",
                 requested_file_count=0,
                 stored_file_count=0,
-            ),
+             published_amended=None,),
             "stdout",
             "",
         ),
@@ -3975,7 +3981,7 @@ def test_non_download_unknown_command_keeps_original_traceback(
                 status="skipped",
                 requested_file_count=2,
                 stored_file_count=0,
-            ),
+             published_amended=None,),
             "stdout",
             "",
         ),
@@ -3989,7 +3995,7 @@ def test_non_download_unknown_command_keeps_original_traceback(
                     RuntimeError(),
                     file_label=None,
                 ),
-            ),
+             published_amended=None,),
             "stderr",
             "",
         ),
@@ -4005,7 +4011,7 @@ def test_non_download_unknown_command_keeps_original_traceback(
                         message=COMPANY_NAME_IGNORED_WARNING_MESSAGE,
                     ),
                 ),
-            ),
+             published_amended=None,),
             "stdout",
             f"{COMPANY_NAME_IGNORED_WARNING_MESSAGE}\n",
         ),
@@ -4021,7 +4027,7 @@ def test_non_download_unknown_command_keeps_original_traceback(
                         message=COMPANY_NAME_IGNORED_WARNING_MESSAGE,
                     ),
                 ),
-            ),
+             published_amended=None,),
             "stdout",
             f"{COMPANY_NAME_IGNORED_WARNING_MESSAGE}\n",
         ),
@@ -4740,7 +4746,7 @@ def _live_command_argv(command_name: str, tmp_path: Path) -> tuple[str, ...]:
     if command_name == "upload_material":
         upload_file = tmp_path / "material.pdf"
         upload_file.write_text("material", encoding="utf-8")
-        return ("upload_material", "--forms", "MATERIAL_OTHER", "--material-name", "Deck", "--ticker", "AAPL", "--files", str(upload_file))
+        return ("upload_material", "--base", str(tmp_path / "workspace"), "--company-name", "Apple Inc.", "--forms", "MATERIAL_OTHER", "--material-name", "Deck", "--ticker", "AAPL", "--files", str(upload_file))
     raise ValueError(f"unknown live command: {command_name}")
 
 
@@ -4886,6 +4892,7 @@ def test_material_cli_path_precheck_keeps_existing_usage_before_service(
     exit_code = cli_main.main(
         (
             "upload_material",
+            "--company-name", "Apple Inc.",
             "--base",
             str(tmp_path / "workspace"),
             "--ticker",

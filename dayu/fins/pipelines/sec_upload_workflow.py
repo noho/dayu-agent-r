@@ -30,9 +30,9 @@ from dayu.fins.pipelines.docling_upload_service import (
 from dayu.fins.pipelines.filing_upload_publication import (
     execute_prepared_filing_publication,
 )
+from dayu.fins.pipelines.material_upload_publication import execute_material_upload_company_stage, execute_prepared_material_publication
 from dayu.fins.pipelines.upload_company_meta import (
     build_upload_company_id,
-    stage_company_meta_for_upload,
     stage_upload_company_meta_decision,
 )
 from dayu.fins.pipelines.upload_filing_events import UploadFilingEvent, UploadFilingEventType
@@ -45,6 +45,7 @@ from dayu.fins.storage import (
     BatchingRepositoryProtocol,
     CompanyMetaRepositoryProtocol,
     FilingUploadStateRepositoryProtocol,
+    MaterialUploadStateRepositoryProtocol,
     SourceDocumentRepositoryProtocol,
 )
 from dayu.fins.ticker_normalization import normalize_ticker
@@ -78,6 +79,11 @@ class SecUploadWorkflowHost(Protocol):
     def _filing_upload_state_repository(self) -> FilingUploadStateRepositoryProtocol:
         """返回 filing authoritative snapshot 唯一仓储。"""
 
+        ...
+
+    @property
+    def _material_upload_state_repository(self) -> MaterialUploadStateRepositoryProtocol:
+        """参数：无；返回：材料状态仓储；异常：无。"""
         ...
 
     @property
@@ -248,6 +254,7 @@ async def run_upload_filing_stream(
                 )
                 raise
             upload_result = commit_prepared_upload_batch(
+                material_state_repository=None,
                 service=host._upload_service,
                 batching_repository=host._batching_repository,
                 batch=publication_batch,
@@ -458,12 +465,8 @@ async def run_upload_material_stream(
     normalized_action: str | None = None
     try:
         selection = request.asset_plan
-        previous_meta = host._safe_get_document_meta(
-            normalized_ticker,
-            resolved_document_id,
-            SourceKind.MATERIAL,
-        )
-        normalized_action = resolve_upload_action(requested_action, previous_meta)
+        previous_meta = request.state_admission.observed_state.source_meta
+        normalized_action = request.state_admission.resolved_action
         yield UploadMaterialEvent(
             event_type=UploadMaterialEventType.UPLOAD_STARTED,
             ticker=normalized_ticker,
@@ -484,22 +487,10 @@ async def run_upload_material_stream(
                 "ticker_aliases": _json_text_list(ticker_aliases),
                 "overwrite": overwrite,
                 "file_count": validated_fins_upload_file_count(request),
+                "requested_amended": raw.amended,
             },
         )
-        company_batch = host._batching_repository.begin_batch(normalized_ticker)
-        try:
-            stage_company_meta_for_upload(
-                repository=host._company_repository,
-                ticker=normalized_ticker,
-                action=normalized_action,
-                company_name=company_name,
-                ticker_aliases=ticker_aliases,
-                batch=company_batch,
-            )
-        except BaseException:
-            host._batching_repository.rollback_batch(company_batch)
-            raise
-        host._batching_repository.commit_batch(company_batch)
+        expected_company_meta = execute_material_upload_company_stage(request=request, state_repository=host._material_upload_state_repository, company_repository=host._company_repository, batching_repository=host._batching_repository, cancellation=cancellation_checker)
         prepared_upload = await host._upload_service.prepare_upload(
             ticker=normalized_ticker,
             source_kind=SourceKind.MATERIAL,
@@ -516,22 +507,15 @@ async def run_upload_material_stream(
                 "company_id": normalized_company_id,
                 "ingest_method": FinsIngestMethod.UPLOAD.to_storage_value(),
                 "material_name": material_name,
+                "amended": raw.amended,
                 "fiscal_year": fiscal_year,
                 "fiscal_period": normalized_fiscal_period,
                 "filing_date": filing_date,
                 "report_date": report_date,
             },
         )
-        if isinstance(prepared_upload, UploadOperationResult):
-            upload_result = prepared_upload
-        else:
-            upload_result = commit_prepared_upload_batch(
-                service=host._upload_service,
-                batching_repository=host._batching_repository,
-                batch=host._batching_repository.begin_batch(normalized_ticker),
-                prepared=prepared_upload,
-                cancellation=cancellation_checker,
-            )
+        outcome = execute_prepared_material_publication(request=request, prepared=prepared_upload, expected_company_meta=expected_company_meta, state_repository=host._material_upload_state_repository, batching_repository=host._batching_repository, upload_service=host._upload_service, cancellation=cancellation_checker)
+        upload_result = outcome.result
         for file_event in upload_result.file_events:
             yield UploadMaterialEvent(
                 event_type=_map_upload_file_event_to_material_event_type(file_event),
@@ -557,6 +541,7 @@ async def run_upload_material_stream(
             overwrite=overwrite,
             **upload_result.payload,
             stored_file_count=upload_result.stored_file_count,
+            published_amended=upload_result.published_amended,
             status=_resolve_upload_status(upload_result.status),
         )
         yield UploadMaterialEvent(
@@ -586,6 +571,7 @@ async def run_upload_material_stream(
             company_name=company_name,
             overwrite=overwrite,
             stored_file_count=0,
+            published_amended=None,
             status="failed",
             message=failure_reason.message,
             failure=failure_reason.to_json(),

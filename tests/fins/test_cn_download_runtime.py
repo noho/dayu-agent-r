@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from dayu.fins.storage import FsBatchingRepository, FsCompanyMetaRepository, FsSourceDocumentRepository, FsDocumentBlobRepository, FsFilingMaintenanceRepository, FsFilingUploadStateRepository, FsProcessedDocumentRepository
+from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
+
+from dayu.fins.storage import FsMaterialUploadStateRepository
+
 import asyncio
 import hashlib
 import json
@@ -378,6 +383,7 @@ class _RecordingPipeline(CnPipeline):
         """
 
         super().__init__(
+            material_upload_state_repository=FsMaterialUploadStateRepository(workspace_root),
             workspace_root=workspace_root,
             cn_discovery_client=_RuntimeFakeDiscoveryClient(
                 temp_dir=workspace_root,
@@ -520,6 +526,7 @@ class _RuntimeRepositorySet:
     blob_repository: FsDocumentBlobRepository
     filing_maintenance_repository: FsFilingMaintenanceRepository
     filing_upload_state_repository: FsFilingUploadStateRepository
+    material_upload_state_repository: FsMaterialUploadStateRepository
 
 
 def test_start_download_cninfo_persists_summary_and_source_document(tmp_path: Path) -> None:
@@ -717,6 +724,7 @@ def test_cn_hk_adapter_factories_use_source_specific_downloader_defaults(
     monkeypatch.setattr(cn_pipeline_module, "HKEXNEWS_DEFAULT_MAX_RETRIES", hk_max_retries)
 
     cn_adapter = cn_pipeline_module.build_cn_download_adapter(
+        material_upload_state_repository=repositories.material_upload_state_repository,
         workspace_root=repositories.workspace_root,
         batching_repository=repositories.batching_repository,
         company_repository=repositories.company_repository,
@@ -727,6 +735,7 @@ def test_cn_hk_adapter_factories_use_source_specific_downloader_defaults(
         docling_converter=_RuntimeFakeConversionRunner(),
     )
     hk_adapter = cn_pipeline_module.build_hk_download_adapter(
+        material_upload_state_repository=repositories.material_upload_state_repository,
         workspace_root=repositories.workspace_root,
         batching_repository=repositories.batching_repository,
         company_repository=repositories.company_repository,
@@ -1408,7 +1417,7 @@ def _build_runtime_with_cn_hk_adapters(
         cn_discovery_client=cn_discovery,
         hk_discovery_client=hk_discovery,
         docling_converter=runner,
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(repositories.workspace_root, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=repositories.workspace_root, create_directories=False))),)
     runtime = FinsIngestionRuntime.create(
         batching_repository=repositories.batching_repository,
         source_repository=repositories.source_repository,
@@ -1441,7 +1450,7 @@ def _build_runtime_with_cn_hk_adapters(
                 market="HK",
             ),
         },
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     return runtime, cn_discovery, hk_discovery, runner
 
 
@@ -1461,6 +1470,7 @@ def _build_runtime_repositories(tmp_path: Path) -> _RuntimeRepositorySet:
     workspace_root = tmp_path / "workspace"
     repository_set = build_fs_repository_set(workspace_root=workspace_root)
     return _RuntimeRepositorySet(
+        material_upload_state_repository=FsMaterialUploadStateRepository(workspace_root, repository_set=repository_set),
         workspace_root=workspace_root,
         batching_repository=FsBatchingRepository(workspace_root, repository_set=repository_set),
         company_repository=FsCompanyMetaRepository(workspace_root, repository_set=repository_set),

@@ -61,6 +61,7 @@ class FinsUploadUsageCode(str, Enum):
     COMPANY_NAME_REQUIRED = "company_name_required"
     CREATE_TARGET_EXISTS = "create_target_exists"
     UPDATE_TARGET_MISSING = "update_target_missing"
+    DELETE_TARGET_MISSING = "delete_target_missing"
     EXISTING_SOURCE_REPAIR_REQUIRES_AUTO = "existing_source_repair_requires_auto"
 
 
@@ -195,6 +196,7 @@ _USAGE_MESSAGES: Final[Mapping[FinsUploadUsageCode, str]] = {
     FinsUploadUsageCode.COMPANY_NAME_REQUIRED: "当前公司缺少有效元数据；create/update 必须提供 --company-name",
     FinsUploadUsageCode.CREATE_TARGET_EXISTS: "create 目标已存在；请改用 update 或允许覆盖",
     FinsUploadUsageCode.UPDATE_TARGET_MISSING: "update 目标不存在；请改用 create",
+    FinsUploadUsageCode.DELETE_TARGET_MISSING: "delete 材料目标不存在；请确认材料身份",
     FinsUploadUsageCode.EXISTING_SOURCE_REPAIR_REQUIRES_AUTO: (
         "目标 filing 不完整；请使用 auto 并提供完整文件重新上传"
     ),
@@ -354,3 +356,16 @@ def fins_upload_primary_selection_usage_failure(
 def fins_upload_format_usage_failure(error: FinsUploadFormatError) -> FinsUploadUsageFailure:
     """参数：格式 owner 失败；返回：同源用法事实；异常：ValueError 表示公开事实非法。"""
     return FinsUploadUsageFailure(code=error.kind, message=str(error), hint=error.retry_hint, file_label=error.file_label)
+
+
+def fins_upload_target_usage_failure(
+    code: FinsUploadUsageCode, *, source_kind: SourceKind,
+) -> FinsUploadUsageFailure:
+    """参数：目标错误与显式来源；返回：同源用法事实；异常：非目标代码或来源不合法。"""
+    if source_kind not in {SourceKind.FILING, SourceKind.MATERIAL}:
+        raise ValueError("目标错误必须声明来源")
+    if code not in {FinsUploadUsageCode.CREATE_TARGET_EXISTS, FinsUploadUsageCode.UPDATE_TARGET_MISSING, FinsUploadUsageCode.DELETE_TARGET_MISSING}:
+        raise ValueError("不是目标前置条件代码")
+    if code is FinsUploadUsageCode.DELETE_TARGET_MISSING and source_kind is not SourceKind.MATERIAL:
+        raise ValueError("filing 不新增删除前置条件")
+    return fins_upload_usage_failure(code)

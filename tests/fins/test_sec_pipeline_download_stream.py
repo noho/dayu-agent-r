@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from dayu.fins.storage import FsBatchingRepository, FsCompanyMetaRepository, FsSourceDocumentRepository, FsDocumentBlobRepository, FsFilingMaintenanceRepository, FsFilingUploadStateRepository, FsProcessedDocumentRepository
+from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
+
+from dayu.fins.storage import FsMaterialUploadStateRepository
+
 import asyncio
 import json
 import logging
@@ -207,7 +212,7 @@ def test_repeat_sec_company_publication_rolls_back_zero_mutation_batch(
         batching_repository=batching_repository,
         company_repository=FsCompanyMetaRepository(tmp_path, repository_set=repository_set),
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=repository_set),)
     asyncio.run(
         _sec_download_workflow._publish_sec_post_repair_mutations(
             host=cast(_sec_download_workflow.SecDownloadWorkflowHost, pipeline),
@@ -858,7 +863,7 @@ def test_download_stream_emits_ordered_events(tmp_path: Path) -> None:
         workspace_root=tmp_path,
         downloader=StreamStubDownloader(),
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
     import asyncio
 
     events = asyncio.run(_collect_events(pipeline, ticker="AAPL", start_is_explicit=False))
@@ -895,7 +900,7 @@ def test_download_stream_writes_blob_before_single_complete_source(tmp_path: Pat
             repository_set=repository_set,
         ),
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=repository_set),)
     import asyncio
 
     events = asyncio.run(_collect_events(pipeline, ticker="AAPL", start_is_explicit=False))
@@ -930,7 +935,7 @@ def test_failed_sec_download_rolls_back_and_retry_publishes_complete_source(tmp_
             repository_set=repository_set,
         ),
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=repository_set),)
     import asyncio
 
     failed_events = asyncio.run(_collect_events(failing_pipeline, ticker="AAPL", start_is_explicit=False))
@@ -955,7 +960,7 @@ def test_failed_sec_download_rolls_back_and_retry_publishes_complete_source(tmp_
             repository_set=repository_set,
         ),
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=repository_set),)
     retry_events = asyncio.run(_collect_events(retry_pipeline, ticker="AAPL", start_is_explicit=False))
     retry_result = _event_pipeline_result(retry_events[-1])
     completed_meta = source_repository.get_source_meta("AAPL", document_id, SourceKind.FILING)
@@ -975,7 +980,7 @@ def test_download_stream_repair_gate_rechecks_cancel_before_company_batch(
         workspace_root=tmp_path,
         downloader=StreamStubDownloader(),
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
     call_count = 0
 
     def _cancel_on_second_call() -> bool:
@@ -1021,7 +1026,7 @@ def test_download_stream_cancel_stops_during_collection_before_filing_requests(
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
 
     import asyncio
 
@@ -1056,7 +1061,7 @@ def test_download_stream_historical_submissions_provider_failure_is_operation_fa
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
 
     import asyncio
 
@@ -1082,7 +1087,7 @@ def test_download_sync_wrapper_aggregates_stream_result(tmp_path: Path) -> None:
         workspace_root=tmp_path,
         downloader=StreamStubDownloader(),
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
     result = pipeline.download(ticker="AAPL", overwrite=False, start_is_explicit=False)
     assert result["action"] == "download"
     assert result["summary"]["downloaded"] == 1
@@ -1095,7 +1100,7 @@ def test_adapter_progress_sink_uses_filing_granularity(tmp_path: Path) -> None:
         workspace_root=tmp_path,
         downloader=StreamStubDownloader(),
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
     progress_events: list[FinsDownloadProgressEvent] = []
 
     import asyncio
@@ -1189,7 +1194,7 @@ def test_download_stream_filing_skip_event_exposes_reason_fields(tmp_path: Path)
         workspace_root=tmp_path,
         downloader=StreamStubDownloader(),
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
 
     import asyncio
 
@@ -1222,7 +1227,7 @@ def test_download_stream_resolves_has_xbrl_from_complete_file_entries(tmp_path: 
             repository_set=repository_set,
         ),
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=repository_set),)
 
     import asyncio
 
@@ -1411,7 +1416,7 @@ def _build_sec_integrity_scenario(root: Path, scenario: str, *, changes: int = 3
         company_repository=FsCompanyMetaRepository(root, repository_set=shared),
         processed_repository=FsProcessedDocumentRepository(root, repository_set=shared),
         filing_maintenance_repository=FsFilingMaintenanceRepository(root, repository_set=shared),
-        downloader=downloader, processor_registry=build_fins_processor_registry())
+        downloader=downloader, processor_registry=build_fins_processor_registry(),  material_upload_state_repository=FsMaterialUploadStateRepository(root, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=root, create_directories=False))), filing_upload_state_repository=FsFilingUploadStateRepository(root, repository_set=_material_test_repository_set),)
     return pipeline, downloader, source, batching
 
 

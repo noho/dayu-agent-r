@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from functools import partial
+from dayu.fins.domain.enums import SourceKind
+
 from collections.abc import Callable
 from typing import cast
 
@@ -125,13 +128,13 @@ def test_unsupported_upload_format_reason_strict_json_round_trip() -> None:
     ("factory", "code", "message", "retry_hint"),
     (
         (
-            fins_upload_source_integrity_unsafe_failure,
+            partial(fins_upload_source_integrity_unsafe_failure, source_kind=SourceKind.FILING),
             FinsUploadFailureCode.SOURCE_INTEGRITY_UNSAFE,
             "工作区中的目标 filing 状态不完整且无法安全自动修复",
             "请先修复工作区 source 状态后再重试",
         ),
         (
-            fins_upload_source_publication_conflict_failure,
+            partial(fins_upload_source_publication_conflict_failure, source_kind=SourceKind.FILING),
             FinsUploadFailureCode.SOURCE_PUBLICATION_CONFLICT,
             "目标 filing 在上传准备期间已由另一请求发布，本次上传未提交",
             "请基于最新目标状态重新发起上传",
@@ -320,3 +323,18 @@ def test_upload_failure_kind_code_mapping_is_disjoint_complete_and_single_source
     assert len(grouped_codes) == len(frozenset(grouped_codes))
     assert frozenset(grouped_codes) == frozenset(FinsUploadFailureCode)
     assert upload_failure._FAILURE_KIND_BY_CODE == expected_mapping
+
+
+@pytest.mark.parametrize('source_kind', [SourceKind.FILING,SourceKind.MATERIAL])
+def test_source_failure_text_is_owned_by_explicit_source_kind(source_kind: SourceKind) -> None:
+    """参数：真实两种来源；返回：无；异常：断言失败；同 code、材料业务文案及原 filing 文案由唯一 owner 决定。"""
+    unsafe=fins_upload_source_integrity_unsafe_failure(source_kind=source_kind)
+    conflict=fins_upload_source_publication_conflict_failure(source_kind=source_kind)
+    assert unsafe.code is FinsUploadFailureCode.SOURCE_INTEGRITY_UNSAFE
+    assert conflict.code is FinsUploadFailureCode.SOURCE_PUBLICATION_CONFLICT
+    if source_kind is SourceKind.MATERIAL:
+        assert '材料' in unsafe.message and 'filing' not in unsafe.message
+        assert '材料' in conflict.message and 'filing' not in conflict.message
+    else:
+        assert unsafe.message=='工作区中的目标 filing 状态不完整且无法安全自动修复'
+        assert conflict.message=='目标 filing 在上传准备期间已由另一请求发布，本次上传未提交'

@@ -1,0 +1,184 @@
+{
+  "label": "upload-material-unified-s2-owner-contract-sol-20261003-01",
+  "runtime": "codex",
+  "provider": "gpt-6-sol",
+  "model": "unknown unless identity event present",
+  "outer_exit": 0,
+  "outer_exit_source": "managed write_stdin40145 actual completed0",
+  "events": 95,
+  "commands": 33,
+  "errors": [],
+  "nonzero_commands": [],
+  "actual_subprocess_exits": {
+    "coverage-import-probe-01": {
+      "pid": 45968,
+      "actual_wait_exit": 0,
+      "start_unix": 1790974675.396106,
+      "end_unix": 1790974675.9775229,
+      "timed_out": false,
+      "terminated": false
+    },
+    "targeted-tests-02": {
+      "pid": 45961,
+      "actual_wait_exit": 0,
+      "start_unix": 1790974635.323661,
+      "end_unix": 1790974640.744542,
+      "timed_out": false,
+      "terminated": false
+    },
+    "exploratory-path-recovery-01": {
+      "pid": 45995,
+      "actual_wait_exit": 0,
+      "start_unix": 1790974794.523425,
+      "end_unix": 1790974794.530824,
+      "timed_out": false,
+      "terminated": false
+    },
+    "diffcheck-01": {
+      "pid": 46022,
+      "actual_wait_exit": 0,
+      "start_unix": 1790974832.16946,
+      "end_unix": 1790974832.1887949,
+      "timed_out": false,
+      "terminated": false
+    },
+    "report-assembly-01": {
+      "pid": 46044,
+      "actual_wait_exit": 0,
+      "start_unix": 1790975024.9607491,
+      "end_unix": 1790975024.9845319,
+      "timed_out": false,
+      "terminated": false
+    },
+    "full-pyright-02": {
+      "pid": 45977,
+      "actual_wait_exit": 0,
+      "start_unix": 1790974713.642533,
+      "end_unix": 1790974748.126058,
+      "timed_out": false,
+      "terminated": false
+    },
+    "final-audit-01": {
+      "pid": 46046,
+      "actual_wait_exit": 0,
+      "start_unix": 1790975025.4667509,
+      "end_unix": 1790975026.385461,
+      "timed_out": false,
+      "terminated": false
+    },
+    "coverage-dotted-probe-01": {
+      "pid": 45980,
+      "actual_wait_exit": 1,
+      "start_unix": 1790974714.792664,
+      "end_unix": 1790974715.545845,
+      "timed_out": false,
+      "terminated": false
+    },
+    "coverage-directory-recovery-01": {
+      "pid": 46019,
+      "actual_wait_exit": 0,
+      "start_unix": 1790974831.053296,
+      "end_unix": 1790974831.7736828,
+      "timed_out": false,
+      "terminated": false
+    },
+    "exploratory-path-error-01": {
+      "pid": 45993,
+      "actual_wait_exit": 2,
+      "start_unix": 1790974794.033531,
+      "end_unix": 1790974794.04104,
+      "timed_out": false,
+      "terminated": false
+    },
+    "targeted-tests-01": {
+      "pid": 45936,
+      "actual_wait_exit": 2,
+      "start_unix": 1790974553.834903,
+      "end_unix": 1790974557.619756,
+      "timed_out": false,
+      "terminated": false
+    },
+    "full-pyright-01": {
+      "pid": 45937,
+      "actual_wait_exit": 0,
+      "start_unix": 1790974558.0593522,
+      "end_unix": 1790974593.198872,
+      "timed_out": false,
+      "terminated": false
+    },
+    "delta-audit-01": {
+      "pid": 45991,
+      "actual_wait_exit": 0,
+      "start_unix": 1790974793.491188,
+      "end_unix": 1790974793.548671,
+      "timed_out": false,
+      "terminated": false
+    }
+  },
+  "changed_files": [
+    {
+      "path": "dayu/fins/storage/_fs_material_upload_state_core.py",
+      "before": "7819477a9f2653cb2f4b0c114c0461bae617325f9f7ab0e36124d5805f3fbb47",
+      "after": "0a9d16ba641c4950cd2e628234316badde45e77bd461d54d168ef295035bef11"
+    },
+    {
+      "path": "dayu/fins/storage/repository_protocols.py",
+      "before": "93082b720613509c5b5371c62d6d7b4cd5a12ba5b6ff8bb68cde62377c10cd15",
+      "after": "a65da7e8692898240ce117b16275168590cfb9e2e918389a7b13c6e28ad686b1"
+    },
+    {
+      "path": "dayu/fins/storage/fs_material_upload_state_repository.py",
+      "before": "c736cd83b0581c04e0cfcfb27e272bdc897d88ac9190f33e8b56a86026681e64",
+      "after": "a5f9978ebc337ee1eb4f36d436e2d0a967667809e8f41476dc6c718cbeb8b591"
+    },
+    {
+      "path": "tests/fins/test_material_upload_state_repository.py",
+      "before": "96dcdef2670513c1d5e336865c90d87f8de9c0211415bc49b32ccf8509feefce",
+      "after": "8adbf0742909db886a08bd82d43d2bf1ef1b0f2aecc7099ecd05ba8e0807792c"
+    }
+  ],
+  "ast": {
+    "dayu/fins/storage/_fs_material_upload_state_core.py": "one defined TypeError guard only; stripped remainder exact AST unchanged",
+    "dayu/fins/storage/repository_protocols.py": "docstring-only; non-doc AST identical",
+    "dayu/fins/storage/fs_material_upload_state_repository.py": "docstring-only; non-doc AST identical"
+  },
+  "protected_files": 9564,
+  "protected_drift": [],
+  "junit": {
+    "tests": 81,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "core_coverage": {
+    "covered_lines": 75,
+    "num_statements": 78,
+    "percent_covered": 96.15384615384616,
+    "percent_covered_display": "96",
+    "missing_lines": 3,
+    "excluded_lines": 0,
+    "percent_statements_covered": 96.15384615384616,
+    "percent_statements_covered_display": "96"
+  },
+  "artifact": "docs/gateflow/upload-material-unified-s2-owner-contract-fix-report-20261003.md",
+  "artifact_sha256": "cb35b6cc1235be95eeb1aa2df4af6562fe3cd210149f2ae3ab9fb78627bb0cc3",
+  "controller": {
+    "setup_status": "ok",
+    "agent_status": "completed",
+    "tool_evidence": "yes",
+    "tool_trace": "complete",
+    "required_evidence": "complete",
+    "canary_status": "match",
+    "result_status": "accepted",
+    "warnings": [
+      "Dotted coverage source triggered dependency-import/NumPy error: targeted-tests-01 exit2 and coverage-dotted-probe-01 exit1 preserved; directory coverage recovered identical81tests/core96.15. Product and dependencies unchanged.",
+      "Guessed coverage/pytest_plugin.py missing: compound outer0 not success; actual isolated rg exit2 preserved and valid source query recovered.",
+      "Pyright version advisory and three edgar deprecation warnings nonfatal.",
+      "Root grouped-cat token assertion corrected to exact last output line and actual Python read; standalone audit actual0 verified.",
+      "Root empty Skill formatter and fileshash root-relative path assumptions corrected; saved source/validation artifacts unaffected."
+    ],
+    "evidence_gaps": [],
+    "retry_class": "none"
+  },
+  "decision": "T01 candidate verified for same-version delta re-review, no S2 pass"
+}

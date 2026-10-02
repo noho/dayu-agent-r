@@ -109,7 +109,7 @@ class FinsUploadToolCallable:
         try:
             request = _upload_request_from_arguments(call.arguments)
             if isinstance(request, FinsUploadMaterialRequest):
-                validated = admit_fins_upload_material_request(request)
+                validated = admit_fins_upload_material_request(request, state_repository=self.runtime.material_upload_state_repository)
                 for path in validated.file_selection.files:
                     _validate_upload_file_path(path)
                 request = validated
@@ -191,7 +191,7 @@ def build_fins_upload_tool(runtime: FinsIngestionRuntime) -> ToolDefinition:
                 name=UPLOAD_TOOL_NAME,
                 description=(
                     "为一家公司上传本地财报文件或补充材料。调用后等待工具结果返回；"
-                    "结果会说明上传、删除、转换或失败情况。仅在用户明确要求使用本地文件补充财报资料时调用。"
+                    "材料结果含必填 published_amended：成功、跳过、删除或仅更新标记时为实际已发布布尔值，失败或取消为 null。metadata_updated 表示只更新标记、未重新转换，stored_file_count=0。仅在用户明确要求使用本地文件补充财报资料时调用。"
                     '最小材料示例：{"ticker":"AAPL","upload_kind":"material","files":["/path/deck.txt"],"form_type":"MATERIAL_OTHER","material_name":"Deck"}。'
                 ),
                 parameters=_upload_parameters_schema(),
@@ -301,7 +301,7 @@ def _upload_parameters_schema() -> ToolParametersSchema:
         },
         "amended": {
             "type": "boolean",
-            "description": "上传文件是否为修订版本。",
+            "description": "请求的修订标记。材料成功结果 published_amended 为实际发布标记，跳过或删除也读取现有事实；失败或取消为 null。",
             "default": False,
         },
         "filing_date": {

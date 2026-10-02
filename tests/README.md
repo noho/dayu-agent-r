@@ -17,6 +17,14 @@ propagate 与 disabled 状态，并关闭本测试新增的 logger handler，避
 
 ## 常用命令
 
+`test_source_meta_contract.py` 验证精确布尔删除/修订字段；`test_source_manifest_contract.py` 验证两类 manifest 使用同一严格删除投影。`test_fins_storage_atomicity.py` 的真实 Fs 生命周期回归核对 filing/material 首删、健康重删的全部发布字节/revision/时间不变、恢复后再删，以及坏删除字段和损坏 tombstone 的失败关闭。
+
+`test_material_upload_state_repository.py` 使用真实 Fs 仓储核对同次材料 state、深层不可变 meta、required 条件登记、最终 guard、metadata-only 内容保持、严格实际损坏分类、独立公司初始缺席等价 no-op / 已观察快照漂移，以及 COMMITTED 后真实释放位置的故障注入。`test_fins_storage_provider.py` 的材料 fixture 显式提供非修订布尔事实及完整 Docling 主源/role，同时保留 namespace、provenance、citation 和 meta-less corpus 的业务断言。
+
+`test_material_upload_publication.py` 覆盖真实 Fs 八格修订矩阵、目标首错、删除与恢复、四类候选在 A begin 前的 source/company 竞争提交、operational 故障不改写、损坏 winner 拒绝跳过，以及列表标记与推荐 ID 同源。`test_fins_ingestion_runtime.py` 核对 typed failure 双摘要与 active-only、三类已存终态在投影异常后保持。`test_fins_ingestion_tools.py` 的 S2 文本用例直接经过工具、生产 Docling、真实仓储、observation/direct、列表和 job，验证 ok→metadata_updated→skipped 的实际发布标记。CLI architecture 禁止 UI 获取仓储能力；材料前置校验消费 Service handoff。
+
+材料 publication 回归还覆盖 b/a 多文件、非首项 a 为主源的真实 D 内容/标记/skip 候选，公共身份规范排序与原输入事件顺序、竞争 skip 的业务字节/revision/时间保持、不同主源/角色指纹/内容/标记拒绝，以及非覆盖 create-on-tombstone 的既有仓储拒绝。已有公司、共同旧 MISSING 的确定 interleave 在 A 公司 guard 前完成 B 发布，auto 非覆盖继续到 writer 裁 skip，create 或覆盖请求仍拒源漂移。状态仓储测试核对 required 显式 None 仅免源条件、完整当前状态返回，以及公司全快照/alias 严格拒绝；writer 登记仍要求完整状态。
+
 材料静态身份与主源回归由 `test_material_identity_contract.py` 和 `test_source_manifest_contract.py` 集中验证：必填/码点/独立财年财期、ID 一致断言、一次路径规范化、exact selector、strict manifest 及真实 Fs A→B→B 发布与 snapshot/processor 默认源。`test_fins_ingestion_tools.py` 使用真实 tool、生产 workflow 和 Fs 仓储，只控制转换 outcome，分别核对 process observation 无持久 job、真实 upload job 的同源五字段双摘要，以及 US/CN/HK 空内容和损坏转换。`test_docling_upload_service_integration.py` 的文本转换用例无需额外开关，实际调用 Docling 子进程并读回默认 processor；历史 PDF 集成仍需显式启用。
 
 F5 完整 owner 回归：`python -m pytest tests/fins/test_f5_result_contract.py tests/fins/test_f5_storage_calendar.py tests/fins/test_f5_workflow_rebuild.py -q`。

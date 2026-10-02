@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Final, Literal
 
@@ -153,49 +152,6 @@ def stage_upload_company_meta_decision(
     repository.stage_company_meta_intent(decision.company_meta_intent, batch=batch)
 
 
-def stage_company_meta_for_upload(
-    *,
-    repository: CompanyMetaRepositoryProtocol,
-    ticker: str,
-    action: str,
-    company_name: str | None,
-    ticker_aliases: Sequence[str] | None = None,
-    batch: BatchToken,
-) -> None:
-    """在 caller-owned batch 中读取、裁决并 stage 公司元数据。
-
-    Args:
-        repository: 公司元数据仓储实现。
-        ticker: 股票代码。
-        action: 上传动作。
-        company_name: 公司名称。
-        ticker_aliases: 可选 ticker alias 列表。
-        batch: caller 显式传入的 batch capability。
-
-    Returns:
-        无。
-
-    Raises:
-        UploadCompanyNameRequiredError: create/update 场景在缺少公司名称时抛出。
-        ValueError: ticker/alias 非法或既有 identity 与请求不一致时抛出。
-        OSError: 仓储写入失败时抛出。
-    """
-
-    existing_meta = _load_existing_company_meta(repository=repository, ticker=ticker)
-    decision = resolve_upload_company_meta_decision(
-        existing_meta=existing_meta,
-        ticker=ticker,
-        action=action.strip().lower(),
-        company_name=company_name,
-        ticker_aliases=tuple(ticker_aliases or ()),
-    )
-    stage_upload_company_meta_decision(
-        repository=repository,
-        decision=decision,
-        batch=batch,
-    )
-
-
 def build_upload_company_id(ticker: str) -> str:
     """按上传链路稳定规则生成公司 ID。
 
@@ -248,31 +204,6 @@ def _optional_upload_company_name(value: str | None) -> str | None:
     return normalized_value or None
 
 
-def _load_existing_company_meta(
-    *,
-    repository: CompanyMetaRepositoryProtocol,
-    ticker: str,
-) -> CompanyMeta | None:
-    """读取现有公司元数据。
-
-    Args:
-        repository: 公司元数据仓储实现。
-        ticker: 股票代码。
-
-    Returns:
-        若仓储中已存在公司元数据则返回该对象，否则返回 ``None``。
-
-    Raises:
-        ValueError: 现有元数据格式非法时抛出。
-        OSError: 仓储读取失败时抛出。
-    """
-
-    try:
-        return repository.get_company_meta(ticker)
-    except FileNotFoundError:
-        return None
-
-
 def _existing_company_meta_is_fresh(*, existing_meta: CompanyMeta, resolver_version: str) -> bool:
     """判断既有 upload company meta 是否由当前 resolver 语义产生。
 
@@ -297,6 +228,5 @@ __all__ = [
     "UploadCompanyMetaDecision",
     "build_upload_company_id",
     "resolve_upload_company_meta_decision",
-    "stage_company_meta_for_upload",
     "stage_upload_company_meta_decision",
 ]

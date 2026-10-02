@@ -9,6 +9,7 @@ import pytest
 import dayu.fins.storage as storage
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.storage import require_source_meta_is_deleted
+from dayu.fins.storage.source_meta_contract import require_material_source_meta_amended
 
 
 @pytest.mark.parametrize("is_deleted", (False, True))
@@ -82,3 +83,18 @@ def test_source_meta_deleted_reader_is_formal_storage_export() -> None:
 
     assert "require_source_meta_is_deleted" in storage.__all__
     assert storage.require_source_meta_is_deleted is require_source_meta_is_deleted
+
+
+@pytest.mark.parametrize("amended", (False, True))
+def test_material_amended_reader_keeps_exact_bool(amended: bool) -> None:
+    """参数：精确布尔值；返回：无；异常：断言失败；不重算或默认修订事实。"""
+    assert require_material_source_meta_amended({"amended": amended}) is amended
+
+
+@pytest.mark.parametrize("value", (None, 0, 1, "false", [], {}))
+def test_material_amended_reader_fails_closed(value: JsonValue) -> None:
+    """参数：非法JSON值；返回：无；异常：断言失败；缺失及类型错误严格区分。"""
+    with pytest.raises(KeyError):
+        require_material_source_meta_amended({})
+    with pytest.raises(ValueError, match="material amended 必须为布尔值"):
+        require_material_source_meta_amended({"amended": value})

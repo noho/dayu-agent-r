@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dayu.fins.storage import FsMaterialUploadStateRepository
+
 from dayu.fins.upload_usage_contract import (
     FinsUploadUsageCategory,
     FinsUploadUsageCode,
@@ -901,7 +903,7 @@ class _RecordingFinsUploadRunner(FinsUploadRunner):
             requested_file_count=0,
             stored_file_count=0,
             deleted=True,
-        )
+         published_amended=None,)
 
 
 class _ForbiddenFilingUploadStateRepository:
@@ -1637,8 +1639,8 @@ def test_upload_tool_material_path_failure_uses_planner_usage_owner(
     )
     with pytest.raises(FinsUploadUsageError) as raised:
         admit_fins_upload_material_request(
-            FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="AAPL", action="create", files=(Path(raw_name),))
-        )
+            FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="AAPL", action="create", files=(Path(raw_name),),  company_name="Apple Inc.",)
+        ,  state_repository=FsMaterialUploadStateRepository(tmp_path),)
     outcome = asyncio.run(
         FinsUploadToolCallable(runtime=runtime)(
             _call(UPLOAD_TOOL_NAME, arguments), _context()
@@ -1740,7 +1742,7 @@ def test_upload_tool_mixed_name_and_format_uses_plan_reason(
         path.parent.mkdir()
         path.write_bytes(b"input")
     with pytest.raises(FinsUploadUsageError) as raised:
-        admit_fins_upload_material_request(FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="AAPL", files=paths))
+        admit_fins_upload_material_request(FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="AAPL", files=paths,  company_name="Apple Inc.",),  state_repository=FsMaterialUploadStateRepository(tmp_path),)
     assert raised.value.failure.code is expected_code
     assert raised.value.failure.message == expected_message
     arguments: dict[str, JsonValue] = {
@@ -1872,8 +1874,8 @@ def test_upload_tool_projects_same_usage_fact_independent_of_exception_cause(
     }
     with pytest.raises(FinsUploadUsageError) as raised:
         admit_fins_upload_material_request(
-            FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="AAPL", action="create", files=(Path("a\x00b.txt"),))
-        )
+            FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="AAPL", action="create", files=(Path("a\x00b.txt"),),  company_name="Apple Inc.",)
+        ,  state_repository=FsMaterialUploadStateRepository(tmp_path),)
     original_error = raised.value
     assert isinstance(original_error.__cause__, FinsUploadAssetPlanError)
     assert original_error.failure.category is FinsUploadUsageCategory.ASSET_PLAN
@@ -1981,6 +1983,7 @@ def test_upload_tool_material_keeps_file_state_precheck_after_admission(
                     "ticker": "AAPL", "upload_kind": "material", "action": "create",
                     "files": [str(input_path)], "form_type": "MATERIAL_OTHER",
                     "material_name": "Deck",
+                "company_name": "Apple Inc.",
                 },
             ),
             _context(),
@@ -2736,7 +2739,7 @@ def test_upload_tool_raw_material_request_rejects_format_before_production_runne
     cancellation_checker: FinsJobCancellationChecker = _OpenCancellationToken()
 
     with pytest.raises(FinsUploadUsageError) as exc_info:
-        admit_fins_upload_material_request(request)
+        admit_fins_upload_material_request(request,  state_repository=FsMaterialUploadStateRepository(tmp_path),)
 
     assert exc_info.value.failure.file_label == "deck.zip"
     assert not (workspace_root / "portfolio" / "AAPL").exists()
@@ -3187,7 +3190,7 @@ def _runtime_with_static_admission_guard(
         job_store=base_runtime.ingestion_job_store,
         executor=executor,
         upload_runner=upload_runner,
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(workspace_root),)
     return runtime, executor, state_repository
 
 
@@ -3223,7 +3226,7 @@ def _runtime_with_executor(
         job_store=base_runtime.ingestion_job_store,
         executor=executor,
         upload_runner=upload_runner,
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(workspace_root),)
 
 
 def _write_split_fins_provider_overlay(
@@ -3726,7 +3729,7 @@ async def test_s1_real_tool_role_and_combination(tmp_path: Path, case: str) -> N
         with pytest.raises(FinsUploadUsageError) as error:
             raw = upload_tools._upload_request_from_arguments(arguments)
             assert isinstance(raw, FinsUploadMaterialRequest)
-            admit_fins_upload_material_request(raw)
+            admit_fins_upload_material_request(raw,  state_repository=FsMaterialUploadStateRepository(tmp_path),)
         assert error.value.failure.code is expected_code
         assert error.value.failure.category is FinsUploadUsageCategory.REQUEST
         assert outcome.result.message == error.value.failure.message
@@ -3749,3 +3752,46 @@ async def test_s1_real_tool_role_and_combination(tmp_path: Path, case: str) -> N
         finally:
             await runtime.abandon_observation(record.handle)
     default.close()
+
+
+@pytest.mark.asyncio
+async def test_s2_real_tool_runtime_docling_actual_publication_and_job(tmp_path: Path) -> None:
+    """参数：独占真实 workspace；返回：无；异常：断言失败；工具、真实生产转换/仓储、观察/direct、列表与 job 使用同一 published amended。"""
+    workspace_root = tmp_path/'workspace'
+    sample=tmp_path/'probe.txt';sample.write_text('A public material text probe. Revenue increased in the sample.\n')
+    default=DefaultFinsRuntime.create(workspace_root=workspace_root)
+    runtime=default.get_ingestion_runtime()
+    definition=build_fins_upload_tool(runtime=runtime)
+    try:
+        for amended, expected in ((True,'ok'),(False,'metadata_updated'),(False,'skipped')):
+            before=set(runtime._observations)
+            arguments: dict[str, JsonValue] = {'ticker':'AAPL','upload_kind':'material','files':[str(sample)],'form_type':'MATERIAL_OTHER','material_name':'Actual Tool','company_name':'Apple Inc.','amended':amended}
+            outcome=await definition.callable(_call(UPLOAD_TOOL_NAME,arguments),_context())
+            assert isinstance(outcome,ToolAwaitingOutcome)
+            added=set(runtime._observations)-before;assert len(added)==1
+            observation=runtime._observations[added.pop()]
+            runtime.activate_observation(observation.handle)
+            try:
+                snapshot=await _wait_s1_observation(runtime,observation.handle)
+                assert snapshot.status is FinsObservationStatus.SUCCEEDED and snapshot.result is not None
+                details={item.label:item.value for item in snapshot.result.details}
+                assert details['status']==expected and details['published amended']==str(amended).lower()
+                assert details['stored files']==('1' if expected=='ok' else '0')
+                assert not tuple(_job_store_root(workspace_root).glob('*.json'))
+            finally:
+                await runtime.abandon_observation(observation.handle)
+            listed=default.get_read_runtime().list_documents(ticker='AAPL')
+            assert len(listed['documents'])==1 and listed['documents'][0]['published_amended'] is amended
+            assert listed['recommended_documents']['latest_material_document_id']==listed['documents'][0]['document_id']
+        request=upload_tools._upload_request_from_arguments(arguments)
+        start=runtime.start_upload(request)
+        job=runtime.read_job(start.job_id)
+        for _ in range(500):
+            job=runtime.read_job(start.job_id)
+            if job.status in (FinsIngestionJobStatus.SUCCEEDED,FinsIngestionJobStatus.FAILED,FinsIngestionJobStatus.CANCELLED):break
+            await asyncio.sleep(0.02)
+        assert job.status is FinsIngestionJobStatus.SUCCEEDED and job.result_summary['status']=='skipped'
+        assert job.result_summary['published_amended'] is False and job.request_summary['requested_amended'] is False
+        assert job.failure_summary=={}
+    finally:
+        default.close()

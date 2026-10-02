@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+from tests.fins.test_material_upload_publication import seed_material_upload_target
+
+from dayu.fins.storage import FsBatchingRepository, FsCompanyMetaRepository, FsSourceDocumentRepository, FsDocumentBlobRepository, FsFilingMaintenanceRepository, FsFilingUploadStateRepository, FsProcessedDocumentRepository
+from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
+
+from dayu.fins.storage import FsMaterialUploadStateRepository
+
 from dayu.fins.pipelines.docling_upload_service import build_material_ids
 
 from dayu.fins.upload_usage_contract import FinsUploadUsageCode, FinsUploadUsageError, fins_upload_usage_failure
@@ -410,7 +417,7 @@ def test_failed_pipeline_result_requires_closed_typed_failure_reason() -> None:
 
     with pytest.raises(ValueError):
         FinsUploadPipelineResult.from_pipeline_json(
-            {"status": "failed", "stored_file_count": 0},
+            {"status": "failed", "stored_file_count": 0, "published_amended": None,},
             source_kind=SourceKind.MATERIAL,
         )
     with pytest.raises(ValueError):
@@ -425,7 +432,7 @@ def test_failed_pipeline_result_requires_closed_typed_failure_reason() -> None:
                     "retry_hint": None,
                     "file_label": None,
                 },
-            },
+             "published_amended": False,},
             source_kind=SourceKind.MATERIAL,
         )
     result = FinsUploadPipelineResult.from_pipeline_json(
@@ -439,7 +446,7 @@ def test_failed_pipeline_result_requires_closed_typed_failure_reason() -> None:
                 "retry_hint": "请确认文件可正常打开并重新上传",
                 "file_label": "report.pdf",
             },
-        },
+         "published_amended": None,},
         source_kind=SourceKind.MATERIAL,
     )
     assert result.failure_reason is not None
@@ -576,7 +583,7 @@ def test_failed_pipeline_result_rejects_unsafe_or_open_failure_json(
 
     with pytest.raises(ValueError):
         FinsUploadPipelineResult.from_pipeline_json(
-            {"status": "failed", "stored_file_count": 0, "failure": failure},
+            {"status": "failed", "stored_file_count": 0, "failure": failure, "published_amended": None,},
             source_kind=SourceKind.MATERIAL,
         )
 
@@ -727,7 +734,7 @@ def test_upload_direct_details_consume_typed_failure_label_and_retry_hint() -> N
         stored_file_count=0,
         document_id="AAPL-2024-FY",
         failure_reason=reason,
-    )
+     published_amended=None,)
 
     projected_details = ingestion_runtime._upload_result_details(summary)
     details = {detail.label: detail.value for detail in projected_details}
@@ -873,11 +880,11 @@ def test_upload_pipeline_count_owner_accepts_complete_status_matrix(
         status=status,
         stored_file_count=stored_file_count,
         failure_reason=failure_reason,
-    )
+     source_kind=SourceKind.FILING, published_amended=None,)
     payload: dict[str, JsonValue] = {
         "status": status,
         "stored_file_count": stored_file_count,
-    }
+     "published_amended": None if status in {"failed", "cancelled"} else False,}
     if failure_reason is not None:
         payload["failure"] = failure_reason.to_json()
     parsed = FinsUploadPipelineResult.from_pipeline_json(
@@ -922,11 +929,11 @@ def test_upload_pipeline_count_owner_rejects_invalid_status_matrix(
             status=status,
             stored_file_count=stored_file_count,
             failure_reason=failure_reason,
-        )
+         source_kind=SourceKind.FILING, published_amended=None,)
     payload: dict[str, JsonValue] = {
         "status": status,
         "stored_file_count": stored_file_count,
-    }
+     "published_amended": None if status in {"failed", "cancelled"} else False,}
     if failure_reason is not None:
         payload["failure"] = failure_reason.to_json()
     with pytest.raises(ValueError, match="stored_file_count"):
@@ -952,7 +959,7 @@ def test_upload_pipeline_count_owner_rejects_missing_bool_negative_and_non_int(
         AssertionError: parser 接受非法 count 时抛出。
     """
 
-    payload: dict[str, JsonValue] = {"status": "ok"}
+    payload: dict[str, JsonValue] = {"status": "ok", "published_amended": False}
     if stored_file_count is not None:
         payload["stored_file_count"] = stored_file_count
     with pytest.raises(ValueError, match="stored_file_count"):
@@ -982,7 +989,7 @@ def test_upload_pipeline_constructor_rejects_bool_and_negative_count(
         FinsUploadPipelineResult(
             status="cancelled",
             stored_file_count=stored_file_count,
-        )
+         source_kind=SourceKind.FILING, published_amended=None,)
 
 
 @pytest.mark.parametrize(
@@ -1020,7 +1027,7 @@ def test_upload_summary_count_owner_accepts_complete_status_matrix(
         requested_file_count=requested_file_count,
         stored_file_count=stored_file_count,
         failure_reason=_runtime_failure_for_status(status),
-    )
+     published_amended=None,)
 
     assert summary.to_json_summary()["requested_file_count"] == requested_file_count
     assert summary.to_json_summary()["stored_file_count"] == stored_file_count
@@ -1065,7 +1072,7 @@ def test_upload_summary_count_owner_rejects_invalid_status_matrix(
             requested_file_count=requested_file_count,
             stored_file_count=stored_file_count,
             failure_reason=_runtime_failure_for_status(status),
-        )
+         published_amended=None,)
 
 
 @pytest.mark.parametrize(
@@ -1095,7 +1102,7 @@ def test_upload_summary_count_owner_rejects_bool_and_negative_counts(
             status="cancelled",
             requested_file_count=requested_file_count,
             stored_file_count=stored_file_count,
-        )
+         published_amended=None,)
 
 
 def _constructor_keyword_sets(source_path: Path, constructor_name: str) -> list[frozenset[str]]:
@@ -1265,11 +1272,13 @@ def test_production_upload_count_constructors_are_explicit_and_complete() -> Non
 
     assert len(summary_calls) == 4
     assert all({"requested_file_count", "stored_file_count"} <= keywords for keywords in summary_calls)
-    assert len(operation_calls) == 4
+    assert len(operation_calls) == 5
     assert all("stored_file_count" in keywords for keywords in operation_calls)
     assert pipeline_calls == [
         frozenset(
             {
+                "source_kind",
+                "published_amended",
                 "status",
                 "stored_file_count",
                 "document_id",
@@ -1796,7 +1805,7 @@ def test_filing_validator_unsafe_prevalidation_precedes_action_and_company(
     with pytest.raises(FinsUploadPrevalidationError) as exc_info:
         validate_fins_upload_filing_request(request, published_state=published_state)
 
-    assert exc_info.value.failure == fins_upload_source_integrity_unsafe_failure()
+    assert exc_info.value.failure == fins_upload_source_integrity_unsafe_failure(source_kind=SourceKind.FILING)
     assert str(tmp_path) not in exc_info.value.failure.message
     assert _PUBLISHED_SOURCE_REVISION_TOKEN not in repr(exc_info.value.failure)
 
@@ -1958,7 +1967,7 @@ def test_raw_runtime_unsafe_prevalidation_creates_no_job_observation_or_mutation
     with pytest.raises(FinsUploadPrevalidationError) as observation_exc:
         runtime.prepare_observed_upload(request, _NeverCancelledToken())
 
-    expected_failure = fins_upload_source_integrity_unsafe_failure()
+    expected_failure = fins_upload_source_integrity_unsafe_failure(source_kind=SourceKind.FILING)
     assert job_exc.value.failure == expected_failure
     assert observation_exc.value.failure == expected_failure
     assert state_repository.calls == [
@@ -4328,7 +4337,7 @@ class _BarrierUploadRunner(FinsUploadRunner):
                 status="cancelled",
                 requested_file_count=len(raw_request.files),
                 stored_file_count=0,
-            )
+             published_amended=None,)
         return self.accepted_summary
 
 
@@ -4450,7 +4459,7 @@ class _BlockingArtifactUploadRunner(FinsUploadRunner):
             requested_file_count=1,
             stored_file_count=1,
             primary_document=f"{self.document_id}_docling.json",
-        )
+         published_amended=None,)
 
 
 class _UploadRuntimeConverter:
@@ -4590,7 +4599,7 @@ def _inject_upload_runtime_converter(
             filing_maintenance_repository=default_runtime.filing_maintenance_repository,
             filing_upload_state_repository=default_runtime.filing_upload_state_repository,
             docling_converter=effective_converter,
-        ),
+         material_upload_state_repository=default_runtime.material_upload_state_repository,),
         cn_pipeline=CnPipeline(
             workspace_root=default_runtime.workspace_root,
             batching_repository=default_runtime.batching_repository,
@@ -4601,7 +4610,7 @@ def _inject_upload_runtime_converter(
             filing_maintenance_repository=default_runtime.filing_maintenance_repository,
             filing_upload_state_repository=default_runtime.filing_upload_state_repository,
             docling_converter=effective_converter,
-        ),
+         material_upload_state_repository=default_runtime.material_upload_state_repository,),
     )
 
 
@@ -5532,7 +5541,7 @@ def test_store_downloaded_document_commit_failure_does_not_caller_rollback(tmp_p
         processor_registry=default_runtime.processor_registry,
         job_store=default_runtime.ingestion_job_store,
         executor=_HoldingExecutor(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     document = FinsDownloadedSourceDocument(
         source_kind=SourceKind.FILING,
         document_id="aapl-commit-failed",
@@ -6686,7 +6695,7 @@ async def test_direct_upload_projection_failure_before_claim_emits_single_failur
         status="ok",
         requested_file_count=1,
         stored_file_count=1,
-    )
+     published_amended=None,)
     assert summary.to_json_summary()["document_id"] == oversized_direct_label
     runtime = _build_ingestion_runtime(
         tmp_path / "fins-workspace",
@@ -6746,7 +6755,7 @@ async def test_direct_upload_stream_copies_typed_warnings_exactly(
         requested_file_count=requested_file_count,
         stored_file_count=stored_file_count,
         warnings=warnings,
-    )
+     published_amended=None,)
     runtime = _build_ingestion_runtime(
         tmp_path / "fins-workspace",
         executor=_HoldingExecutor(),
@@ -6853,7 +6862,7 @@ async def test_direct_upload_cancel_before_final_checkpoint_returns_only_cancell
             status="ok",
             requested_file_count=1,
             stored_file_count=1,
-        ),
+         published_amended=None,),
         observe_cancel_before_summary=True,
     )
     runtime = _build_ingestion_runtime(
@@ -6903,7 +6912,7 @@ async def test_direct_upload_cancel_after_commit_before_summary_keeps_completed(
             status="ok",
             requested_file_count=1,
             stored_file_count=1,
-        ),
+         published_amended=None,),
         observe_cancel_before_summary=False,
     )
     runtime = _build_ingestion_runtime(
@@ -7006,7 +7015,7 @@ async def test_direct_upload_cancel_around_summary_claim_keeps_progress_result_a
                 requested_file_count=1 if status == "ok" else 0,
                 stored_file_count=1 if status == "ok" else 0,
                 failure_reason=_runtime_failure_for_status(status),
-            )
+             published_amended=None,)
         ),
     )
     collection = asyncio.create_task(_collect_direct_events(runtime.upload(_valid_runtime_filing_request())))
@@ -7757,7 +7766,7 @@ def test_start_upload_persists_queued_record_and_uses_public_ticker_normalizatio
             status="ok",
             requested_file_count=1,
             stored_file_count=1,
-        )
+         published_amended=None,)
     )
     runtime = _build_ingestion_runtime(workspace_root, executor=executor, upload_runner=runner)
     original_normalize = ticker_normalization.normalize_ticker
@@ -7848,12 +7857,12 @@ def test_start_upload_without_runner_writes_failed_terminal_record(tmp_path: Pat
     runtime = _build_ingestion_runtime(workspace_root, executor=executor)
 
     start = runtime.start_upload(
-        FinsUploadMaterialRequest(form_type="MATERIAL_OTHER",
+        seed_material_upload_target(FinsUploadMaterialRequest(form_type="MATERIAL_OTHER",
             ticker="AAPL",
             action="delete",
 
             material_name="Investor Day",
-        )
+         company_name="Apple Inc.",), workspace_root)
     )
     executor.run_all()
     record = runtime.read_job(start.job_id)
@@ -7865,8 +7874,11 @@ def test_start_upload_without_runner_writes_failed_terminal_record(tmp_path: Pat
     assert record.result_summary["status"] == "failed"
     assert record.result_summary["requested_file_count"] == 0
     assert record.result_summary["stored_file_count"] == 0
-    assert "unsupported upload runtime" in str(record.failure_summary["message"])
-    assert "production upload runner" in str(record.failure_summary["message"])
+    failure = record.result_summary["failure"]
+    assert isinstance(failure, dict)
+    assert record.failure_summary["message"] == failure["message"] == "上传执行失败，请检查运行日志后重试"
+    assert failure["code"] == "unexpected_runtime"
+    assert record.result_summary["published_amended"] is None
 
 
 def test_material_delete_without_files_has_zero_count_in_job_and_progress(
@@ -7891,12 +7903,12 @@ def test_material_delete_without_files_has_zero_count_in_job_and_progress(
     runner = _FakeUploadRunner(FinsUploadResultSummary(
         source_kind=SourceKind.MATERIAL, status="deleted",
         requested_file_count=0, stored_file_count=0, deleted=True,
-    ))
+     published_amended=False,))
     runtime = _build_ingestion_runtime(workspace_root, executor=executor, upload_runner=runner)
-    start = runtime.start_upload(FinsUploadMaterialRequest(
+    start = runtime.start_upload(seed_material_upload_target(FinsUploadMaterialRequest(
         ticker="AAPL", action="delete", files=(),
         form_type="OTHER", material_name="Investor Day",
-    ))
+     company_name="Apple Inc.",), workspace_root))
     queued = runtime.read_job(start.job_id)
     assert queued.request_summary["file_count"] == 0
     executor.run_all()
@@ -7926,7 +7938,7 @@ def test_start_upload_with_runner_writes_bounded_result_summary(tmp_path: Path) 
             skip_reason=None,
             document_version="v2",
             source_fingerprint="sha256:abc123",
-        )
+         published_amended=False,)
     )
     runtime = _build_ingestion_runtime(workspace_root, executor=executor, upload_runner=runner)
 
@@ -7939,7 +7951,7 @@ def test_start_upload_with_runner_writes_bounded_result_summary(tmp_path: Path) 
             material_name="Investor Day",
 
 
-        )
+         company_name="Apple Inc.",)
     )
     executor.run_all()
     record = runtime.read_job(start.job_id)
@@ -8279,7 +8291,7 @@ async def test_direct_upload_stream_omits_paths_job_ids_and_raw_payload_text(tmp
             requested_file_count=1,
             stored_file_count=1,
             primary_document="primary.pdf",
-        )
+         published_amended=None,)
     )
     ingestion = _build_ingestion_runtime(
         workspace_root,
@@ -8392,7 +8404,7 @@ async def test_direct_upload_typed_failure_projection_bypasses_string_classifier
             requested_file_count=1,
             stored_file_count=0,
             failure_reason=reason,
-        )
+         published_amended=None,)
     )
     ingestion = _build_ingestion_runtime(
         tmp_path / "fins-workspace",
@@ -8455,7 +8467,7 @@ async def test_alias_conflict_failure_is_identical_across_direct_durable_and_obs
         requested_file_count=1,
         stored_file_count=0,
         failure_reason=reason,
-    )
+     published_amended=None,)
     executor = _HoldingExecutor()
     runtime = _build_ingestion_runtime(
         tmp_path / "fins-workspace",
@@ -8533,7 +8545,7 @@ async def test_direct_upload_without_runner_reports_requested_and_zero_stored_co
             FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", primary_selectors=(Path('first.pdf'),),
                 ticker="AAPL",
                 files=(Path("first.pdf"), Path("second.pdf")),
-            )
+             company_name="Apple Inc.",)
         )
     )
 
@@ -8565,7 +8577,7 @@ def test_start_upload_failed_status_emits_completed_with_failures_progress(tmp_p
             skip_reason="fixture failure",
             document_version=None,
             source_fingerprint=None,
-        )
+         published_amended=None,)
     )
     runtime = _build_ingestion_runtime(workspace_root, executor=executor, upload_runner=runner)
 
@@ -8578,7 +8590,7 @@ def test_start_upload_failed_status_emits_completed_with_failures_progress(tmp_p
             material_name="Investor Day",
 
 
-        )
+         company_name="Apple Inc.",)
     )
     executor.run_all()
     record = runtime.read_job(start.job_id)
@@ -8643,7 +8655,7 @@ def test_durable_upload_projection_failure_preserves_accepted_terminal(
                 requested_file_count=1 if status == "ok" else 0,
                 stored_file_count=1 if status == "ok" else 0,
                 failure_reason=_runtime_failure_for_status(status),
-            )
+             published_amended=None,)
         ),
     )
     start = runtime.start_upload(_valid_runtime_filing_request())
@@ -8745,7 +8757,7 @@ def test_durable_upload_projection_failure_preserves_accepted_terminal(
     )
 
     assert len(accepted_records) == 1
-    assert fallback_reads == accepted_records
+    assert fallback_reads == []
     assert record == accepted_records[0]
     assert record.status is expected_job_status
     assert record.result_summary["status"] == status
@@ -8774,7 +8786,7 @@ def test_durable_upload_cancel_before_final_checkpoint_saves_only_cancelled(
             status="ok",
             requested_file_count=1,
             stored_file_count=1,
-        ),
+         published_amended=None,),
         observe_cancel_before_summary=True,
     )
     runtime = _build_ingestion_runtime(
@@ -8834,7 +8846,7 @@ def test_durable_upload_cancel_after_commit_before_summary_keeps_completed(
             status="ok",
             requested_file_count=1,
             stored_file_count=1,
-        ),
+         published_amended=None,),
         observe_cancel_before_summary=False,
     )
     runtime = _build_ingestion_runtime(
@@ -8965,7 +8977,7 @@ def test_durable_upload_cancel_before_atomic_save_keeps_accepted_summary(
                 requested_file_count=1 if status == "ok" else 0,
                 stored_file_count=1 if status == "ok" else 0,
                 failure_reason=_runtime_failure_for_status(status),
-            )
+             published_amended=None,)
         ),
     )
     start = runtime.start_upload(_valid_runtime_filing_request())
@@ -9081,7 +9093,7 @@ def test_durable_upload_cancel_after_atomic_save_keeps_single_terminal(
                 requested_file_count=1 if status == "ok" else 0,
                 stored_file_count=1 if status == "ok" else 0,
                 failure_reason=_runtime_failure_for_status(status),
-            )
+             published_amended=None,)
         ),
     )
     start = runtime.start_upload(_valid_runtime_filing_request())
@@ -9142,14 +9154,14 @@ def test_accepted_upload_terminal_store_rejects_mismatch_and_preserves_existing_
         requested_file_count=1,
         stored_file_count=1,
         warnings=(_company_name_ignored_warning(),),
-    ).to_json_summary()
+     published_amended=None,).to_json_summary()
     failed_summary = FinsUploadResultSummary(
         source_kind=SourceKind.FILING,
         status="failed",
         requested_file_count=0,
         stored_file_count=0,
         failure_reason=fins_upload_failure_from_exception(RuntimeError(), file_label=None),
-    ).to_json_summary()
+     published_amended=None,).to_json_summary()
     finished_at = datetime.now(timezone.utc).isoformat()
 
     with pytest.raises(ValueError, match="不接受 cancelled"):
@@ -9379,7 +9391,7 @@ def test_durable_runtime_concurrent_explicit_create_persists_exact_conflict_term
     assert sorted(record.status.value for record in records) == ["failed", "succeeded"]
     failed = next(record for record in records if record.status is FinsIngestionJobStatus.FAILED)
     succeeded = next(record for record in records if record.status is FinsIngestionJobStatus.SUCCEEDED)
-    expected_failure = fins_upload_source_publication_conflict_failure().to_json()
+    expected_failure = fins_upload_source_publication_conflict_failure(source_kind=SourceKind.FILING).to_json()
     assert failed.request_summary["action"] == "create"
     assert failed.failure_summary == expected_failure
     assert failed.result_summary["failure"] == expected_failure
@@ -9436,7 +9448,7 @@ def test_durable_upload_fresh_unsafe_persists_exact_typed_failure_reason(tmp_pat
     failed = ingestion.start_upload(validated)
     failed_record = _wait_terminal(ingestion, failed.job_id)
 
-    expected = fins_upload_source_integrity_unsafe_failure().to_json()
+    expected = fins_upload_source_integrity_unsafe_failure(source_kind=SourceKind.FILING).to_json()
     assert failed_record.status is FinsIngestionJobStatus.FAILED
     assert failed_record.failure_summary == expected
     assert failed_record.result_summary["failure"] == expected
@@ -9508,7 +9520,7 @@ def test_upload_request_and_result_summaries_enforce_bounds(tmp_path: Path) -> N
             FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck",
                 ticker="AAPL",
                 ticker_aliases=too_many_aliases,
-            )
+             company_name="Apple Inc.",)
         )
     assert material_aliases_exc.value.failure.code is FinsUploadUsageCode.TOO_MANY_TICKER_ALIASES
     with pytest.raises(ValueError, match="requested_file_count"):
@@ -9517,7 +9529,7 @@ def test_upload_request_and_result_summaries_enforce_bounds(tmp_path: Path) -> N
             status="ok",
             requested_file_count=-1,
             stored_file_count=0,
-        )
+         published_amended=None,)
     assert executor.operations == []
 
 
@@ -9525,11 +9537,11 @@ def test_upload_request_and_result_summaries_enforce_bounds(tmp_path: Path) -> N
     ("upload_request", "expected_code"),
     (
         (
-            FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="Apple Inc."),
+            FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="Apple Inc.",  company_name="Apple Inc.",),
             FinsUploadUsageCode.INVALID_TICKER,
         ),
         (
-            FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="AAPL", ticker_aliases=("a apl",)),
+            FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="AAPL", ticker_aliases=("a apl",),  company_name="Apple Inc.",),
             FinsUploadUsageCode.INVALID_TICKER_ALIAS,
         ),
     ),
@@ -9613,7 +9625,7 @@ def test_material_dates_fail_shared_admission_before_all_upload_lifecycles(
         material_name="Deck",
         filing_date=raw_date if field_name == "filing_date" else None,
         report_date=raw_date if field_name == "report_date" else None,
-    )
+     company_name="Apple Inc.",)
     before = _snapshot_runtime_workspace_tree(workspace_root)
 
     for entrance in ("direct", "observation", "observed", "job"):
@@ -9666,9 +9678,9 @@ def test_material_dates_accept_none_and_real_leap_day_before_job_creation(
         material_name="Deck",
         filing_date=date_value,
         report_date=date_value,
-    )
+     company_name="Apple Inc.",)
 
-    runtime.upload(request)
+    runtime.upload(seed_material_upload_target(request, workspace_root))
     runtime.prepare_observed_upload(request, _NeverCancelledToken())
     start = runtime.start_upload(request)
     summary = runtime.read_job(start.job_id).request_summary
@@ -9726,7 +9738,7 @@ def test_upload_requests_use_source_kind_for_filing_material_discrimination(tmp_
         runtime.start_upload(FinsUploadFilingRequest(ticker="AAPL", source_kind=SourceKind.MATERIAL))
     assert source_kind_exc.value.failure.code is FinsUploadUsageCode.INVALID_SOURCE_KIND
     with pytest.raises(ValueError, match="material 上传请求必须使用 source_kind=material"):
-        runtime.start_upload(FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="AAPL", source_kind=SourceKind.FILING))
+        runtime.start_upload(FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="AAPL", source_kind=SourceKind.FILING,  company_name="Apple Inc.",))
 
     material_file = tmp_path / "material.pdf"
     material_file.write_bytes(b"valid boundary input")
@@ -9736,7 +9748,7 @@ def test_upload_requests_use_source_kind_for_filing_material_discrimination(tmp_
             source_kind=SourceKind.MATERIAL,
             files=(material_file,),
 
-        )
+         company_name="Apple Inc.",)
     )
     material_record = runtime.read_job(material_start.job_id)
 
@@ -9762,7 +9774,7 @@ def test_result_summaries_allow_slash_in_document_ids() -> None:
         stored_file_count=1,
         document_id="sec/aapl-2024-10ka",
         internal_document_id="sec/aapl-2024-10ka-internal",
-    )
+     published_amended=None,)
 
     assert download_summary.to_json_summary(max_json_chars=4096)["written_document_ids"] == ["sec/aapl-2024-10ka"]
     assert preprocess_summary.to_json_summary()["processed_document_ids"] == ["processed/aapl-2024-10ka"]
@@ -9927,12 +9939,12 @@ def test_pipeline_warning_parser_requires_filing_field_but_allows_material_missi
     """
 
     material = FinsUploadPipelineResult.from_pipeline_json(
-        {"status": "skipped", "stored_file_count": 0},
+        {"status": "skipped", "stored_file_count": 0, "published_amended": False,},
         source_kind=SourceKind.MATERIAL,
     )
     assert material.warnings == ()
     explicit_empty_material = FinsUploadPipelineResult.from_pipeline_json(
-        {"status": "skipped", "stored_file_count": 0, "warnings": []},
+        {"status": "skipped", "stored_file_count": 0, "warnings": [], "published_amended": False,},
         source_kind=SourceKind.MATERIAL,
     )
     assert explicit_empty_material.warnings == ()
@@ -9947,17 +9959,17 @@ def test_pipeline_warning_parser_requires_filing_field_but_allows_material_missi
                         "message": COMPANY_NAME_IGNORED_WARNING_MESSAGE,
                     }
                 ],
-            },
+             "published_amended": False,},
             source_kind=SourceKind.MATERIAL,
         )
     with pytest.raises(ValueError, match="必须显式包含 warnings"):
         FinsUploadPipelineResult.from_pipeline_json(
-            {"status": "skipped", "stored_file_count": 0},
+            {"status": "skipped", "stored_file_count": 0, "published_amended": False,},
             source_kind=SourceKind.FILING,
         )
     with pytest.raises(ValueError, match="JSON array"):
         FinsUploadPipelineResult.from_pipeline_json(
-            {"status": "skipped", "stored_file_count": 0, "warnings": None},
+            {"status": "skipped", "stored_file_count": 0, "warnings": None, "published_amended": False,},
             source_kind=SourceKind.MATERIAL,
         )
 
@@ -9988,7 +10000,7 @@ def test_pipeline_warning_invariant_rejects_non_success_status(status: str) -> N
                     message=COMPANY_NAME_IGNORED_WARNING_MESSAGE,
                 ),
             ),
-        )
+         source_kind=SourceKind.FILING, published_amended=None,)
 
 
 def test_upload_summary_warning_contract_is_exact_bounded_and_success_only() -> None:
@@ -10012,7 +10024,7 @@ def test_upload_summary_warning_contract_is_exact_bounded_and_success_only() -> 
             requested_file_count=1,
             stored_file_count=1 if status == "ok" else 0,
             warnings=(warning,),
-        )
+         published_amended=None,)
         assert summary.warnings == (warning,)
         assert summary.to_json_summary()["warnings"] == [warning.to_json()]
 
@@ -10023,7 +10035,7 @@ def test_upload_summary_warning_contract_is_exact_bounded_and_success_only() -> 
             requested_file_count=1,
             stored_file_count=1,
             warnings=(cast(CompanyMetadataWarning, "not-a-warning"),),
-        )
+         published_amended=None,)
     with pytest.raises(ValueError, match="最多允许一个"):
         FinsUploadResultSummary(
             source_kind=SourceKind.FILING,
@@ -10031,7 +10043,7 @@ def test_upload_summary_warning_contract_is_exact_bounded_and_success_only() -> 
             requested_file_count=1,
             stored_file_count=1,
             warnings=(warning, warning),
-        )
+         published_amended=None,)
     for status in ("failed", "cancelled", "deleted"):
         with pytest.raises(ValueError, match="ok/skipped"):
             FinsUploadResultSummary(
@@ -10041,7 +10053,7 @@ def test_upload_summary_warning_contract_is_exact_bounded_and_success_only() -> 
                 stored_file_count=0,
                 failure_reason=_runtime_failure_for_status(status),
                 warnings=(warning,),
-            )
+             published_amended=None,)
 
 
 def test_upload_summary_json_always_contains_warnings_array() -> None:
@@ -10062,7 +10074,7 @@ def test_upload_summary_json_always_contains_warnings_array() -> None:
         status="deleted",
         requested_file_count=0,
         stored_file_count=0,
-    )
+     published_amended=None,)
 
     assert summary.warnings == ()
     assert summary.to_json_summary()["warnings"] == []
@@ -10100,7 +10112,7 @@ def test_upload_status_owner_maps_only_exact_production_statuses(
     pipeline_json: dict[str, JsonValue] = {
         "status": status,
         "stored_file_count": stored_file_count,
-    }
+     "published_amended": None if status in {"failed", "cancelled"} else False,}
     if status == "failed":
         pipeline_json["failure"] = {
             "kind": "runtime",
@@ -10119,7 +10131,7 @@ def test_upload_status_owner_maps_only_exact_production_statuses(
         requested_file_count=requested_file_count,
         stored_file_count=stored_file_count,
         failure_reason=_runtime_failure_for_status(status),
-    )
+     published_amended=None,)
 
     assert pipeline_result.status == status
     assert summary.terminal_disposition() is expected
@@ -10144,7 +10156,7 @@ def test_upload_status_owner_rejects_unknown_case_and_whitespace_variants(status
 
     with pytest.raises(ValueError, match="upload status"):
         FinsUploadPipelineResult.from_pipeline_json(
-            {"status": status, "stored_file_count": 0},
+            {"status": status, "stored_file_count": 0, "published_amended": None if status in {"failed", "cancelled"} else False,},
             source_kind=SourceKind.MATERIAL,
         )
     with pytest.raises(ValueError, match="upload status"):
@@ -10153,7 +10165,7 @@ def test_upload_status_owner_rejects_unknown_case_and_whitespace_variants(status
             status=status,
             requested_file_count=0,
             stored_file_count=0,
-        )
+         published_amended=None,)
 
 
 def test_prepare_observed_operations_do_not_submit_until_activation(tmp_path: Path) -> None:
@@ -10321,7 +10333,7 @@ def test_abandon_submitted_observation_cancels_and_keeps_storage_artifacts(
         job_store=default_runtime.ingestion_job_store,
         executor=executor,
         upload_runner=runner,
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     handle = runtime.prepare_observed_upload(
         _valid_runtime_filing_request(),
         cancellation_token=_NeverCancelledToken(),
@@ -10620,7 +10632,7 @@ def test_job_event_sidecar_omits_paths_payload_bodies_and_raw_provider_payloads(
             status="ok",
             requested_file_count=1,
             stored_file_count=1,
-        )
+         published_amended=None,)
     )
     ingestion = _build_ingestion_runtime(workspace_root, executor=executor, upload_runner=runner)
     upload_file = tmp_path / "raw" / "aapl-10k.pdf"
@@ -10942,7 +10954,7 @@ def test_progress_event_append_failure_warns_and_job_still_succeeds(
             status="ok",
             requested_file_count=1,
             stored_file_count=1,
-        )
+         published_amended=None,)
     )
     ingestion = _build_ingestion_runtime(
         workspace_root,
@@ -11469,7 +11481,7 @@ def test_claim_running_preserves_cancel_between_read_and_running_write(
         processor_registry=default_runtime.processor_registry,
         job_store=job_store,
         executor=executor,
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
 
     start = ingestion.start_preprocess(
         FinsPreprocessRequest(
@@ -11704,7 +11716,7 @@ def test_start_preprocess_unsupported_document_records_not_supported_summary(tmp
         processed_repository=default_runtime.processed_repository,
         processor_registry=ProcessorRegistry(),
         job_store=default_runtime.ingestion_job_store,
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
 
     start = ingestion.start_preprocess(FinsPreprocessRequest(ticker="AAPL", document_ids=("aapl-2024-10k",)))
     record = _wait_terminal(ingestion, start.job_id)
@@ -12099,7 +12111,7 @@ def _build_static_admission_guarded_runtime(
         job_store=default_runtime.ingestion_job_store,
         executor=executor,
         upload_runner=runner,
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(workspace_root),)
     return runtime, executor, state_repository, runner
 
 
@@ -12140,7 +12152,7 @@ def _build_fixed_state_guarded_runtime(
         job_store=default_runtime.ingestion_job_store,
         executor=executor,
         upload_runner=runner,
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(workspace_root),)
     return runtime, executor, state_repository, runner
 
 
@@ -12179,7 +12191,7 @@ def _build_ingestion_runtime(
         executor=executor,
         download_adapters=download_adapters,
         upload_runner=upload_runner,
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(workspace_root),)
 
 
 def _build_ingestion_runtime_with_repository_set(
@@ -12225,7 +12237,7 @@ def _build_ingestion_runtime_with_repository_set(
         processor_registry=default_runtime.processor_registry,
         job_store=default_runtime.ingestion_job_store,
         executor=_HoldingExecutor(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(workspace_root),)
 
 
 def _add_unmatched_source_documents(
@@ -12631,7 +12643,7 @@ def test_validated_material_handoff_rejects_cross_field_drift(tmp_path: Path) ->
     """
 
     paths = (tmp_path / "first.pdf", tmp_path / "second.pdf")
-    admitted = admit_fins_upload_material_request(FinsUploadMaterialRequest(ticker="AAPL", files=paths, primary_selectors=(paths[0],), form_type="OTHER", material_name="Deck"))
+    admitted = admit_fins_upload_material_request(seed_material_upload_target(FinsUploadMaterialRequest(ticker="AAPL", files=paths, primary_selectors=(paths[0],), form_type="OTHER", material_name="Deck",  company_name="Apple Inc.",), tmp_path),  state_repository=FsMaterialUploadStateRepository(tmp_path),)
     assert tuple(pair.path for pair in admitted.asset_plan.ordered_pairs) == paths
     for changed in (replace(admitted.request, files=(paths[0],)), replace(admitted.request, primary_selectors=(paths[1],))):
         with pytest.raises(ValueError):
@@ -12642,7 +12654,7 @@ def test_validated_material_handoff_rejects_cross_field_drift(tmp_path: Path) ->
         replace(admitted, asset_plan=replace(admitted.asset_plan, converter_pairs=tuple(reversed(admitted.asset_plan.converter_pairs))))
     with pytest.raises(ValueError):
         replace(admitted, asset_plan=replace(admitted.asset_plan, primary_original_name="missing.pdf"))
-    deleted = admit_fins_upload_material_request(FinsUploadMaterialRequest(ticker="AAPL", action="delete", form_type="OTHER", material_name="Deck"))
+    deleted = admit_fins_upload_material_request(seed_material_upload_target(FinsUploadMaterialRequest(ticker="AAPL", action="delete", form_type="OTHER", material_name="Deck",  company_name="Apple Inc.",), tmp_path),  state_repository=FsMaterialUploadStateRepository(tmp_path),)
     assert deleted.request.files == () and deleted.file_selection.is_empty
     with pytest.raises(ValueError):
         replace(deleted, asset_plan=admitted.asset_plan)
@@ -12673,10 +12685,10 @@ def test_material_identity_remains_outside_static_admission(
         ticker="AAPL", action=action,
         files=(tmp_path / "deck.pdf",) if action == "create" else (),
         form_type="OTHER", material_name="Deck",
-    )
+     company_name="Apple Inc.",)
     request = replace(request, **{field_name: value})
     with pytest.raises(FinsUploadUsageError) as raised:
-        admit_fins_upload_material_request(request)
+        admit_fins_upload_material_request(request,  state_repository=FsMaterialUploadStateRepository(tmp_path),)
     expected = FinsUploadUsageCode.MISSING_FORM_TYPE if field_name == "form_type" else FinsUploadUsageCode.MISSING_MATERIAL_NAME
     assert raised.value.failure.code is expected
 
@@ -12703,9 +12715,9 @@ async def test_material_missing_identity_keeps_workflow_failure_boundary(
     raw = FinsUploadMaterialRequest(
         ticker="AAPL" if pipeline_type is SecPipeline else "600519",
         action="delete", form_type="OTHER", material_name="Deck",
-    )
+     company_name="Apple Inc.",)
     with pytest.raises(FinsUploadUsageError) as raised:
-        admit_fins_upload_material_request(replace(raw, **{field_name: None}))
+        admit_fins_upload_material_request(replace(raw, **{field_name: None}),  state_repository=FsMaterialUploadStateRepository(Path.cwd() / "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/static-admission-unused"),)
     expected = FinsUploadUsageCode.MISSING_FORM_TYPE if field_name == "form_type" else FinsUploadUsageCode.MISSING_MATERIAL_NAME
     assert raised.value.failure.code is expected
 
@@ -12726,8 +12738,8 @@ def test_material_handoff_constructor_reuses_static_admission_and_full_plan(tmp_
     raw = FinsUploadMaterialRequest(
         ticker="AAPL", action="create", files=(tmp_path / "deck.pdf",),
         form_type=" OTHER ", material_name=" Deck ",
-    )
-    valid = admit_fins_upload_material_request(raw)
+     company_name="Apple Inc.",)
+    valid = admit_fins_upload_material_request(raw,  state_repository=FsMaterialUploadStateRepository(tmp_path),)
     assert valid.request.form_type == "OTHER"
     assert valid.request.material_name == "Deck"
     for changed, code in (
@@ -12737,16 +12749,16 @@ def test_material_handoff_constructor_reuses_static_admission_and_full_plan(tmp_
         (replace(valid.request, ticker_aliases=("bad alias",)), FinsUploadUsageCode.INVALID_TICKER_ALIAS),
     ):
         with pytest.raises(FinsUploadUsageError) as raised:
-            ValidatedFinsUploadMaterialRequest(changed, valid.file_selection, valid.asset_plan, identity=valid.identity, action_decision=valid.action_decision)
+            ValidatedFinsUploadMaterialRequest(changed, valid.file_selection, valid.asset_plan, identity=valid.identity, action_decision=valid.action_decision, state_admission=valid.state_admission)
         assert raised.value.failure.code is code
     with pytest.raises(ValueError, match="action"):
         ValidatedFinsUploadMaterialRequest(
             replace(raw, action="bogus"), valid.file_selection, valid.asset_plan
-        , identity=valid.identity, action_decision=valid.action_decision)
+        , identity=valid.identity, action_decision=valid.action_decision, state_admission=valid.state_admission)
     with pytest.raises(ValueError, match="source_kind=material"):
         ValidatedFinsUploadMaterialRequest(
             replace(valid.request, source_kind=SourceKind.FILING), valid.file_selection, valid.asset_plan
-        , identity=valid.identity, action_decision=valid.action_decision)
+        , identity=valid.identity, action_decision=valid.action_decision, state_admission=valid.state_admission)
     control = tmp_path / "meta.json"
     pair = UploadAssetPair(control, control.name, f"{control.name}_docling.json")
     with pytest.raises(FinsUploadAssetPlanError) as plan_error:
@@ -12762,7 +12774,7 @@ def test_material_handoff_constructor_reuses_static_admission_and_full_plan(tmp_
             replace(valid.request, files=(control,)),
             FinsUploadMaterialFiles.from_upsert_paths((control,)),
             same_value_plan,
-          identity=valid.identity, action_decision=valid.action_decision)
+          identity=valid.identity, action_decision=valid.action_decision, state_admission=valid.state_admission)
     assert raised.value.reason is FinsUploadAssetPlanReason.RESERVED_CONTROL_NAME
 
 
@@ -12785,10 +12797,11 @@ async def test_public_validated_material_entry_rechecks_handoff_before_first_eve
         AssertionError: 非法日期越过消费 owner 时抛出。
     """
 
-    validated = admit_fins_upload_material_request(FinsUploadMaterialRequest(
+    validated = admit_fins_upload_material_request(seed_material_upload_target(FinsUploadMaterialRequest(
         ticker="AAPL" if pipeline_type is SecPipeline else "600519",
         action="delete", form_type="OTHER", material_name="Deck",
-    ))
+     company_name="Apple Inc.",), tmp_path),  state_repository=FsMaterialUploadStateRepository(tmp_path),)
+    before = _snapshot_runtime_workspace_tree(tmp_path)
     object.__setattr__(validated, "request", replace(validated.request, filing_date="2024-02-30"))
     pipeline = object.__new__(pipeline_type)
     events: list[str] = []
@@ -12797,7 +12810,7 @@ async def test_public_validated_material_entry_rechecks_handoff_before_first_eve
             events.append(str(event))
     assert raised.value.failure.code is FinsUploadUsageCode.INVALID_FILING_DATE
     assert events == []
-    assert not (tmp_path / "portfolio").exists()
+    assert _snapshot_runtime_workspace_tree(tmp_path) == before
 
 
 def test_service_runtime_rechecks_validated_material_before_observation_or_job(tmp_path: Path) -> None:
@@ -12815,9 +12828,9 @@ def test_service_runtime_rechecks_validated_material_before_observation_or_job(t
 
     workspace_root = tmp_path / "workspace"
     runtime, executor, state_repository, runner = _build_static_admission_guarded_runtime(workspace_root)
-    validated = admit_fins_upload_material_request(FinsUploadMaterialRequest(
+    validated = admit_fins_upload_material_request(seed_material_upload_target(FinsUploadMaterialRequest(
         ticker="AAPL", action="delete", form_type="OTHER", material_name="Deck",
-    ))
+     company_name="Apple Inc.",), workspace_root),  state_repository=FsMaterialUploadStateRepository(workspace_root),)
     object.__setattr__(validated, "request", replace(validated.request, report_date="2024-02-30"))
     before = _snapshot_runtime_workspace_tree(workspace_root)
     for entrance in ("direct", "observation", "job"):
@@ -12931,3 +12944,41 @@ def test_download_integrity_failure_closed_source_projection(source: FinsDownloa
     assert set(failure.to_json_value()) == {"classification", "source", "transport_category", "message", "retry_hint", "reason_code"}
     assert all(part not in json.dumps(failure.to_json_value()) for part in ("/Users", "https://", "token=", "synthetic secret"))
     assert set(ingestion_runtime._DOWNLOAD_PUBLIC_ERROR_KINDS) == set(FinsPublicFailureKind)
+
+
+@pytest.mark.parametrize('status', ['ok', 'failed', 'cancelled'])
+def test_upload_durable_terminal_survives_projection_exception(tmp_path: Path, status: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """参数：三类终态、真实 store 与投影故障；返回：无；异常：断言失败；已落盘终态和双摘要不得被通用异常覆写。"""
+    executor = _HoldingExecutor()
+    summary = FinsUploadResultSummary(source_kind=SourceKind.MATERIAL, published_amended=True if status == 'ok' else None, status=status, requested_file_count=1, stored_file_count=1 if status == 'ok' else 0, failure_reason=_runtime_failure_for_status(status))
+    runtime = _build_ingestion_runtime(tmp_path/'workspace',executor=executor, upload_runner=_FakeUploadRunner(summary))
+    sample = tmp_path/'probe.txt';sample.write_text('first')
+    start = runtime.start_upload(FinsUploadMaterialRequest(ticker='AAPL', files=(sample,), form_type='MATERIAL_OTHER', material_name='Terminal', company_name='Apple Inc.', amended=True))
+    monkeypatch.setattr(runtime, '_append_terminal_job_event_warn', Mock(side_effect=RuntimeError('projection failure')))
+    failure_save = Mock(side_effect=AssertionError('不得覆盖已存终态'))
+    monkeypatch.setattr(runtime, '_save_upload_failure_if_active', failure_save)
+    executor.run_all()
+    record = runtime.read_job(start.job_id)
+    assert record.status is {'ok':FinsIngestionJobStatus.SUCCEEDED,'failed':FinsIngestionJobStatus.FAILED,'cancelled':FinsIngestionJobStatus.CANCELLED}[status]
+    assert record.result_summary == summary.to_json_summary()
+    assert record.failure_summary == (summary.failure_reason.to_json() if summary.failure_reason is not None else {})
+    failure_save.assert_not_called()
+
+
+def test_upload_generic_exception_shares_typed_failure_and_active_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """参数：真实 job store 与 runner 故障；返回：无；异常：断言失败；同 reason 双摘要，后续失败不覆盖终态。"""
+    executor = _HoldingExecutor()
+    runner = _FakeUploadRunner(FinsUploadResultSummary(source_kind=SourceKind.MATERIAL,published_amended=True,status='ok',requested_file_count=1,stored_file_count=1))
+    runtime = _build_ingestion_runtime(tmp_path/'workspace',executor=executor,upload_runner=runner)
+    sample = tmp_path/'probe.txt';sample.write_text('first')
+    raw = FinsUploadMaterialRequest(ticker='AAPL',files=(sample,),form_type='MATERIAL_OTHER',material_name='Exception',company_name='Apple Inc.',amended=True)
+    request = runtime._validate_runtime_upload_request(raw)
+    start = runtime.start_upload(request)
+    monkeypatch.setattr(runner,'run_upload', Mock(side_effect=RuntimeError('private failure text')))
+    executor.run_all()
+    record = runtime.read_job(start.job_id)
+    assert record.status is FinsIngestionJobStatus.FAILED
+    assert record.result_summary['failure'] == record.failure_summary
+    assert record.result_summary['published_amended'] is None and record.request_summary['requested_amended'] is True
+    runtime._save_upload_failure_if_active(start.job_id,request,OSError('later different failure'))
+    assert runtime.read_job(start.job_id) == record

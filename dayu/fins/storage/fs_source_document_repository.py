@@ -222,6 +222,10 @@ def _build_material_restore_request(req: SourceDocumentStateChangeRequest) -> Ma
 class FsSourceDocumentRepository(SourceDocumentRepositoryProtocol):
     """基于文件系统的源文档仓储实现。"""
 
+    def update_material_amended(self, *, batch: BatchToken, document_id: str, amended: bool) -> None:
+        """参数：已登记材料 batch、文档、修订值；返回：无；异常：严格事实、条件或 I/O 失败。"""
+        self._repository_set.core.update_material_amended(batch=batch, document_id=document_id, amended=amended)
+
     def __init__(
         self,
         workspace_root: Path,

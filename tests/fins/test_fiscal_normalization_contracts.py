@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dayu.fins.domain.enums import SourceKind
+
 import datetime
 from typing import cast
 
@@ -202,7 +204,7 @@ def test_source_meta_missing_fiscal_fields_stay_missing_without_date_or_form_inf
             "report_date": "2024-12-31",
             "filing_date": "2025-02-01",
         }
-    )
+    ,  source_kind=SourceKind.FILING,)
 
     assert meta["fiscal_year"] is None
     assert meta["fiscal_period"] is None
@@ -221,7 +223,7 @@ def test_source_meta_canonicalizes_explicit_fiscal_period() -> None:
         AssertionError: 显式 fiscal 值未被保真解析时抛出。
     """
 
-    meta = _parse_source_document_meta({"form_type": "10-K", "fiscal_year": 2024, "fiscal_period": " fy "})
+    meta = _parse_source_document_meta({"form_type": "10-K", "fiscal_year": 2024, "fiscal_period": " fy "},  source_kind=SourceKind.FILING,)
 
     assert meta["fiscal_year"] == 2024
     assert meta["fiscal_period"] == "FY"
@@ -506,7 +508,7 @@ def test_source_meta_rejects_invalid_fiscal_period(value: JsonValue) -> None:
     """
 
     with pytest.raises(ValueError, match="fiscal_period"):
-        _parse_source_document_meta({"fiscal_period": value})
+        _parse_source_document_meta({"fiscal_period": value},  source_kind=SourceKind.FILING,)
 
 
 @pytest.mark.parametrize(

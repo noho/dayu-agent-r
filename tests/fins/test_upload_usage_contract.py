@@ -72,6 +72,7 @@ def test_fins_upload_usage_failure_mapping_is_closed_bounded_and_path_free() -> 
         "company_name_required",
         "create_target_exists",
         "update_target_missing",
+        "delete_target_missing",
         "existing_source_repair_requires_auto",
         "missing_form_type",
         "missing_material_name",

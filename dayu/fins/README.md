@@ -100,7 +100,11 @@ source document meta 中的 `source_provider` 是来源提供方真源，当前�
 
 source document meta 中的 `is_deleted` 由 storage publication owner 产生；storage snapshot 与上传 skip 判定统一通过 `require_source_meta_is_deleted(...)` 读取精确布尔值。字段缺失或非布尔值均视为损坏并 fail closed，不使用默认值或 loose truthiness。
 
-source published revision 由 complete-source mutation owner 在每次 source create、update、replace、delete 或 restore 的最终 meta 中自动生成并持久化，随同一个 batch commit 与 source 内容原子发布。`SourceDocumentRevision.token` 只承诺非空字符串的 exact opaque equality，不承诺 prefix、长度、字符集、hash 算法或其它 grammar；producer 不能传入 token，processed / company / maintenance-only batch 与 rollback 不改变已发布 token。consumer 只通过 storage snapshot 取得同版 opaque revision，不按 meta、文件字段、时间或内容 hash 重建它。
+filing/material manifest 共用 storage 的严格删除事实投影，模型接显式 `is_deleted`，不自行默认。源文档 owner 在 writer 同版视图确认完整 source 与 canonical manifest 后，才将已删除目标的重删视为 no-op；保持原 meta、manifest、资产、时间及 revision。缺失或非布尔删除字段不能被 delete/restore 改写成合法状态。材料 source 与 material manifest 的 amended 是同一严格布尔事实，缺字段或非布尔值分别拒绝；projection 不补默认值。
+
+source published revision 由 complete-source mutation owner 在 source create、update、replace、restore 或实际改变删除状态的最终 meta 中自动生成并持久化，随同一个 batch commit 与 source 内容原子发布；健康重删 no-op 保留原 revision。`SourceDocumentRevision.token` 只承诺非空字符串的 exact opaque equality，不承诺 prefix、长度、字符集、hash 算法或其它 grammar；producer 不能传入 token，processed / company / maintenance-only batch 与 rollback 不改变已发布 token。consumer 只通过 storage snapshot 取得同版 opaque revision，不按 meta、文件字段、时间或内容 hash 重建它。
+
+`MaterialUploadStateRepositoryProtocol` 通过真实 Fs core 提供同次 company、exact material integrity、opaque revision 和深层不可变 source meta；只有同次完整检查才投影上传身份、原件声明、角色指纹与修订事实。材料 batch 必须显式登记 source/company 条件，在 writer acquisition view 与最终 publication guard 重复核对；正常 commit 返回 guard 内形成的实际 final，cleanup/release 失败仍抛出，不把 durable 发布重新解释成 skip 或撤销。metadata-only owner 只修改 amended、updated_at 与 revision/manifest 维护事实，内容版本和原件不变。独立材料公司提交沿既有公司 merge/identity/alias owner：已有 non-identity snapshot 严格比较，包括 updated_at；初始缺席的同意图当前等价无增量提交关闭 batch 而不 swap/刷新时间。
 
 `SourceDocumentRepositoryProtocol.read_source_meta_view(ticker, source_kind)` 在一个 publication guard 内沿用原 list/get 规则完整有序枚举、读取元数据，返回成功前缀及首个原读取异常。每份元数据来自本次独立 JSON 解析并提供顶层只读映射，独立于其他公开读取与后续发布；嵌套 JSON 由消费者只读使用，不承诺深冻结。这项批量观察不承诺来源完整性、可信 revision 或写入授权。公开单文档 get/list 的契约保持不变。
 
@@ -716,9 +720,17 @@ direct caller
   -> emit PROGRESS events and terminal RESULT
 ```
 
-当前 upload 同时具备 direct stream runtime contract、production runner、`start_fins_upload` awaiting tool provider 与 Service wait adapter binding。`FinsUploadFilingRequest` 与 `FinsUploadMaterialRequest` 使用已有 `SourceKind.FILING` / `SourceKind.MATERIAL` 区分 filing 与 material；direct result 只暴露有界业务字段和文件数量，不保存或输出本地文件路径。未装配 `FinsUploadRunner` 时，upload stream 产出 unsupported upload runtime 的 failed RESULT。
+当前 upload 同时具备 direct stream runtime contract、production runner、`start_fins_upload` awaiting tool provider 与 Service wait adapter binding。`FinsUploadFilingRequest` 与 `FinsUploadMaterialRequest` 使用已有 `SourceKind.FILING` / `SourceKind.MATERIAL` 区分 filing 与 material；direct result 只暴露有界业务字段和文件数量，不保存或输出本地文件路径。未装配 `FinsUploadRunner` 时，upload stream 与 job 均从共享 typed failure owner 产生 failed 结果。
 
 直接 `upload_filing` 与 `start_fins_upload` 的 filing 分支在 workspace state read、operation / observation / job 创建和 converter / storage mutation 前执行同一静态 admission：required `fiscal_year` 必须是 `1000..9999` 整数。material 分支在同一共享 request admission 校验日期及完整资产规划，早于 direct producer、observation 和 durable job 创建。公开 material handoff 构造和 validated 消费边界复用该准入，防止手工计划绕过静态规则。材料身份由纯 `MaterialUploadIdentity` owner 在静态准入产生：每个动作的 form/name 必填，form 唯一 strip/upper，name trim 后最多 240 Unicode 码点；year 可独立省略或为非 bool 的 1800..2100 整数，period 可独立省略或为六值。两个 ID 使用同一合法 seed 生成且相同，document_id 仅作一致性断言，public 输入不含 internal_document_id。constructor 与 replace 只校验同一规范事实，不再解析路径。两类上传的可选 `filing_date` / `report_date` 只在 `None` 时缺失；非 `None` 原文必须是实际存在、无首尾空白的 canonical Gregorian `YYYY-MM-DD` 日期，空串和纯空白按字段产生 typed usage failure。tool 将日期原文交给准入；CLI material 仅在入口保留既有空值折叠，非空原文不裁剪。`upload_filings_from` 的扫描与脚本生成元数据处理不属于直接上传日期准入承诺。
+
+材料受理在完整静态准入后读取 exact typed state，先校验目标再作公司决策；handoff 消费只复核已观察的完整事实。CLI 从 Service 的材料准入函数取得 handoff，不取得仓储能力。所有材料写入装配共享同组状态仓储和 batch core。独立公司阶段正常提交后才准备材料；材料 publication owner 取得 writer view，执行纯竞争裁决并登记源与公司预期，storage 在最终 publication guard 再验证。只有原 auto 非覆盖、fresh exact healthy active、相同身份/角色指纹/主源/修订标记/公司快照才能竞争跳过；真实 I/O、锁与释放失败原样保留。
+
+`MaterialUploadPublicationIdentity` 的公共值构造先校验原件集合，再按原件 `name` 建立规范 tuple，准备候选和仓储投影共用这一顺序真源。身份仍精确比较主源、角色指纹、原件摘要、修订标记及其他业务字段；身份的规范顺序不改变原请求处理或文件事件顺序。D 的准备事实保留请求顺序，竞争 skip 和普通 skip 均沿该顺序发出事件。
+
+只读 `validate_material_upload_state` 的 `expected_source_state` 必填且无默认值：显式 `None` 只要求严格公司快照和 alias 条件，不表示材料 MISSING，返回值仍是完整当前状态。公司阶段仅原 auto 非覆盖请求传 `None`，不再先独立读取材料；其余动作传完整受理状态。已观察公司始终严格比较全快照，初始公司缺席的等价 no-op 仍由公司 commit owner 判定。材料 writer 登记、最终提交 guard、D 的 skip 与重删复验继续要求完整非空源状态。
+
+材料同指纹同标记非覆盖为 skipped，同指纹异标记为 metadata_updated，后者只更新标记和维护时间，零转换且保内容版及其它业务字段；覆盖全部强制转换，版本仍归指纹 owner。删除与恢复由同一严格 storage 删除合同控制。D 唯一持有取消与 capability 转移边界，正常提交消费 storage 返回的该次 final，验证跳过和健康重删消费同次 guard state；publication outcome、市场结果、Service summary、direct/job 与材料列表的 published_amended 均从该真源投影，不 postcommit 重读。材料 requested_amended 只描述请求，failed/cancelled 的 typed summary 标记为 None。filing 保持原 amended JSON，拒 metadata_updated。推荐槽位只引用同次读取文档集合的 ID，不另造事实列表。未装配 runner 或执行异常从同一 typed reason 保存双摘要；终态已保存后的投影异常仅记录日志，保留已落盘终态。
 
 Upload workflow 返回的 summary 表示 publication/no-op/cancellation 已完成 first-commit 仲裁。Direct stream 在同一把 operation lock 上 claim 一次 summary，再从该 claim 投影 progress 与唯一 RESULT；cancelled 不发 completed progress，failed 只发 completed-with-failures，completed 只发 completed。Legacy upload job 使用 upload 专属 atomic save：completed/failed summary 不会被 runner 返回后的迟到取消改写，cancelled summary 走 cancelled save；terminal record 保存后，progress 与 terminal event 才从最终 record 投影。Download 与 preprocess 原有 success-or-cancelled / failed-or-cancelled 终态语义不受 upload 规则影响。
 

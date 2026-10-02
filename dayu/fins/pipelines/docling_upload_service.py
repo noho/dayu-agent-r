@@ -17,7 +17,7 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from io import BytesIO
 from pathlib import Path
-from typing import Final, Literal, TypeAlias
+from typing import Final, Literal, TypeAlias, cast
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
@@ -34,9 +34,8 @@ from dayu.fins.domain.document_models import (
     now_iso8601,
 )
 from dayu.fins.upload_usage_contract import FinsUploadUsageCode, FinsUploadUsageError, fins_upload_usage_failure
-from dayu.fins.domain.filing_semantics import FiscalPeriod, normalize_fiscal_period
+from dayu.fins.domain.filing_semantics import FISCAL_PERIODS, FiscalPeriod, normalize_fiscal_period
 from dayu.fins.domain.enums import SourceKind
-from dayu.fins.domain.filing_semantics import FiscalPeriod
 from dayu.fins.pipelines.docling_process_converter import (
     DEFAULT_FINS_DOCLING_CONVERSION_CONFIG,
     DoclingConversionCancelledError,
@@ -51,11 +50,16 @@ from dayu.fins.storage import (
     FilingUploadAssetDescriptor,
     FilingUploadAssetSource,
     FilingUploadPublicationIdentity,
+    MaterialUploadOriginalDescriptor,
+    MaterialUploadPublicationIdentity,
+    MaterialUploadPublishedState,
+    MaterialUploadStateRepositoryProtocol,
     SourceIntegrityRepairBlockedError,
     SourceIntegrityRevisionConflictError,
     SourceDocumentRepositoryProtocol,
     require_source_meta_is_deleted,
 )
+from dayu.fins.storage.source_integrity import SourceIntegrityStatus
 from dayu.fins.ticker_normalization import normalize_ticker
 from dayu.fins.upload_asset_plan import UploadAssetPair, UploadAssetPlan, plan_upload_assets
 from dayu.fins.upload_format_contract import (
@@ -73,6 +77,8 @@ from dayu.fins.upload_repair_contract import (
     ExistingSourceRepairDisposition,
     NoExistingSourceRepair,
 )
+
+from dayu.fins.storage.source_meta_contract import require_material_source_meta_amended
 
 JsonObject: TypeAlias = dict[str, JsonValue]
 
@@ -118,6 +124,9 @@ class UploadOperationResult:
             仅 shared filing publication 可消费。
     """
 
+    source_kind: SourceKind
+    published_amended: bool | None
+    material_published_state: MaterialUploadPublishedState | None
     status: str
     document_id: str | None
     internal_document_id: str | None
@@ -196,6 +205,27 @@ class _PreparedAssetMutation:
     repair_disposition: ExistingSourceRepairDisposition
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedMaterialSkipCandidate:
+    """已读一次原件的待验证跳过候选，不是终态。"""
+    ticker: str
+    document_id: str
+    internal_document_id: str
+    publication_identity: MaterialUploadPublicationIdentity
+    file_events: tuple[UploadFileEventPayload, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedMaterialMetaMutation:
+    """只更新材料修订标记的准备事实，保留请求顺序的竞争 skip 事件。"""
+    ticker: str
+    document_id: str
+    internal_document_id: str
+    desired_amended: bool
+    publication_identity: MaterialUploadPublicationIdentity
+    file_events: tuple[UploadFileEventPayload, ...]
+
+
 class FilingInitialSkipDisposition(str, Enum):
     """filing preparation owner 产生的 initial identical-skip 事实。"""
 
@@ -233,7 +263,7 @@ class _PreparedFilingAssetMutation(_PreparedAssetMutation):
             raise TypeError("initial skip disposition 必须是 FilingInitialSkipDisposition")
 
 
-PreparedDoclingUpload: TypeAlias = UploadOperationResult | _PreparedDeleteMutation | _PreparedAssetMutation
+PreparedDoclingUpload: TypeAlias = UploadOperationResult | _PreparedDeleteMutation | _PreparedAssetMutation | _PreparedMaterialSkipCandidate | _PreparedMaterialMetaMutation
 """Docling 转换完成后交给 top-level publication owner 的 typed plan。"""
 
 
@@ -243,11 +273,14 @@ class UploadOverwritePrecondition(str, Enum):
     ALLOWED = "allowed"
     CREATE_TARGET_EXISTS = "create_target_exists"
     UPDATE_TARGET_MISSING = "update_target_missing"
+    DELETE_TARGET_MISSING = "delete_target_missing"
 
 
 def evaluate_upload_overwrite_precondition(
     *,
     action: str,
+    source_kind: SourceKind,
+    material_state: MaterialUploadPublishedState | None,
     previous_meta: Mapping[str, JsonValue] | None,
     overwrite: bool,
 ) -> UploadOverwritePrecondition:
@@ -267,6 +300,15 @@ def evaluate_upload_overwrite_precondition(
 
     if action not in UPLOAD_ACTIONS:
         raise ValueError("上传动作必须是 create、update 或 delete")
+    if source_kind is SourceKind.MATERIAL:
+        if material_state is None or material_state.source_integrity.status not in {SourceIntegrityStatus.MISSING, SourceIntegrityStatus.COMPLETE}:
+            raise ValueError("材料前置条件必须使用健康 typed state")
+        if action == "delete" and material_state.source_integrity.status is SourceIntegrityStatus.MISSING:
+            return UploadOverwritePrecondition.DELETE_TARGET_MISSING
+        if action == "create" and material_state.publication_identity is not None and material_state.publication_identity.is_deleted:
+            return UploadOverwritePrecondition.ALLOWED
+    elif material_state is not None:
+        raise ValueError("filing 不得携带材料状态")
     if action == "create" and previous_meta is not None and not overwrite:
         return UploadOverwritePrecondition.CREATE_TARGET_EXISTS
     if action == "update" and previous_meta is None:
@@ -433,7 +475,7 @@ class DoclingUploadService:
         if not form_type.strip():
             raise ValueError("form_type 不能为空")
         if _is_cancelled(cancellation):
-            return _build_cancelled_result(document_id=document_id, internal_document_id=internal_document_id)
+            return _build_cancelled_result(source_kind=source_kind, document_id=document_id, internal_document_id=internal_document_id)
 
         if normalized_action == "delete":
             return _PreparedDeleteMutation(
@@ -445,17 +487,14 @@ class DoclingUploadService:
 
         normalized_previous_meta = dict(previous_meta) if previous_meta is not None else None
         validated_files = _validate_source_files(tuple(pair.path for pair in asset_plan.ordered_pairs))
-        precondition = evaluate_upload_overwrite_precondition(
-            action=normalized_action,
-            previous_meta=normalized_previous_meta,
-            overwrite=overwrite,
-        )
-        if precondition is UploadOverwritePrecondition.CREATE_TARGET_EXISTS and source_kind is SourceKind.FILING:
-            raise FileExistsError(f"Document already exists for create: {document_id}")
-        if precondition is UploadOverwritePrecondition.UPDATE_TARGET_MISSING:
-            raise FileNotFoundError(f"Document not found for update: {document_id}")
+        if source_kind is SourceKind.FILING:
+            precondition = evaluate_upload_overwrite_precondition(action=normalized_action, source_kind=source_kind, material_state=None, previous_meta=normalized_previous_meta, overwrite=overwrite)
+            if precondition is UploadOverwritePrecondition.CREATE_TARGET_EXISTS:
+                raise FileExistsError(f"Document already exists for create: {document_id}")
+            if precondition is UploadOverwritePrecondition.UPDATE_TARGET_MISSING:
+                raise FileNotFoundError(f"Document not found for update: {document_id}")
         if _is_cancelled(cancellation):
-            return _build_cancelled_result(document_id=document_id, internal_document_id=internal_document_id)
+            return _build_cancelled_result(source_kind=source_kind, document_id=document_id, internal_document_id=internal_document_id)
 
         original_assets = self._build_original_assets(
             asset_plan.ordered_pairs,
@@ -478,16 +517,13 @@ class DoclingUploadService:
                     FilingInitialSkipDisposition.IDENTICAL_PUBLICATION
                 )
             else:
-                Log.info(
-                    f"文档已存在且未变更，跳过上传: ticker={normalized_ticker} document_id={document_id}",
-                    module=self.MODULE,
-                )
-                skipped_events = _build_skipped_file_events(validated_files)
-                return _build_skipped_result(
-                    document_id=document_id,
-                    internal_document_id=internal_document_id,
-                    file_events=skipped_events,
-                )
+                candidate = _describe_material_candidate(ticker=normalized_ticker, document_id=document_id, internal_document_id=internal_document_id, form_type=form_type, originals=tuple(original_assets), primary_document=next(pair.docling_name for pair in asset_plan.ordered_pairs if pair.original_name == asset_plan.primary_original_name), source_fingerprint=source_fingerprint.value, document_version=_resolve_document_version(normalized_previous_meta, source_fingerprint), meta=meta)
+                desired = require_material_source_meta_amended(meta)
+                if normalized_previous_meta is None:
+                    raise AssertionError("相同候选缺少既有事实")
+                if require_material_source_meta_amended(normalized_previous_meta) != desired:
+                    return _PreparedMaterialMetaMutation(normalized_ticker, document_id, internal_document_id, desired, candidate, tuple(_build_skipped_file_events(validated_files)))
+                return _PreparedMaterialSkipCandidate(normalized_ticker, document_id, internal_document_id, candidate, tuple(_build_skipped_file_events(validated_files)))
 
         try:
             pending_assets, conversion_events, primary_document = await self._build_pending_assets(
@@ -498,11 +534,12 @@ class DoclingUploadService:
             )
         except DoclingConversionCancelledError:
             return _build_cancelled_result(
+                source_kind=source_kind,
                 document_id=document_id,
                 internal_document_id=internal_document_id,
             )
         if _is_cancelled(cancellation):
-            return _build_cancelled_result(document_id=document_id, internal_document_id=internal_document_id)
+            return _build_cancelled_result(source_kind=source_kind, document_id=document_id, internal_document_id=internal_document_id)
         current_version = _resolve_document_version(normalized_previous_meta, source_fingerprint)
         staging_meta = _build_upsert_meta(
             previous_meta=normalized_previous_meta,
@@ -581,6 +618,7 @@ class DoclingUploadService:
                 batch=batch,
             )
             return UploadOperationResult(
+                source_kind=prepared.source_kind, published_amended=None, material_published_state=None,
                 status="deleted",
                 document_id=prepared.document_id,
                 internal_document_id=prepared.internal_document_id,
@@ -592,6 +630,11 @@ class DoclingUploadService:
                     "deleted": True,
                 },
             )
+        if isinstance(prepared, _PreparedMaterialSkipCandidate):
+            return _build_skipped_result(source_kind=SourceKind.MATERIAL, document_id=prepared.document_id, internal_document_id=prepared.internal_document_id, file_events=list(prepared.file_events))
+        if isinstance(prepared, _PreparedMaterialMetaMutation):
+            self._source_repository.update_material_amended(batch=batch, document_id=prepared.document_id, amended=prepared.desired_amended)
+            return UploadOperationResult(source_kind=SourceKind.MATERIAL, published_amended=None, material_published_state=None, status="metadata_updated", document_id=prepared.document_id, internal_document_id=prepared.internal_document_id, stored_file_count=0, file_events=[], payload={"document_id": prepared.document_id, "internal_document_id": prepared.internal_document_id})
         result = self._store_upload_assets(
             ticker=prepared.ticker,
             source_kind=prepared.source_kind,
@@ -712,6 +755,7 @@ class DoclingUploadService:
         for asset in pending_assets:
             if _is_cancelled(cancellation):
                 return _build_cancelled_result(
+                    source_kind=source_kind,
                     document_id=document_id,
                     internal_document_id=internal_document_id,
                 )
@@ -750,6 +794,7 @@ class DoclingUploadService:
 
         if _is_cancelled(cancellation):
             return _build_cancelled_result(
+                source_kind=source_kind,
                 document_id=document_id,
                 internal_document_id=internal_document_id,
             )
@@ -766,10 +811,12 @@ class DoclingUploadService:
         )
         if _is_cancelled(cancellation):
             return _build_cancelled_result(
+                source_kind=source_kind,
                 document_id=document_id,
                 internal_document_id=internal_document_id,
             )
         return UploadOperationResult(
+            source_kind=source_kind, published_amended=None, material_published_state=None,
             status="uploaded",
             document_id=document_id,
             internal_document_id=internal_document_id,
@@ -1350,6 +1397,7 @@ def build_prepared_filing_skip_result(
     if not file_events:
         raise ValueError("prepared filing skip result 必须至少包含一个 original")
     return _build_skipped_result(
+        source_kind=SourceKind.FILING,
         document_id=candidate.document_id,
         internal_document_id=candidate.internal_document_id,
         file_events=file_events,
@@ -1361,8 +1409,9 @@ def commit_prepared_upload_batch(
     service: DoclingUploadService,
     batching_repository: BatchingRepositoryProtocol,
     batch: BatchToken,
-    prepared: _PreparedDeleteMutation | _PreparedAssetMutation,
+    prepared: _PreparedDeleteMutation | _PreparedAssetMutation | _PreparedMaterialSkipCandidate | _PreparedMaterialMetaMutation,
     cancellation: CancellationToken | None,
+    material_state_repository: MaterialUploadStateRepositoryProtocol | None,
 ) -> UploadOperationResult:
     """发布并提交一个 caller-owned 文档 batch。
 
@@ -1376,6 +1425,7 @@ def commit_prepared_upload_batch(
         batch: 尚未交给 ``commit_batch`` 的 caller-owned capability。
         prepared: 已完成转换与业务校验的 mutation。
         cancellation: 公共取消观察 token；``None`` 表示无取消源。
+        material_state_repository: 材料必须传同组实际状态仓储，filing 必须显式 None。
 
     Returns:
         commit 正常返回后的完成结果，或 precommit 取消并回滚后的取消结果。
@@ -1385,8 +1435,13 @@ def commit_prepared_upload_batch(
             commit 已开始后的异常不会触发 caller rollback。
     """
 
+    source_kind = SourceKind.MATERIAL if isinstance(prepared, (_PreparedMaterialSkipCandidate, _PreparedMaterialMetaMutation)) else prepared.source_kind
+    if (source_kind is SourceKind.MATERIAL) != (material_state_repository is not None):
+        raise ValueError("材料必须传状态仓储，filing 必须显式 None")
     batch_terminal_started = False
     try:
+        initial = material_state_repository.read_material_upload_state_in_batch(batch, prepared.document_id) if material_state_repository is not None else None
+        repeated_delete = isinstance(prepared, _PreparedDeleteMutation) and initial is not None and initial.publication_identity is not None and initial.publication_identity.is_deleted
         result = service.publish_prepared_upload(
             prepared,
             batch=batch,
@@ -1396,16 +1451,29 @@ def commit_prepared_upload_batch(
             batch_terminal_started = True
             batching_repository.rollback_batch(batch)
             return _build_cancelled_result(
+                source_kind=source_kind,
                 document_id=prepared.document_id,
                 internal_document_id=prepared.internal_document_id,
             )
         # 先转移 capability 所有权，再进入 storage commit；从此不再读取取消或回滚。
+        if material_state_repository is not None:
+            if isinstance(prepared, _PreparedMaterialSkipCandidate) or repeated_delete:
+                if initial is None:
+                    raise AssertionError("no-op 缺 guard 输入")
+                observed = initial
+                # 空 batch 无 swap；同一个权威 guard 先验证再交 rollback owner。
+                final = material_state_repository.validate_material_upload_state(ticker=prepared.ticker, document_id=prepared.document_id, expected_source_state=observed, expected_company_meta=observed.company_meta)
+                batch_terminal_started = True
+                batching_repository.rollback_batch(batch)
+            else:
+                batch_terminal_started = True
+                final = material_state_repository.commit_material_upload_batch(batch)
+            if final.source_meta is None:
+                raise RuntimeError("材料成功缺 actual final meta")
+            return replace(result, published_amended=require_material_source_meta_amended(final.source_meta), material_published_state=final)
         batch_terminal_started = True
         company_meta_commit_outcome = batching_repository.commit_batch(batch)
-        return replace(
-            result,
-            company_meta_commit_outcome=company_meta_commit_outcome,
-        )
+        return replace(result, company_meta_commit_outcome=company_meta_commit_outcome)
     finally:
         if not batch_terminal_started:
             rollback_prepared_upload_batch(
@@ -2022,6 +2090,7 @@ def _build_stored_file_entry(
 
 def _build_skipped_result(
     *,
+    source_kind: SourceKind,
     document_id: str,
     internal_document_id: str,
     file_events: list[UploadFileEventPayload],
@@ -2041,6 +2110,7 @@ def _build_skipped_result(
     """
 
     return UploadOperationResult(
+        source_kind=source_kind, published_amended=None, material_published_state=None,
         status="skipped",
         document_id=document_id,
         internal_document_id=internal_document_id,
@@ -2054,7 +2124,7 @@ def _build_skipped_result(
     )
 
 
-def _build_cancelled_result(*, document_id: str, internal_document_id: str) -> UploadOperationResult:
+def _build_cancelled_result(*, source_kind: SourceKind, document_id: str, internal_document_id: str) -> UploadOperationResult:
     """构建取消状态上传结果。
 
     Args:
@@ -2069,6 +2139,7 @@ def _build_cancelled_result(*, document_id: str, internal_document_id: str) -> U
     """
 
     return UploadOperationResult(
+        source_kind=source_kind, published_amended=None, material_published_state=None,
         status="cancelled",
         document_id=document_id,
         internal_document_id=internal_document_id,
@@ -2132,3 +2203,47 @@ __all__ = [
     "resolve_upload_action",
     "rollback_prepared_upload_batch",
 ]
+
+
+def _describe_material_candidate(*, ticker: str, document_id: str, internal_document_id: str, form_type: str, originals: tuple[_PendingFileAsset, ...], primary_document: str, source_fingerprint: str, document_version: str, meta: Mapping[str, JsonValue]) -> MaterialUploadPublicationIdentity:
+    """参数：D 已拥有的资产及元数据事实；返回：纯材料候选；异常：缺字段或严格类型违约；不重读或重算摘要。"""
+    name = meta["material_name"]
+    year = meta["fiscal_year"]
+    period = meta["fiscal_period"]
+    if not isinstance(name, str) or (year is not None and type(year) is not int) or (period is not None and period not in FISCAL_PERIODS):
+        raise ValueError("材料候选业务事实类型非法")
+    return MaterialUploadPublicationIdentity(ticker=ticker, document_id=document_id, internal_document_id=internal_document_id, form_type=form_type, material_name=name, fiscal_year=year, fiscal_period=cast(FiscalPeriod | None, period), source_fingerprint=source_fingerprint, primary_document=primary_document, originals=tuple(MaterialUploadOriginalDescriptor(name=asset.name, sha256=asset.sha256, size=asset.size, source="original") for asset in originals if asset.source == FILING_UPLOAD_ASSET_SOURCE_ORIGINAL), amended=require_material_source_meta_amended(meta), is_deleted=False, document_version=document_version)
+
+
+def describe_prepared_material_publication(prepared: _PreparedAssetMutation | _PreparedMaterialSkipCandidate | _PreparedMaterialMetaMutation) -> MaterialUploadPublicationIdentity:
+    """参数：材料准备事实；返回：同源身份；异常：filing 或字段非法；不执行 I/O。"""
+    if isinstance(prepared, (_PreparedMaterialSkipCandidate, _PreparedMaterialMetaMutation)):
+        return prepared.publication_identity
+    if prepared.source_kind is not SourceKind.MATERIAL:
+        raise ValueError("不是材料候选")
+    return _describe_material_candidate(ticker=prepared.ticker, document_id=prepared.document_id, internal_document_id=prepared.internal_document_id, form_type=prepared.form_type, originals=prepared.pending_assets, primary_document=prepared.primary_document, source_fingerprint=prepared.source_fingerprint, document_version=prepared.document_version, meta=prepared.meta)
+
+
+def build_prepared_material_skip_candidate(prepared: _PreparedAssetMutation | _PreparedMaterialSkipCandidate | _PreparedMaterialMetaMutation) -> _PreparedMaterialSkipCandidate:
+    """从已裁相同的准备事实构造按请求顺序发出的 skip 候选。
+
+    Args:
+        prepared: D 已产生的材料资产、标记更新或 skip 准备事实。
+    Returns:
+        共用规范身份、保留原请求事件顺序的 skip 候选，不重新读取或转换。
+    Raises:
+        ValueError: prepared 不是合法材料身份。
+    """
+    identity = describe_prepared_material_publication(prepared)
+    if isinstance(prepared, _PreparedMaterialSkipCandidate):
+        return prepared
+    if isinstance(prepared, _PreparedMaterialMetaMutation):
+        events = prepared.file_events
+    else:
+        # 身份的 canonical 原件顺序不承载输入顺序；pending assets 保留 D 的实际输入处理顺序。
+        events = tuple(
+            UploadFileEventPayload("file_skipped", asset.name, {"reason": "already_uploaded"})
+            for asset in prepared.pending_assets
+            if asset.source == FILING_UPLOAD_ASSET_SOURCE_ORIGINAL
+        )
+    return _PreparedMaterialSkipCandidate(identity.ticker, identity.document_id, identity.internal_document_id, identity, events)

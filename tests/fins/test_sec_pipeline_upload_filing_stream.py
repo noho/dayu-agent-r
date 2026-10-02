@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from dayu.fins.storage import FsBatchingRepository, FsCompanyMetaRepository, FsSourceDocumentRepository, FsDocumentBlobRepository, FsFilingMaintenanceRepository, FsFilingUploadStateRepository, FsProcessedDocumentRepository
+from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
+
+from dayu.fins.storage import FsMaterialUploadStateRepository
+
 from dayu.fins.upload_usage_contract import FinsUploadUsageCode, FinsUploadUsageError
 
 import asyncio
@@ -60,7 +65,8 @@ from dayu.fins.pipelines.docling_process_converter import (
 from dayu.fins.pipelines.upload_filing_events import UploadFilingEvent, UploadFilingEventType
 from dayu.fins.pipelines.upload_company_meta import (
     RESOLVER_VERSION,
-    stage_company_meta_for_upload,
+    stage_upload_company_meta_decision,
+    resolve_upload_company_meta_decision,
 )
 from dayu.fins.processors.registry import build_fins_processor_registry
 from dayu.fins.service_runtime import prevalidate_fins_upload_filing_request_for_workspace
@@ -956,7 +962,7 @@ def _tracking_sec_pipeline(
         blob_repository=blob_repository,
         filing_upload_state_repository=filing_state_repository,
         docling_converter=effective_converter,
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(workspace_root, repository_set=repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(workspace_root, repository_set=repository_set), processed_repository=FsProcessedDocumentRepository(workspace_root, repository_set=repository_set),)
     if prepared_identities is not None:
         pipeline._upload_service = _PreparedIdentityRecordingDoclingUploadService(
             source,
@@ -1121,7 +1127,7 @@ def _spawn_identical_sec_upload_worker(
         workspace_root=workspace_root,
         processor_registry=build_fins_processor_registry(),
         docling_converter=_BarrierDoclingConverter(barrier),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(workspace_root, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=workspace_root, create_directories=False))), batching_repository=FsBatchingRepository(workspace_root, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(workspace_root, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(workspace_root, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(workspace_root, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(workspace_root, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(workspace_root, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(workspace_root, repository_set=_material_test_repository_set),)
     request = _validated_sec_filing_request(
         pipeline=pipeline,
         filing_file=filing_file,
@@ -1189,14 +1195,7 @@ def test_upload_company_meta_invalid_ticker_alias_fails_before_repository_write(
     repository = _SpyCompanyMetaRepository()
 
     with pytest.raises(ValueError, match="无法识别的 ticker"):
-        stage_company_meta_for_upload(
-            repository=repository,
-            ticker="AAPL",
-            action="create",
-            company_name="Apple Inc.",
-            ticker_aliases=["AAPL", "Apple Inc."],
-            batch=BatchToken(transaction_id="invalid-alias", ticker="AAPL"),
-        )
+        resolve_upload_company_meta_decision(existing_meta=None, ticker="AAPL", action="create", company_name="Apple Inc.", ticker_aliases=("AAPL", "Apple Inc."))
 
     assert repository.writes == []
 
@@ -1287,7 +1286,7 @@ async def test_upload_filing_stream_preserves_same_version_company_meta(tmp_path
         workspace_root=tmp_path,
         processor_registry=build_fins_processor_registry(),
         docling_converter=_FakeDoclingConverter(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
     _seed_sec_upload_company_meta(
         pipeline=pipeline,
         company_name="Existing Apple",
@@ -1335,7 +1334,7 @@ async def test_upload_filing_stream_refreshes_stale_company_meta(tmp_path: Path)
         workspace_root=tmp_path,
         processor_registry=build_fins_processor_registry(),
         docling_converter=_FakeDoclingConverter(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
     _seed_sec_upload_company_meta(
         pipeline=pipeline,
         company_name="Stale Apple",
@@ -1384,7 +1383,7 @@ async def test_upload_filing_stream_stale_company_meta_requires_company_name(tmp
         workspace_root=tmp_path,
         processor_registry=build_fins_processor_registry(),
         docling_converter=_FakeDoclingConverter(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
     _seed_sec_upload_company_meta(
         pipeline=pipeline,
         company_name="Stale Apple",
@@ -1429,7 +1428,7 @@ async def test_upload_filing_stream_renamed_update_without_overwrite_replaces_co
         workspace_root=tmp_path,
         processor_registry=build_fins_processor_registry(),
         docling_converter=_FakeDoclingConverter(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
     old_file = tmp_path / "q1_old.pdf"
     new_file = tmp_path / "q1_renamed.pdf"
     sibling_file = tmp_path / "q2_sibling.pdf"
@@ -1616,7 +1615,7 @@ async def test_upload_filing_auto_after_delete_republishes_active_source(
         workspace_root=tmp_path,
         processor_registry=build_fins_processor_registry(),
         docling_converter=_FakeDoclingConverter(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
     filing_file = tmp_path / "restore.pdf"
     filing_file.write_text("same filing", encoding="utf-8")
     create_request = _validated_sec_filing_request(
@@ -2286,7 +2285,7 @@ async def test_upload_filing_observably_classifies_cancelled_docling_storage_and
         workspace_root=tmp_path,
         processor_registry=build_fins_processor_registry(),
         docling_converter=_FailingDoclingConverter(error),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
     filing_file = tmp_path / "filing.pdf"
     filing_file.write_text("demo filing", encoding="utf-8")
     request = _validated_sec_filing_request(
@@ -3056,7 +3055,7 @@ def test_concurrent_explicit_create_obeys_overwrite_rebase_contract(
         failed = next(result for result in results if result["status"] == "failed")
         failure = failed["failure"]
         assert isinstance(failure, dict)
-        assert failure == fins_upload_source_publication_conflict_failure().to_json()
+        assert failure == fins_upload_source_publication_conflict_failure(source_kind=SourceKind.FILING).to_json()
         assert failed["requested_action"] == "create"
         assert failed["resolved_action"] == "create"
         assert failed["filing_action"] == "create"
@@ -3416,7 +3415,7 @@ def test_concurrent_explicit_updates_conflict_after_source_observation_changes(
         workspace_root=tmp_path,
         processor_registry=build_fins_processor_registry(),
         docling_converter=_FakeDoclingConverter(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
     seed_file = tmp_path / "seed.pdf"
     seed_file.write_bytes(b"seed")
     seeded = seed_pipeline.upload_filing(
@@ -3572,7 +3571,7 @@ def test_spawn_process_identical_auto_has_one_publish_and_one_skip(tmp_path: Pat
         workspace_root=tmp_path,
         processor_registry=build_fins_processor_registry(),
         docling_converter=_FakeDoclingConverter(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
     primary = tmp_path / "spawn-q1.pdf"
     primary.write_bytes(b"spawn-identical")
     observed_request = _validated_sec_filing_request(

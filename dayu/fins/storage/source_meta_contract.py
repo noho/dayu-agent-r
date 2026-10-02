@@ -8,6 +8,7 @@ from typing import Final
 from dayu.contracts.json_value import JsonValue
 
 _IS_DELETED_FIELD: Final[str] = "is_deleted"
+_AMENDED_FIELD: Final[str] = "amended"
 
 
 def require_source_meta_is_deleted(source_meta: Mapping[str, JsonValue]) -> bool:
@@ -43,4 +44,23 @@ def require_material_source_meta_primary_document(meta: Mapping[str, JsonValue])
     return primary
 
 
-__all__ = ["require_source_meta_is_deleted", "require_material_source_meta_primary_document"]
+def require_material_source_meta_amended(meta: Mapping[str, JsonValue]) -> bool:
+    """读取材料源元数据的严格修订事实。
+
+    Args:
+        meta: 仓储产生的材料源元数据。
+
+    Returns:
+        精确布尔修订事实。
+
+    Raises:
+        KeyError: 缺少 amended 字段时抛出。
+        ValueError: amended 不是布尔值时抛出。
+    """
+    amended = meta[_AMENDED_FIELD]
+    if type(amended) is not bool:
+        raise ValueError("material amended 必须为布尔值")
+    return amended
+
+
+__all__ = ["require_source_meta_is_deleted", "require_material_source_meta_primary_document", "require_material_source_meta_amended"]

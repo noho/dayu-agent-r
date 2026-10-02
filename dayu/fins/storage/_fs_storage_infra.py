@@ -41,6 +41,8 @@ from dayu.fins.domain.company_meta_contract import (
     CompanyMetaCommitIntent,
     CompanyMetaCommitOutcome,
     merge_company_meta_for_commit,
+    merge_material_upload_company_meta_for_commit,
+    CompanyMetaConcurrentUpdateError,
 )
 from dayu.fins.domain.enums import SourceKind
 
@@ -65,11 +67,14 @@ from .file_store import FileStore
 from ._fs_source_integrity import (
     _SourcePublicationInspection,
     _inspect_source_kind_unguarded,
+    _project_material_upload_publication_identity,
 )
+from .source_integrity import SourceIntegrityStatus, SourceIntegrityRevisionConflictError
 from .local_file_store import LocalFileStore
 from .repository_protocols import (
     CompanyTickerAliasConflictError,
     CompanyTickerIdentityCorruptionError,
+    MaterialUploadPublishedState,
 )
 from ._fs_storage_utils import (
     _DOWNLOAD_REJECTIONS_FILENAME,
@@ -135,6 +140,10 @@ class _ActiveBatchState:
     phase: str
     company_meta_intent: CompanyMetaCommitIntent | None
     publishes_new_corpus: bool
+    material_preconditions: tuple[MaterialUploadPublishedState, CompanyMeta | None] | None
+    material_final: MaterialUploadPublishedState | None
+    material_company_stage: bool
+    material_company_noop: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -471,6 +480,8 @@ class _FsStorageInfra:
                 phase=_PHASE_STARTED,
                 company_meta_intent=None,
                 publishes_new_corpus=not target_is_published,
+                material_preconditions=None, material_final=None,
+                material_company_stage=False, material_company_noop=False,
             )
             self._write_batch_journal(state, _PHASE_STARTED)
             if target_is_published:
@@ -557,7 +568,7 @@ class _FsStorageInfra:
         try:
             # 复杂逻辑说明：完整性校验只读 transaction staging，必须先于 publication guard。
             self._validate_complete_source_tree(state)
-            if state.company_meta_intent is not None or state.publishes_new_corpus:
+            if state.company_meta_intent is not None or state.publishes_new_corpus or state.material_preconditions is not None:
                 company_meta_outcome = self._commit_batch_with_identity_guards(state)
             else:
                 self._commit_batch_with_publication_guard(state)
@@ -640,7 +651,10 @@ class _FsStorageInfra:
             identity_error: Exception | None = None
             try:
                 company_meta_outcome = self._prepare_company_identity_commit(state)
-                self._commit_batch_with_publication_guard(state)
+                if state.material_company_noop:
+                    self._write_batch_journal(state, _PHASE_COMMITTED)
+                else:
+                    self._commit_batch_with_publication_guard(state)
                 return company_meta_outcome
             except Exception as exc:
                 identity_error = exc
@@ -698,21 +712,30 @@ class _FsStorageInfra:
             )
             if target_stat is not None and not stat.S_ISDIR(target_stat.st_mode):
                 raise CompanyTickerIdentityCorruptionError(kind="invalid_descriptor")
+            if state.material_preconditions is not None:
+                expected, company = state.material_preconditions
+                fresh = self._read_material_state_unguarded(state.token.ticker, expected.source_integrity.document_id, state.target_ticker_dir)
+                self._require_material_state_matches(fresh, expected, company)
             if target_stat is not None:
                 self._replace_directory(state.target_ticker_dir, state.backup_dir)
             self._write_batch_journal(state, _PHASE_BACKED_UP_TARGET)
             self._replace_directory(state.staging_ticker_dir, state.target_ticker_dir)
             self._write_batch_journal(state, _PHASE_SWAPPED_TARGET)
+            if state.material_preconditions is not None:
+                state.material_final = self._read_material_state_unguarded(state.token.ticker, state.material_preconditions[0].source_integrity.document_id, state.target_ticker_dir)
+                if state.material_final.source_integrity.status is not SourceIntegrityStatus.COMPLETE:
+                    raise RuntimeError("材料批次不得提交未完成目标")
             self._write_batch_journal(state, _PHASE_COMMITTED)
         except Exception as exc:
             primary_error = exc
-            try:
-                self._rollback_precommit_batch(state)
-            except Exception as rollback_error:
-                primary_error.add_note(
-                    "commit_batch rollback failed; journal/backup/staging recovery evidence retained"
-                )
-                raise primary_error from rollback_error
+            if state.phase != _PHASE_COMMITTED:
+                try:
+                    self._rollback_precommit_batch(state)
+                except Exception as rollback_error:
+                    primary_error.add_note(
+                        "commit_batch rollback failed; journal/backup/staging recovery evidence retained"
+                    )
+                    raise primary_error from rollback_error
             raise
         finally:
             try:
@@ -763,32 +786,43 @@ class _FsStorageInfra:
         )
         final_meta: CompanyMeta | None = None
         company_meta_outcome: CompanyMetaCommitOutcome | None = None
+        material_identity_index = (
+            self._build_unique_company_identity_index(self._scan_actual_published_company_identities())
+            if state.material_company_stage else None
+        )
+        if state.material_company_stage and state.company_meta_intent is not None:
+            if material_identity_index is None:
+                raise RuntimeError("材料公司阶段缺严格 identity index")
+            self._require_company_lookup_tickers_available(
+                state.company_meta_intent.proposed_identity.lookup_tickers(),
+                material_identity_index,
+                staged_canonical,
+            )
         if state.company_meta_intent is not None:
             current_published = self._read_current_company_meta_for_commit(state)
-            company_meta_outcome = merge_company_meta_for_commit(
+            merge = merge_material_upload_company_meta_for_commit if state.material_company_stage else merge_company_meta_for_commit
+            company_meta_outcome = merge(
                 current_published=current_published,
                 intent=state.company_meta_intent,
                 committed_at=now_iso8601(),
             )
             final_meta = company_meta_outcome.company_meta
-            _write_json(
-                state.staging_ticker_dir / _SOURCE_META_FILENAME,
-                final_meta.to_dict(),
-            )
-        published_identities = self._scan_actual_published_company_identities()
-        unique_index = self._build_unique_company_identity_index(published_identities)
+            state.material_company_noop = state.material_company_stage and final_meta == current_published
+            if not state.material_company_noop:
+                _write_json(
+                    state.staging_ticker_dir / _SOURCE_META_FILENAME,
+                    final_meta.to_dict(),
+                )
+        unique_index = (self._build_unique_company_identity_index(self._scan_actual_published_company_identities())
+                        if material_identity_index is None else material_identity_index)
         incoming_lookup_tickers = (
-            final_meta.ticker_identity.lookup_tickers() if final_meta is not None else (staged_canonical,)
-        )
-        for lookup_ticker in incoming_lookup_tickers:
-            existing_owner = unique_index.get(lookup_ticker)
-            if existing_owner is None or existing_owner == staged_canonical:
-                continue
-            raise CompanyTickerAliasConflictError(
-                alias=lookup_ticker,
-                existing_canonical_ticker=existing_owner,
-                incoming_canonical_ticker=staged_canonical,
+            final_meta.ticker_identity.lookup_tickers() if final_meta is not None else (
+                state.material_preconditions[1].ticker_identity.lookup_tickers()
+                if state.material_preconditions is not None and state.material_preconditions[1] is not None
+                else (staged_canonical,)
             )
+        )
+        self._require_company_lookup_tickers_available(incoming_lookup_tickers, unique_index, staged_canonical)
         return company_meta_outcome
 
     def _read_current_company_meta_for_commit(
@@ -3494,3 +3528,31 @@ class _FsStorageInfra:
         except OSError as exc:
             _raise_path_free_error(_project_filesystem_error(exc, action="解析 rejected filing 条目"))
         return candidate
+
+
+    def _read_material_state_unguarded(self, ticker: str, document_id: str, ticker_dir: Path) -> MaterialUploadPublishedState:
+        """参数：guard/writer 保护目标；返回：同次公司和材料快照；异常：严格身份、I/O 或完整事实错误。"""
+        directory_stat = self._lstat_optional_storage_path(ticker_dir, action="读取材料公司所在目录")
+        company = None if directory_stat is None else self._read_published_company_identity(ticker_dir, expected_storage_key=ticker_dir.name, known_directory_stat=directory_stat).company_meta
+        target = _inspect_source_kind_unguarded(ticker=ticker, source_kind=SourceKind.MATERIAL, ticker_dir=ticker_dir, source_root=ticker_dir / _source_dir_name(SourceKind.MATERIAL), requested_document_id=document_id).target
+        if target is None:
+            raise RuntimeError("exact material inspection 缺 target")
+        trusted = target.classification.status not in {SourceIntegrityStatus.MISSING, SourceIntegrityStatus.UNSAFE}
+        return MaterialUploadPublishedState(company, target.classification, target.business_meta if trusted else None, _project_material_upload_publication_identity(target))
+
+    @staticmethod
+    def _require_material_state_matches(fresh: MaterialUploadPublishedState, expected: MaterialUploadPublishedState, company: CompanyMeta | None) -> None:
+        """参数：当前/预期源与公司；返回：无；异常：公司或源条件冲突。"""
+        if fresh.company_meta != company:
+            raise CompanyMetaConcurrentUpdateError()
+        if fresh.source_integrity != expected.source_integrity or fresh.source_meta != expected.source_meta or fresh.publication_identity != expected.publication_identity:
+            raise SourceIntegrityRevisionConflictError()
+
+
+    @staticmethod
+    def _require_company_lookup_tickers_available(lookup_tickers: tuple[str, ...], unique_index: Mapping[str, str], canonical_ticker: str) -> None:
+        """参数：incoming lookup 身份、同 guard 索引、canonical；返回：无；异常：原 typed alias 占用错误优先拒。"""
+        for lookup_ticker in lookup_tickers:
+            existing_owner = unique_index.get(lookup_ticker)
+            if existing_owner is not None and existing_owner != canonical_ticker:
+                raise CompanyTickerAliasConflictError(alias=lookup_ticker, existing_canonical_ticker=existing_owner, incoming_canonical_ticker=canonical_ticker)

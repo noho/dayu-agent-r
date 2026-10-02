@@ -1,0 +1,104 @@
+{
+  "gate": "re-review S2",
+  "head": "f7e60c9d3e4c6e77a6c2abf18d09cd8020c19235",
+  "branch": "codex/upload-material-oracle",
+  "main": "fac32ecbff9bfe792b63ee9667c8697826b631f4",
+  "frozen_identity": {
+    "head": "f7e60c9d3e4c6e77a6c2abf18d09cd8020c19235",
+    "main": "fac32ecbff9bfe792b63ee9667c8697826b631f4",
+    "branch": "codex/upload-material-oracle",
+    "delta_count": 4,
+    "unchanged_s2_candidates": 56,
+    "input_count": 10552,
+    "hashes": {
+      "delta.json": "761569d0af2b5a23a9f54f24a35e00091ae9d3029ff5dec324bcc456334953f2",
+      "input-sha256.json": "ac1070852a811e2e6065af9df1f200e973270e5288c74133eb3c67c065e8c563",
+      "unchanged-candidates.json": "911bb8215f2e54375f0995633cbba21f357ad0eed76dde67254bbbc984fa368c"
+    },
+    "fix_report": "docs/gateflow/upload-material-unified-s2-owner-contract-fix-report-20261003.md",
+    "fix_report_sha256": "cb35b6cc1235be95eeb1aa2df4af6562fe3cd210149f2ae3ab9fb78627bb0cc3",
+    "root_receipt": "docs/gateflow/evidence/upload-material-unified-repair-20261002/s2-owner-contract-fix-root-receipt.json",
+    "root_receipt_sha256": "0cc9e438268037ae8eed1805fcde94153a4d2999cc0535155b1cc91f09b0a3ab"
+  },
+  "input_drift": [],
+  "reviewers": [
+    {
+      "label": "upload-material-unified-s2-owner-rereview-ds-flash-20261003-01",
+      "runtime": "claude",
+      "provider": "ds-flash",
+      "model": "deepseek-flash[1m]",
+      "outer_exit": 0,
+      "outer_exit_source": "managed write_stdin24383 actual completed0",
+      "structured_terminal": "result.success/is_error=false/no permissions denials/no subagents",
+      "events": 36250,
+      "tools": 50,
+      "results": 50,
+      "failed_tool_flags": [],
+      "compound_failure_line": 25715,
+      "artifact": "docs/reviews/code-review-20261003-051233.md",
+      "artifact_sha256": "8d167547fb3ebac16d3ef7e7f8a086eb1e601d5d6f77185c6c1ffa1b4a7dcbe6",
+      "frozen_files": 10552,
+      "frozen_drift": [],
+      "delta_files": 4,
+      "unchanged_candidates": 56,
+      "controller": {
+        "setup_status": "ok",
+        "agent_status": "completed",
+        "tool_evidence": "yes",
+        "tool_trace": "complete",
+        "required_evidence": "complete",
+        "canary_status": "match",
+        "result_status": "accepted",
+        "warnings": [
+          "stderr exact unrecognized_model prefix nonfatal",
+          "Compound grep unquoted glob failure masked by pipeline outer0: actual raw no-matches line retained, quoted producer read recovered. Cannot credit original as successful.",
+          "Report claims own analyzer pyright diagnostics fixed/re-run0; no corresponding pyright tool or subprocess evidence in full trace. Reject unproven claim; required product full-pyright ticket independently verified0. Analyzer AST runtime itself actual0 and root own equivalent check valid.",
+          "Report base wording confuses last4delta with all diff since f7; actual 4delta frozen before hashes are authoritative.",
+          "Report future aggregate after WU wording rejected: aggregate before PR/WUcloseout, complete CLI/registries after WU as binding control.",
+          "Own temporary analyzer uses dict[str,object] in local report assembly; not product/public contract. No acceptance of style conformity; required exact production diff verified separately."
+        ],
+        "evidence_gaps": [],
+        "retry_class": "none"
+      },
+      "decision": "T01 type guard/core contract verified. No new substantive finding. MiMo in-flight, no S2 pass."
+    },
+    {
+      "label": "upload-material-unified-s2-owner-rereview-mimo-20261003-01",
+      "runtime": "claude",
+      "provider": "mimo",
+      "model": "mimo-v2.6-pro[1m]",
+      "outer_exit": 0,
+      "outer_exit_source": "managed write_stdin12373 actual completed0",
+      "structured_terminal": "result.success/is_error=false/no permission denials/no subagents",
+      "events": 4625,
+      "tools": 57,
+      "results": 57,
+      "failed_tool_flags": [],
+      "artifact": "docs/reviews/code-review-20261003-051907.md",
+      "artifact_sha256": "5d1e1ddf6e3b51093f1c0aa794786cf2ef57ac34e068194c0499040f9402c5a9",
+      "frozen_files": 10552,
+      "frozen_drift": [],
+      "delta_files": 4,
+      "controller": {
+        "setup_status": "ok",
+        "agent_status": "completed",
+        "tool_evidence": "yes",
+        "tool_trace": "complete",
+        "required_evidence": "complete",
+        "canary_status": "match",
+        "result_status": "accepted",
+        "warnings": [
+          "stderr exact unrecognized_model nonfatal; reported model omits [1m], actual event canonical mimo-v2.6-pro[1m] authoritative",
+          "Two exploratory grep no-match masked by head/pipeline outer0; exact JUnit XML and broader README query recovered. Not credited as successful original query.",
+          "Excluded-scope wording places formalPR afterWU: rejected; binding order S3 then aggregate then formalPRreview then WUcloseout then full CLI/registry.",
+          "Broad AttributeError grep examined untouched tests; no added finding or fix from unrelated tests. Scope remains four delta and direct owner chain."
+        ],
+        "evidence_gaps": [],
+        "retry_class": "none"
+      },
+      "decision": "T01 verified fixed; no new substantive finding; root direct input/AST/tests evidence accepted."
+    }
+  ],
+  "root_verification": "Direct four diffs/read register/protocol/public/test/publiccommit/rollback; 81 JUnit0failure0error, fullpyright0, core96.15; independent doc-only/core exact-guard AST proof; root inputs10552hashmatch; no unresolved required evidence.",
+  "decision": "US2-R04-T01 accepted/已修复; other S2 accepted findings already verified fixed; no new finding. S2 review loop pass, next accepted slice commit S2."
+}

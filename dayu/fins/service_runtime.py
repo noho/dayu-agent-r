@@ -16,6 +16,8 @@ from dayu.fins.ingestion_runtime import (
     FinsIngestionRuntime,
     FinsJobCancellationChecker,
     FinsUploadFilingRequest,
+    FinsUploadMaterialRequest,
+    admit_fins_upload_material_request,
     ValidatedFinsUploadMaterialRequest,
     FinsUploadPipelineResult,
     FinsUploadResultSummary,
@@ -39,6 +41,8 @@ from dayu.fins.storage import (
     FsDocumentBlobRepository,
     FsFilingMaintenanceRepository,
     FsFilingUploadStateRepository,
+    FsMaterialUploadStateRepository,
+    MaterialUploadStateRepositoryProtocol,
     FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
     ProcessedDocumentRepositoryProtocol,
@@ -95,6 +99,19 @@ def prevalidate_fins_upload_filing_request_for_workspace(
     )
 
 
+def prevalidate_fins_upload_material_request_for_workspace(
+    request: FinsUploadMaterialRequest, *, workspace_root: Path,
+) -> ValidatedFinsUploadMaterialRequest:
+    """在生产运行时初始化前完成材料的只读受理。
+
+    参数：request 为原始材料请求；workspace_root 为已解析工作区根。
+    返回：唯一材料准入 owner 产生的同一 validated handoff。
+    异常：typed 用法、完整性、公司身份和真实锁/I/O 失败原样传播。
+    """
+    repository = FsMaterialUploadStateRepository(workspace_root, create_directories=False)
+    return admit_fins_upload_material_request(request, state_repository=repository)
+
+
 @dataclass(frozen=True)
 class ProductionFinsUploadRunner(FinsUploadRunner):
     """production Fins upload runner。
@@ -131,6 +148,7 @@ class ProductionFinsUploadRunner(FinsUploadRunner):
         if cancellation_checker():
             return FinsUploadResultSummary(
                 source_kind=raw_request.source_kind,
+                published_amended=None,
                 status="cancelled",
                 requested_file_count=validated_fins_upload_file_count(request),
                 stored_file_count=0,
@@ -249,8 +267,11 @@ def _upload_summary_from_result(
         无。
     """
 
+    if result.source_kind is not request.request.source_kind:
+        raise ValueError("pipeline 与 request source kind 不一致")
     return FinsUploadResultSummary(
-        source_kind=request.request.source_kind,
+        source_kind=result.source_kind,
+        published_amended=result.published_amended,
         status=result.status,
         requested_file_count=validated_fins_upload_file_count(request),
         stored_file_count=result.stored_file_count,
@@ -282,6 +303,7 @@ class DefaultFinsRuntime:
     blob_repository: DocumentBlobRepositoryProtocol
     filing_maintenance_repository: FilingMaintenanceRepositoryProtocol
     filing_upload_state_repository: FilingUploadStateRepositoryProtocol
+    material_upload_state_repository: MaterialUploadStateRepositoryProtocol
     processed_repository: ProcessedDocumentRepositoryProtocol
     processor_registry: ProcessorRegistry
     ingestion_job_store: FsFinsIngestionJobStore
@@ -351,6 +373,7 @@ class DefaultFinsRuntime:
                 workspace_root,
                 repository_set=repository_set,
             ),
+            material_upload_state_repository=FsMaterialUploadStateRepository(workspace_root, repository_set=repository_set),
             processed_repository=FsProcessedDocumentRepository(
                 workspace_root,
                 repository_set=repository_set,
@@ -460,6 +483,7 @@ class DefaultFinsRuntime:
             docling_converter = ProcessDoclingConverter()
 
             sec_download_adapter = build_sec_download_adapter(
+                material_upload_state_repository=self.material_upload_state_repository,
                 workspace_root=self.workspace_root,
                 processor_registry=self.processor_registry,
                 batching_repository=self.batching_repository,
@@ -470,6 +494,7 @@ class DefaultFinsRuntime:
                 filing_maintenance_repository=self.filing_maintenance_repository,
             )
             cn_download_adapter = build_cn_download_adapter(
+                material_upload_state_repository=self.material_upload_state_repository,
                 workspace_root=self.workspace_root,
                 batching_repository=self.batching_repository,
                 company_repository=self.company_repository,
@@ -480,6 +505,7 @@ class DefaultFinsRuntime:
                 docling_converter=docling_converter,
             )
             hk_download_adapter = build_hk_download_adapter(
+                material_upload_state_repository=self.material_upload_state_repository,
                 workspace_root=self.workspace_root,
                 batching_repository=self.batching_repository,
                 company_repository=self.company_repository,
@@ -501,6 +527,7 @@ class DefaultFinsRuntime:
                 blob_repository=self.blob_repository,
                 filing_maintenance_repository=self.filing_maintenance_repository,
                 filing_upload_state_repository=self.filing_upload_state_repository,
+                material_upload_state_repository=self.material_upload_state_repository,
                 docling_converter=docling_converter,
             )
             cn_upload_pipeline = CnPipeline(
@@ -512,6 +539,7 @@ class DefaultFinsRuntime:
                 blob_repository=self.blob_repository,
                 filing_maintenance_repository=self.filing_maintenance_repository,
                 filing_upload_state_repository=self.filing_upload_state_repository,
+                material_upload_state_repository=self.material_upload_state_repository,
                 docling_converter=docling_converter,
             )
             upload_runner = ProductionFinsUploadRunner(
@@ -524,6 +552,7 @@ class DefaultFinsRuntime:
                 blob_repository=self.blob_repository,
                 filing_maintenance_repository=self.filing_maintenance_repository,
                 filing_upload_state_repository=self.filing_upload_state_repository,
+                material_upload_state_repository=self.material_upload_state_repository,
                 processed_repository=self.processed_repository,
                 processor_registry=self.processor_registry,
                 job_store=self.ingestion_job_store,
