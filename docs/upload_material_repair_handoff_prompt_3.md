@@ -1,6 +1,12 @@
+> 最新入口（2026-10-02）：统一修复一个WU/三个完整行为slices，计划同版双审和总控已通过。唯一分支约束及当前gate见 `docs/gateflow/upload-material-unified-repair-control-20261002.md`，accepted计划为 `docs/gateflow/upload-material-unified-repair-plan-20261002.md`；原findings最终裁决见 `docs/gateflow/upload-material-unified-plan-rereview-root-adjudication-20261002.md`。不要恢复旧多WU排程；S3必须携带UP-RR-T01。完整upload_material CLI CI/正式oracles/scenarios在本修复WU后独立执行。
+
 # upload_material 修复交接 prompt 3
 
 本文件是下一位总控的执行入口。全程中文。先核实现场，再按用户已经批准的修复目标推进；不要求用户重述裁决或授权。
+
+## 最新执行入口（2026-10-02 用户改排程）
+
+当前入口以 `docs/gateflow/upload-material-unified-repair-control-20261002.md` 为准：所有剩余修复合为一个 WU，gpt-6-sol plan/implement/fix，MiMo/ds-flash 并行双审，全部 slices 与 aggregate 完成后才 PR review。修复 WU 完成后另行做 upload_material 完整 CLI CI 和 oracle/scenario 登记；不把它们并入本 WU。以下六个候选 WU、findings 后交接停机和旧审查路由为历史准备，不能覆盖这条最新指令。
 
 ## 0. 当前状态和下一入口
 

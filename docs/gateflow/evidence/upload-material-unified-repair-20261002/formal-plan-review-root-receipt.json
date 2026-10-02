@@ -1,0 +1,37 @@
+{
+  "gate": "plan review",
+  "decision": "findings accepted, not pass; concentrated fix next",
+  "frozen_plan_sha256": "2fc3d1911737e4afcd964a2cb586a2e661c5fd38a55cf62480c15ce6c3a9f9d7",
+  "head": "619d092ab4278645203c7ebe08515f7697d92b71",
+  "root_checked_at": "2026-10-02T18:55:10.002406+08:00",
+  "runners": [
+    {
+      "runtime": "claude",
+      "provider": "mimo",
+      "actual_model": "mimo-v2.6-pro[1m]",
+      "outer_exit": 0,
+      "terminal": "success; is_error=false",
+      "actual_tools": 43,
+      "canary": "match actual tool and final",
+      "artifact": "docs/reviews/plan-review-20261002-184152.md",
+      "artifact_sha256": "45ed87540d04ba3c19d1628ebbaa8e33f56666afea17fe7970d9ac707a22877d",
+      "root_result_status": "accepted",
+      "tool_trace": "complete",
+      "failure_recovery": "see durable root adjudication and private audit; no unresolved evidence gap"
+    },
+    {
+      "runtime": "claude",
+      "provider": "ds-flash",
+      "actual_model": "deepseek-flash[1m]",
+      "outer_exit": 0,
+      "terminal": "success; is_error=false",
+      "actual_tools": 135,
+      "canary": "match actual tool and final",
+      "artifact": "docs/reviews/plan-review-20261002-182942.md",
+      "artifact_sha256": "41d6ab798117a215cf6824313d7b905624a5629a69d73ac51f469e96e1e5c67e",
+      "root_result_status": "accepted",
+      "tool_trace": "complete",
+      "failure_recovery": "see durable root adjudication and private audit; no unresolved evidence gap"
+    }
+  ]
+}

@@ -1,0 +1,65 @@
+{
+  "outer_exit": 0,
+  "events": 90,
+  "completed_commands": 30,
+  "canary_status": "match actualitem1+final",
+  "model": "unknown",
+  "protected_files": 27,
+  "protected_mismatch": [],
+  "delivery_files": 10,
+  "delivery_mismatch": [],
+  "S1S2_byte_unchanged": true,
+  "root_harness_exit": 1,
+  "startup_results": [
+    {
+      "case": "tier-0-boundary",
+      "exit": -6
+    },
+    {
+      "case": "tier-0-direct",
+      "exit": -6
+    },
+    {
+      "case": "tier-0-native",
+      "exit": -6
+    },
+    {
+      "case": "tier-0-python",
+      "exit": -6
+    },
+    {
+      "case": "tier-1-boundary",
+      "exit": -6
+    },
+    {
+      "case": "tier-1-direct",
+      "exit": -6
+    },
+    {
+      "case": "tier-1-native",
+      "exit": -6
+    },
+    {
+      "case": "tier-1-python",
+      "exit": -6
+    },
+    {
+      "case": "tier-2-boundary",
+      "exit": -6
+    },
+    {
+      "case": "tier-2-direct",
+      "exit": -6
+    },
+    {
+      "case": "tier-2-native",
+      "exit": -6
+    },
+    {
+      "case": "tier-2-python",
+      "exit": -6
+    }
+  ],
+  "root_inputs_unchanged": true,
+  "generation_ready": false
+}

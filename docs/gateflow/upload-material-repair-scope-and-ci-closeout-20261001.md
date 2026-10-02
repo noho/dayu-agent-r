@@ -1,5 +1,7 @@
 # upload_material 修复范围与最终真实 CI 收口约束
 
+> 2026-10-02 最新排程以 `docs/gateflow/upload-material-unified-repair-control-20261002.md` 为准：剩余修复合为一个 WU，MiMo/ds-flash 双审；修复 WU 完成后再独立执行完整 upload_material CLI CI 与正式 oracle/scenario 登记。以下旧 stop/六 WU/旧路由/在途状态仅作历史，不是当前入口。
+
 ## 用户最新大目标（权威）
 
 2026-10-01 用户要求核实完全按 CI 后本人裁决登记的修复项执行、完全遵守现成裁决；如有偏离纠正。任务大目标是完成修复项后重跑 CI，确定 oracle 和 scenarios。本文件将该终点显式加入当前总控队列，不用各WU代码测试/closeout代替最终CLI验收。

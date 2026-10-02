@@ -1,5 +1,7 @@
 # upload_material 裁决修复与 issue #198：依赖顺序
 
+> 2026-10-02 最新排程以 `docs/gateflow/upload-material-unified-repair-control-20261002.md` 为准：剩余修复合为一个 WU，MiMo/ds-flash 双审；修复 WU 完成后再独立执行完整 upload_material CLI CI 与正式 oracle/scenario 登记。以下旧 stop/六 WU/旧路由/在途状态仅作历史，不是当前入口。
+
 <!-- PR197_LIVE_GATE_STATUS_START -->
 ## 当前总控状态（review findings最终closeout / 用户指定交接停止）
 

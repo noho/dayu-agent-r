@@ -1,0 +1,14 @@
+{
+  "scope": "startup viability only; not taxonomy boundary matrix or production support proof",
+  "argv": [
+    "sandbox-exec",
+    "-p",
+    "(version 1) (allow default)",
+    "/usr/bin/true"
+  ],
+  "execution": "independent root exec_command require_escalated",
+  "exit": 0,
+  "stdout": "",
+  "stderr": "",
+  "meaning": "OS sandbox process startup succeeds outside parent filesystem sandbox; remaining actual confinement/trace proof not run"
+}
