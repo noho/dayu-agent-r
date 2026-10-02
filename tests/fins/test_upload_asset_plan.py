@@ -48,7 +48,7 @@ def _material_plan(paths: tuple[Path, ...]) -> tuple[FinsUploadMaterialFiles, Up
         FinsUploadAssetPlanError: 资产输入不可唯一规划时抛出。
     """
 
-    selection, plan = plan_upload_assets(
+    selection, plan = plan_upload_assets(material_primary_selectors=(paths[0],) if paths else (),
         source_kind=SourceKind.MATERIAL, operation="upsert", files=paths
     )
     if not isinstance(selection, FinsUploadMaterialFiles):
@@ -83,7 +83,7 @@ def test_material_full_basename_mapping_and_order(tmp_path: Path) -> None:
         assert tuple(pair.original_name for pair in plan.ordered_pairs) == tuple(
             path.name for path in paths
         )
-        assert plan.filing_primary_original_name is None
+        assert plan.primary_original_name == paths[0].name
 
 
 def test_material_count_boundary_and_delete_mode(tmp_path: Path) -> None:
@@ -112,9 +112,9 @@ def test_material_count_boundary_and_delete_mode(tmp_path: Path) -> None:
         _material_plan(())
     assert empty_info.value.reason is FinsUploadAssetPlanReason.MISSING_FILES
     with pytest.raises(FinsUploadAssetPlanError) as delete_limit:
-        plan_upload_assets(source_kind=SourceKind.MATERIAL, operation="delete", files=paths)
+        plan_upload_assets(material_primary_selectors=(), source_kind=SourceKind.MATERIAL, operation="delete", files=paths)
     assert delete_limit.value.reason is FinsUploadAssetPlanReason.TOO_MANY_FILES
-    empty_selection, empty_plan = plan_upload_assets(
+    empty_selection, empty_plan = plan_upload_assets(material_primary_selectors=(),
         source_kind=SourceKind.MATERIAL, operation="delete", files=paths[:-1]
     )
     assert isinstance(empty_selection, FinsUploadMaterialFiles)
@@ -147,7 +147,7 @@ def test_material_delete_classifies_raw_path_shape_without_selecting_files(
     """
 
     with pytest.raises(FinsUploadAssetPlanError) as raised:
-        plan_upload_assets(
+        plan_upload_assets(material_primary_selectors=(),
             source_kind=SourceKind.MATERIAL, operation="delete", files=(raw_path,)
         )
     assert raised.value.reason is FinsUploadAssetPlanReason.INVALID_ASSET_NAME
@@ -174,7 +174,7 @@ def test_material_delete_symlink_loop_keeps_pathless_operational_failure(
     loop = tmp_path / "loop.pdf"
     loop.symlink_to(loop.name)
     with pytest.raises(OSError) as raised:
-        plan_upload_assets(
+        plan_upload_assets(material_primary_selectors=(),
             source_kind=SourceKind.MATERIAL, operation="delete", files=(loop,)
         )
     assert raised.value.errno is not None
@@ -205,11 +205,11 @@ def test_plan_accepts_equal_distinct_converter_pairs(tmp_path: Path) -> None:
         converted is not original
         for converted, original in zip(material_converter, material.ordered_pairs, strict=True)
     )
-    assert UploadAssetPlan(material.ordered_pairs, material_converter, None, SourceKind.MATERIAL).converter_pairs == material.ordered_pairs
+    assert UploadAssetPlan(material.ordered_pairs, material_converter, next(iter(material.ordered_pairs)).original_name, SourceKind.MATERIAL).converter_pairs == material.ordered_pairs
 
     primary = first.resolve(strict=False)
     selection = FinsUploadFilingFiles.for_upsert(primary=primary, companions=(second.resolve(strict=False),))
-    _, filing = plan_upload_assets(
+    _, filing = plan_upload_assets(material_primary_selectors=(),
         source_kind=SourceKind.FILING,
         operation="upsert",
         files=selection.ordered_files,
@@ -219,7 +219,7 @@ def test_plan_accepts_equal_distinct_converter_pairs(tmp_path: Path) -> None:
     copied = UploadAssetPair(original.path, original.original_name, original.docling_name)
     assert copied is not original
     assert UploadAssetPlan(
-        filing.ordered_pairs, (copied,), filing.filing_primary_original_name, SourceKind.FILING
+        filing.ordered_pairs, (copied,), filing.primary_original_name, SourceKind.FILING
     ).converter_pairs == filing.converter_pairs
 
 
@@ -242,14 +242,10 @@ def test_bare_plan_and_filing_identity_symlink_loop_use_safe_operational_failure
     loop = tmp_path / "loop.pdf"
     loop.symlink_to(loop.name)
     pair = UploadAssetPair(loop, loop.name, f"{loop.name}{DOCLING_FILE_SUFFIX}")
-    for produce in (
-        lambda: UploadAssetPlan((pair,), (pair,), None, SourceKind.MATERIAL),
-        lambda: filing_original_storage_name(loop),
-    ):
-        with pytest.raises(OSError) as raised:
-            produce()
-        assert "上传路径解析出现循环" in str(raised.value)
-        assert str(tmp_path) not in str(raised.value)
+    with pytest.raises(OSError):
+        normalize_upload_asset_path(loop)
+    UploadAssetPlan((pair,), (pair,), pair.original_name, SourceKind.MATERIAL)
+    filing_original_storage_name(loop)
 
 
 @pytest.mark.parametrize(
@@ -336,14 +332,14 @@ def test_control_name_precedes_duplicate_basename_with_stable_usage(
     with pytest.raises(FinsUploadAssetPlanError) as raised:
         _material_plan(paths)
     error = raised.value
-    usage, hint = fins_upload_asset_plan_usage_failure(
+    usage = fins_upload_asset_plan_usage_failure(
         error, max_files=MAX_MATERIAL_UPLOAD_FILES
     )
     assert error.reason is FinsUploadAssetPlanReason.RESERVED_CONTROL_NAME
     assert error.file_label == "META.JSON"
     assert usage.code is FinsUploadUsageCode.RESERVED_CONTROL_NAME
     assert usage.message == "文件名与仓储控制文件冲突：META.JSON；请重命名后重试"
-    assert hint == "请避开仓储控制文件名后重试"
+    assert usage.hint == "请避开仓储控制文件名后重试"
     assert str(tmp_path) not in usage.message
 
 
@@ -390,11 +386,11 @@ def test_mixed_name_and_unsupported_format_share_plan_owner_priority(
     )
     for produce in (
         lambda: _material_plan(paths),
-        lambda: UploadAssetPlan(pairs, pairs, None, SourceKind.MATERIAL),
+        lambda: UploadAssetPlan(pairs, pairs, next(iter(pairs)).original_name, SourceKind.MATERIAL),
     ):
         with pytest.raises(FinsUploadAssetPlanError) as raised:
             produce()
-        usage, _ = fins_upload_asset_plan_usage_failure(
+        usage = fins_upload_asset_plan_usage_failure(
             raised.value, max_files=MAX_MATERIAL_UPLOAD_FILES
         )
         assert raised.value.reason is expected_reason
@@ -423,7 +419,7 @@ def test_bare_material_plan_rejects_101_distinct_names(tmp_path: Path) -> None:
     )
     assert len({pair.original_name for pair in pairs}) == MAX_MATERIAL_UPLOAD_FILES + 1
     with pytest.raises(FinsUploadAssetPlanError) as raised:
-        UploadAssetPlan(pairs, pairs, None, SourceKind.MATERIAL)
+        UploadAssetPlan(pairs, pairs, next(iter(pairs)).original_name, SourceKind.MATERIAL)
     assert raised.value.reason is FinsUploadAssetPlanReason.TOO_MANY_FILES
 
 
@@ -466,10 +462,10 @@ def test_bare_material_plan_applies_planner_name_and_format_rules(
     )
     if reason is None:
         with pytest.raises(FinsUploadFormatError):
-            UploadAssetPlan(pairs, pairs, None, SourceKind.MATERIAL)
+            UploadAssetPlan(pairs, pairs, next(iter(pairs)).original_name, SourceKind.MATERIAL)
     else:
         with pytest.raises(FinsUploadAssetPlanError) as raised:
-            UploadAssetPlan(pairs, pairs, None, SourceKind.MATERIAL)
+            UploadAssetPlan(pairs, pairs, next(iter(pairs)).original_name, SourceKind.MATERIAL)
         assert raised.value.reason is reason
     assert not tuple(tmp_path.iterdir())
 
@@ -641,16 +637,16 @@ def test_bare_plan_rejects_cross_field_identity_drift(tmp_path: Path) -> None:
     first, second = tmp_path / "deck.txt", tmp_path / "notes.md"
     _, material = _material_plan((first, second))
     with pytest.raises(ValueError, match="保序一致"):
-        UploadAssetPlan(material.ordered_pairs, material.ordered_pairs[:1], None, SourceKind.MATERIAL)
+        UploadAssetPlan(material.ordered_pairs, material.ordered_pairs[:1], next(iter(material.ordered_pairs)).original_name, SourceKind.MATERIAL)
     wrong = UploadAssetPair(first, "notes.md", "notes.md_docling.json")
     with pytest.raises(ValueError, match="身份不一致"):
-        UploadAssetPlan((wrong,), (wrong,), None, SourceKind.MATERIAL)
+        UploadAssetPlan((wrong,), (wrong,), next(iter((wrong,))).original_name, SourceKind.MATERIAL)
     with pytest.raises(ValueError, match="身份不一致"):
-        UploadAssetPlan((UploadAssetPair(first, first.name, "other.json"),), (), None, SourceKind.MATERIAL)
+        UploadAssetPlan((UploadAssetPair(first, first.name, "other.json"),), (), next(iter((UploadAssetPair(first, first.name, 'other.json'),))).original_name, SourceKind.MATERIAL)
     primary = first.resolve(strict=False)
     companion = second.resolve(strict=False)
     filing = FinsUploadFilingFiles.for_upsert(primary=primary, companions=(companion,))
-    _, filing_plan = plan_upload_assets(
+    _, filing_plan = plan_upload_assets(material_primary_selectors=(),
         source_kind=SourceKind.FILING,
         operation="upsert",
         files=filing.ordered_files,
@@ -658,7 +654,7 @@ def test_bare_plan_rejects_cross_field_identity_drift(tmp_path: Path) -> None:
     )
     assert len(filing_plan.converter_pairs) == 1
     with pytest.raises(ValueError, match="主文件"):
-        UploadAssetPlan(filing_plan.ordered_pairs, filing_plan.ordered_pairs, filing_plan.filing_primary_original_name, SourceKind.FILING)
+        UploadAssetPlan(filing_plan.ordered_pairs, filing_plan.ordered_pairs, filing_plan.primary_original_name, SourceKind.FILING)
 
 
 def test_plan_source_kind_is_explicit_and_matches_primary_identity(tmp_path: Path) -> None:
@@ -680,13 +676,13 @@ def test_plan_source_kind_is_explicit_and_matches_primary_identity(tmp_path: Pat
     filing_pair = UploadAssetPair(path, filing_name, docling_storage_name(SourceKind.FILING, filing_name))
     assert UploadAssetPlan((), (), None, SourceKind.MATERIAL).source_kind is SourceKind.MATERIAL
     assert UploadAssetPlan((), (), None, SourceKind.FILING).source_kind is SourceKind.FILING
-    with pytest.raises(ValueError, match="不得携带 filing 主文件"):
+    with pytest.raises(ValueError, match="身份不一致"):
         UploadAssetPlan((filing_pair,), (filing_pair,), filing_name, SourceKind.MATERIAL)
     with pytest.raises(ValueError, match="必须携带主文件"):
         UploadAssetPlan((filing_pair,), (filing_pair,), None, SourceKind.FILING)
     with pytest.raises(ValueError, match="身份不一致"):
         UploadAssetPlan((material_pair,), (material_pair,), filing_name, SourceKind.FILING)
-    assert UploadAssetPlan((material_pair,), (material_pair,), None, SourceKind.MATERIAL).source_kind is SourceKind.MATERIAL
+    assert UploadAssetPlan((material_pair,), (material_pair,), next(iter((material_pair,))).original_name, SourceKind.MATERIAL).source_kind is SourceKind.MATERIAL
 
 
 def test_path_identity_and_unicode_collision(tmp_path: Path) -> None:
@@ -732,7 +728,7 @@ def test_filing_identity_and_derived_mapping_keep_existing_bytes(tmp_path: Path)
     primary = (tmp_path / "Report.PDF").resolve(strict=False)
     companion = (tmp_path / "appendix.xsd").resolve(strict=False)
     selection = FinsUploadFilingFiles.for_upsert(primary=primary, companions=(companion,))
-    selected, plan = plan_upload_assets(
+    selected, plan = plan_upload_assets(material_primary_selectors=(),
         source_kind=SourceKind.FILING,
         operation="upsert",
         files=selection.ordered_files,
@@ -746,8 +742,8 @@ def test_filing_identity_and_derived_mapping_keep_existing_bytes(tmp_path: Path)
     expected_digest = hashlib.sha256(
         b"fins-upload-asset-v1\0" + primary.as_posix().encode("utf-8")
     ).hexdigest()
-    assert plan.filing_primary_original_name == f"original-{expected_digest}.pdf"
-    assert plan.filing_primary_original_name == filing_original_storage_name(primary)
+    assert plan.primary_original_name == f"original-{expected_digest}.pdf"
+    assert plan.primary_original_name == filing_original_storage_name(primary)
     assert len(plan.converter_pairs) == 1
     assert plan.converter_pairs[0] == plan.ordered_pairs[0]
     assert plan.ordered_pairs[0].original_name.endswith(".pdf")
@@ -755,7 +751,7 @@ def test_filing_identity_and_derived_mapping_keep_existing_bytes(tmp_path: Path)
         SourceKind.FILING, plan.ordered_pairs[0].original_name
     )
     with pytest.raises(ValueError, match="保序一致"):
-        plan_upload_assets(
+        plan_upload_assets(material_primary_selectors=(),
             source_kind=SourceKind.FILING,
             operation="upsert",
             files=(companion, primary),

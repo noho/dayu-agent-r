@@ -1,0 +1,52 @@
+{
+  "label": "upload-material-unified-s1-review-mimo-20261002-01",
+  "outer_exit": 0,
+  "actual_model": "mimo-v2.6-pro[1m]",
+  "events": 17880,
+  "tools": 126,
+  "canary_actual_tool_bytes_match": true,
+  "terminal_result": "success/is_errorfalse/completed",
+  "artifact": "docs/reviews/code-review-20261002-215924.md",
+  "artifact_sha256": "4d69ec23b6b3e70fa1202875bd8643f6c6f9f7c1ab5727ca1079f128d2a345b5",
+  "warnings": [
+    {
+      "tool_index": 49,
+      "tool_id": "call_e5f7c575e5174dd48929682c",
+      "resolution": "50 fully reads CLI helpers1174-1300 after zsh echo=== aborted original sed."
+    },
+    {
+      "tool_index": 80,
+      "tool_id": "call_369410bd96cd4f79b3f2de37",
+      "resolution": "81 real sigint names actual130/stdout/stderr/PID signal;82 full19case index mismatch0."
+    },
+    {
+      "tool_index": 81,
+      "tool_id": "call_2bdd5518ac9e4ce7a2c48d29",
+      "resolution": "82 removes duplicated pytest-tmp prefix and recomputes19case artifacts0mismatch."
+    },
+    {
+      "tool_index": 84,
+      "tool_id": "call_6ae1702ba5ca47c896a834b6",
+      "resolution": "85 correct dict files interpretation,18prod minimum86.06."
+    },
+    {
+      "tool_index": 108,
+      "tool_id": "call_9f9e3c18537c49b392726d79",
+      "resolution": "First raw helper successfully read; second imported nullable helper wrongly located in upload_tools. Root reads actual import48 and _ingestion_tool_helpers138-165 same frozen code; DS46 had successful helper evidence. Coverage limitation disclosed; no necessary evidence remains missing."
+    }
+  ],
+  "stderr_allowed_warning": "[claude-code:unrecognized_model] {\"model\":\"mimo-v2.6-pro[1m]\",\"query_source\":\"sdk\"}\n",
+  "freeze_count": 9514,
+  "freeze_drift": 0,
+  "artifact_limit": "Report says3 failures/no other nonzero,actual5is_error;root records all5,successfully recovered via later evidence/root. No independent reviewer test rerun claimed.",
+  "decisions": "finding1 mergedUS1-R01accepted;finding2style rejected;Windows deferred user platformWU;form length existing residual;dual format literal prior contract preserved no newbehaviorgoal;batchowner location acceptedplan not architecturefinding;strict oldschema failclosed accepted.",
+  "setup_status": "ok",
+  "agent_status": "completed",
+  "tool_evidence": "yes",
+  "tool_trace": "complete",
+  "required_evidence": "complete",
+  "canary_status": "match",
+  "result_status": "accepted",
+  "evidence_gaps": [],
+  "retry_class": "none"
+}

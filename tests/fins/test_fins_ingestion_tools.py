@@ -85,6 +85,12 @@ from dayu.fins.direct_events import (
     FinsResultSummary,
 )
 from dayu.fins.service_runtime import DefaultFinsRuntime, ProductionFinsUploadRunner
+from dayu.fins.pipelines.docling_process_converter import (DoclingConversionConfig, DoclingConversionResult, DoclingConversionError, DoclingConversionFailureKind)
+from dayu.fins.upload_failure import fins_upload_empty_input_failure, fins_upload_failure_from_exception
+from dayu.fins.direct_events import canonicalize_fins_public_file_label
+from dayu.fins.ingestion_runtime import FinsIngestionJobStatus
+from docling_core.types.doc.document import DoclingDocument
+from docling_core.types.doc.labels import DocItemLabel
 from dayu.fins.storage import FilingUploadPublishedState
 from dayu.fins.upload_format_contract import FINS_UPLOAD_FORMAT_TEXT
 from dayu.fins.tools import download_provider, preprocess_provider, provider as read_provider
@@ -1445,9 +1451,7 @@ def test_upload_tool_filing_static_invalid_input_has_zero_side_effects(
     assert isinstance(outcome, ToolFailedOutcome)
     assert outcome.result.error == "invalid_argument"
     assert outcome.result.message == expected_message
-    assert outcome.result.hint == (
-        "请检查 ticker、upload_kind、action、files、primary、会计期间和材料字段后重试。"
-    )
+    assert outcome.result.hint == outcome.result.message
     assert state_repository.calls == []
     assert state_repository.batch_calls == []
     assert executor.submitted_job_ids == ()
@@ -1633,7 +1637,7 @@ def test_upload_tool_material_path_failure_uses_planner_usage_owner(
     )
     with pytest.raises(FinsUploadUsageError) as raised:
         admit_fins_upload_material_request(
-            FinsUploadMaterialRequest(ticker="AAPL", action="create", files=(Path(raw_name),))
+            FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="AAPL", action="create", files=(Path(raw_name),))
         )
     outcome = asyncio.run(
         FinsUploadToolCallable(runtime=runtime)(
@@ -1736,7 +1740,7 @@ def test_upload_tool_mixed_name_and_format_uses_plan_reason(
         path.parent.mkdir()
         path.write_bytes(b"input")
     with pytest.raises(FinsUploadUsageError) as raised:
-        admit_fins_upload_material_request(FinsUploadMaterialRequest(ticker="AAPL", files=paths))
+        admit_fins_upload_material_request(FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="AAPL", files=paths))
     assert raised.value.failure.code is expected_code
     assert raised.value.failure.message == expected_message
     arguments: dict[str, JsonValue] = {
@@ -1868,7 +1872,7 @@ def test_upload_tool_projects_same_usage_fact_independent_of_exception_cause(
     }
     with pytest.raises(FinsUploadUsageError) as raised:
         admit_fins_upload_material_request(
-            FinsUploadMaterialRequest(ticker="AAPL", action="create", files=(Path("a\x00b.txt"),))
+            FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="AAPL", action="create", files=(Path("a\x00b.txt"),))
         )
     original_error = raised.value
     assert isinstance(original_error.__cause__, FinsUploadAssetPlanError)
@@ -1947,15 +1951,15 @@ def test_upload_tool_action_and_identity_precede_material_asset_name(
     assert not tuple(_job_store_root(workspace_root).glob("*.json"))
 
 
-@pytest.mark.parametrize("file_state", ("missing", "directory", "empty"))
+@pytest.mark.parametrize("file_state", ("missing", "directory"))
 def test_upload_tool_material_keeps_file_state_precheck_after_admission(
     tmp_path: Path, file_state: str
 ) -> None:
-    """material 原有存在性、普通文件和非空预检仍阻止任务启动。
+    """material 存在性和普通文件预检仍阻止任务启动；内容由字节 owner 判定。
 
     Args:
         tmp_path: 隔离输入及工作区。
-        file_state: 缺失、目录或空文件状态。
+        file_state: 缺失或目录状态。
 
     Returns:
         无。
@@ -1969,8 +1973,6 @@ def test_upload_tool_material_keeps_file_state_precheck_after_admission(
     input_path = tmp_path / "report.txt"
     if file_state == "directory":
         input_path.mkdir()
-    elif file_state == "empty":
-        input_path.write_bytes(b"")
     outcome = asyncio.run(
         FinsUploadToolCallable(runtime=runtime)(
             _call(
@@ -1986,11 +1988,7 @@ def test_upload_tool_material_keeps_file_state_precheck_after_admission(
     )
     assert isinstance(outcome, ToolFailedOutcome)
     assert outcome.result.error == "invalid_argument"
-    assert outcome.result.message == (
-        "upload file path must point to a non-empty file"
-        if file_state == "empty"
-        else "upload file path must point to an existing file"
-    )
+    assert outcome.result.message == "upload file path must point to an existing file"
     assert executor.submitted_job_ids == ()
     assert runtime._observations == {}
     assert not tuple(_job_store_root(workspace_root).glob("*.json"))
@@ -2150,6 +2148,8 @@ def test_upload_tool_calendar_year_schema_and_usage_messages_are_business_neutra
     assert isinstance(aliases_schema, dict)
     assert isinstance(files_schema, dict)
     assert isinstance(primary_schema, dict)
+    assert fiscal_year_schema["type"] == ["integer", "null"]
+    assert fiscal_period_schema["type"] == ["string", "null"]
     assert "canonical ticker" in str(ticker_schema["description"])
     assert "不要填写 CSV" in str(ticker_schema["description"])
     assert "filing 与 material 上传都适用" in str(aliases_schema["description"])
@@ -2176,11 +2176,11 @@ def test_upload_tool_calendar_year_schema_and_usage_messages_are_business_neutra
         "delete 不得提供文件。"
     )
     assert expected_material_text in str(files_schema["description"])
-    assert f"upload_kind=material 时，{FINS_UPLOAD_FORMAT_TEXT.material_files}" in str(
+    assert ("upload_kind=material 时，" + FINS_UPLOAD_FORMAT_TEXT.material_files.replace("--primary", "primary").replace("--files", "files")) in str(
         files_schema["description"]
     )
     assert primary_schema == {
-        "type": "string",
+        "type": ["string", "null"],
         "description": FINS_UPLOAD_FORMAT_TEXT.upload_tool_primary,
     }
     assert "primary" not in build_fins_upload_tool(runtime).schema.function.parameters.required
@@ -2209,7 +2209,7 @@ def test_upload_tool_calendar_year_schema_and_usage_messages_are_business_neutra
         "primary 必须精确匹配 files 中的一个路径",
         "files 的顺序不决定主文件角色",
         "delete 必须省略 files 和 primary",
-        FINS_UPLOAD_FORMAT_TEXT.upload_tool_material_primary_failure,
+        "多文件材料必须恰好指定一个 primary",
         "不能根据质量、重要性或转换是否成功推断",
     ):
         assert expected_fragment in str(primary_schema["description"])
@@ -2224,10 +2224,10 @@ def test_upload_tool_calendar_year_schema_and_usage_messages_are_business_neutra
         assert forbidden_fragment not in str(files_schema["description"])
         assert forbidden_fragment not in str(primary_schema["description"])
     assert fiscal_year_schema["description"] == (
-        "财年。上传 filing 时必填，且只接受 1000..9999 的整数；上传 material 时可选。"
+        "财年。上传 filing 时必填，且只接受 1000..9999 的整数；上传 material 时可选，必须是 1800..2100 的整数，不能是布尔值。"
     )
     assert fiscal_period_schema["description"] == (
-        "财报期间。上传 filing 时必填且只支持 FY、H1、Q1、Q2、Q3、Q4；上传 material 时可选。"
+        "财报期间。上传 filing 时必填且只支持 FY、H1、Q1、Q2、Q3、Q4；上传 material 时可选，仍只支持上述六值；去首尾空白并转大写。省略/null 表示未提供，显式空文本非法。"
     )
     assert filing_date_schema["description"] == (
         "可选披露日期文本，filing 与 material 上传都适用。省略或填 null 表示未提供；"
@@ -2308,20 +2308,9 @@ def test_upload_tool_adapter_projects_zero_or_one_filing_primary_selector(
     assert isinstance(selected, FinsUploadFilingRequest)
     assert selected.files == (companion.resolve(), primary.resolve())
     assert selected.primary_selectors == (primary.resolve(),)
-    with pytest.raises(ValueError) as material_error:
-        upload_tools._upload_request_from_arguments(
-            {
-                "ticker": "AAPL",
-                "upload_kind": "material",
-                "action": "delete",
-                "primary": str(primary),
-                "form_type": "MATERIAL_OTHER",
-                "material_name": "Deck",
-            }
-        )
-    assert str(material_error.value) == (
-        FINS_UPLOAD_FORMAT_TEXT.upload_tool_material_primary_failure
-    )
+    material = upload_tools._upload_request_from_arguments({"ticker": "AAPL", "upload_kind": "material", "action": "delete", "primary": str(primary), "form_type": "MATERIAL_OTHER", "material_name": "Deck"})
+    assert isinstance(material, FinsUploadMaterialRequest)
+    assert material.primary_selectors == (primary,)
 
 
 def test_upload_tool_material_primary_failure_is_owned_and_has_zero_side_effects(
@@ -2365,11 +2354,9 @@ def test_upload_tool_material_primary_failure_is_owned_and_has_zero_side_effects
     assert isinstance(outcome, ToolFailedOutcome)
     assert outcome.result.error == "invalid_argument"
     assert outcome.result.message == (
-        FINS_UPLOAD_FORMAT_TEXT.upload_tool_material_primary_failure
+        fins_upload_usage_failure(FinsUploadUsageCode.PRIMARY_NOT_ALLOWED_FOR_DELETE).message
     )
-    assert outcome.result.hint == (
-        "请检查 ticker、upload_kind、action、files、primary、会计期间和材料字段后重试。"
-    )
+    assert outcome.result.hint == outcome.result.message
     assert state_repository.calls == []
     assert executor.submitted_job_ids == ()
     assert runtime._observations == {}
@@ -2748,47 +2735,13 @@ def test_upload_tool_raw_material_request_rejects_format_before_production_runne
     monkeypatch.setattr(Path, "read_bytes", reject_file_read)
     cancellation_checker: FinsJobCancellationChecker = _OpenCancellationToken()
 
-    with pytest.raises(FinsUploadFormatError) as exc_info:
+    with pytest.raises(FinsUploadUsageError) as exc_info:
         admit_fins_upload_material_request(request)
 
-    assert exc_info.value.file_label == "deck.zip"
+    assert exc_info.value.failure.file_label == "deck.zip"
     assert not (workspace_root / "portfolio" / "AAPL").exists()
 
 
-def test_upload_tool_empty_file_returns_failed_outcome_before_observation_start(tmp_path: Path) -> None:
-    """上传空文件必须在 observation 启动前返回失败 outcome。"""
-
-    workspace_root = _build_workspace(tmp_path)
-    allowed_root = _build_upload_root(tmp_path)
-    empty_file = allowed_root / "empty.pdf"
-    empty_file.write_bytes(b"")
-    definition = upload_provider.discover_tools(
-        _upload_spec(
-            spec_id=_UPLOAD_SPEC_ID,
-            workspace_root=workspace_root,
-        )
-    ).definitions[0]
-
-    outcome = asyncio.run(
-        definition.callable(
-            _call(
-                UPLOAD_TOOL_NAME,
-                {
-                    "ticker": "AAPL",
-                    "upload_kind": "filing",
-                    "files": [str(empty_file)],
-                    "fiscal_year": 2024,
-                    "fiscal_period": "FY",
-                },
-            ),
-            _context(),
-        )
-    )
-
-    assert isinstance(outcome, ToolFailedOutcome)
-    assert outcome.result.error == "invalid_argument"
-    assert "non-empty file" in outcome.result.message
-    assert not tuple(_job_store_root(workspace_root).glob("*.json"))
 
 
 def test_upload_tool_delete_rejects_unnecessary_files_before_job_creation(tmp_path: Path) -> None:
@@ -2822,7 +2775,7 @@ def test_upload_tool_delete_rejects_unnecessary_files_before_job_creation(tmp_pa
 
     assert isinstance(outcome, ToolFailedOutcome)
     assert outcome.result.error == "invalid_argument"
-    assert "files must be omitted" in outcome.result.message
+    assert outcome.result.message == fins_upload_usage_failure(FinsUploadUsageCode.FILES_NOT_ALLOWED_FOR_DELETE).message
     assert not tuple(_job_store_root(workspace_root).glob("*.json"))
 
 
@@ -3650,3 +3603,149 @@ def _is_runtime_start_call(node: ast.AST, *, start_method: str) -> TypeGuard[ast
     """
 
     return isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == start_method
+
+
+class _S1ContentConverter:
+    """仅控制 Docling outcome，所有准入、市场 workflow 和仓储保持真实。"""
+
+    def __init__(self, failing_name: str | None = None) -> None:
+        """参数：可选损坏文件名；返回：无；异常：无。"""
+        self.calls: list[str] = []
+        self.failing_name = failing_name
+
+    async def convert_to_json_bytes(self, input_bytes: bytes, stream_name: str, *,
+                                    config: DoclingConversionConfig,
+                                    cancellation: CancellationToken | None) -> DoclingConversionResult:
+        """参数：真实字节、名称、配置、取消；返回：合法 Docling JSON；异常：受控损坏抛 typed conversion。"""
+        self.calls.append(stream_name)
+        if stream_name == self.failing_name:
+            raise DoclingConversionError(DoclingConversionFailureKind.CONVERTER_EXECUTION, "Docling conversion execution failed", None)
+        document = DoclingDocument(name=stream_name)
+        document.add_text(label=DocItemLabel.TEXT, text=input_bytes.decode("utf-8"))
+        data = document.model_dump_json().encode("utf-8")
+        return DoclingConversionResult(data, len(data), hashlib.sha256(data).hexdigest())
+
+
+async def _wait_s1_observation(runtime: FinsIngestionRuntime, handle: FinsObservationHandle) -> FinsObservationSnapshot:
+    """参数：真实 runtime 与 handle；返回：真实终态；异常：超时后断言失败，不把 pending 冒充成功。"""
+    for _ in range(500):
+        snapshot = await runtime.poll_observation(handle)
+        if snapshot.status in (FinsObservationStatus.SUCCEEDED, FinsObservationStatus.FAILED, FinsObservationStatus.CANCELLED):
+            return snapshot
+        await asyncio.sleep(0.02)
+    raise AssertionError("真实 observation 未在十秒内终结")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ticker", ("AAPL", "600519", "0700"))
+@pytest.mark.parametrize("content_case", ("empty", "corrupt"))
+async def test_s1_real_tool_content_failure_and_job_facts(tmp_path: Path, ticker: str, content_case: str) -> None:
+    """参数：真实根、三市场、空/损坏；返回：无；异常：断言失败；同 owner 五字段贯穿 observation 与持久 job 双摘要。"""
+    workspace_root = _build_workspace(tmp_path)
+    input_path = tmp_path / ("empty.txt" if content_case == "empty" else "corrupt.docx")
+    input_path.write_bytes(b"" if content_case == "empty" else b"corrupt document")
+    converter = _S1ContentConverter(None if content_case == "empty" else input_path.name)
+    with patch("dayu.fins.pipelines.docling_process_converter.ProcessDoclingConverter", return_value=converter):
+        default = DefaultFinsRuntime.create(workspace_root=workspace_root)
+        runtime = default.get_ingestion_runtime()
+    arguments: dict[str, JsonValue] = {"ticker": ticker, "upload_kind": "material", "files": [str(input_path)],
+        "form_type": " other ", "material_name": " Deck ", "company_name": "Example Company"}
+    definition = build_fins_upload_tool(runtime=runtime)
+    outcome = await definition.callable(_call(UPLOAD_TOOL_NAME, arguments), _context())
+    assert isinstance(outcome, ToolAwaitingOutcome)
+    record = next(iter(runtime._observations.values()))
+    runtime.activate_observation(record.handle)
+    try:
+        snapshot = await _wait_s1_observation(runtime, record.handle)
+        assert snapshot.status is FinsObservationStatus.FAILED
+        assert snapshot.result is not None
+        reason = (fins_upload_empty_input_failure(canonicalize_fins_public_file_label(input_path.name))
+                  if content_case == "empty" else fins_upload_failure_from_exception(
+                      DoclingConversionError(DoclingConversionFailureKind.CONVERTER_EXECUTION, "Docling conversion execution failed", None),
+                      file_label=canonicalize_fins_public_file_label(input_path.name)))
+        details = {item.label: item.value for item in snapshot.result.details}
+        assert details["failure kind"] == reason.kind.value
+        assert details["failure code"] == reason.code.value
+        assert details["failure message"] == reason.message
+        assert details["retry hint"] == reason.retry_hint
+        assert details["file"] == reason.file_label
+        assert snapshot.result.error_message == reason.message
+        assert details["stored files"] == "0"
+        assert not tuple(_job_store_root(workspace_root).glob("*.json"))
+        assert converter.calls == ([] if content_case == "empty" else [input_path.name])
+        assert default.company_repository.get_company_meta(ticker) is not None
+        assert default.source_repository.list_source_document_ids(ticker, SourceKind.MATERIAL) == []
+    finally:
+        await runtime.abandon_observation(record.handle)
+    request = upload_tools._upload_request_from_arguments(arguments)
+    start = runtime.start_upload(request)
+    job = runtime.read_job(start.job_id)
+    for _ in range(500):
+        job = runtime.read_job(start.job_id)
+        if job.status is FinsIngestionJobStatus.FAILED:
+            break
+        await asyncio.sleep(0.02)
+    assert job.status is FinsIngestionJobStatus.FAILED
+    assert job.result_summary["failure"] == reason.to_json()
+    assert job.failure_summary == reason.to_json()
+    assert job.result_summary["stored_file_count"] == 0
+    default.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ("multi_b", "multi_missing", "outside", "single_default", "single_explicit", "delete_files", "delete_primary"))
+async def test_s1_real_tool_role_and_combination(tmp_path: Path, case: str) -> None:
+    """参数：真实根与角色用例；返回：无；异常：断言失败；tool 参数、共享准入、生产发布及真实 default snapshot 联通。"""
+    workspace_root = _build_workspace(tmp_path)
+    a, b = tmp_path / "a.txt", tmp_path / "b.txt"
+    a.write_bytes(b"a contents"); b.write_bytes(b"b contents")
+    converter = _S1ContentConverter()
+    with patch("dayu.fins.pipelines.docling_process_converter.ProcessDoclingConverter", return_value=converter):
+        default = DefaultFinsRuntime.create(workspace_root=workspace_root)
+        runtime = default.get_ingestion_runtime()
+    arguments: dict[str, JsonValue] = {"ticker": "AAPL", "upload_kind": "material", "form_type": "OTHER",
+        "material_name": "Deck", "company_name": "Example Company", "files": [str(a), str(b)]}
+    if case == "multi_b": arguments["primary"] = str(b)
+    elif case == "outside": arguments["primary"] = str(tmp_path / "outside.txt")
+    elif case in ("single_default", "single_explicit"):
+        arguments["files"] = [str(a)]
+        if case == "single_explicit": arguments["primary"] = str(a)
+    elif case == "delete_files": arguments["action"] = "delete"
+    elif case == "delete_primary":
+        arguments["action"] = "delete"; arguments["files"] = []; arguments["primary"] = "~unknown_s1_user/never.txt"
+    definition = build_fins_upload_tool(runtime=runtime)
+    outcome = await definition.callable(_call(UPLOAD_TOOL_NAME, arguments), _context())
+    if case in ("multi_missing", "outside", "delete_files", "delete_primary"):
+        assert isinstance(outcome, ToolFailedOutcome)
+        assert converter.calls == [] and runtime._observations == {}
+        assert not tuple(_job_store_root(workspace_root).glob("*.json"))
+        expected_code = {"multi_missing": FinsUploadUsageCode.MISSING_MULTI_FILE_PRIMARY,
+                         "outside": FinsUploadUsageCode.PRIMARY_NOT_IN_FILES,
+                         "delete_files": FinsUploadUsageCode.FILES_NOT_ALLOWED_FOR_DELETE,
+                         "delete_primary": FinsUploadUsageCode.PRIMARY_NOT_ALLOWED_FOR_DELETE}[case]
+        with pytest.raises(FinsUploadUsageError) as error:
+            raw = upload_tools._upload_request_from_arguments(arguments)
+            assert isinstance(raw, FinsUploadMaterialRequest)
+            admit_fins_upload_material_request(raw)
+        assert error.value.failure.code is expected_code
+        assert error.value.failure.category is FinsUploadUsageCategory.REQUEST
+        assert outcome.result.message == error.value.failure.message
+        assert outcome.result.hint == error.value.failure.hint
+    else:
+        assert isinstance(outcome, ToolAwaitingOutcome)
+        record = next(iter(runtime._observations.values()))
+        runtime.activate_observation(record.handle)
+        try:
+            snapshot = await _wait_s1_observation(runtime, record.handle)
+            assert snapshot.status is FinsObservationStatus.SUCCEEDED
+            assert snapshot.result is not None
+            details = {item.label: item.value for item in snapshot.result.details}
+            document_id = details["document"]
+            primary = "b.txt_docling.json" if case == "multi_b" else "a.txt_docling.json"
+            with default.source_repository.read_source_snapshot("AAPL", document_id, SourceKind.MATERIAL, materialize_files=True) as source:
+                assert source.primary_filename == primary
+            assert converter.calls == (["a.txt", "b.txt"] if case == "multi_b" else ["a.txt"])
+            assert not tuple(_job_store_root(workspace_root).glob("*.json"))
+        finally:
+            await runtime.abandon_observation(record.handle)
+    default.close()

@@ -1266,9 +1266,9 @@ async def test_upload_material_unsupported_suffix_fails_before_reads_or_mutation
     monkeypatch.setattr(pipeline._batching_repository, "begin_batch", reject_batch)
     monkeypatch.setattr(Path, "read_bytes", reject_file_read)
 
-    with pytest.raises(FinsUploadFormatError) as exc_info:
+    with pytest.raises(FinsUploadUsageError) as exc_info:
         _ = [event async for event in pipeline.upload_material_stream(FinsUploadMaterialRequest(ticker="600519", action="create", form_type="MATERIAL_OTHER", material_name="Roadshow Deck", files=(unsupported_file,), company_name="贵州茅台"))]
-    assert exc_info.value.file_label == "deck.zip"
+    assert exc_info.value.failure.file_label == "deck.zip"
     assert converter.calls == 0
     assert not (tmp_path / "portfolio" / "600519").exists()
 
@@ -2737,7 +2737,7 @@ def test_cn_material_sync_delegate_admits_once(
         AssertionError: 同步委托重复准入时抛出。
     """
 
-    request = FinsUploadMaterialRequest(
+    request = FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck",
         ticker="600519", files=tuple(tmp_path / f"part-{index:03d}.pdf" for index in range(101)),
     )
     pipeline = object.__new__(CnPipeline)

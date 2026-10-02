@@ -73,6 +73,13 @@ def test_fins_upload_usage_failure_mapping_is_closed_bounded_and_path_free() -> 
         "create_target_exists",
         "update_target_missing",
         "existing_source_repair_requires_auto",
+        "missing_form_type",
+        "missing_material_name",
+        "material_name_too_long",
+        "invalid_material_fiscal_year",
+        "empty_document_id",
+        "document_id_mismatch",
+
     }
     assert {code.value for code in FinsUploadUsageCode} == expected_codes
     exact_messages = {
@@ -172,23 +179,23 @@ def test_upload_usage_failure_fact_rejects_open_code_and_unbounded_message() -> 
         "open_code",
     )
     with pytest.raises(TypeError, match="closed contract"):
-        FinsUploadUsageFailure(code=invalid_code, message="非法 code")
+        FinsUploadUsageFailure(hint="请修正输入后重试", file_label=None, code=invalid_code, message="非法 code")
     with pytest.raises(ValueError, match="不能为空"):
-        FinsUploadUsageFailure(code=FinsUploadUsageCode.EMPTY_TICKER, message="")
+        FinsUploadUsageFailure(hint="请修正输入后重试", file_label=None, code=FinsUploadUsageCode.EMPTY_TICKER, message="")
     with pytest.raises(ValueError, match="长度上限"):
-        FinsUploadUsageFailure(
+        FinsUploadUsageFailure(hint="请修正输入后重试", file_label=None,
             code=FinsUploadFormatFailureKind.PRIMARY_SUFFIX_UNSUPPORTED,
             message="x" * 241,
         )
     invalid_category = cast(FinsUploadUsageCategory, "asset_plan_typo")
     with pytest.raises(TypeError, match="category"):
-        FinsUploadUsageFailure(
+        FinsUploadUsageFailure(hint="请修正输入后重试", file_label=None,
             code=FinsUploadUsageCode.EMPTY_TICKER,
             message="非法类别",
             category=invalid_category,
         )
     with pytest.raises(ValueError, match="规划契约"):
-        FinsUploadUsageFailure(
+        FinsUploadUsageFailure(hint="请修正输入后重试", file_label=None,
             code=FinsUploadUsageCode.INVALID_TICKER,
             message="非法组合",
             category=FinsUploadUsageCategory.ASSET_PLAN,
@@ -200,7 +207,7 @@ def test_upload_usage_failure_fact_rejects_open_code_and_unbounded_message() -> 
         FinsUploadUsageCode.INVALID_ASSET_NAME,
     ):
         with pytest.raises(ValueError, match="规划类别"):
-            FinsUploadUsageFailure(code=code, message="规划专属错误")
+            FinsUploadUsageFailure(hint="请修正输入后重试", file_label=None, code=code, message="规划专属错误")
 
 
 
@@ -234,7 +241,7 @@ def test_planner_reasons_share_usage_message_with_public_failure(tmp_path: Path)
                 FinsUploadAssetPlanReason.TOO_MANY_FILES,
             } else tmp_path / "deck.pdf",
         )
-        usage, hint = fins_upload_asset_plan_usage_failure(
+        usage = fins_upload_asset_plan_usage_failure(
             error, max_files=MAX_MATERIAL_UPLOAD_FILES
         )
         public = fins_upload_failure_from_exception(error, file_label=None)
@@ -243,11 +250,11 @@ def test_planner_reasons_share_usage_message_with_public_failure(tmp_path: Path)
         assert public.kind is FinsUploadFailureKind.USAGE
         assert public.code is FinsUploadFailureCode(reason.value)
         assert public.message == usage.message
-        assert public.retry_hint == hint
+        assert public.retry_hint == usage.hint
         assert public.file_label == error.file_label
         assert 0 < len(usage.message) <= FINS_UPLOAD_USAGE_TEXT_LIMIT
         assert str(tmp_path) not in usage.message
-        assert str(tmp_path) not in hint
+        assert str(tmp_path) not in usage.hint
         if reason in {
             FinsUploadAssetPlanReason.DUPLICATE_ORIGINAL_BASENAME,
             FinsUploadAssetPlanReason.ASSET_NAME_COLLISION,
@@ -276,7 +283,7 @@ def test_shared_usage_code_retains_distinct_typed_category(code: FinsUploadUsage
 
     request_failure = fins_upload_usage_failure(code)
     plan_error = FinsUploadAssetPlanError(FinsUploadAssetPlanReason(code.value))
-    plan_failure, _ = fins_upload_asset_plan_usage_failure(
+    plan_failure = fins_upload_asset_plan_usage_failure(
         plan_error, max_files=MAX_MATERIAL_UPLOAD_FILES
     )
     assert request_failure.code is plan_failure.code
@@ -344,20 +351,20 @@ def test_long_planner_file_label_preserves_closed_bounded_usage(
 
     basename = "a" * 222 + ".txt"
     error = FinsUploadAssetPlanError(FinsUploadAssetPlanReason(reason), tmp_path / basename)
-    usage, hint = fins_upload_asset_plan_usage_failure(error, max_files=MAX_MATERIAL_UPLOAD_FILES)
+    usage = fins_upload_asset_plan_usage_failure(error, max_files=MAX_MATERIAL_UPLOAD_FILES)
     public = fins_upload_failure_from_exception(error, file_label=None)
 
     assert usage.code is FinsUploadUsageCode(reason)
     assert public.code.value == reason
     assert public.message == usage.message
-    assert public.retry_hint == hint
+    assert public.retry_hint == usage.hint
     assert error.file_label == basename
     assert 0 < len(usage.message) <= FINS_UPLOAD_USAGE_TEXT_LIMIT
     assert "…" in usage.message
     assert ".txt" in usage.message
     assert "请" in usage.message
     assert str(tmp_path) not in usage.message
-    assert str(tmp_path) not in hint
+    assert str(tmp_path) not in usage.hint
 
 
 def test_multibyte_planner_basename_keeps_complete_usage_bounded(tmp_path: Path) -> None:
@@ -378,20 +385,20 @@ def test_multibyte_planner_basename_keeps_complete_usage_bounded(tmp_path: Path)
 
     basename = "名" * 230 + ".txt"
     with pytest.raises(FinsUploadAssetPlanError) as exc_info:
-        plan_upload_assets(
+        plan_upload_assets(material_primary_selectors=(),
             source_kind=SourceKind.MATERIAL,
             operation="upsert",
             files=(tmp_path / basename,),
         )
     error = exc_info.value
     assert error.reason is FinsUploadAssetPlanReason.INVALID_ASSET_NAME
-    usage, hint = fins_upload_asset_plan_usage_failure(error, max_files=MAX_MATERIAL_UPLOAD_FILES)
+    usage = fins_upload_asset_plan_usage_failure(error, max_files=MAX_MATERIAL_UPLOAD_FILES)
     public = fins_upload_failure_from_exception(error, file_label=None)
 
     assert usage.code is FinsUploadUsageCode.INVALID_ASSET_NAME
     assert public.code.value == error.reason.value
     assert public.message == usage.message
-    assert public.retry_hint == hint
+    assert public.retry_hint == usage.hint
     assert len(usage.message) == FINS_UPLOAD_USAGE_TEXT_LIMIT
     assert "…" in usage.message
     leading, trailing = usage.message.split("…", maxsplit=1)
@@ -399,7 +406,7 @@ def test_multibyte_planner_basename_keeps_complete_usage_bounded(tmp_path: Path)
     assert ".txt" in trailing
     assert "请" in trailing
     assert str(tmp_path) not in usage.message
-    assert str(tmp_path) not in hint
+    assert str(tmp_path) not in usage.hint
 
 
 def test_control_character_basename_uses_readable_hidden_usage_label(tmp_path: Path) -> None:
@@ -420,26 +427,26 @@ def test_control_character_basename_uses_readable_hidden_usage_label(tmp_path: P
 
     basename = "隐\x01藏.txt"
     with pytest.raises(FinsUploadAssetPlanError) as exc_info:
-        plan_upload_assets(
+        plan_upload_assets(material_primary_selectors=(),
             source_kind=SourceKind.MATERIAL,
             operation="upsert",
             files=(tmp_path / "first" / basename, tmp_path / "second" / basename),
         )
     error = exc_info.value
     assert error.reason is FinsUploadAssetPlanReason.DUPLICATE_ORIGINAL_BASENAME
-    usage, hint = fins_upload_asset_plan_usage_failure(error, max_files=MAX_MATERIAL_UPLOAD_FILES)
+    usage = fins_upload_asset_plan_usage_failure(error, max_files=MAX_MATERIAL_UPLOAD_FILES)
     public = fins_upload_failure_from_exception(error, file_label=None)
 
     assert usage.code is FinsUploadUsageCode.DUPLICATE_ORIGINAL_BASENAME
     assert public.code.value == error.reason.value
     assert public.message == usage.message
-    assert public.retry_hint == hint
+    assert public.retry_hint == usage.hint
     assert error.file_label == "输入文件（文件名已隐藏）"
     assert "输入文件（文件名已隐藏）" in usage.message
     assert 0 < len(usage.message) <= FINS_UPLOAD_USAGE_TEXT_LIMIT
     assert basename not in usage.message
     assert str(tmp_path) not in usage.message
-    assert str(tmp_path) not in hint
+    assert str(tmp_path) not in usage.hint
 
 
 @pytest.mark.parametrize("basename", ("a\\b.txt", "a\ud800b.txt", "a\udc80b.txt"))
@@ -463,20 +470,20 @@ def test_rejected_basename_has_utf8_safe_usage_and_public_failure(
     from dayu.fins.upload_usage_contract import fins_upload_asset_plan_usage_failure
 
     with pytest.raises(FinsUploadAssetPlanError) as exc_info:
-        plan_upload_assets(
+        plan_upload_assets(material_primary_selectors=(),
             source_kind=SourceKind.MATERIAL,
             operation="upsert",
             files=(tmp_path / basename,),
         )
     error = exc_info.value
-    usage, hint = fins_upload_asset_plan_usage_failure(error, max_files=MAX_MATERIAL_UPLOAD_FILES)
+    usage = fins_upload_asset_plan_usage_failure(error, max_files=MAX_MATERIAL_UPLOAD_FILES)
     public = fins_upload_failure_from_exception(error, file_label=None)
 
     assert error.reason is FinsUploadAssetPlanReason.INVALID_ASSET_NAME
     assert error.file_label == "输入文件（文件名已隐藏）"
     assert usage.code is FinsUploadUsageCode.INVALID_ASSET_NAME
     assert public.message == usage.message
-    assert public.retry_hint == hint
+    assert public.retry_hint == usage.hint
     assert public.file_label == error.file_label
     assert 0 < len(usage.message) <= FINS_UPLOAD_USAGE_TEXT_LIMIT
     assert str(tmp_path) not in usage.message
@@ -507,17 +514,17 @@ def test_unresolvable_name_keeps_reserved_reason_and_utf8_safe_failure(
 
     paths = tuple(tmp_path / str(index) / name for index, name in enumerate(names))
     with pytest.raises(FinsUploadAssetPlanError) as exc_info:
-        plan_upload_assets(
+        plan_upload_assets(material_primary_selectors=(),
             source_kind=SourceKind.MATERIAL, operation="upsert", files=paths
         )
     error = exc_info.value
-    usage, hint = fins_upload_asset_plan_usage_failure(error, max_files=MAX_MATERIAL_UPLOAD_FILES)
+    usage = fins_upload_asset_plan_usage_failure(error, max_files=MAX_MATERIAL_UPLOAD_FILES)
     public = fins_upload_failure_from_exception(error, file_label=None)
 
     assert error.reason is FinsUploadAssetPlanReason.RESERVED_CONTROL_NAME
     assert usage.code is FinsUploadUsageCode.RESERVED_CONTROL_NAME
     assert public.message == usage.message
-    assert public.retry_hint == hint
+    assert public.retry_hint == usage.hint
     assert 0 < len(usage.message) <= FINS_UPLOAD_USAGE_TEXT_LIMIT
     assert str(tmp_path) not in usage.message
     assert "\ud800" not in usage.message

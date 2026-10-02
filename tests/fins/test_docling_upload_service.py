@@ -57,7 +57,6 @@ from dayu.fins.pipelines.docling_upload_service import (
     derive_report_kind,
     read_prepared_filing_initial_skip_disposition,
     rebase_prepared_filing_create_overwrite,
-    validate_material_upload_ids,
 )
 from dayu.fins.pipelines.docling_process_converter import (
     DoclingConversionCancelledError,
@@ -1084,7 +1083,7 @@ def _material_plan_for_test(files: tuple[Path, ...]) -> UploadAssetPlan:
         FinsUploadFormatError: 原件格式不可转换时抛出。
     """
 
-    _, plan = plan_upload_assets(
+    _, plan = plan_upload_assets(material_primary_selectors=(files[0],) if files else (),
         source_kind=SourceKind.MATERIAL, operation="upsert", files=files
     )
     return plan
@@ -2080,10 +2079,11 @@ def test_prepare_material_nth_conversion_failure_discards_partial_work(
         calls=calls,
     )
 
-    with pytest.raises(DoclingConversionError) as exc_info:
+    with pytest.raises(FinsUploadFailureError) as exc_info:
         _prepare_material_for_admission_test(service=context.service, files=files)
 
-    assert exc_info.value is cause
+    assert exc_info.value.__cause__ is cause
+    assert exc_info.value.failure.file_label == "corrupt.docx"
     assert calls == ["ok.pdf", "corrupt.docx"]
     assert isinstance(context.batching_repository, _BatchIdentityUploadBatchingRepository)
     assert context.batching_repository.begin_calls == 0
@@ -2287,7 +2287,7 @@ def test_prepare_upload_rejects_bare_material_plan_mismatch_before_io(
     context.service._docling_converter = _FakeDoclingConverter(calls)
     first = tmp_path / "first.pdf"
     second = tmp_path / "second.pdf"
-    _, valid = plan_upload_assets(
+    _, valid = plan_upload_assets(material_primary_selectors=(first,),
         source_kind=SourceKind.MATERIAL,
         operation="upsert",
         files=(first, second),
@@ -2382,7 +2382,7 @@ def test_direct_material_service_rejects_mutated_101_plan_before_io(tmp_path: Pa
     calls: list[str] = []
     context = _build_service_context(tmp_path)
     context.service._docling_converter = _FakeDoclingConverter(calls)
-    _, plan = plan_upload_assets(
+    _, plan = plan_upload_assets(material_primary_selectors=(),
         source_kind=SourceKind.MATERIAL, operation="upsert", files=(tmp_path / "seed.pdf",)
     )
     pairs = tuple(
@@ -2391,6 +2391,7 @@ def test_direct_material_service_rejects_mutated_101_plan_before_io(tmp_path: Pa
     )
     object.__setattr__(plan, "ordered_pairs", pairs)
     object.__setattr__(plan, "converter_pairs", pairs)
+    object.__setattr__(plan, "primary_original_name", pairs[0].original_name)
     with patch.object(Path, "read_bytes", side_effect=AssertionError("超量计划读取原件")):
         with pytest.raises(FinsUploadAssetPlanError) as raised:
             asyncio.run(context.service.prepare_upload(
@@ -2437,7 +2438,7 @@ def test_direct_service_rejects_invalid_material_plan_before_side_effects(
     context = _build_service_context(tmp_path)
     context.service._docling_converter = _FakeDoclingConverter(calls)
     seed = tmp_path / "seed.txt"
-    _, plan = plan_upload_assets(
+    _, plan = plan_upload_assets(material_primary_selectors=(),
         source_kind=SourceKind.MATERIAL, operation="upsert", files=(seed,)
     )
     pairs = tuple(
@@ -2451,6 +2452,7 @@ def test_direct_service_rejects_invalid_material_plan_before_side_effects(
     # 模拟跨边界取得构造后被损坏的计划；service 必须重新调用 owner 校验。
     object.__setattr__(plan, "ordered_pairs", pairs)
     object.__setattr__(plan, "converter_pairs", pairs)
+    object.__setattr__(plan, "primary_original_name", pairs[0].original_name)
     expected_error = FinsUploadFormatError if reason is None else FinsUploadAssetPlanError
     with patch.object(Path, "read_bytes", side_effect=AssertionError("非法计划读取原件")):
         with pytest.raises(expected_error) as raised:
@@ -2485,20 +2487,20 @@ def test_prepare_upload_rejects_mutated_loop_plan_before_file_io(tmp_path: Path)
     context = _build_service_context(tmp_path)
     context.service._docling_converter = _FakeDoclingConverter(calls)
     original = tmp_path / "original.pdf"
-    _, plan = plan_upload_assets(
+    _, plan = plan_upload_assets(material_primary_selectors=(),
         source_kind=SourceKind.MATERIAL, operation="upsert", files=(original,)
     )
     loop = tmp_path / "loop.pdf"
     loop.symlink_to(loop.name)
     object.__setattr__(plan.ordered_pairs[0], "path", loop)
-    with pytest.raises(OSError) as raised:
+    with pytest.raises(ValueError) as raised:
         asyncio.run(context.service.prepare_upload(
             ticker="AAPL", source_kind=SourceKind.MATERIAL, action="create",
             document_id="loop_plan", internal_document_id="loop_plan", form_type="TEST",
             selection=plan, overwrite=False, previous_meta=None, meta={},
             repair_disposition=NoExistingSourceRepair(), cancellation=None,
         ))
-    assert "上传路径解析出现循环" in str(raised.value)
+    assert "身份不一致" in str(raised.value)
     assert str(tmp_path) not in str(raised.value)
     assert calls == []
     assert published_tree_sha256(tmp_path, "AAPL") == {}
@@ -3185,7 +3187,7 @@ def test_prepare_upload_requires_canonical_boolean_deleted_state(
             )
         ],
         source_kind=SourceKind.FILING,
-        filing_primary_original_name=filing_original_storage_name(sample_file),
+        primary_original_name=filing_original_storage_name(sample_file),
     )
     previous_meta: dict[str, JsonValue] = {"source_fingerprint": fingerprint.value}
     expected_error: type[KeyError] | type[ValueError]
@@ -4462,12 +4464,12 @@ def test_ambiguous_filing_primary_forces_versions_then_recovers_safe_skip(tmp_pa
     first_primary_fingerprint = _build_upload_source_fingerprint(
         [first_asset, second_asset],
         source_kind=SourceKind.FILING,
-        filing_primary_original_name=filing_original_storage_name(first),
+        primary_original_name=filing_original_storage_name(first),
     )
     second_primary_fingerprint = _build_upload_source_fingerprint(
         [second_asset, first_asset],
         source_kind=SourceKind.FILING,
-        filing_primary_original_name=filing_original_storage_name(second),
+        primary_original_name=filing_original_storage_name(second),
     )
     companions_only_duplicate = _build_upload_source_fingerprint(
         [
@@ -4476,7 +4478,7 @@ def test_ambiguous_filing_primary_forces_versions_then_recovers_safe_skip(tmp_pa
             _build_filing_original_asset_for_test(duplicate_companion),
         ],
         source_kind=SourceKind.FILING,
-        filing_primary_original_name=filing_original_storage_name(unique),
+        primary_original_name=filing_original_storage_name(unique),
     )
 
     assert first_primary_fingerprint.value == second_primary_fingerprint.value
@@ -4643,7 +4645,7 @@ def test_safe_multifile_whole_set_move_keeps_v1_and_published_tree(tmp_path: Pat
             _build_filing_original_asset_for_test(old_companion),
         ],
         source_kind=SourceKind.FILING,
-        filing_primary_original_name=filing_original_storage_name(old_primary),
+        primary_original_name=filing_original_storage_name(old_primary),
     )
     new_fingerprint = _build_upload_source_fingerprint(
         [
@@ -4651,7 +4653,7 @@ def test_safe_multifile_whole_set_move_keeps_v1_and_published_tree(tmp_path: Pat
             _build_filing_original_asset_for_test(new_companion),
         ],
         source_kind=SourceKind.FILING,
-        filing_primary_original_name=filing_original_storage_name(new_primary),
+        primary_original_name=filing_original_storage_name(new_primary),
     )
     old_identities = {
         filing_original_storage_name(old_primary),
@@ -4738,7 +4740,7 @@ def test_old_v1_multifile_fingerprint_transitions_once_to_v2_and_then_skips(tmp_
     current_fingerprint = _build_upload_source_fingerprint(
         assets,
         source_kind=SourceKind.FILING,
-        filing_primary_original_name=filing_original_storage_name(primary),
+        primary_original_name=filing_original_storage_name(primary),
     )
     old_meta: dict[str, JsonValue] = {
         "document_version": "v1",
@@ -4803,7 +4805,7 @@ def test_old_v1_multifile_fingerprint_transitions_once_to_v2_and_then_skips(tmp_
     current_single = _build_upload_source_fingerprint(
         single_assets,
         source_kind=SourceKind.FILING,
-        filing_primary_original_name=filing_original_storage_name(primary),
+        primary_original_name=filing_original_storage_name(primary),
     )
     assert current_single.value == old_single_digest
     assert current_single.identical_skip_safe is True
@@ -5275,7 +5277,7 @@ def test_upload_helper_id_and_version_rules() -> None:
         fiscal_period="FY",
         amended=False,
     )
-    material_id, material_internal_id = build_material_ids(
+    identity = build_material_ids(document_id=None,
         form_type="MATERIAL_OTHER",
         material_name="Deck",
         fiscal_year=2024,
@@ -5287,8 +5289,8 @@ def test_upload_helper_id_and_version_rules() -> None:
     assert cn_ids_from_normalized_form == (cn_document_id, cn_internal_id)
     assert sec_document_id == "fil_sec_6aa496469a42491a41bcbfbe5dd2833e86b39e7b"
     assert sec_internal_id == "sec_6aa496469a42491a41bcbfbe5dd2833e86b39e7b"
-    assert material_id == material_internal_id
-    assert material_id.startswith("mat_")
+    assert identity.document_id == identity.internal_document_id
+    assert identity.document_id.startswith("mat_")
     assert derive_report_kind("FY") == "annual"
     assert derive_report_kind("H1") == "semi_annual"
     assert derive_report_kind("Q1") == "quarterly"
@@ -5311,19 +5313,8 @@ def test_upload_helper_id_and_version_rules() -> None:
         False,
         repair_disposition=NoExistingSourceRepair(),
     ) is False
-    assert validate_material_upload_ids(
-        stable_document_id="mat_a",
-        stable_internal_document_id="mat_a",
-        document_id=None,
-        internal_document_id=None,
-    ) == ("mat_a", "mat_a")
     with pytest.raises(ValueError, match="document_id"):
-        validate_material_upload_ids(
-            stable_document_id="mat_a",
-            stable_internal_document_id="mat_a",
-            document_id="mat_b",
-            internal_document_id=None,
-        )
+        build_material_ids(form_type="MATERIAL_OTHER", material_name="Deck", fiscal_year=2024, fiscal_period="FY", document_id="mat_b")
 
 
 def test_upload_source_fingerprint_is_stable() -> None:
@@ -5348,17 +5339,17 @@ def test_upload_source_fingerprint_is_stable() -> None:
         _PendingFileAsset("b.pdf", None, None, b"b", "application/pdf", "sha-b", 1, "original"),
     ]
 
-    expected_digest = "099dc9636e306c75f1d5d64dd0210123956ba73888e968088c7279baab1d7fdd"
+    expected_digest = "0fdb9598a4834742c8730e6001897b9bdd7b6e0728136ca6873642beda17a261"
 
     first_fingerprint = _build_upload_source_fingerprint(
         first,
         source_kind=SourceKind.MATERIAL,
-        filing_primary_original_name=None,
+        primary_original_name="a.pdf",
     )
     second_fingerprint = _build_upload_source_fingerprint(
         second,
         source_kind=SourceKind.MATERIAL,
-        filing_primary_original_name=None,
+        primary_original_name="a.pdf",
     )
 
     assert first_fingerprint.value == expected_digest
@@ -5386,7 +5377,7 @@ def test_filing_fingerprint_rejects_empty_original_assets(tmp_path: Path) -> Non
         _build_upload_source_fingerprint(
             [],
             source_kind=SourceKind.FILING,
-            filing_primary_original_name=filing_original_storage_name(primary),
+            primary_original_name=filing_original_storage_name(primary),
         )
 
 
@@ -5411,7 +5402,7 @@ def test_filing_fingerprint_rejects_missing_authoritative_primary(tmp_path: Path
         _build_upload_source_fingerprint(
             [asset],
             source_kind=SourceKind.FILING,
-            filing_primary_original_name=None,
+            primary_original_name=None,
         )
 
 
@@ -5441,12 +5432,12 @@ def test_filing_fingerprint_rejects_primary_without_exact_original_match(tmp_pat
         _build_upload_source_fingerprint(
             [asset],
             source_kind=SourceKind.FILING,
-            filing_primary_original_name=filing_original_storage_name(unmatched_primary),
+            primary_original_name=filing_original_storage_name(unmatched_primary),
         )
 
 
-def test_material_fingerprint_rejects_filing_primary(tmp_path: Path) -> None:
-    """material fingerprint 必须拒绝非法携带的 filing primary。
+def test_material_fingerprint_rejects_nonmember_primary(tmp_path: Path) -> None:
+    """material fingerprint 必须拒绝未精确命中任何原件的 primary。
 
     Args:
         tmp_path: pytest 临时目录，用于提供合法绝对 primary 路径。
@@ -5470,11 +5461,11 @@ def test_material_fingerprint_rejects_filing_primary(tmp_path: Path) -> None:
         source="original",
     )
 
-    with pytest.raises(ValueError, match="^material fingerprint 不得携带 filing primary$"):
+    with pytest.raises(ValueError, match="material primary 必须 exact"):
         _build_upload_source_fingerprint(
             [asset],
             source_kind=SourceKind.MATERIAL,
-            filing_primary_original_name=filing_original_storage_name(illegal_primary),
+            primary_original_name=filing_original_storage_name(illegal_primary),
         )
 
 

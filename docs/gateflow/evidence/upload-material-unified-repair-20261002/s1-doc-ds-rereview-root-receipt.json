@@ -1,0 +1,40 @@
+{
+  "setup_status": "ok",
+  "agent_status": "completed",
+  "tool_evidence": "yes",
+  "tool_trace": "complete",
+  "required_evidence": "complete",
+  "canary_status": "match",
+  "result_status": "accepted",
+  "warnings": [
+    "stderr exact unrecognized_model allowed warning.",
+    "Reviewer did not recompute all9765 manifest files, only manifest/selfdelta/protectedbeforeafter; root independently recomputed every9765 livefile now, drift0, supplies missing required identity check. Do not claim child did allhash. No gate pass until other reviewer terminal.",
+    {
+      "tool_indexes": [
+        7,
+        32
+      ],
+      "classification": "Conventional diff-u shows intended single-line delta (difference exit normally1, numeric not separately captured by Claude); new report collision lookup ls missing in compound command is expected. Author all-commands-exit0 statement not adopted as complete per-command numeric proof; full result trace reviewed, no unresolved critical read."
+    }
+  ],
+  "evidence_gaps": [],
+  "retry_class": "none",
+  "runtime": "claude",
+  "provider": "ds-flash",
+  "model": "deepseek-flash[1m]",
+  "label": "upload-material-unified-s1-doc-rereview-ds-flash-20261002-01",
+  "outer_exit": 0,
+  "outer_exit_source": "managed write_stdin77164 returned0",
+  "structured_events": 17652,
+  "tools": 36,
+  "num_turns": 37,
+  "review_artifact": "docs/reviews/code-review-20261002-231659.md",
+  "review_sha256": "064e11b9b6341d1af659c394b489a82608e83ca541940bb8e5b620c617705e41",
+  "root_manifest_allhash": 9765,
+  "root_manifest_drift": [],
+  "root_independent_proof": "Root prior fix audit exact single byte replacement/sourcebeforeafter/wholemodule nondocAST identical; pyright actualargv0; this review allfrozen9765 livehash checked. Real raw-value caller actualsource read unchanged.",
+  "finding_status": {
+    "US1-R03": "已修复"
+  },
+  "decision": "Evidence accepted; S1 gate waits MiMo."
+}

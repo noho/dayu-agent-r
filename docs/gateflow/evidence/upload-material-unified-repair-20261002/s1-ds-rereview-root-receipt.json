@@ -1,0 +1,131 @@
+{
+  "setup_status": "ok",
+  "agent_status": "completed",
+  "tool_evidence": "yes",
+  "tool_trace": "complete",
+  "required_evidence": "complete",
+  "canary_status": "match",
+  "result_status": "accepted",
+  "warnings": [
+    {
+      "tool_indexes": [
+        35,
+        36,
+        63
+      ],
+      "classification": "zsh unquoted echo === stopped one read. Actual prior/next source reads cover constructor/validate/naming; no lost necessary source."
+    },
+    {
+      "tool_indexes": [
+        58,
+        59
+      ],
+      "classification": "Incorrect own index base reported 93 missing; corrected repo base gives 93 hashes and18 exits. No source drift."
+    },
+    {
+      "tool_indexes": [
+        61,
+        63
+      ],
+      "classification": "Wrong HEAD comparison and parsing README as Python failed; correct oldsource=original S1 dirty freeze, six Python doc-stripped ASTs equal."
+    },
+    {
+      "tool_indexes": [
+        77,
+        78,
+        79,
+        80
+      ],
+      "classification": "Own probe included command body among comment lines, driver1; fixed own slice parser then driver0 all six probes. Initial combined raw trace preserved."
+    },
+    {
+      "tool_indexes": [
+        83,
+        89,
+        94
+      ],
+      "classification": "Missing activated venv PATH yielded 1 failed31pass2skip in existing generated-script test; new isolated correct PATH run32pass2skip0 and254pass0. Original failed ticket retained."
+    },
+    {
+      "tool_indexes": [
+        95,
+        96,
+        97
+      ],
+      "classification": "Wrong delivery field yielded86 false mismatch; inspecting sha256/size and correcting gives86/86 zero. Root independently recomputed."
+    },
+    {
+      "tool_indexes": [
+        112,
+        113
+      ],
+      "classification": "Attempt write outside own directory /tmp/now.txt sandbox denied; no file write/clobber succeeded. Direct git stdout recovered. Author 5-item no-other-nonzero claim is incomplete; root corrects here."
+    },
+    {
+      "classification": "stderr exact claude-code:unrecognized_model diagnostic accepted warning; actual init deepseek-flash[1m]."
+    },
+    {
+      "classification": "diff old/new exit1 is expected delta; content failure CLI1 and SIGINT130 are expected business outcomes, not test failures."
+    }
+  ],
+  "evidence_gaps": [],
+  "retry_class": "none",
+  "runtime": "claude",
+  "provider": "ds-flash",
+  "model": "deepseek-flash[1m]",
+  "label": "upload-material-unified-s1-rereview-ds-flash-20261002-01",
+  "outer_exit": 0,
+  "outer_exit_source": "managed write_stdin session41567 returned0 before context compaction",
+  "structured_events": 43166,
+  "tools": 114,
+  "num_turns": 115,
+  "output_sha256": "c31881b36bd1918666b936c0c4e005e505be765b262b22d01aefcb53cd227f96",
+  "review_artifact": "docs/reviews/code-review-20261002-223941.md",
+  "review_sha256": "fea995c15ba05260482ab373a6b130b2d1fd09527d2aab44fcc1ad7c6b9b28a7",
+  "frozen_files": 9704,
+  "frozen_drift": [],
+  "delivery_hashes": 86,
+  "probe_hashes": 93,
+  "probe_exits": 18,
+  "final_tests": {
+    "tests": 2178,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 3
+  },
+  "production_coverage": {
+    "dayu/fins/pipelines/docling_upload_service.py": 90.57851239669421,
+    "dayu/fins/pipelines/sec_upload_workflow.py": 94.73684210526316,
+    "dayu/fins/pipelines/sec_pipeline.py": 87.60504201680672,
+    "dayu/fins/pipelines/cn_pipeline.py": 94.60043196544277,
+    "dayu/fins/ingestion_runtime.py": 91.33305819232356,
+    "dayu/fins/upload_asset_plan.py": 89.55223880597015,
+    "dayu/fins/upload_usage_contract.py": 92.90780141843972,
+    "dayu/fins/upload_failure.py": 96.29629629629629,
+    "dayu/fins/upload_format_contract.py": 93.02325581395348,
+    "dayu/fins/upload_batch.py": 95.58359621451105,
+    "dayu/fins/domain/document_models.py": 94.65478841870824,
+    "dayu/fins/storage/source_meta_contract.py": 100.0,
+    "dayu/fins/storage/source_manifest_contract.py": 100.0,
+    "dayu/fins/storage/_fs_source_document_core.py": 86.06403013182674,
+    "dayu/fins/storage/_fs_source_integrity.py": 87.94567062818336,
+    "dayu/cli/arg_parsing.py": 96.82080924855491,
+    "dayu/cli/commands/fins.py": 88.62660944206009,
+    "dayu/fins/tools/upload_tools.py": 94.96402877697842,
+    "dayu/cli/upload_script.py": 93.37748344370861
+  },
+  "canary_tool_event": 1025,
+  "findings": {
+    "US1-R01": "已修复",
+    "US1-R02": "已修复",
+    "US1-T01": "回归保持"
+  },
+  "residual_decisions": {
+    "OSError_doc": "rejected-with-reason: Python3.11 Path.is_file reraises OSError unless _ignore_error, so doc claim of operational failure propagation remains accurate. Direct stdlib source inspected.",
+    "comment_copy": "rejected-with-reason: multiline comment prefixes are correct display shape; no machine consumer.",
+    "platform": "assigned to later work unit per explicit user deferral",
+    "campaign": "covered by later independent post-WU stage"
+  },
+  "scope": "Task evidence accepted; S1 gate still waits MiMo terminal and controller combined decision.",
+  "stderr_warning": "[claude-code:unrecognized_model] {\"model\":\"deepseek-flash[1m]\",\"query_source\":\"sdk\"}"
+}

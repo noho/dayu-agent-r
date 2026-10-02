@@ -1,0 +1,307 @@
+{
+  "setup_status": "ok",
+  "agent_status": "completed",
+  "result_status": "accepted",
+  "retry_class": "none",
+  "runtime": "codex",
+  "provider": "gpt-6-sol",
+  "model": "unknown",
+  "outer_exit": 0,
+  "canary_status": "match",
+  "required_evidence": "complete",
+  "events": 388,
+  "completed_commands": 184,
+  "warnings": [
+    {
+      "items": [
+        "item_58",
+        "item_134"
+      ],
+      "cause": "exploratory rg had no match or summary not yet emitted",
+      "recovery": "final owner/source reads and actual pytest-16 terminal verified"
+    },
+    {
+      "items": [
+        "item_83"
+      ],
+      "cause": "wrong observation locator",
+      "recovery": "item_85 actual observation_handle read, real observation/job assertions passed"
+    },
+    {
+      "items": [
+        "item_113"
+      ],
+      "cause": "report did not exist yet",
+      "recovery": "item_198 wrote report; final delivery SHA verified"
+    },
+    {
+      "items": [
+        "item_116",
+        "item_180"
+      ],
+      "cause": "asked for inner validation exit while in flight",
+      "recovery": "later actual exits in validation index verified; pytest-08 and pyright-11 both0"
+    },
+    {
+      "items": [
+        "item_139"
+      ],
+      "cause": "new-line trailing whitespace",
+      "recovery": "own changed lines cleaned, diffcheck-02 actual0 and root git diff --check0"
+    },
+    {
+      "items": [
+        "item_15",
+        "item_40",
+        "item_90",
+        "item_92",
+        "item_95",
+        "item_137",
+        "item_141"
+      ],
+      "cause": "compound exploratory reads used nonexistent locators; outer0 not evidence of success",
+      "recovery": "actual repository protocol/processors registry/asset_filename_contract and storage/default-read production paths used; no conclusion relies on missing files"
+    },
+    {
+      "items": [
+        "validation-index.json"
+      ],
+      "cause": "intermediate tests/type checks failed during same implementation pass",
+      "recovery": "all27 original双流/exit hashes retained; final pytest-16 2165passed/3skipped and pyright-11 0 independently verified"
+    }
+  ],
+  "raw_stream": "/private/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/sub-agents.th19JI/upload-material-unified-s1-implement-sol-20261002-01.jsonl",
+  "raw_stream_sha256": "e966e66cb0525bc2dee7528787256dc8ee5f2352ca8dc6975a3eb12bb57fa981",
+  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "scope": "implementation output accepted for code review; no slice/gate acceptance",
+  "protected_files": 9212,
+  "delivery_files": 38,
+  "captured_final_test_inputs": 47,
+  "validation_rounds": 27,
+  "cli_cases": 19,
+  "cli_artifacts": 76,
+  "testcases": 2168,
+  "passed": 2165,
+  "skipped": 3,
+  "pyright_errors": 0,
+  "coverage": [
+    {
+      "path": "dayu/fins/pipelines/docling_upload_service.py",
+      "source_sha256": "d544f47085fa2079f49db117dd48eeb5855ba61a2c75028eb4a8dda2c6f3389a",
+      "covered_lines": 548,
+      "num_statements": 605,
+      "percent_covered": 90.57851239669421,
+      "percent_covered_display": "91",
+      "missing_lines": 57,
+      "excluded_lines": 0,
+      "percent_statements_covered": 90.57851239669421,
+      "percent_statements_covered_display": "91"
+    },
+    {
+      "path": "dayu/fins/pipelines/sec_upload_workflow.py",
+      "source_sha256": "6516118c3663d5b9abc562c5e94c41a991e19252393f255e312f539790191ab6",
+      "covered_lines": 162,
+      "num_statements": 171,
+      "percent_covered": 94.73684210526316,
+      "percent_covered_display": "95",
+      "missing_lines": 9,
+      "excluded_lines": 22,
+      "percent_statements_covered": 94.73684210526316,
+      "percent_statements_covered_display": "95"
+    },
+    {
+      "path": "dayu/fins/pipelines/sec_pipeline.py",
+      "source_sha256": "5225081bd8b54d67e6ef96cb842497c75d27c19b5a361349e6a0e750a4dcd718",
+      "covered_lines": 417,
+      "num_statements": 476,
+      "percent_covered": 87.60504201680672,
+      "percent_covered_display": "88",
+      "missing_lines": 59,
+      "excluded_lines": 0,
+      "percent_statements_covered": 87.60504201680672,
+      "percent_statements_covered_display": "88"
+    },
+    {
+      "path": "dayu/fins/pipelines/cn_pipeline.py",
+      "source_sha256": "025cd553160f4031d01cf701b00b93ebc2e6dc2a4f69e7a65de25c99cd91ccdd",
+      "covered_lines": 438,
+      "num_statements": 463,
+      "percent_covered": 94.60043196544277,
+      "percent_covered_display": "95",
+      "missing_lines": 25,
+      "excluded_lines": 0,
+      "percent_statements_covered": 94.60043196544277,
+      "percent_statements_covered_display": "95"
+    },
+    {
+      "path": "dayu/fins/ingestion_runtime.py",
+      "source_sha256": "f2efe736d5d6895255b77f2ebd0bf60a85bbb049695a04ea5e3e1fed25dce7e7",
+      "covered_lines": 2213,
+      "num_statements": 2423,
+      "percent_covered": 91.33305819232356,
+      "percent_covered_display": "91",
+      "missing_lines": 210,
+      "excluded_lines": 35,
+      "percent_statements_covered": 91.33305819232356,
+      "percent_statements_covered_display": "91"
+    },
+    {
+      "path": "dayu/fins/upload_asset_plan.py",
+      "source_sha256": "b615c29f710d54c93b0a13ac3f85505c054cb3c3ee7826d6441c934f670de49c",
+      "covered_lines": 240,
+      "num_statements": 268,
+      "percent_covered": 89.55223880597015,
+      "percent_covered_display": "90",
+      "missing_lines": 28,
+      "excluded_lines": 0,
+      "percent_statements_covered": 89.55223880597015,
+      "percent_statements_covered_display": "90"
+    },
+    {
+      "path": "dayu/fins/upload_usage_contract.py",
+      "source_sha256": "dc1c309dcf68b505b9aed1d87dddbac06e878c5c6bbbb319f23837e2a1577004",
+      "covered_lines": 131,
+      "num_statements": 141,
+      "percent_covered": 92.90780141843972,
+      "percent_covered_display": "93",
+      "missing_lines": 10,
+      "excluded_lines": 0,
+      "percent_statements_covered": 92.90780141843972,
+      "percent_statements_covered_display": "93"
+    },
+    {
+      "path": "dayu/fins/upload_failure.py",
+      "source_sha256": "172b02ce6f9933fc81f58bdeb8f79ff9ca9edb9fefef3e5e6eae2141ffa787d5",
+      "covered_lines": 156,
+      "num_statements": 162,
+      "percent_covered": 96.29629629629629,
+      "percent_covered_display": "96",
+      "missing_lines": 6,
+      "excluded_lines": 0,
+      "percent_statements_covered": 96.29629629629629,
+      "percent_statements_covered_display": "96"
+    },
+    {
+      "path": "dayu/fins/upload_format_contract.py",
+      "source_sha256": "ab3cd1ed59e41e76dce2e98ddd0193646be0e05e8e678a2f29b70a91dc435e5a",
+      "covered_lines": 160,
+      "num_statements": 172,
+      "percent_covered": 93.02325581395348,
+      "percent_covered_display": "93",
+      "missing_lines": 12,
+      "excluded_lines": 0,
+      "percent_statements_covered": 93.02325581395348,
+      "percent_statements_covered_display": "93"
+    },
+    {
+      "path": "dayu/fins/upload_batch.py",
+      "source_sha256": "dd7a4b4f31b083a4f7456ac04fe4c1f2ba6876236863e0cad53ca1e000b0f581",
+      "covered_lines": 303,
+      "num_statements": 317,
+      "percent_covered": 95.58359621451105,
+      "percent_covered_display": "96",
+      "missing_lines": 14,
+      "excluded_lines": 0,
+      "percent_statements_covered": 95.58359621451105,
+      "percent_statements_covered_display": "96"
+    },
+    {
+      "path": "dayu/fins/domain/document_models.py",
+      "source_sha256": "c65c5bb724cf29c009d14dcbf5a87f24b5eb59a2f328551b20606b53cced4096",
+      "covered_lines": 425,
+      "num_statements": 449,
+      "percent_covered": 94.65478841870824,
+      "percent_covered_display": "95",
+      "missing_lines": 24,
+      "excluded_lines": 0,
+      "percent_statements_covered": 94.65478841870824,
+      "percent_statements_covered_display": "95"
+    },
+    {
+      "path": "dayu/fins/storage/source_meta_contract.py",
+      "source_sha256": "cb4383c8633884f72105baac5bb5af7ff48dba6fe1487ebd65aca2c6c3c8ee43",
+      "covered_lines": 19,
+      "num_statements": 19,
+      "percent_covered": 100.0,
+      "percent_covered_display": "100",
+      "missing_lines": 0,
+      "excluded_lines": 0,
+      "percent_statements_covered": 100.0,
+      "percent_statements_covered_display": "100"
+    },
+    {
+      "path": "dayu/fins/storage/source_manifest_contract.py",
+      "source_sha256": "177fcd4bffd96ed4dd8312b4f8d5724956e064f756205123711c75563ab1cead",
+      "covered_lines": 6,
+      "num_statements": 6,
+      "percent_covered": 100.0,
+      "percent_covered_display": "100",
+      "missing_lines": 0,
+      "excluded_lines": 0,
+      "percent_statements_covered": 100.0,
+      "percent_statements_covered_display": "100"
+    },
+    {
+      "path": "dayu/fins/storage/_fs_source_document_core.py",
+      "source_sha256": "eef1a7077414f6144bf027f9bfaf42969ceb8b679dfe9fbcb612b54d24f652ad",
+      "covered_lines": 457,
+      "num_statements": 531,
+      "percent_covered": 86.06403013182674,
+      "percent_covered_display": "86",
+      "missing_lines": 74,
+      "excluded_lines": 0,
+      "percent_statements_covered": 86.06403013182674,
+      "percent_statements_covered_display": "86"
+    },
+    {
+      "path": "dayu/fins/storage/_fs_source_integrity.py",
+      "source_sha256": "5fd951f039cb3eabc2e62a5c26a22875ecb5a859408b292c99c84fe24f729fcf",
+      "covered_lines": 518,
+      "num_statements": 589,
+      "percent_covered": 87.94567062818336,
+      "percent_covered_display": "88",
+      "missing_lines": 71,
+      "excluded_lines": 0,
+      "percent_statements_covered": 87.94567062818336,
+      "percent_statements_covered_display": "88"
+    },
+    {
+      "path": "dayu/cli/arg_parsing.py",
+      "source_sha256": "9083dc59bb7ec638fb5fcd0ac0658849b213282374f93a063616b4ab2751fcce",
+      "covered_lines": 335,
+      "num_statements": 346,
+      "percent_covered": 96.82080924855491,
+      "percent_covered_display": "97",
+      "missing_lines": 11,
+      "excluded_lines": 8,
+      "percent_statements_covered": 96.82080924855491,
+      "percent_statements_covered_display": "97"
+    },
+    {
+      "path": "dayu/cli/commands/fins.py",
+      "source_sha256": "3c16fd9884c87ffc1114fd4e1c6c5a62062d9cc083df9d96c8b7e034324a687b",
+      "covered_lines": 413,
+      "num_statements": 466,
+      "percent_covered": 88.62660944206009,
+      "percent_covered_display": "89",
+      "missing_lines": 53,
+      "excluded_lines": 0,
+      "percent_statements_covered": 88.62660944206009,
+      "percent_statements_covered_display": "89"
+    },
+    {
+      "path": "dayu/fins/tools/upload_tools.py",
+      "source_sha256": "190a4339380fc07d990e045ebf897ca4a5f967e23a3175fe921c8c5128768513",
+      "covered_lines": 132,
+      "num_statements": 139,
+      "percent_covered": 94.96402877697842,
+      "percent_covered_display": "95",
+      "missing_lines": 7,
+      "excluded_lines": 0,
+      "percent_statements_covered": 94.96402877697842,
+      "percent_statements_covered_display": "95"
+    }
+  ],
+  "report_sha256": "958f1d23acd438e8b36d791065a80f123598467bcb6ab2c0cd4e28263c8f2ab9",
+  "author_report_snapshot_note": "end-verification report hash is before report generation; final delivery-manifest hash958f is authoritative; all product/test/doc byte hashes match final delivery"
+}

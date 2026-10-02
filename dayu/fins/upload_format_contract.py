@@ -90,6 +90,7 @@ class FinsUploadFormatError(ValueError):
 
     kind: FinsUploadFormatFailureKind
     file_label: str
+    retry_hint: str
 
     def __init__(self, kind: FinsUploadFormatFailureKind, file_label: str) -> None:
         """初始化有界、去路径化的格式错误。
@@ -111,6 +112,7 @@ class FinsUploadFormatError(ValueError):
         validate_fins_public_file_label(file_label)
         self.kind = kind
         self.file_label = file_label
+        self.retry_hint = "请查看上传帮助中的支持格式后重试"
         super().__init__(_bounded_format_failure_message(kind, file_label=file_label))
 
 
@@ -548,7 +550,7 @@ class FinsUploadFormatTextProjection:
         material_files: material ``--files`` 的自足说明。
         upload_tool_files: 同时覆盖 filing 与 material 的工具字段说明。
         upload_tool_primary: 工具 ``primary`` 字段的自足说明。
-        upload_tool_material_primary_failure: material 携带 ``primary`` 时的工具失败说明。
+        material_primary: 材料主文件选择的自足说明。
 
     Raises:
         无。
@@ -559,7 +561,7 @@ class FinsUploadFormatTextProjection:
     material_files: str
     upload_tool_files: str
     upload_tool_primary: str
-    upload_tool_material_primary_failure: str
+    material_primary: str
 
 
 def _project_filing_primary_rules(
@@ -615,9 +617,11 @@ def project_fins_upload_format_text(
         files_label="files",
         primary_label="primary",
     )
-    upload_tool_material_primary_failure = (
-        "upload_kind=material 不得提供 primary；请省略 primary 字段"
+    material_primary = (
+        "单文件材料可省略 --primary，省略时唯一文件就是主文件；多文件材料必须恰好指定一个 --primary；"
+        "--primary 必须精确匹配 --files 中的一个路径；文件顺序不决定主文件。delete 必须省略 --files 和 --primary。"
     )
+    material_tool_primary = material_primary.replace("--primary", "primary").replace("--files", "files")
     filing_files = (
         "auto/create/update 必须至少提供一个文件。已选主文件必须实际转换成功；"
         f"filing 一次最多 {MAX_FILING_UPLOAD_FILES} 个文件；"
@@ -639,11 +643,11 @@ def project_fins_upload_format_text(
     return FinsUploadFormatTextProjection(
         filing_files=filing_files,
         filing_primary=filing_primary,
-        material_files=material_files,
+        material_files=material_files + material_primary,
         upload_tool_files=(
             f"upload_kind=filing 时，{filing_files}"
-            f"upload_kind=material 时，{material_files}"
-            "每个路径必须指向已存在、非空的普通文件。"
+            f"upload_kind=material 时，{material_files}{material_tool_primary}"
+            "每个路径必须指向已存在的普通文件。文件为空，无法上传；请提供非空文件后重试。"
             f"material 一次最多 {MAX_MATERIAL_UPLOAD_FILES} 个文件；不同路径的原件不能有相同完整文件名，"
             f"文件名也不能与工作区控制文件（{control_names}）或本批原件及转换结果冲突；"
             "大小写不同的文件名也可能冲突。"
@@ -651,11 +655,11 @@ def project_fins_upload_format_text(
             "例如 deck.txt 对应 deck.txt_docling.json；请在上传前避开这些冲突。"
         ),
         upload_tool_primary=(
-            f"仅用于 upload_kind=filing：{upload_tool_primary_rules}"
-            f"{upload_tool_material_primary_failure}。"
+            f"upload_kind=filing：{upload_tool_primary_rules}"
+            f"upload_kind=material：{material_tool_primary}"
             "primary 是用户选择的业务角色，不能根据质量、重要性或转换是否成功推断。"
         ),
-        upload_tool_material_primary_failure=upload_tool_material_primary_failure,
+        material_primary=material_primary,
     )
 
 

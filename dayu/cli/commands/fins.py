@@ -63,6 +63,7 @@ from dayu.fins.ingestion_runtime import (
     FinsUploadMaterialRequest,
     ValidatedFinsUploadMaterialRequest,
     admit_fins_upload_material_request,
+    validate_fins_upload_material_action_files,
     ValidatedFinsUploadFilingRequest,
 )
 from dayu.fins.upload_usage_contract import FinsUploadUsageError
@@ -469,7 +470,7 @@ def _upload_batch_regeneration_argv(
     :param ticker: 已规范化的用户 ticker CSV。
     :param source_dir: 用户 source directory。
     :param explicit_company_name: 用户显式 company name，不含 FMP 推断值。
-    :param material_form: 已规范化单一 material form 候选。
+    :param material_form: 保留原文的单一 material form 候选。
     :returns: 可安全写入注释的 argv。
     :raises Exception: 不主动抛出异常。
     """
@@ -1145,15 +1146,17 @@ def _prevalidate_upload_material_request(
 
     if args.command_name != COMMAND_UPLOAD_MATERIAL:
         return None
+    raw_files = tuple(Path(raw_file) for raw_file in args.files or ())
+    validate_fins_upload_material_action_files(args.action, raw_files)
     ticker = _parse_ticker_csv(args.ticker)
     request = FinsUploadMaterialRequest(
         ticker=ticker.canonical_ticker,
         action=args.action,
-        files=tuple(Path(raw_file) for raw_file in args.files or ()),
+        files=raw_files,
         form_type=_single_optional_form(args.forms),
-        material_name=_optional_stripped_text(args.material_name),
+        material_name=args.material_name,
         document_id=_optional_stripped_text(_single_document_id(args.document_id)),
-        internal_document_id=_optional_stripped_text(args.internal_document_id),
+        primary_selectors=tuple(Path(raw_selector) for raw_selector in args.primary or ()),
         fiscal_year=args.fiscal_year,
         fiscal_period=_optional_stripped_text(args.fiscal_period),
         amended=args.amended,
@@ -1164,12 +1167,7 @@ def _prevalidate_upload_material_request(
         overwrite=args.overwrite,
     )
     validated = admit_fins_upload_material_request(request)
-    checked_paths = (
-        tuple(normalize_upload_asset_path(path) for path in request.files)
-        if validated.request.action == "delete"
-        else validated.file_selection.files
-    )
-    _prevalidated_upload_paths(checked_paths)
+    _prevalidated_upload_paths(validated.file_selection.files)
     return validated
 
 
@@ -1208,6 +1206,8 @@ def _single_optional_form(values: list[str] | None) -> str | None:
     :raises CliFinsUsageError: 传入多个 form 时抛出。
     """
 
+    if values is not None and len(values) == 1 and "," not in values[0]:
+        return values[0]
     normalized = _normalized_text_tuple(values, field_name="--forms")
     if len(normalized) > 1:
         raise CliFinsUsageError(_MULTIPLE_MATERIAL_FORMS_MESSAGE)
@@ -1222,16 +1222,18 @@ def _single_batch_material_form(
     """读取 batch 可选单一 material form override。
 
     :param values: ``--material-forms`` 输入。
-    :returns: 规范化的单一 material form 候选；未传入时返回 ``None``。
-    :raises CliFinsUsageError: 传入多个 form 时抛出。
+    :returns: 保留原文的单一 material form 候选；未传入时返回 ``None``，规范化由身份 owner 完成。
+    :raises CliFinsUsageError: 任一逗号分隔项为空或纯空白，或传入多个 form 时抛出。
     """
 
-    normalized = _normalized_text_tuple(values, field_name="--material-forms")
-    if len(normalized) > 1:
-        raise CliFinsUsageError(_MULTIPLE_BATCH_MATERIAL_FORMS_MESSAGE)
-    if not normalized:
+    if values is None:
         return None
-    return normalized[0].upper()
+    raw_items = tuple(item for value in values for item in value.split(","))
+    if any(not item.strip() for item in raw_items):
+        raise CliFinsUsageError("--material-forms must not contain empty item")
+    if len(raw_items) > 1:
+        raise CliFinsUsageError(_MULTIPLE_BATCH_MATERIAL_FORMS_MESSAGE)
+    return next(iter(raw_items))
 
 
 def _document_ids_from_arg(raw_value: str | list[str] | None) -> tuple[str, ...]:

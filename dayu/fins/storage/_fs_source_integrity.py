@@ -20,7 +20,6 @@ from dayu.fins.domain.document_models import (
     FilingManifestItem,
     FinsIngestMethod,
     FinsSourceProvider,
-    MaterialManifestItem,
     SourceDocumentProvenance,
     SourceDocumentRevision,
 )
@@ -54,6 +53,8 @@ from .repository_protocols import (
     FilingUploadPublicationIdentity,
     SourceSnapshotFileDescriptor,
 )
+from .source_manifest_contract import project_material_manifest_item
+from .source_meta_contract import require_material_source_meta_primary_document
 from .source_integrity import (
     SourceIntegrityClassification,
     SourceIntegrityPreflightError,
@@ -899,6 +900,8 @@ def _classify_role_projection(
         declared_files=declared_files,
     )
     reasons: list[SourceIntegrityReason] = []
+    if source_kind is SourceKind.MATERIAL and primary is not None and not _is_declared_docling_primary(primary, declared_files):
+        primary = None
     if primary is None:
         reasons.append(SourceIntegrityReason.PRIMARY_PROJECTION_MISMATCH)
     is_user_upload_filing = (
@@ -960,6 +963,23 @@ def _classify_role_projection(
         reasons.append(SourceIntegrityReason.DERIVED_PROJECTION_MISMATCH)
     return _ordered_reasons(reasons)
 
+
+
+def _is_declared_docling_primary(primary: str, declared_files: tuple[_DeclaredSourceFile, ...]) -> bool:
+    """参数：exact 主源名与已解析声明；返回：是否精确命中 DOCLING 角色；异常：无，不读取文件。"""
+    return any(item.inspected.descriptor.name == primary and item.source == FILING_UPLOAD_ASSET_SOURCE_DOCLING
+               for item in declared_files)
+
+
+def validate_material_source_primary(*, source_meta: Mapping[str, JsonValue], source_directory: Path) -> None:
+    """参数：完整源声明与源目录；返回：无；异常：KeyError/ValueError 表示主源缺失、错角色或非法声明；不读取字节。"""
+    require_material_source_meta_primary_document(source_meta)
+    declared = _parse_declared_source_files(persisted_meta=source_meta, source_directory=source_directory)
+    if declared is None:
+        raise ValueError("材料文件声明不合法")
+    primary = _trusted_primary_document(persisted_meta=source_meta, declared_files=declared)
+    if primary is None or not _is_declared_docling_primary(primary, declared):
+        raise ValueError("材料主文件必须精确命中已声明的 Docling 文件")
 
 def _trusted_primary_document(
     *,
@@ -1238,7 +1258,7 @@ def _canonical_manifest_item(
     item = (
         FilingManifestItem.from_source_meta(persisted_meta).to_dict()
         if source_kind is SourceKind.FILING
-        else MaterialManifestItem.from_source_meta(persisted_meta).to_dict()
+        else project_material_manifest_item(persisted_meta).to_dict()
     )
     return cast(Mapping[str, JsonValue], item)
 

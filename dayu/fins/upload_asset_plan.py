@@ -87,11 +87,11 @@ class UploadAssetPlan:
 
     ordered_pairs: tuple[UploadAssetPair, ...]
     converter_pairs: tuple[UploadAssetPair, ...]
-    filing_primary_original_name: str | None
+    primary_original_name: str | None
     source_kind: SourceKind
 
     def __post_init__(self) -> None:
-        """构造时执行同一资产计划不变量校验。
+        """构造时执行同一纯资产计划不变量校验，不展开或解析路径。
 
         Args:
             无。
@@ -102,13 +102,12 @@ class UploadAssetPlan:
         Raises:
             TypeError: 来源类型、计划字段或资产项类型错误时抛出。
             ValueError: 来源类型、路径、名称、转换集合或主文件身份不一致时抛出。
-            OSError: 路径解析出现循环或底层操作失败时抛出。
         """
 
         self.validate()
 
     def validate(self) -> None:
-        """校验原件、转换输入与主文件身份，供构造和直接消费边界复用。
+        """纯校验原件、转换输入与主文件身份，不展开或解析路径，供构造和直接消费边界复用。
 
         Args:
             无。
@@ -119,34 +118,31 @@ class UploadAssetPlan:
         Raises:
             TypeError: 来源类型、计划字段或资产项类型错误时抛出。
             ValueError: 来源类型、路径、名称、转换集合或主文件身份不一致时抛出。
-            OSError: 路径解析出现循环或底层操作失败时抛出。
         """
 
         if not isinstance(self.ordered_pairs, tuple) or not isinstance(self.converter_pairs, tuple):
             raise TypeError("资产计划必须使用不可变的保序资产组")
         if not isinstance(self.source_kind, SourceKind):
             raise TypeError("资产计划 source kind 必须是 SourceKind")
-        if self.filing_primary_original_name is not None and not isinstance(
-            self.filing_primary_original_name, str
+        if self.primary_original_name is not None and not isinstance(
+            self.primary_original_name, str
         ):
-            raise TypeError("filing 主文件身份必须是字符串或 None")
+            raise TypeError("主文件身份必须是字符串或 None")
         if not self.ordered_pairs:
-            if self.converter_pairs or self.filing_primary_original_name is not None:
+            if self.converter_pairs or self.primary_original_name is not None:
                 raise ValueError("空资产计划不得携带转换输入或主文件")
             return
         if any(not isinstance(pair, UploadAssetPair) for pair in self.ordered_pairs + self.converter_pairs):
             raise TypeError("资产计划条目必须是 UploadAssetPair")
         filing = self.source_kind is SourceKind.FILING
-        if filing and self.filing_primary_original_name is None:
-            raise ValueError("filing 资产计划必须携带主文件身份")
-        if not filing and self.filing_primary_original_name is not None:
-            raise ValueError("material 资产计划不得携带 filing 主文件身份")
+        if self.primary_original_name is None:
+            raise ValueError("上传资产计划必须携带主文件身份")
         if not filing and len(self.ordered_pairs) > MAX_MATERIAL_UPLOAD_FILES:
             raise FinsUploadAssetPlanError(FinsUploadAssetPlanReason.TOO_MANY_FILES)
         seen_paths: set[Path] = set()
         seen_names: set[str] = set()
         for pair in self.ordered_pairs:
-            if not isinstance(pair.path, Path) or not pair.path.is_absolute() or normalize_upload_asset_path(pair.path) != pair.path:
+            if not isinstance(pair.path, Path) or not pair.path.is_absolute() or ".." in pair.path.parts:
                 raise ValueError("资产计划路径必须已规范化")
             expected_name = (
                 filing_original_storage_name(pair.path) if filing else pair.path.name
@@ -158,18 +154,89 @@ class UploadAssetPlan:
                 raise ValueError("资产计划原件身份重复")
             seen_paths.add(pair.path)
             seen_names.add(pair.original_name)
+        if not filing:
+            _validate_material_asset_names(tuple(enumerate(self.ordered_pairs)), None)
+        primary = tuple(
+            pair for pair in self.ordered_pairs
+            if pair.original_name == self.primary_original_name
+        )
+        if len(primary) != 1:
+            raise ValueError("主文件必须精确对应一个原件")
         if filing:
-            primary = tuple(
-                pair for pair in self.ordered_pairs
-                if pair.original_name == self.filing_primary_original_name
-            )
-            if len(primary) != 1 or self.converter_pairs != primary:
+            if self.converter_pairs != primary:
                 raise ValueError("filing 转换输入必须精确对应主文件")
         else:
-            _validate_material_asset_names(tuple(enumerate(self.ordered_pairs)), None)
             if self.converter_pairs != self.ordered_pairs:
                 raise ValueError("material 转换输入必须与原件保序一致")
 
+
+
+class UploadPrimarySelectionFailure(str, Enum):
+    """唯一主文件纯选择算法的五个封闭失败原因。"""
+
+    MISSING_FILES = "missing_files"
+    DUPLICATE_FILE_PATH = "duplicate_file_path"
+    MULTIPLE_PRIMARY_SELECTORS = "multiple_primary_selectors"
+    MISSING_MULTI_FILE_PRIMARY = "missing_multi_file_primary"
+    PRIMARY_NOT_IN_FILES = "primary_not_in_files"
+
+
+class UploadPrimaryDeleteFailure(str, Enum):
+    """删除请求不能声明主文件的独立原因。"""
+
+    PRIMARY_NOT_ALLOWED_FOR_DELETE = "primary_not_allowed_for_delete"
+
+
+class UploadPrimarySelectionError(ValueError):
+    """携带纯选择或删除组合错误，交由用法 owner 分类。"""
+
+    def __init__(self, reason: UploadPrimarySelectionFailure | UploadPrimaryDeleteFailure) -> None:
+        """参数：封闭原因；返回：无；异常：TypeError 表示原因类型不合法。"""
+        if not isinstance(reason, (UploadPrimarySelectionFailure, UploadPrimaryDeleteFailure)):
+            raise TypeError("主文件选择原因类型错误")
+        self.reason = reason
+        super().__init__(reason.value)
+
+
+class UploadPrimarySelectionPathError(ValueError):
+    """保留无法规范化的 selector 输入，不吞资产规划异常。"""
+
+    def __init__(self, input_path: Path) -> None:
+        """参数：原始选择路径；返回：无；异常：TypeError 表示路径类型错误。"""
+        if not isinstance(input_path, Path):
+            raise TypeError("主文件选择路径必须是 Path")
+        self.input_path = input_path
+        super().__init__("主文件选择路径无法解析")
+
+
+@dataclass(frozen=True, slots=True)
+class UploadPrimarySelection:
+    """从规范路径产生的 exact 主文件与保序随附文件。"""
+
+    primary: Path
+    companions: tuple[Path, ...]
+
+
+def project_upload_primary_selection(
+    *, files: tuple[Path, ...], primary_selectors: tuple[Path, ...],
+) -> UploadPrimarySelection | UploadPrimarySelectionFailure:
+    """参数：已规范文件与保留次数的选择路径；返回：唯一角色或封闭原因；异常：TypeError 表示形状错误。"""
+    if not isinstance(files, tuple) or not isinstance(primary_selectors, tuple):
+        raise TypeError("主文件选择要求 Path tuple")
+    if any(not isinstance(path, Path) for path in (*files, *primary_selectors)):
+        raise TypeError("主文件选择只接受 Path")
+    if not files:
+        return UploadPrimarySelectionFailure.MISSING_FILES
+    if has_duplicate_upload_asset_paths(files):
+        return UploadPrimarySelectionFailure.DUPLICATE_FILE_PATH
+    if len(primary_selectors) > 1:
+        return UploadPrimarySelectionFailure.MULTIPLE_PRIMARY_SELECTORS
+    if len(files) > 1 and not primary_selectors:
+        return UploadPrimarySelectionFailure.MISSING_MULTI_FILE_PRIMARY
+    primary = next(iter(primary_selectors)) if primary_selectors else next(iter(files))
+    if primary not in files:
+        return UploadPrimarySelectionFailure.PRIMARY_NOT_IN_FILES
+    return UploadPrimarySelection(primary, tuple(path for path in files if path != primary))
 
 def normalize_upload_asset_path(path: Path) -> Path:
     """将上传路径规范成绝对路径。
@@ -237,7 +304,7 @@ def has_duplicate_upload_asset_paths(paths: tuple[Path, ...]) -> bool:
 
 
 def filing_original_storage_name(normalized_path: Path) -> str:
-    """保持既有字节规则生成 filing 原件仓储身份。
+    """从已规范路径纯计算 filing 原件仓储身份，不再展开或解析路径。
 
     Args:
         normalized_path: 已解析的绝对文件路径。
@@ -248,12 +315,11 @@ def filing_original_storage_name(normalized_path: Path) -> str:
     Raises:
         TypeError: 输入不是 Path 时抛出。
         ValueError: 路径不是已规范化绝对路径时抛出。
-        OSError: 路径解析出现循环或底层操作失败时抛出。
     """
 
     if not isinstance(normalized_path, Path):
         raise TypeError("filing asset identity 输入必须是 Path")
-    if not normalized_path.is_absolute() or normalize_upload_asset_path(normalized_path) != normalized_path:
+    if not normalized_path.is_absolute() or ".." in normalized_path.parts:
         raise ValueError("filing asset identity 输入必须是 absolute normalized path")
     digest_input = (
         _FILING_ASSET_IDENTITY_NAMESPACE.encode("utf-8")
@@ -381,6 +447,7 @@ def plan_upload_assets(
     source_kind: SourceKind,
     operation: Literal["upsert", "delete"],
     files: tuple[Path, ...],
+    material_primary_selectors: tuple[Path, ...],
     filing_selection: FinsUploadFilingFiles | None = None,
 ) -> tuple[FinsUploadMaterialFiles | FinsUploadFilingFiles, UploadAssetPlan]:
     """一次规划 authoritative selection 和同一组原件/派生身份。
@@ -389,6 +456,7 @@ def plan_upload_assets(
         source_kind: filing 或 material。
         operation: 上游明确判定的资产操作模式。
         files: 保持输入顺序的原始 material 路径或 filing 路径。
+        material_primary_selectors: 保留次数的材料主文件选择路径；filing 显式传空 tuple。
         filing_selection: filing 已判角色的 authoritative selection。
 
     Returns:
@@ -404,6 +472,8 @@ def plan_upload_assets(
     if operation not in ("upsert", "delete"):
         raise ValueError("资产操作模式不受支持")
     if source_kind is SourceKind.FILING:
+        if material_primary_selectors:
+            raise ValueError("filing 不接受 material selector 参数")
         if filing_selection is None:
             raise ValueError("filing 必须携带 authoritative selection")
         if files != filing_selection.ordered_files:
@@ -431,6 +501,8 @@ def plan_upload_assets(
         raise ValueError("资产来源类型不受支持")
     if len(files) > MAX_MATERIAL_UPLOAD_FILES:
         raise FinsUploadAssetPlanError(FinsUploadAssetPlanReason.TOO_MANY_FILES)
+    if operation == "delete" and material_primary_selectors:
+        raise UploadPrimarySelectionError(UploadPrimaryDeleteFailure.PRIMARY_NOT_ALLOWED_FOR_DELETE)
     normalized_entries, invalid_entry = _normalize_material_upload_paths(files)
     if operation == "delete":
         if invalid_entry is not None:
@@ -446,9 +518,17 @@ def plan_upload_assets(
         original_name = path.name
         derived_name = docling_storage_name(SourceKind.MATERIAL, original_name)
         indexed_pairs.append((index, UploadAssetPair(path, original_name, derived_name)))
-    if invalid_entry is not None:
-        _validate_material_asset_names(tuple(indexed_pairs), invalid_entry)
+    _validate_material_asset_names(tuple(indexed_pairs), invalid_entry)
+    normalized_selectors: list[Path] = []
+    for selector in material_primary_selectors:
+        try:
+            normalized_selectors.append(normalize_upload_asset_path(selector))
+        except (OSError, ValueError) as exc:
+            raise UploadPrimarySelectionPathError(selector) from exc
+    projection = project_upload_primary_selection(files=normalized, primary_selectors=tuple(normalized_selectors))
+    if isinstance(projection, UploadPrimarySelectionFailure):
+        raise UploadPrimarySelectionError(projection)
     ordered_pairs = tuple(pair for _, pair in indexed_pairs)
-    plan = UploadAssetPlan(ordered_pairs, ordered_pairs, None, SourceKind.MATERIAL)
+    plan = UploadAssetPlan(ordered_pairs, ordered_pairs, projection.primary.name, SourceKind.MATERIAL)
     selection = FinsUploadMaterialFiles.from_upsert_paths(normalized)
     return selection, plan

@@ -2221,7 +2221,7 @@ def test_source_owner_material_update_delete_restore_replace_and_reset(tmp_path:
                 "source_provider": "user_upload",
                 "material_name": "Investor presentation",
             },
-            files=[file_meta],
+            file_entries=[{"name": "material-owner.txt", "uri": file_meta.uri, "size": file_meta.size, "sha256": file_meta.sha256, "source": "docling"}],
         ),
         SourceKind.MATERIAL,
         batch=create_batch,
@@ -6170,8 +6170,6 @@ def _create_complete_source(
             batch=batch,
             content_type="application/json",
         )
-        if source_kind is SourceKind.FILING
-        else None
     )
     file_entries = None
     files = [file_meta]
@@ -6663,7 +6661,7 @@ def test_source_integrity_classifies_published_staged_and_whole_tree(
         (
             "generic_declared_missing",
             SourceKind.MATERIAL,
-            (SourceIntegrityReason.DECLARED_FILE_MISSING,),
+            (SourceIntegrityReason.ORIGINAL_FILE_MISSING,),
         ),
         (
             "physical_size_mismatch",
@@ -7196,11 +7194,7 @@ def test_safe_hidden_metadata_preserves_source_publication(
             assert snapshot.revision == baseline.revision
             assert {item.name for item in snapshot.files} == {
                 f"{document_id}.txt",
-                *(
-                    (f"{document_id}.txt_docling.json",)
-                    if source_kind is SourceKind.FILING
-                    else ()
-                ),
+                f"{document_id}.txt_docling.json",
             }
             if materialize_files:
                 with snapshot.get_primary_source().open() as primary_stream:
@@ -7492,7 +7486,7 @@ def test_hidden_directory_enumeration_error_propagates_without_path(
     ("corruption", "expected_reason"),
     (
         ("content", SourceIntegrityReason.DIGEST_MISMATCH),
-        ("missing", SourceIntegrityReason.DECLARED_FILE_MISSING),
+        ("missing", SourceIntegrityReason.PRIMARY_DOCLING_FILE_MISSING),
         ("symlink", SourceIntegrityReason.UNSAFE_FILESYSTEM_ENTRY),
         ("fifo", SourceIntegrityReason.UNSAFE_FILESYSTEM_ENTRY),
     ),
@@ -7536,7 +7530,10 @@ def test_declared_dotfile_remains_a_business_source_file(
             ticker="AAPL", document_id=document_id, internal_document_id=document_id,
             form_type="EX-99", primary_document=filename,
             meta={"ingest_method": "upload", "source_provider": "user_upload"},
-            files=[file_meta],
+            file_entries=[{"name": filename, "uri": file_meta.uri, "etag": file_meta.etag,
+                           "last_modified": file_meta.last_modified, "size": file_meta.size,
+                           "content_type": file_meta.content_type, "sha256": file_meta.sha256, "source": "docling",
+                           "original_filename": filename, "derived_from": filename}],
         ),
         SourceKind.MATERIAL,
         batch=batch,

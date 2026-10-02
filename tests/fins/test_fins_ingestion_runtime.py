@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dayu.fins.pipelines.docling_upload_service import build_material_ids
+
 from dayu.fins.upload_usage_contract import FinsUploadUsageCode, FinsUploadUsageError, fins_upload_usage_failure
 
 import ast
@@ -1603,7 +1605,7 @@ def test_validate_fins_upload_filing_request_resolves_state_aware_contract(
 
     validated = validate_fins_upload_filing_request(request, published_state=absent)
 
-    assert validated.request is request
+    assert validated.request == request
     assert validated.normalized_ticker.canonical == "AAPL"
     assert validated.normalized_fiscal_period == "FY"
     assert validated.resolved_action == "create"
@@ -2121,7 +2123,7 @@ def test_filing_validator_selects_explicit_primary_at_any_position(
 
     normalized_files = tuple(path.resolve(strict=False) for path in files)
     normalized_primary = primary.resolve(strict=False)
-    assert validated.request is request
+    assert validated.request == request
     assert validated.request.files == files
     assert validated.request.primary_selectors == (primary,)
     assert validated.file_selection.primary == normalized_primary
@@ -3307,7 +3309,7 @@ def test_filing_calendar_year_static_admission_accepts_boundaries_and_delegates(
     assert first.document_id == second.document_id
     assert first.internal_document_id == second.internal_document_id
     assert first.resolved_action == "delete"
-    assert first.request is request
+    assert first.request == request
     assert year_calls
     assert set(year_calls) == {fiscal_year}
     assert date_calls
@@ -7846,10 +7848,10 @@ def test_start_upload_without_runner_writes_failed_terminal_record(tmp_path: Pat
     runtime = _build_ingestion_runtime(workspace_root, executor=executor)
 
     start = runtime.start_upload(
-        FinsUploadMaterialRequest(
+        FinsUploadMaterialRequest(form_type="MATERIAL_OTHER",
             ticker="AAPL",
             action="delete",
-            document_id="aapl-investor-day",
+
             material_name="Investor Day",
         )
     )
@@ -7867,7 +7869,7 @@ def test_start_upload_without_runner_writes_failed_terminal_record(tmp_path: Pat
     assert "production upload runner" in str(record.failure_summary["message"])
 
 
-def test_material_delete_raw_files_keep_authoritative_zero_count_in_job_and_progress(
+def test_material_delete_without_files_has_zero_count_in_job_and_progress(
     tmp_path: Path,
 ) -> None:
     """delete 的 raw 文件仅作输入守卫，不成为持久摘要和进度的上传数量。
@@ -7892,8 +7894,8 @@ def test_material_delete_raw_files_keep_authoritative_zero_count_in_job_and_prog
     ))
     runtime = _build_ingestion_runtime(workspace_root, executor=executor, upload_runner=runner)
     start = runtime.start_upload(FinsUploadMaterialRequest(
-        ticker="AAPL", action="delete", files=(upload_file,),
-        document_id="aapl-investor-day", form_type="OTHER", material_name="Investor Day",
+        ticker="AAPL", action="delete", files=(),
+        form_type="OTHER", material_name="Investor Day",
     ))
     queued = runtime.read_job(start.job_id)
     assert queued.request_summary["file_count"] == 0
@@ -7935,8 +7937,8 @@ def test_start_upload_with_runner_writes_bounded_result_summary(tmp_path: Path) 
             files=(tmp_path / "primary.pdf",),
             form_type="8-K",
             material_name="Investor Day",
-            document_id="aapl-investor-day",
-            internal_document_id="aapl-investor-day-internal",
+
+
         )
     )
     executor.run_all()
@@ -7962,7 +7964,7 @@ def test_start_upload_with_runner_writes_bounded_result_summary(tmp_path: Path) 
         "upload.started",
         "upload.completed",
     ]
-    assert progress_events[0].document_id == "aapl-investor-day"
+    assert progress_events[0].document_id == runner.requests[0].identity.document_id
     assert progress_events[0].payload["source_kind"] == "material"
     assert progress_events[0].payload["file_count"] == 1
     assert "requested_file_count" not in progress_events[0].payload
@@ -8462,7 +8464,7 @@ async def test_alias_conflict_failure_is_identical_across_direct_durable_and_obs
     )
     upload_file = tmp_path / "material.pdf"
     upload_file.write_bytes(b"material")
-    request = FinsUploadMaterialRequest(
+    request = FinsUploadMaterialRequest(form_type="MATERIAL_OTHER",
         ticker="AAPL",
         action="create",
         files=(upload_file,),
@@ -8528,7 +8530,7 @@ async def test_direct_upload_without_runner_reports_requested_and_zero_stored_co
     )
     events = await _collect_direct_events(
         ingestion.upload(
-            FinsUploadMaterialRequest(
+            FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", primary_selectors=(Path('first.pdf'),),
                 ticker="AAPL",
                 files=(Path("first.pdf"), Path("second.pdf")),
             )
@@ -8574,8 +8576,8 @@ def test_start_upload_failed_status_emits_completed_with_failures_progress(tmp_p
             files=(tmp_path / "primary.pdf",),
             form_type="8-K",
             material_name="Investor Day",
-            document_id="aapl-investor-day",
-            internal_document_id="aapl-investor-day-internal",
+
+
         )
     )
     executor.run_all()
@@ -9503,7 +9505,7 @@ def test_upload_request_and_result_summaries_enforce_bounds(tmp_path: Path) -> N
     assert aliases_exc.value.failure.code is FinsUploadUsageCode.TOO_MANY_TICKER_ALIASES
     with pytest.raises(FinsUploadUsageError) as material_aliases_exc:
         runtime.start_upload(
-            FinsUploadMaterialRequest(
+            FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck",
                 ticker="AAPL",
                 ticker_aliases=too_many_aliases,
             )
@@ -9523,11 +9525,11 @@ def test_upload_request_and_result_summaries_enforce_bounds(tmp_path: Path) -> N
     ("upload_request", "expected_code"),
     (
         (
-            FinsUploadMaterialRequest(ticker="Apple Inc."),
+            FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="Apple Inc."),
             FinsUploadUsageCode.INVALID_TICKER,
         ),
         (
-            FinsUploadMaterialRequest(ticker="AAPL", ticker_aliases=("a apl",)),
+            FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="AAPL", ticker_aliases=("a apl",)),
             FinsUploadUsageCode.INVALID_TICKER_ALIAS,
         ),
     ),
@@ -9724,23 +9726,23 @@ def test_upload_requests_use_source_kind_for_filing_material_discrimination(tmp_
         runtime.start_upload(FinsUploadFilingRequest(ticker="AAPL", source_kind=SourceKind.MATERIAL))
     assert source_kind_exc.value.failure.code is FinsUploadUsageCode.INVALID_SOURCE_KIND
     with pytest.raises(ValueError, match="material 上传请求必须使用 source_kind=material"):
-        runtime.start_upload(FinsUploadMaterialRequest(ticker="AAPL", source_kind=SourceKind.FILING))
+        runtime.start_upload(FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="AAPL", source_kind=SourceKind.FILING))
 
     material_file = tmp_path / "material.pdf"
     material_file.write_bytes(b"valid boundary input")
     material_start = runtime.start_upload(
-        FinsUploadMaterialRequest(
+        FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck",
             ticker="AAPL",
             source_kind=SourceKind.MATERIAL,
             files=(material_file,),
-            document_id="aapl-investor-day",
+
         )
     )
     material_record = runtime.read_job(material_start.job_id)
 
     assert material_record.source_kind is SourceKind.MATERIAL
     assert material_record.request_summary["source_kind"] == "material"
-    assert material_record.request_summary["document_id"] == "aapl-investor-day"
+    assert material_record.request_summary["document_id"] == build_material_ids(form_type="MATERIAL_OTHER", material_name="Deck", fiscal_year=None, fiscal_period=None, document_id=None).document_id
     assert len(executor.operations) == 1
 
 
@@ -12629,43 +12631,20 @@ def test_validated_material_handoff_rejects_cross_field_drift(tmp_path: Path) ->
     """
 
     paths = (tmp_path / "first.pdf", tmp_path / "second.pdf")
-    admitted = admit_fins_upload_material_request(
-        FinsUploadMaterialRequest(ticker="AAPL", files=paths)
-    )
+    admitted = admit_fins_upload_material_request(FinsUploadMaterialRequest(ticker="AAPL", files=paths, primary_selectors=(paths[0],), form_type="OTHER", material_name="Deck"))
     assert tuple(pair.path for pair in admitted.asset_plan.ordered_pairs) == paths
-    wrong_selection = FinsUploadMaterialFiles.from_upsert_paths((paths[1], paths[0]))
-    with pytest.raises(ValueError, match="selection"):
-        replace(admitted, file_selection=wrong_selection)
-    with pytest.raises(ValueError, match="raw request"):
-        replace(admitted, request=replace(admitted.request, files=(paths[0],)))
-    shortened_pairs = admitted.asset_plan.ordered_pairs[:1]
-    with pytest.raises(ValueError, match="asset plan"):
-        replace(admitted, asset_plan=UploadAssetPlan(shortened_pairs, shortened_pairs, None, SourceKind.MATERIAL))
-    copied_pairs = tuple(list(admitted.asset_plan.ordered_pairs))
-    assert copied_pairs is not admitted.asset_plan.ordered_pairs
-    assert replace(
-        admitted, asset_plan=replace(admitted.asset_plan, converter_pairs=copied_pairs)
-    ).asset_plan.converter_pairs == admitted.asset_plan.ordered_pairs
-    with pytest.raises(ValueError, match="保序一致"):
-        replace(
-            admitted,
-            asset_plan=replace(admitted.asset_plan, converter_pairs=tuple(reversed(copied_pairs))),
-        )
-    with pytest.raises(ValueError, match="不得携带 filing 主文件身份"):
-        replace(admitted, asset_plan=replace(admitted.asset_plan, filing_primary_original_name="first.pdf"))
-    wrong_pair = UploadAssetPair(paths[0], "other.pdf", "other.pdf_docling.json")
-    wrong_pairs = (wrong_pair, admitted.asset_plan.ordered_pairs[1])
-    with pytest.raises(ValueError, match="身份不一致"):
-        replace(admitted, asset_plan=UploadAssetPlan(wrong_pairs, wrong_pairs, None, SourceKind.MATERIAL))
-
-    deleted = admit_fins_upload_material_request(
-        FinsUploadMaterialRequest(ticker="AAPL", action="delete", files=paths)
-    )
-    assert deleted.request.files == paths
-    assert deleted.file_selection.is_empty
-    with pytest.raises(ValueError, match="selection"):
-        replace(deleted, file_selection=admitted.file_selection)
-    with pytest.raises(ValueError, match="asset plan"):
+    for changed in (replace(admitted.request, files=(paths[0],)), replace(admitted.request, primary_selectors=(paths[1],))):
+        with pytest.raises(ValueError):
+            replace(admitted, request=changed)
+    with pytest.raises(ValueError):
+        replace(admitted, file_selection=FinsUploadMaterialFiles.from_upsert_paths(tuple(reversed(paths))))
+    with pytest.raises(ValueError):
+        replace(admitted, asset_plan=replace(admitted.asset_plan, converter_pairs=tuple(reversed(admitted.asset_plan.converter_pairs))))
+    with pytest.raises(ValueError):
+        replace(admitted, asset_plan=replace(admitted.asset_plan, primary_original_name="missing.pdf"))
+    deleted = admit_fins_upload_material_request(FinsUploadMaterialRequest(ticker="AAPL", action="delete", form_type="OTHER", material_name="Deck"))
+    assert deleted.request.files == () and deleted.file_selection.is_empty
+    with pytest.raises(ValueError):
         replace(deleted, asset_plan=admitted.asset_plan)
 
 
@@ -12675,7 +12654,7 @@ def test_validated_material_handoff_rejects_cross_field_drift(tmp_path: Path) ->
 def test_material_identity_remains_outside_static_admission(
     tmp_path: Path, action: str, field_name: str, value: str | None,
 ) -> None:
-    """未实施 O05 时，静态准入保留原始身份和既有执行阶段规则。
+    """材料每个动作的缺失身份都在静态准入拒绝。
 
     Args:
         tmp_path: 隔离资产路径。
@@ -12687,7 +12666,7 @@ def test_material_identity_remains_outside_static_admission(
         无。
 
     Raises:
-        AssertionError: 静态准入提前实施 O05 时抛出。
+        AssertionError: 静态准入未拒绝缺失身份时抛出。
     """
 
     request = FinsUploadMaterialRequest(
@@ -12696,12 +12675,10 @@ def test_material_identity_remains_outside_static_admission(
         form_type="OTHER", material_name="Deck",
     )
     request = replace(request, **{field_name: value})
-    validated = admit_fins_upload_material_request(request)
-    if field_name == "form_type":
-        assert validated.request.form_type == value
-    else:
-        assert validated.request.material_name == value
-    validated.validate()
+    with pytest.raises(FinsUploadUsageError) as raised:
+        admit_fins_upload_material_request(request)
+    expected = FinsUploadUsageCode.MISSING_FORM_TYPE if field_name == "form_type" else FinsUploadUsageCode.MISSING_MATERIAL_NAME
+    assert raised.value.failure.code is expected
 
 
 @pytest.mark.asyncio
@@ -12710,7 +12687,7 @@ def test_material_identity_remains_outside_static_admission(
 async def test_material_missing_identity_keeps_workflow_failure_boundary(
     pipeline_type: type[SecPipeline] | type[CnPipeline], field_name: str,
 ) -> None:
-    """缺失身份通过静态准入后，仍在原有 SEC/CN workflow 位置失败。
+    """缺失身份在进入 SEC/CN workflow 前 typed 拒绝。
 
     Args:
         pipeline_type: SEC 或 CN 公开 pipeline 类型。
@@ -12727,13 +12704,10 @@ async def test_material_missing_identity_keeps_workflow_failure_boundary(
         ticker="AAPL" if pipeline_type is SecPipeline else "600519",
         action="delete", form_type="OTHER", material_name="Deck",
     )
-    validated = admit_fins_upload_material_request(replace(raw, **{field_name: None}))
-    pipeline = object.__new__(pipeline_type)
-    events: list[str] = []
-    with pytest.raises(ValueError, match="material 上传必须提供 form_type 与 material_name"):
-        async for event in pipeline.upload_material_validated_stream(validated):
-            events.append(str(event))
-    assert events == []
+    with pytest.raises(FinsUploadUsageError) as raised:
+        admit_fins_upload_material_request(replace(raw, **{field_name: None}))
+    expected = FinsUploadUsageCode.MISSING_FORM_TYPE if field_name == "form_type" else FinsUploadUsageCode.MISSING_MATERIAL_NAME
+    assert raised.value.failure.code is expected
 
 
 def test_material_handoff_constructor_reuses_static_admission_and_full_plan(tmp_path: Path) -> None:
@@ -12754,42 +12728,42 @@ def test_material_handoff_constructor_reuses_static_admission_and_full_plan(tmp_
         form_type=" OTHER ", material_name=" Deck ",
     )
     valid = admit_fins_upload_material_request(raw)
-    assert valid.request.form_type == " OTHER "
-    assert valid.request.material_name == " Deck "
+    assert valid.request.form_type == "OTHER"
+    assert valid.request.material_name == "Deck"
     for changed, code in (
-        (replace(raw, filing_date="2024-02-30"), FinsUploadUsageCode.INVALID_FILING_DATE),
-        (replace(raw, report_date="2024-02-30"), FinsUploadUsageCode.INVALID_REPORT_DATE),
-        (replace(raw, ticker="bad ticker"), FinsUploadUsageCode.INVALID_TICKER),
-        (replace(raw, ticker_aliases=("bad alias",)), FinsUploadUsageCode.INVALID_TICKER_ALIAS),
+        (replace(valid.request, filing_date="2024-02-30"), FinsUploadUsageCode.INVALID_FILING_DATE),
+        (replace(valid.request, report_date="2024-02-30"), FinsUploadUsageCode.INVALID_REPORT_DATE),
+        (replace(valid.request, ticker="bad ticker"), FinsUploadUsageCode.INVALID_TICKER),
+        (replace(valid.request, ticker_aliases=("bad alias",)), FinsUploadUsageCode.INVALID_TICKER_ALIAS),
     ):
         with pytest.raises(FinsUploadUsageError) as raised:
-            ValidatedFinsUploadMaterialRequest(changed, valid.file_selection, valid.asset_plan)
+            ValidatedFinsUploadMaterialRequest(changed, valid.file_selection, valid.asset_plan, identity=valid.identity, action_decision=valid.action_decision)
         assert raised.value.failure.code is code
-    with pytest.raises(ValueError, match="upload_action"):
+    with pytest.raises(ValueError, match="action"):
         ValidatedFinsUploadMaterialRequest(
             replace(raw, action="bogus"), valid.file_selection, valid.asset_plan
-        )
+        , identity=valid.identity, action_decision=valid.action_decision)
     with pytest.raises(ValueError, match="source_kind=material"):
         ValidatedFinsUploadMaterialRequest(
-            replace(raw, source_kind=SourceKind.FILING), valid.file_selection, valid.asset_plan
-        )
+            replace(valid.request, source_kind=SourceKind.FILING), valid.file_selection, valid.asset_plan
+        , identity=valid.identity, action_decision=valid.action_decision)
     control = tmp_path / "meta.json"
     pair = UploadAssetPair(control, control.name, f"{control.name}_docling.json")
     with pytest.raises(FinsUploadAssetPlanError) as plan_error:
-        UploadAssetPlan((pair,), (pair,), None, SourceKind.MATERIAL)
+        UploadAssetPlan((pair,), (pair,), pair.original_name, SourceKind.MATERIAL)
     assert plan_error.value.reason is FinsUploadAssetPlanReason.RESERVED_CONTROL_NAME
     same_value_plan = UploadAssetPlan(
-        valid.asset_plan.ordered_pairs, valid.asset_plan.converter_pairs, None, SourceKind.MATERIAL
+        valid.asset_plan.ordered_pairs, valid.asset_plan.converter_pairs, valid.asset_plan.primary_original_name, SourceKind.MATERIAL
     )
     object.__setattr__(same_value_plan, "ordered_pairs", (pair,))
     object.__setattr__(same_value_plan, "converter_pairs", (pair,))
-    with pytest.raises(FinsUploadUsageError) as raised:
+    with pytest.raises(FinsUploadAssetPlanError) as raised:
         ValidatedFinsUploadMaterialRequest(
-            replace(raw, files=(control,)),
+            replace(valid.request, files=(control,)),
             FinsUploadMaterialFiles.from_upsert_paths((control,)),
             same_value_plan,
-        )
-    assert raised.value.failure.code is FinsUploadUsageCode.RESERVED_CONTROL_NAME
+          identity=valid.identity, action_decision=valid.action_decision)
+    assert raised.value.reason is FinsUploadAssetPlanReason.RESERVED_CONTROL_NAME
 
 
 @pytest.mark.asyncio

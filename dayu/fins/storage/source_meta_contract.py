@@ -32,4 +32,15 @@ def require_source_meta_is_deleted(source_meta: Mapping[str, JsonValue]) -> bool
     return is_deleted
 
 
-__all__ = ["require_source_meta_is_deleted"]
+_PRIMARY_DOCUMENT_FIELD: Final[str] = "primary_document"
+
+
+def require_material_source_meta_primary_document(meta: Mapping[str, JsonValue]) -> str:
+    """参数：材料源元数据；返回：必填非空主文件名；异常：KeyError 缺字段，ValueError 表示类型或空值错误。"""
+    primary = meta[_PRIMARY_DOCUMENT_FIELD]
+    if not isinstance(primary, str) or not primary.strip():
+        raise ValueError("material primary_document 必须是非空文本")
+    return primary
+
+
+__all__ = ["require_source_meta_is_deleted", "require_material_source_meta_primary_document"]

@@ -37,7 +37,7 @@
 ## 当前 gate / 下一入口
 
 - goal confirmation：沿用户已明确批准范围及最新排程纠正确认；本文件固定边界。
-- current gate / next entry：accepted plan commit。修后计划SHA `c99c35adba919a8baf371b0142e0ab1abf256a951e89b2fc15e8a2d38988e8ea`已同版MiMo/ds-flash re-review pass并总控逐项核收，详`upload-material-unified-plan-rereview-root-adjudication-20261002.md`。全部旧plan accepted findings已修；UP-RR-T01明确归S3必要技术采集器，真实验收前必须修完。创建本gate protected local checkpoint后立即S1一次完整implementation pass，S2/S3尚未实施。产品标准install/CLI/coverage仍S3，完整campaign/registry仍WU后。
+- current gate / next entry：accepted slice commit S1 → implementation S2。accepted plan checkpoint `6c49f818efd5a11b4dbd91d9a44f3bcfb2c01e58`、计划SHA `c99c35adba919a8baf371b0142e0ab1abf256a951e89b2fc15e8a2d38988e8ea` 不变；S1全部11标签与US1-T01/R01/R02/R03实施/fix/同版双复审/root直接核收已闭环，最终2175pass/3skip/fullpyright0/19prod≥80，最后doc-only新fulltype0，见 `upload-material-unified-s1-final-root-adjudication-20261002.md`。下一自动创建S1 checkpoint并集中一次S2实施；S2/S3尚未实施。UP-RR-T01须S3验收前修。所有slice+aggregate后正式PR197review，完整campaign/registry修WU后。
 
 - planreview 必须挑战切片成本、机械拆分、可合并性与 future-slice 漂移；默认避免超过 3 slices，超过须直接理由。
 - 所有成立新修复即时写 artifact/控制表；accepted finding 必须已修并经复审才通过。普通 gate 通过后继续固定顺序，不因 gate 完成停机。

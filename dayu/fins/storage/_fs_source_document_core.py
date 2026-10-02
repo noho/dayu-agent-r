@@ -36,7 +36,10 @@ from dayu.fins.domain.enums import SourceKind
 from dayu.fins.xbrl_file_discovery import has_xbrl_instance
 
 from .local_file_source import LocalFileSource
+from .source_manifest_contract import project_material_manifest_item
+from .source_meta_contract import require_material_source_meta_primary_document
 from ._fs_source_integrity import (
+    validate_material_source_primary,
     _SOURCE_REVISION_META_FIELD,
     _SourceKindPublicationInspection,
     _inspect_source_kind_unguarded,
@@ -1114,6 +1117,8 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             document_id=external_document_id,
             source_kind=normalized_source_kind,
         )
+        if normalized_source_kind is SourceKind.MATERIAL:
+            validate_material_source_primary(source_meta=normalized_meta, source_directory=meta_path.parent)
         _write_json(meta_path, normalized_meta)
 
         if normalized_source_kind == SourceKind.FILING:
@@ -1124,7 +1129,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         else:
             self._upsert_material_manifest(
                 state,
-                [MaterialManifestItem.from_source_meta(normalized_meta)],
+                [project_material_manifest_item(normalized_meta)],
             )
 
     def list_documents(self, ticker: str, query: DocumentQuery) -> list[DocumentSummary]:
@@ -1642,6 +1647,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             主文件元数据。
 
         Raises:
+            KeyError: material 元数据缺少必填 primary_document 时抛出。
             FileNotFoundError: 主文件无法定位时抛出。
             ValueError: 元数据格式非法时抛出。
             RuntimeFileLockError: publication guard 获取或释放失败时抛出。
@@ -1665,6 +1671,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             主文件元数据。
 
         Raises:
+            KeyError: material 元数据缺少必填 primary_document 时抛出。
             FileNotFoundError: source 或主文件无法定位时抛出。
             ValueError: meta 内容非法时抛出。
         """
@@ -1675,13 +1682,22 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             raise ValueError("meta.files 必须为 list")
         if not files:
             raise FileNotFoundError("源文档未绑定文件，无法定位主文件")
-        primary_name = str(meta.get("primary_document", "")).strip()
-        if not primary_name:
-            raise FileNotFoundError("源文档 primary_document 不能为空")
+        source_kind = _normalize_source_kind(handle.source_kind)
+        if source_kind is SourceKind.MATERIAL:
+            primary_name = require_material_source_meta_primary_document(meta)
+            source_directory = self._source_meta_path_for_read(
+                handle.ticker, handle.document_id, source_kind
+            ).parent
+            validate_material_source_primary(source_meta=meta, source_directory=source_directory)
+        else:
+            primary_name = str(meta.get("primary_document", "")).strip()
+            if not primary_name:
+                raise FileNotFoundError("源文档 primary_document 不能为空")
         for item in files:
             if not isinstance(item, dict):
                 continue
-            name = str(item.get("name") or _infer_filename_from_uri(item.get("uri", ""))).strip()
+            name = (item["name"] if source_kind is SourceKind.MATERIAL else
+                    str(item.get("name") or _infer_filename_from_uri(item.get("uri", ""))).strip())
             if name == primary_name:
                 return _file_object_meta_from_dict(item)
         raise FileNotFoundError("源文档 primary_document 未命中 files")
@@ -1786,6 +1802,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             Source 抽象。
 
         Raises:
+            KeyError: material 元数据缺少必填 primary_document 时抛出。
             FileNotFoundError: 文档或主文件不存在时抛出。
             ValueError: 文件元数据非法时抛出。
             RuntimeFileLockError: publication guard 获取或释放失败时抛出。
@@ -1901,6 +1918,8 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             source_kind=source_kind,
         )
 
+        if source_kind is SourceKind.MATERIAL:
+            validate_material_source_primary(source_meta=merged_meta, source_directory=meta_path.parent)
         _write_json(meta_path, merged_meta)
 
         if source_kind == SourceKind.FILING:
@@ -1911,7 +1930,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         else:
             self._upsert_material_manifest(
                 state,
-                [MaterialManifestItem.from_source_meta(merged_meta)],
+                [project_material_manifest_item(merged_meta)],
             )
 
         primary_file_uri = (
@@ -1977,6 +1996,8 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             document_id=external_document_id,
             source_kind=source_kind,
         )
+        if source_kind is SourceKind.MATERIAL:
+            validate_material_source_primary(source_meta=meta, source_directory=meta_path.parent)
         _write_json(meta_path, meta)
 
         if source_kind == SourceKind.FILING:
@@ -1987,7 +2008,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         else:
             self._upsert_material_manifest(
                 state,
-                [MaterialManifestItem.from_source_meta(meta)],
+                [project_material_manifest_item(meta)],
             )
 
         file_payloads = _extract_file_payloads(meta)

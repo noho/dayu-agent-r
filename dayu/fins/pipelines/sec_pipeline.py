@@ -26,6 +26,7 @@ from dayu.fins.domain.document_models import (
     DownloadRejectionRegistry,
     SourceHandle,
 )
+from dayu.fins.ticker_normalization import normalize_ticker
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.downloaders.sec_downloader import (
     DEFAULT_MAX_RETRIES,
@@ -42,6 +43,7 @@ from dayu.fins.download_contract import (
     FinsDownloadSource,
     FinsDownloadProviderError,
 )
+from dayu.fins.pipelines.upload_company_meta import build_upload_company_id
 from dayu.fins.ingestion_runtime import (
     FinsDownloadProgressEvent,
     FinsDownloadProgressSink,
@@ -848,6 +850,10 @@ class SecPipeline:
             FinsUploadUsageError: 资产规划失败时抛出。
         """
 
+        normalized = normalize_ticker(request.ticker)
+        if normalized.market != "US":
+            raise ValueError(f"SecPipeline 仅支持 US，当前 market={normalized.market}")
+        build_upload_company_id(normalized.canonical)
         validated = admit_fins_upload_material_request(request)
         async for event in self.upload_material_validated_stream(
             validated, cancellation_checker=cancellation_checker

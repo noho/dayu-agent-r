@@ -1,0 +1,124 @@
+{
+  "setup_status": "ok",
+  "agent_status": "completed",
+  "tool_evidence": "yes",
+  "tool_trace": "complete",
+  "required_evidence": "complete",
+  "canary_status": "match",
+  "result_status": "accepted",
+  "evidence_gaps": [],
+  "retry_class": "none",
+  "outer_exit": 0,
+  "structured_events": 105,
+  "completed_commands": 42,
+  "canary_actual_read_ids": [
+    "item_6"
+  ],
+  "canary_durable_report_match": true,
+  "actual_model": "unknown",
+  "protected_files": 9260,
+  "protected_drift": 0,
+  "old_s1_raw_receipts": 252,
+  "old_s1_raw_drift": 0,
+  "changed_files": [
+    "dayu/cli/upload_script.py",
+    "dayu/cli/commands/fins.py",
+    "dayu/fins/ingestion_runtime.py",
+    "dayu/fins/upload_asset_plan.py",
+    "dayu/fins/tools/upload_tools.py",
+    "dayu/fins/pipelines/docling_upload_service.py",
+    "dayu/fins/storage/_fs_source_document_core.py",
+    "README.md",
+    "tests/cli/test_upload_filings_from_command.py"
+  ],
+  "six_doc_ast_equal": true,
+  "final_test_counts": {
+    "tests": 2178,
+    "failures": 0,
+    "errors": 0,
+    "skips": 3
+  },
+  "final_full_pyright": "0 errors, 0 warnings, 0 informations",
+  "final_source_same_validation": true,
+  "production_coverage": {
+    "dayu/fins/pipelines/docling_upload_service.py": 90.57851239669421,
+    "dayu/fins/pipelines/sec_upload_workflow.py": 94.73684210526315,
+    "dayu/fins/pipelines/sec_pipeline.py": 87.60504201680672,
+    "dayu/fins/pipelines/cn_pipeline.py": 94.60043196544277,
+    "dayu/fins/ingestion_runtime.py": 91.33305819232356,
+    "dayu/fins/upload_asset_plan.py": 89.55223880597015,
+    "dayu/fins/upload_usage_contract.py": 92.90780141843972,
+    "dayu/fins/upload_failure.py": 96.29629629629629,
+    "dayu/fins/upload_format_contract.py": 93.02325581395348,
+    "dayu/fins/upload_batch.py": 95.58359621451105,
+    "dayu/fins/domain/document_models.py": 94.65478841870824,
+    "dayu/fins/storage/source_meta_contract.py": 100.0,
+    "dayu/fins/storage/source_manifest_contract.py": 100.0,
+    "dayu/fins/storage/_fs_source_document_core.py": 86.06403013182674,
+    "dayu/fins/storage/_fs_source_integrity.py": 87.94567062818336,
+    "dayu/cli/arg_parsing.py": 96.82080924855492,
+    "dayu/cli/commands/fins.py": 88.62660944206009,
+    "dayu/fins/tools/upload_tools.py": 94.96402877697841,
+    "dayu/cli/upload_script.py": 93.37748344370861
+  },
+  "coverage_sha256": "7c32827451e750f56dfc2cf734d1eb7c36071aafb5244ffad341169cd6553030",
+  "validations": [
+    {
+      "run": "owner-01",
+      "actual_exit": 0,
+      "stdout_sha256": "4ffbe15fd101e88ba9b05253b7eee1f70398946dec54e906ab43f99ea198d2b5",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "run": "pyright-01",
+      "actual_exit": 0,
+      "stdout_sha256": "46a6c7834c9080ada23a415afd925abecc37d531f5c6e3d14ad0a7ff579096cb",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "run": "pyright-02",
+      "actual_exit": 0,
+      "stdout_sha256": "46a6c7834c9080ada23a415afd925abecc37d531f5c6e3d14ad0a7ff579096cb",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "run": "broad-01",
+      "actual_exit": 0,
+      "stdout_sha256": "7508f35ff32280eda44653d16df1876d499610eca717a614aa26b8e55c2901a6",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "run": "artifact-index-02",
+      "actual_exit": 0,
+      "stdout_sha256": "8330f74d390edf5bd9b7cb1c6e0307eeb3a3928508dfb57fdf9210a6b44198fd",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "run": "helper-pyright-01",
+      "actual_exit": 0,
+      "stdout_sha256": "46a6c7834c9080ada23a415afd925abecc37d531f5c6e3d14ad0a7ff579096cb",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "report_sha256": "a555ec2a5819529aaaacb9e023cda8d5a65f9bbb551c43e03cdfd8ad28831421",
+  "warnings": [
+    {
+      "id": "item_44",
+      "classification": "Technical collector failure preservedpartial index/failure.json; truncated pytest dirs/current symlink counting fixed by artifact-index02,9unique18actualexit93hash without rerun producttests"
+    },
+    {
+      "id": "last_message_report_protocol",
+      "classification": "Final brief omits header/token, but task-designated durable report satisfies exact protocol; no mismatch or missing required evidence."
+    }
+  ],
+  "root_warnings": [
+    "Preliminary reverse apply used in-flight stale fix-only.diff after allowed neighboring doc reverted, not valid current evidence; root now directly checks final oldsource/finalsource hash + six non-doc AST equal.",
+    "Initial root audit wrongly required last-message brief to repeat token, although generated fixed protocol specifies report and task durable report. Actual tool-read prefix and required report exact header/token match; last-message brief lacks headers, not a mismatch."
+  ],
+  "decision": "Fix implementation accepted for same-version dual re-review, S1 not yet accepted",
+  "delivery_hashes_checked": 86,
+  "technical_probe_hashes_checked": 93,
+  "technical_actual_exits_checked": 18,
+  "HEAD": "6c49f818efd5a11b4dbd91d9a44f3bcfb2c01e58",
+  "main": "fac32ecbff9bfe792b63ee9667c8697826b631f4"
+}

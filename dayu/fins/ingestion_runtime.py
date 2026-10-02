@@ -127,6 +127,8 @@ from dayu.fins.storage import (
     SourceIntegrityStatus,
 )
 from dayu.fins.pipelines.docling_upload_service import (
+    MaterialUploadIdentity,
+    build_material_ids,
     UploadOverwritePrecondition,
     build_cn_filing_ids,
     build_sec_filing_ids,
@@ -147,6 +149,11 @@ from dayu.fins.upload_failure import (
 )
 from dayu.fins.upload_asset_plan import (
     UploadAssetPlan,
+    UploadPrimarySelectionFailure,
+    UploadPrimarySelectionError,
+    UploadPrimarySelectionPathError,
+    UploadPrimaryDeleteFailure,
+    project_upload_primary_selection,
     FinsUploadAssetPlanError,
     has_duplicate_upload_asset_paths,
     normalize_upload_asset_path,
@@ -158,6 +165,8 @@ from dayu.fins.upload_usage_contract import (
     FinsUploadUsageError,
     FinsUploadUsageFailure,
     fins_upload_usage_failure,
+    fins_upload_primary_selection_usage_failure,
+    fins_upload_format_usage_failure,
     fins_upload_asset_plan_usage_failure,
 )
 from dayu.fins.upload_format_contract import (
@@ -544,7 +553,7 @@ class FinsDownloadProgressEvent:
     Attributes:
         stage: runtime 可直接投影的下载阶段标签。
         message: 用户可读进度说明。
-        document_id: 可选业务文档 ID。
+        document_id: 可选的实际业务文档 ID，用于标识进度或结果对应的文档。
         file_name: 可选文件名；存在时优先作为 CLI 文档短标签展示。
         payload: 额外有界业务摘要，不得包含本地路径或 provider raw payload。
     """
@@ -763,7 +772,7 @@ class ValidatedFinsUploadFilingRequest:
 
         Raises:
             TypeError: repair disposition 不属于封闭 union 时抛出。
-            FinsUploadUsageError: request path 在重建 authoritative selection 时无法规范化时抛出。
+            FinsUploadUsageError: 同一规范 request 与 authoritative selection 的用法组合错误时抛出。
             ValueError: target identity、状态、动作或文件选择与 repair 授权不一致时抛出。
         """
 
@@ -801,134 +810,9 @@ class _StaticFinsUploadFilingValidation:
     normalized_fiscal_period: FiscalPeriod
     document_id: str
     internal_document_id: str
+    canonical_files: tuple[Path, ...]
+    canonical_selectors: tuple[Path, ...]
     file_selection: FinsUploadFilingFiles
-
-
-class _FinsUploadFilingSelectionFailure(str, Enum):
-    """filing files/selectors 无法投影唯一 selection 的封闭原因。"""
-
-    MISSING_FILES = "missing_files"
-    DUPLICATE_FILE_PATH = "duplicate_file_path"
-    MULTIPLE_PRIMARY_SELECTORS = "multiple_primary_selectors"
-    MISSING_MULTI_FILE_PRIMARY = "missing_multi_file_primary"
-    PRIMARY_NOT_IN_FILES = "primary_not_in_files"
-
-
-@dataclass(frozen=True, slots=True)
-class _FinsUploadFilingSelectionProjection:
-    """已从规范路径唯一投影的 filing primary 与 companions。
-
-    Attributes:
-        primary: 唯一 authoritative primary。
-        companions: 保持 files 原相对顺序的 companions。
-    """
-
-    primary: Path
-    companions: tuple[Path, ...]
-
-    def to_file_selection(self) -> FinsUploadFilingFiles:
-        """构造共享 projection 对应的 public immutable selection。
-
-        Args:
-            无。
-
-        Returns:
-            primary/companions 与 projection 精确一致的 filing selection。
-
-        Raises:
-            TypeError: projection 的路径类型违反内部不变量时抛出。
-            FinsUploadFormatError: 任一 projected path 不符合其 filing 角色格式时抛出。
-        """
-
-        return FinsUploadFilingFiles.for_upsert(
-            primary=self.primary,
-            companions=self.companions,
-        )
-
-
-_FILING_SELECTION_FAILURE_USAGE_CODES: Final[
-    Mapping[_FinsUploadFilingSelectionFailure, FinsUploadUsageCode]
-] = {
-    _FinsUploadFilingSelectionFailure.MISSING_FILES: FinsUploadUsageCode.MISSING_FILES,
-    _FinsUploadFilingSelectionFailure.DUPLICATE_FILE_PATH: (
-        FinsUploadUsageCode.DUPLICATE_FILE_PATH
-    ),
-    _FinsUploadFilingSelectionFailure.MULTIPLE_PRIMARY_SELECTORS: (
-        FinsUploadUsageCode.MULTIPLE_PRIMARY_SELECTORS
-    ),
-    _FinsUploadFilingSelectionFailure.MISSING_MULTI_FILE_PRIMARY: (
-        FinsUploadUsageCode.MISSING_MULTI_FILE_PRIMARY
-    ),
-    _FinsUploadFilingSelectionFailure.PRIMARY_NOT_IN_FILES: (
-        FinsUploadUsageCode.PRIMARY_NOT_IN_FILES
-    ),
-}
-
-
-def _normalize_fins_upload_paths(paths: tuple[Path, ...]) -> tuple[Path, ...]:
-    """用唯一 path owner 规范化一组保序 upload paths。
-
-    Args:
-        paths: raw files 或 primary selectors。
-
-    Returns:
-        保持输入顺序的 canonical absolute paths。
-
-    Raises:
-        TypeError: 任一路径不是 ``Path`` 时抛出。
-        FinsUploadUsageError: 任一路径无法展开或解析时抛出。
-    """
-
-    return tuple(_normalize_upload_path_for_filing(path) for path in paths)
-
-
-def _project_fins_upload_filing_selection(
-    *,
-    files: tuple[Path, ...],
-    primary_selectors: tuple[Path, ...],
-) -> _FinsUploadFilingSelectionProjection | _FinsUploadFilingSelectionFailure:
-    """从规范 files/selectors 纯投影唯一 primary/companions 或封闭失败原因。
-
-    本 owner 不读取 filesystem、不规范化路径、不产生 public usage exception。调用边界负责
-    将 closed failure 投影为自身的异常面。
-
-    Args:
-        files: 已规范化且保持 raw 顺序的 upsert 文件。
-        primary_selectors: 已规范化且保持 raw cardinality 的 primary selectors。
-
-    Returns:
-        唯一 primary/companions projection；无法唯一投影时返回封闭 failure enum。
-
-    Raises:
-        TypeError: 任一输入或其中路径不符合严格 tuple/Path contract 时抛出。
-    """
-
-    if not isinstance(files, tuple) or not isinstance(primary_selectors, tuple):
-        raise TypeError("filing selection projection 要求 Path tuple")
-    if any(not isinstance(path, Path) for path in (*files, *primary_selectors)):
-        raise TypeError("filing selection projection 只接受 Path")
-    if not files:
-        return _FinsUploadFilingSelectionFailure.MISSING_FILES
-    file_identities = tuple(upload_asset_path_identity(path) for path in files)
-    if has_duplicate_upload_asset_paths(files):
-        return _FinsUploadFilingSelectionFailure.DUPLICATE_FILE_PATH
-    if len(primary_selectors) > 1:
-        return _FinsUploadFilingSelectionFailure.MULTIPLE_PRIMARY_SELECTORS
-    if len(files) > 1 and not primary_selectors:
-        return _FinsUploadFilingSelectionFailure.MISSING_MULTI_FILE_PRIMARY
-    primary = primary_selectors[0] if primary_selectors else next(iter(files))
-    primary_identity = upload_asset_path_identity(primary)
-    if primary_identity not in file_identities:
-        return _FinsUploadFilingSelectionFailure.PRIMARY_NOT_IN_FILES
-    companions = tuple(
-        path
-        for path, path_identity in zip(files, file_identities, strict=True)
-        if path_identity != primary_identity
-    )
-    return _FinsUploadFilingSelectionProjection(
-        primary=primary,
-        companions=companions,
-    )
 
 
 def _validate_filing_selection_matches_request(
@@ -941,7 +825,7 @@ def _validate_filing_selection_matches_request(
     也不根据 published state 反推角色。
 
     Args:
-        request: validated request 保存的原始 filing 请求。
+        request: validated request 保存的首次规范 filing 请求。
         selection: static admission 产生的 authoritative 文件选择。
 
     Returns:
@@ -949,7 +833,7 @@ def _validate_filing_selection_matches_request(
 
     Raises:
         TypeError: request 或 selection 类型不符合契约时抛出。
-        FinsUploadUsageError: request path 无法由唯一 path owner 规范化时抛出。
+        FinsUploadUsageError: 规范 request 的用法组合不合法时抛出。
         ValueError: delete 空状态或 upsert 完整文件选择不一致时抛出。
     """
 
@@ -962,20 +846,20 @@ def _validate_filing_selection_matches_request(
         if request.files or request.primary_selectors or not selection.is_empty:
             raise ValueError("delete request 必须与唯一空 file selection 一致")
         return
-    normalized_files = _normalize_fins_upload_paths(request.files)
-    normalized_selectors = _normalize_fins_upload_paths(request.primary_selectors)
-    projection = _project_fins_upload_filing_selection(
+    normalized_files = request.files
+    normalized_selectors = request.primary_selectors
+    projection = project_upload_primary_selection(
         files=normalized_files,
         primary_selectors=normalized_selectors,
     )
-    if isinstance(projection, _FinsUploadFilingSelectionFailure):
+    if isinstance(projection, UploadPrimarySelectionFailure):
         raise ValueError(
             "validated filing raw selection 无法唯一投影: "
             f"{projection.value}"
         )
     if selection.is_empty:
         raise ValueError("filing upsert request 必须携带非空完整 file selection")
-    expected_selection = projection.to_file_selection()
+    expected_selection = FinsUploadFilingFiles.for_upsert(primary=projection.primary, companions=projection.companions)
     if selection != expected_selection:
         raise ValueError("validated filing file selection 与 raw request 不完整一致")
 
@@ -1015,7 +899,7 @@ def _raise_upload_format_usage(error: FinsUploadFormatError) -> NoReturn:
         FinsUploadUsageError: 始终携带原始 role-specific failure kind 抛出。
     """
 
-    raise FinsUploadUsageError(FinsUploadUsageFailure(code=error.kind, message=str(error))) from error
+    raise FinsUploadUsageError(fins_upload_format_usage_failure(error)) from error
 
 
 def _admit_fins_upload_file_basename(basename: str) -> None:
@@ -1150,6 +1034,8 @@ def _validate_fins_upload_filing_static(
     _validate_optional_upload_iso_date(request.filing_date, FinsUploadUsageCode.INVALID_FILING_DATE)
     _validate_optional_upload_iso_date(request.report_date, FinsUploadUsageCode.INVALID_REPORT_DATE)
     _validate_optional_upload_text(request.company_name, FinsUploadUsageCode.COMPANY_NAME_TOO_LONG)
+    normalized_files: tuple[Path, ...] = ()
+    normalized_selectors: tuple[Path, ...] = ()
     if action == _UPLOAD_ACTION_DELETE:
         if request.files:
             _raise_upload_usage(FinsUploadUsageCode.FILES_NOT_ALLOWED_FOR_DELETE)
@@ -1157,14 +1043,14 @@ def _validate_fins_upload_filing_static(
             _raise_upload_usage(FinsUploadUsageCode.PRIMARY_NOT_ALLOWED_FOR_DELETE)
         file_selection = FinsUploadFilingFiles.for_delete()
     else:
-        normalized_files = _normalize_fins_upload_paths(request.files)
-        normalized_selectors = _normalize_fins_upload_paths(request.primary_selectors)
-        projection = _project_fins_upload_filing_selection(
+        normalized_files = tuple(_normalize_upload_path_for_filing(path) for path in request.files)
+        normalized_selectors = tuple(_normalize_upload_path_for_filing(path) for path in request.primary_selectors)
+        projection = project_upload_primary_selection(
             files=normalized_files,
             primary_selectors=normalized_selectors,
         )
-        if isinstance(projection, _FinsUploadFilingSelectionFailure):
-            _raise_upload_usage(_FILING_SELECTION_FAILURE_USAGE_CODES[projection])
+        if isinstance(projection, UploadPrimarySelectionFailure):
+            raise FinsUploadUsageError(fins_upload_primary_selection_usage_failure(UploadPrimarySelectionError(projection), source_kind=SourceKind.FILING))
         primary_identity = upload_asset_path_identity(projection.primary)
         for file_path in normalized_files:
             basename = file_path.name
@@ -1183,7 +1069,7 @@ def _validate_fins_upload_filing_static(
             except FinsUploadFormatError as error:
                 _raise_upload_format_usage(error)
         try:
-            file_selection = projection.to_file_selection()
+            file_selection = FinsUploadFilingFiles.for_upsert(primary=projection.primary, companions=projection.companions)
         except FinsUploadFormatError as error:
             _raise_upload_format_usage(error)
     if normalized_ticker.market == "US":
@@ -1207,6 +1093,8 @@ def _validate_fins_upload_filing_static(
         document_id=document_id,
         internal_document_id=internal_document_id,
         file_selection=file_selection,
+        canonical_files=normalized_files,
+        canonical_selectors=normalized_selectors,
     )
 
 
@@ -1404,7 +1292,7 @@ def validate_fins_upload_filing_request(
     except UploadCompanyNameRequiredError:
         _raise_upload_usage(FinsUploadUsageCode.COMPANY_NAME_REQUIRED)
     return ValidatedFinsUploadFilingRequest(
-        request=request,
+        request=replace(request, files=static.canonical_files, primary_selectors=static.canonical_selectors),
         normalized_ticker=static.normalized_ticker,
         normalized_fiscal_period=static.normalized_fiscal_period,
         document_id=static.document_id,
@@ -1425,11 +1313,10 @@ class FinsUploadMaterialRequest:
         ticker: 用户提供的 ticker 文本，运行时会先调用公共 ticker 归一化 API。
         source_kind: 源文档类别；material 上传必须为 ``SourceKind.MATERIAL``。
         action: 上传动作，允许 ``auto``、``create``、``update`` 或 ``delete``。
-        files: 待上传文件路径；Slice 1 只保存文件数量摘要，不读取文件。
-        form_type: 可选材料表单类型。
-        material_name: 可选材料名称。
-        document_id: 可选业务文档 ID。
-        internal_document_id: 可选来源内部文档 ID。
+        files: 待上传的保序原始路径；delete 不得提供。
+        form_type: 每个动作必填的材料类型，准入后为规范文本。
+        material_name: 每个动作必填的名称，去首尾空白后最多 240 个 Unicode 码点。
+        document_id: 可选生成身份一致性断言，不能覆盖材料身份。
         fiscal_year: 可选会计年度。
         fiscal_period: 可选会计期间。
         amended: 是否为修正材料。
@@ -1447,7 +1334,7 @@ class FinsUploadMaterialRequest:
     form_type: str | None = None
     material_name: str | None = None
     document_id: str | None = None
-    internal_document_id: str | None = None
+    primary_selectors: tuple[Path, ...] = ()
     fiscal_year: int | None = None
     fiscal_period: str | None = None
     amended: bool = False
@@ -1459,130 +1346,104 @@ class FinsUploadMaterialRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class FinsUploadMaterialActionDecision:
+    """不访问路径的材料动作及下游动作事实。"""
+
+    requested_action: Literal["auto", "create", "update", "delete"]
+    pipeline_action: Literal["create", "update", "delete"] | None
+
+    def __post_init__(self) -> None:
+        """参数：无；返回：无；异常：ValueError 表示动作对不一致。"""
+        if self.requested_action not in _UPLOAD_ACTION_VALUES or self.pipeline_action != (None if self.requested_action == FINS_UPLOAD_ACTION_AUTO else self.requested_action):
+            raise ValueError("材料动作事实不一致")
+
+
+def validate_fins_upload_material_action_files(action: str, files: tuple[Path, ...]) -> FinsUploadMaterialActionDecision:
+    """参数：原始动作与保序文件；返回：无 I/O 动作事实；异常：FinsUploadUsageError 表示动作或数量组合错误。"""
+    normalized = action.strip().lower()
+    if normalized not in _UPLOAD_ACTION_VALUES:
+        _raise_upload_usage(FinsUploadUsageCode.INVALID_ACTION)
+    if normalized == _UPLOAD_ACTION_DELETE:
+        if files:
+            _raise_upload_usage(FinsUploadUsageCode.FILES_NOT_ALLOWED_FOR_DELETE)
+    elif not files:
+        _raise_upload_usage(FinsUploadUsageCode.MISSING_FILES)
+    requested = cast(Literal["auto", "create", "update", "delete"], normalized)
+    pipeline = None if requested == FINS_UPLOAD_ACTION_AUTO else requested
+    return FinsUploadMaterialActionDecision(requested, pipeline)
+
+
+@dataclass(frozen=True, slots=True)
 class ValidatedFinsUploadMaterialRequest:
-    """material 准入后不可变的 raw 请求、选择与资产规划 handoff。"""
+    """一次准入产生的规范请求、身份、动作与 exact 角色资产事实。"""
 
     request: FinsUploadMaterialRequest
     file_selection: FinsUploadMaterialFiles
     asset_plan: UploadAssetPlan
+    identity: MaterialUploadIdentity
+    action_decision: FinsUploadMaterialActionDecision
 
     def __post_init__(self) -> None:
-        """校验请求、选择与资产计划属于同一次 material 准入。
-
-        Args:
-            无。
-
-        Returns:
-            无。
-
-        Raises:
-            TypeError: handoff 字段类型错误时抛出。
-            FinsUploadUsageError: 静态业务字段或资产规划不符合准入规则时抛出。
-            ValueError: 选择或资产计划与请求不同源时抛出。
-        """
-
-        if not isinstance(self.request, FinsUploadMaterialRequest):
-            raise TypeError("validated material request 类型错误")
-        if not isinstance(self.file_selection, FinsUploadMaterialFiles):
-            raise TypeError("validated material file selection 类型错误")
-        if not isinstance(self.asset_plan, UploadAssetPlan):
-            raise TypeError("validated material asset plan 类型错误")
-        normalized, expected_selection, expected_plan = _admit_material_upload_facts(self.request)
-        if self.file_selection != expected_selection:
-            raise ValueError("material file selection 与 raw request 不一致")
-        if self.asset_plan != expected_plan:
-            raise ValueError("material asset plan 与 raw request 不一致")
-        # 构造器与 factory 共用准入；只替换 action 归一化后的 raw 值。
-        object.__setattr__(self, "request", normalized)
+        """参数：无；返回：无；异常：类型、用法或 ValueError 表示事实漂移；不访问文件系统。"""
+        self.validate()
 
     def validate(self) -> None:
-        """在公开 validated 消费边界复核静态准入与同源规划。
-
-        Args:
-            无。
-
-        Returns:
-            无。
-
-        Raises:
-            TypeError: handoff 字段类型错误时抛出。
-            FinsUploadUsageError: 请求不符合共享准入时抛出。
-            ValueError: 请求、选择或计划发生漂移时抛出。
-        """
-
-        if not isinstance(self.request, FinsUploadMaterialRequest):
-            raise TypeError("validated material request 类型错误")
-        if not isinstance(self.file_selection, FinsUploadMaterialFiles):
-            raise TypeError("validated material file selection 类型错误")
-        if not isinstance(self.asset_plan, UploadAssetPlan):
-            raise TypeError("validated material asset plan 类型错误")
-        normalized, expected_selection, expected_plan = _admit_material_upload_facts(self.request)
-        if self.request != normalized:
-            raise ValueError("validated material action 未归一化")
-        if self.file_selection != expected_selection:
-            raise ValueError("material file selection 与 raw request 不一致")
-        if self.asset_plan != expected_plan:
-            raise ValueError("material asset plan 与 raw request 不一致")
+        """参数：无；返回：无；异常：类型、用法或 ValueError 表示事实不一致；纯校验不解析路径。"""
+        if not isinstance(self.request, FinsUploadMaterialRequest) or not isinstance(self.file_selection, FinsUploadMaterialFiles) or not isinstance(self.asset_plan, UploadAssetPlan) or not isinstance(self.identity, MaterialUploadIdentity) or not isinstance(self.action_decision, FinsUploadMaterialActionDecision):
+            raise TypeError("材料准入事实类型错误")
+        raw = self.request
+        decision = validate_fins_upload_material_action_files(raw.action, raw.files)
+        if decision != self.action_decision or raw.action != decision.requested_action:
+            raise ValueError("材料动作事实发生漂移")
+        _admit_fins_upload_ticker_identity(raw.ticker, raw.ticker_aliases)
+        _validate_upload_source_kind(raw)
+        _validate_optional_upload_iso_date(raw.filing_date, FinsUploadUsageCode.INVALID_FILING_DATE)
+        _validate_optional_upload_iso_date(raw.report_date, FinsUploadUsageCode.INVALID_REPORT_DATE)
+        expected_identity = build_material_ids(form_type=raw.form_type, material_name=raw.material_name, fiscal_year=raw.fiscal_year, fiscal_period=raw.fiscal_period, document_id=raw.document_id)
+        if expected_identity != self.identity or (raw.form_type, raw.material_name, raw.fiscal_year, raw.fiscal_period) != (self.identity.form_type, self.identity.material_name, self.identity.fiscal_year, self.identity.fiscal_period):
+            raise ValueError("材料身份事实发生漂移")
+        self.asset_plan.validate()
+        if self.asset_plan.source_kind is not SourceKind.MATERIAL or tuple(pair.path for pair in self.asset_plan.ordered_pairs) != raw.files or self.file_selection.files != raw.files:
+            raise ValueError("材料文件事实发生漂移")
+        if decision.pipeline_action == _UPLOAD_ACTION_DELETE:
+            if raw.primary_selectors or self.asset_plan.primary_original_name is not None:
+                raise ValueError("删除不得携带主文件")
+            return
+        projection = project_upload_primary_selection(files=raw.files, primary_selectors=raw.primary_selectors)
+        if isinstance(projection, UploadPrimarySelectionFailure) or projection.primary.name != self.asset_plan.primary_original_name:
+            raise ValueError("材料主文件事实发生漂移")
 
 
-def _admit_material_upload_facts(
-    request: FinsUploadMaterialRequest,
-) -> tuple[FinsUploadMaterialRequest, FinsUploadMaterialFiles, UploadAssetPlan]:
-    """从 raw 请求产生静态准入与完整资产规划的唯一事实。
-
-    Args:
-        request: 原始 material 请求。
-
-    Returns:
-        归一化请求、文件选择及完整资产计划。
-
-    Raises:
-        FinsUploadUsageError: 请求或资产规划不符合准入规则时抛出。
-        FinsUploadFormatError: 文件格式不支持时抛出。
-        ValueError: 其它既有请求字段非法时抛出。
-    """
-
-    normalized = _normalize_upload_request(request)
-    if not isinstance(normalized, FinsUploadMaterialRequest):
-        raise AssertionError("material normalization 返回错误类型")
-    operation: Literal["upsert", "delete"] = (
-        "delete" if normalized.action == _UPLOAD_ACTION_DELETE else "upsert"
-    )
+def _admit_material_upload_facts(request: FinsUploadMaterialRequest) -> ValidatedFinsUploadMaterialRequest:
+    """参数：原始材料请求；返回：完整规范事实；异常：用法、格式或路径错误；先静态准入后一次路径解析。"""
+    _admit_fins_upload_ticker_identity(request.ticker, request.ticker_aliases)
+    if request.action.strip().lower() not in _UPLOAD_ACTION_VALUES:
+        _raise_upload_usage(FinsUploadUsageCode.INVALID_ACTION)
+    _validate_upload_source_kind(request)
+    decision = validate_fins_upload_material_action_files(request.action, request.files)
+    _validate_optional_upload_iso_date(request.filing_date, FinsUploadUsageCode.INVALID_FILING_DATE)
+    _validate_optional_upload_iso_date(request.report_date, FinsUploadUsageCode.INVALID_REPORT_DATE)
+    identity = build_material_ids(form_type=request.form_type, material_name=request.material_name, fiscal_year=request.fiscal_year, fiscal_period=request.fiscal_period, document_id=request.document_id)
+    operation: Literal["upsert", "delete"] = "delete" if decision.pipeline_action == _UPLOAD_ACTION_DELETE else "upsert"
     try:
-        selection, asset_plan = plan_upload_assets(
-            source_kind=SourceKind.MATERIAL,
-            operation=operation,
-            files=normalized.files,
-        )
+        selection, asset_plan = plan_upload_assets(source_kind=SourceKind.MATERIAL, operation=operation, files=request.files, material_primary_selectors=request.primary_selectors)
     except FinsUploadAssetPlanError as error:
-        failure, _ = fins_upload_asset_plan_usage_failure(
-            error, max_files=MAX_MATERIAL_UPLOAD_FILES
-        )
-        raise FinsUploadUsageError(failure) from error
+        raise FinsUploadUsageError(fins_upload_asset_plan_usage_failure(error, max_files=MAX_MATERIAL_UPLOAD_FILES)) from error
+    except (UploadPrimarySelectionError, UploadPrimarySelectionPathError) as error:
+        raise FinsUploadUsageError(fins_upload_primary_selection_usage_failure(error, source_kind=SourceKind.MATERIAL)) from error
+    except FinsUploadFormatError as error:
+        raise FinsUploadUsageError(fins_upload_format_usage_failure(error)) from error
     if not isinstance(selection, FinsUploadMaterialFiles):
         raise AssertionError("material planner 返回错误选择类型")
-    return normalized, selection, asset_plan
+    canonical_files = tuple(pair.path for pair in asset_plan.ordered_pairs)
+    primary_paths = tuple(pair.path for pair in asset_plan.ordered_pairs if pair.original_name == asset_plan.primary_original_name)
+    normalized = replace(request, action=decision.requested_action, form_type=identity.form_type, material_name=identity.material_name, fiscal_year=identity.fiscal_year, fiscal_period=identity.fiscal_period, files=canonical_files, primary_selectors=primary_paths if request.primary_selectors else ())
+    return ValidatedFinsUploadMaterialRequest(normalized, selection, asset_plan, identity, decision)
 
 
-def admit_fins_upload_material_request(
-    request: FinsUploadMaterialRequest,
-) -> ValidatedFinsUploadMaterialRequest:
-    """在任何转换或生命周期事件前唯一准入 material 资产。
-
-    Args:
-        request: 原始 material 上传请求。
-
-    Returns:
-        同一选择及规划组成的不可变执行 handoff。
-
-    Raises:
-        FinsUploadUsageError: 资产数量或身份规划失败时抛出。
-        FinsUploadFormatError: 文件格式不支持时抛出。
-        ValueError: 其它既有请求字段非法时抛出。
-    """
-
-    normalized, selection, asset_plan = _admit_material_upload_facts(request)
-    return ValidatedFinsUploadMaterialRequest(normalized, selection, asset_plan)
+def admit_fins_upload_material_request(request: FinsUploadMaterialRequest) -> ValidatedFinsUploadMaterialRequest:
+    """参数：原始材料上传请求；返回：同一准入 handoff；异常：静态用法、格式或路径错误先于任何生命周期副作用。"""
+    return _admit_material_upload_facts(request)
 
 
 FinsUploadRequest = FinsUploadFilingRequest | FinsUploadMaterialRequest
@@ -1715,7 +1576,7 @@ class FinsUploadPipelineResult:
     Attributes:
         status: 上传业务状态，pipeline 必须显式提供。
         stored_file_count: commit 成功后发布的用户输入 original 数。
-        document_id: 可选业务文档 ID。
+        document_id: 可选的实际业务文档 ID，用于标识进度或结果对应的文档。
         internal_document_id: 可选来源内部文档 ID。
         primary_document: 可选主文件名。
         deleted: 可选删除动作结果；缺失表示 pipeline 未声明。
@@ -1827,7 +1688,7 @@ class FinsUploadResultSummary:
 
     Attributes:
         source_kind: 源文档类别，使用已有 ``SourceKind`` 区分 filing/material。
-        document_id: 可选业务文档 ID。
+        document_id: 可选的实际业务文档 ID，用于标识进度或结果对应的文档。
         internal_document_id: 可选来源内部文档 ID。
         status: 上传业务状态摘要。
         requested_file_count: validated request 中的用户输入文件数。
@@ -6185,7 +6046,7 @@ class FinsIngestionRuntime:
             record: 事件对应的 running job record 快照。
             source_event_type: runtime 内部进度标签，只用于消费方展示分类。
             message: 有界进度说明。
-            document_id: 可选业务文档 ID；不得放本地文件路径。
+            document_id: 可选的实际业务文档 ID；不得放本地文件路径。
             payload: 有界 JSON-compatible 业务摘要。
 
         Returns:
@@ -6241,7 +6102,7 @@ class FinsIngestionRuntime:
             context: legacy job 或 direct stream 执行上下文。
             source_event_type: runtime 内部进度标签。
             message: 用户可读进度说明。
-            document_id: 可选业务文档 ID。
+            document_id: 可选的实际业务文档 ID，用于标识进度或结果对应的文档。
             payload: 有界业务摘要。
 
         Returns:
@@ -6559,7 +6420,7 @@ def _direct_progress_event(
         context: direct stream 执行上下文。
         source_event_type: runtime 进度阶段。
         message: 用户可读进度说明。
-        document_id: 可选业务文档 ID。
+        document_id: 可选的实际业务文档 ID，用于标识进度或结果对应的文档。
         payload: 有界业务摘要。
         emitted_at: 调用方提供的带时区事件构造时间。
 
@@ -6795,7 +6656,7 @@ def _direct_document_label(document_id: str | None) -> str | None:
     """构造 direct event 的文档短标签。
 
     Args:
-        document_id: 可选业务文档 ID。
+        document_id: 可选的实际业务文档 ID，用于标识进度或结果对应的文档。
 
     Returns:
         文档短标签；为空时返回 ``None``。
@@ -7886,31 +7747,6 @@ def _download_document_meta(meta: Mapping[str, JsonValue]) -> DocumentMeta:
     return result
 
 
-def _normalize_upload_request(request: FinsUploadRequest) -> FinsUploadRequest:
-    """校验并归一化上传请求。
-
-    Args:
-        request: 原始上传请求。
-
-    Returns:
-        已归一化 action 字段的上传请求。
-
-    Raises:
-        FinsUploadUsageError: material 日期不是实际存在的 strict ISO full date 时抛出。
-        ValueError: source_kind、action 或有界字段非法时抛出。
-    """
-
-    _admit_fins_upload_ticker_identity(request.ticker, request.ticker_aliases)
-    action = _normalize_upload_action(request.action)
-    _validate_upload_source_kind(request)
-    if isinstance(request, FinsUploadFilingRequest):
-        return replace(request, action=action)
-    if isinstance(request, FinsUploadMaterialRequest):
-        _validate_optional_upload_iso_date(request.filing_date, FinsUploadUsageCode.INVALID_FILING_DATE)
-        _validate_optional_upload_iso_date(request.report_date, FinsUploadUsageCode.INVALID_REPORT_DATE)
-        return replace(request, action=action)
-    assert_never(request)
-
 
 def _raw_upload_request(
     request: ValidatedFinsUploadFilingRequest | ValidatedFinsUploadMaterialRequest,
@@ -8025,31 +7861,11 @@ def _upload_request_summary(
             _bounded_text_tuple(raw_request.ticker_aliases, "ticker_aliases", reject_path_separators=False)
         ),
     }
-    if isinstance(raw_request, FinsUploadMaterialRequest):
-        summary.update(
-            {
-                "form_type": _optional_bounded_text(
-                    raw_request.form_type,
-                    "form_type",
-                    reject_path_separators=False,
-                ),
-                "material_name": _optional_bounded_text(
-                    raw_request.material_name,
-                    "material_name",
-                    reject_path_separators=False,
-                ),
-                "document_id": _optional_bounded_text(
-                    raw_request.document_id,
-                    "document_id",
-                    reject_path_separators=False,
-                ),
-                "internal_document_id": _optional_bounded_text(
-                    raw_request.internal_document_id,
-                    "internal_document_id",
-                    reject_path_separators=False,
-                ),
-            }
-        )
+    if isinstance(request, ValidatedFinsUploadMaterialRequest):
+        identity = request.identity
+        summary.update({"form_type": identity.form_type, "material_name": identity.material_name,
+            "fiscal_year": identity.fiscal_year, "fiscal_period": identity.fiscal_period,
+            "document_id": identity.document_id, "internal_document_id": identity.internal_document_id})
     _assert_bounded_summary(summary, "upload_request_summary")
     return summary
 
@@ -8344,20 +8160,16 @@ def _upload_request_document_id(
         request: 上传请求。
 
     Returns:
-        material 请求中的显式 document_id；filing 请求返回 ``None``。
+        material 返回已准入身份生成的 document_id；filing 返回已准入 request.document_id。
 
     Raises:
-        ValueError: 文档 ID 越界时抛出。
+        无。仅提取已准入请求持有的业务 ID，不重新校验。
     """
 
     if isinstance(request, ValidatedFinsUploadFilingRequest):
         return request.document_id
     if isinstance(request, ValidatedFinsUploadMaterialRequest):
-        return _optional_bounded_text(
-            request.request.document_id,
-            "upload_document_id",
-            reject_path_separators=False,
-        )
+        return request.identity.document_id
     assert_never(request)
 
 
@@ -8379,12 +8191,14 @@ def _upload_context_request_progress_payload(
     """
 
     raw_request = _raw_upload_request(request)
-    _validate_upload_file_count(raw_request.files)
+    action = (request.action_decision.requested_action
+              if isinstance(request, ValidatedFinsUploadMaterialRequest)
+              else _normalize_upload_action(raw_request.action))
     return {
         _PAYLOAD_TICKER: context.normalized_ticker,
         _PAYLOAD_MARKET: context.market,
         _PAYLOAD_SOURCE_KIND: raw_request.source_kind.value,
-        _PAYLOAD_ACTION: _normalize_upload_action(raw_request.action),
+        _PAYLOAD_ACTION: action,
         _PAYLOAD_FILE_COUNT: validated_fins_upload_file_count(request),
     }
 

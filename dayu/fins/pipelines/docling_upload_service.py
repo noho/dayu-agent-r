@@ -33,6 +33,8 @@ from dayu.fins.domain.document_models import (
     SourceHandle,
     now_iso8601,
 )
+from dayu.fins.upload_usage_contract import FinsUploadUsageCode, FinsUploadUsageError, fins_upload_usage_failure
+from dayu.fins.domain.filing_semantics import FiscalPeriod, normalize_fiscal_period
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.domain.filing_semantics import FiscalPeriod
 from dayu.fins.pipelines.docling_process_converter import (
@@ -395,9 +397,9 @@ class DoclingUploadService:
             ValueError: 资产计划路径、名称、转换集合、动作或其它参数不一致，或既有 source meta 的 ``is_deleted`` 非布尔值时抛出。
             FileNotFoundError: 需要的文件或文档不存在时抛出。
             FileExistsError: create 目标已存在且不可覆盖时抛出。
-            FinsUploadFailureError: filing 为空或无法转换时抛出 typed content failure。
+            FinsUploadFailureError: filing 或 material 的原件为空或 Docling 转换失败时抛出 typed content failure。
             RuntimeError: 上传失败时抛出。
-            OSError: 资产计划路径解析出现循环、其它底层路径操作或仓储读写失败时抛出。
+            OSError: filing 输入路径规范化、文件状态检查、原件读取或仓储操作失败时透传；material 资产计划只做纯校验。
         """
 
         normalized_action = action.strip().lower()
@@ -462,7 +464,7 @@ class DoclingUploadService:
         source_fingerprint = _build_upload_source_fingerprint(
             original_assets,
             source_kind=source_kind,
-            filing_primary_original_name=asset_plan.filing_primary_original_name,
+            primary_original_name=asset_plan.primary_original_name,
         )
         initial_skip_disposition = FilingInitialSkipDisposition.NOT_ELIGIBLE
         if _can_skip_upload(
@@ -894,7 +896,7 @@ class DoclingUploadService:
 
         Raises:
             FileNotFoundError: 源文件不存在时抛出。
-            FinsUploadFailureError: filing 文件为空时抛出。
+            FinsUploadFailureError: 两类上传任一原件为空时抛出，转换尚未开始。
             OSError: 源文件读取失败时抛出。
         """
 
@@ -902,10 +904,10 @@ class DoclingUploadService:
         for pair in pairs:
             file_path = pair.path
             raw_data = file_path.read_bytes()
-            if source_kind is SourceKind.FILING and raw_data == b"":
+            if raw_data == b"":
                 raw_basename = file_path.name
                 _LOGGER.error(
-                    "Filing upload empty input rejected before publication; raw_basename=%r",
+                    "Upload empty input rejected before publication; raw_basename=%r",
                     raw_basename,
                 )
                 file_label = canonicalize_fins_public_file_label(raw_basename)
@@ -950,8 +952,7 @@ class DoclingUploadService:
 
         Raises:
             DoclingConversionCancelledError: 转换前或两次转换之间观察到取消时抛出。
-            FinsUploadFailureError: filing Docling 转换失败时抛出。
-            DoclingConversionError: material Docling 转换失败时原样抛出。
+            FinsUploadFailureError: 当前原件 Docling 转换失败时抛出，保留安全文件名与 cause。
             RuntimeError: 未产生主 Docling 文件时抛出。
             ValueError: preparation 与 ``original_assets`` 不一致时抛出。
         """
@@ -986,11 +987,9 @@ class DoclingUploadService:
                     cancellation=cancellation,
                 )
             except DoclingConversionError as exc:
-                if source_kind is not SourceKind.FILING:
-                    raise
                 raw_basename = file_path.name
                 _LOGGER.exception(
-                    "Filing upload conversion rejected before publication; raw_basename=%r",
+                    "Upload conversion rejected before publication; raw_basename=%r",
                     raw_basename,
                 )
                 file_label = canonicalize_fins_public_file_label(raw_basename)
@@ -1007,7 +1006,7 @@ class DoclingUploadService:
             else:
                 original_filename = None
                 derived_from = None
-            if primary_document is None:
+            if pair.original_name == preparation.primary_original_name:
                 primary_document = docling_name
             docling_sha256 = conversion.sha256
             assets.append(
@@ -1491,6 +1490,7 @@ def _prepare_upload_asset_plan(
             source_kind=SourceKind.FILING,
             operation=operation,
             files=selection.ordered_files,
+            material_primary_selectors=(),
             filing_selection=selection,
         )
         return plan
@@ -1596,14 +1596,14 @@ def _build_upload_source_fingerprint(
     assets: list[_PendingFileAsset],
     *,
     source_kind: SourceKind,
-    filing_primary_original_name: str | None,
+    primary_original_name: str | None,
 ) -> _UploadSourceFingerprint:
     """构建上传源指纹。
 
     Args:
         assets: 待上传资产列表。
         source_kind: filing 或 material 来源类型。
-        filing_primary_original_name: 资产计划中的 filing 主文件原件仓储身份；material 必须为 ``None``。
+        primary_original_name: 资产计划中 exact 主文件的完整原件仓储名称，两种来源均必填。
 
     Returns:
         指纹摘要与 identical-skip 安全性的 typed 结果。
@@ -1616,9 +1616,9 @@ def _build_upload_source_fingerprint(
     if source_kind is SourceKind.FILING:
         if not assets:
             raise ValueError("filing fingerprint 必须携带非空 originals")
-        if filing_primary_original_name is None:
+        if primary_original_name is None:
             raise ValueError("filing fingerprint 必须携带 authoritative primary")
-        primary_identity = filing_primary_original_name
+        primary_identity = primary_original_name
         primary_matches = [asset for asset in assets if asset.name == primary_identity]
         if len(primary_matches) != 1:
             raise ValueError("filing primary identity 必须 exact 命中一个 original asset")
@@ -1665,9 +1665,9 @@ def _build_upload_source_fingerprint(
             payload = role_payload
             identical_skip_safe = primary_descriptor not in companion_descriptors
     elif source_kind is SourceKind.MATERIAL:
-        if filing_primary_original_name is not None:
-            raise ValueError("material fingerprint 不得携带 filing primary")
-        payload = [
+        if primary_original_name is None or sum(asset.name == primary_original_name for asset in assets) != 1:
+            raise ValueError("material primary 必须 exact 命中一个 original")
+        descriptors_material: list[JsonValue] = [
             {
                 "name": asset.name,
                 "sha256": asset.sha256,
@@ -1676,6 +1676,18 @@ def _build_upload_source_fingerprint(
             }
             for asset in sorted(assets, key=lambda item: item.name)
         ]
+        if len(assets) == 1:
+            payload = descriptors_material
+        else:
+            primary_descriptor_material: JsonObject = next(
+                {"name": asset.name, "sha256": asset.sha256, "size": asset.size, "source": asset.source}
+                for asset in assets if asset.name == primary_original_name
+            )
+            payload = {
+                "fingerprint_version": MATERIAL_PRIMARY_ROLE_FINGERPRINT_VERSION,
+                "primary": primary_descriptor_material,
+                "companions": [descriptor for descriptor in descriptors_material if descriptor != primary_descriptor_material],
+            }
         identical_skip_safe = True
     else:
         raise ValueError(f"不支持的 source_kind: {source_kind}")
@@ -1761,76 +1773,78 @@ def _increment_document_version(previous_version: str) -> str:
     return f"v{int(suffix) + 1}"
 
 
-def build_material_ids(
-    *,
-    form_type: str,
-    material_name: str,
-    fiscal_year: int | None,
-    fiscal_period: str | None,
-) -> tuple[str, str]:
-    """生成稳定材料文档 ID 对。
+MAX_MATERIAL_NAME_CODE_POINTS: Final[int] = 240
+MIN_MATERIAL_FISCAL_YEAR: Final[int] = 1800
+MAX_MATERIAL_FISCAL_YEAR: Final[int] = 2100
+MATERIAL_PRIMARY_ROLE_FINGERPRINT_VERSION: Final[int] = 1
 
-    Args:
-        form_type: 材料 form type。
-        material_name: 材料名称。
-        fiscal_year: 可选财年。
-        fiscal_period: 可选财期。
 
-    Returns:
-        ``(document_id, internal_document_id)``。
+def normalize_material_form_type(value: str) -> str:
+    """参数：材料类别文本；返回：去首尾空白的大写类别；异常：无。"""
+    return value.strip().upper()
 
-    Raises:
-        ValueError: 参数非法时抛出。
-    """
 
-    normalized_form_type = form_type.strip().upper()
-    normalized_material_name = material_name.strip()
-    normalized_period = _normalize_optional_upload_fiscal_period(fiscal_period)
-    if not normalized_form_type:
-        raise ValueError("form_type 不能为空")
-    if not normalized_material_name:
-        raise ValueError("material_name 不能为空")
-    seed_parts = [normalized_form_type, normalized_material_name]
+def _material_identity_values(
+    *, form_type: str | None, material_name: str | None,
+    fiscal_year: int | None, fiscal_period: str | None, document_id: str | None,
+) -> tuple[str, str, int | None, FiscalPeriod | None, str]:
+    """参数：完整材料身份输入；返回：合法规范字段及稳定 ID；异常：FinsUploadUsageError 表示调用方可修正错误。"""
+    form = normalize_material_form_type(form_type) if form_type is not None else ""
+    if not form:
+        raise FinsUploadUsageError(fins_upload_usage_failure(FinsUploadUsageCode.MISSING_FORM_TYPE))
+    name = material_name.strip() if material_name is not None else ""
+    if not name:
+        raise FinsUploadUsageError(fins_upload_usage_failure(FinsUploadUsageCode.MISSING_MATERIAL_NAME))
+    if len(name) > MAX_MATERIAL_NAME_CODE_POINTS:
+        raise FinsUploadUsageError(fins_upload_usage_failure(FinsUploadUsageCode.MATERIAL_NAME_TOO_LONG))
+    if fiscal_year is not None and (type(fiscal_year) is not int or not MIN_MATERIAL_FISCAL_YEAR <= fiscal_year <= MAX_MATERIAL_FISCAL_YEAR):
+        raise FinsUploadUsageError(fins_upload_usage_failure(FinsUploadUsageCode.INVALID_MATERIAL_FISCAL_YEAR))
+    try:
+        period = normalize_fiscal_period(fiscal_period, field_name="fiscal_period")
+    except ValueError as exc:
+        raise FinsUploadUsageError(fins_upload_usage_failure(FinsUploadUsageCode.UNSUPPORTED_FISCAL_PERIOD)) from exc
+    seed_parts = [form, name]
     if fiscal_year is not None:
         seed_parts.append(str(fiscal_year))
-    if normalized_period is not None:
-        seed_parts.append(normalized_period)
-    digest = hashlib.sha1("|".join(seed_parts).encode("utf-8")).hexdigest()
-    material_document_id = f"mat_{digest}"
-    return material_document_id, material_document_id
+    if period is not None:
+        seed_parts.append(period)
+    stable_id = "mat_" + hashlib.sha1("|".join(seed_parts).encode("utf-8")).hexdigest()
+    if document_id is not None:
+        if not document_id.strip():
+            raise FinsUploadUsageError(fins_upload_usage_failure(FinsUploadUsageCode.EMPTY_DOCUMENT_ID))
+        if document_id.strip() != stable_id:
+            raise FinsUploadUsageError(fins_upload_usage_failure(FinsUploadUsageCode.DOCUMENT_ID_MISMATCH))
+    return form, name, fiscal_year, period, stable_id
 
 
-def validate_material_upload_ids(
-    *,
-    stable_document_id: str,
-    stable_internal_document_id: str,
-    document_id: str | None,
-    internal_document_id: str | None,
-) -> tuple[str, str]:
-    """校验显式传入的材料文档 ID 与稳定 ID 是否一致。
+@dataclass(frozen=True, slots=True)
+class MaterialUploadIdentity:
+    """合法且规范的完整材料身份事实；内部身份由同一 seed 产生。"""
 
-    Args:
-        stable_document_id: 按稳定规则生成的 document ID。
-        stable_internal_document_id: 按稳定规则生成的 internal document ID。
-        document_id: 外部传入的 document ID。
-        internal_document_id: 外部传入的 internal document ID。
+    form_type: str
+    material_name: str
+    fiscal_year: int | None
+    fiscal_period: FiscalPeriod | None
+    document_id: str
+    internal_document_id: str
 
-    Returns:
-        稳定 ID 对。
+    def __post_init__(self) -> None:
+        """参数：无；返回：无；异常：用法错误或 ValueError 表示非规范字段/身份漂移。"""
+        values = _material_identity_values(form_type=self.form_type, material_name=self.material_name,
+            fiscal_year=self.fiscal_year, fiscal_period=self.fiscal_period, document_id=self.document_id)
+        if values != (self.form_type, self.material_name, self.fiscal_year, self.fiscal_period, self.document_id) or self.internal_document_id != self.document_id:
+            raise ValueError("材料身份事实不规范或发生漂移")
 
-    Raises:
-        ValueError: 显式 ID 与稳定 ID 不一致时抛出。
-    """
 
-    normalized_document_id = str(document_id or "").strip()
-    normalized_internal_document_id = str(internal_document_id or "").strip()
-    if normalized_document_id and normalized_document_id != stable_document_id:
-        raise ValueError("显式 document_id 与按 form_type/material_name/fiscal 生成的稳定 document_id 不一致")
-    if normalized_internal_document_id and normalized_internal_document_id != stable_internal_document_id:
-        raise ValueError(
-            "显式 internal_document_id 与按 form_type/material_name/fiscal 生成的稳定 internal_document_id 不一致"
-        )
-    return stable_document_id, stable_internal_document_id
+def build_material_ids(
+    *, form_type: str | None, material_name: str | None,
+    fiscal_year: int | None, fiscal_period: str | None, document_id: str | None,
+) -> MaterialUploadIdentity:
+    """参数：材料类别、名称、可选财年/财期及 ID 一致性断言；返回：唯一合法身份；异常：FinsUploadUsageError 表示输入非法。"""
+    form, name, year, period, stable_id = _material_identity_values(
+        form_type=form_type, material_name=material_name, fiscal_year=fiscal_year,
+        fiscal_period=fiscal_period, document_id=document_id)
+    return MaterialUploadIdentity(form, name, year, period, stable_id, stable_id)
 
 
 def resolve_upload_action(
@@ -1966,25 +1980,6 @@ def _normalize_optional_upload_action(action: str | None) -> str | None:
     if normalized_action not in UPLOAD_ACTIONS:
         raise ValueError(f"不支持的 action: {action}")
     return normalized_action
-
-
-def _normalize_optional_upload_fiscal_period(fiscal_period: str | None) -> str | None:
-    """标准化可选上传财期。
-
-    Args:
-        fiscal_period: 原始财期。
-
-    Returns:
-        去除空白并转大写后的财期；空值返回 ``None``。
-
-    Raises:
-        无。
-    """
-
-    normalized_period = str(fiscal_period or "").strip().upper()
-    if not normalized_period:
-        return None
-    return normalized_period
 
 
 def _build_stored_file_entry(
@@ -2136,5 +2131,4 @@ __all__ = [
     "derive_report_kind",
     "resolve_upload_action",
     "rollback_prepared_upload_batch",
-    "validate_material_upload_ids",
 ]

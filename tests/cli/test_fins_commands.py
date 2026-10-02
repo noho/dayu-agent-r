@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from dayu.fins.pipelines.docling_upload_service import build_material_ids
+from dayu.fins.storage import FsCompanyMetaRepository
+
 import ast
 import asyncio
 import errno
@@ -9,6 +12,10 @@ import hashlib
 import io
 import logging
 import os
+import signal
+import select
+import time
+import json
 import subprocess
 import sys
 from collections.abc import AsyncGenerator
@@ -442,7 +449,7 @@ class _FakeFinsDirectService:
                 form_type=raw.form_type,
                 material_name=raw.material_name,
                 document_id=raw.document_id,
-                internal_document_id=raw.internal_document_id,
+                internal_document_id=request.identity.internal_document_id,
                 fiscal_year=raw.fiscal_year,
                 fiscal_period=raw.fiscal_period,
                 amended=raw.amended,
@@ -2663,6 +2670,8 @@ def test_download_mutation_mode_conflict_precedes_all_side_effects(
     assert not workspace_root.exists()
 
 
+@pytest.mark.parametrize("command_name", ("upload_filing", "upload_material"))
+@pytest.mark.parametrize("ticker", ("ICPD", "600519", "0700"))
 @pytest.mark.parametrize(
     ("file_name", "payload", "expected_reason", "expected_failure_code"),
     (
@@ -2687,8 +2696,10 @@ def test_real_cli_content_failure_has_bounded_stderr_and_zero_fresh_workspace_mu
     payload: bytes,
     expected_reason: str,
     expected_failure_code: str,
+    command_name: str,
+    ticker: str,
 ) -> None:
-    """真实 CLI empty/corrupt PDF/DOCX failure 必须安全投影且零 mutation。
+    """两类真实 CLI 在 US/CN/HK 的 empty/corrupt PDF/DOCX 保持五字段、安全路径与零文档发布，material 保留合法公司。
 
     Args:
         tmp_path: pytest 临时目录。
@@ -2715,11 +2726,11 @@ def test_real_cli_content_failure_has_bounded_stderr_and_zero_fresh_workspace_mu
             sys.executable,
             "-m",
             "dayu.cli",
-            "upload_filing",
+            command_name,
             "--base",
             str(workspace_root),
             "--ticker",
-            "ICPD",
+            ticker,
             "--files",
             str(corrupt_file),
             "--fiscal-year",
@@ -2728,6 +2739,7 @@ def test_real_cli_content_failure_has_bounded_stderr_and_zero_fresh_workspace_mu
             "FY",
             "--company-name",
             "ICPD Corp.",
+            *(("--forms", "MATERIAL_OTHER", "--material-name", "CLI Content") if command_name == "upload_material" else ()),
         ),
         cwd=repository_root,
         check=False,
@@ -2747,7 +2759,19 @@ def test_real_cli_content_failure_has_bounded_stderr_and_zero_fresh_workspace_mu
     assert "Traceback" not in completed.stderr
     assert str(repository_root) not in completed.stderr
     assert str(corrupt_file) not in completed.stderr
-    assert not workspace_root.exists()
+    (tmp_path / "cli.stdout").write_text(completed.stdout, encoding="utf-8")
+    (tmp_path / "cli.stderr").write_text(completed.stderr, encoding="utf-8")
+    (tmp_path / "cli.exit").write_text(str(completed.returncode) + "\n", encoding="utf-8")
+    (tmp_path / "cli.command.json").write_text(json.dumps(completed.args, ensure_ascii=False), encoding="utf-8")
+    if command_name == "upload_filing":
+        assert not workspace_root.exists()
+    else:
+        repository = FsSourceDocumentRepository(workspace_root)
+        assert repository.list_source_document_ids(ticker, SourceKind.MATERIAL) == []
+        assert FsCompanyMetaRepository(workspace_root).get_company_meta(ticker).company_name == "ICPD Corp."
+        assert not tuple((workspace_root / ".dayu" / "fins_ingestion" / "jobs").glob("*.json"))
+        assert not (workspace_root / "sessions").exists()
+        assert not (workspace_root / "artifacts").exists()
 
 
 def test_download_repeated_ticker_is_last_wins(
@@ -2860,17 +2884,15 @@ def test_upload_commands_map_args_and_validate_files(
             (
                 "upload_material",
                 "--ticker",
-                "DELTA,MSFT",
+                "AAPL,MSFT",
                 "--forms",
                 "8-K",
                 "--material-name",
                 "Investor Day",
                 "--files",
                 str(material_file),
-                "--document-id",
-                "doc-1",
-                "--internal-document-id",
-                "internal-1",
+
+
             )
         )
         == EXIT_SUCCESS
@@ -2895,13 +2917,13 @@ def test_upload_commands_map_args_and_validate_files(
     ]
     assert fake_service.upload_material_requests == [
         _UploadMaterialCall(
-            ticker="DELTA",
+            ticker="AAPL",
             action="auto",
             files=(material_file.resolve(),),
             form_type="8-K",
             material_name="Investor Day",
-            document_id="doc-1",
-            internal_document_id="internal-1",
+            document_id=None,
+            internal_document_id=build_material_ids(form_type="8-K", material_name="Investor Day", fiscal_year=None, fiscal_period=None, document_id=None).internal_document_id,
             fiscal_year=None,
             fiscal_period=None,
             amended=False,
@@ -3111,7 +3133,7 @@ def test_upload_material_cli_mixed_name_and_format_uses_plan_reason(
         path.parent.mkdir()
         path.write_bytes(b"input")
     with pytest.raises(FinsUploadUsageError) as raised:
-        admit_fins_upload_material_request(FinsUploadMaterialRequest(ticker="AAPL", files=paths))
+        admit_fins_upload_material_request(FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="AAPL", files=paths))
     assert raised.value.failure.code.value == expected_code
     assert raised.value.failure.message == expected_message
     exit_code = cli_main.main((
@@ -3157,7 +3179,7 @@ def test_real_cli_long_duplicate_basename_is_typed_usage_without_publication(
     second.write_bytes(b"second")
     with pytest.raises(FinsUploadUsageError) as raised:
         admit_fins_upload_material_request(
-            FinsUploadMaterialRequest(ticker="AAPL", files=(first, second))
+            FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", primary_selectors=(first,), ticker="AAPL", files=(first, second))
         )
     assert raised.value.failure.code is FinsUploadUsageCode.DUPLICATE_ORIGINAL_BASENAME
 
@@ -3217,7 +3239,7 @@ def test_real_cli_backslash_basename_is_typed_usage_without_publication(
     upload_file.write_bytes(b"content")
     with pytest.raises(FinsUploadUsageError) as raised:
         admit_fins_upload_material_request(
-            FinsUploadMaterialRequest(ticker="AAPL", files=(upload_file,))
+            FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="AAPL", files=(upload_file,))
         )
     assert raised.value.failure.code is FinsUploadUsageCode.INVALID_ASSET_NAME
 
@@ -3268,7 +3290,7 @@ def test_real_cli_unknown_home_uses_planner_usage_without_publication(
     raw_name = "~dayu_assets_nonexistent_user_20260929/report.txt"
     with pytest.raises(FinsUploadUsageError) as raised:
         admit_fins_upload_material_request(
-            FinsUploadMaterialRequest(ticker="AAPL", files=(Path(raw_name),))
+            FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="AAPL", files=(Path(raw_name),))
         )
     assert raised.value.failure.code is FinsUploadUsageCode.INVALID_ASSET_NAME
     workspace_root = tmp_path / "fresh-workspace"
@@ -3325,47 +3347,20 @@ def test_real_cli_filing_unknown_home_uses_typed_usage_before_workspace(
     assert not workspace_root.exists()
 
 
-def test_real_cli_material_delete_restores_raw_file_guards(tmp_path: Path) -> None:
-    """delete 保持合法文件行为，并在真实 CLI 阻断缺失文件和超额 raw 列表。
-
-    Args:
-        tmp_path: 隔离文件与工作区。
-
-    Returns:
-        无。
-
-    Raises:
-        AssertionError: 旧状态守卫、数量上限或零副作用漂移时抛出。
-        subprocess.TimeoutExpired: CLI 未在期限内结束时抛出。
-    """
-
+def test_real_cli_material_delete_rejects_files_before_path_access(tmp_path: Path) -> None:
+    """参数：隔离根；返回：无；异常：断言/超时；delete 所有 files 在解析路径前同源拒绝。"""
     workspace_root = tmp_path / "fresh-workspace"
     valid = tmp_path / "valid.pdf"
     valid.write_bytes(b"valid")
-    prefix = (
-        sys.executable, "-m", "dayu.cli", "upload_material", "--base", str(workspace_root),
-        "--ticker", "AAPL", "--action", "delete", "--forms", "MATERIAL_OTHER",
-        "--material-name", "Deck", "--company-name", "Apple Inc.", "--files",
-    )
-    accepted = fins_command._prevalidate_upload_material_request(parse_cli_args(
-        ("upload_material", "--base", str(workspace_root), "--ticker", "AAPL",
-         "--action", "delete", "--forms", "MATERIAL_OTHER", "--material-name", "Deck",
-         "--company-name", "Apple Inc.", "--files", str(valid))
-    ))
-    assert accepted is not None
-    assert accepted.request.files == (valid,)
-    assert accepted.asset_plan.ordered_pairs == ()
-    for paths, expected in (
-        ((str(tmp_path / "missing.pdf"),), "upload file does not exist"),
-        ((str(tmp_path),), "upload path is not a file"),
-        ((str(valid),) * 101, "--files 数量不能超过 100 个"),
-    ):
-        completed = subprocess.run(
-            (*prefix, *paths), cwd=Path(__file__).resolve().parents[2],
-            check=False, capture_output=True, text=True, timeout=60.0,
-        )
+    prefix = (sys.executable, "-m", "dayu.cli", "upload_material", "--base", str(workspace_root),
+              "--ticker", "AAPL", "--action", "delete", "--forms", "MATERIAL_OTHER",
+              "--material-name", "Deck", "--company-name", "Apple Inc.", "--files")
+    for paths in ((str(valid),), (str(tmp_path / "missing.pdf"),), (str(tmp_path),), (str(valid),) * 101):
+        completed = subprocess.run((*prefix, *paths), cwd=Path(__file__).resolve().parents[2],
+                                   check=False, capture_output=True, text=True, timeout=60.0)
         assert completed.returncode == EXIT_USAGE_ERROR
-        assert expected in completed.stderr
+        assert completed.stdout == ""
+        assert "delete 不得提供 --files" in completed.stderr
         assert not workspace_root.exists()
 
 
@@ -3397,7 +3392,7 @@ def test_real_cli_material_delete_unknown_home_is_closed_usage(tmp_path: Path) -
     )
     assert completed.returncode == EXIT_USAGE_ERROR
     assert completed.stdout == ""
-    assert "文件名无法安全保存：report.pdf" in completed.stderr
+    assert "delete 不得提供 --files" in completed.stderr
     assert "dayu_assets_nonexistent_user_20260930" not in completed.stderr
     assert not workspace_root.exists()
 
@@ -3433,7 +3428,7 @@ def test_real_cli_material_symlink_loop_is_operational_without_publication(
         ),
         cwd=repository_root, check=False, capture_output=True, text=True, timeout=60.0,
     )
-    assert completed.returncode == EXIT_FAILURE
+    assert completed.returncode == (EXIT_USAGE_ERROR if action == "delete" else EXIT_FAILURE)
     assert completed.stdout == ""
     assert "文件名无法安全保存" not in completed.stderr
     assert str(loop) not in completed.stderr
@@ -3473,8 +3468,11 @@ def test_cli_nul_path_uses_planner_usage_before_service_factory(
     captured = capsys.readouterr()
     assert exit_code == EXIT_USAGE_ERROR
     assert captured.out == ""
-    assert "文件名无法安全保存" in captured.err
-    assert "输入文件（文件名已隐藏）" in captured.err
+    if action == "delete":
+        assert "delete 不得提供 --files" in captured.err
+    else:
+        assert "文件名无法安全保存" in captured.err
+        assert "输入文件（文件名已隐藏）" in captured.err
     assert "embedded null byte" not in captured.err
     assert str(tmp_path) not in captured.err
     assert fake_service.upload_material_requests == []
@@ -4742,7 +4740,7 @@ def _live_command_argv(command_name: str, tmp_path: Path) -> tuple[str, ...]:
     if command_name == "upload_material":
         upload_file = tmp_path / "material.pdf"
         upload_file.write_text("material", encoding="utf-8")
-        return ("upload_material", "--ticker", "AAPL", "--files", str(upload_file))
+        return ("upload_material", "--forms", "MATERIAL_OTHER", "--material-name", "Deck", "--ticker", "AAPL", "--files", str(upload_file))
     raise ValueError(f"unknown live command: {command_name}")
 
 
@@ -4957,3 +4955,41 @@ def test_fins_download_sec_integrity_failure_preserves_summary(
     assert str(tmp_path) not in captured.err and "://" not in captured.err
     assert pipeline.source_repository.classify_source_integrity("AAPL", "fil_0000000000-25-000001", SourceKind.FILING).status is SourceIntegrityStatus.COMPLETE
     print(captured.err)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="真实 SIGINT 验证需要 POSIX 信号")
+def test_real_material_cli_sigint_waits_for_cancelled_terminal(tmp_path: Path) -> None:
+    """参数：独占真实输入与根；返回：无；异常：断言/超时；首个真实进度后 SIGINT 请求协作取消，exit=130且无材料/job/Agent产物。"""
+    workspace_root = tmp_path / "workspace"
+    path = tmp_path / "cancel.txt"
+    path.write_text("Public cancellation probe text.\n" * 2000, encoding="utf-8")
+    argv = (sys.executable, "-m", "dayu.cli", "upload_material", "--base", str(workspace_root),
+            "--ticker", "AAPL", "--forms", "MATERIAL_OTHER", "--material-name", "Cancel Text",
+            "--company-name", "Apple Inc.", "--files", str(path))
+    started = time.monotonic()
+    process = subprocess.Popen(argv, cwd=Path(__file__).resolve().parents[2], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    first_line = ""
+    try:
+        assert process.stdout is not None
+        readable, _, _ = select.select((process.stdout,), (), (), 30.0)
+        assert readable, "CLI 未产生首个进度"
+        first_line = process.stdout.readline()
+        assert "Fins progress" in first_line
+        process.send_signal(signal.SIGINT)
+        stdout, stderr = process.communicate(timeout=30.0)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.communicate(timeout=10.0)
+    (tmp_path / "sigint.stdout").write_text(first_line + stdout, encoding="utf-8")
+    (tmp_path / "sigint.stderr").write_text(stderr, encoding="utf-8")
+    (tmp_path / "sigint.exit").write_text(str(process.returncode) + "\n", encoding="utf-8")
+    (tmp_path / "sigint.command.json").write_text(json.dumps({"argv": argv, "pid": process.pid,
+        "monotonic_start": started, "monotonic_end": time.monotonic(), "signal": "SIGINT"}), encoding="utf-8")
+    assert process.returncode == EXIT_KEYBOARD_INTERRUPT
+    assert "Fins cancelled" in stderr and "Traceback" not in stderr
+    assert not tuple((workspace_root / ".dayu" / "fins_ingestion" / "jobs").glob("*.json"))
+    assert FsSourceDocumentRepository(workspace_root).list_source_document_ids("AAPL", SourceKind.MATERIAL) == []
+    assert not (workspace_root / "sessions").exists()
+    assert not (workspace_root / "artifacts").exists()

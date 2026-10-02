@@ -200,7 +200,14 @@ def test_material_form_candidate_reaches_fins_owner_and_maps_usage_exit(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """CLI 必须传播规范化候选，并把 Fins owner 的拒绝映射为 usage exit。"""
+    """CLI 必须传播原文候选，并把 Fins owner 的拒绝映射为 usage exit。
+
+    :param tmp_path: 当前测试独占的临时目录。
+    :param capsys: CLI 双流捕获夹具。
+    :param monkeypatch: 当前测试的调用观察与隔离夹具。
+    :returns: 无。
+    :raises AssertionError: 原文传播或用法退出不符合预期时抛出。
+    """
 
     _install_forbidden_direct_service(monkeypatch)
     _CAPTURED_BATCH_REQUESTS.clear()
@@ -232,9 +239,9 @@ def test_material_form_candidate_reaches_fins_owner_and_maps_usage_exit(
 
     assert exit_code == EXIT_USAGE_ERROR
     assert [request.material_form for request in _CAPTURED_BATCH_REQUESTS] == [
-        "ESG_REPORT"
+        " esg_report "
     ]
-    assert "unsupported material form: ESG_REPORT" in capsys.readouterr().err
+    assert "unsupported material form:  esg_report " in capsys.readouterr().err
     assert not (tmp_path / "workspace").exists()
 
 
@@ -462,6 +469,165 @@ def test_posix_script_round_trips_adversarial_argv_with_real_sh(tmp_path: Path) 
         ["second", *appended],
     ]
     assert not marker.exists()
+
+
+def test_posix_single_line_script_preserves_exact_bytes() -> None:
+    """锁定普通单行再生成注释和命令正文的既有字节。
+
+    :param: 无。
+    :returns: 无。
+    :raises AssertionError: 普通单行脚本发生字节变化时抛出。
+    """
+
+    content = upload_script.render_upload_script(
+        (("python", "recorder.py", "space value", ""),),
+        regeneration_argv=("python", "-m", "dayu.cli", "upload_filings_from"),
+        platform="posix",
+    )
+    assert content.encode("utf-8") == (
+        b"#!/usr/bin/env sh\nset -eu\n"
+        b"# Regenerate: python -m dayu.cli upload_filings_from\n"
+        b"python recorder.py 'space value' '' \"$@\"\n"
+    )
+
+
+@pytest.mark.parametrize("line_break", ("\n", "\r\n", "\r"))
+def test_posix_multiline_regeneration_remains_comment_and_argv_round_trips(
+    tmp_path: Path,
+    line_break: str,
+) -> None:
+    """真实 sh 核查再生成多行文本无执行效果且命令参数原字节往返。
+
+    :param tmp_path: 当前测试独占的 recorder 与 shell 工作目录。
+    :param line_break: LF、CRLF 或不拆行的 CR。
+    :returns: 无。
+    :raises AssertionError: 语法、注释隔离或 argv 字节往返不符合预期时抛出。
+    :raises OSError: 独占技术文件读写或子进程启动失败时透传。
+    """
+
+    recorder = tmp_path / "recorder.py"
+    output = tmp_path / "argv.json"
+    marker = tmp_path / "comment-executed"
+    recorder.write_text(
+        '"""独占 shell 参数字节记录器，不访问财报。"""\n'
+        "import json, os, pathlib, sys\n"
+        "def main() -> None:\n"
+        '    """参数：进程 argv；返回：无；异常：技术文件写入失败透传。"""\n'
+        "    values = [os.fsencode(value).hex() for value in sys.argv[2:]]\n"
+        "    pathlib.Path(sys.argv[1]).write_text(json.dumps(values), encoding='utf-8')\n"
+        "main()\n",
+        encoding="utf-8",
+    )
+    regeneration_value = (
+        f"{line_break}{line_break}raw'{line_break}"
+        f"touch '{marker}'{line_break}$(touch '{marker}'){line_break}{line_break}"
+    )
+    fixed = ("\nleading", "trailing\n", "\r\nCRLF\r\n", "\rCR\r", regeneration_value)
+    appended = ("\n\nappended\r\n", "中文\n'quoted'\n")
+    script = tmp_path / "multiline.sh"
+    content = upload_script.render_upload_script(
+        ((sys.executable, str(recorder), str(output), *fixed),),
+        regeneration_argv=("dayu-cli", "--material-forms", regeneration_value),
+        platform="posix",
+    )
+    script.write_bytes(content.encode("utf-8"))
+    syntax = subprocess.run(
+        ("/bin/sh", "-n", str(script)),
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+    )
+    execution = subprocess.run(
+        ("/bin/sh", str(script), *appended),
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+    )
+    for phase, argv, completed in (
+        ("syntax", ("/bin/sh", "-n", str(script)), syntax),
+        ("execution", ("/bin/sh", str(script), *appended), execution),
+    ):
+        (tmp_path / f"{phase}.command.json").write_text(json.dumps(argv), encoding="utf-8")
+        (tmp_path / f"{phase}.stdout").write_bytes(completed.stdout)
+        (tmp_path / f"{phase}.stderr").write_bytes(completed.stderr)
+        (tmp_path / f"{phase}.exit").write_text(str(completed.returncode), encoding="utf-8")
+    assert syntax.returncode == EXIT_SUCCESS, syntax.stderr
+    assert execution.returncode == EXIT_SUCCESS, execution.stderr
+    assert execution.stdout == b""
+    assert execution.stderr == b""
+    assert not marker.exists()
+    assert json.loads(output.read_text(encoding="utf-8")) == [
+        os.fsencode(value).hex() for value in (*fixed, *appended)
+    ]
+
+
+@pytest.mark.parametrize(
+    "raw_form",
+    (
+        "\nearnings_presentation",
+        "earnings_presentation\n",
+        "\r\nearnings_presentation",
+        "earnings_presentation\r\n",
+        "\n\nearnings_presentation\n\n",
+        "\r\n\r\nearnings_presentation\r\n\r\n",
+    ),
+)
+def test_real_batch_cli_generates_valid_script_for_raw_form_line_boundaries(
+    tmp_path: Path,
+    raw_form: str,
+) -> None:
+    """真实 CLI 保留合法 form 原文并生成通过 sh 语法检查的脚本。
+
+    :param tmp_path: 当前测试独占的源目录、输出目录与技术票据目录。
+    :param raw_form: 含首尾 LF、CRLF 或边界空行的合法原文候选。
+    :returns: 无；仅生成脚本，不执行上传。
+    :raises AssertionError: CLI、注释原文或命令业务 form 不符合预期时抛出。
+    :raises OSError: 独占技术文件读写或子进程启动失败时透传。
+    """
+
+    source_dir = tmp_path / "source"
+    base = tmp_path / "workspace"
+    source_dir.mkdir()
+    (source_dir / "2024 Earnings Presentation.txt").write_text("technical input", encoding="utf-8")
+    argv = (
+        sys.executable,
+        "-m",
+        "dayu.cli",
+        "upload_filings_from",
+        "--base",
+        str(base),
+        "--ticker",
+        "AAPL",
+        "--from",
+        str(source_dir),
+        "--material-forms",
+        raw_form,
+    )
+    generation = subprocess.run(
+        argv,
+        cwd=Path(__file__).resolve().parents[2],
+        check=False,
+        capture_output=True,
+    )
+    (tmp_path / "generation.command.json").write_text(json.dumps(argv), encoding="utf-8")
+    (tmp_path / "generation.stdout").write_bytes(generation.stdout)
+    (tmp_path / "generation.stderr").write_bytes(generation.stderr)
+    (tmp_path / "generation.exit").write_text(str(generation.returncode), encoding="utf-8")
+    assert generation.returncode == EXIT_SUCCESS, generation.stderr
+    script = base / "upload_filings_AAPL.sh"
+    syntax_argv = ("/bin/sh", "-n", str(script))
+    syntax = subprocess.run(syntax_argv, check=False, capture_output=True, cwd=tmp_path)
+    (tmp_path / "syntax.command.json").write_text(json.dumps(syntax_argv), encoding="utf-8")
+    (tmp_path / "syntax.stdout").write_bytes(syntax.stdout)
+    (tmp_path / "syntax.stderr").write_bytes(syntax.stderr)
+    (tmp_path / "syntax.exit").write_text(str(syntax.returncode), encoding="utf-8")
+    assert syntax.returncode == EXIT_SUCCESS, syntax.stderr
+    content = script.read_bytes().decode("utf-8")
+    comment, body = content.split("\n", maxsplit=2)[2].rsplit("\n", maxsplit=2)[:2]
+    # 只撤销 renderer 的注释前缀，验证原文未被 batch 或 renderer 裁剪。
+    assert raw_form in comment.replace("\n# ", "\n")
+    assert "--forms EARNINGS_PRESENTATION" in body
+    assert "Material files: 1" in generation.stdout.decode("utf-8")
 
 
 def test_windows_renderer_round_trips_fixed_argument_oracles() -> None:

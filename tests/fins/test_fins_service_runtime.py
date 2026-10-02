@@ -587,11 +587,11 @@ def test_upload_summary_joins_validated_request_and_pipeline_counts(
         AssertionError: summary 重建 stored count 或保留 basename 时抛出。
     """
 
-    raw_request = FinsUploadMaterialRequest(
+    raw_request = FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", primary_selectors=() if status == "deleted" else (Path('first.pdf'),),
         ticker="AAPL",
         source_kind=SourceKind.MATERIAL,
         action="delete" if status == "deleted" else "create",
-        files=(Path("first.pdf"), Path("second.pdf")),
+        files=() if status == "deleted" else (Path("first.pdf"), Path("second.pdf")),
     )
     request = admit_fins_upload_material_request(raw_request)
     summary = _upload_summary_from_result(
@@ -674,7 +674,7 @@ def test_upload_summary_from_result_explicitly_copies_typed_warnings() -> None:
     )
 
     summary = _upload_summary_from_result(
-        request=admit_fins_upload_material_request(FinsUploadMaterialRequest(
+        request=admit_fins_upload_material_request(FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck",
             ticker="AAPL",
             files=(Path("material.pdf"),),
         )),
@@ -752,7 +752,7 @@ def test_production_runner_preserves_material_handoff_identity(tmp_path: Path) -
     """
 
     validated = admit_fins_upload_material_request(
-        FinsUploadMaterialRequest(ticker="AAPL", files=(tmp_path / "deck.pdf",))
+        FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="AAPL", files=(tmp_path / "deck.pdf",))
     )
     pipeline = _MaterialPipelineFacade()
     runner = ProductionFinsUploadRunner(
@@ -786,7 +786,7 @@ def test_production_upload_runner_early_cancel_uses_request_count(
     ).get_ingestion_runtime()
     runner = runtime.upload_runner
     assert isinstance(runner, ProductionFinsUploadRunner)
-    request = FinsUploadMaterialRequest(
+    request = FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", primary_selectors=(Path('first.pdf'),),
         ticker="AAPL",
         files=(Path("first.pdf"), Path("second.pdf")),
     )

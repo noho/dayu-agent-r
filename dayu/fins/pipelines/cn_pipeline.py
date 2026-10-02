@@ -79,12 +79,10 @@ from dayu.fins.pipelines._filing_upload_fresh_validation import (
 from dayu.fins.pipelines.docling_upload_service import (
     DoclingUploadService,
     UploadOperationResult,
-    build_material_ids,
     commit_prepared_upload_batch,
     derive_report_kind,
     resolve_upload_action,
     rollback_prepared_upload_batch,
-    validate_material_upload_ids,
 )
 from dayu.fins.pipelines.filing_upload_publication import (
     execute_prepared_filing_publication,
@@ -1032,6 +1030,7 @@ class CnPipeline:
             FinsUploadUsageError: 资产规划失败时抛出。
         """
 
+        build_upload_company_id(_normalize_upload_ticker(request.ticker))
         validated = admit_fins_upload_material_request(request)
         async for event in self.upload_material_validated_stream(
             validated, cancellation_checker=cancellation_checker
@@ -1089,15 +1088,11 @@ class CnPipeline:
         request.validate()
         raw = request.request
         ticker = raw.ticker
-        action = None if raw.action == FINS_UPLOAD_ACTION_AUTO else raw.action
-        form_type = raw.form_type
-        material_name = raw.material_name
-        if form_type is None or material_name is None:
-            raise ValueError("material 上传必须提供 form_type 与 material_name")
-        document_id = raw.document_id
-        internal_document_id = raw.internal_document_id
-        fiscal_year = raw.fiscal_year
-        fiscal_period = raw.fiscal_period
+        identity = request.identity
+        form_type = identity.form_type
+        material_name = identity.material_name
+        fiscal_year = identity.fiscal_year
+        fiscal_period = identity.fiscal_period
         filing_date = raw.filing_date
         report_date = raw.report_date
         company_name = raw.company_name
@@ -1106,20 +1101,10 @@ class CnPipeline:
         file_list = list(request.file_selection.files)
         normalized_ticker = _normalize_upload_ticker(ticker)
         normalized_company_id = build_upload_company_id(normalized_ticker)
-        normalized_fiscal_period = str(fiscal_period or "").strip().upper() or None
-        stable_document_id, stable_internal_document_id = build_material_ids(
-            form_type=form_type,
-            material_name=material_name,
-            fiscal_year=fiscal_year,
-            fiscal_period=normalized_fiscal_period,
-        )
-        resolved_document_id, resolved_internal_id = validate_material_upload_ids(
-            stable_document_id=stable_document_id,
-            stable_internal_document_id=stable_internal_document_id,
-            document_id=document_id,
-            internal_document_id=internal_document_id,
-        )
-        requested_action = str(action or "").strip().lower() or None
+        normalized_fiscal_period = identity.fiscal_period
+        resolved_document_id = identity.document_id
+        resolved_internal_id = identity.internal_document_id
+        requested_action = request.action_decision.pipeline_action
         resolved_action: str | None = None
         try:
             selection = request.asset_plan
@@ -1128,7 +1113,7 @@ class CnPipeline:
                 resolved_document_id,
                 SourceKind.MATERIAL,
             )
-            resolved_action = resolve_upload_action(action, previous_meta)
+            resolved_action = resolve_upload_action(requested_action, previous_meta)
             yield UploadMaterialEvent(
                 event_type=UploadMaterialEventType.UPLOAD_STARTED,
                 ticker=normalized_ticker,

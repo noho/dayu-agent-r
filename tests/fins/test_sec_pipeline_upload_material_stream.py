@@ -129,7 +129,7 @@ class _FailingMaterialDoclingConverter:
 
 
 @pytest.mark.asyncio
-async def test_material_delete_with_legal_raw_file_keeps_zero_selected_count(
+async def test_material_delete_without_files_keeps_zero_selected_count(
     tmp_path: Path,
 ) -> None:
     """合法 raw 文件不改变 delete 行为，也不进入 pipeline 进度文件数。
@@ -163,7 +163,7 @@ async def test_material_delete_with_legal_raw_file_keeps_zero_selected_count(
     deleted = [
         event async for event in pipeline.upload_material_stream(
             FinsUploadMaterialRequest(
-                ticker="AAPL", action="delete", files=(material_file,),
+                ticker="AAPL", action="delete", files=(),
                 form_type="MATERIAL_OTHER", material_name="Deck", company_name="Apple Inc.",
             )
         )
@@ -361,7 +361,7 @@ async def test_upload_material_nth_conversion_failure_is_content_terminal_withou
 
     events = [
         event
-        async for event in pipeline.upload_material_stream(FinsUploadMaterialRequest(ticker="AAPL", action="create", form_type="MATERIAL_OTHER", material_name="Deck", files=tuple(files), company_name="Apple Inc.", overwrite=False))
+        async for event in pipeline.upload_material_stream(FinsUploadMaterialRequest(ticker="AAPL", action="create", form_type="MATERIAL_OTHER", material_name="Deck", files=tuple(files), primary_selectors=(files[0],), company_name="Apple Inc.", overwrite=False))
     ]
 
     assert [event.event_type for event in events] == [
@@ -378,7 +378,7 @@ async def test_upload_material_nth_conversion_failure_is_content_terminal_withou
         "code": "docling_converter_execution",
         "message": "文件无法解析或已损坏，请检查文件后重试",
         "retry_hint": "请确认文件可正常打开并重新上传",
-        "file_label": None,
+        "file_label": "corrupt.docx",
     }
     document_id = str(result["document_id"])
     with pytest.raises(FileNotFoundError):
@@ -470,9 +470,9 @@ async def test_upload_material_unsupported_suffix_fails_before_reads_or_mutation
     monkeypatch.setattr(pipeline._batching_repository, "begin_batch", reject_batch)
     monkeypatch.setattr(Path, "read_bytes", reject_file_read)
 
-    with pytest.raises(FinsUploadFormatError) as exc_info:
+    with pytest.raises(FinsUploadUsageError) as exc_info:
         _ = [event async for event in pipeline.upload_material_stream(FinsUploadMaterialRequest(ticker="AAPL", action="create", form_type="MATERIAL_OTHER", material_name="Deck", files=(unsupported_file,), company_name="Apple Inc."))]
-    assert exc_info.value.file_label == "deck.zip"
+    assert exc_info.value.failure.file_label == "deck.zip"
     assert calls == []
     assert not (tmp_path / "portfolio" / "AAPL").exists()
 
@@ -679,7 +679,7 @@ def test_sec_material_sync_delegate_admits_once(
         AssertionError: 同步委托重复准入时抛出。
     """
 
-    request = FinsUploadMaterialRequest(
+    request = FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck",
         ticker="AAPL", files=tuple(tmp_path / f"part-{index:03d}.pdf" for index in range(101)),
     )
     pipeline = object.__new__(SecPipeline)

@@ -31,6 +31,7 @@ from dayu.fins.ingestion_runtime import (
     FinsUploadMaterialRequest,
     admit_fins_upload_filing_selection,
     admit_fins_upload_material_request,
+    validate_fins_upload_material_action_files,
     FinsUploadRequest,
 )
 from dayu.fins.storage import CompanyTickerIdentityCorruptionError
@@ -140,7 +141,7 @@ class FinsUploadToolCallable:
                     else _ERROR_INVALID_ARGUMENT
                 ),
                 message=exc.failure.message,
-                hint=_INVALID_ARGUMENT_HINT,
+                hint=exc.failure.hint,
             )
         except ValueError as exc:
             return _failed_outcome(
@@ -191,6 +192,7 @@ def build_fins_upload_tool(runtime: FinsIngestionRuntime) -> ToolDefinition:
                 description=(
                     "为一家公司上传本地财报文件或补充材料。调用后等待工具结果返回；"
                     "结果会说明上传、删除、转换或失败情况。仅在用户明确要求使用本地文件补充财报资料时调用。"
+                    '最小材料示例：{"ticker":"AAPL","upload_kind":"material","files":["/path/deck.txt"],"form_type":"MATERIAL_OTHER","material_name":"Deck"}。'
                 ),
                 parameters=_upload_parameters_schema(),
             ),
@@ -271,35 +273,31 @@ def _upload_parameters_schema() -> ToolParametersSchema:
             "maxItems": max(MAX_FILING_UPLOAD_FILES, MAX_MATERIAL_UPLOAD_FILES),
         },
         "primary": {
-            "type": "string",
+            "type": ["string", "null"],
             "description": FINS_UPLOAD_FORMAT_TEXT.upload_tool_primary,
         },
         "fiscal_year": {
-            "type": "integer",
-            "description": "财年。上传 filing 时必填，且只接受 1000..9999 的整数；上传 material 时可选。",
+            "type": ["integer", "null"],
+            "description": "财年。上传 filing 时必填，且只接受 1000..9999 的整数；上传 material 时可选，必须是 1800..2100 的整数，不能是布尔值。",
         },
         "fiscal_period": {
-            "type": "string",
+            "type": ["string", "null"],
             "description": (
                 "财报期间。上传 filing 时必填且只支持 FY、H1、Q1、Q2、Q3、Q4；"
-                "上传 material 时可选。"
+                "上传 material 时可选，仍只支持上述六值；去首尾空白并转大写。省略/null 表示未提供，显式空文本非法。"
             ),
         },
         "form_type": {
             "type": "string",
-            "description": "补充材料类型，例如 8-K 或 MATERIAL_OTHER。上传 material 时必填。",
+            "description": "补充材料类型，例如 8-K 或 MATERIAL_OTHER。材料每个动作必填非空文本，去首尾空白并转大写。",
         },
         "material_name": {
             "type": "string",
-            "description": "补充材料显示名称。上传 material 时必填。",
+            "description": "补充材料名称。材料每个动作必填非空文本，去首尾空白后最多 240 个 Unicode 码点。",
         },
         "document_id": {
-            "type": "string",
-            "description": "可选的补充材料文档 ID。只有用户明确提供已存文档 ID 时才填写。",
-        },
-        "internal_document_id": {
-            "type": "string",
-            "description": "可选的补充材料内部源文件 ID。只有用户明确提供精确源文件 ID 时才填写。",
+            "type": ["string", "null"],
+            "description": "可选材料文档 ID，仅验证与材料类型/名称/财年/财期生成的身份一致，不能覆盖身份；显式空文本非法。",
         },
         "amended": {
             "type": "boolean",
@@ -351,16 +349,23 @@ def _upload_request_from_arguments(arguments: Mapping[str, JsonValue]) -> FinsUp
         Fins 上传请求。
 
     Raises:
-        ValueError: 参数类型、动作、上传类别或文件路径非法时抛出。
+        ValueError: 参数词法、上传类别或文件路径非法时抛出。
+        FinsUploadUsageError: 材料动作与文件组合非法时抛出。
     """
 
+    if "internal_document_id" in arguments:
+        raise ValueError("unknown upload parameter: internal_document_id")
     upload_kind = _required_upload_kind(arguments)
     action = _required_upload_action(arguments)
     primary_selectors = _upload_primary_selectors_from_arguments(
         arguments,
         upload_kind=upload_kind,
     )
-    files = _upload_files_from_arguments(arguments, action=action)
+    if upload_kind == _UPLOAD_KIND_MATERIAL:
+        files = _material_upload_files_from_arguments(arguments)
+        validate_fins_upload_material_action_files(action, files)
+    else:
+        files = _upload_files_from_arguments(arguments, action=action)
     if upload_kind == _UPLOAD_KIND_FILING:
         return FinsUploadFilingRequest(
             ticker=_required_text(arguments, "ticker"),
@@ -380,10 +385,10 @@ def _upload_request_from_arguments(arguments: Mapping[str, JsonValue]) -> FinsUp
         ticker=_required_text(arguments, "ticker"),
         action=action,
         files=files,
-        form_type=_required_text(arguments, "form_type"),
-        material_name=_required_text(arguments, "material_name"),
-        document_id=_optional_nullable_text(arguments, "document_id"),
-        internal_document_id=_optional_nullable_text(arguments, "internal_document_id"),
+        form_type=_optional_raw_nullable_text(arguments, "form_type"),
+        material_name=_optional_raw_nullable_text(arguments, "material_name"),
+        document_id=_optional_raw_nullable_text(arguments, "document_id"),
+        primary_selectors=primary_selectors,
         fiscal_year=_optional_int(arguments, "fiscal_year"),
         fiscal_period=_optional_nullable_text(arguments, "fiscal_period"),
         amended=_optional_bool(arguments, "amended", default=False),
@@ -404,28 +409,54 @@ def _upload_primary_selectors_from_arguments(
 
     Args:
         arguments: 工具参数。
-        upload_kind: 已由请求 union 边界识别的上传类别。
+        upload_kind: 上传类别；材料路径保持原文，财报保留既有文本处理。
 
     Returns:
-        filing 未提供 primary 时返回空 tuple，提供时返回单元素原始路径 tuple。
+        两类上传省略或 null 时返回空 tuple；非空文本产生一个原始路径 selector。
 
     Raises:
-        ValueError: primary 不是非空字符串，或 material 请求携带 primary 时抛出。
+        ValueError: primary 既非 null 也非非空字符串时抛出。
     """
 
-    raw_primary = _optional_nullable_text(arguments, "primary")
+    raw_primary = (_optional_raw_nullable_text(arguments, "primary")
+        if upload_kind == _UPLOAD_KIND_MATERIAL else _optional_nullable_text(arguments, "primary"))
     if raw_primary is None:
         return ()
-    if upload_kind == _UPLOAD_KIND_MATERIAL:
-        raise ValueError(FINS_UPLOAD_FORMAT_TEXT.upload_tool_material_primary_failure)
+    if not raw_primary.strip():
+        raise ValueError("primary must be a non-empty string or null")
     return (Path(raw_primary),)
+
+
+def _material_upload_files_from_arguments(arguments: Mapping[str, JsonValue]) -> tuple[Path, ...]:
+    """机械读取材料路径列表，保留路径原文与出现顺序。
+
+    Args:
+        arguments: 单次工具调用 JSON 参数。
+
+    Returns:
+        缺失或 null 时返回空 tuple；合法字符串原样转换为路径，不访问文件系统。
+
+    Raises:
+        ValueError: files 不是字符串数组，或数组含空白文本时抛出。
+    """
+    value = arguments.get("files")
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError("files must be an array of strings")
+    paths: list[Path] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("files must contain only non-empty strings")
+        paths.append(Path(item))
+    return tuple(paths)
 
 
 def _optional_raw_nullable_text(
     arguments: Mapping[str, JsonValue],
     key: str,
 ) -> str | None:
-    """读取上传日期需保留原始形态的可选文本。
+    """机械读取需要交给业务准入 owner 的可选文本，不替它 trim 或判空。
 
     Args:
         arguments: 工具参数。
@@ -524,14 +555,12 @@ def _validate_upload_file_path(candidate: Path) -> None:
         无。
 
     Raises:
-        ValueError: 路径不是普通文件或文件为空时抛出。
+        ValueError: 路径不是已存在的普通文件时抛出；空内容由上传读取阶段判定。
         OSError: 文件状态读取发生操作性失败时透传。
     """
 
     if not candidate.is_file():
         raise ValueError("upload file path must point to an existing file")
-    if candidate.stat().st_size <= 0:
-        raise ValueError("upload file path must point to a non-empty file")
 
 
 __all__ = [

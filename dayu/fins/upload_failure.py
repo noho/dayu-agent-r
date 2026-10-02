@@ -44,6 +44,12 @@ class FinsUploadFailureCode(str, Enum):
     """上传失败的 closed public reason code。"""
 
     UNSUPPORTED_UPLOAD_FORMAT = "unsupported_upload_format"
+    MISSING_FORM_TYPE = "missing_form_type"
+    MISSING_MATERIAL_NAME = "missing_material_name"
+    MATERIAL_NAME_TOO_LONG = "material_name_too_long"
+    INVALID_MATERIAL_FISCAL_YEAR = "invalid_material_fiscal_year"
+    EMPTY_DOCUMENT_ID = "empty_document_id"
+    DOCUMENT_ID_MISMATCH = "document_id_mismatch"
     MISSING_FILES = "missing_files"
     TOO_MANY_FILES = "too_many_files"
     DUPLICATE_FILE_PATH = "duplicate_file_path"
@@ -190,7 +196,7 @@ _CONTENT_FAILURE_CODES: Final[frozenset[FinsUploadFailureCode]] = frozenset(
     (*_DOCLING_FAILURE_CODES.values(), FinsUploadFailureCode.EMPTY_INPUT_FILE)
 )
 _USAGE_FAILURE_CODES: Final[frozenset[FinsUploadFailureCode]] = frozenset(
-    {FinsUploadFailureCode.UNSUPPORTED_UPLOAD_FORMAT,
+    {FinsUploadFailureCode.MISSING_FORM_TYPE,FinsUploadFailureCode.MISSING_MATERIAL_NAME,FinsUploadFailureCode.MATERIAL_NAME_TOO_LONG,FinsUploadFailureCode.INVALID_MATERIAL_FISCAL_YEAR,FinsUploadFailureCode.EMPTY_DOCUMENT_ID,FinsUploadFailureCode.DOCUMENT_ID_MISMATCH, FinsUploadFailureCode.UNSUPPORTED_UPLOAD_FORMAT,
      *(FinsUploadFailureCode(reason.value) for reason in FinsUploadAssetPlanReason)}
 )
 _STORAGE_FAILURE_CODES: Final[frozenset[FinsUploadFailureCode]] = frozenset(
@@ -243,15 +249,17 @@ def fins_upload_failure_from_exception(
         ValueError: ``file_label`` 未经过唯一 canonicalizer 时抛出。
     """
 
+    if isinstance(error, FinsUploadFailureError):
+        return error.failure
     if isinstance(error, FinsUploadAssetPlanError):
-        usage, hint = fins_upload_asset_plan_usage_failure(
+        usage = fins_upload_asset_plan_usage_failure(
             error, max_files=MAX_MATERIAL_UPLOAD_FILES
         )
         return FinsUploadFailureReason(
             kind=FinsUploadFailureKind.USAGE,
             code=FinsUploadFailureCode(error.reason.value),
             message=usage.message,
-            retry_hint=hint,
+            retry_hint=usage.hint,
             file_label=error.file_label,
         )
     if isinstance(error, FinsUploadFormatError):
@@ -312,7 +320,7 @@ def fins_upload_failure_from_exception(
 
 
 def fins_upload_empty_input_failure(file_label: str) -> FinsUploadFailureReason:
-    """构造 filing 空文件的 closed bounded public reason。
+    """构造两类上传共同的空文件 closed bounded public reason。
 
     Args:
         file_label: 当前 original 的 canonical public file label。

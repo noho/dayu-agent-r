@@ -8,8 +8,13 @@ from enum import Enum
 from pathlib import Path
 from typing import Final
 
-from dayu.fins.upload_asset_plan import FinsUploadAssetPlanError, FinsUploadAssetPlanReason
-from dayu.fins.upload_format_contract import FinsUploadFormatFailureKind
+from dayu.fins.direct_events import canonicalize_fins_rejected_file_label
+from dayu.fins.domain.enums import SourceKind
+from dayu.fins.upload_asset_plan import (
+    FinsUploadAssetPlanError, FinsUploadAssetPlanReason,
+    UploadPrimarySelectionError, UploadPrimarySelectionPathError,
+)
+from dayu.fins.upload_format_contract import FinsUploadFormatFailureKind, FinsUploadFormatError
 
 FINS_UPLOAD_USAGE_TEXT_LIMIT: Final[int] = 240
 _FILE_LABEL_PLACEHOLDER: Final[str] = "{file_name}"
@@ -18,6 +23,12 @@ _FILE_LABEL_ELLIPSIS: Final[str] = "…"
 class FinsUploadUsageCode(str, Enum):
     """上传调用方可修正的 closed usage failure code。"""
 
+    MISSING_FORM_TYPE = "missing_form_type"
+    MISSING_MATERIAL_NAME = "missing_material_name"
+    MATERIAL_NAME_TOO_LONG = "material_name_too_long"
+    INVALID_MATERIAL_FISCAL_YEAR = "invalid_material_fiscal_year"
+    EMPTY_DOCUMENT_ID = "empty_document_id"
+    DOCUMENT_ID_MISMATCH = "document_id_mismatch"
     EMPTY_TICKER = "empty_ticker"
     INVALID_TICKER = "invalid_ticker"
     INVALID_TICKER_ALIAS = "invalid_ticker_alias"
@@ -68,10 +79,14 @@ class FinsUploadUsageFailure:
         code: closed usage failure code；格式错误直接使用角色 owner 的 failure kind。
         message: 最大 240 字符的可行动中文文案。
         category: 失败的 typed 语义来源，由 usage owner 校验。
+        hint: 必填、同源且可行动的恢复建议。
+        file_label: 已规范的安全文件标签；无法归属文件时为 None。
     """
 
     code: FinsUploadUsageCode | FinsUploadFormatFailureKind
     message: str
+    hint: str
+    file_label: str | None
     category: FinsUploadUsageCategory = FinsUploadUsageCategory.REQUEST
 
     def __post_init__(self) -> None:
@@ -96,6 +111,10 @@ class FinsUploadUsageFailure:
             raise ValueError("资产规划 usage failure code 不属于规划契约")
         if self.category is FinsUploadUsageCategory.REQUEST and self.code in _PLANNER_EXCLUSIVE_USAGE_CODES:
             raise ValueError("资产规划专属 usage failure code 必须标记规划类别")
+        if not isinstance(self.hint, str) or not self.hint or len(self.hint) > FINS_UPLOAD_USAGE_TEXT_LIMIT:
+            raise ValueError("upload usage hint 必须是有界非空文本")
+        if self.file_label is not None and self.file_label != canonicalize_fins_rejected_file_label(self.file_label):
+            raise ValueError("upload usage file label 未规范化")
         if not isinstance(self.message, str):
             raise TypeError("upload usage failure message 必须是字符串")
         if not self.message:
@@ -137,6 +156,13 @@ _FILE_USAGE_CODES: Final[frozenset[FinsUploadUsageCode]] = frozenset(
     }
 )
 _USAGE_MESSAGES: Final[Mapping[FinsUploadUsageCode, str]] = {
+    FinsUploadUsageCode.MISSING_FORM_TYPE: "材料每个动作都必须提供非空 form_type",
+    FinsUploadUsageCode.MISSING_MATERIAL_NAME: "材料每个动作都必须提供非空 material_name",
+    FinsUploadUsageCode.MATERIAL_NAME_TOO_LONG: "材料名称去除首尾空白后不能超过 240 个 Unicode 码点",
+    FinsUploadUsageCode.INVALID_MATERIAL_FISCAL_YEAR: "材料财年必须是 1800..2100 的整数，不能是布尔值",
+    FinsUploadUsageCode.EMPTY_DOCUMENT_ID: "document_id 不能是空文本；可省略以使用生成的材料身份",
+    FinsUploadUsageCode.DOCUMENT_ID_MISMATCH: "document_id 仅用于验证生成身份一致，不能覆盖材料身份",
+
     FinsUploadUsageCode.EMPTY_TICKER: "--ticker 不能为空，请提供公司代码",
     FinsUploadUsageCode.INVALID_TICKER: "--ticker 无法识别，请提供有效公司代码",
     FinsUploadUsageCode.INVALID_TICKER_ALIAS: "--ticker 别名无法识别，请提供有效公司代码",
@@ -255,7 +281,7 @@ def fins_upload_usage_failure(
         message = template
     if len(message) > FINS_UPLOAD_USAGE_TEXT_LIMIT:
         raise ValueError("usage failure message 超出长度上限")
-    return FinsUploadUsageFailure(code=code, message=message, category=category)
+    return FinsUploadUsageFailure(code=code, message=message, category=category, hint=message, file_label=canonicalize_fins_rejected_file_label(file_name) if file_name is not None else None)
 
 
 
@@ -285,7 +311,7 @@ _PLANNER_RETRY_HINTS: Final[Mapping[FinsUploadAssetPlanReason, str]] = {
 
 def fins_upload_asset_plan_usage_failure(
     error: FinsUploadAssetPlanError, *, max_files: int
-) -> tuple[FinsUploadUsageFailure, str]:
+) -> FinsUploadUsageFailure:
     """将规划失败投影为唯一有界 usage 文案与重试建议。
 
     Args:
@@ -293,7 +319,7 @@ def fins_upload_asset_plan_usage_failure(
         max_files: 已判来源的文件数量上限。
 
     Returns:
-        同源 usage fact 和可操作的安全重试建议。
+        携带 code/category/message/hint/file_label 的同源 usage fact。
 
     Raises:
         ValueError: 数量上限或文件标签不符合文案契约时抛出。
@@ -306,4 +332,25 @@ def fins_upload_asset_plan_usage_failure(
         max_files=max_files if code is FinsUploadUsageCode.TOO_MANY_FILES else None,
         category=FinsUploadUsageCategory.ASSET_PLAN,
     )
-    return failure, _PLANNER_RETRY_HINTS[error.reason]
+    return FinsUploadUsageFailure(code=failure.code, message=failure.message, category=failure.category, hint=_PLANNER_RETRY_HINTS[error.reason], file_label=error.file_label)
+
+
+def fins_upload_primary_selection_usage_failure(
+    error: UploadPrimarySelectionError | UploadPrimarySelectionPathError, *, source_kind: SourceKind,
+) -> FinsUploadUsageFailure:
+    """参数：资产 owner 的选择错误与来源；返回：唯一公开用法事实；异常：ValueError 表示来源或文案契约错误。"""
+    if source_kind not in (SourceKind.FILING, SourceKind.MATERIAL):
+        raise ValueError("主文件选择来源不支持")
+    if isinstance(error, UploadPrimarySelectionPathError):
+        return fins_upload_usage_failure(FinsUploadUsageCode.FILE_NOT_FOUND, file_name=canonicalize_fins_rejected_file_label(error.input_path.name))
+    code = FinsUploadUsageCode(error.reason.value)
+    failure = fins_upload_usage_failure(code)
+    if code is FinsUploadUsageCode.MISSING_MULTI_FILE_PRIMARY and source_kind is SourceKind.MATERIAL:
+        message = "多文件材料必须明确指定唯一主文件"
+        return FinsUploadUsageFailure(code=code, message=message, hint=message, file_label=None)
+    return failure
+
+
+def fins_upload_format_usage_failure(error: FinsUploadFormatError) -> FinsUploadUsageFailure:
+    """参数：格式 owner 失败；返回：同源用法事实；异常：ValueError 表示公开事实非法。"""
+    return FinsUploadUsageFailure(code=error.kind, message=str(error), hint=error.retry_hint, file_label=error.file_label)

@@ -17,6 +17,8 @@ propagate 与 disabled 状态，并关闭本测试新增的 logger handler，避
 
 ## 常用命令
 
+材料静态身份与主源回归由 `test_material_identity_contract.py` 和 `test_source_manifest_contract.py` 集中验证：必填/码点/独立财年财期、ID 一致断言、一次路径规范化、exact selector、strict manifest 及真实 Fs A→B→B 发布与 snapshot/processor 默认源。`test_fins_ingestion_tools.py` 使用真实 tool、生产 workflow 和 Fs 仓储，只控制转换 outcome，分别核对 process observation 无持久 job、真实 upload job 的同源五字段双摘要，以及 US/CN/HK 空内容和损坏转换。`test_docling_upload_service_integration.py` 的文本转换用例无需额外开关，实际调用 Docling 子进程并读回默认 processor；历史 PDF 集成仍需显式启用。
+
 F5 完整 owner 回归：`python -m pytest tests/fins/test_f5_result_contract.py tests/fins/test_f5_storage_calendar.py tests/fins/test_f5_workflow_rebuild.py -q`。
 使用真实隔离 Fs/staging、两个 publication rename barrier、严格 raw 原异常与 guard 释放、同公司可信年度/英文证据、366 天边界、官方冻结 Raw 正例与明确标记的合成未知报告。结果回归核对 A 发布+B 未知、240 字真实 ID、10/11 独立列表与 4096 预算、fresh schema、正常/取消双投影、收口失败保全、F6 优先、实际 adapter/observation/wait/CLI 同源及 normal→rebuild→overwrite 日期/来源（含旧 processed 非空值）时序。相关既有 downloader/workflow/runtime/store/CLI/wait 测试同步使用 mandatory 新签名和完整新 schema，未提供旧库兼容。
 官方 Raw 六件正式资产位于 `tests/fins/fixtures/hk_f5_official_raw/`：两份原响应 body、原 provenance envelope、原 owner 验证与采集结果均逐字验 SHA256，不依赖 ignored 临时采集目录。年度 1446 字节、季度 658 字节；官方正例不被称作未知反例。

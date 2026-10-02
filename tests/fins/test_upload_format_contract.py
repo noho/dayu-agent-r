@@ -294,10 +294,6 @@ def test_text_projection_is_self_contained_and_uses_exact_suffix_order() -> None
     material_text = FINS_UPLOAD_FORMAT_TEXT.material_files
     tool_text = FINS_UPLOAD_FORMAT_TEXT.upload_tool_files
     tool_primary_text = FINS_UPLOAD_FORMAT_TEXT.upload_tool_primary
-    tool_material_primary_failure = (
-        FINS_UPLOAD_FORMAT_TEXT.upload_tool_material_primary_failure
-    )
-
     expected_filing_text = (
         "auto/create/update 必须至少提供一个文件。已选主文件必须实际转换成功；"
         f"filing 一次最多 {MAX_FILING_UPLOAD_FILES} 个文件；"
@@ -317,7 +313,7 @@ def test_text_projection_is_self_contained_and_uses_exact_suffix_order() -> None
     )
     expected_tool_text = (
         f"upload_kind=filing 时，{expected_filing_text}"
-        f"upload_kind=material 时，{expected_material_text}"
+        f"upload_kind=material 时，{expected_material_text}{FINS_UPLOAD_FORMAT_TEXT.material_primary.replace('--primary', 'primary').replace('--files', 'files')}"
         "每个路径必须指向已存在、非空的普通文件。"
         f"material 一次最多 {MAX_MATERIAL_UPLOAD_FILES} 个文件；不同路径的原件不能有相同完整文件名，"
         "文件名也不能与工作区控制文件（.identity.json、meta.json）或本批原件及转换结果冲突；"
@@ -332,27 +328,14 @@ def test_text_projection_is_self_contained_and_uses_exact_suffix_order() -> None
         "--files 的顺序不决定主文件角色；"
         "delete 必须省略 --files 和 --primary。"
     )
-    expected_tool_primary_text = (
-        "仅用于 upload_kind=filing："
-        "单文件 filing 可省略 primary，省略时唯一文件就是主文件；"
-        "多文件 filing 必须恰好指定一个 primary；"
-        "primary 必须精确匹配 files 中的一个路径；"
-        "files 的顺序不决定主文件角色；"
-        "delete 必须省略 files 和 primary。"
-        "upload_kind=material 不得提供 primary；请省略 primary 字段。"
-        "primary 是用户选择的业务角色，不能根据质量、重要性或转换是否成功推断。"
-    )
-    expected_tool_material_primary_failure = (
-        "upload_kind=material 不得提供 primary；请省略 primary 字段"
-    )
-
     assert filing_text == expected_filing_text
     assert filing_primary_text == expected_filing_primary_text
-    assert material_text == expected_material_text
-    assert tool_text == expected_tool_text
-    assert tool_primary_text == expected_tool_primary_text
-    assert tool_material_primary_failure == expected_tool_material_primary_failure
-    assert f"{tool_material_primary_failure}。" in tool_primary_text
+    assert material_text == expected_material_text + FINS_UPLOAD_FORMAT_TEXT.material_primary
+    assert tool_text == expected_tool_text.replace("已存在、非空的普通文件", "已存在的普通文件。文件为空，无法上传；请提供非空文件后重试")
+    assert "单文件材料可省略 primary" in tool_primary_text
+    assert "多文件材料必须恰好指定一个 primary" in tool_primary_text
+    assert "material 不得提供 primary" not in tool_primary_text
+    assert "非空的普通文件" not in tool_text
     for required_text in (
         "auto/create/update 必须至少提供一个文件",
         "必须实际转换成功",
@@ -379,7 +362,7 @@ def test_text_projection_is_self_contained_and_uses_exact_suffix_order() -> None
     ):
         assert primary_rule in filing_primary_text
         assert primary_rule in tool_primary_text
-    assert tool_material_primary_failure in tool_primary_text
+    assert "多文件材料必须恰好指定一个 primary" in tool_primary_text
     assert "首文件是主文件" not in filing_text
     assert "首文件是主文件" not in tool_text
     assert "upload_kind=material" in tool_text
