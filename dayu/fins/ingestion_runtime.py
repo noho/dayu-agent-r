@@ -698,9 +698,6 @@ _UPLOAD_ACTION_VALUES: Final[frozenset[str]] = frozenset(
         _UPLOAD_ACTION_DELETE,
     }
 )
-_UNSUPPORTED_UPLOAD_RUNTIME_MESSAGE: Final[str] = (
-    "不支持的上传运行时 (unsupported upload runtime): production upload runner 尚未装配"
-)
 
 
 @dataclass(frozen=True)

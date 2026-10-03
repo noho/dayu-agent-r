@@ -207,8 +207,8 @@ def run_fins_direct_command(args: ParsedCliArgs) -> int:
         render_cli_error(f"dayu-cli {args.command_name}: {exc}")
         return EXIT_USAGE_ERROR
     except FinsUploadPrevalidationError as exc:
-        _LOGGER.exception("upload_filing prevalidation operational failure")
-        render_cli_error(f"dayu-cli upload_filing: {exc.failure.message}")
+        _LOGGER.exception("%s prevalidation operational failure", args.command_name)
+        render_cli_error(f"dayu-cli {args.command_name}: {exc.failure.message}")
         return EXIT_FAILURE
     except FinsDirectStreamProtocolError as exc:
         render_cli_error(f"dayu-cli {args.command_name}: {exc.message}")

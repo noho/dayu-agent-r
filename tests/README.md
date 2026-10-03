@@ -27,6 +27,8 @@ XBRL 部署 owner 测试分布在 Documents 配置/快照、Fins converter facto
 
 `test_material_upload_publication.py` 覆盖真实 Fs 八格修订矩阵、目标首错、删除与恢复、四类候选在 A begin 前的 source/company 竞争提交、operational 故障不改写、损坏 winner 拒绝跳过，以及列表标记与推荐 ID 同源。`test_fins_ingestion_runtime.py` 核对 typed failure 双摘要与 active-only、三类已存终态在投影异常后保持。`test_fins_ingestion_tools.py` 的 S2 文本用例直接经过工具、生产 Docling、真实仓储、observation/direct、列表和 job，验证 ok→metadata_updated→skipped 的实际发布标记。CLI architecture 禁止 UI 获取仓储能力；材料前置校验消费 Service handoff。
 
+`test_fins_commands.py` 经 CLI 主入口对真实已发布材料的坏 meta、缺原件、缺 Docling 文件、缺 manifest 执行 auto/update/delete，核对材料命令前缀、闭合且无路径的安全文案、operator 日志归属、factory 与生命周期零调用及整个已播种工作区字节保持；既有 filing 损坏与 I/O 回归保留原前缀和失败边界。
+
 材料 publication 回归还覆盖 b/a 多文件、非首项 a 为主源的真实 D 内容/标记/skip 候选，公共身份规范排序与原输入事件顺序、竞争 skip 的业务字节/revision/时间保持、不同主源/角色指纹/内容/标记拒绝，以及非覆盖 create-on-tombstone 的既有仓储拒绝。已有公司、共同旧 MISSING 的确定 interleave 在 A 公司 guard 前完成 B 发布，auto 非覆盖继续到 writer 裁 skip，create 或覆盖请求仍拒源漂移。状态仓储测试核对 required 显式 None 仅免源条件、完整当前状态返回，以及公司全快照/alias 严格拒绝；writer 登记仍要求完整状态。
 
 材料静态身份与主源回归由 `test_material_identity_contract.py` 和 `test_source_manifest_contract.py` 集中验证：必填/码点/独立财年财期、ID 一致断言、一次路径规范化、exact selector、strict manifest 及真实 Fs A→B→B 发布与 snapshot/processor 默认源。`test_fins_ingestion_tools.py` 使用真实 tool、生产 workflow 和 Fs 仓储，只控制转换 outcome，分别核对 process observation 无持久 job、真实 upload job 的同源五字段双摘要，以及 US/CN/HK 空内容和损坏转换。`test_docling_upload_service_integration.py` 的文本转换用例无需额外开关，实际调用 Docling 子进程并读回默认 processor；历史 PDF 集成仍需显式启用。

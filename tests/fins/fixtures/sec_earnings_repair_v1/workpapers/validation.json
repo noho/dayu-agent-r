@@ -661,7 +661,11 @@
   "pyright": {
     "errors": 0,
     "warnings": 0,
-    "log": "final-pyright.log"
+    "log": "final-pyright.raw.json",
+    "log_encoding": "base64",
+    "log_decoding": "Decode payload as base64 to recover the exact historical stdout bytes; size and sha256 describe decoded bytes, including the final blank line.",
+    "log_decoded_size": 191,
+    "log_decoded_sha256": "70a0f3577f8953319fd286c94822becc2dd8c6ec2ba6d76e8bc67172b4e12691"
   },
   "baseline_protection": {
     "README.md": "original content preserved; task documentation inserted",

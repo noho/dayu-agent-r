@@ -12697,11 +12697,15 @@ def test_material_identity_remains_outside_static_admission(
 @pytest.mark.parametrize("pipeline_type", (SecPipeline, CnPipeline))
 @pytest.mark.parametrize("field_name", ("form_type", "material_name"))
 async def test_material_missing_identity_keeps_workflow_failure_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     pipeline_type: type[SecPipeline] | type[CnPipeline], field_name: str,
 ) -> None:
     """缺失身份在进入 SEC/CN workflow 前 typed 拒绝。
 
     Args:
+        tmp_path: pytest 隔离仓储根目录。
+        monkeypatch: 状态读取零调用观测夹具。
         pipeline_type: SEC 或 CN 公开 pipeline 类型。
         field_name: 待移除的身份字段。
 
@@ -12709,17 +12713,24 @@ async def test_material_missing_identity_keeps_workflow_failure_boundary(
         无。
 
     Raises:
-        AssertionError: 身份被提前改成 typed 拒绝或进入事件流时抛出。
+        AssertionError: 缺身份未按原错误码拒绝或提前读取状态时抛出。
     """
 
     raw = FinsUploadMaterialRequest(
         ticker="AAPL" if pipeline_type is SecPipeline else "600519",
         action="delete", form_type="OTHER", material_name="Deck",
      company_name="Apple Inc.",)
+    repository = FsMaterialUploadStateRepository(tmp_path / "static-admission-unused")
+    read_state = Mock(side_effect=AssertionError("缺身份必须先于状态读取拒绝"))
+    monkeypatch.setattr(repository, "read_material_upload_state", read_state)
     with pytest.raises(FinsUploadUsageError) as raised:
-        admit_fins_upload_material_request(replace(raw, **{field_name: None}),  state_repository=FsMaterialUploadStateRepository(Path.cwd() / "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/static-admission-unused"),)
+        admit_fins_upload_material_request(
+            replace(raw, **{field_name: None}), state_repository=repository,
+        )
     expected = FinsUploadUsageCode.MISSING_FORM_TYPE if field_name == "form_type" else FinsUploadUsageCode.MISSING_MATERIAL_NAME
     assert raised.value.failure.code is expected
+    read_state.assert_not_called()
+    assert not (tmp_path / "static-admission-unused").exists()
 
 
 def test_material_handoff_constructor_reuses_static_admission_and_full_plan(tmp_path: Path) -> None:

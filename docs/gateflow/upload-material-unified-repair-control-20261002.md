@@ -37,7 +37,7 @@
 ## 当前 gate / 下一入口
 
 - goal confirmation：沿用户已明确批准范围及最新排程纠正确认；本文件固定边界。
-- current gate / next entry：aggregate deepreview（S1/S2/S3均已accepted；S3最终同版双复审及全42实际2841pass/3skip/type0、38prod>=80完成，唯一branch checkpoint即将创建）。S2 checkpoint a514dea14c0ce66722da034502f3af54a54c3238；S3当前完整裁决见 upload-material-unified-s3-final-root-adjudication-20261003.md 与 evidence/upload-material-unified-repair-20261002/s3-final-validation.json。所有S3 accepted finding已修闭合；原失败Raw/裁决保存。Raw EOF仍后续aggregate集中收口、未fullPRdiffcheck pass。全部slice后按固定aggregate→fix/re-review/checkpoint，再普通push到既有draftPR197→正式PRreview/fix/re-review/checkpoint/finalpush/closeout。main不动，CLI/registry仍WU后独立阶段。
+- current gate / next entry：accepted deepreview commit（aggregate双复审/总控pass，实际checkpoint尚待创建；随后ready-to-open-draft-PR→普通push→复用已有draftPR197→正式PRreview）。S1/S2/S3已accepted，四aggregatefinding已修复，MiMo31tests/6docs与DS ZIP尾/dayu README实际缺口均闭合，详 aggregate-final-root-adjudication-20261003.md。main不动，CLI/registry在修复WU后独立。
 
 - planreview 必须挑战切片成本、机械拆分、可合并性与 future-slice 漂移；默认避免超过 3 slices，超过须直接理由。
 - 所有成立新修复即时写 artifact/控制表；accepted finding 必须已修并经复审才通过。普通 gate 通过后继续固定顺序，不因 gate 完成停机。
@@ -48,4 +48,16 @@
 
 修复 WU closeout pass 不等于整体任务完成；继续后续 CLI CI/登记阶段，直到用户当前大目标完成，或遇到真实 blocking stop condition。
 
-最新集中修复核收：upload-material-unified-s3-integration-fix-root-adjudication-20261003.md。T03/T04当前已修待同版复审；不改变原42文件failed历史，不给S3pass。
+最新集中修复核收：upload-material-unified-s3-integration-fix-root-adjudication-20261003.md。此处记先前集中fix核收历史；后续T03/T04已修并通过同版双复审及当前完整42回归，S3已accepted checkpoint ec54351e。旧42 failed历史不改。
+
+## Aggregate 当前补记（2026-10-03）
+
+两路外层已actual0结束，DS170tools/MiMo119tools及113冻结输入0漂移已root核。DS三小项+Raw登记 UA-R01/R02/R03/UA-E01 accepted未修；MiMo无新finding。两路scope自述有部分不完整，root按实际证据部分采纳，复审须补DS ZIP尾/架构README及MiMo31tests/6docs完整diff。current gate=fix aggregate deepreview；一次gpt-6-sol集中fix，之后同版双复审并核实际covered，不新增slice。参见aggregate findings register及DS/MiMo root audit。
+
+## Aggregate 集中fix核收后的当前入口
+
+两原审scope自述仅部分采纳；当前四项已实施，671passed、fullpyright0、Raw exactbytes保全、9364保护项zero、gpt outer0/turn.completed/54actualcommands均root核。current gate=re-review aggregate deepreview；不得把报告交付当pass。四项和原审MiMo31tests/6docs、DS ZIP尾/dayu README缺口在本同版双审一起收口。
+
+## Aggregate最终同版收口
+
+MiMo44370/DS56153外层都actual0，完整70/81tools及必要证据root核；8236行diff和DS253/279行逐字coverage证明已核。四项accepted已修复，无新finding；aggregatepass，下一accepteddeepreviewcommit并普通push已有draft197进入正式PRreview，不停普通gate。旧状态段均历史。

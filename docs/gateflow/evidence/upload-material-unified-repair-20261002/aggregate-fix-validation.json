@@ -1,0 +1,116 @@
+{
+  "gate": "fix aggregate deepreview",
+  "head": "ec54351e58e66cd5d00b009c862589b109064ade",
+  "main": "fac32ecbff9bfe792b63ee9667c8697826b631f4",
+  "source": {
+    "manifest": "workspace/tmp/upload-material-unified-aggregate-fix-sol-20261003-01/source-final-v2.json",
+    "sha256": "8b16119e01c413d869cf38a660ade0da5650ac4586a70530189abd002c1ca91d",
+    "count": 88,
+    "changed_paths": {
+      "dayu/cli/commands/fins.py": "0285f93d3ee26c5dcdd144a3f371dcf0d74ff5b1e591e348e9e7aec7e0fb6e64",
+      "dayu/fins/ingestion_runtime.py": "1defbc52d20b8e21666af41c4730304bc449a75304c598aae811e8c05b887af8",
+      "tests/cli/test_fins_commands.py": "b1772f5111699c3714feff4b062b0cc5a43c8541c1dfedd78a587781bee2d72d",
+      "tests/fins/test_fins_ingestion_runtime.py": "4caacce453077494707924304897a051b0435f1677e9fc71a21bdf8063a88437",
+      "tests/fins/fixtures/sec_earnings_repair_v1/workpapers/final-pyright.log": "31bfd34fccbe65a397b8875ac69cba184c920cd954578fd513a045006875f20e",
+      "tests/fins/fixtures/sec_earnings_repair_v1/workpapers/final-pyright.raw.json": "7f89f136651ed7a5546a0c5811d331341e068abd7d369848dda45699fe8b73de",
+      "tests/fins/fixtures/sec_earnings_repair_v1/workpapers/validation.json": "0fac23d924a4eed94d1bf2b3055681fe6f48e79602cc7bb1d90f5368b71b5034",
+      "tests/fins/fixtures/sec_earnings_repair_v1/change_manifest.json": "5a3f8854d190b8d2c1f0d364e653ba31d5bea62915dd819e8a16c375eb248d3e",
+      "tests/README.md": "78fa35da25e15f5b3433e85da9569983469110630cc11b51ce752d309d79c4b0",
+      "docs/gateflow/upload-material-unified-aggregate-fix-report-20261003.md": "0fdeca5adcc432c718c94589b104418b7ea118b94b96103393fe09e6f3e0fa99"
+    },
+    "collector_sha256": "9198c023a69754e7a20f187efab9e62adf8ce4ea25eec556cec02787ff752f48"
+  },
+  "protected_count": 9364,
+  "protected_drift": 0,
+  "passed": 671,
+  "failed": 0,
+  "skipped": 0,
+  "coverage": {
+    "dayu/cli/commands/fins.py": 82.44111349036403,
+    "dayu/fins/ingestion_runtime.py": 90.65868263473054
+  },
+  "pyright": {
+    "errors": 0,
+    "warnings": 0,
+    "infos": 0
+  },
+  "receipts": {
+    "tests-union-01": {
+      "path": "workspace/tmp/upload-material-unified-aggregate-fix-sol-20261003-01/tests-union-01/receipt.json",
+      "sha256": "0dcd047355b1a02dafa40cdefd4a916b33af5d2fa318d39c3bd522522bfe862b",
+      "actual_exit": 2,
+      "actual_wait": true
+    },
+    "numpy-import-probe-01": {
+      "path": "workspace/tmp/upload-material-unified-aggregate-fix-sol-20261003-01/numpy-import-probe-01/receipt.json",
+      "sha256": "32e8491bef30b75cdc373e32541c6539950d7fda07d5ef0a1f7fccd2ee6dfaa0",
+      "actual_exit": 0,
+      "actual_wait": true
+    },
+    "tests-union-02": {
+      "path": "workspace/tmp/upload-material-unified-aggregate-fix-sol-20261003-01/tests-union-02/receipt.json",
+      "sha256": "fd1ef93efec22826dacb8b2edc48aedfb16d399ad091ecd82e46bc2762fa5e07",
+      "actual_exit": 0,
+      "actual_wait": true
+    },
+    "pyright-01": {
+      "path": "workspace/tmp/upload-material-unified-aggregate-fix-sol-20261003-01/pyright-01/receipt.json",
+      "sha256": "7c77e0c912cba0520800fd020e9359a48abb3bff8d913069ba0ba77133dc9495",
+      "actual_exit": 0,
+      "actual_wait": true
+    },
+    "raw-readback-01": {
+      "path": "workspace/tmp/upload-material-unified-aggregate-fix-sol-20261003-01/raw-readback-01/receipt.json",
+      "sha256": "5466adbc0272dfe69954163fd78cdeba6ab5350813fade317d1b3c112485d04d",
+      "actual_exit": 0,
+      "actual_wait": true
+    },
+    "validation-readback-01": {
+      "path": "workspace/tmp/upload-material-unified-aggregate-fix-sol-20261003-01/validation-readback-01/receipt.json",
+      "sha256": "18e8b360d4c92e45ccdc8b2e126736daabb4088355a1e3fa85adc90f96396fc9",
+      "actual_exit": 1,
+      "actual_wait": true
+    },
+    "validation-readback-02": {
+      "path": "workspace/tmp/upload-material-unified-aggregate-fix-sol-20261003-01/validation-readback-02/receipt.json",
+      "sha256": "ba828ee159043ae4f422b775d676b8cab63297f1e3f43a9541a8b84a97bbb479",
+      "actual_exit": 0,
+      "actual_wait": true
+    },
+    "whole-pr-diffcheck-01": {
+      "path": "workspace/tmp/upload-material-unified-aggregate-fix-sol-20261003-01/whole-pr-diffcheck-01/receipt.json",
+      "sha256": "2feb34fc5269fbecf63c5ee455c4fa21babc5a73eedb894e30095d151e690d30",
+      "actual_exit": 0,
+      "actual_wait": true
+    },
+    "carrier-diffcheck-01": {
+      "path": "workspace/tmp/upload-material-unified-aggregate-fix-sol-20261003-01/carrier-diffcheck-01/receipt.json",
+      "sha256": "36181d86161afd65dd205eefc493efa4130aa036eecc8c070c8548157249e59c",
+      "actual_exit": 1,
+      "actual_wait": true
+    },
+    "end-scan-01": {
+      "path": "workspace/tmp/upload-material-unified-aggregate-fix-sol-20261003-01/end-scan-01/receipt.json",
+      "sha256": "2d9523f0c2b02312346dfe977d1b7fd3939f402b19b19812974c4cbdce1b3003",
+      "actual_exit": 0,
+      "actual_wait": true
+    },
+    "delivery-readback-01": {
+      "path": "workspace/tmp/upload-material-unified-aggregate-fix-sol-20261003-01/delivery-readback-01/receipt.json",
+      "sha256": "18493f1051adb79d30fb5ebb1e3c7978f97ec8e42a50c84345a550562741aa83",
+      "actual_exit": 0,
+      "actual_wait": true
+    }
+  },
+  "raw_original": {
+    "size": 191,
+    "sha256": "70a0f3577f8953319fd286c94822becc2dd8c6ec2ba6d76e8bc67172b4e12691",
+    "decoded_equals_git_head_original": true
+  },
+  "report": "docs/gateflow/upload-material-unified-aggregate-fix-report-20261003.md",
+  "report_sha256": "0fdeca5adcc432c718c94589b104418b7ea118b94b96103393fe09e6f3e0fa99",
+  "outer_exit": 0,
+  "events": 126,
+  "commands": 54,
+  "final_gate_status": "pending same-version dual re-review"
+}

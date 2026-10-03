@@ -72,6 +72,7 @@ from dayu.fins.ingestion_runtime import (
     FinsJobCancellationChecker,
     FinsIngestionOperationKind,
     FinsUploadFilingRequest,
+    FinsUploadMaterialRequest,
     ValidatedFinsUploadMaterialRequest,
     FinsUploadResultSummary,
     validate_fins_upload_filing_request,
@@ -95,6 +96,7 @@ from dayu.service.fins_direct import (
     FINS_DIRECT_EXIT_SUCCESS,
 )
 from tests.fins.test_fins_ingestion_runtime import _build_real_sec_integrity_runtime
+from tests.fins.test_material_upload_publication import seed_material_upload_target
 
 _NOW: datetime = datetime(2026, 6, 16, tzinfo=timezone.utc)
 _UNPARSABLE_PDF_BYTES = b"not a PDF"
@@ -2366,6 +2368,104 @@ def test_upload_filing_non_first_primary_is_preserved_into_validated_service_req
     assert call.files == (companion.resolve(), primary.resolve())
     assert call.primary_selectors == (primary.resolve(),)
     assert call.selected_primary == primary.resolve()
+
+
+@pytest.mark.parametrize("damage", ("bad_meta", "missing_original", "missing_docling", "missing_manifest"))
+@pytest.mark.parametrize("action", ("auto", "update", "delete"))
+def test_upload_material_real_corruption_prevalidation_keeps_cli_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    damage: str,
+    action: str,
+) -> None:
+    """真实损坏材料经 CLI 主入口拒绝，命令归属正确且零生命周期写入。
+
+    Args:
+        tmp_path: pytest 隔离目录。
+        monkeypatch: factory 与生命周期零调用观测夹具。
+        capsys: 标准流捕获夹具。
+        damage: 已发布材料的实际损坏形态。
+        action: 待执行的上传动作。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 错误归属、安全投影、准入顺序或业务字节保持漂移时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    seed_material_upload_target(
+        FinsUploadMaterialRequest(
+            ticker="AAPL", action="delete", form_type="OTHER", material_name="Deck",
+            company_name="Apple Inc.",
+        ),
+        workspace_root,
+    )
+    material_root = workspace_root / "portfolio" / "AAPL" / "materials"
+    if damage == "bad_meta":
+        paths = tuple(material_root.rglob("meta.json"))
+        assert len(paths) == 1
+        paths[0].write_text("{}", encoding="utf-8")
+    else:
+        name = (
+            "seed-target.txt" if damage == "missing_original"
+            else "seed-target.txt_docling.json" if damage == "missing_docling"
+            else "material_manifest.json"
+        )
+        next(material_root.rglob(name)).unlink()
+    identity = build_material_ids(
+        form_type="OTHER", material_name="Deck", fiscal_year=None, fiscal_period=None, document_id=None,
+    )
+    state = FsMaterialUploadStateRepository(workspace_root).read_material_upload_state(
+        "AAPL", identity.document_id,
+    )
+    assert state.source_integrity.status in {SourceIntegrityStatus.UNSAFE, SourceIntegrityStatus.REPAIR_REQUIRED}
+    before_tree = _snapshot_cli_workspace_tree(workspace_root)
+    input_file = tmp_path / "deck.txt"
+    input_file.write_text("candidate", encoding="utf-8")
+    operator_log = tmp_path / "operator.log"
+    service = _FakeFinsDirectService()
+    factory_calls: list[Path] = []
+    monkeypatch.setattr(
+        fins_command, "FINS_DIRECT_SERVICE_FACTORY",
+        partial(_recording_direct_service_factory, service=service, factory_calls=factory_calls),
+    )
+    lifecycle_calls: list[Mock] = []
+    for owner, method in (
+        (ingestion_runtime.FinsIngestionRuntime, "upload"),
+        (ingestion_runtime.FinsIngestionRuntime, "prepare_observed_upload"),
+        (ingestion_runtime.FinsIngestionRuntime, "start_upload"),
+        (FsBatchingRepository, "begin_batch"),
+    ):
+        spy = Mock(side_effect=AssertionError("材料损坏必须在生命周期之前拒绝"))
+        monkeypatch.setattr(owner, method, spy)
+        lifecycle_calls.append(spy)
+
+    exit_code = cli_main.main(
+        (
+            "upload_material", "--base", str(workspace_root), "--log-file", str(operator_log),
+            "--ticker", "AAPL", "--action", action, "--forms", "OTHER", "--material-name", "Deck",
+            *(("--files", str(input_file)) if action != "delete" else ()),
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_FAILURE
+    assert captured.out == ""
+    assert captured.err == "dayu-cli upload_material: 工作区中的目标材料状态不完整，无法安全上传\n"
+    assert str(tmp_path) not in captured.err
+    assert "Traceback" not in captured.err and "FinsUploadPrevalidationError" not in captured.err
+    operator_diagnostic = operator_log.read_text(encoding="utf-8")
+    assert "upload_material prevalidation operational failure" in operator_diagnostic
+    assert "upload_filing prevalidation operational failure" not in operator_diagnostic
+    assert "FinsUploadPrevalidationError" in operator_diagnostic
+    assert factory_calls == []
+    assert service.upload_material_requests == [] and service.stream_calls == []
+    for spy in lifecycle_calls:
+        spy.assert_not_called()
+    assert _snapshot_cli_workspace_tree(workspace_root) == before_tree
 
 
 def test_upload_filing_prevalidation_io_failure_is_typed_bounded_and_path_free(

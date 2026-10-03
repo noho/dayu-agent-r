@@ -109,9 +109,21 @@
       "sha256": "60650bf2d5ed131a906937b56376fb7b87949c9ad10521d56346c14a4ae0c2db"
     },
     {
-      "path": "tests/fins/fixtures/sec_earnings_repair_v1/workpapers/final-pyright.log",
-      "size": 191,
-      "sha256": "70a0f3577f8953319fd286c94822becc2dd8c6ec2ba6d76e8bc67172b4e12691"
+      "path": "tests/fins/fixtures/sec_earnings_repair_v1/workpapers/final-pyright.raw.json",
+      "size": 395,
+      "sha256": "7f89f136651ed7a5546a0c5811d331341e068abd7d369848dda45699fe8b73de",
+      "encoding": "base64",
+      "decoded_original": {
+        "path": "tests/fins/fixtures/sec_earnings_repair_v1/workpapers/final-pyright.log",
+        "size": 191,
+        "sha256": "70a0f3577f8953319fd286c94822becc2dd8c6ec2ba6d76e8bc67172b4e12691"
+      },
+      "guide": {
+        "path": "tests/fins/fixtures/sec_earnings_repair_v1/workpapers/final-pyright.log",
+        "size": 340,
+        "sha256": "31bfd34fccbe65a397b8875ac69cba184c920cd954578fd513a045006875f20e",
+        "role": "ASCII guide; not historical stdout"
+      }
     },
     {
       "path": "tests/fins/fixtures/sec_earnings_repair_v1/workpapers/final-tests.log",
@@ -125,8 +137,8 @@
     },
     {
       "path": "tests/fins/fixtures/sec_earnings_repair_v1/workpapers/validation.json",
-      "size": 27559,
-      "sha256": "5da17626bc1b84de0e4c5996a91cc2fe44b884109d75c1a90d4f92ede24e4203"
+      "size": 27884,
+      "sha256": "0fac23d924a4eed94d1bf2b3055681fe6f48e79602cc7bb1d90f5368b71b5034"
     },
     {
       "path": "tests/fins/test_sec_earnings_repair.py",
