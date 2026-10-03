@@ -78,6 +78,7 @@ flowchart TD
 - `dayu.config` 提供包内默认配置、prompt fragments 和 scene manifests。ConfigLoader 只读取 typed config view；ScenePrepare 只解释显式传入的 scene manifest root、prompt asset root 和 context slot values。
 - `dayu.tools` 承载业务工具实现与 provider。工具通过 `dayu.runtime.tools_discovery` 或 Service composition root 显式发现后形成 `ToolBundle`，再由 Host ToolRuntime 治理执行。
 - `dayu.fins` 是财报领域能力边界。共享 `DefaultFinsRuntime` 装配 read runtime 与 ingestion runtime；财报文档存取必须通过 `dayu.fins.storage` 仓储协议与实现。
+- XBRL 部署装配由 Fins converter factory 消费显式管理员配置，Documents 负责部署清单及输入快照完整性；层中立 runtime 只生成和应用显式 OS 权限策略，不解释 taxonomy 或财务语义。受控 worker 在独占工作目录应用策略、复验输入后才导入第三方转换器，生命周期仍由既有进程 handle 管理。
 - `dayu.documents` 是共享文档处理基础包。它只把调用方提供的文档来源解析为章节、表格、全文、页内容和搜索命中等结构，不处理 Host 生命周期、工具治理或财报仓储真源。
 
 ## 主要组件

@@ -393,6 +393,7 @@ Fins 公共契约分为 Fins 专属契约、Dayu Agent 公共契约和文档处�
 
 - `dayu.fins.domain`：财报领域模型、枚举与共享业务值 parser，包括 `Market`、`SourceKind`、公司元数据、源文档、processed 文档、文件对象、批处理 token、rejected filing artifact、SEC form parser / alias expansion、财期、文档质量与财务数据质量等数据对象和封闭值。
 - `dayu.fins.ticker_normalization`：ticker 标准化结果与 market / exchange 推导。
+- XBRL 候选转换采用管理员显式部署和请求独占快照，配置/准备/隔离失败为 converter construction failure；转换内容失败保持 execution failure，无普通转换回退。Docling 的 SimplePipeline 卸载不承诺关闭 XBRL 模型，持有真实结果的 worker 在导出后 finally 显式卸载实际 backend 一次。材料成功仍以原件、Docling JSON、源元数据及权威 manifest 的完整仓储发布为准；许可 taxonomy 是外部部署输入，不是材料资产。
 - `dayu.fins.upload_format_contract`：在 Documents converter capability 之上叠加 Fins 文件角色，持有 filing primary/companion 与 material 的 immutable typed selection，并为 CLI help 和 LLM-facing upload tool schema 产生同源业务文案。filing 的 validated selection 显式持有必须转换的唯一 primary 与只原样保存的 companions；material 每项都是 converter-required。
 - `dayu.fins.storage.repository_protocols`：公司、源文档、processed、blob、filing maintenance 与批处理事务仓储协议。
 - `FinsDownloadRequest` / `FinsPreprocessRequest` / `FinsUploadFilingRequest` / `FinsUploadMaterialRequest`：下载、预处理与上传请求。

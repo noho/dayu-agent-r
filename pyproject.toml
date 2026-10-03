@@ -48,7 +48,7 @@ dependencies = [
     # 已不打算维护的更低版本区间。Docling 模型栈基线为 transformers
     # 5.16.1+（官方 darwin lock 版本），darwin 可用版本由 docling-slim
     # 排除列表收窄，各平台 lock 文件分别锁定 5.16.1 / 5.17.0。
-    "docling>=2.127.0,<3.0.0",
+    "docling[xbrl]>=2.127.0,<3.0.0",
     "docling-core>=2.96.0,<3.0.0",
     "transformers>=5.16.1,<6.0.0",
     # pandas 下界需与 docling / docling-core 当前依赖树保持一致，

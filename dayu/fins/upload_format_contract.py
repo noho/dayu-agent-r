@@ -638,6 +638,7 @@ def project_fins_upload_format_text(
         "后缀通过只表示具备转换资格，不保证文件内容转换成功。"
         ".json 仅是 Docling 格式的 JSON 文档候选，不代表任意 JSON 内容可转换。"
         ".xml/.xbrl 仅是 XBRL 财报实例文档候选，不代表任意 XML 或独立 linkbase 文件可转换。"
+        "XBRL 转换需要管理员完成受控部署配置；未配置或配置校验失败时上传失败。"
         "delete 不得提供文件。"
     )
     return FinsUploadFormatTextProjection(

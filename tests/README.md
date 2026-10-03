@@ -15,6 +15,10 @@ source .venv/bin/activate
 `tests/conftest.py` 提供全局测试隔离夹具：每个测试结束后恢复 `dayu` namespace logger 的 handler、level、
 propagate 与 disabled 状态，并关闭本测试新增的 logger handler，避免 CLI 入口日志装配把 pytest 捕获流泄漏给后续测试。
 
+XBRL 部署 owner 测试分布在 Documents 配置/快照、Fins converter factory / process 和 runtime macOS policy 边界。`test_xbrl_controlled_upload_integration.py` 的真实样本由显式 `DAYU_S3_XBRL_RESOURCE` 指向本地管理员部署描述，原 instance/taxonomy 的混合许可资源不进入 Git fixture；无外部资源时对应集成用例明确跳过，不能据此宣称标准部署或真实上传通过。临时机制 fixture 只验证 owner 合同，不替代真实 CLI、实际强制策略、实际 backend 卸载和公共仓储读回。独占外部资源的 macOS 实际集成需要允许原生策略应用的执行环境；单元测试不绕过生产策略来伪造正例。
+
+无外部资源的常规 XBRL 回归还验证 worker 的单次 XBRL 调度、PDF 零调用、内容状态及 errors 的 execution 分类、export 的 serialization 分类和持有结果后的单次释放。合成状态矩阵只证明控制流；合成坏内容则由真实 Docling 路由和解析，断言构造拒绝时 backend 属性未绑定且原 execution 保留到父侧。这两类测试均不替代真实 CLI 内核隔离或合法财报转换的验收。
+
 ## 常用命令
 
 `test_source_meta_contract.py` 验证精确布尔删除/修订字段；`test_source_manifest_contract.py` 验证两类 manifest 使用同一严格删除投影。`test_fins_storage_atomicity.py` 的真实 Fs 生命周期回归核对 filing/material 首删、健康重删的全部发布字节/revision/时间不变、恢复后再删，以及坏删除字段和损坏 tombstone 的失败关闭。

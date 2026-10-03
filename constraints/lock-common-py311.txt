@@ -11,11 +11,13 @@ annotated-doc==0.0.4
 annotated-types==0.7.0
 antlr4-python3-runtime==4.9.3
 anyio==4.13.0
+arelle-release==2.45.3
 attrs==26.1.0
 babel==2.18.0
 beautifulsoup4==4.14.3
 black==26.3.1
 blinker==1.9.0
+bottle==0.13.4
 cachetools==7.0.6
 certifi==2026.2.25
 chardet==7.4.3
@@ -55,6 +57,8 @@ httpxthrottlecache==0.3.5
 humanize==4.15.0
 idna==3.11
 iniconfig==2.3.0
+isodate==0.7.2
+jaconv==0.5.0
 Jinja2==3.1.6
 jsonlines==4.0.0
 jsonref==1.1.0
@@ -109,6 +113,7 @@ pyee==13.0.1
 Pygments==2.20.0
 pylatexenc==2.10
 pypdfium2==5.7.0
+pyparsing==3.3.3
 pyrate-limiter==4.1.0
 pyright==1.1.409
 pytest==9.0.3

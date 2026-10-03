@@ -309,6 +309,7 @@ def test_text_projection_is_self_contained_and_uses_exact_suffix_order() -> None
         "后缀通过只表示具备转换资格，不保证文件内容转换成功。"
         ".json 仅是 Docling 格式的 JSON 文档候选，不代表任意 JSON 内容可转换。"
         ".xml/.xbrl 仅是 XBRL 财报实例文档候选，不代表任意 XML 或独立 linkbase 文件可转换。"
+        "XBRL 转换需要管理员完成受控部署配置；未配置或配置校验失败时上传失败。"
         "delete 不得提供文件。"
     )
     expected_tool_text = (
@@ -431,3 +432,10 @@ import dayu.fins.tools.upload_tools
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+def test_material_xbrl_text_explains_admin_deployment() -> None:
+    """参数：无；返回：无；异常：共享说明缺受控部署条件时断言失败。"""
+    projection = FINS_UPLOAD_FORMAT_TEXT
+    assert "XBRL 转换需要管理员完成受控部署配置" in projection.material_files
+    assert "未配置或配置校验失败时上传失败" in projection.material_files

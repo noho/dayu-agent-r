@@ -478,9 +478,9 @@ class DefaultFinsRuntime:
                 build_hk_download_adapter,
             )
             from dayu.fins.pipelines.sec_pipeline import SEC_DOWNLOAD_SOURCE, SecPipeline, build_sec_download_adapter
-            from dayu.fins.pipelines.docling_process_converter import ProcessDoclingConverter
+            from dayu.fins.pipelines.docling_converter_factory import create_docling_converter
 
-            docling_converter = ProcessDoclingConverter()
+            docling_converter = create_docling_converter(self.workspace_root)
 
             sec_download_adapter = build_sec_download_adapter(
                 material_upload_state_repository=self.material_upload_state_repository,

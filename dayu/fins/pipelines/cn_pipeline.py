@@ -87,9 +87,9 @@ from dayu.fins.pipelines.docling_upload_service import (
 from dayu.fins.pipelines.filing_upload_publication import (
     execute_prepared_filing_publication,
 )
+from dayu.fins.pipelines.docling_converter_factory import create_docling_converter
 from dayu.fins.pipelines.docling_process_converter import (
     DoclingConverter,
-    ProcessDoclingConverter,
 )
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.pipelines.material_upload_publication import execute_material_upload_company_stage, execute_prepared_material_publication
@@ -448,7 +448,7 @@ class CnPipeline:
             max_retries=max_retries,
         )
         self._pdf_download_gate = pdf_download_gate or NoopCnDownloadPdfGate()
-        self._docling_converter = docling_converter or ProcessDoclingConverter()
+        self._docling_converter = docling_converter or create_docling_converter(self._workspace_root)
         self._upload_service = DoclingUploadService(
             source_repository=self._source_repository,
             blob_repository=self._blob_repository,

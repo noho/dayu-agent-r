@@ -18,10 +18,17 @@ from pathlib import Path
 from typing import ClassVar, Literal, Protocol, TextIO, cast
 
 import pytest
+from docling.backend.abstract_backend import AbstractDocumentBackend
+from docling.datamodel.base_models import ConversionStatus, DoclingComponentType, ErrorItem, InputFormat
+from docling.datamodel.document import ConversionResult, InputDocument
+from docling_core.types.doc.document import DoclingDocument
 
+from dayu.documents.xbrl_config import PreparedXbrlInput
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.documents.docling_runtime import DoclingRuntimeInitializationError
+from dayu.documents import docling_runtime
+from tests.documents.test_xbrl_config import _deployment, _loaded
 from dayu.fins.pipelines import docling_process_converter
 from dayu.runtime.interruptible_process import (
     InterruptibleProcessCompleted,
@@ -366,7 +373,7 @@ class _SpawnBoundaryProbeTarget:
                 output_path=self.output_path,
                 stream_name="annual-report.pdf",
                 config=docling_process_converter.DEFAULT_FINS_DOCLING_CONVERSION_CONFIG,
-            )()
+            xbrl_input=None, sandbox_profile=None)()
         finally:
             child_monkeypatch.undo()
 
@@ -520,6 +527,8 @@ class _IgnoringTerminateNestedTarget:
     output_path: str
     stream_name: str
     config: docling_process_converter.DoclingConversionConfig
+    xbrl_input: PreparedXbrlInput | None
+    sandbox_profile: str | None
 
     def __call__(self) -> JsonValue:
         """等待 nested child ready 后发布 parent PID 并阻塞。
@@ -689,7 +698,7 @@ def test_child_target_is_pickleable_and_preserves_input_name_config_without_suff
         output_path=str(output_path),
         stream_name=stream_name,
         config=docling_process_converter.DEFAULT_FINS_DOCLING_CONVERSION_CONFIG,
-    )
+    xbrl_input=None, sandbox_profile=None)
     monkeypatch.setattr(
         docling_process_converter,
         "convert_pdf_bytes_with_docling",
@@ -1179,7 +1188,7 @@ async def test_converter_success_closes_before_output_validation_and_cleans_inde
         "_read_terminal_result",
         read_after_close,
     )
-    converter = docling_process_converter.ProcessDoclingConverter()
+    converter = docling_process_converter.ProcessDoclingConverter(xbrl_config=None)
     first, second = await asyncio.gather(
         converter.convert_to_json_bytes(
             _INPUT_BYTES,
@@ -1969,7 +1978,7 @@ async def test_converter_rejects_invalid_contract_before_temp(
 
     temp_paths = _install_recording_converter_dependencies(monkeypatch)
     with pytest.raises(ValueError):
-        await docling_process_converter.ProcessDoclingConverter().convert_to_json_bytes(
+        await docling_process_converter.ProcessDoclingConverter(xbrl_config=None).convert_to_json_bytes(
             input_bytes,
             stream_name,
             config=docling_process_converter.DEFAULT_FINS_DOCLING_CONVERSION_CONFIG,
@@ -1994,7 +2003,7 @@ def _target_in_temp(tmp_path: Path) -> docling_process_converter._DoclingProcess
         output_path=str(tmp_path / "output.json"),
         stream_name="annual-report.pdf",
         config=docling_process_converter.DEFAULT_FINS_DOCLING_CONVERSION_CONFIG,
-    )
+    xbrl_input=None, sandbox_profile=None)
 
 
 async def _convert_once(
@@ -2010,7 +2019,7 @@ async def _convert_once(
     :raises asyncio.CancelledError: 外层取消时透传。
     """
 
-    return await docling_process_converter.ProcessDoclingConverter().convert_to_json_bytes(
+    return await docling_process_converter.ProcessDoclingConverter(xbrl_config=None).convert_to_json_bytes(
         _INPUT_BYTES,
         "annual-report.pdf",
         config=docling_process_converter.DEFAULT_FINS_DOCLING_CONVERSION_CONFIG,
@@ -2061,7 +2070,7 @@ def _record_temp_paths(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
         """
 
         created = Path(real_mkdtemp(prefix=prefix))
-        temp_paths.append(created)
+        temp_paths.append(created.resolve(strict=True))
         return str(created)
 
     monkeypatch.setattr(
@@ -2146,3 +2155,118 @@ def _pid_exists(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+@dataclass
+class _XbrlBackendObservation:
+    """合成 backend 生命周期计数；不证明 Arelle 模型关闭。"""
+
+    unload_calls: int = 0
+
+    def unload(self) -> None:
+        """参数：无；返回：无；异常：无，记录 owner 调用。"""
+        self.unload_calls += 1
+
+
+@dataclass
+class _XbrlWorkerObservation:
+    """用真实结果类型注入合成状态，仅证明 worker 控制流。"""
+
+    result: ConversionResult
+    prepared: PreparedXbrlInput
+    raise_execution: bool
+    dispatch_calls: int = 0
+    release_calls: int = 0
+
+    def convert(self, input_bytes: bytes, *, stream_name: str, xbrl_input: PreparedXbrlInput) -> ConversionResult:
+        """参数：输入/名称/快照；返回：注入结果；异常：指定 execution 场景时抛出。"""
+        assert input_bytes == _INPUT_BYTES and stream_name == 'synthetic.xml'
+        assert xbrl_input is self.prepared
+        self.dispatch_calls += 1
+        if self.raise_execution:
+            raise RuntimeError('synthetic execution failure before result ownership')
+        return self.result
+
+    def release(self, result: ConversionResult) -> None:
+        """参数：持有结果；返回：无；异常：错结果或真实 helper 失败时透传。"""
+        assert result is self.result
+        self.release_calls += 1
+        docling_runtime.unload_xbrl_conversion(result)
+
+
+def _forbidden_xbrl_pdf_dispatch(
+    raw_bytes: bytes, *, stream_name: str, do_ocr: bool, do_table_structure: bool,
+    table_mode: str, do_cell_matching: bool,
+) -> ConversionResult:
+    """参数：PDF 调用参数；返回：永不返回；异常：XBRL 路由误调用 PDF 时失败。"""
+    raise AssertionError('XBRL must not dispatch PDF')
+
+
+def _xbrl_export_failure(document: DoclingDocument) -> dict[str, JsonValue]:
+    """参数：真实 document 类型；返回：永不返回；异常：合成 export 故障。"""
+    raise RuntimeError('synthetic export failure')
+
+
+@pytest.mark.parametrize('case', ['success', 'status', 'errors', 'export', 'raises'])
+def test_xbrl_worker_dispatch_classification_and_owned_release(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    case: Literal['success', 'status', 'errors', 'export', 'raises'],
+) -> None:
+    """参数：独占根/注入工具/合成场景；返回：无；异常：dispatch、分类、释放次数错误时失败。"""
+    config, _, _ = _deployment(tmp_path)
+    prepared = docling_process_converter.prepare_xbrl_input(
+        _loaded(config, tmp_path / 'workspace'), snapshot_root=tmp_path / 'snapshot',
+        writable_root=tmp_path / 'work', stream_name='synthetic.xml',
+    )
+    input_path = tmp_path / 'input.bin'
+    output_path = prepared.writable_root / 'output.json'
+    input_path.write_bytes(_INPUT_BYTES)
+    backend = _XbrlBackendObservation()
+    in_doc = InputDocument.model_construct(
+        file=input_path, document_hash=hashlib.sha256(_INPUT_BYTES).hexdigest(),
+        valid=True, format=InputFormat.XML_XBRL,
+    )
+    in_doc._backend = cast(AbstractDocumentBackend, backend)
+    errors = [ErrorItem(component_type=DoclingComponentType.DOCUMENT_BACKEND,
+                        module_name='synthetic', error_message='synthetic content error')] if case == 'errors' else []
+    result = ConversionResult(
+        input=in_doc, status=ConversionStatus.FAILURE if case == 'status' else ConversionStatus.SUCCESS,
+        errors=errors, document=DoclingDocument(name='synthetic-control-flow'),
+    )
+    observed = _XbrlWorkerObservation(result, prepared, case == 'raises')
+    monkeypatch.setattr(docling_process_converter, 'convert_xbrl_bytes_with_docling', observed.convert)
+    monkeypatch.setattr(docling_process_converter, 'convert_pdf_bytes_with_docling', _forbidden_xbrl_pdf_dispatch)
+    monkeypatch.setattr(docling_process_converter, 'unload_xbrl_conversion', observed.release)
+    # 只测试控制流：明确不施加真实内核策略；快照复验仍使用真实 owner。
+    monkeypatch.setattr(docling_process_converter, 'apply_macos_sandbox', _observe_synthetic_policy)
+    if case == 'export':
+        monkeypatch.setattr(DoclingDocument, 'export_to_dict', _xbrl_export_failure)
+    monkeypatch.chdir(Path.cwd())
+    for key in ('TMPDIR', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME'):
+        monkeypatch.setenv(key, os.environ.get(key, 'synthetic-before'))
+    monkeypatch.setattr(docling_process_converter.tempfile, 'tempdir', docling_process_converter.tempfile.tempdir)
+    target = docling_process_converter._DoclingProcessTarget(
+        str(input_path), str(output_path), 'synthetic.xml',
+        docling_process_converter.DEFAULT_FINS_DOCLING_CONVERSION_CONFIG, prepared, 'synthetic-profile',
+    )
+    descriptor = target()
+    assert observed.dispatch_calls == 1
+    assert observed.release_calls == (0 if case == 'raises' else 1)
+    assert backend.unload_calls == (0 if case == 'raises' else 1)
+    terminal = InterruptibleProcessCompleted(value=descriptor, exitcode=0)
+    if case == 'success':
+        public = docling_process_converter._read_terminal_result(output_path=output_path, wait_result=terminal)
+        assert public.json_bytes == output_path.read_bytes()
+    else:
+        kind = (docling_process_converter.DoclingConversionFailureKind.RESULT_SERIALIZATION
+                if case == 'export' else docling_process_converter.DoclingConversionFailureKind.CONVERTER_EXECUTION)
+        assert descriptor == docling_process_converter._failure_descriptor(kind)
+        assert not output_path.exists()
+        with pytest.raises(docling_process_converter.DoclingConversionError) as error:
+            docling_process_converter._read_terminal_result(output_path=output_path, wait_result=terminal)
+        assert error.value.kind is kind and error.value.exit_code == 0
+
+
+def _observe_synthetic_policy(profile: str) -> None:
+    """参数：合成策略标签；返回：无；异常：非预期标签时断言失败；不施加内核策略。"""
+    assert profile == 'synthetic-profile'

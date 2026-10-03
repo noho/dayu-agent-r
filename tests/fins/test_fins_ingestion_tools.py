@@ -2172,13 +2172,14 @@ def test_upload_tool_calendar_year_schema_and_usage_messages_are_business_neutra
     assert max_items == max(MAX_FILING_UPLOAD_FILES, MAX_MATERIAL_UPLOAD_FILES)
     assert max_items >= MAX_FILING_UPLOAD_FILES
     assert max_items >= MAX_MATERIAL_UPLOAD_FILES
-    expected_material_text = (
-        "后缀通过只表示具备转换资格，不保证文件内容转换成功。"
-        ".json 仅是 Docling 格式的 JSON 文档候选，不代表任意 JSON 内容可转换。"
-        ".xml/.xbrl 仅是 XBRL 财报实例文档候选，不代表任意 XML 或独立 linkbase 文件可转换。"
-        "delete 不得提供文件。"
-    )
-    assert expected_material_text in str(files_schema["description"])
+    for expected_material_fact in (
+        "后缀通过只表示具备转换资格，不保证文件内容转换成功。",
+        ".json 仅是 Docling 格式的 JSON 文档候选，不代表任意 JSON 内容可转换。",
+        ".xml/.xbrl 仅是 XBRL 财报实例文档候选，不代表任意 XML 或独立 linkbase 文件可转换。",
+        "XBRL 转换需要管理员完成受控部署配置；未配置或配置校验失败时上传失败。",
+        "delete 不得提供文件。",
+    ):
+        assert expected_material_fact in files_description
     assert ("upload_kind=material 时，" + FINS_UPLOAD_FORMAT_TEXT.material_files.replace("--primary", "primary").replace("--files", "files")) in str(
         files_schema["description"]
     )
@@ -3648,7 +3649,7 @@ async def test_s1_real_tool_content_failure_and_job_facts(tmp_path: Path, ticker
     input_path = tmp_path / ("empty.txt" if content_case == "empty" else "corrupt.docx")
     input_path.write_bytes(b"" if content_case == "empty" else b"corrupt document")
     converter = _S1ContentConverter(None if content_case == "empty" else input_path.name)
-    with patch("dayu.fins.pipelines.docling_process_converter.ProcessDoclingConverter", return_value=converter):
+    with patch("dayu.fins.pipelines.docling_converter_factory.ProcessDoclingConverter", return_value=converter):
         default = DefaultFinsRuntime.create(workspace_root=workspace_root)
         runtime = default.get_ingestion_runtime()
     arguments: dict[str, JsonValue] = {"ticker": ticker, "upload_kind": "material", "files": [str(input_path)],
@@ -3703,7 +3704,7 @@ async def test_s1_real_tool_role_and_combination(tmp_path: Path, case: str) -> N
     a, b = tmp_path / "a.txt", tmp_path / "b.txt"
     a.write_bytes(b"a contents"); b.write_bytes(b"b contents")
     converter = _S1ContentConverter()
-    with patch("dayu.fins.pipelines.docling_process_converter.ProcessDoclingConverter", return_value=converter):
+    with patch("dayu.fins.pipelines.docling_converter_factory.ProcessDoclingConverter", return_value=converter):
         default = DefaultFinsRuntime.create(workspace_root=workspace_root)
         runtime = default.get_ingestion_runtime()
     arguments: dict[str, JsonValue] = {"ticker": "AAPL", "upload_kind": "material", "form_type": "OTHER",

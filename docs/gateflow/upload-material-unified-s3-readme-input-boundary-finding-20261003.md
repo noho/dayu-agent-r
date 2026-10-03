@@ -1,0 +1,9 @@
+# US3-D01：README 原件路径的公开合同漂移
+
+裁决 accepted，P2，未修复；归当前S3文档修复，不新slice/WU。root实际检查 README.md:387 附近新增文案“管理员必须准备工作区外的只读原件、可信taxonomy快照及完整清单”。实际 Documents loader仅校验管理员config/taxonomy/manifest工作区外及权限；Fins原件入口按既有上传合同接受用户提供文件，Process将bytes复制到本请求input/input.bin并设400，worker读取该只读副本。原件上传路径没有管理员工作区外/只读限制，已确认goal及边界修订也未新增该用户上传参数限制。
+
+owner：根README最终用户配置说明消费真实部署/上传公共合同。修复为明确只有config/taxonomy/manifest是工作区外管理员输入；用户原件按既有上传方式提供、受控worker读取请求独占只读副本。不得在产品新增原件路径/权限准入以迁就错误说明，不改已有用户裁决。不需要为纯文本追加镜像测试。
+
+证据：README新增diff；dayu/documents/xbrl_config.py load_xbrl_conversion_config/_trusted_path；dayu/fins/pipelines/docling_process_converter.py convert_to_json_bytes input_path.write_bytes/chmod及worker read_bytes。runtime边界禁止任意workspace私有内容，显式请求原件副本例外不等于原件源路径必须在workspace外。
+
+当前集中US3-C01收尾只允许三个代码/测试文件，README不在其白名单；将本项交随后同版S3 slice review核查，并与该轮全部成立findings一次集中fix。Linux/Windows延期、Docling准确性上游、FTP unknown等原分类不变。原first-delivery审查记录在读取本diff前的README总体核查结论由本项精确补充，不覆历史。

@@ -1,0 +1,15 @@
+{
+  "gate": "accepted slice commit S2",
+  "commit": "a514dea14c0ce66722da034502f3af54a54c3238",
+  "parent": "f7e60c9d3e4c6e77a6c2abf18d09cd8020c19235",
+  "branch": "codex/upload-material-oracle",
+  "main": "fac32ecbff9bfe792b63ee9667c8697826b631f4",
+  "commit_actual_exit": 0,
+  "cached_diffcheck_actual_exit": 0,
+  "stage_index_bytes_verified": 95,
+  "status_after_commit": "clean verified before this checkpoint/control record",
+  "review_gate_decision": "all S2 accepted findings verified fixed, same-version dual review root adjudicated",
+  "final_adjudication": "docs/gateflow/upload-material-unified-s2-final-root-adjudication-20261003.md",
+  "next_entry": "implementation S3",
+  "push": "deferred per Gateflow until all slices and aggregate, current remote/PR head619d092ab4278645203c7ebe08515f7697d92b71"
+}

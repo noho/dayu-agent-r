@@ -21,6 +21,8 @@ from docling.datamodel.pipeline_options import (
 from docling.document_converter import PdfFormatOption
 
 from dayu.documents import docling_runtime
+from dayu.documents.xbrl_config import PreparedXbrlInput, TaxonomyManifest
+from datetime import datetime, timezone
 
 if TYPE_CHECKING:
     from docling.datamodel.document import ConversionResult
@@ -72,6 +74,76 @@ _EXPECTED_PRODUCT_SUFFIXES = (
     ".json",
 )
 _KNOWN_UNSELECTED_THIRD_PARTY_SUFFIXES = frozenset({".text", ".rmd", ".qmd", ".xlsm", ".potx"})
+
+
+@dataclass
+class _OwnedBackend:
+    """合成生命周期观察器，不证明真实模型关闭。"""
+    unload_calls: int = 0
+
+    def unload(self) -> None:
+        """参数：无；返回：无；异常：无，记录一次 owner 调用。"""
+        self.unload_calls += 1
+
+
+@dataclass
+class _OwnedInput:
+    """合成输入的明确 backend 与有效性。"""
+    valid: bool
+    _backend: _OwnedBackend
+
+
+@dataclass
+class _RejectedInput:
+    """真实构造拒绝的属性形状：valid=False，backend 尚未绑定。"""
+    valid: bool = False
+
+
+@dataclass
+class _OwnedResult:
+    """合成结果，只供卸载 owner 的协议测试。"""
+    input: _OwnedInput | _RejectedInput
+
+
+def test_xbrl_explicit_unload_only_valid_backend_once() -> None:
+    """参数：无；返回：无；异常：有效 backend 未卸载或重复卸载无效 backend 时断言失败。"""
+    backend=_OwnedBackend()
+    result=cast('ConversionResult',_OwnedResult(_OwnedInput(True,backend)))
+    docling_runtime.unload_xbrl_conversion(result)
+    assert backend.unload_calls==1
+    # 无效输入不授予调用者 backend 所有权；不重复释放也不访问缺失属性。
+    docling_runtime.unload_xbrl_conversion(cast('ConversionResult',_OwnedResult(_OwnedInput(False,backend))))
+    docling_runtime.unload_xbrl_conversion(cast('ConversionResult',_OwnedResult(_RejectedInput())))
+    assert backend.unload_calls==1
+
+
+def test_xbrl_converter_constructed_once_with_explicit_options(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """参数：合成快照和构造观察；返回：无；异常：格式/资源/次数不符合 owner 合同时断言失败。"""
+    import docling.document_converter as thirdparty
+    from docling.datamodel.backend_options import XBRLBackendOptions
+    from docling.document_converter import XBRLFormatOption
+    from tests.documents.test_xbrl_config import _deployment, _loaded
+    from dayu.documents.xbrl_config import prepare_xbrl_input
+    config,_,_=_deployment(tmp_path); loaded=_loaded(config,tmp_path/'workspace')
+    prepared=prepare_xbrl_input(loaded,snapshot_root=tmp_path/'snapshot',writable_root=tmp_path/'work',stream_name='report.xml')
+    observed: list[str]=[]
+    marker=cast('ConversionResult',_OwnedResult(_OwnedInput(True,_OwnedBackend())))
+    class Converter:
+        """仅观察构造与调用，不替代真实集成正例。"""
+        def convert(self, source: DocumentStream, *, raises_on_error: bool) -> 'ConversionResult':
+            """参数：实际 stream 与错误方式；返回：合成 marker；异常：错误参数时断言失败。"""
+            assert source.name=='report.xml' and raises_on_error is False
+            observed.append('convert'); return marker
+    def construct(*, allowed_formats: list[InputFormat], format_options: dict[InputFormat,XBRLFormatOption]) -> Converter:
+        """参数：严格第三方格式选项；返回：观察器；异常：配置不符合时断言失败。"""
+        assert allowed_formats==[InputFormat.XML_XBRL]
+        options=format_options[InputFormat.XML_XBRL].backend_options
+        assert isinstance(options,XBRLBackendOptions)
+        assert options.taxonomy==prepared.taxonomy_snapshot_root and options.enable_local_fetch and not options.enable_remote_fetch
+        observed.append('construct'); return Converter()
+    monkeypatch.setattr(thirdparty,'DocumentConverter',construct)
+    assert docling_runtime.convert_xbrl_bytes_with_docling(b'synthetic',stream_name='report.xml',xbrl_input=prepared) is marker
+    assert observed==['construct','convert']
 _FUTURE_PDF_EXTENSION = "future-pdf"
 
 

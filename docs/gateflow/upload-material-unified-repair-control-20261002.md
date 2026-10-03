@@ -37,7 +37,7 @@
 ## 当前 gate / 下一入口
 
 - goal confirmation：沿用户已明确批准范围及最新排程纠正确认；本文件固定边界。
-- current gate / next entry：accepted slice commit S2。最后US2-R04-T01已修并经MiMo/ds-flash同版双复审/root直接核收；原S2全部accepted项已修，无block。见 `upload-material-unified-s2-final-root-adjudication-20261003.md`。精准提交全部S2代码/测试/README/历史裁决/报告/receipt后绑定实际HEAD实施S3。正式PRreview三slice与aggregate后，完整CLI/registry WU后；main保持fac32ecb。
+- current gate / next entry：aggregate deepreview（S1/S2/S3均已accepted；S3最终同版双复审及全42实际2841pass/3skip/type0、38prod>=80完成，唯一branch checkpoint即将创建）。S2 checkpoint a514dea14c0ce66722da034502f3af54a54c3238；S3当前完整裁决见 upload-material-unified-s3-final-root-adjudication-20261003.md 与 evidence/upload-material-unified-repair-20261002/s3-final-validation.json。所有S3 accepted finding已修闭合；原失败Raw/裁决保存。Raw EOF仍后续aggregate集中收口、未fullPRdiffcheck pass。全部slice后按固定aggregate→fix/re-review/checkpoint，再普通push到既有draftPR197→正式PRreview/fix/re-review/checkpoint/finalpush/closeout。main不动，CLI/registry仍WU后独立阶段。
 
 - planreview 必须挑战切片成本、机械拆分、可合并性与 future-slice 漂移；默认避免超过 3 slices，超过须直接理由。
 - 所有成立新修复即时写 artifact/控制表；accepted finding 必须已修并经复审才通过。普通 gate 通过后继续固定顺序，不因 gate 完成停机。
@@ -47,3 +47,5 @@
 按 `upload-material-repair-scope-and-ci-closeout-20261001.md` 与 `docs/cli_ci.md` 重建最终完整 mandatory upload_material campaign，冻结最终 commit/parser/corpus/policy，真实采集 stdout/stderr/exit/screen/FS/log/process/durable/manifest 等适用证据，再按用户裁决正式登记 oracles/scenarios、版本与 supersede lineage、双向覆盖及 readiness proof。旧 Raw 根用户确认删除，不索要同一备份、不编造旧 hash，不用其它命令 registry ready 代替本范围。
 
 修复 WU closeout pass 不等于整体任务完成；继续后续 CLI CI/登记阶段，直到用户当前大目标完成，或遇到真实 blocking stop condition。
+
+最新集中修复核收：upload-material-unified-s3-integration-fix-root-adjudication-20261003.md。T03/T04当前已修待同版复审；不改变原42文件failed历史，不给S3pass。

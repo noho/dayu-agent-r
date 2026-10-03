@@ -66,7 +66,7 @@ async def test_real_docling_upload_service_conversion_when_enabled(tmp_path: Pat
     service = DoclingUploadService(
         source_repository=source_repository,
         blob_repository=blob_repository,
-        docling_converter=ProcessDoclingConverter(),
+        docling_converter=ProcessDoclingConverter(xbrl_config=None),
     )
     sample_file = tmp_path / "minimal.pdf"
     sample_file.write_bytes(_MINIMAL_PDF)
@@ -107,7 +107,7 @@ async def test_real_docling_upload_service_conversion_when_enabled(tmp_path: Pat
 async def test_real_text_conversion_role_versions_and_default_processor(tmp_path: Path) -> None:
     """参数：真实隔离根；返回：无；异常：转换或断言失败；离线文本经真实子进程转换、仓储及 processor factory 验证 A→B→B。"""
     registry = build_fins_processor_registry()
-    pipeline = SecPipeline(workspace_root=tmp_path, processor_registry=registry, docling_converter=ProcessDoclingConverter(),  material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
+    pipeline = SecPipeline(workspace_root=tmp_path, processor_registry=registry, docling_converter=ProcessDoclingConverter(xbrl_config=None),  material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=tmp_path, create_directories=False))), batching_repository=FsBatchingRepository(tmp_path, repository_set=_material_test_repository_set), company_repository=FsCompanyMetaRepository(tmp_path, repository_set=_material_test_repository_set), source_repository=FsSourceDocumentRepository(tmp_path, repository_set=_material_test_repository_set), blob_repository=FsDocumentBlobRepository(tmp_path, repository_set=_material_test_repository_set), filing_maintenance_repository=FsFilingMaintenanceRepository(tmp_path, repository_set=_material_test_repository_set), filing_upload_state_repository=FsFilingUploadStateRepository(tmp_path, repository_set=_material_test_repository_set), processed_repository=FsProcessedDocumentRepository(tmp_path, repository_set=_material_test_repository_set),)
     a, b = tmp_path / "a.txt", tmp_path / "b.txt"
     a.write_text("Alpha source contents", encoding="utf-8")
     b.write_text("Bravo source contents", encoding="utf-8")

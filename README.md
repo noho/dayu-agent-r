@@ -381,8 +381,20 @@ dayu-cli upload_material --help
 ```
 
 上传材料时，`.json` 仅是 Docling 格式的 JSON 文档候选，`.xml/.xbrl` 仅是
-XBRL 财报实例文档候选；后缀符合要求不保证文件内容转换成功。当前支持的后缀清单
+XBRL 财报实例文档候选；后缀符合要求不保证文件内容转换成功。XBRL 转换当前仅在 macOS arm64 / Python 3.11 完成受控部署验证，其它平台尚未提供受控转换。当前支持的后缀清单
 以 `dayu-cli upload_material --help` 的即时输出为准。
+
+XBRL 转换前，管理员必须准备工作区外的可信 taxonomy 源目录、完整清单和配置，并设置 `DAYU_XBRL_CONFIG` 为配置 JSON 的绝对路径。程序按请求生成 taxonomy 快照；用户原件按上传合同进入本次请求独占的只读副本，不要求原件位于工作区外。例如：
+
+```bash
+export DAYU_XBRL_CONFIG=/private/tmp/dayu-xbrl-admin/config.json
+```
+
+配置恰含三个字段：`taxonomy_root`（taxonomy 目录绝对路径）、`manifest_path`（该目录之外的清单文件绝对路径）、`manifest_sha256`（清单原始字节的 64 位小写 SHA-256）。配置及清单同样必须在工作区外；路径不得含符号链接，文件及目录不得允许组或其他用户写入。程序不会从 HOME 或原件旁边猜测配置。
+
+清单恰含 `source_urls`（非空 HTTPS 来源列表）、`acquired_at`（带 UTC 时区的获取时间）、`license_urls`（非空 HTTPS 许可来源列表）和 `files`（非空完整文件列表）。每个文件声明 `relative_path`（不越界的相对路径）、`size_bytes`（非负整数字节数）、`sha256`（64 位小写摘要）、`archive_entries`；非 ZIP 的 `archive_entries` 必须为 `null`，ZIP 必须列出全部成员，每项恰含 `relative_path`、`size_bytes`、`sha256`，目录成员使用零字节及空内容摘要。目录中的文件及目录条目必须全部由这些声明覆盖。管理员应保留逐可信 URL、UTC、许可及文件摘要的来源记录，程序不自动下载 taxonomy。
+
+上传时只复制清单声明的 taxonomy 到请求独占快照，复验后再启动受控转换。已安装运行库及其中公开 XSD 可以只读访问；其它私有文件内容及出站网络被策略禁止，输出只写请求独占目录。未配置、清单/摘要不匹配或隔离启动失败会导致转换初始化失败，不会回退到普通转换器；转换失败或发布前取消不会提交部分材料。taxonomy 不会作为材料附件进入仓储。
 
 `upload_filing --files` 声明同一 filing 的文件集合，文件顺序不决定主文件角色。单文件
 filing 可以省略 `--primary`，省略时唯一文件就是 primary；多文件 filing 必须恰好提供

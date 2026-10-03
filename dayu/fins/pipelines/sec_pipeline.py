@@ -56,7 +56,8 @@ from dayu.fins.ingestion_runtime import (
     FinsUploadMaterialRequest,
     admit_fins_upload_material_request,
 )
-from dayu.fins.pipelines.docling_process_converter import DoclingConverter, ProcessDoclingConverter
+from dayu.fins.pipelines.docling_process_converter import DoclingConverter
+from dayu.fins.pipelines.docling_converter_factory import create_docling_converter
 from dayu.fins.pipelines.docling_upload_service import DoclingUploadService
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.pipelines.sec_6k_rules import (
@@ -580,7 +581,7 @@ class SecPipeline:
         self._upload_service = DoclingUploadService(
             source_repository=self._source_repository,
             blob_repository=self._blob_repository,
-            docling_converter=docling_converter or ProcessDoclingConverter(),
+            docling_converter=docling_converter or create_docling_converter(self._workspace_root),
         )
 
     @property
