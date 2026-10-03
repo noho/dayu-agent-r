@@ -11,6 +11,8 @@ import pytest
 from dayu.fins.upload_format_contract import (
     FINS_UPLOAD_FORMAT_CAPABILITY,
     FINS_UPLOAD_FORMAT_TEXT,
+    MAX_MATERIAL_UPLOAD_FILES,
+    MAX_FILING_UPLOAD_FILES,
     FinsUploadFileRole,
     FinsUploadFilingFiles,
     FinsUploadFormatCapability,
@@ -292,12 +294,9 @@ def test_text_projection_is_self_contained_and_uses_exact_suffix_order() -> None
     material_text = FINS_UPLOAD_FORMAT_TEXT.material_files
     tool_text = FINS_UPLOAD_FORMAT_TEXT.upload_tool_files
     tool_primary_text = FINS_UPLOAD_FORMAT_TEXT.upload_tool_primary
-    tool_material_primary_failure = (
-        FINS_UPLOAD_FORMAT_TEXT.upload_tool_material_primary_failure
-    )
-
     expected_filing_text = (
         "auto/create/update 必须至少提供一个文件。已选主文件必须实际转换成功；"
+        f"filing 一次最多 {MAX_FILING_UPLOAD_FILES} 个文件；"
         "其余文件是仅原样保存、不转换的随附文件。"
         f"主文件支持后缀：{suffix_text}；随附文件支持这些后缀以及 .xsd，且 .xsd 只能作为随附文件。"
         ".xml 仅是 XBRL XML 候选，不代表任意 XML；主文件后缀通过只表示具备转换资格，不保证文件内容转换成功。"
@@ -307,12 +306,21 @@ def test_text_projection_is_self_contained_and_uses_exact_suffix_order() -> None
     expected_material_text = (
         "auto/create/update 必须至少提供一个文件；"
         f"每个文件都必须使用转换器支持的后缀：{suffix_text}，并逐个实际转换成功；"
-        "后缀通过只表示具备转换资格，不保证文件内容转换成功。delete 不得提供文件。"
+        "后缀通过只表示具备转换资格，不保证文件内容转换成功。"
+        ".json 仅是 Docling 格式的 JSON 文档候选，不代表任意 JSON 内容可转换。"
+        ".xml/.xbrl 仅是 XBRL 财报实例文档候选，不代表任意 XML 或独立 linkbase 文件可转换。"
+        "XBRL 转换需要管理员完成受控部署配置；未配置或配置校验失败时上传失败。"
+        "delete 不得提供文件。"
     )
     expected_tool_text = (
         f"upload_kind=filing 时，{expected_filing_text}"
-        f"upload_kind=material 时，{expected_material_text}"
+        f"upload_kind=material 时，{expected_material_text}{FINS_UPLOAD_FORMAT_TEXT.material_primary.replace('--primary', 'primary').replace('--files', 'files')}"
         "每个路径必须指向已存在、非空的普通文件。"
+        f"material 一次最多 {MAX_MATERIAL_UPLOAD_FILES} 个文件；不同路径的原件不能有相同完整文件名，"
+        "文件名也不能与工作区控制文件（.identity.json、meta.json）或本批原件及转换结果冲突；"
+        "大小写不同的文件名也可能冲突。"
+        "每个转换结果的文件名是完整原件文件名后追加 _docling.json，"
+        "例如 deck.txt 对应 deck.txt_docling.json；请在上传前避开这些冲突。"
     )
     expected_filing_primary_text = (
         "单文件 filing 可省略 --primary，省略时唯一文件就是主文件；"
@@ -321,27 +329,14 @@ def test_text_projection_is_self_contained_and_uses_exact_suffix_order() -> None
         "--files 的顺序不决定主文件角色；"
         "delete 必须省略 --files 和 --primary。"
     )
-    expected_tool_primary_text = (
-        "仅用于 upload_kind=filing："
-        "单文件 filing 可省略 primary，省略时唯一文件就是主文件；"
-        "多文件 filing 必须恰好指定一个 primary；"
-        "primary 必须精确匹配 files 中的一个路径；"
-        "files 的顺序不决定主文件角色；"
-        "delete 必须省略 files 和 primary。"
-        "upload_kind=material 不得提供 primary；请省略 primary 字段。"
-        "primary 是用户选择的业务角色，不能根据质量、重要性或转换是否成功推断。"
-    )
-    expected_tool_material_primary_failure = (
-        "upload_kind=material 不得提供 primary；请省略 primary 字段"
-    )
-
     assert filing_text == expected_filing_text
     assert filing_primary_text == expected_filing_primary_text
-    assert material_text == expected_material_text
-    assert tool_text == expected_tool_text
-    assert tool_primary_text == expected_tool_primary_text
-    assert tool_material_primary_failure == expected_tool_material_primary_failure
-    assert f"{tool_material_primary_failure}。" in tool_primary_text
+    assert material_text == expected_material_text + FINS_UPLOAD_FORMAT_TEXT.material_primary
+    assert tool_text == expected_tool_text.replace("已存在、非空的普通文件", "已存在的普通文件。文件为空，无法上传；请提供非空文件后重试")
+    assert "单文件材料可省略 primary" in tool_primary_text
+    assert "多文件材料必须恰好指定一个 primary" in tool_primary_text
+    assert "material 不得提供 primary" not in tool_primary_text
+    assert "非空的普通文件" not in tool_text
     for required_text in (
         "auto/create/update 必须至少提供一个文件",
         "必须实际转换成功",
@@ -368,7 +363,7 @@ def test_text_projection_is_self_contained_and_uses_exact_suffix_order() -> None
     ):
         assert primary_rule in filing_primary_text
         assert primary_rule in tool_primary_text
-    assert tool_material_primary_failure in tool_primary_text
+    assert "多文件材料必须恰好指定一个 primary" in tool_primary_text
     assert "首文件是主文件" not in filing_text
     assert "首文件是主文件" not in tool_text
     assert "upload_kind=material" in tool_text
@@ -437,3 +432,10 @@ import dayu.fins.tools.upload_tools
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+def test_material_xbrl_text_explains_admin_deployment() -> None:
+    """参数：无；返回：无；异常：共享说明缺受控部署条件时断言失败。"""
+    projection = FINS_UPLOAD_FORMAT_TEXT
+    assert "XBRL 转换需要管理员完成受控部署配置" in projection.material_files
+    assert "未配置或配置校验失败时上传失败" in projection.material_files

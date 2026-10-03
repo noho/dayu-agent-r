@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 from collections.abc import AsyncIterator, Mapping
-from pathlib import Path
 from typing import Final, Protocol, TypeAlias
 
 from dayu.contracts.cancellation import CancellationToken
@@ -16,26 +15,24 @@ from dayu.contracts.json_value import JsonValue
 from dayu.fins.company_metadata_warning import company_metadata_warnings_to_json
 from dayu.fins.domain.document_models import FinsIngestMethod
 from dayu.fins.domain.enums import SourceKind
-from dayu.fins.ingestion_runtime import ValidatedFinsUploadFilingRequest
+from dayu.fins.ingestion_runtime import FINS_UPLOAD_ACTION_AUTO, ValidatedFinsUploadFilingRequest, ValidatedFinsUploadMaterialRequest, validated_fins_upload_file_count
 from dayu.fins.pipelines._filing_upload_fresh_validation import (
     resolve_fresh_filing_request,
 )
 from dayu.fins.pipelines.docling_upload_service import (
     DoclingUploadService,
     UploadOperationResult,
-    build_material_ids,
     commit_prepared_upload_batch,
     derive_report_kind,
     resolve_upload_action,
     rollback_prepared_upload_batch,
-    validate_material_upload_ids,
 )
 from dayu.fins.pipelines.filing_upload_publication import (
     execute_prepared_filing_publication,
 )
+from dayu.fins.pipelines.material_upload_publication import execute_material_upload_company_stage, execute_prepared_material_publication
 from dayu.fins.pipelines.upload_company_meta import (
     build_upload_company_id,
-    stage_company_meta_for_upload,
     stage_upload_company_meta_decision,
 )
 from dayu.fins.pipelines.upload_filing_events import UploadFilingEvent, UploadFilingEventType
@@ -48,10 +45,10 @@ from dayu.fins.storage import (
     BatchingRepositoryProtocol,
     CompanyMetaRepositoryProtocol,
     FilingUploadStateRepositoryProtocol,
+    MaterialUploadStateRepositoryProtocol,
     SourceDocumentRepositoryProtocol,
 )
 from dayu.fins.ticker_normalization import normalize_ticker
-from dayu.fins.upload_format_contract import FinsUploadMaterialFiles
 from dayu.fins.upload_failure import (
     FinsUploadFailureError,
     FinsUploadFailureReason,
@@ -82,6 +79,11 @@ class SecUploadWorkflowHost(Protocol):
     def _filing_upload_state_repository(self) -> FilingUploadStateRepositoryProtocol:
         """返回 filing authoritative snapshot 唯一仓储。"""
 
+        ...
+
+    @property
+    def _material_upload_state_repository(self) -> MaterialUploadStateRepositoryProtocol:
+        """参数：无；返回：材料状态仓储；异常：无。"""
         ...
 
     @property
@@ -205,7 +207,7 @@ async def run_upload_filing_stream(
             "company_name": raw_request.company_name,
             "ticker_aliases": _json_text_list(list(raw_request.ticker_aliases)),
             "overwrite": raw_request.overwrite,
-            "file_count": len(raw_request.files),
+            "file_count": validated_fins_upload_file_count(authoritative_request),
         },
     )
     try:
@@ -252,6 +254,7 @@ async def run_upload_filing_stream(
                 )
                 raise
             upload_result = commit_prepared_upload_batch(
+                material_state_repository=None,
                 service=host._upload_service,
                 batching_repository=host._batching_repository,
                 batch=publication_batch,
@@ -418,86 +421,52 @@ def _build_sec_filing_failure_event(
 
 async def run_upload_material_stream(
     host: SecUploadWorkflowHost,
+    request: ValidatedFinsUploadMaterialRequest,
     *,
-    ticker: str,
-    action: str | None,
-    form_type: str,
-    material_name: str,
-    files: list[Path] | None = None,
-    document_id: str | None = None,
-    internal_document_id: str | None = None,
-    fiscal_year: int | None = None,
-    fiscal_period: str | None = None,
-    filing_date: str | None = None,
-    report_date: str | None = None,
-    company_id: str | None = None,
-    company_name: str | None = None,
-    ticker_aliases: list[str] | None = None,
-    overwrite: bool = False,
     cancellation_checker: CancellationToken | None = None,
 ) -> AsyncIterator[UploadMaterialEvent]:
-    """执行流式材料上传。
+    """使用同一次 material 准入计划执行 SEC 上传流。
 
     Args:
-        host: SEC pipeline facade 暴露出的最小宿主边界。
-        ticker: 股票代码。
-        action: 可选动作类型；为空时自动判定。
-        form_type: 材料类型。
-        material_name: 材料名称。
-        files: 文件列表。
-        document_id: 可选文档 ID。
-        internal_document_id: 可选内部文档 ID。
-        fiscal_year: 可选财年。
-        fiscal_period: 可选财期。
-        filing_date: 可选 filing 日期。
-        report_date: 可选 report 日期。
-        company_id: 可选兼容字段；上传链路不会把它作为身份真源。
-        company_name: 公司名称。
-        ticker_aliases: ticker alias 列表。
-        overwrite: 是否覆盖。
+        host: SEC pipeline 的最小宿主边界。
+        request: 已准入且包含 authoritative selection/asset plan 的请求。
         cancellation_checker: 可选协作式取消检查器。
 
     Yields:
         上传流程事件。
 
     Raises:
-        ValueError: 市场类型非法时抛出。
+        ValueError: 市场或业务身份字段非法时抛出。
         RuntimeError: 上传执行失败时抛出。
     """
 
+    raw = request.request
+    ticker = raw.ticker
+    identity = request.identity
+    form_type = identity.form_type
+    material_name = identity.material_name
+    fiscal_year = identity.fiscal_year
+    fiscal_period = identity.fiscal_period
+    filing_date = raw.filing_date
+    report_date = raw.report_date
+    company_name = raw.company_name
+    ticker_aliases = list(raw.ticker_aliases)
+    overwrite = raw.overwrite
     normalized = normalize_ticker(ticker)
     if normalized.market != "US":
         raise ValueError(f"SecPipeline 仅支持 US，当前 market={normalized.market}")
     normalized_ticker = normalized.canonical
     normalized_company_id = build_upload_company_id(normalized_ticker)
-    file_list = files or []
-    normalized_fiscal_period = str(fiscal_period or "").strip().upper() or None
-    stable_document_id, stable_internal_document_id = build_material_ids(
-        form_type=form_type,
-        material_name=material_name,
-        fiscal_year=fiscal_year,
-        fiscal_period=normalized_fiscal_period,
-    )
-    resolved_document_id, resolved_internal_id = validate_material_upload_ids(
-        stable_document_id=stable_document_id,
-        stable_internal_document_id=stable_internal_document_id,
-        document_id=document_id,
-        internal_document_id=internal_document_id,
-    )
-    requested_action = str(action or "").strip().lower() or None
+    file_list = list(request.file_selection.files)
+    normalized_fiscal_period = identity.fiscal_period
+    resolved_document_id = identity.document_id
+    resolved_internal_id = identity.internal_document_id
+    requested_action = request.action_decision.pipeline_action
     normalized_action: str | None = None
     try:
-        selection = (
-            FinsUploadMaterialFiles.for_delete()
-            if requested_action == "delete"
-            else FinsUploadMaterialFiles.from_upsert_paths(tuple(file_list))
-        )
-        previous_meta = host._safe_get_document_meta(
-            normalized_ticker,
-            resolved_document_id,
-            SourceKind.MATERIAL,
-        )
-        normalized_action = resolve_upload_action(action, previous_meta)
+        selection = request.asset_plan
+        previous_meta = request.state_admission.observed_state.source_meta
+        normalized_action = request.state_admission.resolved_action
         yield UploadMaterialEvent(
             event_type=UploadMaterialEventType.UPLOAD_STARTED,
             ticker=normalized_ticker,
@@ -517,23 +486,11 @@ async def run_upload_material_stream(
                 "company_name": company_name,
                 "ticker_aliases": _json_text_list(ticker_aliases),
                 "overwrite": overwrite,
-                "file_count": len(file_list),
+                "file_count": validated_fins_upload_file_count(request),
+                "requested_amended": raw.amended,
             },
         )
-        company_batch = host._batching_repository.begin_batch(normalized_ticker)
-        try:
-            stage_company_meta_for_upload(
-                repository=host._company_repository,
-                ticker=normalized_ticker,
-                action=normalized_action,
-                company_name=company_name,
-                ticker_aliases=ticker_aliases,
-                batch=company_batch,
-            )
-        except BaseException:
-            host._batching_repository.rollback_batch(company_batch)
-            raise
-        host._batching_repository.commit_batch(company_batch)
+        expected_company_meta = execute_material_upload_company_stage(request=request, state_repository=host._material_upload_state_repository, company_repository=host._company_repository, batching_repository=host._batching_repository, cancellation=cancellation_checker)
         prepared_upload = await host._upload_service.prepare_upload(
             ticker=normalized_ticker,
             source_kind=SourceKind.MATERIAL,
@@ -550,22 +507,15 @@ async def run_upload_material_stream(
                 "company_id": normalized_company_id,
                 "ingest_method": FinsIngestMethod.UPLOAD.to_storage_value(),
                 "material_name": material_name,
+                "amended": raw.amended,
                 "fiscal_year": fiscal_year,
                 "fiscal_period": normalized_fiscal_period,
                 "filing_date": filing_date,
                 "report_date": report_date,
             },
         )
-        if isinstance(prepared_upload, UploadOperationResult):
-            upload_result = prepared_upload
-        else:
-            upload_result = commit_prepared_upload_batch(
-                service=host._upload_service,
-                batching_repository=host._batching_repository,
-                batch=host._batching_repository.begin_batch(normalized_ticker),
-                prepared=prepared_upload,
-                cancellation=cancellation_checker,
-            )
+        outcome = execute_prepared_material_publication(request=request, prepared=prepared_upload, expected_company_meta=expected_company_meta, state_repository=host._material_upload_state_repository, batching_repository=host._batching_repository, upload_service=host._upload_service, cancellation=cancellation_checker)
+        upload_result = outcome.result
         for file_event in upload_result.file_events:
             yield UploadMaterialEvent(
                 event_type=_map_upload_file_event_to_material_event_type(file_event),
@@ -591,6 +541,7 @@ async def run_upload_material_stream(
             overwrite=overwrite,
             **upload_result.payload,
             stored_file_count=upload_result.stored_file_count,
+            published_amended=upload_result.published_amended,
             status=_resolve_upload_status(upload_result.status),
         )
         yield UploadMaterialEvent(
@@ -620,6 +571,7 @@ async def run_upload_material_stream(
             company_name=company_name,
             overwrite=overwrite,
             stored_file_count=0,
+            published_amended=None,
             status="failed",
             message=failure_reason.message,
             failure=failure_reason.to_json(),

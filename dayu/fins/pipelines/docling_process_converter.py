@@ -21,14 +21,28 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Final, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Final, Literal, Protocol, cast
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.documents.docling_runtime import (
     DoclingRuntimeInitializationError,
     convert_pdf_bytes_with_docling,
+    convert_xbrl_bytes_with_docling,
+    unload_xbrl_conversion,
 )
+from dayu.documents.xbrl_config import (
+    PreparedXbrlInput, XbrlConfigurationError, XbrlConversionConfig,
+    prepare_xbrl_input, verify_prepared_xbrl_input,
+)
+from dayu.documents.docling_runtime import DOCLING_CONVERTER_CAPABILITY
+from dayu.runtime.macos_sandbox import (
+    MacosSandboxError, apply_macos_sandbox, build_macos_sandbox_profile,
+    inspect_macos_runtime_dependencies,
+)
+
+if TYPE_CHECKING:
+    from docling.datamodel.document import ConversionResult
 from dayu.runtime.interruptible_process import (
     InterruptibleProcessCompleted,
     InterruptibleProcessFailed,
@@ -56,6 +70,34 @@ _MESSAGE_KEY: Final[str] = "message"
 _SHA256_HEX_LENGTH: Final[int] = 64
 _LOWERCASE_HEX_DIGITS: Final[frozenset[str]] = frozenset("0123456789abcdef")
 _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
+
+
+def _xbrl_suffixes() -> tuple[str, ...]:
+    """参数：无；返回：共享候选合同的 XBRL 后缀；异常：合同无格式时抛 ValueError。"""
+    for format in DOCLING_CONVERTER_CAPABILITY.formats:
+        if format.format_id == "XML_XBRL":
+            return format.suffixes
+    raise ValueError("共享转换格式合同缺少 XML_XBRL")
+
+
+def _build_xbrl_sandbox_profile(*, input_root: Path, prepared: PreparedXbrlInput) -> str:
+    """参数：本请求输入与快照；返回：实际运行环境策略；异常：平台/库清单未闭合抛沙箱错误。"""
+    if sys.platform != "darwin":
+        raise MacosSandboxError("XBRL 受控运行尚未在当前平台验收")
+    base = Path(sys.base_prefix)
+    executable = Path(sys.executable)
+    app = base / "Resources/Python.app/Contents/MacOS/Python"
+    if not app.is_file():
+        raise MacosSandboxError("实际 Python.app 可执行文件缺失")
+    dependencies = inspect_macos_runtime_dependencies(executable, base)
+    libraries = tuple(sorted({path for dependency in dependencies for path in (dependency.declared_path.parent, dependency.resolved_path.parent)}))
+    files = tuple(path for dependency in dependencies for path in (dependency.declared_path, dependency.resolved_path))
+    return build_macos_sandbox_profile(
+        readonly_roots=(*libraries, Path(sys.prefix), base, Path("/usr/lib"), Path("/System/Library/Frameworks"), input_root, prepared.taxonomy_snapshot_root),
+        readonly_files=(*files, Path("/dev/null"), Path("/dev/urandom"), Path("/dev/random")),
+        writable_root=prepared.writable_root,
+        executable_files=(executable, app), allow_existing_posix_semaphores=True,
+    )
 
 
 @contextmanager
@@ -260,12 +302,16 @@ class _DoclingProcessTarget:
     :param output_path: 父进程独占临时输出文件。
     :param stream_name: Docling 业务可读输入名。
     :param config: 闭合转换配置。
+    :param xbrl_input: XML_XBRL 请求的可信独占快照；其它格式为 None。
+    :param sandbox_profile: 父侧生成的完整强制策略；其它格式为 None。
     """
 
     input_path: str
     output_path: str
     stream_name: str
     config: DoclingConversionConfig
+    xbrl_input: PreparedXbrlInput | None
+    sandbox_profile: str | None
 
     def __call__(self) -> JsonValue:
         """执行 Docling 并返回闭合小型 descriptor。
@@ -274,35 +320,52 @@ class _DoclingProcessTarget:
         :raises Exception: descriptor queue 传输等目标外故障可由 runtime 捕获。
         """
 
-        try:
-            input_bytes = Path(self.input_path).read_bytes()
-            with _isolated_inherited_stderr():
-                conversion = convert_pdf_bytes_with_docling(
-                    input_bytes,
-                    stream_name=self.stream_name,
-                    do_ocr=self.config.do_ocr,
-                    do_table_structure=self.config.do_table_structure,
-                    table_mode=self.config.table_mode,
-                    do_cell_matching=self.config.do_cell_matching,
-                )
-        except DoclingRuntimeInitializationError:
-            return _failure_descriptor(DoclingConversionFailureKind.CONVERTER_CONSTRUCTION)
-        except Exception:
-            return _failure_descriptor(DoclingConversionFailureKind.CONVERTER_EXECUTION)
+        if self.xbrl_input is not None:
+            try:
+                if self.sandbox_profile is None:
+                    raise XbrlConfigurationError("XBRL 强制策略缺失")
+                os.chdir(self.xbrl_input.writable_root)
+                # 临时文件、Arelle 用户配置和模型 cache 都只能进入本请求 work。
+                os.environ["TMPDIR"] = str(self.xbrl_input.writable_root)
+                os.environ["XDG_CONFIG_HOME"] = str(self.xbrl_input.writable_root)
+                os.environ["XDG_CACHE_HOME"] = str(self.xbrl_input.writable_root)
+                tempfile.tempdir = str(self.xbrl_input.writable_root)
+                apply_macos_sandbox(self.sandbox_profile)
+                verify_prepared_xbrl_input(self.xbrl_input)
+            except (XbrlConfigurationError, MacosSandboxError, OSError):
+                return _failure_descriptor(DoclingConversionFailureKind.CONVERTER_CONSTRUCTION)
 
+        conversion: ConversionResult | None = None
         try:
-            exported = cast(JsonValue, conversion.document.export_to_dict())
-            if not isinstance(exported, Mapping) or not _is_closed_json_value(exported):
-                raise ValueError("Docling export is not a closed JSON mapping")
-            output_bytes = json.dumps(
-                exported,
-                ensure_ascii=False,
-                indent=2,
-            ).encode("utf-8")
-            Path(self.output_path).write_bytes(output_bytes)
-        except Exception:
-            return _failure_descriptor(DoclingConversionFailureKind.RESULT_SERIALIZATION)
-        return _success_descriptor(output_bytes)
+            try:
+                input_bytes = Path(self.input_path).read_bytes()
+                with _isolated_inherited_stderr():
+                    if self.xbrl_input is not None:
+                        conversion = convert_xbrl_bytes_with_docling(input_bytes, stream_name=self.stream_name, xbrl_input=self.xbrl_input)
+                    else:
+                        conversion = convert_pdf_bytes_with_docling(
+                            input_bytes, stream_name=self.stream_name,
+                            do_ocr=self.config.do_ocr, do_table_structure=self.config.do_table_structure,
+                            table_mode=self.config.table_mode, do_cell_matching=self.config.do_cell_matching,
+                        )
+            except DoclingRuntimeInitializationError:
+                return _failure_descriptor(DoclingConversionFailureKind.CONVERTER_CONSTRUCTION)
+            except Exception:
+                return _failure_descriptor(DoclingConversionFailureKind.CONVERTER_EXECUTION)
+            if self.xbrl_input is not None and (conversion.status.value != "success" or conversion.errors):
+                return _failure_descriptor(DoclingConversionFailureKind.CONVERTER_EXECUTION)
+            try:
+                exported = cast(JsonValue, conversion.document.export_to_dict())
+                if not isinstance(exported, Mapping) or not _is_closed_json_value(exported):
+                    raise ValueError("Docling export is not a closed JSON mapping")
+                output_bytes = json.dumps(exported, ensure_ascii=False, indent=2).encode("utf-8")
+                Path(self.output_path).write_bytes(output_bytes)
+            except Exception:
+                return _failure_descriptor(DoclingConversionFailureKind.RESULT_SERIALIZATION)
+            return _success_descriptor(output_bytes)
+        finally:
+            if self.xbrl_input is not None and conversion is not None:
+                unload_xbrl_conversion(conversion)
 
 
 @dataclass(frozen=True, slots=True)
@@ -374,6 +437,10 @@ class _CleanupOutcome(Enum):
 class ProcessDoclingConverter:
     """基于公共 interruptible process primitive 的共享转换器。"""
 
+    def __init__(self, *, xbrl_config: XbrlConversionConfig | None) -> None:
+        """参数：管理员配置或显式未配置；返回：无；异常：本构造不抛出异常。"""
+        self._xbrl_config = xbrl_config
+
     async def convert_to_json_bytes(
         self,
         input_bytes: bytes,
@@ -408,12 +475,28 @@ class ProcessDoclingConverter:
         result: DoclingConversionResult | None = None
         child_pid: int | None = None
         child_pgid: int | None = None
+        xbrl_input: PreparedXbrlInput | None = None
+        sandbox_profile: str | None = None
+        output_path: Path | None = None
+        is_xbrl = Path(stream_name).suffix.lower() in _xbrl_suffixes()
 
         try:
-            temp_root = Path(tempfile.mkdtemp(prefix=_DOCLING_TEMP_PREFIX))
-            input_path = temp_root / _DOCLING_INPUT_FILE_NAME
-            output_path = temp_root / _DOCLING_OUTPUT_FILE_NAME
+            temp_root = Path(tempfile.mkdtemp(prefix=_DOCLING_TEMP_PREFIX)).resolve(strict=True)
+            input_root = temp_root / "input"
+            input_root.mkdir(mode=0o700)
+            input_path = input_root / _DOCLING_INPUT_FILE_NAME
+            if is_xbrl:
+                if self._xbrl_config is None:
+                    raise XbrlConfigurationError("XBRL 尚未配置管理员输入")
+                xbrl_input = prepare_xbrl_input(self._xbrl_config, snapshot_root=temp_root / "taxonomy", writable_root=temp_root / "work", stream_name=stream_name)
+                sandbox_profile = _build_xbrl_sandbox_profile(input_root=input_root, prepared=xbrl_input)
+                output_path = xbrl_input.writable_root / _DOCLING_OUTPUT_FILE_NAME
+            else:
+                output_path = temp_root / _DOCLING_OUTPUT_FILE_NAME
             input_path.write_bytes(input_bytes)
+            input_path.chmod(0o400)
+        except (XbrlConfigurationError, MacosSandboxError) as exc:
+            primary_error = _public_error(DoclingConversionFailureKind.CONVERTER_CONSTRUCTION, exit_code=None, cause=exc)
         except Exception as exc:
             primary_error = _public_error(
                 DoclingConversionFailureKind.IPC_PROTOCOL,
@@ -428,6 +511,8 @@ class ProcessDoclingConverter:
                         output_path=str(output_path),
                         stream_name=stream_name,
                         config=config,
+                        xbrl_input=xbrl_input,
+                        sandbox_profile=sandbox_profile,
                     )
                 )
                 handle.start()
@@ -475,8 +560,9 @@ class ProcessDoclingConverter:
             if not wait_outcome.request_cancelled:
                 try:
                     assert temp_root is not None
+                    assert output_path is not None
                     result = _read_terminal_result(
-                        output_path=temp_root / _DOCLING_OUTPUT_FILE_NAME,
+                        output_path=output_path,
                         wait_result=wait_outcome.wait_result,
                     )
                 except DoclingConversionError as exc:

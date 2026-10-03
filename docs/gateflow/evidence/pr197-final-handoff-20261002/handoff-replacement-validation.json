@@ -1,0 +1,11 @@
+{
+  "handoff_path": "docs/upload_material_repair_handoff_prompt_3.md",
+  "handoff_sha256": "e1f48a1c31b0e27c98d728c25f1400476689d83f9693a04ae339e011d19e47db",
+  "no_placeholders": true,
+  "old_prompt_inverse_hash_match": true,
+  "7_prepared_original_sha_match": true,
+  "source_unchanged_after_review": true,
+  "source_checkpoint": "3d0d390206739a8bb255dee517b5b61bfc4497b6",
+  "next": "new agent G1 formal plan",
+  "current_run_stops_after_final_docs_push": true
+}

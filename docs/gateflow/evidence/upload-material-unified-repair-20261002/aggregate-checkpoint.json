@@ -1,0 +1,15 @@
+{
+  "accepted_deepreview_commit": "44c1892e7361dba799154fc01b2a4dfe43407e75",
+  "parent": "ec54351e58e66cd5d00b009c862589b109064ade",
+  "branch": "codex/upload-material-oracle",
+  "committed_items": 24,
+  "commit_actual_exit": 0,
+  "tracked_untracked_status_after_commit": "clean",
+  "exact_index_and_commit_sha_verified": true,
+  "cached_diffcheck_exit": 0,
+  "whole_pr_postcommit_diffcheck_exit": 0,
+  "main": "fac32ecbff9bfe792b63ee9667c8697826b631f4",
+  "next_gate": "ready-to-open-draft-PR then ordinary push and PR review",
+  "pr_number": 197,
+  "merge": "user only"
+}

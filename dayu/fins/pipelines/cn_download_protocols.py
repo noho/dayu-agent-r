@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from collections.abc import Callable
 from typing import Optional, Protocol
 
@@ -28,6 +29,7 @@ from dayu.fins.pipelines.cn_download_pdf_gate import CnDownloadPdfGateProtocol
 from dayu.fins.pipelines.cn_download_models import (
     CnCompanyProfile,
     CnReportCandidate,
+    CnReportDiscoveryResult,
     CnReportQuery,
     DownloadedReportAsset,
 )
@@ -82,22 +84,25 @@ class CnReportDiscoveryClientProtocol(Protocol):
         query: CnReportQuery,
         profile: CnCompanyProfile,
         *,
+        local_annual_ends: tuple[date, ...],
         cancellation_checkpoint: Callable[[], None] | None = None,
-    ) -> tuple[CnReportCandidate, ...]:
+    ) -> CnReportDiscoveryResult:
         """列出符合 ``discovery_periods`` 与窗口约束的候选报告。
 
         实现层负责按白/黑名单与类别过滤、按 fiscal_period 去重；多版本仅保留
-        最新有效全文，amended 优先。HK 季度报告查无返回空 tuple，**不**抛
-        异常。
+        最新有效全文，amended 优先。查无时确定候选和未知报告均为空，
+        不将已发现但财期不确定的 HK 报告写成查无。
 
         Args:
             query: 单次 download 的查询参数。
             profile: ``resolve_company`` 返回的公司元数据。
+            local_annual_ends: 同公司可信本地年度截止日；CN 必须为空。
             cancellation_checkpoint: 可选 workflow-owned 无参取消检查点；
                 provider 只在真实 discovery I/O 边界调用并原样传播异常。
 
         Returns:
-            候选报告 tuple；候选已经按 fiscal_period 收敛、amended 优先。
+            完整发现结果；确定候选已按 fiscal_period 收敛、amended 优先，
+            未知报告独立保留，CN 显式产生空未知集合。
 
         Raises:
             ValueError: 查询参数或 profile 与当前 provider 不匹配时抛出。

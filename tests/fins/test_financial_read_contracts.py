@@ -1999,6 +1999,7 @@ def test_real_sec_processor_reads_and_projects_aapl_fixture() -> None:
         media_type="text/html",
     )
     assert SecProcessor.supports(source, form_type="10-K", media_type="text/html")
+    assert SecProcessor.supports(source, form_type="F-1", media_type="text/html")
     assert not SecProcessor.supports(source, form_type="6-K", media_type="text/html")
     assert not SecProcessor.supports(source, form_type=None, media_type="text/html")
 

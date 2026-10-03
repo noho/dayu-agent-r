@@ -276,3 +276,8 @@ def _failure_title_for_operation(operation_kind: FinsOperationKind) -> str:
     if operation_kind is FinsOperationKind.PROCESS_MATERIAL:
         return _DIRECT_PREPROCESS_FAILURE_TITLE
     assert_never(operation_kind)
+
+
+def direct_download_uncertain_period_message() -> str:
+    """参数无；返回全请求存在未确认财期的固定说明；异常无。"""
+    return "已发现财期未确认的报告；已确认报告的处理结果保留，请补齐可信年度截止日资料后重试。"

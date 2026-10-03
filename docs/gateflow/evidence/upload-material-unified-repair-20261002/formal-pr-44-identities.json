@@ -1,0 +1,23 @@
+{
+  "head": "44c1892e7361dba799154fc01b2a4dfe43407e75",
+  "base": "fac32ecbff9bfe792b63ee9667c8697826b631f4",
+  "compare_url": "repos/noho/dayu-agent-r/compare/fac32ecbff9bfe792b63ee9667c8697826b631f4...44c1892e7361dba799154fc01b2a4dfe43407e75",
+  "github_diff_sha256": "3a3fda4b69a6bf2e024f965917f041179bbe395bd64f7522712dd3b77496d7e0",
+  "local_diff_sha256": "64bbee039abeab2fd62f28172756b506c1a56854d6933e6d92ef8c02c2b2a009",
+  "github_bytes": 18525105,
+  "local_bytes": 18531790,
+  "push_outer_exit": 0,
+  "pr_body_server_readback": true,
+  "normalized_equal": true,
+  "normalized_sha256": "6ab668723b8a77baa512987290da69df61655de1758994a888a8f5ce56f66b25",
+  "total_paths": 1059,
+  "counts": {
+    "configuration-readme": 14,
+    "source": 74,
+    "historical-governance-content-excluded": 875,
+    "tests": 58,
+    "historical-fixture-evidence": 26,
+    "utils": 12
+  },
+  "setup_recovery": "Initial naive delimiter split matched diff text inside historical evidence; no agent started. Anchored line headers restored exact full path set."
+}

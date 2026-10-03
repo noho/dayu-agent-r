@@ -24,6 +24,8 @@ DEFAULT_FORMS_US: list[str] = ["10-K", "20-F", "10-Q", "6-K", "8-K", "DEF 14A", 
 LOOKBACK_YEARS_BY_FORM: dict[str, int] = {
     "10-K": 5,
     "20-F": 5,
+    "F-1": 5,
+    "F-1/A": 5,
     "10-Q": 2,
     "6-K": 2,
     "DEF 14A": 3,

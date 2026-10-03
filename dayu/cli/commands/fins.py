@@ -36,15 +36,19 @@ from dayu.cli.exit_codes import (
     EXIT_USAGE_ERROR,
 )
 from dayu.cli.output import (
+    CLI_LOG_LOCATION_HINT,
     render_cli_error,
     render_fins_direct_cancel_requested,
     render_fins_direct_event,
 )
 from dayu.cli.upload_script import (
+    UploadScriptPublishError,
     current_upload_script_platform,
     publish_upload_script,
     render_upload_script,
 )
+from dayu.fins.service_runtime import prevalidate_fins_upload_material_request_for_workspace
+from dayu.cli.workspace_root import resolve_workspace_root
 from dayu.fins.direct_events import (
     FinsDirectStreamProtocolError,
     FinsEvent,
@@ -54,11 +58,15 @@ from dayu.fins.direct_events import (
 from dayu.fins.direct_events import ValidatedFinsEventStream
 from dayu.fins.download_contract import FinsDownloadRequest, FinsDownloadUsageError
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.upload_asset_plan import normalize_upload_asset_path
 from dayu.fins.ingestion_runtime import (
     FinsUploadFilingRequest,
-    FinsUploadUsageError,
+    FinsUploadMaterialRequest,
+    ValidatedFinsUploadMaterialRequest,
+    validate_fins_upload_material_action_files,
     ValidatedFinsUploadFilingRequest,
 )
+from dayu.fins.upload_usage_contract import FinsUploadUsageError
 from dayu.fins.upload_failure import FinsUploadPrevalidationError
 from dayu.fins.domain.filing_semantics import FiscalPeriod
 from dayu.fins.resolver import FmpCompanyInfoResolver
@@ -78,7 +86,6 @@ from dayu.fins.upload_batch import (
 )
 from dayu.fins.upload_format_contract import (
     FinsUploadFormatError,
-    FinsUploadMaterialFiles,
 )
 from dayu.service.fins_direct import (
     FinsDirectCommandService,
@@ -100,7 +107,6 @@ _FINS_DIAGNOSTIC_TEXT_MAX_CHARS: Final[int] = 120
 _FINS_DIAGNOSTIC_DETAIL_MAX_ITEMS: Final[int] = 4
 _FINS_DIAGNOSTIC_TRUNCATED_SUFFIX: Final[str] = "..."
 _FINS_DIRECT_DEBUG_BASE_PART_COUNT: Final[int] = 2
-_FINS_DIRECT_UNKNOWN_FAILURE_MESSAGE: Final[str] = "命令执行失败，请使用 --log-file PATH 重试并查看日志"
 _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
 
@@ -201,20 +207,26 @@ def run_fins_direct_command(args: ParsedCliArgs) -> int:
         render_cli_error(f"dayu-cli {args.command_name}: {exc}")
         return EXIT_USAGE_ERROR
     except FinsUploadPrevalidationError as exc:
-        _LOGGER.exception("upload_filing prevalidation operational failure")
-        render_cli_error(f"dayu-cli upload_filing: {exc.failure.message}")
+        _LOGGER.exception("%s prevalidation operational failure", args.command_name)
+        render_cli_error(f"dayu-cli {args.command_name}: {exc.failure.message}")
         return EXIT_FAILURE
     except FinsDirectStreamProtocolError as exc:
         render_cli_error(f"dayu-cli {args.command_name}: {exc.message}")
         return EXIT_FAILURE
+    except UploadScriptPublishError as exc:
+        render_cli_error(f"dayu-cli {args.command_name}: {exc}")
+        return EXIT_FAILURE
     except KeyboardInterrupt:
         return EXIT_KEYBOARD_INTERRUPT
-    except Exception:
-        _LOGGER.exception(
-            "Fins direct command failed; command=%s",
-            args.command_name,
-        )
-        render_cli_error(f"dayu-cli {args.command_name}: {_FINS_DIRECT_UNKNOWN_FAILURE_MESSAGE}")
+    except Exception as exc:
+        if args.command_name == COMMAND_DOWNLOAD:
+            _LOGGER.error(
+                "fins.download.command_unexpected_failure %s",
+                runtime_log.safe_exception_trace(exc, source_root=Path(__file__).parent.parent.parent),
+            )
+        else:
+            _LOGGER.exception("Fins direct command failed; command=%s", args.command_name)
+        render_cli_error(f"dayu-cli {args.command_name}: 命令执行失败，{CLI_LOG_LOCATION_HINT}")
         return EXIT_FAILURE
 
 
@@ -235,11 +247,12 @@ async def _run_fins_direct_command_async(args: ParsedCliArgs) -> int:
     if args.command_name == COMMAND_UPLOAD_FILINGS_FROM:
         return _run_upload_filings_from(args)
     download_request = _prevalidate_download_request(args)
-    workspace_root = _resolve_workspace_root(args.workspace_root)
+    workspace_root = resolve_workspace_root(args.workspace_root, error_factory=CliFinsUsageError)
     upload_filing_request = _prevalidate_upload_filing_request(
         args,
         workspace_root=workspace_root,
     )
+    upload_material_request = _prevalidate_upload_material_request(args)
     service = FINS_DIRECT_SERVICE_FACTORY(workspace_root)
     cancellation_token = _CliFinsCancellationToken()
     stream = _open_direct_stream(
@@ -248,6 +261,7 @@ async def _run_fins_direct_command_async(args: ParsedCliArgs) -> int:
         cancellation_token=cancellation_token,
         download_request=download_request,
         upload_filing_request=upload_filing_request,
+        upload_material_request=upload_material_request,
     )
     try:
         runtime_log.log_verbose(
@@ -299,6 +313,7 @@ def _run_upload_filings_from(args: ParsedCliArgs) -> int:
     :raises UploadBatchPlanUsageError: Fins batch helper 判断输入非法时抛出。
     :raises UploadBatchPlanEmptyError: 源目录无可识别文件时抛出。
     :raises RuntimeError: FMP 结果与用户 canonical ticker 冲突时抛出。
+    :raises UploadScriptPublishError: 脚本发布违反 containment/symlink/target-type contract 时抛出。
     :raises OSError: 脚本发布失败时由底层抛出。
     """
 
@@ -325,7 +340,7 @@ def _run_upload_filings_from(args: ParsedCliArgs) -> int:
         if company_name is None:
             company_name = resolved_info.company_name
     material_form = _single_batch_material_form(args.material_forms)
-    workspace_root = _resolve_workspace_root(args.workspace_root)
+    workspace_root = resolve_workspace_root(args.workspace_root, error_factory=CliFinsUsageError)
     source_dir = Path(args.source_dir)
     plan = generate_upload_batch_plan(
         UploadBatchPlanRequest(
@@ -455,7 +470,7 @@ def _upload_batch_regeneration_argv(
     :param ticker: 已规范化的用户 ticker CSV。
     :param source_dir: 用户 source directory。
     :param explicit_company_name: 用户显式 company name，不含 FMP 推断值。
-    :param material_form: 已规范化单一 material form 候选。
+    :param material_form: 保留原文的单一 material form 候选。
     :returns: 可安全写入注释的 argv。
     :raises Exception: 不主动抛出异常。
     """
@@ -532,6 +547,7 @@ def _open_direct_stream(
     cancellation_token: _CliFinsCancellationToken,
     download_request: FinsDownloadRequest | None,
     upload_filing_request: ValidatedFinsUploadFilingRequest | None,
+    upload_material_request: ValidatedFinsUploadMaterialRequest | None,
 ) -> ValidatedFinsEventStream:
     """按命令名打开 direct event stream。
 
@@ -562,8 +578,10 @@ def _open_direct_stream(
             cancellation_token=cancellation_token,
         )
     if args.command_name == COMMAND_UPLOAD_MATERIAL:
+        if upload_material_request is None:
+            raise AssertionError("upload_material command 缺少预校验请求")
         return _upload_material_stream(
-            args=args,
+            request=upload_material_request,
             service=service,
             cancellation_token=cancellation_token,
         )
@@ -679,11 +697,8 @@ def _prevalidate_upload_filing_request(
     request = FinsUploadFilingRequest(
         ticker=raw_ticker,
         action=args.action,
-        files=tuple(Path(raw_file).expanduser().resolve(strict=False) for raw_file in (args.files or ())),
-        primary_selectors=tuple(
-            Path(raw_selector).expanduser().resolve(strict=False)
-            for raw_selector in (args.primary or ())
-        ),
+        files=tuple(Path(raw_file) for raw_file in (args.files or ())),
+        primary_selectors=tuple(Path(raw_selector) for raw_selector in (args.primary or ())),
         fiscal_year=args.fiscal_year,
         fiscal_period=_optional_stripped_text(args.fiscal_period),
         amended=args.amended,
@@ -701,40 +716,25 @@ def _prevalidate_upload_filing_request(
 
 def _upload_material_stream(
     *,
-    args: ParsedCliArgs,
+    request: ValidatedFinsUploadMaterialRequest,
     service: FinsDirectCommandService,
     cancellation_token: _CliFinsCancellationToken,
 ) -> ValidatedFinsEventStream:
-    """打开 upload_material direct stream。
+    """用同一次 Fins 准入 handoff 打开 material direct stream。
 
-    :param args: argparse 已解析的 upload_material 参数。
-    :param service: Fins direct Service helper。
-    :param cancellation_token: 当前 operation 的取消 token。
-    :returns: Fins owner 已验证的 direct 事件流。
-    :raises CliFinsUsageError: ticker、forms 或文件路径非法时抛出。
-    :raises FinsUploadFormatError: 任一文件不具备 converter-required 格式时抛出。
+    Args:
+        request: CLI 已准入的 material handoff。
+        service: Fins direct Service helper。
+        cancellation_token: 当前 operation 的取消 token。
+
+    Returns:
+        Fins owner 已验证的 direct 事件流。
+
+    Raises:
+        Exception: Service 或 runtime 打开 stream 失败时透传。
     """
 
-    ticker = _parse_ticker_csv(args.ticker)
-    form_type = _single_optional_form(args.forms)
-    return service.upload_material(
-        ticker=ticker.canonical_ticker,
-        action=args.action,
-        files=_validated_upload_files(args.files).files,
-        form_type=form_type,
-        material_name=_optional_stripped_text(args.material_name),
-        document_id=_optional_stripped_text(_single_document_id(args.document_id)),
-        internal_document_id=_optional_stripped_text(args.internal_document_id),
-        fiscal_year=args.fiscal_year,
-        fiscal_period=_optional_stripped_text(args.fiscal_period),
-        amended=args.amended,
-        filing_date=_optional_stripped_text(args.filing_date),
-        report_date=_optional_stripped_text(args.report_date),
-        company_name=_optional_stripped_text(args.company_name),
-        ticker_aliases=ticker.accepted_aliases,
-        overwrite=args.overwrite,
-        cancellation_token=cancellation_token,
-    )
+    return service.upload_material(request, cancellation_token=cancellation_token)
 
 
 def _process_stream(
@@ -1088,19 +1088,6 @@ def _bounded_diagnostic_text(value: str) -> str:
     )
 
 
-def _resolve_workspace_root(raw_value: str) -> Path:
-    """解析 CLI workspace root。
-
-    :param raw_value: ``--base`` / ``--workspace`` 原始值。
-    :returns: 解析后的绝对路径。
-    :raises CliFinsUsageError: 路径为空时抛出。
-    """
-
-    if raw_value.strip() == "":
-        raise CliFinsUsageError(f"{_BASE_OPTION} must not be empty")
-    return Path(raw_value).expanduser().resolve(strict=False)
-
-
 def _parse_ticker_csv(raw_value: str | None) -> CompanyTickerIdentity:
     """解析 ticker CSV 为 canonical ticker 与 aliases。
 
@@ -1120,26 +1107,68 @@ def _parse_ticker_csv(raw_value: str | None) -> CompanyTickerIdentity:
         raise CliFinsUsageError(str(exc)) from exc
 
 
-def _validated_upload_files(raw_files: list[str] | None) -> FinsUploadMaterialFiles:
-    """校验并解析 material upload 文件路径与转换格式。
+def _prevalidated_upload_paths(paths: tuple[Path, ...]) -> None:
+    """在 material 准入后保留 CLI 既有逐路径存在性校验与文案。
 
-    :param raw_files: CLI 收到的 ``--files`` 值。
-    :returns: Fins owner 产生的 material typed selection。
-    :raises CliFinsUsageError: 文件不存在或不是普通文件时抛出。
-    :raises FinsUploadFormatError: 任一文件不具备 converter-required 格式时抛出。
+    Args:
+        paths: 唯一资产规划 owner 已解析的路径。
+
+    Returns:
+        无。
+
+    Raises:
+        CliFinsUsageError: 文件不存在或不是普通文件时抛出。
     """
 
-    if raw_files is None:
-        return FinsUploadMaterialFiles.for_delete()
-    paths: list[Path] = []
-    for raw_file in raw_files:
-        path = Path(raw_file).expanduser().resolve(strict=False)
+    for path in paths:
         if not path.exists():
             raise CliFinsUsageError(_MISSING_UPLOAD_FILE_TEMPLATE.format(path=path))
         if not path.is_file():
             raise CliFinsUsageError(_UPLOAD_PATH_NOT_FILE_TEMPLATE.format(path=path))
-        paths.append(path)
-    return FinsUploadMaterialFiles.from_upsert_paths(tuple(paths))
+
+
+def _prevalidate_upload_material_request(
+    args: ParsedCliArgs,
+) -> ValidatedFinsUploadMaterialRequest | None:
+    """在 Service factory 前构造并准入 material request。
+
+    Args:
+        args: argparse 已解析的 direct command 参数。
+
+    Returns:
+        material 命令的不可变 handoff；其它命令返回 None。
+
+    Raises:
+        CliFinsUsageError: CLI 路径或参数非法时抛出。
+        FinsUploadUsageError: 资产数量或身份规划失败时抛出。
+        FinsUploadFormatError: 文件格式不受支持时抛出。
+    """
+
+    if args.command_name != COMMAND_UPLOAD_MATERIAL:
+        return None
+    raw_files = tuple(Path(raw_file) for raw_file in args.files or ())
+    validate_fins_upload_material_action_files(args.action, raw_files)
+    ticker = _parse_ticker_csv(args.ticker)
+    request = FinsUploadMaterialRequest(
+        ticker=ticker.canonical_ticker,
+        action=args.action,
+        files=raw_files,
+        form_type=_single_optional_form(args.forms),
+        material_name=args.material_name,
+        document_id=_optional_stripped_text(_single_document_id(args.document_id)),
+        primary_selectors=tuple(Path(raw_selector) for raw_selector in args.primary or ()),
+        fiscal_year=args.fiscal_year,
+        fiscal_period=_optional_stripped_text(args.fiscal_period),
+        amended=args.amended,
+        filing_date=_optional_material_date_text(args.filing_date),
+        report_date=_optional_material_date_text(args.report_date),
+        company_name=_optional_stripped_text(args.company_name),
+        ticker_aliases=ticker.accepted_aliases,
+        overwrite=args.overwrite,
+    )
+    validated = prevalidate_fins_upload_material_request_for_workspace(request, workspace_root=resolve_workspace_root(args.workspace_root, error_factory=CliFinsUsageError))
+    _prevalidated_upload_paths(validated.file_selection.files)
+    return validated
 
 
 def _normalized_text_tuple(
@@ -1177,6 +1206,8 @@ def _single_optional_form(values: list[str] | None) -> str | None:
     :raises CliFinsUsageError: 传入多个 form 时抛出。
     """
 
+    if values is not None and len(values) == 1 and "," not in values[0]:
+        return values[0]
     normalized = _normalized_text_tuple(values, field_name="--forms")
     if len(normalized) > 1:
         raise CliFinsUsageError(_MULTIPLE_MATERIAL_FORMS_MESSAGE)
@@ -1191,16 +1222,18 @@ def _single_batch_material_form(
     """读取 batch 可选单一 material form override。
 
     :param values: ``--material-forms`` 输入。
-    :returns: 规范化的单一 material form 候选；未传入时返回 ``None``。
-    :raises CliFinsUsageError: 传入多个 form 时抛出。
+    :returns: 保留原文的单一 material form 候选；未传入时返回 ``None``，规范化由身份 owner 完成。
+    :raises CliFinsUsageError: 任一逗号分隔项为空或纯空白，或传入多个 form 时抛出。
     """
 
-    normalized = _normalized_text_tuple(values, field_name="--material-forms")
-    if len(normalized) > 1:
-        raise CliFinsUsageError(_MULTIPLE_BATCH_MATERIAL_FORMS_MESSAGE)
-    if not normalized:
+    if values is None:
         return None
-    return normalized[0].upper()
+    raw_items = tuple(item for value in values for item in value.split(","))
+    if any(not item.strip() for item in raw_items):
+        raise CliFinsUsageError("--material-forms must not contain empty item")
+    if len(raw_items) > 1:
+        raise CliFinsUsageError(_MULTIPLE_BATCH_MATERIAL_FORMS_MESSAGE)
+    return next(iter(raw_items))
 
 
 def _document_ids_from_arg(raw_value: str | list[str] | None) -> tuple[str, ...]:
@@ -1269,6 +1302,19 @@ def _optional_stripped_text(value: str | None) -> str | None:
     if stripped == "":
         return None
     return stripped
+
+
+def _optional_material_date_text(value: str | None) -> str | None:
+    """保留 material 日期原文，仅投影 CLI 已有的空值行为。
+
+    :param value: argparse 读取的原始日期文本。
+    :returns: ``None`` 或空白文本返回 ``None``；非空文本原样返回。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    if value is None or value.strip() == "":
+        return None
+    return value
 
 
 __all__: tuple[str, ...] = (

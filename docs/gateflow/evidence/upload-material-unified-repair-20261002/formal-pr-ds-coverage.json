@@ -1,0 +1,667 @@
+{
+  "outer_exit": 0,
+  "events": 54421,
+  "tools": 228,
+  "results": 228,
+  "actual_models": [
+    "deepseek-flash"
+  ],
+  "system_models": [
+    "deepseek-flash[1m]"
+  ],
+  "canary_match": true,
+  "report_sha_match": true,
+  "claimed_path_set_exact": true,
+  "scope_path_count": 158,
+  "coverage": {
+    "source.diff": {
+      "total_lines": 14446,
+      "matched_lines": 14446,
+      "missing_first30": [],
+      "reads": [
+        {
+          "use_event": 11238,
+          "result_event": 11239,
+          "offset": 1,
+          "limit": 420
+        },
+        {
+          "use_event": 11240,
+          "result_event": 11241,
+          "offset": 421,
+          "limit": 420
+        },
+        {
+          "use_event": 11779,
+          "result_event": 11780,
+          "offset": 841,
+          "limit": 420
+        },
+        {
+          "use_event": 11781,
+          "result_event": 11782,
+          "offset": 1261,
+          "limit": 420
+        },
+        {
+          "use_event": 12578,
+          "result_event": 12579,
+          "offset": 1681,
+          "limit": 420
+        },
+        {
+          "use_event": 12580,
+          "result_event": 12581,
+          "offset": 2101,
+          "limit": 420
+        },
+        {
+          "use_event": 12650,
+          "result_event": 12651,
+          "offset": 2521,
+          "limit": 420
+        },
+        {
+          "use_event": 12652,
+          "result_event": 12653,
+          "offset": 2941,
+          "limit": 420
+        },
+        {
+          "use_event": 13501,
+          "result_event": 13502,
+          "offset": 3361,
+          "limit": 420
+        },
+        {
+          "use_event": 13503,
+          "result_event": 13504,
+          "offset": 3781,
+          "limit": 420
+        },
+        {
+          "use_event": 13612,
+          "result_event": 13613,
+          "offset": 4201,
+          "limit": 420
+        },
+        {
+          "use_event": 13614,
+          "result_event": 13615,
+          "offset": 4621,
+          "limit": 420
+        },
+        {
+          "use_event": 13943,
+          "result_event": 13944,
+          "offset": 5041,
+          "limit": 420
+        },
+        {
+          "use_event": 13945,
+          "result_event": 13946,
+          "offset": 5461,
+          "limit": 420
+        },
+        {
+          "use_event": 13976,
+          "result_event": 13977,
+          "offset": 5881,
+          "limit": 420
+        },
+        {
+          "use_event": 13978,
+          "result_event": 13979,
+          "offset": 6301,
+          "limit": 420
+        },
+        {
+          "use_event": 14054,
+          "result_event": 14055,
+          "offset": 6721,
+          "limit": 420
+        },
+        {
+          "use_event": 14056,
+          "result_event": 14057,
+          "offset": 7141,
+          "limit": 420
+        },
+        {
+          "use_event": 14161,
+          "result_event": 14162,
+          "offset": 7561,
+          "limit": 420
+        },
+        {
+          "use_event": 14163,
+          "result_event": 14164,
+          "offset": 7981,
+          "limit": 420
+        },
+        {
+          "use_event": 14433,
+          "result_event": 14434,
+          "offset": 8401,
+          "limit": 420
+        },
+        {
+          "use_event": 14435,
+          "result_event": 14436,
+          "offset": 8821,
+          "limit": 420
+        },
+        {
+          "use_event": 14486,
+          "result_event": 14487,
+          "offset": 9241,
+          "limit": 420
+        },
+        {
+          "use_event": 14488,
+          "result_event": 14489,
+          "offset": 9661,
+          "limit": 420
+        },
+        {
+          "use_event": 14527,
+          "result_event": 14528,
+          "offset": 10081,
+          "limit": 420
+        },
+        {
+          "use_event": 14529,
+          "result_event": 14530,
+          "offset": 10501,
+          "limit": 420
+        },
+        {
+          "use_event": 14571,
+          "result_event": 14572,
+          "offset": 10921,
+          "limit": 420
+        },
+        {
+          "use_event": 14573,
+          "result_event": 14574,
+          "offset": 11341,
+          "limit": 420
+        },
+        {
+          "use_event": 14611,
+          "result_event": 14612,
+          "offset": 11761,
+          "limit": 420
+        },
+        {
+          "use_event": 14613,
+          "result_event": 14614,
+          "offset": 12181,
+          "limit": 420
+        },
+        {
+          "use_event": 14655,
+          "result_event": 14656,
+          "offset": 12601,
+          "limit": 420
+        },
+        {
+          "use_event": 14657,
+          "result_event": 14658,
+          "offset": 13021,
+          "limit": 420
+        },
+        {
+          "use_event": 14702,
+          "result_event": 14703,
+          "offset": 13441,
+          "limit": 420
+        },
+        {
+          "use_event": 14704,
+          "result_event": 14705,
+          "offset": 13861,
+          "limit": 586
+        }
+      ]
+    },
+    "tests.diff": {
+      "total_lines": 23749,
+      "matched_lines": 23749,
+      "missing_first30": [],
+      "reads": [
+        {
+          "use_event": 28510,
+          "result_event": 28511,
+          "offset": 1,
+          "limit": 430
+        },
+        {
+          "use_event": 28512,
+          "result_event": 28513,
+          "offset": 431,
+          "limit": 430
+        },
+        {
+          "use_event": 28630,
+          "result_event": 28631,
+          "offset": 859,
+          "limit": 432
+        },
+        {
+          "use_event": 28632,
+          "result_event": 28633,
+          "offset": 1291,
+          "limit": 432
+        },
+        {
+          "use_event": 28634,
+          "result_event": 28635,
+          "offset": 1723,
+          "limit": 432
+        },
+        {
+          "use_event": 28749,
+          "result_event": 28750,
+          "offset": 2155,
+          "limit": 432
+        },
+        {
+          "use_event": 28751,
+          "result_event": 28752,
+          "offset": 2587,
+          "limit": 432
+        },
+        {
+          "use_event": 28753,
+          "result_event": 28754,
+          "offset": 3019,
+          "limit": 432
+        },
+        {
+          "use_event": 28801,
+          "result_event": 28802,
+          "offset": 3451,
+          "limit": 432
+        },
+        {
+          "use_event": 28803,
+          "result_event": 28804,
+          "offset": 3883,
+          "limit": 432
+        },
+        {
+          "use_event": 28805,
+          "result_event": 28806,
+          "offset": 4315,
+          "limit": 432
+        },
+        {
+          "use_event": 28835,
+          "result_event": 28836,
+          "offset": 4747,
+          "limit": 432
+        },
+        {
+          "use_event": 28837,
+          "result_event": 28838,
+          "offset": 5179,
+          "limit": 432
+        },
+        {
+          "use_event": 28839,
+          "result_event": 28840,
+          "offset": 5611,
+          "limit": 432
+        },
+        {
+          "use_event": 28879,
+          "result_event": 28880,
+          "offset": 6043,
+          "limit": 432
+        },
+        {
+          "use_event": 28881,
+          "result_event": 28882,
+          "offset": 6475,
+          "limit": 432
+        },
+        {
+          "use_event": 28883,
+          "result_event": 28884,
+          "offset": 6907,
+          "limit": 432
+        },
+        {
+          "use_event": 28913,
+          "result_event": 28914,
+          "offset": 7339,
+          "limit": 432
+        },
+        {
+          "use_event": 28915,
+          "result_event": 28916,
+          "offset": 7771,
+          "limit": 432
+        },
+        {
+          "use_event": 28917,
+          "result_event": 28918,
+          "offset": 8203,
+          "limit": 432
+        },
+        {
+          "use_event": 28947,
+          "result_event": 28948,
+          "offset": 8635,
+          "limit": 432
+        },
+        {
+          "use_event": 28949,
+          "result_event": 28950,
+          "offset": 9067,
+          "limit": 432
+        },
+        {
+          "use_event": 28951,
+          "result_event": 28952,
+          "offset": 9499,
+          "limit": 432
+        },
+        {
+          "use_event": 28981,
+          "result_event": 28982,
+          "offset": 9931,
+          "limit": 432
+        },
+        {
+          "use_event": 28983,
+          "result_event": 28984,
+          "offset": 10363,
+          "limit": 432
+        },
+        {
+          "use_event": 28985,
+          "result_event": 28986,
+          "offset": 10795,
+          "limit": 432
+        },
+        {
+          "use_event": 29015,
+          "result_event": 29016,
+          "offset": 11227,
+          "limit": 432
+        },
+        {
+          "use_event": 29017,
+          "result_event": 29018,
+          "offset": 11659,
+          "limit": 432
+        },
+        {
+          "use_event": 29019,
+          "result_event": 29020,
+          "offset": 12091,
+          "limit": 432
+        },
+        {
+          "use_event": 29057,
+          "result_event": 29058,
+          "offset": 12523,
+          "limit": 432
+        },
+        {
+          "use_event": 29059,
+          "result_event": 29060,
+          "offset": 12955,
+          "limit": 432
+        },
+        {
+          "use_event": 29061,
+          "result_event": 29062,
+          "offset": 13387,
+          "limit": 432
+        },
+        {
+          "use_event": 29091,
+          "result_event": 29092,
+          "offset": 13819,
+          "limit": 432
+        },
+        {
+          "use_event": 29093,
+          "result_event": 29094,
+          "offset": 14251,
+          "limit": 432
+        },
+        {
+          "use_event": 29095,
+          "result_event": 29096,
+          "offset": 14683,
+          "limit": 432
+        },
+        {
+          "use_event": 29316,
+          "result_event": 29317,
+          "offset": 15113,
+          "limit": 432
+        },
+        {
+          "use_event": 29318,
+          "result_event": 29319,
+          "offset": 15545,
+          "limit": 432
+        },
+        {
+          "use_event": 29320,
+          "result_event": 29321,
+          "offset": 15977,
+          "limit": 432
+        },
+        {
+          "use_event": 29345,
+          "result_event": 29346,
+          "offset": 16409,
+          "limit": 432
+        },
+        {
+          "use_event": 29347,
+          "result_event": 29348,
+          "offset": 16841,
+          "limit": 432
+        },
+        {
+          "use_event": 29349,
+          "result_event": 29350,
+          "offset": 17273,
+          "limit": 432
+        },
+        {
+          "use_event": 29374,
+          "result_event": 29375,
+          "offset": 17705,
+          "limit": 432
+        },
+        {
+          "use_event": 29376,
+          "result_event": 29377,
+          "offset": 18137,
+          "limit": 432
+        },
+        {
+          "use_event": 29378,
+          "result_event": 29379,
+          "offset": 18569,
+          "limit": 432
+        },
+        {
+          "use_event": 29403,
+          "result_event": 29404,
+          "offset": 19001,
+          "limit": 432
+        },
+        {
+          "use_event": 29405,
+          "result_event": 29406,
+          "offset": 19433,
+          "limit": 432
+        },
+        {
+          "use_event": 29407,
+          "result_event": 29408,
+          "offset": 19865,
+          "limit": 432
+        },
+        {
+          "use_event": 29507,
+          "result_event": 29508,
+          "offset": 20297,
+          "limit": 432
+        },
+        {
+          "use_event": 29509,
+          "result_event": 29510,
+          "offset": 20729,
+          "limit": 432
+        },
+        {
+          "use_event": 29567,
+          "result_event": 29568,
+          "offset": 21161,
+          "limit": 432
+        },
+        {
+          "use_event": 29569,
+          "result_event": 29570,
+          "offset": 21593,
+          "limit": 432
+        },
+        {
+          "use_event": 29629,
+          "result_event": 29630,
+          "offset": 22025,
+          "limit": 432
+        },
+        {
+          "use_event": 29631,
+          "result_event": 29632,
+          "offset": 22457,
+          "limit": 432
+        },
+        {
+          "use_event": 29657,
+          "result_event": 29658,
+          "offset": 22889,
+          "limit": 432
+        },
+        {
+          "use_event": 29659,
+          "result_event": 29660,
+          "offset": 23321,
+          "limit": 432
+        }
+      ]
+    },
+    "utils.diff": {
+      "total_lines": 2862,
+      "matched_lines": 2862,
+      "missing_first30": [],
+      "reads": [
+        {
+          "use_event": 9756,
+          "result_event": 9757,
+          "offset": 1,
+          "limit": 410
+        },
+        {
+          "use_event": 9758,
+          "result_event": 9759,
+          "offset": 411,
+          "limit": 410
+        },
+        {
+          "use_event": 10053,
+          "result_event": 10054,
+          "offset": 821,
+          "limit": 420
+        },
+        {
+          "use_event": 10055,
+          "result_event": 10056,
+          "offset": 1241,
+          "limit": 420
+        },
+        {
+          "use_event": 10104,
+          "result_event": 10105,
+          "offset": 1661,
+          "limit": 420
+        },
+        {
+          "use_event": 10106,
+          "result_event": 10107,
+          "offset": 2081,
+          "limit": 420
+        },
+        {
+          "use_event": 10120,
+          "result_event": 10121,
+          "offset": 2501,
+          "limit": 362
+        }
+      ]
+    },
+    "configuration-readme.diff": {
+      "total_lines": 904,
+      "matched_lines": 904,
+      "missing_first30": [],
+      "reads": [
+        {
+          "use_event": 8236,
+          "result_event": 8238,
+          "offset": 1,
+          "limit": 330
+        },
+        {
+          "use_event": 8754,
+          "result_event": 8755,
+          "offset": 331,
+          "limit": 330
+        },
+        {
+          "use_event": 9306,
+          "result_event": 9307,
+          "offset": 661,
+          "limit": 244
+        }
+      ]
+    }
+  },
+  "read_content_mismatches": [],
+  "findings": [
+    {
+      "id": "F-1",
+      "file": "utils/ab_ocr_convert.py",
+      "line": "59,70",
+      "severity": "低",
+      "status": "未修复（与总控 UPR-R01 同源，独立确认成立）",
+      "summary": "object 参数 + getattr 消去 DoclingDocument 契约，违反编码硬约束"
+    },
+    {
+      "id": "F-2",
+      "file": "utils/diagnose_semantic_digests.py:65,124; utils/inspect_semantic_digests.py:49,70,92; utils/pptx_docx_smoke.py:267; utils/trace_missing_tokens.py:41",
+      "severity": "低",
+      "status": "未修复（总控登记未完成核对，本次完成全 12 utils AST 扫描给出闭集）",
+      "summary": "裸 dict 注解（无类型参数），同 PR 同族脚本已有 Mapping[str, JsonValue] 先例"
+    }
+  ],
+  "interpretation": "All actual 41961 relevant diff lines byte-matched; blank EOF presentation line excluded. Full 228 tools checked; bounded report inaccuracies handled by root, fixes remain unimplemented.",
+  "presentation_extra_eof_lines": [
+    {
+      "file": "tests.diff",
+      "event": 29659,
+      "line": 23750,
+      "presentation": "blank trailing EOF line"
+    }
+  ]
+}

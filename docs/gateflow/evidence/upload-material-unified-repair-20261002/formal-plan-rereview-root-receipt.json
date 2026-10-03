@@ -1,0 +1,42 @@
+{
+  "gate": "plan re-review",
+  "decision": "pass",
+  "plan_sha256": "c99c35adba919a8baf371b0142e0ab1abf256a951e89b2fc15e8a2d38988e8ea",
+  "frozen_manifest_sha256": "169e06c6b4da6e772ae88f143c080ec7c8089429521ee3f3b5075e644971d9fa",
+  "input_count": 9250,
+  "root_final_input_mismatches": [],
+  "findings": "UP-DS-F1..6/UP-M-F1..3/P0-R09 accepted/fixed, independently re-reviewed",
+  "deferred": [
+    {
+      "id": "UP-RR-T01",
+      "owner": "S3 technical collector",
+      "status": "not fixed",
+      "destination": "actual S3 boundary acceptance before use",
+      "authorization": "existing S3 required evidence contract; no goal or scope change"
+    }
+  ],
+  "reviews": [
+    {
+      "provider": "mimo",
+      "runtime": "claude",
+      "actual_model": "mimo-v2.6-pro[1m]",
+      "artifact": "docs/reviews/plan-review-20261002-194559.md",
+      "sha256": "1a8397925e6dac2024c5a00611d534cdf75c0e98acbeb065ac9430947f73a10d",
+      "outer_exit": 0,
+      "terminal": "success; is_error=false",
+      "canary": "actual tool and final matched",
+      "root_result_status": "accepted"
+    },
+    {
+      "provider": "ds-flash",
+      "runtime": "claude",
+      "actual_model": "deepseek-flash[1m]",
+      "artifact": "docs/reviews/plan-review-20261002-193428.md",
+      "sha256": "ebf3b9aec7d22d39caa527abf8a3b4a4206d4b97023c0da422f57b12fbd68ae0",
+      "outer_exit": 0,
+      "terminal": "success; is_error=false",
+      "canary": "actual tool and final matched",
+      "root_result_status": "accepted"
+    }
+  ]
+}

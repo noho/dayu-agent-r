@@ -1,0 +1,13 @@
+{
+  "classification": "prepared proposals only; no plan acceptance/implementation",
+  "files": {
+    "docs/gateflow/upload-material-g1-consolidated-plan-preparation-20261001.md": "71f6a639a2b76974816999f54b7c553aaf16ef397c34ff986489be761f4f4e05",
+    "docs/gateflow/upload-material-g2-primary-plan-preparation-20261001.md": "26c2d8548d86fd87d62eb29891106e3e364e6219cab02e8f40e6e91e97c95220",
+    "docs/gateflow/upload-material-g3-state-plan-preparation-20261001.md": "686629350dbfeb9b4c785494180220c24475ebe79c7a71a9fa8476b713bae824",
+    "docs/gateflow/upload-material-g4-content-plan-preparation-20261001.md": "fe73edc58b661923b1410d065d591fde67517127d5dc51faa4ad2f21144bc509",
+    "docs/gateflow/upload-material-g5-concurrency-plan-preparation-20261001.md": "19f22757dc64523e64a5dc3c6bd3e1398a7c616402a2c7692f5d6e6db919e46c",
+    "docs/gateflow/upload-material-xbrl-p0-plan-preparation-20261001.md": "2d05a912afb847e43f19c99471027a694291b9e54d3dbfa61734149a579e28c3",
+    "docs/gateflow/upload-material-final-ci-refreshed-preparation-20261001.md": "78d2d7d22bedc5d4ea3c299ede32220bb1e4df3152633f31f4b5ddad7cbffaf9"
+  },
+  "next": "G1正式重绑plan→双路planreview，不重开既有业务裁决"
+}

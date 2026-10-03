@@ -1,0 +1,384 @@
+{
+  "head_before_checkpoint": "a514dea14c0ce66722da034502f3af54a54c3238",
+  "main": "fac32ecbff9bfe792b63ee9667c8697826b631f4",
+  "source_sha256": "e47e6373be4a195e9587b308293891a25df07e8cbbdf9024ab7fbe7f76e748dc",
+  "source_hashes": {
+    "dayu/cli/arg_parsing.py": "9083dc59bb7ec638fb5fcd0ac0658849b213282374f93a063616b4ab2751fcce",
+    "dayu/cli/commands/fins.py": "f2b8f55f35de49f4431790213fd775f65f1876d0afec86d294a9dbae261fbcac",
+    "dayu/cli/upload_script.py": "d19e7aaeb0f503b02c8068e14dd2aa44c6ba04609a5d79e2d4818703f24cd969",
+    "dayu/documents/docling_runtime.py": "2e71f9e690847549c3ca3febaedc0cfd735f6123c03bb85a244907f8637eae98",
+    "dayu/documents/xbrl_config.py": "941de0dbda162318e5c1a249f8df0b7f6ce7a34dca121d65067652166fb20d13",
+    "dayu/fins/domain/company_meta_contract.py": "8ce7c5683e4b30186d1a230ea6c08cff27a475dc7fa9f9adf666d1d6be78b81d",
+    "dayu/fins/domain/document_models.py": "d04206ce9be11aac14b6245915742f2c6a5421176d8c9ad823dc0483d2687f4c",
+    "dayu/fins/ingestion_runtime.py": "a8bdb6b7e2aed7e5f4ea772f6b0157d176159a7ab65cebdaa70ad3c9a895205f",
+    "dayu/fins/pipelines/cn_pipeline.py": "a359c06858b2a3be0bc562e2f51d9058fa30f966d098079d05b2e04727c8dce9",
+    "dayu/fins/pipelines/docling_converter_factory.py": "9602abfcb6476cb7eab53e9988c1f90c533fb36cdc70b52e331210eec4fd9b72",
+    "dayu/fins/pipelines/docling_process_converter.py": "d6b6772e329c66045f634fb4994c76bbcb9ef0130d3fe498b2e7f044ae6cd1b8",
+    "dayu/fins/pipelines/docling_upload_service.py": "2f6efcdda8e00f45f7b0302fb4b1df50068f11d83412a05bb7bf48a089343722",
+    "dayu/fins/pipelines/filing_upload_publication.py": "f31c72b9352ea6aa8de2bbc015c97840608231ec2c72c458fe732ddb458e062d",
+    "dayu/fins/pipelines/material_upload_publication.py": "08fa979cf7843958ea37e9664271758719059cf32409c47a0564eb6728eef0c9",
+    "dayu/fins/pipelines/sec_pipeline.py": "13b59b729214a83635d41677b12df203b702a7c6ee2e8f4cab7af0d343dfafde",
+    "dayu/fins/pipelines/sec_upload_workflow.py": "bd3a8d2ccaccf0b666f8891795534c2a5c317b6216dba94048940c935aa5104e",
+    "dayu/fins/pipelines/upload_company_meta.py": "43b0ce1f57ef750cb92b47bb577e5f6dc45662628f5d9c7c71821400407f85e8",
+    "dayu/fins/service_runtime.py": "7cec10edf79832a6ea7aba8a7f5989acb6710279d194fb235d864683b8bdca3a",
+    "dayu/fins/storage/__init__.py": "92e7560b335dd4daf8808a2fe29141ed39c6a2f0fbdfa9336ffd88ed8393d944",
+    "dayu/fins/storage/_fs_material_upload_state_core.py": "0a9d16ba641c4950cd2e628234316badde45e77bd461d54d168ef295035bef11",
+    "dayu/fins/storage/_fs_source_document_core.py": "4002cc67116cd773dc959e3eb27617289a0e69ed6b210a882480b71b0a0db4f3",
+    "dayu/fins/storage/_fs_source_integrity.py": "a179edfe83fe200a7ed7ab2ad4c975644f8027bde2347fd85352f4415eb045cf",
+    "dayu/fins/storage/_fs_storage_core.py": "897588e86d7e206a9abf5677f27240e395c3d0a08269d614b9b62485e2e1497d",
+    "dayu/fins/storage/_fs_storage_infra.py": "5acf5445ea60f98d33a04f11469cde121fdcc9b5b22fda1b09acec711c47ad37",
+    "dayu/fins/storage/fs_material_upload_state_repository.py": "a5f9978ebc337ee1eb4f36d436e2d0a967667809e8f41476dc6c718cbeb8b591",
+    "dayu/fins/storage/fs_source_document_repository.py": "3443fae747ad326b3f96a325d3c586364369d298684f11dd8d03756565227b51",
+    "dayu/fins/storage/repository_protocols.py": "a65da7e8692898240ce117b16275168590cfb9e2e918389a7b13c6e28ad686b1",
+    "dayu/fins/storage/source_manifest_contract.py": "6aad93fc998b512b120fa69cf2f855facb9c353ad7adbb7343c7290fa6a58216",
+    "dayu/fins/storage/source_meta_contract.py": "c4657260b8c30cf2e799eac84579bfa8c418679a7c2fc206cd505cefc6799855",
+    "dayu/fins/tools/fins_tools.py": "b086c50c17f5abe03dc2274903e496970a0043538bf683aff78523f2c266d63d",
+    "dayu/fins/tools/read_runtime.py": "1b48a88e3ec593c4463559a6e9c4b1d55e30455d77c0a995a62778dbbb90ef53",
+    "dayu/fins/tools/upload_tools.py": "f5ef3dfb66c04479e96d02eeb7ce2781b231804dfdc982bc85998b4f4b0f64a1",
+    "dayu/fins/upload_asset_plan.py": "12698b070b761f5fcf10be56362b4c9c4905befbc2243bc6b1806d8272040da0",
+    "dayu/fins/upload_batch.py": "dd7a4b4f31b083a4f7456ac04fe4c1f2ba6876236863e0cad53ca1e000b0f581",
+    "dayu/fins/upload_failure.py": "9f722aa9156aa107c5b8cc88a72e1c3f668e1540be4f6fcbead1f9c02e24744b",
+    "dayu/fins/upload_format_contract.py": "04ae2b2965d0d3a72b1021ad83f8d385d1beb6a97297edae93db70ca52eb702e",
+    "dayu/fins/upload_usage_contract.py": "fbe84d8d1dd36a3813d4ff965f41f4ff80e82003dc7da701391b81a73d77cb8e",
+    "dayu/runtime/macos_sandbox.py": "0794d0390706941f76d9250a02c7503aaeaaf35a08420fe27dccf5f890dd3a54",
+    "tests/cli/test_fins_commands.py": "238259ec537166919b61db2f3e50e5a00429d6d2091609e7e44a2dd9bc9cbf4f",
+    "tests/cli/test_upload_filings_from_command.py": "d570314fa4bc6dadfbc03ea6e09bf69980e6ee5f7d0f6e71280f04e37db11ec4",
+    "tests/documents/test_docling_runtime.py": "34dcf288689ef6b5b3c2342a8a77d2acfe27ee418c6e35f39119b0fbdc1c2c95",
+    "tests/documents/test_import_boundary.py": "3ca47e87f85f1f8bedf955d53ce4933b114f1049ba290bb362591f3caae6a2dc",
+    "tests/documents/test_xbrl_config.py": "d46a8ef2f2038612bdfee019ddb4e2b8a6115bfe2e5b27fddc307d89c1ad042a",
+    "tests/fins/test_cn_download_runtime.py": "d1f5cbb1c694408272690d24d120f45560145ef7cd25892968d6c763923d8175",
+    "tests/fins/test_cn_download_workflow.py": "e4141bc4c20f9dcc7080b6e02f88c0cabd52dd87c6b8a6ef54043a8f64a5b68f",
+    "tests/fins/test_cn_pipeline.py": "23fe62e9e088ed49906ed5f114674ccd14cdf335c1954bb349cd43946b7cfc90",
+    "tests/fins/test_company_identity_storage_contract.py": "6ab4681046f038fdf0206b4f21f78a2fd57f589892107a12c565da10f45f2896",
+    "tests/fins/test_company_meta_contract.py": "bad12c2766b04b935e80ad28a3c29ee82d3c1a66587d1821df18daa16a994f23",
+    "tests/fins/test_docling_converter_factory.py": "aac77de6c907aa121118c49764c00a7ded946b7546b823404e794004a87d89af",
+    "tests/fins/test_docling_process_converter.py": "42a568762cb28c23690a955d2871dff6f31835f14ccbadfded6886c870ba8b73",
+    "tests/fins/test_docling_upload_service.py": "4a7b351925e8d3ec6fa13c35499967a1540371eab8d8e8acc75f002ea3cd7024",
+    "tests/fins/test_docling_upload_service_integration.py": "d1ac2005a28bdd400e859ff06acb77aeb6216cc1ed6b5a07a13d280b8924aa67",
+    "tests/fins/test_filing_upload_publication.py": "a119e2c06d3d64efad04753df8e1512e163a4b9b6ac037b0b259e45540a6e8dd",
+    "tests/fins/test_fins_direct_stream.py": "02c38bcde4934618cc76eb31053d266aeb908327151e0e72af1dc0f9de596353",
+    "tests/fins/test_fins_ingestion_runtime.py": "a6ed008b26cb969a184c48f0a65d875ddabaa1b6dd8e5bdebf278ef1e2137635",
+    "tests/fins/test_fins_ingestion_tools.py": "4c8545d32c8b6e9f2d3e3ee169a738f727eb0e0e04e8ddf9540ca7171a8d0ea4",
+    "tests/fins/test_fins_read_runtime.py": "01db5538c870b672775425c2204a2d7038ab000b6d9829d0d7edce1ea25b6692",
+    "tests/fins/test_fins_service_runtime.py": "5f550a5763f76da09360b2d9e914395d74a4a4f5b21b4965f08a94d8bd2b2282",
+    "tests/fins/test_fins_storage_atomicity.py": "531d4abc228164c40f76db74c6c072278132bc9bfff29c81adea4713b26b0928",
+    "tests/fins/test_fins_storage_provider.py": "3799f8b0269f5a177bf2fa6c2ebf6069130ecccb8463ededd73e27f964e0fe73",
+    "tests/fins/test_fiscal_normalization_contracts.py": "04c7ebe568f18f09c0ee4f36ed3e1f064410b3d919acca2071a809d34d35a404",
+    "tests/fins/test_material_identity_contract.py": "45fa297ee82d7a1314dc5d9b851fae3203d15b0c055c5e2ee1c23fb6260819f9",
+    "tests/fins/test_material_upload_publication.py": "9cb12372613c027d9a9c95b042c246e341fb72405e390bf49e76ab0d836fdf4c",
+    "tests/fins/test_material_upload_state_repository.py": "8adbf0742909db886a08bd82d43d2bf1ef1b0f2aecc7099ecd05ba8e0807792c",
+    "tests/fins/test_processor_read_consistency.py": "7038fb52cabbc7c87293593e52ffca8f7bc7a3d22716cd1abed1c24f03d2983d",
+    "tests/fins/test_read_runtime_semantic_ownership_guards.py": "15847c0ad7534de4fa20445491eb1712d266a9ebacca0daf42f8c8d7f62ab40f",
+    "tests/fins/test_sec_pipeline_download.py": "bb16216f4f0af38a6f0d2d73efa5bbdc211d791cdd821aa6ae05b8b9fb9d06fd",
+    "tests/fins/test_sec_pipeline_download_stream.py": "e1113587bbaf92e9da0d08d9ec3faa96e7d27a31a391ddb533cc727bf3ab893a",
+    "tests/fins/test_sec_pipeline_upload_filing_stream.py": "28ccfcb10894ef6fc204dbbb9cb09aed7be1a4b1f064e7c150c300c52470594d",
+    "tests/fins/test_sec_pipeline_upload_material_stream.py": "7b198f8e2e77e47be3d0aa4749eac4b88f2a68a9211db095d3895f07af1edd79",
+    "tests/fins/test_source_manifest_contract.py": "b6cd458c39ca31333a9c54e78350b81676c9f7e9a3dcecce5c4bdfb09e6846c9",
+    "tests/fins/test_source_meta_contract.py": "c2022ac19541a41e449e6d797662e6e31119721bb4489e9634dd7cb290cff4e4",
+    "tests/fins/test_upload_asset_plan.py": "9622e418d2f197050446627792380e9ab77eb1fda9a7f83aff66c171c8f2667a",
+    "tests/fins/test_upload_batch.py": "778ec9489ce4b7f96bacbd9696bedd926f174febc0b022354d2b113730858643",
+    "tests/fins/test_upload_failure.py": "167dd8f8fff733aa436d889fff7e0015de72c390fd9ae0de26db9cc8602bdb1a",
+    "tests/fins/test_upload_format_contract.py": "a8808d310174d597eca7504a87cba548eeae5f8522bc3fdbd61e45b98f6aaa9a",
+    "tests/fins/test_upload_usage_contract.py": "8424199cfc94456676f1846354716268ae16ebb616492ebb13a922e88de4f69e",
+    "tests/fins/test_xbrl_controlled_upload_integration.py": "9d3faeb8fa55531814d25dd6ac4935bbd9d631b3582faed480d24763b242a725",
+    "tests/runtime/test_macos_sandbox.py": "9ada1906f6dfbb203fbf6525a40d0e2ce48e4d79af440b1bc5fe362f53982c51",
+    "tests/service/test_fins_direct.py": "b731b98b2d2be7c9f91e6c5544f769397265cd5a79d2e98139151288b4de6fa4",
+    "pyproject.toml": "358eab55d4ecbf4462137dda34d0d38786a9fa907fa185979b40cf9b39bc704a",
+    "constraints/lock-common-py311.txt": "894cb2c76ef0fd0fc91610c4e02415d89083e5ea4f9c13b0d09f1f01d3da4d70",
+    "constraints/lock-macos-arm64-py311.txt": "c8242535d33f97c1b55e7b3d34e4cd504caacbe2d5ac8aba7735b9a20ed41563",
+    "pyrightconfig.json": "661d7c531f7cacc7038f570675b43052ed800cd87915a1a218504dbfe6d4357c"
+  },
+  "tests": {
+    "receipt_verified": true,
+    "source_match": true,
+    "source_sha256": "e47e6373be4a195e9587b308293891a25df07e8cbbdf9024ab7fbe7f76e748dc",
+    "test_cases": 2844,
+    "passed": 2841,
+    "skipped": [
+      {
+        "classname": "tests.cli.test_upload_filings_from_command",
+        "name": "test_windows_cmd_script_round_trips_adversarial_argv_with_real_cmd",
+        "time": "0.000"
+      },
+      {
+        "classname": "tests.cli.test_upload_filings_from_command",
+        "name": "test_windows_generated_script_runs_real_cli_into_temp_storage",
+        "time": "0.000"
+      },
+      {
+        "classname": "tests.fins.test_docling_upload_service_integration",
+        "name": "test_real_docling_upload_service_conversion_when_enabled",
+        "time": "0.002"
+      }
+    ],
+    "failures": [],
+    "coverage": [
+      {
+        "path": "dayu/cli/arg_parsing.py",
+        "percent": 96.82080924855491,
+        "source_sha256": "9083dc59bb7ec638fb5fcd0ac0658849b213282374f93a063616b4ab2751fcce"
+      },
+      {
+        "path": "dayu/cli/commands/fins.py",
+        "percent": 88.6509635974304,
+        "source_sha256": "f2b8f55f35de49f4431790213fd775f65f1876d0afec86d294a9dbae261fbcac"
+      },
+      {
+        "path": "dayu/cli/upload_script.py",
+        "percent": 93.37748344370861,
+        "source_sha256": "d19e7aaeb0f503b02c8068e14dd2aa44c6ba04609a5d79e2d4818703f24cd969"
+      },
+      {
+        "path": "dayu/documents/docling_runtime.py",
+        "percent": 91.06382978723404,
+        "source_sha256": "2e71f9e690847549c3ca3febaedc0cfd735f6123c03bb85a244907f8637eae98"
+      },
+      {
+        "path": "dayu/documents/xbrl_config.py",
+        "percent": 96.03174603174604,
+        "source_sha256": "941de0dbda162318e5c1a249f8df0b7f6ce7a34dca121d65067652166fb20d13"
+      },
+      {
+        "path": "dayu/fins/domain/company_meta_contract.py",
+        "percent": 95.08196721311475,
+        "source_sha256": "8ce7c5683e4b30186d1a230ea6c08cff27a475dc7fa9f9adf666d1d6be78b81d"
+      },
+      {
+        "path": "dayu/fins/domain/document_models.py",
+        "percent": 95.55555555555556,
+        "source_sha256": "d04206ce9be11aac14b6245915742f2c6a5421176d8c9ad823dc0483d2687f4c"
+      },
+      {
+        "path": "dayu/fins/ingestion_runtime.py",
+        "percent": 91.73982442138866,
+        "source_sha256": "a8bdb6b7e2aed7e5f4ea772f6b0157d176159a7ab65cebdaa70ad3c9a895205f"
+      },
+      {
+        "path": "dayu/fins/pipelines/cn_pipeline.py",
+        "percent": 93.89978213507625,
+        "source_sha256": "a359c06858b2a3be0bc562e2f51d9058fa30f966d098079d05b2e04727c8dce9"
+      },
+      {
+        "path": "dayu/fins/pipelines/docling_converter_factory.py",
+        "percent": 100.0,
+        "source_sha256": "9602abfcb6476cb7eab53e9988c1f90c533fb36cdc70b52e331210eec4fd9b72"
+      },
+      {
+        "path": "dayu/fins/pipelines/docling_process_converter.py",
+        "percent": 94.71153846153847,
+        "source_sha256": "d6b6772e329c66045f634fb4994c76bbcb9ef0130d3fe498b2e7f044ae6cd1b8"
+      },
+      {
+        "path": "dayu/fins/pipelines/docling_upload_service.py",
+        "percent": 90.33674963396778,
+        "source_sha256": "2f6efcdda8e00f45f7b0302fb4b1df50068f11d83412a05bb7bf48a089343722"
+      },
+      {
+        "path": "dayu/fins/pipelines/filing_upload_publication.py",
+        "percent": 87.4074074074074,
+        "source_sha256": "f31c72b9352ea6aa8de2bbc015c97840608231ec2c72c458fe732ddb458e062d"
+      },
+      {
+        "path": "dayu/fins/pipelines/material_upload_publication.py",
+        "percent": 92.85714285714286,
+        "source_sha256": "08fa979cf7843958ea37e9664271758719059cf32409c47a0564eb6728eef0c9"
+      },
+      {
+        "path": "dayu/fins/pipelines/sec_pipeline.py",
+        "percent": 87.65690376569037,
+        "source_sha256": "13b59b729214a83635d41677b12df203b702a7c6ee2e8f4cab7af0d343dfafde"
+      },
+      {
+        "path": "dayu/fins/pipelines/sec_upload_workflow.py",
+        "percent": 94.61077844311377,
+        "source_sha256": "bd3a8d2ccaccf0b666f8891795534c2a5c317b6216dba94048940c935aa5104e"
+      },
+      {
+        "path": "dayu/fins/pipelines/upload_company_meta.py",
+        "percent": 98.0,
+        "source_sha256": "43b0ce1f57ef750cb92b47bb577e5f6dc45662628f5d9c7c71821400407f85e8"
+      },
+      {
+        "path": "dayu/fins/service_runtime.py",
+        "percent": 94.26229508196721,
+        "source_sha256": "7cec10edf79832a6ea7aba8a7f5989acb6710279d194fb235d864683b8bdca3a"
+      },
+      {
+        "path": "dayu/fins/storage/__init__.py",
+        "percent": 100.0,
+        "source_sha256": "92e7560b335dd4daf8808a2fe29141ed39c6a2f0fbdfa9336ffd88ed8393d944"
+      },
+      {
+        "path": "dayu/fins/storage/_fs_material_upload_state_core.py",
+        "percent": 97.43589743589743,
+        "source_sha256": "0a9d16ba641c4950cd2e628234316badde45e77bd461d54d168ef295035bef11"
+      },
+      {
+        "path": "dayu/fins/storage/_fs_source_document_core.py",
+        "percent": 87.05035971223022,
+        "source_sha256": "4002cc67116cd773dc959e3eb27617289a0e69ed6b210a882480b71b0a0db4f3"
+      },
+      {
+        "path": "dayu/fins/storage/_fs_source_integrity.py",
+        "percent": 88.88888888888889,
+        "source_sha256": "a179edfe83fe200a7ed7ab2ad4c975644f8027bde2347fd85352f4415eb045cf"
+      },
+      {
+        "path": "dayu/fins/storage/_fs_storage_core.py",
+        "percent": 100.0,
+        "source_sha256": "897588e86d7e206a9abf5677f27240e395c3d0a08269d614b9b62485e2e1497d"
+      },
+      {
+        "path": "dayu/fins/storage/_fs_storage_infra.py",
+        "percent": 87.31665228645385,
+        "source_sha256": "5acf5445ea60f98d33a04f11469cde121fdcc9b5b22fda1b09acec711c47ad37"
+      },
+      {
+        "path": "dayu/fins/storage/fs_material_upload_state_repository.py",
+        "percent": 100.0,
+        "source_sha256": "a5f9978ebc337ee1eb4f36d436e2d0a967667809e8f41476dc6c718cbeb8b591"
+      },
+      {
+        "path": "dayu/fins/storage/fs_source_document_repository.py",
+        "percent": 96.84210526315789,
+        "source_sha256": "3443fae747ad326b3f96a325d3c586364369d298684f11dd8d03756565227b51"
+      },
+      {
+        "path": "dayu/fins/storage/repository_protocols.py",
+        "percent": 84.82587064676616,
+        "source_sha256": "a65da7e8692898240ce117b16275168590cfb9e2e918389a7b13c6e28ad686b1"
+      },
+      {
+        "path": "dayu/fins/storage/source_manifest_contract.py",
+        "percent": 100.0,
+        "source_sha256": "6aad93fc998b512b120fa69cf2f855facb9c353ad7adbb7343c7290fa6a58216"
+      },
+      {
+        "path": "dayu/fins/storage/source_meta_contract.py",
+        "percent": 100.0,
+        "source_sha256": "c4657260b8c30cf2e799eac84579bfa8c418679a7c2fc206cd505cefc6799855"
+      },
+      {
+        "path": "dayu/fins/tools/fins_tools.py",
+        "percent": 86.49425287356321,
+        "source_sha256": "b086c50c17f5abe03dc2274903e496970a0043538bf683aff78523f2c266d63d"
+      },
+      {
+        "path": "dayu/fins/tools/read_runtime.py",
+        "percent": 86.59160696008189,
+        "source_sha256": "1b48a88e3ec593c4463559a6e9c4b1d55e30455d77c0a995a62778dbbb90ef53"
+      },
+      {
+        "path": "dayu/fins/tools/upload_tools.py",
+        "percent": 94.96402877697842,
+        "source_sha256": "f5ef3dfb66c04479e96d02eeb7ce2781b231804dfdc982bc85998b4f4b0f64a1"
+      },
+      {
+        "path": "dayu/fins/upload_asset_plan.py",
+        "percent": 89.55223880597015,
+        "source_sha256": "12698b070b761f5fcf10be56362b4c9c4905befbc2243bc6b1806d8272040da0"
+      },
+      {
+        "path": "dayu/fins/upload_batch.py",
+        "percent": 95.58359621451105,
+        "source_sha256": "dd7a4b4f31b083a4f7456ac04fe4c1f2ba6876236863e0cad53ca1e000b0f581"
+      },
+      {
+        "path": "dayu/fins/upload_failure.py",
+        "percent": 95.0,
+        "source_sha256": "9f722aa9156aa107c5b8cc88a72e1c3f668e1540be4f6fcbead1f9c02e24744b"
+      },
+      {
+        "path": "dayu/fins/upload_format_contract.py",
+        "percent": 93.02325581395348,
+        "source_sha256": "04ae2b2965d0d3a72b1021ad83f8d385d1beb6a97297edae93db70ca52eb702e"
+      },
+      {
+        "path": "dayu/fins/upload_usage_contract.py",
+        "percent": 91.33333333333333,
+        "source_sha256": "fbe84d8d1dd36a3813d4ff965f41f4ff80e82003dc7da701391b81a73d77cb8e"
+      },
+      {
+        "path": "dayu/runtime/macos_sandbox.py",
+        "percent": 85.08771929824562,
+        "source_sha256": "0794d0390706941f76d9250a02c7503aaeaaf35a08420fe27dccf5f890dd3a54"
+      }
+    ],
+    "external_cases": [
+      {
+        "name": "test_real_external_instance_cli_manifest_and_repository_readback",
+        "passed": true
+      },
+      {
+        "name": "test_real_invalid_content_no_success[.xml-<ordinary>synthetic plain XML</ordinary>]",
+        "passed": true
+      },
+      {
+        "name": "test_real_invalid_content_no_success[.xbrl-<link:linkbase xmlns:link=\"http://www.xbrl.org/2003/linkbase\"/>]",
+        "passed": true
+      },
+      {
+        "name": "test_real_invalid_content_no_success[.xml-<broken]",
+        "passed": true
+      },
+      {
+        "name": "test_real_invalid_content_no_success[.json-{\"synthetic\":\"not a Docling document\"}]",
+        "passed": true
+      }
+    ],
+    "junit_sha256": "b732217cdcc1571dd040d539d5fee8120a0190d9c659a9939513d6c75b6b2e87",
+    "coverage_sha256": "4e6135eefcfd0ae972174098523564e0d83ca79bc40811603203c20ec77f629e",
+    "actual_receipt": {
+      "pid": 82084,
+      "actual_exit": 0,
+      "actual_wait": true,
+      "utc_end": "2026-10-03T01:45:29.067352+00:00",
+      "duration_wall_s": 234.5870893750107,
+      "sha256": {
+        "command.json": "75d19993cf8f80204efba5b92ac58100b392068126342bba4c6060cfff8b01e2",
+        "stdout": "3b7bc878e9b2952a120809eb62752acdad360b2bb482a8da93ed2bd4b55700a3",
+        "stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    }
+  },
+  "pyright": {
+    "receipt": {
+      "pid": 79980,
+      "actual_exit": 0,
+      "actual_wait": true,
+      "utc_end": "2026-10-03T01:27:24.932399+00:00",
+      "duration_wall_s": 38.1040159999975,
+      "sha256": {
+        "command.json": "f1e79f1b141bb4e67d692e6994be43637bd0923c248e94433f669b43cb11feae",
+        "stdout": "46a6c7834c9080ada23a415afd925abecc37d531f5c6e3d14ad0a7ff579096cb",
+        "stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    },
+    "command": {
+      "argv": [
+        "/Users/leo/workspace/dayu-agent-r/.venv/bin/python",
+        "-m",
+        "pyright"
+      ],
+      "cwd": "/Users/leo/workspace/dayu-agent-r",
+      "utc_start": "2026-10-03T01:26:46.828227+00:00",
+      "environment": {
+        "VIRTUAL_ENV": "/Users/leo/workspace/dayu-agent-r/.venv",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "TMPDIR": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-unified-s3-integration-fix-sol-20261003-01/tmp",
+        "XDG_CONFIG_HOME": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-unified-s3-integration-fix-sol-20261003-01/config",
+        "XDG_CACHE_HOME": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-unified-s3-integration-fix-sol-20261003-01/cache"
+      },
+      "source_manifest": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-unified-s3-integration-fix-sol-20261003-01/source-final-v2.json",
+      "source_manifest_sha256": "e47e6373be4a195e9587b308293891a25df07e8cbbdf9024ab7fbe7f76e748dc"
+    },
+    "stdout": "0 errors, 0 warnings, 0 informations\nWARNING: there is a new pyright version available (v1.1.409 -> v1.1.414).\nPlease install the new version or set PYRIGHT_PYTHON_FORCE_VERSION to `latest`\n\n",
+    "stderr": ""
+  },
+  "review_artifacts": {
+    "docs/reviews/code-review-20261003-094147.md": "b744af6291bedd80a9a11d7e94972d7cfc9acff66c552801a2ab8f5e64c79b3f",
+    "docs/reviews/code-review-20261003-094635.md": "dd871ae4e659bb8ee053573a22f5b8658cc70f54de21e2cb7c9bc9e555f2af75",
+    "docs/gateflow/upload-material-unified-s3-focused-rereview-root-adjudication-20261003.md": "5f4fd806c769e171616181f4e90ba44ee7af9c591b4506a1d71df7951cf025a5",
+    "docs/gateflow/upload-material-unified-s3-integration-fix-root-adjudication-20261003.md": "79ac3795b9155f6fac749955463763ab16572b225621cf4931522563fe57b984"
+  }
+}

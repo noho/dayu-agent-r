@@ -227,6 +227,25 @@ class SourceIntegrityRevisionConflictError(RuntimeError):
         super().__init__("source publication identity 已变化，无法安全应用预取结果")
 
 
+class SourceIntegrityRepairRequiredError(RuntimeError):
+    """完整性复查发现来源仍需修复，不能继续本次操作。"""
+
+    def __init__(self) -> None:
+        """构造不携带路径、版本或原始数据的修复异常。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        super().__init__("来源仍需修复，当前操作不能继续")
+
+
 class SourceIntegrityRepairBlockedReason(str, Enum):
     """target identity 仍匹配时阻断 staged repair 的封闭原因。"""
 

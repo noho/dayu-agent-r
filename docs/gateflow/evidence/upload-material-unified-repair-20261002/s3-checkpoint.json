@@ -1,0 +1,14 @@
+{
+  "head": "ec54351e58e66cd5d00b009c862589b109064ade",
+  "parent": "a514dea14c0ce66722da034502f3af54a54c3238",
+  "main": "fac32ecbff9bfe792b63ee9667c8697826b631f4",
+  "branch": "codex/upload-material-oracle",
+  "staged_count": 60,
+  "exact_index_sha_verified": true,
+  "cached_check_exit": 0,
+  "actual_commit_exit": 0,
+  "status_after_commit": "clean",
+  "source_manifest_sha256": "e47e6373be4a195e9587b308293891a25df07e8cbbdf9024ab7fbe7f76e748dc",
+  "prior_failed_check": "cached-check.stdout; exit2; no commit; preserved report carrier",
+  "next_gate": "aggregate deepreview"
+}

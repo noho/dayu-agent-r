@@ -409,7 +409,7 @@ def _build_list_documents_definition(
 
     @tool(
         name=LIST_DOCUMENTS_TOOL_NAME,
-        description="列出公司可用文档。先用本工具拿到 document_id，再继续读章节、表格或财务数据。",
+        description="列出公司可用文档。先用本工具拿到 document_id，再继续读章节、表格或财务数据。推荐槽位只提供文档 ID 引用；材料当前修订事实见 documents 中 published_amended 是当前发布材料的修订布尔值，例如 {\"source_kind\":\"material\",\"published_amended\":true}。",
         parameters=parameters,
         execution=ProcessBackedToolExecutionCapability(
             target_factory=process_target_factory,

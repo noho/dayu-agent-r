@@ -1,0 +1,237 @@
+{
+  "source": "complete-final.coverage.json",
+  "files": {
+    "dayu/cli/output.py": {
+      "covered_lines": 176,
+      "num_statements": 206,
+      "percent_covered": 85.4368932038835,
+      "percent_covered_display": "85",
+      "missing_lines": 30,
+      "excluded_lines": 0,
+      "percent_statements_covered": 85.4368932038835,
+      "percent_statements_covered_display": "85"
+    },
+    "dayu/fins/direct_event_text.py": {
+      "covered_lines": 74,
+      "num_statements": 85,
+      "percent_covered": 87.05882352941177,
+      "percent_covered_display": "87",
+      "missing_lines": 11,
+      "excluded_lines": 0,
+      "percent_statements_covered": 87.05882352941177,
+      "percent_statements_covered_display": "87"
+    },
+    "dayu/fins/direct_events.py": {
+      "covered_lines": 407,
+      "num_statements": 455,
+      "percent_covered": 89.45054945054945,
+      "percent_covered_display": "89",
+      "missing_lines": 48,
+      "excluded_lines": 0,
+      "percent_statements_covered": 89.45054945054945,
+      "percent_statements_covered_display": "89"
+    },
+    "dayu/fins/download_contract.py": {
+      "covered_lines": 415,
+      "num_statements": 473,
+      "percent_covered": 87.73784355179704,
+      "percent_covered_display": "88",
+      "missing_lines": 58,
+      "excluded_lines": 0,
+      "percent_statements_covered": 87.73784355179704,
+      "percent_statements_covered_display": "88"
+    },
+    "dayu/fins/downloaders/cninfo_downloader.py": {
+      "covered_lines": 301,
+      "num_statements": 334,
+      "percent_covered": 90.11976047904191,
+      "percent_covered_display": "90",
+      "missing_lines": 33,
+      "excluded_lines": 0,
+      "percent_statements_covered": 90.11976047904191,
+      "percent_statements_covered_display": "90"
+    },
+    "dayu/fins/downloaders/hkexnews_downloader.py": {
+      "covered_lines": 390,
+      "num_statements": 458,
+      "percent_covered": 85.1528384279476,
+      "percent_covered_display": "85",
+      "missing_lines": 68,
+      "excluded_lines": 0,
+      "percent_statements_covered": 85.1528384279476,
+      "percent_statements_covered_display": "85"
+    },
+    "dayu/fins/ingestion_runtime.py": {
+      "covered_lines": 2221,
+      "num_statements": 2434,
+      "percent_covered": 91.24897288414134,
+      "percent_covered_display": "91",
+      "missing_lines": 213,
+      "excluded_lines": 35,
+      "percent_statements_covered": 91.24897288414134,
+      "percent_statements_covered_display": "91"
+    },
+    "dayu/fins/pipelines/cn_download_models.py": {
+      "covered_lines": 110,
+      "num_statements": 113,
+      "percent_covered": 97.34513274336283,
+      "percent_covered_display": "97",
+      "missing_lines": 3,
+      "excluded_lines": 0,
+      "percent_statements_covered": 97.34513274336283,
+      "percent_statements_covered_display": "97"
+    },
+    "dayu/fins/pipelines/cn_download_protocols.py": {
+      "covered_lines": 40,
+      "num_statements": 40,
+      "percent_covered": 100.0,
+      "percent_covered_display": "100",
+      "missing_lines": 0,
+      "excluded_lines": 50,
+      "percent_statements_covered": 100.0,
+      "percent_statements_covered_display": "100"
+    },
+    "dayu/fins/pipelines/cn_download_rebuild.py": {
+      "covered_lines": 161,
+      "num_statements": 186,
+      "percent_covered": 86.55913978494624,
+      "percent_covered_display": "87",
+      "missing_lines": 25,
+      "excluded_lines": 0,
+      "percent_statements_covered": 86.55913978494624,
+      "percent_statements_covered_display": "87"
+    },
+    "dayu/fins/pipelines/cn_download_source_upsert.py": {
+      "covered_lines": 68,
+      "num_statements": 79,
+      "percent_covered": 86.07594936708861,
+      "percent_covered_display": "86",
+      "missing_lines": 11,
+      "excluded_lines": 0,
+      "percent_statements_covered": 86.07594936708861,
+      "percent_statements_covered_display": "86"
+    },
+    "dayu/fins/pipelines/cn_download_workflow.py": {
+      "covered_lines": 277,
+      "num_statements": 291,
+      "percent_covered": 95.18900343642612,
+      "percent_covered_display": "95",
+      "missing_lines": 14,
+      "excluded_lines": 0,
+      "percent_statements_covered": 95.18900343642612,
+      "percent_statements_covered_display": "95"
+    },
+    "dayu/fins/pipelines/cn_pipeline.py": {
+      "covered_lines": 441,
+      "num_statements": 466,
+      "percent_covered": 94.63519313304721,
+      "percent_covered_display": "95",
+      "missing_lines": 25,
+      "excluded_lines": 0,
+      "percent_statements_covered": 94.63519313304721,
+      "percent_statements_covered_display": "95"
+    },
+    "dayu/fins/pipelines/cn_report_selection.py": {
+      "covered_lines": 268,
+      "num_statements": 291,
+      "percent_covered": 92.09621993127148,
+      "percent_covered_display": "92",
+      "missing_lines": 23,
+      "excluded_lines": 0,
+      "percent_statements_covered": 92.09621993127148,
+      "percent_statements_covered_display": "92"
+    },
+    "dayu/fins/pipelines/hk_download_rebuild.py": {
+      "covered_lines": 90,
+      "num_statements": 98,
+      "percent_covered": 91.83673469387755,
+      "percent_covered_display": "92",
+      "missing_lines": 8,
+      "excluded_lines": 0,
+      "percent_statements_covered": 91.83673469387755,
+      "percent_statements_covered_display": "92"
+    },
+    "dayu/fins/pipelines/hk_fiscal_calendar.py": {
+      "covered_lines": 56,
+      "num_statements": 58,
+      "percent_covered": 96.55172413793103,
+      "percent_covered_display": "97",
+      "missing_lines": 2,
+      "excluded_lines": 0,
+      "percent_statements_covered": 96.55172413793103,
+      "percent_statements_covered_display": "97"
+    },
+    "dayu/fins/pipelines/sec_pipeline.py": {
+      "covered_lines": 406,
+      "num_statements": 470,
+      "percent_covered": 86.38297872340425,
+      "percent_covered_display": "86",
+      "missing_lines": 64,
+      "excluded_lines": 0,
+      "percent_statements_covered": 86.38297872340425,
+      "percent_statements_covered_display": "86"
+    },
+    "dayu/fins/storage/__init__.py": {
+      "covered_lines": 15,
+      "num_statements": 15,
+      "percent_covered": 100.0,
+      "percent_covered_display": "100",
+      "missing_lines": 0,
+      "excluded_lines": 0,
+      "percent_statements_covered": 100.0,
+      "percent_statements_covered_display": "100"
+    },
+    "dayu/fins/storage/_fs_source_document_core.py": {
+      "covered_lines": 448,
+      "num_statements": 518,
+      "percent_covered": 86.48648648648648,
+      "percent_covered_display": "86",
+      "missing_lines": 70,
+      "excluded_lines": 0,
+      "percent_statements_covered": 86.48648648648648,
+      "percent_statements_covered_display": "86"
+    },
+    "dayu/fins/storage/fs_source_document_repository.py": {
+      "covered_lines": 90,
+      "num_statements": 93,
+      "percent_covered": 96.7741935483871,
+      "percent_covered_display": "97",
+      "missing_lines": 3,
+      "excluded_lines": 0,
+      "percent_statements_covered": 96.7741935483871,
+      "percent_statements_covered_display": "97"
+    },
+    "dayu/fins/storage/repository_protocols.py": {
+      "covered_lines": 250,
+      "num_statements": 293,
+      "percent_covered": 85.32423208191126,
+      "percent_covered_display": "85",
+      "missing_lines": 43,
+      "excluded_lines": 162,
+      "percent_statements_covered": 85.32423208191126,
+      "percent_statements_covered_display": "85"
+    },
+    "dayu/fins/storage/source_meta_read.py": {
+      "covered_lines": 20,
+      "num_statements": 20,
+      "percent_covered": 100.0,
+      "percent_covered_display": "100",
+      "missing_lines": 0,
+      "excluded_lines": 0,
+      "percent_statements_covered": 100.0,
+      "percent_statements_covered_display": "100"
+    },
+    "dayu/service/fins_wait_adapter.py": {
+      "covered_lines": 188,
+      "num_statements": 201,
+      "percent_covered": 93.53233830845771,
+      "percent_covered_display": "94",
+      "missing_lines": 13,
+      "excluded_lines": 0,
+      "percent_statements_covered": 93.53233830845771,
+      "percent_statements_covered_display": "94"
+    }
+  },
+  "threshold": 80,
+  "all_pass": true
+}

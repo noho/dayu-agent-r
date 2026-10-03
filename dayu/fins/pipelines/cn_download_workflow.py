@@ -13,13 +13,23 @@ from functools import partial
 from typing import TypeAlias, cast
 
 from dayu.contracts.json_value import JsonValue
+from dayu.fins.domain.enums import SourceKind
+from dayu.fins.download_contract import FinsDownloadSource, FinsDownloadUncertainReport, validate_download_uncertain_reports
+from dayu.fins.pipelines.cn_report_selection import local_hk_annual_ends
 from dayu.fins.pipelines.cn_download_company_meta import stage_company_meta_for_cn_download
 from dayu.fins.pipelines.cn_download_filing_workflow import (
     project_cn_filing_failure,
     run_cn_download_single_filing_stream,
 )
+from dayu.fins.pipelines.cn_download_identity import (
+    CnDownloadIdentityIndex, read_cn_download_identity_index, resolve_cn_download_ids,
+)
 from dayu.fins.pipelines.cn_download_models import (
+    CN_DOWNLOAD_TERMINAL_CANCELLED,
+    CN_DOWNLOAD_TERMINAL_INTEGRITY_FAILED,
+    CN_DOWNLOAD_TERMINAL_OK,
     CnDownloadCancelledError,
+    CnDownloadTerminalStatus,
     CnCompanyProfile,
     CnFiscalPeriod,
     CnMarketKind,
@@ -32,8 +42,8 @@ from dayu.fins.pipelines.cn_download_protocols import (
     CnReportDiscoveryClientProtocol,
 )
 from dayu.fins.pipelines.cn_form_utils import (
+    CnDownloadPeriodPolicy,
     PeriodDownloadWindow,
-    build_cn_filing_ids,
     resolve_period_windows,
     resolve_download_period_policy,
     resolve_window,
@@ -41,13 +51,50 @@ from dayu.fins.pipelines.cn_form_utils import (
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.storage import (
     SelectedSourceRepairRequired,
+    SourceIntegrityPreflightError,
     SourceIntegrityRevisionConflictError,
+    SourceIntegrityRepairRequiredError,
     classify_source_integrity_preflight,
 )
 from dayu.fins._log import Log
 from dayu.fins.ticker_normalization import ticker_to_company_id, try_normalize_ticker
 
 JsonObject: TypeAlias = dict[str, JsonValue]
+_INTEGRITY_FAILED_REASON = "source_integrity_failed"
+_INTEGRITY_FAILED_MESSAGE = "本地来源完整性状态阻止文档处理"
+_INTEGRITY_PREFLIGHT_MESSAGE = "本地来源完整性预检失败"
+
+
+class CnDownloadIntegrityAbort(Exception):
+    """携带原始完整性异常及已处理文档快照的私有下载中止。"""
+
+    def __init__(
+        self,
+        cause: SourceIntegrityPreflightError | SourceIntegrityRevisionConflictError | SourceIntegrityRepairRequiredError,
+        result: JsonObject,
+        uncertain_reports: tuple[FinsDownloadUncertainReport, ...],
+    ) -> None:
+        """保存同一 workflow owner 产生的失败事实。
+
+        Args:
+            cause: 原始完整性异常。
+            result: 已处理文档的私有失败快照。
+            uncertain_reports: 独立完整 typed 未知 tuple；无未知显式为空。
+
+        Returns:
+            无。
+
+        Raises:
+            TypeError: cause 不属于封闭完整性异常集合时抛出。
+        """
+
+        if not isinstance(cause, SourceIntegrityPreflightError | SourceIntegrityRevisionConflictError | SourceIntegrityRepairRequiredError):
+            raise TypeError("下载中止原因必须是封闭完整性异常")
+        super().__init__(_INTEGRITY_PREFLIGHT_MESSAGE)
+        self.cause = cause
+        self.result = result
+        validate_download_uncertain_reports(FinsDownloadSource.HKEXNEWS, uncertain_reports)
+        self.uncertain_reports = uncertain_reports
 
 
 async def run_cn_download_stream_impl(
@@ -87,6 +134,8 @@ async def run_cn_download_stream_impl(
     Raises:
         ValueError: ticker、form 或日期参数非法时抛出。
         OSError: 仓储读写失败时抛出。
+        SourceIntegrityPreflightError: 首候选前完整性预检失败时抛出。
+        CnDownloadIntegrityAbort: 已处理候选后的封闭完整性失败时抛出。
     """
 
     started_at = time.perf_counter()
@@ -193,8 +242,14 @@ async def run_cn_download_stream_impl(
     notes: list[str] = []
     company_info: JsonObject = {}
     missing_periods: tuple[str, ...] = ()
+    uncertain_reports: tuple[FinsDownloadUncertainReport, ...] = ()
     try:
         _raise_if_cancelled(module=module, ticker=normalized_ticker, document_id="", cancel_checker=cancel_checker)
+        local_ends = ()
+        if market == "HK":
+            entries = host.source_repository.read_source_meta_integrity_view(normalized_ticker, SourceKind.FILING, batch=None)
+            local_ends = tuple(sorted(set(local_hk_annual_ends(entries).values())))
+            _raise_if_cancelled(module=module, ticker=normalized_ticker, document_id="", cancel_checker=cancel_checker)
         profile = discovery.resolve_company(query)
         _raise_if_cancelled(module=module, ticker=normalized_ticker, document_id="", cancel_checker=cancel_checker)
         company_info = {
@@ -209,18 +264,29 @@ async def run_cn_download_stream_impl(
             ticker=normalized_ticker,
             payload=company_info,
         )
-        candidates = discovery.list_report_candidates(
+        discovery_result = discovery.list_report_candidates(
             query,
             profile,
+            local_annual_ends=local_ends,
             cancellation_checkpoint=cancellation_checkpoint,
         )
         _raise_if_cancelled(module=module, ticker=normalized_ticker, document_id="", cancel_checker=cancel_checker)
+        uncertain_reports = tuple(
+            report for report in discovery_result.uncertain_reports
+            if report.filing_date is not None and any(w.start_date <= report.filing_date <= w.end_date for w in period_windows)
+        )
+        validate_download_uncertain_reports(FinsDownloadSource.HKEXNEWS if market == "HK" else FinsDownloadSource.CNINFO, uncertain_reports)
         selected = _select_candidates_for_a4(
-            candidates,
+            discovery_result.candidates,
             period_windows=period_windows,
             use_default_business_limits=not start_is_explicit,
         )
-        accepted_filing_ids = frozenset(_candidate_document_id(normalized_ticker, candidate) for candidate in selected)
+        initial_identity_index = read_cn_download_identity_index(
+            normalized_ticker, selected, host.source_repository,
+        )
+        accepted_filing_ids = frozenset(
+            _candidate_document_id(normalized_ticker, candidate, initial_identity_index) for candidate in selected
+        )
         preflight = classify_source_integrity_preflight(
             host.source_repository.list_source_integrity(normalized_ticker),
             accepted_filing_ids=accepted_filing_ids,
@@ -232,10 +298,12 @@ async def run_cn_download_stream_impl(
             selected = tuple(
                 sorted(
                     selected,
-                    key=lambda item: (_candidate_document_id(normalized_ticker, item) != repair_document_id,),
+                    key=lambda item: (
+                        _candidate_document_id(normalized_ticker, item, initial_identity_index) != repair_document_id,
+                    ),
                 )
             )
-        missing_periods = _resolve_missing_periods(
+        missing_periods = () if uncertain_reports else _resolve_missing_periods(
             period_policy.missing_eligible_periods,
             selected,
         )
@@ -254,7 +322,10 @@ async def run_cn_download_stream_impl(
                 notes.append("cancelled")
                 cancelled = True
                 break
-            document_id = _candidate_document_id(normalized_ticker, candidate)
+            start_identity_index = read_cn_download_identity_index(
+                normalized_ticker, (candidate,), host.source_repository,
+            )
+            document_id = _candidate_document_id(normalized_ticker, candidate, start_identity_index)
             yield DownloadEvent(
                 event_type=DownloadEventType.FILING_STARTED,
                 ticker=normalized_ticker,
@@ -303,10 +374,37 @@ async def run_cn_download_stream_impl(
                 notes.append("cancelled")
                 cancelled = True
                 break
+            except (SourceIntegrityPreflightError, SourceIntegrityRevisionConflictError) as exc:
+                failed_item = _build_candidate_failed_result(
+                    document_id=document_id,
+                    candidate=candidate,
+                    reason_code=_INTEGRITY_FAILED_REASON,
+                    reason_message=_INTEGRITY_FAILED_MESSAGE,
+                )
+                filings.append(failed_item)
+                yield DownloadEvent(
+                    event_type=DownloadEventType.FILING_FAILED,
+                    ticker=normalized_ticker,
+                    document_id=document_id,
+                    payload=_filing_event_payload(failed_item),
+                )
+                raise _integrity_abort(
+                    cause=exc,
+                    started_at=started_at,
+                    pipeline_name=pipeline_name,
+                    ticker=normalized_ticker,
+                    company_info=company_info,
+                    filters=_download_filters(period_policy, period_windows, window.end_date, overwrite),
+                    warnings=warnings,
+                    notes=notes,
+                    filings=filings,
+                    missing_periods=missing_periods,
+                    uncertain_reports=uncertain_reports,
+                ) from exc
             except Exception as exc:
                 reason_code, reason_message = project_cn_filing_failure(exc)
                 failed_item = _build_candidate_failed_result(
-                    ticker=normalized_ticker,
+                    document_id=document_id,
                     candidate=candidate,
                     reason_code=reason_code,
                     reason_message=reason_message,
@@ -328,25 +426,55 @@ async def run_cn_download_stream_impl(
                 if filing_terminal_status == "failed":
                     # 单 filing owner 已投影失败；repair gate 直接终止，company 保持旧值。
                     break
-                post_repair = classify_source_integrity_preflight(
-                    host.source_repository.list_source_integrity(normalized_ticker),
-                    accepted_filing_ids=accepted_filing_ids,
-                    rejected_filing_ids=frozenset(),
-                )
-                if isinstance(post_repair, SelectedSourceRepairRequired):
-                    raise SourceIntegrityRevisionConflictError
+                try:
+                    post_repair = classify_source_integrity_preflight(
+                        host.source_repository.list_source_integrity(normalized_ticker),
+                        accepted_filing_ids=accepted_filing_ids,
+                        rejected_filing_ids=frozenset(),
+                    )
+                    if isinstance(post_repair, SelectedSourceRepairRequired):
+                        raise SourceIntegrityRepairRequiredError()
+                except (SourceIntegrityPreflightError, SourceIntegrityRevisionConflictError, SourceIntegrityRepairRequiredError) as exc:
+                    raise _integrity_abort(
+                        cause=exc,
+                        started_at=started_at,
+                        pipeline_name=pipeline_name,
+                        ticker=normalized_ticker,
+                        company_info=company_info,
+                        filters=_download_filters(period_policy, period_windows, window.end_date, overwrite),
+                        warnings=warnings,
+                        notes=notes,
+                        filings=filings,
+                        missing_periods=missing_periods,
+                        uncertain_reports=uncertain_reports,
+                    ) from exc
                 _raise_if_cancelled(
                     module=module,
                     ticker=normalized_ticker,
                     document_id=document_id,
                     cancel_checker=cancel_checker,
                 )
-                _publish_cn_company_after_repair(
-                    host=host,
-                    profile=profile,
-                    normalized_ticker=normalized_ticker,
-                    ticker_aliases=ticker_aliases,
-                )
+                try:
+                    _publish_cn_company_after_repair(
+                        host=host,
+                        profile=profile,
+                        normalized_ticker=normalized_ticker,
+                        ticker_aliases=ticker_aliases,
+                    )
+                except SourceIntegrityPreflightError as exc:
+                    raise _integrity_abort(
+                        cause=exc,
+                        started_at=started_at,
+                        pipeline_name=pipeline_name,
+                        ticker=normalized_ticker,
+                        company_info=company_info,
+                        filters=_download_filters(period_policy, period_windows, window.end_date, overwrite),
+                        warnings=warnings,
+                        notes=notes,
+                        filings=filings,
+                        missing_periods=missing_periods,
+                        uncertain_reports=uncertain_reports,
+                    ) from exc
                 repair_gate_completed = True
     except CnDownloadCancelledError:
         notes.append("cancelled")
@@ -361,19 +489,15 @@ async def run_cn_download_stream_impl(
     summary = _build_summary(filings=filings, elapsed_ms=elapsed_ms)
     result = _build_result(
         pipeline_name=pipeline_name,
-        status="cancelled" if final_cancelled else "ok",
+        status=CN_DOWNLOAD_TERMINAL_CANCELLED if final_cancelled else CN_DOWNLOAD_TERMINAL_OK,
         ticker=normalized_ticker,
         company_info=company_info,
-        filters={
-            "forms": list(period_policy.effective_periods),
-            "start_dates": {item.fiscal_period: item.start_date for item in period_windows},
-            "end_date": window.end_date,
-            "overwrite": overwrite,
-        },
+        filters=_download_filters(period_policy, period_windows, window.end_date, overwrite),
         warnings=warnings,
         notes=notes,
         filings=filings,
         missing_periods=missing_periods,
+        uncertain_reports=uncertain_reports,
         summary=summary,
     )
     Log.info(
@@ -400,6 +524,88 @@ def _select_discovery_client(
     """按市场选择 discovery client。"""
 
     return host.cn_discovery_client if market == "CN" else host.hk_discovery_client
+
+
+def _download_filters(
+    period_policy: CnDownloadPeriodPolicy,
+    period_windows: tuple[PeriodDownloadWindow, ...],
+    end_date: str | None,
+    overwrite: bool,
+) -> JsonObject:
+    """从本次请求的有效期间与窗口构造唯一筛选快照。
+
+    Args:
+        period_policy: 已解析的财期策略。
+        period_windows: 已解析的分财期起点。
+        end_date: 已解析的窗口终点。
+        overwrite: 是否覆盖已存在文档。
+
+    Returns:
+        与正常及中止结果共用的筛选字段。
+
+    Raises:
+        无。
+    """
+
+    return {
+        "forms": list(period_policy.effective_periods),
+        "start_dates": {item.fiscal_period: item.start_date for item in period_windows},
+        "end_date": end_date,
+        "overwrite": overwrite,
+    }
+
+
+def _integrity_abort(
+    *,
+    cause: SourceIntegrityPreflightError | SourceIntegrityRevisionConflictError | SourceIntegrityRepairRequiredError,
+    started_at: float,
+    pipeline_name: str,
+    ticker: str,
+    company_info: JsonObject,
+    filters: JsonObject,
+    warnings: list[str],
+    notes: list[str],
+    filings: list[JsonObject],
+    missing_periods: tuple[str, ...],
+    uncertain_reports: tuple[FinsDownloadUncertainReport, ...],
+) -> CnDownloadIntegrityAbort:
+    """仅从已处理 filing 真源冻结完整性中止快照。
+
+    Args:
+        cause: 原始封闭异常。
+        started_at: 工作流启动时刻。
+        pipeline_name: 当前来源管线名。
+        ticker: canonical ticker。
+        company_info: 已解析公司信息。
+        filters: 有效请求筛选条件。
+        warnings: 当前业务警告。
+        notes: 当前业务说明。
+        filings: 已确认终态 filing 列表。
+        missing_periods: 来源缺失财期。
+        uncertain_reports: 发现时取得的完整 typed 未知集合，不写入封闭 integrity result。
+
+    Returns:
+        携带原异常和严格同源快照的私有中止。
+
+    Raises:
+        无。
+    """
+
+    summary = _build_summary(filings=filings, elapsed_ms=int((time.perf_counter() - started_at) * 1000))
+    result = _build_result(
+        pipeline_name=pipeline_name,
+        status=CN_DOWNLOAD_TERMINAL_INTEGRITY_FAILED,
+        ticker=ticker,
+        company_info=company_info,
+        filters=filters,
+        warnings=warnings,
+        notes=notes,
+        filings=filings,
+        missing_periods=missing_periods,
+        uncertain_reports=uncertain_reports,
+        summary=summary,
+    )
+    return CnDownloadIntegrityAbort(cause, result, uncertain_reports)
 
 
 def _publish_cn_company_after_repair(
@@ -592,7 +798,7 @@ def _resolve_missing_periods(
 
 def _build_candidate_failed_result(
     *,
-    ticker: str,
+    document_id: str,
     candidate: CnReportCandidate,
     reason_code: str,
     reason_message: str,
@@ -600,7 +806,7 @@ def _build_candidate_failed_result(
     """构建单候选异常失败结果。
 
     Args:
-        ticker: ticker。
+        document_id: 已绑定的文档 ID。
         candidate: 远端候选。
         reason_code: 稳定原因码。
         reason_message: 失败说明。
@@ -613,11 +819,11 @@ def _build_candidate_failed_result(
     """
 
     return {
-        "document_id": _candidate_document_id(ticker, candidate),
+        "document_id": document_id,
         "status": "failed",
         "form_type": candidate.period_projection.identity_period,
         "filing_date": candidate.filing_date,
-        "report_date": None,
+        "report_date": candidate.report_date,
         "fiscal_year": candidate.fiscal_year,
         "fiscal_period": candidate.period_projection.identity_period,
         "covered_fiscal_periods": list(candidate.period_projection.covered_periods),
@@ -759,8 +965,9 @@ def _build_summary(*, filings: list[JsonObject], elapsed_ms: int) -> JsonObject:
 def _build_result(
     *,
     pipeline_name: str,
-    status: str,
+    status: CnDownloadTerminalStatus,
     ticker: str,
+    uncertain_reports: tuple[FinsDownloadUncertainReport, ...],
     reason_code: str | None = None,
     message: str | None = None,
     company_info: JsonObject | None = None,
@@ -775,8 +982,10 @@ def _build_result(
 
     Args:
         pipeline_name: 来源 pipeline 名称。
-        status: pipeline 终态。
+        status: 必填 pipeline 终态，取共享模型词表的 ok、cancelled 或
+            integrity_failed；调用方按普通结果或完整性中止选择对应值。
         ticker: canonical ticker。
+        uncertain_reports: 全量独立未知报告；与已确认 filings 分开投影，不猜其财期。
         reason_code: 可选失败原因码。
         message: 可选失败说明。
         company_info: 公司业务事实。
@@ -797,7 +1006,7 @@ def _build_result(
     warning_values: list[JsonValue] = list(warnings or [])
     note_values: list[JsonValue] = list(notes or [])
     filing_values: list[JsonValue] = list(filings or [])
-    return {
+    result: JsonObject = {
         "pipeline": pipeline_name,
         "action": "download",
         "status": status,
@@ -822,28 +1031,35 @@ def _build_result(
         },
     }
 
+    if status != CN_DOWNLOAD_TERMINAL_INTEGRITY_FAILED:
+        result["uncertain_reports"] = [report.to_json_value() for report in uncertain_reports]
+    raw_summary = result["summary"]
+    if isinstance(raw_summary, dict):
+        raw_summary["uncertain_count"] = len(uncertain_reports)
+    return result
 
-def _candidate_document_id(ticker: str, candidate: CnReportCandidate) -> str:
-    """构建单候选真实 document_id。
+
+def _candidate_document_id(
+    ticker: str,
+    candidate: CnReportCandidate,
+    index: CnDownloadIdentityIndex,
+) -> str:
+    """从当前观察索引构建单候选真实 document_id。
 
     Args:
         ticker: 已归一化 ticker。
         candidate: 远端候选。
+        index: 本观察窗口的来源身份索引。
 
     Returns:
         与单 filing 阶段机一致的 source document ID。
 
     Raises:
-        无。
+        ValueError: 来源身份缺失、重复或索引 ticker 不符时抛出。
+        OSError: 原元数据读取失败时抛出。
     """
 
-    document_id, _ = build_cn_filing_ids(
-        ticker=ticker,
-        form_type=candidate.period_projection.identity_period,
-        fiscal_year=candidate.fiscal_year,
-        fiscal_period=candidate.period_projection.identity_period,
-        amended=candidate.amended,
-    )
+    document_id, _ = resolve_cn_download_ids(ticker, candidate, index)
     return document_id
 
 

@@ -15,7 +15,9 @@
   - ``GET http://www.cninfo.com.cn/new/data/szse_stock.json``：
     全市场 A 股公司基础映射（``code`` -> ``orgId``）。
   - ``POST http://www.cninfo.com.cn/new/hisAnnouncement/query``：按
-    ``stock={code},{orgId}`` + ``category_*_szsh;`` 分类拉公告列表。
+    ``stock={code},{orgId}`` + ``category_*_szsh;`` 分类拉公告列表。空结果时
+    响应 ``announcements`` 字段为 ``null``（key 存在、值为 null），与空数组
+    同义；缺 key 或其它类型按协议失败处理。
   - ``GET http://static.cninfo.com.cn/{adjunctUrl}``：PDF 实体下载。
 
 - 产品级候选筛选、标题黑名单、fiscal year 推断、同 period/year 去重、
@@ -34,6 +36,7 @@ import datetime as dt
 import hashlib
 import re
 import time
+from datetime import date
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Final, Optional, TypeAlias, cast
@@ -49,6 +52,7 @@ from dayu.fins.pipelines.cn_download_models import (
     CnFiscalPeriod,
     CnReportHeadMeta,
     CnReportCandidate,
+    CnReportDiscoveryResult,
     CnReportQuery,
     CninfoRawAnnouncement,
     DownloadedReportAsset,
@@ -228,8 +232,9 @@ class CninfoDiscoveryClient:
         query: CnReportQuery,
         profile: CnCompanyProfile,
         *,
+        local_annual_ends: tuple[date, ...],
         cancellation_checkpoint: Callable[[], None] | None = None,
-    ) -> tuple[CnReportCandidate, ...]:
+    ) -> CnReportDiscoveryResult:
         """列出符合 ``query.discovery_periods`` 与窗口约束的候选报告。
 
         实现细节：
@@ -243,18 +248,21 @@ class CninfoDiscoveryClient:
         Args:
             query: 单次 download 查询参数。
             profile: ``resolve_company`` 返回的公司元数据。
+            local_annual_ends: 同公司可信本地年度截止日；CN 必须为空。
             cancellation_checkpoint: 可选 workflow-owned 无参取消检查点；
                 每个受支持财期的每次 POST 前和成功响应后调用。
 
         Returns:
-            候选报告 tuple；按 ``fiscal_year`` 降序、再按 ``fiscal_period``
-            稳定顺序排序。
+            完整发现结果；确定候选按 ``fiscal_year`` 降序、再按 ``fiscal_period``
+            稳定顺序排序，CN 的未知集合显式为空。
 
         Raises:
             ValueError: market/provider/company_id 非法时抛出。
             FinsDownloadProviderError: 任一有效财期来源请求或协议失败时抛出。
         """
 
+        if local_annual_ends:
+            raise ValueError("CN discovery does not accept HK annual evidence")
         if query.market != "CN":
             raise ValueError(f"CninfoDiscoveryClient 仅支持 CN，收到 market={query.market!r}")
         if profile.provider != "cninfo":
@@ -288,11 +296,12 @@ class CninfoDiscoveryClient:
                 cancellation_checkpoint=cancellation_checkpoint,
             )
             raw_by_period[period] = tuple(announcements)
-        return select_cninfo_report_candidates(
+        candidates = select_cninfo_report_candidates(
             query=query,
             announcements_by_period=raw_by_period,
             read_head_meta=self._http_head_meta,
         )
+        return CnReportDiscoveryResult(candidates=candidates, uncertain_reports=())
 
     def download_report_pdf(self, candidate: CnReportCandidate) -> DownloadedReportAsset:
         """下载单份候选 PDF 并返回强类型资产对象。
@@ -470,7 +479,15 @@ class CninfoDiscoveryClient:
                 cancellation_checkpoint()
             if not isinstance(payload, dict):
                 raise _cninfo_protocol_error("巨潮来源返回的公告列表格式不符合预期")
-            items = payload.get("announcements")
+            if "announcements" not in payload:
+                # 空结果编码恒带 key（值为 null）；缺 key 是未知契约形态，
+                # 必须失败，防止错误载荷被伪装成“无候选”空成功。
+                raise _cninfo_protocol_error("巨潮来源返回的公告列表格式不符合预期")
+            items = payload["announcements"]
+            if items is None:
+                # 巨潮用 null 编码空结果（key 存在、值为 null，与
+                # totalRecordNum=0 同现）；与空数组同义，按空页结束分页。
+                break
             if not isinstance(items, list):
                 raise _cninfo_protocol_error("巨潮来源返回的公告列表格式不符合预期")
             if not items:

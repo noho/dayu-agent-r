@@ -1,0 +1,59 @@
+{
+  "argv": [
+    "/Users/leo/workspace/dayu-agent-r/.venv/bin/python",
+    "-m",
+    "pytest",
+    "tests/fins/test_cn_report_selection.py",
+    "tests/fins/test_hkexnews_downloader.py",
+    "tests/fins/test_cninfo_downloader.py",
+    "tests/fins/test_cn_pipeline.py",
+    "tests/fins/test_cn_download_workflow.py",
+    "tests/fins/test_cn_download_runtime.py",
+    "tests/fins/test_hk_period_rebuild.py",
+    "tests/fins/test_fins_storage_atomicity.py",
+    "tests/fins/test_fins_storage_provider.py",
+    "tests/fins/test_cn_download_identity.py",
+    "tests/fins/test_cn_download_models.py",
+    "tests/fins/test_fins_ingestion_runtime.py",
+    "tests/fins/test_fins_direct_stream.py",
+    "tests/fins/test_fins_service_runtime.py",
+    "tests/fins/test_sec_pipeline_download.py",
+    "tests/fins/test_sec_pipeline_download_stream.py",
+    "tests/cli/test_output.py",
+    "tests/service/test_fins_wait_adapter.py",
+    "tests/service/test_fins_direct.py",
+    "tests/fins/test_f5_storage_calendar.py",
+    "tests/fins/test_f5_workflow_rebuild.py",
+    "tests/fins/test_f5_result_contract.py",
+    "-q",
+    "--tb=short",
+    "--cov=dayu",
+    "--cov-report=json:/Users/leo/workspace/dayu-agent-r/workspace/tmp/pr197-f5-aggregate-fix-sol-20261002-01/validation/complete-final.coverage.json",
+    "--cov-report=term:skip-covered",
+    "-o",
+    "cache_dir=/Users/leo/workspace/dayu-agent-r/workspace/tmp/pr197-f5-aggregate-fix-sol-20261002-01/validation/complete-cache"
+  ],
+  "cwd": "/Users/leo/workspace/dayu-agent-r",
+  "python": "3.11.15 (main, Mar  3 2026, 00:52:57) [Clang 17.0.0 (clang-1700.6.3.2)]",
+  "env": {
+    "VIRTUAL_ENV": "/Users/leo/workspace/dayu-agent-r/.venv",
+    "PATH": "/Users/leo/workspace/dayu-agent-r/.venv/bin:/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex-path:/Users/leo/.codex/tmp/arg0/codex-arg0Y5DWMe:/Users/leo/.codex/tmp/arg0/codex-arg0bnQM21:/opt/homebrew/Caskroom/miniconda/base/bin:/Users/leo/bin:/Users/leo/.local/bin:/opt/homebrew/bin:/Users/leo/workspace/python:/usr/local/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin:/pkg/env/global/bin:/Library/TeX/texbin:/opt/homebrew/Caskroom/miniconda/base/bin:/Users/leo/bin:/Users/leo/.local/bin:/opt/homebrew/bin:/Users/leo/workspace/python:/Applications/iTerm.app/Contents/Resources/utilities:/opt/homebrew/share/android-commandlinetools/ndk/29.0.14206865:/opt/homebrew/share/android-commandlinetools/platform-tools:/opt/homebrew/share/android-commandlinetools/ndk/29.0.14206865:/opt/homebrew/share/android-commandlinetools/platform-tools",
+    "COVERAGE_FILE": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/pr197-f5-aggregate-fix-sol-20261002-01/validation/complete-final.coverage-data",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONPATH": null
+  },
+  "activation": "source .venv/bin/activate",
+  "exit_code": 0,
+  "duration_wall_s": 71.3718569278717,
+  "input_files_unchanged": true,
+  "stdout": {
+    "path": "workspace/tmp/pr197-f5-aggregate-fix-sol-20261002-01/validation/complete-final.stdout",
+    "bytes": 34309,
+    "sha256": "7493df7c4807bdceb8134494b89ad558179e5a5a236435b29ec4171920cf3fc8"
+  },
+  "stderr": {
+    "path": "workspace/tmp/pr197-f5-aggregate-fix-sol-20261002-01/validation/complete-final.stderr",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+}

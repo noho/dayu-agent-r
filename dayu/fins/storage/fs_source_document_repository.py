@@ -29,6 +29,7 @@ from dayu.fins.domain.enums import SourceKind
 from ._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
 from .file_store import FileStore
 from .repository_protocols import SourceDocumentRepositoryProtocol, SourceSnapshotProtocol
+from .source_meta_read import SourceMetaIntegrityReadEntry, SourceMetaReadView
 from .source_integrity import SourceIntegrityClassification
 
 
@@ -220,6 +221,10 @@ def _build_material_restore_request(req: SourceDocumentStateChangeRequest) -> Ma
 
 class FsSourceDocumentRepository(SourceDocumentRepositoryProtocol):
     """基于文件系统的源文档仓储实现。"""
+
+    def update_material_amended(self, *, batch: BatchToken, document_id: str, amended: bool) -> None:
+        """参数：已登记材料 batch、文档、修订值；返回：无；异常：严格事实、条件或 I/O 失败。"""
+        self._repository_set.core.update_material_amended(batch=batch, document_id=document_id, amended=amended)
 
     def __init__(
         self,
@@ -545,6 +550,41 @@ class FsSourceDocumentRepository(SourceDocumentRepositoryProtocol):
         """
 
         return self._repository_set.core.get_source_meta(ticker, document_id, source_kind)
+
+    def read_source_meta_integrity_view(
+        self, ticker: str, source_kind: SourceKind, *, batch: BatchToken | None,
+    ) -> tuple[SourceMetaIntegrityReadEntry, ...]:
+        """读取同一稳定根内的完整原始元数据和完整性分类。
+
+        参数：ticker 为公司身份；source_kind 为来源；batch 为同 core/ticker 的
+            open capability，None 时持短 publication guard。
+        返回：完整有序观察，每份独立 JSON 树顶层只读，嵌套值仅供只读消费。
+        异常：校验 ValueError、原读取 OSError、完整性异常及锁异常原样传播。
+        """
+        return self._repository_set.core.read_source_meta_integrity_view(ticker, source_kind, batch=batch)
+
+    def read_source_meta_view(
+        self, ticker: str, source_kind: SourceKind,
+    ) -> SourceMetaReadView:
+        """在同一个 publication guard 内按原 list/get 规则读取源元数据。
+
+        Args:
+            ticker: exact external ticker。
+            source_kind: 必填的 filing 或 material 来源类型。
+
+        Returns:
+            完整有序枚举的成功元数据前缀及首个原 ValueError/OSError 对象；
+            read_error 为 None 才表示全部读取完成。每份元数据来自本次独立
+            JSON 解析，顶层只读；嵌套 JSON 由消费者只读使用，独立于其他
+            公开读取与后续发布，不代表完整性或写授权。
+
+        Raises:
+            ValueError: 输入或完整枚举不合法时抛出。
+            OSError: 完整枚举的 I/O 失败时抛出。
+            RuntimeFileLockError: publication guard 获取或释放失败时抛出。
+            Exception: 非 ValueError/OSError 的元数据读取异常原样传播。
+        """
+        return self._repository_set.core.read_source_meta_view(ticker, source_kind)
 
     def classify_source_integrity(
         self,

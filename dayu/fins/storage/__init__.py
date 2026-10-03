@@ -1,6 +1,8 @@
 """财报仓储子包导出。"""
 
+from .fs_material_upload_state_repository import FsMaterialUploadStateRepository
 from .file_store import FileStore
+from .asset_filename_contract import DOCUMENT_SOURCE_CONTROL_FILENAMES
 from .fs_batching_repository import FsBatchingRepository
 from .fs_company_meta_repository import FsCompanyMetaRepository
 from .fs_document_blob_repository import FsDocumentBlobRepository
@@ -10,6 +12,7 @@ from .fs_processed_document_repository import FsProcessedDocumentRepository
 from .fs_source_document_repository import FsSourceDocumentRepository
 from .local_file_store import LocalFileStore
 from .repository_protocols import (
+    MaterialUploadOriginalDescriptor, MaterialUploadPublicationIdentity, MaterialUploadPublishedState, MaterialUploadStateRepositoryProtocol,
     BatchingRepositoryProtocol,
     CompanyMetaRepositoryProtocol,
     CompanyTickerAliasConflictError,
@@ -38,19 +41,26 @@ from .source_integrity import (
     SourceIntegrityRepairBlockedReason,
     SourceIntegrityReason,
     SourceIntegrityRevisionConflictError,
+    SourceIntegrityRepairRequiredError,
     SourceIntegrityStatus,
     classify_source_integrity_preflight,
     has_same_source_publication_identity,
 )
+from .source_meta_read import SourceMetaIntegrityReadEntry, SourceMetaReadEntry, SourceMetaReadView
 from .source_meta_contract import require_source_meta_is_deleted
 
 __all__ = [
+    "FsMaterialUploadStateRepository", "MaterialUploadOriginalDescriptor", "MaterialUploadPublicationIdentity", "MaterialUploadPublishedState", "MaterialUploadStateRepositoryProtocol",
+    "DOCUMENT_SOURCE_CONTROL_FILENAMES",
     "BatchingRepositoryProtocol",
     "CompanyMetaRepositoryProtocol",
     "CompanyTickerAliasConflictError",
     "CompanyTickerIdentityCorruptionError",
     "CompanyTickerIdentityCorruptionKind",
     "SourceDocumentRepositoryProtocol",
+    "SourceMetaIntegrityReadEntry",
+    "SourceMetaReadEntry",
+    "SourceMetaReadView",
     "ProcessedDocumentRepositoryProtocol",
     "DocumentBlobRepositoryProtocol",
     "FILING_UPLOAD_ASSET_SOURCE_DOCLING",
@@ -80,6 +90,7 @@ __all__ = [
     "SourceIntegrityRepairBlockedReason",
     "SourceIntegrityReason",
     "SourceIntegrityRevisionConflictError",
+    "SourceIntegrityRepairRequiredError",
     "SourceIntegrityStatus",
     "classify_source_integrity_preflight",
     "has_same_source_publication_identity",

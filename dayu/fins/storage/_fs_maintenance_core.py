@@ -20,12 +20,12 @@ from dayu.fins.domain.enums import SourceKind
 
 from ._fs_storage_infra import _ActiveBatchState, _FsStorageInfra
 from ._fs_identity import (
-    _IDENTITY_DESCRIPTOR_FILENAME,
     _REJECTED_FILING_IDENTITY_NAMESPACE,
     _list_external_identities,
     _read_identity_descriptor,
     _require_external_identity,
 )
+from .asset_filename_contract import DOCUMENT_SOURCE_CONTROL_FILENAMES
 from ._fs_storage_utils import (
     _REJECTED_FILINGS_DIRNAME,
     _SOURCE_META_FILENAME,
@@ -577,10 +577,7 @@ class _FsMaintenanceMixin(_FsStorageInfra):
                 artifact_dir,
                 action="枚举 rejected filing artifact 文件",
             ):
-                if child.name in {
-                    _IDENTITY_DESCRIPTOR_FILENAME,
-                    _SOURCE_META_FILENAME,
-                }:
+                if child.name in DOCUMENT_SOURCE_CONTROL_FILENAMES:
                     continue
                 if child.is_symlink() or not child.is_file():
                     raise ValueError("rejected filing artifact 存在非法文件条目")

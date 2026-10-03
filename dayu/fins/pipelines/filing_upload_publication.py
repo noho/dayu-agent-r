@@ -11,6 +11,7 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Final, NoReturn
 
+from dayu.fins.domain.enums import SourceKind
 from dayu.contracts.cancellation import CancellationToken
 from dayu.fins.company_metadata_warning import (
     CompanyMetadataWarning,
@@ -18,9 +19,8 @@ from dayu.fins.company_metadata_warning import (
 )
 from dayu.fins.domain.company_meta_contract import CompanyMetaCommitOutcome
 from dayu.fins.domain.document_models import BatchToken
+from dayu.fins.upload_usage_contract import FinsUploadUsageCode, FinsUploadUsageError
 from dayu.fins.ingestion_runtime import (
-    FinsUploadUsageCode,
-    FinsUploadUsageError,
     ValidatedFinsUploadFilingRequest,
     validate_fins_upload_filing_request,
 )
@@ -540,10 +540,10 @@ def arbitrate_filing_upload_publication(
             and fresh_request.resolved_action == "create"
         ):
             return _publish_decision(FilingUploadPublishMode.REBASE_CREATE_OVERWRITE)
-        return _conflict_decision(fins_upload_source_publication_conflict_failure())
+        return _conflict_decision(fins_upload_source_publication_conflict_failure(source_kind=SourceKind.FILING))
     if initial_status is SourceIntegrityStatus.REPAIR_REQUIRED:
         return _conflict_decision(fins_upload_source_revision_stale_failure())
-    return _conflict_decision(fins_upload_source_publication_conflict_failure())
+    return _conflict_decision(fins_upload_source_publication_conflict_failure(source_kind=SourceKind.FILING))
 
 
 def _is_cancelled(cancellation: CancellationToken | None) -> bool:
@@ -727,6 +727,7 @@ def execute_prepared_filing_publication(
             return FilingUploadPublicationOutcome(
                 authoritative_request=request,
                 result=_build_cancelled_result(
+            source_kind=SourceKind.FILING,
                     document_id=request.document_id,
                     internal_document_id=request.internal_document_id,
                 ),
@@ -746,7 +747,7 @@ def execute_prepared_filing_publication(
         except FinsUploadUsageError as error:
             if error.failure.code not in _STATE_DEPENDENT_USAGE_CODES:
                 raise
-            validation_failure = fins_upload_source_publication_conflict_failure()
+            validation_failure = fins_upload_source_publication_conflict_failure(source_kind=SourceKind.FILING)
             fresh_request = None
         except FinsUploadPrevalidationError as error:
             validation_failure = error.failure
@@ -775,6 +776,7 @@ def execute_prepared_filing_publication(
             return FilingUploadPublicationOutcome(
                 authoritative_request=request,
                 result=_build_cancelled_result(
+            source_kind=SourceKind.FILING,
                     document_id=request.document_id,
                     internal_document_id=request.internal_document_id,
                 ),
@@ -858,6 +860,7 @@ def execute_prepared_filing_publication(
         # capability 转交 existing commit owner；从此由其负责 publish/cancel/rollback/commit。
         batch_terminal_started = True
         result = commit_prepared_upload_batch(
+                material_state_repository=None,
             service=upload_service,
             batching_repository=batching_repository,
             batch=batch,

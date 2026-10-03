@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from dayu.fins.download_contract import FinsDownloadRequest
     from dayu.fins.ingestion_runtime import (
         FinsPreprocessRequest,
-        FinsUploadRequest,
+        FinsRuntimeUploadRequest,
     )
 
 FINS_OBSERVATION_HANDLE_ID_PREFIX: Final[str] = "finsobs_"
@@ -239,7 +239,7 @@ class FinsObservationRuntime(Protocol):
 
     def start_observed_upload(
         self,
-        request: FinsUploadRequest,
+        request: FinsRuntimeUploadRequest,
         cancellation_token: CancellationToken,
     ) -> FinsObservationHandle:
         """启动可观察 upload operation。
@@ -253,7 +253,7 @@ class FinsObservationRuntime(Protocol):
 
     def prepare_observed_upload(
         self,
-        request: FinsUploadRequest,
+        request: FinsRuntimeUploadRequest,
         cancellation_token: CancellationToken,
     ) -> FinsObservationHandle:
         """登记可观察 upload operation，但不启动后台执行。

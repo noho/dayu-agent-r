@@ -7,6 +7,7 @@ Host、tool/provider 装配不在本 Slice 内。
 """
 
 from __future__ import annotations
+from dataclasses import replace
 
 import asyncio
 import logging
@@ -34,19 +35,33 @@ from dayu.fins.download_contract import (
     FinsDownloadDocumentResult,
     FinsDownloadEffectiveFilters,
     FinsDownloadResultSummary,
+    FinsDownloadUncertainReport,
+    FinsDownloadTerminalDisposition,
     FinsDownloadSource,
 )
 from dayu.fins.ingestion_runtime import (
     FinsDownloadProgressEvent,
     FinsDownloadProgressSink,
     FinsSourceDownloadAdapter,
+    FinsSourceDownloadAdapterFailure,
     FinsSourceDownloadAdapterRequest,
     FinsSourceDownloadAdapterResult,
     ValidatedFinsUploadFilingRequest,
+    ValidatedFinsUploadMaterialRequest,
+    FinsUploadMaterialRequest,
+    FINS_UPLOAD_ACTION_AUTO,
+    admit_fins_upload_material_request,
+    validated_fins_upload_file_count,
 )
 from dayu.fins.domain.document_models import FinsIngestMethod
 from dayu.fins.domain.enums import SourceKind
-from dayu.fins.pipelines.cn_download_models import CN_FISCAL_PERIOD_ORDER, CnMarketKind
+from dayu.fins.pipelines.cn_download_models import (
+    CN_DOWNLOAD_NORMAL_TERMINAL_STATUSES,
+    CN_DOWNLOAD_TERMINAL_CANCELLED,
+    CN_DOWNLOAD_TERMINAL_INTEGRITY_FAILED,
+    CN_FISCAL_PERIOD_ORDER,
+    CnMarketKind,
+)
 from dayu.fins.pipelines.cn_download_pdf_gate import (
     CnDownloadPdfGateProtocol,
     NoopCnDownloadPdfGate,
@@ -54,31 +69,32 @@ from dayu.fins.pipelines.cn_download_pdf_gate import (
 from dayu.fins.pipelines.cn_download_protocols import (
     CnReportDiscoveryClientProtocol,
 )
-from dayu.fins.pipelines.cn_download_workflow import run_cn_download_stream_impl
+from dayu.fins.pipelines.cn_download_workflow import (
+    CnDownloadIntegrityAbort,
+    run_cn_download_stream_impl,
+)
 from dayu.fins.pipelines._filing_upload_fresh_validation import (
     resolve_fresh_filing_request,
 )
 from dayu.fins.pipelines.docling_upload_service import (
     DoclingUploadService,
     UploadOperationResult,
-    build_material_ids,
     commit_prepared_upload_batch,
     derive_report_kind,
     resolve_upload_action,
     rollback_prepared_upload_batch,
-    validate_material_upload_ids,
 )
 from dayu.fins.pipelines.filing_upload_publication import (
     execute_prepared_filing_publication,
 )
+from dayu.fins.pipelines.docling_converter_factory import create_docling_converter
 from dayu.fins.pipelines.docling_process_converter import (
     DoclingConverter,
-    ProcessDoclingConverter,
 )
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
+from dayu.fins.pipelines.material_upload_publication import execute_material_upload_company_stage, execute_prepared_material_publication
 from dayu.fins.pipelines.upload_company_meta import (
     build_upload_company_id,
-    stage_company_meta_for_upload,
     stage_upload_company_meta_decision,
 )
 from dayu.fins.pipelines.upload_filing_events import UploadFilingEvent, UploadFilingEventType
@@ -98,6 +114,7 @@ from dayu.fins.storage import (
     FsDocumentBlobRepository,
     FsFilingMaintenanceRepository,
     FsFilingUploadStateRepository,
+    MaterialUploadStateRepositoryProtocol,
     FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
     ProcessedDocumentRepositoryProtocol,
@@ -105,7 +122,6 @@ from dayu.fins.storage import (
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
 from dayu.fins.ticker_normalization import normalize_ticker, try_normalize_ticker
-from dayu.fins.upload_format_contract import FinsUploadMaterialFiles
 from dayu.fins.upload_failure import (
     FinsUploadFailureError,
     FinsUploadFailureReason,
@@ -121,8 +137,6 @@ _CN_FORMS_ADAPTER_JOINER: Final[str] = ","
 _CN_STATUS_DOWNLOADED: Final[str] = "downloaded"
 _CN_STATUS_SKIPPED: Final[str] = "skipped"
 _CN_STATUS_FAILED: Final[str] = "failed"
-_CN_TERMINAL_OK: Final[str] = "ok"
-_CN_TERMINAL_CANCELLED: Final[str] = "cancelled"
 _ADAPTER_PROGRESS_FILE_STARTED: Final[str] = "download.file_started"
 _ADAPTER_PROGRESS_FILE_COMPLETED: Final[str] = "download.file_completed"
 _ADAPTER_PROGRESS_FILE_SKIPPED: Final[str] = "download.file_skipped"
@@ -199,6 +213,7 @@ async def collect_cn_download_result_from_events(
 
     Raises:
         RuntimeError: 事件流未产生完成事件，或完成事件缺少结果时抛出。
+        CnDownloadIntegrityAbort: 工作流已有文档后遇到封闭完整性失败时透传。
     """
 
     async for event in events:
@@ -341,6 +356,7 @@ class CnPipeline:
     def __init__(
         self,
         *,
+        material_upload_state_repository: MaterialUploadStateRepositoryProtocol,
         workspace_root: Optional[Path] = None,
         cn_discovery_client: CnReportDiscoveryClientProtocol | None = None,
         hk_discovery_client: CnReportDiscoveryClientProtocol | None = None,
@@ -360,6 +376,7 @@ class CnPipeline:
         """初始化 CN/HK 下载管线。
 
         Args:
+            material_upload_state_repository: 必传材料状态仓储，必须与写入仓储共享同一个 core。
             workspace_root: Fins 工作区根目录。
             cn_discovery_client: 可选巨潮 discovery client。
             hk_discovery_client: 可选披露易 discovery client。
@@ -416,6 +433,7 @@ class CnPipeline:
             self._workspace_root,
             repository_set=repository_set,
         )
+        self._material_upload_state_repository = material_upload_state_repository
         self._user_agent = user_agent
         self._sleep_seconds = sleep_seconds
         self._max_retries = max_retries
@@ -430,7 +448,7 @@ class CnPipeline:
             max_retries=max_retries,
         )
         self._pdf_download_gate = pdf_download_gate or NoopCnDownloadPdfGate()
-        self._docling_converter = docling_converter or ProcessDoclingConverter()
+        self._docling_converter = docling_converter or create_docling_converter(self._workspace_root)
         self._upload_service = DoclingUploadService(
             source_repository=self._source_repository,
             blob_repository=self._blob_repository,
@@ -677,6 +695,8 @@ class CnPipeline:
         Raises:
             RuntimeError: 当前线程已有事件循环时抛出。
             ValueError: ticker 或过滤参数非法时抛出。
+            CnDownloadIntegrityAbort: 已处理文档后的完整性中止。
+            SourceIntegrityPreflightError: 首候选前的完整性预检失败。
         """
 
         return _run_async_download_sync(
@@ -726,6 +746,8 @@ class CnPipeline:
 
         Raises:
             ValueError: ticker 或过滤参数非法时抛出。
+            CnDownloadIntegrityAbort: 已处理文档后的完整性中止。
+            SourceIntegrityPreflightError: 首候选前的完整性预检失败。
         """
 
         pipeline_name = _pipeline_name_for_ticker(ticker)
@@ -836,7 +858,7 @@ class CnPipeline:
                 "company_name": raw_request.company_name,
                 "ticker_aliases": _json_text_list(list(raw_request.ticker_aliases)),
                 "overwrite": raw_request.overwrite,
-                "file_count": len(raw_request.files),
+                "file_count": validated_fins_upload_file_count(authoritative_request),
             },
         )
         try:
@@ -883,6 +905,7 @@ class CnPipeline:
                     )
                     raise
                 upload_result = commit_prepared_upload_batch(
+                material_state_repository=None,
                     service=self._upload_service,
                     batching_repository=self._batching_repository,
                     batch=publication_batch,
@@ -968,152 +991,130 @@ class CnPipeline:
 
     def upload_material(
         self,
-        ticker: str,
-        action: Optional[str],
-        form_type: str,
-        material_name: str,
-        files: Optional[list[Path]] = None,
-        document_id: Optional[str] = None,
-        internal_document_id: Optional[str] = None,
-        fiscal_year: Optional[int] = None,
-        fiscal_period: Optional[str] = None,
-        filing_date: Optional[str] = None,
-        report_date: Optional[str] = None,
-        company_id: Optional[str] = None,
-        company_name: Optional[str] = None,
-        ticker_aliases: Optional[list[str]] = None,
-        overwrite: bool = False,
+        request: FinsUploadMaterialRequest,
         *,
         cancellation_checker: CancellationToken | None = None,
     ) -> CnPipelineUploadResult:
-        """执行 CN/HK 材料上传并同步返回聚合结果。
+        """同步准入 raw material 请求并执行 CN/HK 上传。
 
         Args:
-            ticker: 股票代码。
-            action: 可选动作类型。
-            form_type: 材料类型。
-            material_name: 材料名称。
-            files: 可选上传文件列表。
-            document_id: 可选文档 ID。
-            internal_document_id: 可选内部文档 ID。
-            fiscal_year: 可选财年。
-            fiscal_period: 可选财期。
-            filing_date: 可选披露日期。
-            report_date: 可选报告日期。
-            company_id: 可选兼容字段。
-            company_name: 公司名称。
-            ticker_aliases: 可选 ticker alias。
-            overwrite: 是否强制覆盖。
-            cancellation_checker: 可选协作式取消检查器。
+            request: 原始 material 请求。
+            cancellation_checker: 可选取消检查器。
 
         Returns:
-            上传结果字典。
+            聚合上传结果。
 
         Raises:
-            RuntimeError: 当前线程存在运行中的事件循环时抛出。
+            FinsUploadUsageError: 资产规划失败时抛出。
+            RuntimeError: 已有运行中事件循环时抛出。
         """
 
         return _run_async_upload_sync(
             collect_cn_upload_result_from_events(
-                self.upload_material_stream(
-                    ticker=ticker,
-                    action=action,
-                    form_type=form_type,
-                    material_name=material_name,
-                    files=files,
-                    document_id=document_id,
-                    internal_document_id=internal_document_id,
-                    fiscal_year=fiscal_year,
-                    fiscal_period=fiscal_period,
-                    filing_date=filing_date,
-                    report_date=report_date,
-                    company_id=company_id,
-                    company_name=company_name,
-                    ticker_aliases=ticker_aliases,
-                    overwrite=overwrite,
-                    cancellation_checker=cancellation_checker,
-                ),
+                self.upload_material_stream(request, cancellation_checker=cancellation_checker),
                 stream_name="upload_material_stream",
             )
         )
 
     async def upload_material_stream(
         self,
-        ticker: str,
-        action: Optional[str],
-        form_type: str,
-        material_name: str,
-        files: Optional[list[Path]] = None,
-        document_id: Optional[str] = None,
-        internal_document_id: Optional[str] = None,
-        fiscal_year: Optional[int] = None,
-        fiscal_period: Optional[str] = None,
-        filing_date: Optional[str] = None,
-        report_date: Optional[str] = None,
-        company_id: Optional[str] = None,
-        company_name: Optional[str] = None,
-        ticker_aliases: Optional[list[str]] = None,
-        overwrite: bool = False,
+        request: FinsUploadMaterialRequest,
         *,
         cancellation_checker: CancellationToken | None = None,
     ) -> AsyncIterator[UploadMaterialEvent]:
-        """执行流式 CN/HK 材料上传。
+        """在首个事件前准入 raw material 请求。
 
         Args:
-            ticker: 股票代码。
-            action: 可选动作类型。
-            form_type: 材料类型。
-            material_name: 材料名称。
-            files: 可选上传文件列表。
-            document_id: 可选文档 ID。
-            internal_document_id: 可选内部文档 ID。
-            fiscal_year: 可选财年。
-            fiscal_period: 可选财期。
-            filing_date: 可选披露日期。
-            report_date: 可选报告日期。
-            company_id: 可选兼容字段。
-            company_name: 公司名称。
-            ticker_aliases: 可选 ticker alias。
-            overwrite: 是否强制覆盖。
-            cancellation_checker: 可选协作式取消检查器。
+            request: 原始 material 请求。
+            cancellation_checker: 可选取消检查器。
 
         Yields:
-            上传过程事件流。
+            CN/HK material 上传事件。
 
         Raises:
-            RuntimeError: 上传执行失败时抛出。
+            FinsUploadUsageError: 资产规划失败时抛出。
         """
 
-        file_list = files or []
+        build_upload_company_id(_normalize_upload_ticker(request.ticker))
+        validated = admit_fins_upload_material_request(request, state_repository=self._material_upload_state_repository)
+        async for event in self.upload_material_validated_stream(
+            validated, cancellation_checker=cancellation_checker
+        ):
+            yield event
+
+    def upload_material_validated(
+        self,
+        request: ValidatedFinsUploadMaterialRequest,
+        *,
+        cancellation_checker: CancellationToken | None = None,
+    ) -> CnPipelineUploadResult:
+        """同步执行已经准入的 CN/HK material 请求。
+
+        Args:
+            request: 同一次 Fins 准入的 handoff。
+            cancellation_checker: 可选取消检查器。
+
+        Returns:
+            聚合上传结果。
+
+        Raises:
+            RuntimeError: 已有运行中事件循环时抛出。
+        """
+
+        return _run_async_upload_sync(
+            collect_cn_upload_result_from_events(
+                self.upload_material_validated_stream(
+                    request, cancellation_checker=cancellation_checker
+                ),
+                stream_name="upload_material_validated_stream",
+            )
+        )
+
+    async def upload_material_validated_stream(
+        self,
+        request: ValidatedFinsUploadMaterialRequest,
+        *,
+        cancellation_checker: CancellationToken | None = None,
+    ) -> AsyncIterator[UploadMaterialEvent]:
+        """以同一资产计划执行 CN/HK material 上传。
+
+        Args:
+            request: 同一次 Fins 准入的 handoff。
+            cancellation_checker: 可选取消检查器。
+
+        Yields:
+            CN/HK material 上传事件。
+
+        Raises:
+            FinsUploadUsageError: handoff 静态准入或规划失败时抛出。
+            ValueError: handoff 或业务身份输入非法时抛出。
+        """
+
+        request.validate()
+        raw = request.request
+        ticker = raw.ticker
+        identity = request.identity
+        form_type = identity.form_type
+        material_name = identity.material_name
+        fiscal_year = identity.fiscal_year
+        fiscal_period = identity.fiscal_period
+        filing_date = raw.filing_date
+        report_date = raw.report_date
+        company_name = raw.company_name
+        ticker_aliases = list(raw.ticker_aliases)
+        overwrite = raw.overwrite
+        file_list = list(request.file_selection.files)
         normalized_ticker = _normalize_upload_ticker(ticker)
         normalized_company_id = build_upload_company_id(normalized_ticker)
-        normalized_fiscal_period = str(fiscal_period or "").strip().upper() or None
-        stable_document_id, stable_internal_document_id = build_material_ids(
-            form_type=form_type,
-            material_name=material_name,
-            fiscal_year=fiscal_year,
-            fiscal_period=normalized_fiscal_period,
-        )
-        resolved_document_id, resolved_internal_id = validate_material_upload_ids(
-            stable_document_id=stable_document_id,
-            stable_internal_document_id=stable_internal_document_id,
-            document_id=document_id,
-            internal_document_id=internal_document_id,
-        )
-        requested_action = str(action or "").strip().lower() or None
+        normalized_fiscal_period = identity.fiscal_period
+        resolved_document_id = identity.document_id
+        resolved_internal_id = identity.internal_document_id
+        requested_action = request.action_decision.pipeline_action
         resolved_action: str | None = None
         try:
-            selection = (
-                FinsUploadMaterialFiles.for_delete()
-                if requested_action == "delete"
-                else FinsUploadMaterialFiles.from_upsert_paths(tuple(file_list))
-            )
-            previous_meta = self._safe_get_upload_document_meta(
-                normalized_ticker,
-                resolved_document_id,
-                SourceKind.MATERIAL,
-            )
-            resolved_action = resolve_upload_action(action, previous_meta)
+            selection = request.asset_plan
+            previous_meta = request.state_admission.observed_state.source_meta
+            resolved_action = request.state_admission.resolved_action
             yield UploadMaterialEvent(
                 event_type=UploadMaterialEventType.UPLOAD_STARTED,
                 ticker=normalized_ticker,
@@ -1133,23 +1134,11 @@ class CnPipeline:
                     "company_name": company_name,
                     "ticker_aliases": _json_text_list(ticker_aliases),
                     "overwrite": overwrite,
-                    "file_count": len(file_list),
+                    "file_count": validated_fins_upload_file_count(request),
+                    "requested_amended": raw.amended,
                 },
             )
-            company_batch = self._batching_repository.begin_batch(normalized_ticker)
-            try:
-                stage_company_meta_for_upload(
-                    repository=self._company_repository,
-                    ticker=normalized_ticker,
-                    action=resolved_action,
-                    company_name=company_name,
-                    ticker_aliases=ticker_aliases,
-                    batch=company_batch,
-                )
-            except BaseException:
-                self._batching_repository.rollback_batch(company_batch)
-                raise
-            self._batching_repository.commit_batch(company_batch)
+            expected_company_meta = execute_material_upload_company_stage(request=request, state_repository=self._material_upload_state_repository, company_repository=self._company_repository, batching_repository=self._batching_repository, cancellation=cancellation_checker)
             prepared_upload = await self._upload_service.prepare_upload(
                 ticker=normalized_ticker,
                 source_kind=SourceKind.MATERIAL,
@@ -1166,22 +1155,15 @@ class CnPipeline:
                     "company_id": normalized_company_id,
                     "ingest_method": FinsIngestMethod.UPLOAD.to_storage_value(),
                     "material_name": material_name,
+                    "amended": raw.amended,
                     "fiscal_year": fiscal_year,
                     "fiscal_period": normalized_fiscal_period,
                     "filing_date": filing_date,
                     "report_date": report_date,
                 },
             )
-            if isinstance(prepared_upload, UploadOperationResult):
-                upload_result = prepared_upload
-            else:
-                upload_result = commit_prepared_upload_batch(
-                    service=self._upload_service,
-                    batching_repository=self._batching_repository,
-                    batch=self._batching_repository.begin_batch(normalized_ticker),
-                    prepared=prepared_upload,
-                    cancellation=cancellation_checker,
-                )
+            outcome = execute_prepared_material_publication(request=request, prepared=prepared_upload, expected_company_meta=expected_company_meta, state_repository=self._material_upload_state_repository, batching_repository=self._batching_repository, upload_service=self._upload_service, cancellation=cancellation_checker)
+            upload_result = outcome.result
             for file_event in upload_result.file_events:
                 yield UploadMaterialEvent(
                     event_type=_map_upload_file_event_to_material_event_type(file_event),
@@ -1207,6 +1189,7 @@ class CnPipeline:
                 overwrite=overwrite,
                 **upload_result.payload,
                 stored_file_count=upload_result.stored_file_count,
+                published_amended=upload_result.published_amended,
                 status=_resolve_upload_status(upload_result.status),
             )
             yield UploadMaterialEvent(
@@ -1236,6 +1219,7 @@ class CnPipeline:
                 company_name=company_name,
                 overwrite=overwrite,
                 stored_file_count=0,
+                published_amended=None,
                 status="failed",
                 message=failure_reason.message,
                 failure=failure_reason.to_json(),
@@ -1347,6 +1331,8 @@ class CnDownloadAdapter(FinsSourceDownloadAdapter):
         Raises:
             ValueError: ticker 市场或来源非法时抛出。
             RuntimeError: CN/HK 下载失败时抛出。
+            FinsSourceDownloadAdapterFailure: 已处理文档后的完整性中止。
+            SourceIntegrityPreflightError: 首候选前的完整性预检失败。
         """
 
         if request.normalized_ticker.market != self._market:
@@ -1356,21 +1342,30 @@ class CnDownloadAdapter(FinsSourceDownloadAdapter):
         expected_source = FinsDownloadSource.CNINFO if self._market == "CN" else FinsDownloadSource.HKEXNEWS
         if request.source is not expected_source:
             raise ValueError(f"CN/HK 下载来源不匹配: expected={expected_source.value} actual={request.source.value}")
-        result = _run_async_download_sync(
-            collect_cn_download_result_from_events(
-                self._pipeline.download_stream(
-                    ticker=request.normalized_ticker.canonical,
-                    form_type=_form_type_from_adapter_request(request.form_types),
-                    start_date=request.date_range.start_text,
-                    end_date=request.date_range.end_text,
-                    overwrite=request.overwrite_existing,
-                    rebuild=request.rebuild_local_artifacts,
-                    start_is_explicit=request.date_range.start_is_explicit,
-                    cancel_checker=request.cancellation_checker,
-                ),
-                progress_sink=request.progress_sink,
+        try:
+            result = _run_async_download_sync(
+                collect_cn_download_result_from_events(
+                    self._pipeline.download_stream(
+                        ticker=request.normalized_ticker.canonical,
+                        form_type=_form_type_from_adapter_request(request.form_types),
+                        start_date=request.date_range.start_text,
+                        end_date=request.date_range.end_text,
+                        overwrite=request.overwrite_existing,
+                        rebuild=request.rebuild_local_artifacts,
+                        start_is_explicit=request.date_range.start_is_explicit,
+                        cancel_checker=request.cancellation_checker,
+                    ),
+                    progress_sink=request.progress_sink,
+                )
             )
-        )
+        except CnDownloadIntegrityAbort as exc:
+            persisted_summary = _summary_from_integrity_abort(
+                exc.result,
+                uncertain_reports=exc.uncertain_reports,
+                request=request,
+                source_repository=self._pipeline.source_repository,
+            )
+            raise FinsSourceDownloadAdapterFailure(exc.cause, persisted_summary) from exc
         persisted_summary = _summary_from_pipeline_result(
             result,
             request=request,
@@ -1422,8 +1417,66 @@ def _summary_from_pipeline_result(
     """
 
     status = _required_cn_text(result, "status")
-    if status not in {_CN_TERMINAL_OK, _CN_TERMINAL_CANCELLED}:
+    if status not in CN_DOWNLOAD_NORMAL_TERMINAL_STATUSES:
         raise ValueError(f"CN/HK 下载结果 terminal status 未封闭: {status}")
+    return _project_cn_pipeline_summary(
+        result, request=request, source_repository=source_repository,
+        uncertain_reports=tuple(FinsDownloadUncertainReport.from_json_value(item) for item in _required_cn_mapping_list(result, "uncertain_reports")),
+    )
+
+
+def _summary_from_integrity_abort(
+    result: Mapping[str, JsonValue],
+    *,
+    request: FinsSourceDownloadAdapterRequest,
+    uncertain_reports: tuple[FinsDownloadUncertainReport, ...],
+    source_repository: SourceDocumentRepositoryProtocol,
+) -> FinsDownloadResultSummary:
+    """严格验证私有失败状态后投影同一已处理文档快照。
+
+    Args:
+        result: workflow 给出的失败快照。
+        request: 原下载请求。
+        uncertain_reports: typed 中止携带的完整独立未知集合。
+        source_repository: 文档 locator 真源。
+
+    Returns:
+        已验证的持久文档摘要。
+
+    Raises:
+        ValueError: 状态或任何行、身份、筛选条件非法时抛出。
+        OSError: locator 查询失败时抛出。
+    """
+
+    status = _required_cn_text(result, "status")
+    if status != CN_DOWNLOAD_TERMINAL_INTEGRITY_FAILED:
+        raise ValueError(f"CN/HK 完整性失败快照 status 未封闭: {status}")
+    return _project_cn_pipeline_summary(result, request=request, source_repository=source_repository, uncertain_reports=uncertain_reports)
+
+
+def _project_cn_pipeline_summary(
+    result: Mapping[str, JsonValue],
+    *,
+    request: FinsSourceDownloadAdapterRequest,
+    source_repository: SourceDocumentRepositoryProtocol,
+    uncertain_reports: tuple[FinsDownloadUncertainReport, ...],
+) -> FinsDownloadResultSummary:
+    """在各入口已验证 status 后复用唯一纯文档投影。
+
+    Args:
+        result: workflow 结果。
+        request: 原下载请求。
+        uncertain_reports: 由正常解码或 typed 中止提供的完整独立未知集合。
+        source_repository: 文档 locator 真源。
+
+    Returns:
+        已验证的持久文档摘要。
+
+    Raises:
+        ValueError: 行、身份或筛选条件非法时抛出。
+        OSError: locator 查询失败时抛出。
+    """
+
     ticker = _required_cn_text(result, "ticker")
     if ticker != request.normalized_ticker.canonical:
         raise ValueError("CN/HK 下载结果 ticker 与 typed request 不一致")
@@ -1438,13 +1491,15 @@ def _summary_from_pipeline_result(
     )
     missing_periods = _required_cn_text_list(result, "missing_periods")
     filters = _project_cn_effective_filters(result, request=request)
-    return FinsDownloadResultSummary.from_document_rows(
+    summary = FinsDownloadResultSummary.from_document_rows(
         source=request.source,
         canonical_ticker=ticker,
         effective_filters=filters,
         document_rows=rows,
+        uncertain_reports=uncertain_reports,
         missing_periods=missing_periods,
     )
+    return replace(summary, terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED) if result["status"] == CN_DOWNLOAD_TERMINAL_CANCELLED else summary
 
 
 def _project_cn_document_row(
@@ -1935,6 +1990,7 @@ def _json_text_list(values: list[str] | None) -> list[JsonValue]:
 def build_cn_download_adapter(
     *,
     workspace_root: Path,
+    material_upload_state_repository: MaterialUploadStateRepositoryProtocol,
     batching_repository: BatchingRepositoryProtocol,
     company_repository: CompanyMetaRepositoryProtocol,
     source_repository: SourceDocumentRepositoryProtocol,
@@ -1950,6 +2006,7 @@ def build_cn_download_adapter(
 
     Args:
         workspace_root: Fins 工作区根目录。
+        material_upload_state_repository: 同组装配传入的材料状态仓储，不能另建独立 core。
         batching_repository: batch lifecycle 仓储。
         company_repository: 公司元数据仓储。
         source_repository: 源文档仓储。
@@ -1969,6 +2026,7 @@ def build_cn_download_adapter(
     """
 
     pipeline = CnPipeline(
+        material_upload_state_repository=material_upload_state_repository,
         workspace_root=workspace_root,
         batching_repository=batching_repository,
         company_repository=company_repository,
@@ -1987,6 +2045,7 @@ def build_cn_download_adapter(
 def build_hk_download_adapter(
     *,
     workspace_root: Path,
+    material_upload_state_repository: MaterialUploadStateRepositoryProtocol,
     batching_repository: BatchingRepositoryProtocol,
     company_repository: CompanyMetaRepositoryProtocol,
     source_repository: SourceDocumentRepositoryProtocol,
@@ -2002,6 +2061,7 @@ def build_hk_download_adapter(
 
     Args:
         workspace_root: Fins 工作区根目录。
+        material_upload_state_repository: 同组装配传入的材料状态仓储，不能另建独立 core。
         batching_repository: batch lifecycle 仓储。
         company_repository: 公司元数据仓储。
         source_repository: 源文档仓储。
@@ -2021,6 +2081,7 @@ def build_hk_download_adapter(
     """
 
     pipeline = CnPipeline(
+        material_upload_state_repository=material_upload_state_repository,
         workspace_root=workspace_root,
         batching_repository=batching_repository,
         company_repository=company_repository,

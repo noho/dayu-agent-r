@@ -165,12 +165,16 @@ def _render_posix_script(
     """渲染 POSIX ``sh`` 脚本。
 
     :param commands: 已定型命令 argv。
-    :param regeneration_argv: 再生成 argv。
+    :param regeneration_argv: 保留原文的再生成 argv；每个 LF 物理行均保持为注释。
     :returns: UTF-8/LF 脚本文本。
     :raises Exception: 不主动抛出异常。
     """
 
-    lines = [*_POSIX_HEADER, f"# Regenerate: {shlex.join(regeneration_argv)}"]
+    # shlex quoting 允许 argv 含换行，但 shell 注释只延续到当前 LF；逐物理行加前缀。
+    regeneration_comment = f"# Regenerate: {shlex.join(regeneration_argv)}".replace(
+        "\n", "\n# "
+    )
+    lines = [*_POSIX_HEADER, regeneration_comment]
     lines.extend(f'{shlex.join(command)} "$@"' for command in commands)
     return "\n".join(lines) + "\n"
 

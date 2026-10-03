@@ -1,0 +1,72 @@
+{
+  "version": "v1",
+  "kind": "local_byte_exact_copy_no_network_no_kpi_extraction",
+  "records": [
+    {
+      "issuer": "ATAT",
+      "document_id": "fil_0001104659-24-120329",
+      "filing_date": "2024-11-19",
+      "role": "rejected_results_classification_only",
+      "path": "/Users/leo/Documents/_2我的投资/workspace/portfolio/ATAT/filings/.rejections/id-83918e6ec0c181d63cdac62c52398922777fe651c07de718033b20f0ebfe3bf1/tm2428837d1_ex99-1.htm",
+      "sha256": "c256f80d7dadb934294bacf2e1990874e0bbdc76f2f23cc5e4baa21e8f6938f9",
+      "raw_path": "data/raw/tm2428837d1_ex99-1.htm",
+      "size": 369492,
+      "extracted_at": "2026-09-10T01:18:37.055796+00:00"
+    },
+    {
+      "issuer": "ATAT",
+      "document_id": "fil_0001104659-25-027458",
+      "filing_date": "2025-03-25",
+      "role": "rejected_results_classification_only",
+      "path": "/Users/leo/Documents/_2我的投资/workspace/portfolio/ATAT/filings/.rejections/id-92f7768943ec45b96fa90debf22c2a9532ad1a02bb26f581f8fee96b48c50913/tm2510227d1_ex99-1.htm",
+      "sha256": "3a5186bc2806994392d4ac35def7948923d429b18742b4b10d0b44c6ccbd5bb1",
+      "raw_path": "data/raw/tm2510227d1_ex99-1.htm",
+      "size": 397242,
+      "extracted_at": "2026-09-10T01:18:37.079957+00:00"
+    },
+    {
+      "issuer": "MSFT",
+      "document_id": "fil_0000950170-25-100226",
+      "filing_date": "2025-07-30",
+      "role": "cached_cover",
+      "path": "/Users/leo/Documents/_2我的投资/workspace/portfolio/MSFT/filings/id-79cc4a43fa1212d1d19222af74024a84a157f727d266c84dffdee9414bec6bad/msft-20250730.htm",
+      "sha256": "2b6e1ff764c01ed0b6ee708cad6f222d77b8bacd75f485234c1dcc8f90223982",
+      "raw_path": "data/raw/msft-20250730.htm",
+      "size": 63347,
+      "extracted_at": "2026-09-10T01:18:37.092431+00:00"
+    },
+    {
+      "issuer": "META",
+      "document_id": "fil_0001326801-24-000010",
+      "filing_date": "2024-02-01",
+      "role": "cached_cover",
+      "path": "/Users/leo/Documents/_2我的投资/workspace/portfolio/META/filings/id-97893f647892a27bb9bcf2355a6e93a0b283ed9bfc07690bfba300f0b24bd3d8/meta-20240201.htm",
+      "sha256": "6f2e485c9b14d56409671cf5ea0fdaa41eead6fd89f10ea1e7fc086decc3fa8e",
+      "raw_path": "data/raw/meta-20240201.htm",
+      "size": 30637,
+      "extracted_at": "2026-09-10T01:18:37.093134+00:00"
+    },
+    {
+      "issuer": "META",
+      "document_id": "fil_0001326801-25-000014",
+      "filing_date": "2025-01-29",
+      "role": "cached_cover",
+      "path": "/Users/leo/Documents/_2我的投资/workspace/portfolio/META/filings/id-e1965adac49a8327dd280a72922a306231cb1f0ef69699ca4f7ed028d76fcb12/meta-20250129.htm",
+      "sha256": "9f546def2c13139dcf34082b37d060898918c98b6dcb8d941f3a9d58afc930bc",
+      "raw_path": "data/raw/meta-20250129.htm",
+      "size": 29618,
+      "extracted_at": "2026-09-10T01:18:37.093797+00:00"
+    },
+    {
+      "issuer": "META",
+      "document_id": "fil_0001628280-26-003832",
+      "filing_date": "2026-01-28",
+      "role": "cached_cover",
+      "path": "/Users/leo/Documents/_2我的投资/workspace/portfolio/META/filings/id-2e9b0447285214787a1fbb6b6408602471a3ad9857dabefdeb448d48f3fc4516/meta-20260128.htm",
+      "sha256": "db0dfec841d8a03feed53dfae673220f341d495d3a9c1a06895741982cfc780c",
+      "raw_path": "data/raw/meta-20260128.htm",
+      "size": 29178,
+      "extracted_at": "2026-09-10T01:18:37.094322+00:00"
+    }
+  ]
+}

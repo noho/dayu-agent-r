@@ -1,0 +1,54 @@
+{
+  "setup_status": "ok",
+  "agent_status": "completed",
+  "tool_evidence": "yes",
+  "tool_trace": "complete",
+  "required_evidence": "complete",
+  "canary_status": "match",
+  "result_status": "accepted",
+  "warnings": [
+    "Prompt final note incorrectly said tmp01 although explicit body and unique label02 say tmp02; actual writes only new02 which is authorized unique own evidence directory; no01/oldwrite.",
+    "Full pyright new-version diagnostic non-error; no install.",
+    "First01 setup no task preflightfail/notstarted already retained; new02 setupok, no provider retry."
+  ],
+  "evidence_gaps": [],
+  "retry_class": "none",
+  "runtime": "codex",
+  "provider": "gpt-6-sol",
+  "model": "unknown",
+  "label": "upload-material-unified-s1-doc-closeout-sol-20261002-02",
+  "outer_exit": 0,
+  "outer_exit_source": "managed session62176 returned0",
+  "events": 30,
+  "commands": 11,
+  "all_command_exits_zero": true,
+  "protected_files": 9710,
+  "protected_drift": [
+    "dayu/cli/commands/fins.py"
+  ],
+  "allowed_changed_source": "dayu/cli/commands/fins.py",
+  "source_before_sha256": "ed5a48d0705396ff11326410d033a709c7695aec5ce041b98947caa515d911ac",
+  "source_after_sha256": "65e3f7166a3f00c40784f6e003d5a6609b8abf944e8b2e4744de54dfc0193c36",
+  "non_doc_ast_equal": true,
+  "full_pyright": {
+    "actual_argv": [
+      "/bin/zsh",
+      "-c",
+      "source .venv/bin/activate && exec pyright"
+    ],
+    "resolved_executable": "/Users/leo/workspace/dayu-agent-r/.venv/bin/pyright",
+    "pyright_argv": [
+      "/Users/leo/workspace/dayu-agent-r/.venv/bin/pyright"
+    ],
+    "cwd": "/Users/leo/workspace/dayu-agent-r",
+    "exit_code": 0,
+    "stdout": "pyright.stdout",
+    "stderr": "pyright.stderr",
+    "full_project": true,
+    "invocation_count": 1
+  },
+  "full_pyright_stdout_sha256": "46a6c7834c9080ada23a415afd925abecc37d531f5c6e3d14ad0a7ff579096cb",
+  "report": "docs/gateflow/upload-material-unified-s1-doc-closeout-fix-report-20261002.md",
+  "report_sha256": "eee9df57103d90551ffa845711057ee7bc2c55c83c260231b99a35363b62a364",
+  "decision": "US1-R03 fix delivery accepted for exact delta dual re-review; S1 gate remains pending."
+}

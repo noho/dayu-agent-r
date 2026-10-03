@@ -470,3 +470,34 @@ __all__ = [
     "company_names_are_equivalent",
     "merge_company_meta_for_commit",
 ]
+
+
+def merge_material_upload_company_meta_for_commit(*, current_published: CompanyMeta | None, intent: CompanyMetaCommitIntent, committed_at: str) -> CompanyMetaCommitOutcome:
+    """材料公司阶段严格合并，初始缺席仅允许当前等价 no-op。
+
+    Args:
+        current_published: 同 guard 当前公司事实。
+        intent: 已受理公司意图。
+        committed_at: 仓储提交时点。
+
+    Returns:
+        唯一公司 owner 的最终事实；无增量时保持当前时间。
+
+    Raises:
+        CompanyMetaConcurrentUpdateError: 已观察快照漂移或初始缺席意图不等价。
+        ValueError: 公司意图非法。
+    """
+    if intent.expected_non_identity is not None:
+        if current_published is None or _company_meta_non_identity_snapshot(current_published) != intent.expected_non_identity:
+            raise CompanyMetaConcurrentUpdateError()
+    elif current_published is not None:
+        if (current_published.company_id != intent.proposed_company_id
+            or intent.proposed_company_name is None
+            or not company_names_are_equivalent(current_published.company_name, intent.proposed_company_name)
+            or current_published.resolver_version != intent.resolver_version
+            or current_published.ticker_identity != intent.proposed_identity):
+            raise CompanyMetaConcurrentUpdateError()
+    outcome = merge_company_meta_for_commit(current_published=current_published, intent=intent, committed_at=committed_at)
+    if intent.expected_non_identity is None and current_published is not None and outcome.company_meta != current_published:
+        raise CompanyMetaConcurrentUpdateError()
+    return outcome

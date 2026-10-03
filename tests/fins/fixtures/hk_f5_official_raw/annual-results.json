@@ -1,0 +1,36 @@
+{
+  "captured_at_utc": "2026-09-30T19:55:40.284134+00:00",
+  "endpoint": "https://www1.hkexnews.hk/search/titleSearchServlet.do",
+  "request_params": {
+    "lang": "zh",
+    "category": "0",
+    "market": "SEHK",
+    "stockId": "7609",
+    "searchType": "1",
+    "documentType": "-1",
+    "t1code": "10000",
+    "t2Gcode": "3",
+    "t2code": "-2",
+    "fromDate": "20250319",
+    "toDate": "20250319",
+    "MB-Daterange": "0",
+    "rowRange": "100",
+    "sortByOptions": "DateTime",
+    "sortDir": "0"
+  },
+  "http_status": 200,
+  "raw_response_body_sha256": "62582cfbfa1aaeb588971f339bbbb33767420528718b916877d0e05d0c6cb94a",
+  "raw_response_body": "{\"result\":\"[{\\\"FILE_INFO\\\":\\\"83KB\\\",\\\"NEWS_ID\\\":\\\"11576459\\\",\\\"SHORT_TEXT\\\":\\\"公告及通告 - [股息或分派（公告表格）]\\\\u003cbr/\\\\u003e\\\",\\\"TOTAL_COUNT\\\":\\\"2\\\",\\\"DOD_WEB_PATH\\\":\\\"\\\",\\\"STOCK_NAME\\\":\\\"騰訊控股\\\\u003cbr/\\\\u003e騰訊控股－Ｒ\\\",\\\"TITLE\\\":\\\"截至二零二四年十二月三十一日止年度末期股息\\\",\\\"FILE_TYPE\\\":\\\"PDF\\\",\\\"DATE_TIME\\\":\\\"19/03/2025 16:35\\\",\\\"LONG_TEXT\\\":\\\"公告及通告 - [股息或分派（公告表格）]\\\",\\\"STOCK_CODE\\\":\\\"00700\\\\u003cbr/\\\\u003e80700\\\",\\\"FILE_LINK\\\":\\\"/listedco/listconews/sehk/2025/0319/2025031900413_c.pdf\\\"},{\\\"FILE_INFO\\\":\\\"978KB\\\",\\\"NEWS_ID\\\":\\\"11576383\\\",\\\"SHORT_TEXT\\\":\\\"公告及通告 - [末期業績 \\\\u0026#x2f; 股息或分派 \\\\u0026#x2f; 暫停辦理過戶登記手續或更改暫停辦理過戶日期]\\\\u003cbr/\\\\u003e\\\",\\\"TOTAL_COUNT\\\":\\\"2\\\",\\\"DOD_WEB_PATH\\\":\\\"\\\",\\\"STOCK_NAME\\\":\\\"騰訊控股\\\\u003cbr/\\\\u003e騰訊控股－Ｒ\\\",\\\"TITLE\\\":\\\"截至二零二四年十二月三十一日止年度全年業績公佈\\\",\\\"FILE_TYPE\\\":\\\"PDF\\\",\\\"DATE_TIME\\\":\\\"19/03/2025 16:30\\\",\\\"LONG_TEXT\\\":\\\"公告及通告 - [末期業績 \\\\u0026#x2f; 股息或分派 \\\\u0026#x2f; 暫停辦理過戶登記手續或更改暫停辦理過戶日期]\\\",\\\"STOCK_CODE\\\":\\\"00700\\\\u003cbr/\\\\u003e80700\\\",\\\"FILE_LINK\\\":\\\"/listedco/listconews/sehk/2025/0319/2025031900337_c.pdf\\\"}]\",\"hasNextRow\":false,\"sortList\":\"[[0,0]]\",\"rowRange\":100,\"lang\":\"C\",\"loadedRecord\":2,\"recordCnt\":2}",
+  "raw_json_response": {
+    "result": "[{\"FILE_INFO\":\"83KB\",\"NEWS_ID\":\"11576459\",\"SHORT_TEXT\":\"公告及通告 - [股息或分派（公告表格）]\\u003cbr/\\u003e\",\"TOTAL_COUNT\":\"2\",\"DOD_WEB_PATH\":\"\",\"STOCK_NAME\":\"騰訊控股\\u003cbr/\\u003e騰訊控股－Ｒ\",\"TITLE\":\"截至二零二四年十二月三十一日止年度末期股息\",\"FILE_TYPE\":\"PDF\",\"DATE_TIME\":\"19/03/2025 16:35\",\"LONG_TEXT\":\"公告及通告 - [股息或分派（公告表格）]\",\"STOCK_CODE\":\"00700\\u003cbr/\\u003e80700\",\"FILE_LINK\":\"/listedco/listconews/sehk/2025/0319/2025031900413_c.pdf\"},{\"FILE_INFO\":\"978KB\",\"NEWS_ID\":\"11576383\",\"SHORT_TEXT\":\"公告及通告 - [末期業績 \\u0026#x2f; 股息或分派 \\u0026#x2f; 暫停辦理過戶登記手續或更改暫停辦理過戶日期]\\u003cbr/\\u003e\",\"TOTAL_COUNT\":\"2\",\"DOD_WEB_PATH\":\"\",\"STOCK_NAME\":\"騰訊控股\\u003cbr/\\u003e騰訊控股－Ｒ\",\"TITLE\":\"截至二零二四年十二月三十一日止年度全年業績公佈\",\"FILE_TYPE\":\"PDF\",\"DATE_TIME\":\"19/03/2025 16:30\",\"LONG_TEXT\":\"公告及通告 - [末期業績 \\u0026#x2f; 股息或分派 \\u0026#x2f; 暫停辦理過戶登記手續或更改暫停辦理過戶日期]\",\"STOCK_CODE\":\"00700\\u003cbr/\\u003e80700\",\"FILE_LINK\":\"/listedco/listconews/sehk/2025/0319/2025031900337_c.pdf\"}]",
+    "hasNextRow": false,
+    "sortList": "[[0,0]]",
+    "rowRange": 100,
+    "lang": "C",
+    "loadedRecord": 2,
+    "recordCnt": 2
+  },
+  "capture_tool": "httpx public GET; trust_env=False; no cookies/auth/proxy credentials or headers retained",
+  "observed_result_rows": 2,
+  "provisional_company_scope": "stockId7609 from existing official 0700 protocol fixture; raw STOCK_CODE requires owner validation"
+}

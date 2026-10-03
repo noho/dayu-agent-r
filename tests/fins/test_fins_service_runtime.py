@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+from tests.fins.test_material_upload_publication import seed_material_upload_target
+
+from dayu.fins.storage import FsMaterialUploadStateRepository
+
+from dayu.fins.upload_usage_contract import FinsUploadUsageCode, FinsUploadUsageError
+
 import ast
 import errno
 from datetime import datetime
@@ -24,9 +30,9 @@ from dayu.fins.ingestion_runtime import (
     FinsUploadMaterialRequest,
     FinsUploadPipelineResult,
     FinsUploadResultSummary,
-    FinsUploadUsageCode,
-    FinsUploadUsageError,
     ValidatedFinsUploadFilingRequest,
+    ValidatedFinsUploadMaterialRequest,
+    admit_fins_upload_material_request,
 )
 from dayu.fins.pipelines.cn_pipeline import CnPipeline
 from dayu.fins.pipelines.sec_pipeline import SecPipeline, SecPipelineUploadResult
@@ -279,8 +285,50 @@ class _WarningFilingPipelineFacade:
         }
 
 
+class _MaterialPipelineFacade:
+    """记录 production runner 原样转交的 material handoff。"""
+
+    def __init__(self) -> None:
+        """建立空的 handoff 调用记录。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.requests: list[ValidatedFinsUploadMaterialRequest] = []
+
+    def upload_material_validated(
+        self,
+        request: ValidatedFinsUploadMaterialRequest,
+        *,
+        cancellation_checker: CancellationToken | None = None,
+    ) -> SecPipelineUploadResult:
+        """记录 handoff 并返回最小合法 terminal JSON。
+
+        Args:
+            request: runner 传入的 validated material 请求。
+            cancellation_checker: 本用例不使用的取消观察器。
+
+        Returns:
+            合法 skipped terminal JSON。
+
+        Raises:
+            无。
+        """
+
+        del cancellation_checker
+        self.requests.append(request)
+        return {"status": "skipped", "stored_file_count": 0, "published_amended": False,}
+
+
 def test_production_runner_parser_callsites_use_explicit_source_kind() -> None:
-    """四个 parser callsite 必须按所属 runner 方法绑定正确 SourceKind。
+    """三个 parser callsite 必须按所属 runner 方法绑定正确 SourceKind。
 
     Args:
         无。
@@ -338,9 +386,9 @@ def test_production_runner_parser_callsites_use_explicit_source_kind() -> None:
     }
     assert len(source_kinds_by_method["_run_filing_upload"]) == 2
     assert set(source_kinds_by_method["_run_filing_upload"]) == {"FILING"}
-    assert len(source_kinds_by_method["_run_material_upload"]) == 2
+    assert len(source_kinds_by_method["_run_material_upload"]) == 1
     assert set(source_kinds_by_method["_run_material_upload"]) == {"MATERIAL"}
-    assert sum(len(kinds) for kinds in source_kinds_by_method.values()) == 4
+    assert sum(len(kinds) for kinds in source_kinds_by_method.values()) == 3
 
 
 def test_delete_contract_rejects_before_workspace_repository_bootstrap(
@@ -510,7 +558,7 @@ def test_service_prevalidation_propagates_typed_unsafe_without_workspace_mutatio
             workspace_root=workspace_root,
         )
 
-    assert exc_info.value.failure == fins_upload_source_integrity_unsafe_failure()
+    assert exc_info.value.failure == fins_upload_source_integrity_unsafe_failure(source_kind=SourceKind.FILING)
     assert str(workspace_root) not in repr(exc_info.value.failure)
     assert not workspace_root.exists()
 
@@ -520,7 +568,7 @@ def test_service_prevalidation_propagates_typed_unsafe_without_workspace_mutatio
     (
         ("ok", 2, 2),
         ("skipped", 0, 2),
-        ("deleted", 0, 2),
+        ("deleted", 0, 0),
         ("cancelled", 0, 2),
     ),
 )
@@ -528,6 +576,7 @@ def test_upload_summary_joins_validated_request_and_pipeline_counts(
     status: str,
     stored_file_count: int,
     requested_file_count: int,
+    tmp_path: Path,
 ) -> None:
     """runtime 汇合点必须分别消费 request count 与 pipeline stored count。
 
@@ -543,24 +592,68 @@ def test_upload_summary_joins_validated_request_and_pipeline_counts(
         AssertionError: summary 重建 stored count 或保留 basename 时抛出。
     """
 
-    request = FinsUploadMaterialRequest(
+    raw_request = FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", primary_selectors=() if status == "deleted" else (Path('first.pdf'),),
         ticker="AAPL",
         source_kind=SourceKind.MATERIAL,
-        files=(Path("first.pdf"), Path("second.pdf")),
-    )
+        action="delete" if status == "deleted" else "create",
+        files=() if status == "deleted" else (Path("first.pdf"), Path("second.pdf")),
+     company_name="Apple Inc.",)
+    request = admit_fins_upload_material_request(seed_material_upload_target(raw_request, tmp_path),  state_repository=FsMaterialUploadStateRepository(tmp_path),)
     summary = _upload_summary_from_result(
         request=request,
         result=FinsUploadPipelineResult(
             status=status,
             stored_file_count=stored_file_count,
-        ),
+         source_kind=SourceKind.MATERIAL, published_amended=None if status=="cancelled" else False,),
     )
 
     assert summary.requested_file_count == requested_file_count
     assert summary.stored_file_count == stored_file_count
 
 
-def test_upload_summary_from_result_explicitly_copies_typed_warnings() -> None:
+@pytest.mark.parametrize(
+    "raw_name",
+    (
+        "~dayu_nonexistent_user_zz/report.pdf",
+        "bad\x00name.pdf",
+        "bad\ud800name.pdf",
+    ),
+)
+def test_public_filing_prevalidation_path_failure_is_typed_and_safe(
+    tmp_path: Path, raw_name: str
+) -> None:
+    """公开预验证入口在 workspace 读取前封闭路径解析失败。
+
+    Args:
+        tmp_path: 未建立的目标工作区。
+        raw_name: 无法展开或解析的原始 filing 文件路径。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: usage code、消息安全或零工作区副作用漂移时抛出。
+    """
+
+    workspace_root = tmp_path / "fresh-workspace"
+    request = FinsUploadFilingRequest(
+        ticker="AAPL", action="create", files=(Path(raw_name),),
+        fiscal_year=2024, fiscal_period="FY", company_name="Apple Inc.",
+    )
+    with pytest.raises(FinsUploadUsageError) as raised:
+        prevalidate_fins_upload_filing_request_for_workspace(
+            request, workspace_root=workspace_root
+        )
+    assert raised.value.failure.code is FinsUploadUsageCode.FILE_NOT_FOUND
+    assert "上传文件不存在" in raised.value.failure.message
+    assert "embedded null byte" not in raised.value.failure.message
+    assert "codec can't encode" not in raised.value.failure.message
+    assert str(tmp_path) not in raised.value.failure.message
+    raised.value.failure.message.encode("utf-8")
+    assert not workspace_root.exists()
+
+
+def test_upload_summary_from_result_explicitly_copies_typed_warnings(tmp_path: Path) -> None:
     """service 汇合点必须机械复制 pipeline typed warning tuple。
 
     Args:
@@ -573,6 +666,7 @@ def test_upload_summary_from_result_explicitly_copies_typed_warnings() -> None:
         AssertionError: service 丢失、重建或依赖 summary 默认值时抛出。
     """
 
+    (tmp_path / "filing.pdf").write_bytes(b"fixture")
     warnings = (
         CompanyMetadataWarning(
             kind=CompanyMetadataWarningKind.COMPANY_NAME_IGNORED,
@@ -583,16 +677,10 @@ def test_upload_summary_from_result_explicitly_copies_typed_warnings() -> None:
         status="skipped",
         stored_file_count=0,
         warnings=warnings,
-    )
+     source_kind=SourceKind.FILING, published_amended=None,)
 
     summary = _upload_summary_from_result(
-        request=FinsUploadFilingRequest(
-            ticker="AAPL",
-            files=(Path("filing.pdf"),),
-            fiscal_year=2024,
-            fiscal_period="FY",
-            company_name="Apple Inc.",
-        ),
+        request=prevalidate_fins_upload_filing_request_for_workspace(FinsUploadFilingRequest(ticker="AAPL",files=(tmp_path/"filing.pdf",),fiscal_year=2024,fiscal_period="FY",company_name="Apple Inc."),workspace_root=tmp_path),
         result=result,
     )
 
@@ -653,6 +741,33 @@ def test_production_upload_runner_preserves_pipeline_warning_in_summary_and_json
     assert summary.to_json_summary()["warnings"] == [warning.to_json()]
 
 
+def test_production_runner_preserves_material_handoff_identity(tmp_path: Path) -> None:
+    """runner 接收 validated material 后不重入 admission 或重建请求。
+
+    Args:
+        tmp_path: material 路径所在的隔离目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: pipeline 收到不同 handoff 或终态错误时抛出。
+    """
+
+    validated = admit_fins_upload_material_request(
+        FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="AAPL", files=(tmp_path / "deck.pdf",),  company_name="Apple Inc.",)
+    ,  state_repository=FsMaterialUploadStateRepository(tmp_path),)
+    pipeline = _MaterialPipelineFacade()
+    runner = ProductionFinsUploadRunner(
+        sec_pipeline=cast(SecPipeline, pipeline),
+        cn_pipeline=cast(CnPipeline, pipeline),
+    )
+    summary = runner.run_upload(validated, cancellation_checker=_NeverCancelledChecker())
+    assert pipeline.requests == [validated]
+    assert pipeline.requests[0] is validated
+    assert summary.status == "skipped"
+
+
 def test_production_upload_runner_early_cancel_uses_request_count(
     tmp_path: Path,
 ) -> None:
@@ -674,16 +789,50 @@ def test_production_upload_runner_early_cancel_uses_request_count(
     ).get_ingestion_runtime()
     runner = runtime.upload_runner
     assert isinstance(runner, ProductionFinsUploadRunner)
-    request = FinsUploadMaterialRequest(
+    request = FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", primary_selectors=(Path('first.pdf'),),
         ticker="AAPL",
         files=(Path("first.pdf"), Path("second.pdf")),
-    )
+     company_name="Apple Inc.",)
 
+    validated = admit_fins_upload_material_request(request,  state_repository=FsMaterialUploadStateRepository(tmp_path),)
     summary = runner.run_upload(
-        request,
+        validated,
         cancellation_checker=_AlwaysCancelledChecker(),
     )
 
     assert summary.status == "cancelled"
     assert summary.requested_file_count == len(request.files)
     assert summary.stored_file_count == 0
+
+
+class _RecordingMaterialAdmission:
+    """只记录真实受理的仓储与同一返回对象，不代造状态。"""
+
+    def __init__(self) -> None:
+        """参数：无；返回：无；异常：无。"""
+        self.results: list[ValidatedFinsUploadMaterialRequest] = []
+        self.repositories: list[service_runtime.MaterialUploadStateRepositoryProtocol] = []
+
+    def __call__(self, request: FinsUploadMaterialRequest, *, state_repository: service_runtime.MaterialUploadStateRepositoryProtocol) -> ValidatedFinsUploadMaterialRequest:
+        """参数：原请求和实际仓储；返回：真实受理结果；异常：原 owner 失败透传。"""
+        self.repositories.append(state_repository)
+        result = admit_fins_upload_material_request(request, state_repository=state_repository)
+        self.results.append(result)
+        return result
+
+
+def test_material_service_admission_preserves_real_read_only_handoff(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """参数：真实缺席工作区、受理观察器；返回：无；异常：断言失败；Service 才持仓储，零初始化并原样返回 handoff。"""
+    root = tmp_path/'not-created';sample=tmp_path/'probe.txt';sample.write_text('first')
+    recorder=_RecordingMaterialAdmission()
+    monkeypatch.setattr(service_runtime,'admit_fins_upload_material_request',recorder)
+    request=FinsUploadMaterialRequest(ticker='AAPL',files=(sample,),form_type='MATERIAL_OTHER',material_name='Service',company_name='Apple Inc.')
+    handoff=service_runtime.prevalidate_fins_upload_material_request_for_workspace(request,workspace_root=root)
+    assert len(recorder.repositories)==1 and isinstance(recorder.repositories[0],FsMaterialUploadStateRepository)
+    assert handoff is recorder.results[0]
+    assert handoff.state_admission.observed_state.source_integrity.status is SourceIntegrityStatus.MISSING
+    assert handoff.state_admission.observed_state.company_meta is None and not root.exists()
+    with pytest.raises(FinsUploadUsageError) as raised:
+        service_runtime.prevalidate_fins_upload_material_request_for_workspace(FinsUploadMaterialRequest(ticker='AAPL',action='delete',form_type='MATERIAL_OTHER',material_name='Service'),workspace_root=root)
+    assert raised.value.failure.code is FinsUploadUsageCode.DELETE_TARGET_MISSING
+    assert not root.exists()

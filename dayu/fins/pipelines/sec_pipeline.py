@@ -26,6 +26,7 @@ from dayu.fins.domain.document_models import (
     DownloadRejectionRegistry,
     SourceHandle,
 )
+from dayu.fins.ticker_normalization import normalize_ticker
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.downloaders.sec_downloader import (
     DEFAULT_MAX_RETRIES,
@@ -42,15 +43,21 @@ from dayu.fins.download_contract import (
     FinsDownloadSource,
     FinsDownloadProviderError,
 )
+from dayu.fins.pipelines.upload_company_meta import build_upload_company_id
 from dayu.fins.ingestion_runtime import (
     FinsDownloadProgressEvent,
     FinsDownloadProgressSink,
     FinsSourceDownloadAdapter,
     FinsSourceDownloadAdapterRequest,
     FinsSourceDownloadAdapterResult,
+    FinsSourceDownloadAdapterFailure,
     ValidatedFinsUploadFilingRequest,
+    ValidatedFinsUploadMaterialRequest,
+    FinsUploadMaterialRequest,
+    admit_fins_upload_material_request,
 )
-from dayu.fins.pipelines.docling_process_converter import DoclingConverter, ProcessDoclingConverter
+from dayu.fins.pipelines.docling_process_converter import DoclingConverter
+from dayu.fins.pipelines.docling_converter_factory import create_docling_converter
 from dayu.fins.pipelines.docling_upload_service import DoclingUploadService
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.pipelines.sec_6k_rules import (
@@ -93,6 +100,7 @@ from dayu.fins.pipelines.sec_download_state import (
     has_current_download_version,
 )
 from dayu.fins.pipelines.sec_download_workflow import (
+    SecDownloadIntegrityAbort,
     SecDownloadWorkflowHost as _SecDownloadWorkflowHost,
     run_download_stream_impl as _run_download_stream_impl,
 )
@@ -153,6 +161,7 @@ from dayu.fins.storage import (
     FsDocumentBlobRepository,
     FsFilingMaintenanceRepository,
     FsFilingUploadStateRepository,
+    MaterialUploadStateRepositoryProtocol,
     FsProcessedDocumentRepository,
     FsSourceDocumentRepository,
     ProcessedDocumentRepositoryProtocol,
@@ -387,6 +396,7 @@ async def collect_download_result_from_events(
 
     Raises:
         RuntimeError: 事件流未产生完成事件时抛出。
+        SecDownloadIntegrityAbort: 原样传播工作流 typed 中止及确认快照。
     """
 
     async for event in events:
@@ -481,6 +491,7 @@ class SecPipeline:
     def __init__(
         self,
         *,
+        material_upload_state_repository: MaterialUploadStateRepositoryProtocol,
         processor_registry: ProcessorRegistry,
         workspace_root: Optional[Path] = None,
         downloader: Optional[SecDownloader] = None,
@@ -499,6 +510,7 @@ class SecPipeline:
         """初始化 SEC 下载管线。
 
         Args:
+            material_upload_state_repository: 必传材料状态仓储，必须与写入仓储共享同一个 core。
             processor_registry: Fins 文档处理器注册表。
             workspace_root: Fins 工作区根目录。
             downloader: 可选 SEC 下载器实例。
@@ -561,6 +573,7 @@ class SecPipeline:
             self._workspace_root,
             repository_set=repository_set,
         )
+        self._material_upload_state_repository = material_upload_state_repository
         self._processor_registry = processor_registry
         self._user_agent = user_agent
         self._sleep_seconds = sleep_seconds
@@ -568,7 +581,7 @@ class SecPipeline:
         self._upload_service = DoclingUploadService(
             source_repository=self._source_repository,
             blob_repository=self._blob_repository,
-            docling_converter=docling_converter or ProcessDoclingConverter(),
+            docling_converter=docling_converter or create_docling_converter(self._workspace_root),
         )
 
     @property
@@ -798,141 +811,111 @@ class SecPipeline:
 
     def upload_material(
         self,
-        ticker: str,
-        action: Optional[str],
-        form_type: str,
-        material_name: str,
-        files: Optional[list[Path]] = None,
-        document_id: Optional[str] = None,
-        internal_document_id: Optional[str] = None,
-        fiscal_year: Optional[int] = None,
-        fiscal_period: Optional[str] = None,
-        filing_date: Optional[str] = None,
-        report_date: Optional[str] = None,
-        company_id: Optional[str] = None,
-        company_name: Optional[str] = None,
-        ticker_aliases: Optional[list[str]] = None,
-        overwrite: bool = False,
+        request: FinsUploadMaterialRequest,
         *,
         cancellation_checker: CancellationToken | None = None,
     ) -> SecPipelineUploadResult:
-        """执行 SEC 材料上传并同步返回聚合结果。
+        """同步执行一次 raw material 准入与上传。
 
         Args:
-            ticker: 股票代码。
-            action: 可选动作类型。
-            form_type: 材料类型。
-            material_name: 材料名称。
-            files: 可选上传文件列表。
-            document_id: 可选文档 ID。
-            internal_document_id: 可选内部文档 ID。
-            fiscal_year: 可选财年。
-            fiscal_period: 可选财期。
-            filing_date: 可选 filing 日期。
-            report_date: 可选 report 日期。
-            company_id: 可选兼容字段。
-            company_name: 公司名称。
-            ticker_aliases: 可选 ticker alias。
-            overwrite: 是否覆盖。
-            cancellation_checker: 可选协作式取消检查器。
+            request: 原始 material 请求。
+            cancellation_checker: 可选取消检查器。
 
         Returns:
-            上传结果字典。
+            聚合上传结果。
 
         Raises:
-            RuntimeError: 当前线程已有事件循环时抛出。
+            FinsUploadUsageError: 资产规划违反调用方契约时抛出。
+            RuntimeError: 同步调用环境已有事件循环时抛出。
         """
 
         return _run_async_upload_sync(
             _collect_upload_result_from_events(
-                self.upload_material_stream(
-                    ticker=ticker,
-                    action=action,
-                    form_type=form_type,
-                    material_name=material_name,
-                    files=files,
-                    document_id=document_id,
-                    internal_document_id=internal_document_id,
-                    fiscal_year=fiscal_year,
-                    fiscal_period=fiscal_period,
-                    filing_date=filing_date,
-                    report_date=report_date,
-                    company_id=company_id,
-                    company_name=company_name,
-                    ticker_aliases=ticker_aliases,
-                    overwrite=overwrite,
-                    cancellation_checker=cancellation_checker,
-                ),
+                self.upload_material_stream(request, cancellation_checker=cancellation_checker),
                 stream_name="upload_material_stream",
             )
         )
 
     async def upload_material_stream(
         self,
-        ticker: str,
-        action: Optional[str],
-        form_type: str,
-        material_name: str,
-        files: Optional[list[Path]] = None,
-        document_id: Optional[str] = None,
-        internal_document_id: Optional[str] = None,
-        fiscal_year: Optional[int] = None,
-        fiscal_period: Optional[str] = None,
-        filing_date: Optional[str] = None,
-        report_date: Optional[str] = None,
-        company_id: Optional[str] = None,
-        company_name: Optional[str] = None,
-        ticker_aliases: Optional[list[str]] = None,
-        overwrite: bool = False,
+        request: FinsUploadMaterialRequest,
         *,
         cancellation_checker: CancellationToken | None = None,
     ) -> AsyncIterator["UploadMaterialEvent"]:
-        """执行流式 SEC 材料上传。
+        """在首个事件前准入 raw material 请求并执行流。
 
         Args:
-            ticker: 股票代码。
-            action: 可选动作类型。
-            form_type: 材料类型。
-            material_name: 材料名称。
-            files: 可选上传文件列表。
-            document_id: 可选文档 ID。
-            internal_document_id: 可选内部文档 ID。
-            fiscal_year: 可选财年。
-            fiscal_period: 可选财期。
-            filing_date: 可选 filing 日期。
-            report_date: 可选 report 日期。
-            company_id: 可选兼容字段。
-            company_name: 公司名称。
-            ticker_aliases: 可选 ticker alias。
-            overwrite: 是否覆盖。
-            cancellation_checker: 可选协作式取消检查器。
+            request: 原始 material 请求。
+            cancellation_checker: 可选取消检查器。
 
         Yields:
-            上传过程事件。
+            material 上传事件。
 
         Raises:
-            ValueError: 市场类型非法时抛出。
-            RuntimeError: 上传执行失败时抛出。
+            FinsUploadUsageError: 资产规划失败时抛出。
         """
 
+        normalized = normalize_ticker(request.ticker)
+        if normalized.market != "US":
+            raise ValueError(f"SecPipeline 仅支持 US，当前 market={normalized.market}")
+        build_upload_company_id(normalized.canonical)
+        validated = admit_fins_upload_material_request(request, state_repository=self._material_upload_state_repository)
+        async for event in self.upload_material_validated_stream(
+            validated, cancellation_checker=cancellation_checker
+        ):
+            yield event
+
+    def upload_material_validated(
+        self,
+        request: ValidatedFinsUploadMaterialRequest,
+        *,
+        cancellation_checker: CancellationToken | None = None,
+    ) -> SecPipelineUploadResult:
+        """同步执行已经准入的 material 请求。
+
+        Args:
+            request: 同一次 Fins 准入的不可变 handoff。
+            cancellation_checker: 可选取消检查器。
+
+        Returns:
+            聚合上传结果。
+
+        Raises:
+            RuntimeError: 同步调用环境已有事件循环时抛出。
+        """
+
+        return _run_async_upload_sync(
+            _collect_upload_result_from_events(
+                self.upload_material_validated_stream(
+                    request, cancellation_checker=cancellation_checker
+                ),
+                stream_name="upload_material_validated_stream",
+            )
+        )
+
+    async def upload_material_validated_stream(
+        self,
+        request: ValidatedFinsUploadMaterialRequest,
+        *,
+        cancellation_checker: CancellationToken | None = None,
+    ) -> AsyncIterator["UploadMaterialEvent"]:
+        """复核并将 validated handoff 传给 SEC workflow。
+
+        Args:
+            request: 同一次 Fins 准入的不可变 handoff。
+            cancellation_checker: 可选取消检查器。
+
+        Yields:
+            material 上传事件。
+
+        Raises:
+            FinsUploadUsageError: handoff 静态准入或规划失败时抛出。
+            RuntimeError: workflow 执行失败时抛出。
+        """
+
+        request.validate()
         async for event in _run_upload_material_stream(
-            self,
-            ticker=ticker,
-            action=action,
-            form_type=form_type,
-            material_name=material_name,
-            files=files,
-            document_id=document_id,
-            internal_document_id=internal_document_id,
-            fiscal_year=fiscal_year,
-            fiscal_period=fiscal_period,
-            filing_date=filing_date,
-            report_date=report_date,
-            company_id=company_id,
-            company_name=company_name,
-            ticker_aliases=ticker_aliases,
-            overwrite=overwrite,
-            cancellation_checker=cancellation_checker,
+            self, request, cancellation_checker=cancellation_checker
         ):
             yield event
 
@@ -1791,27 +1774,34 @@ class SecDownloadAdapter(FinsSourceDownloadAdapter):
         Raises:
             ValueError: ticker 市场或表单过滤非法时抛出。
             RuntimeError: SEC 下载失败时抛出。
+            FinsSourceDownloadAdapterFailure: 封闭完整性失败携带严格确认摘要时抛出。
         """
 
         if request.normalized_ticker.market != "US":
             raise ValueError(f"SEC 下载仅支持 US market，当前 market={request.normalized_ticker.market}")
         if request.source is not FinsDownloadSource.SEC:
             raise ValueError(f"SEC 下载来源不匹配: source={request.source.value}")
-        result = _run_async_download_sync(
-            collect_download_result_from_events(
-                self._pipeline.download_stream(
-                    ticker=request.normalized_ticker.canonical,
-                    form_type=_form_type_from_adapter_request(request.form_types),
-                    start_date=request.date_range.start_text,
-                    end_date=request.date_range.end_text,
-                    overwrite=request.overwrite_existing,
-                    rebuild=request.rebuild_local_artifacts,
-                    start_is_explicit=request.date_range.start_is_explicit,
-                    cancel_checker=request.cancellation_checker,
-                ),
-                progress_sink=request.progress_sink,
+        try:
+            result = _run_async_download_sync(
+                collect_download_result_from_events(
+                    self._pipeline.download_stream(
+                        ticker=request.normalized_ticker.canonical,
+                        form_type=_form_type_from_adapter_request(request.form_types),
+                        start_date=request.date_range.start_text,
+                        end_date=request.date_range.end_text,
+                        overwrite=request.overwrite_existing,
+                        rebuild=request.rebuild_local_artifacts,
+                        start_is_explicit=request.date_range.start_is_explicit,
+                        cancel_checker=request.cancellation_checker,
+                    ),
+                    progress_sink=request.progress_sink,
+                )
             )
-        )
+        except SecDownloadIntegrityAbort as exc:
+            summary = _summary_from_pipeline_result(
+                exc.result, request=request, source_repository=self._pipeline.source_repository,
+            )
+            raise FinsSourceDownloadAdapterFailure(exc.cause, summary) from exc
         persisted_summary = _summary_from_pipeline_result(
             cast(dict[str, JsonValue], result),
             request=request,
@@ -2071,6 +2061,7 @@ def _build_sec_typed_summary(
         canonical_ticker=ticker,
         effective_filters=filters,
         document_rows=rows,
+        uncertain_reports=(),
         missing_periods=(),
     )
 
@@ -2299,6 +2290,7 @@ def _required_sec_bool(value: Mapping[str, JsonValue], key: str) -> bool:
 def build_sec_download_adapter(
     *,
     workspace_root: Path,
+    material_upload_state_repository: MaterialUploadStateRepositoryProtocol,
     processor_registry: ProcessorRegistry,
     batching_repository: BatchingRepositoryProtocol,
     company_repository: CompanyMetaRepositoryProtocol,
@@ -2314,6 +2306,7 @@ def build_sec_download_adapter(
 
     Args:
         workspace_root: Fins 工作区根目录。
+        material_upload_state_repository: 同组装配传入的材料状态仓储，不能另建独立 core。
         processor_registry: 文档处理器注册表。
         batching_repository: batch lifecycle 仓储。
         company_repository: 公司元数据仓储。
@@ -2333,6 +2326,7 @@ def build_sec_download_adapter(
     """
 
     pipeline = SecPipeline(
+        material_upload_state_repository=material_upload_state_repository,
         processor_registry=processor_registry,
         workspace_root=workspace_root,
         batching_repository=batching_repository,

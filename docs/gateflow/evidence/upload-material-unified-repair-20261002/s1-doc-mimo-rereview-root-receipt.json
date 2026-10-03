@@ -1,0 +1,43 @@
+{
+  "setup_status": "ok",
+  "agent_status": "completed",
+  "tool_evidence": "yes",
+  "tool_trace": "complete",
+  "required_evidence": "complete",
+  "canary_status": "match",
+  "result_status": "accepted",
+  "warnings": [
+    {
+      "tool_indexes": [
+        17,
+        18,
+        20,
+        22,
+        23
+      ],
+      "classification": "Repo-local skills path absent caused tool17exit1, then actual user-level skills found18/read22/Gateflow23; required instructions restored, author all-commands0 claim corrected."
+    },
+    "Exact stderr unrecognized_model warning allowed.",
+    "Reviewer relies on root/author protected hash receipts rather than full allfile livehash; root independently recomputed all9765 at same final source now, drift0. No child allhash claim."
+  ],
+  "evidence_gaps": [],
+  "retry_class": "none",
+  "runtime": "claude",
+  "provider": "mimo",
+  "model": "mimo-v2.6-pro[1m]",
+  "label": "upload-material-unified-s1-doc-rereview-mimo-20261002-01",
+  "outer_exit": 0,
+  "outer_exit_source": "managed write_stdin43169 returned0",
+  "structured_events": 2182,
+  "tools": 29,
+  "num_turns": 30,
+  "review_artifact": "docs/reviews/code-review-20261002-231904.md",
+  "review_sha256": "7a1ef174ba7933702a21598282887dbd50d395ce773d760f7dfaff90505646aa",
+  "root_manifest_allhash": 9765,
+  "root_manifest_drift": [],
+  "root_independent_proof": "Root sourcebeforeafter exact single replacement; whole module executable AST identical; real helper-caller raw-value path read; new fulltype actual0 preserved. Unchanged old38 complete dual reviews and2175/19cover remain hash-bound.",
+  "finding_status": {
+    "US1-R03": "已修复"
+  },
+  "decision": "Evidence accepted; R03fixed, allS1accepted findings fixed, review loop pass."
+}

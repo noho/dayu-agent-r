@@ -493,12 +493,15 @@ def test_upload_material_files_help_consumes_self_contained_format_projection(
     assert files_action.help == FINS_UPLOAD_FORMAT_TEXT.material_files
 
     help_text = "".join(_capture_help(capsys, ("upload_material",)).split())
+    assert "".join(FINS_UPLOAD_FORMAT_TEXT.material_files.split()) in help_text
     for expected_fragment in (
         "auto/create/update 必须至少提供一个文件",
         "每个文件都必须使用转换器支持的后缀",
         "逐个实际转换成功",
         "后缀通过只表示具备转换资格",
         "不保证文件内容转换成功",
+        ".json 仅是 Docling 格式的 JSON 文档候选，不代表任意 JSON 内容可转换。",
+        ".xml/.xbrl 仅是 XBRL 财报实例文档候选，不代表任意 XML 或独立 linkbase 文件可转换。",
         "delete 不得提供文件",
     ):
         assert "".join(expected_fragment.split()) in help_text

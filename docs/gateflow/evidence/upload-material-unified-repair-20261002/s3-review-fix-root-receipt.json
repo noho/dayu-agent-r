@@ -1,0 +1,751 @@
+{
+  "gate": "fix S3; root evidence closure, not slice pass",
+  "workspace": "/Users/leo/workspace/dayu-agent-r",
+  "branch": "codex/upload-material-oracle",
+  "head": "a514dea14c0ce66722da034502f3af54a54c3238",
+  "main": "fac32ecbff9bfe792b63ee9667c8697826b631f4",
+  "runtime": "codex",
+  "provider": "gpt-6-sol",
+  "actual_model": "unknown",
+  "agent_outer_exit": 0,
+  "managed_session": 78878,
+  "agent_historical_status": "blocked-required-CLI-evidence",
+  "result_status": "partial",
+  "root_native_managed_session": 68251,
+  "root_native_outer_exit": 1,
+  "source_manifest": {
+    "path": "workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/source-final-v2.json",
+    "sha256": "6aae2616a06581a2439bd3b396ce8da8c17b1c1884fddc6d72715f3b9528333f",
+    "files": {
+      "README.md": "5307669f4f94ceae368275c5e81d2fe85efb0dd41535d73f5a154cb401564b14",
+      "constraints/lock-common-py311.txt": "894cb2c76ef0fd0fc91610c4e02415d89083e5ea4f9c13b0d09f1f01d3da4d70",
+      "dayu/README.md": "164c5b5382a7ed284f5463bafef7e851059593d05a8d019e342a190f17d46bcd",
+      "dayu/documents/docling_runtime.py": "2e71f9e690847549c3ca3febaedc0cfd735f6123c03bb85a244907f8637eae98",
+      "dayu/documents/xbrl_config.py": "941de0dbda162318e5c1a249f8df0b7f6ce7a34dca121d65067652166fb20d13",
+      "dayu/fins/README.md": "aa8d0e1a6140d26a98ba6901987d5e1f854d78b2903229595124189276522d9b",
+      "dayu/fins/pipelines/cn_pipeline.py": "a359c06858b2a3be0bc562e2f51d9058fa30f966d098079d05b2e04727c8dce9",
+      "dayu/fins/pipelines/docling_converter_factory.py": "9602abfcb6476cb7eab53e9988c1f90c533fb36cdc70b52e331210eec4fd9b72",
+      "dayu/fins/pipelines/docling_process_converter.py": "d6b6772e329c66045f634fb4994c76bbcb9ef0130d3fe498b2e7f044ae6cd1b8",
+      "dayu/fins/pipelines/sec_pipeline.py": "13b59b729214a83635d41677b12df203b702a7c6ee2e8f4cab7af0d343dfafde",
+      "dayu/fins/service_runtime.py": "7cec10edf79832a6ea7aba8a7f5989acb6710279d194fb235d864683b8bdca3a",
+      "dayu/fins/upload_format_contract.py": "04ae2b2965d0d3a72b1021ad83f8d385d1beb6a97297edae93db70ca52eb702e",
+      "dayu/runtime/macos_sandbox.py": "0794d0390706941f76d9250a02c7503aaeaaf35a08420fe27dccf5f890dd3a54",
+      "pyproject.toml": "358eab55d4ecbf4462137dda34d0d38786a9fa907fa185979b40cf9b39bc704a",
+      "tests/README.md": "ba7f22562d31756d168bb28098b71bc7ec67bc89e8c42cdafbbad29bf69b3541",
+      "tests/documents/test_docling_runtime.py": "34dcf288689ef6b5b3c2342a8a77d2acfe27ee418c6e35f39119b0fbdc1c2c95",
+      "tests/documents/test_import_boundary.py": "3ca47e87f85f1f8bedf955d53ce4933b114f1049ba290bb362591f3caae6a2dc",
+      "tests/documents/test_xbrl_config.py": "d46a8ef2f2038612bdfee019ddb4e2b8a6115bfe2e5b27fddc307d89c1ad042a",
+      "tests/fins/test_docling_converter_factory.py": "aac77de6c907aa121118c49764c00a7ded946b7546b823404e794004a87d89af",
+      "tests/fins/test_docling_process_converter.py": "42a568762cb28c23690a955d2871dff6f31835f14ccbadfded6886c870ba8b73",
+      "tests/fins/test_docling_upload_service_integration.py": "d1ac2005a28bdd400e859ff06acb77aeb6216cc1ed6b5a07a13d280b8924aa67",
+      "tests/fins/test_upload_format_contract.py": "a8808d310174d597eca7504a87cba548eeae5f8522bc3fdbd61e45b98f6aaa9a",
+      "tests/fins/test_xbrl_controlled_upload_integration.py": "9d3faeb8fa55531814d25dd6ac4935bbd9d631b3582faed480d24763b242a725",
+      "tests/runtime/test_macos_sandbox.py": "9ada1906f6dfbb203fbf6525a40d0e2ce48e4d79af440b1bc5fe362f53982c51"
+    }
+  },
+  "root_validation": {
+    "event_count": 146,
+    "trace_count": 67,
+    "terminal": "turn.completed",
+    "canary": "match",
+    "receipt_count": 12,
+    "receipts": [
+      {
+        "name": "cli-r01-01",
+        "exit": 1,
+        "source_sha": "d6f78771265c5d6d2cfe60e637028033a60ea99666e8b2d08e2ff6f42498056a"
+      },
+      {
+        "name": "closeout-integrity-command",
+        "exit": 0,
+        "source_sha": "6aae2616a06581a2439bd3b396ce8da8c17b1c1884fddc6d72715f3b9528333f"
+      },
+      {
+        "name": "final-integrity-command",
+        "exit": 0,
+        "source_sha": "6aae2616a06581a2439bd3b396ce8da8c17b1c1884fddc6d72715f3b9528333f"
+      },
+      {
+        "name": "incremental-diff-command",
+        "exit": 1,
+        "source_sha": "6aae2616a06581a2439bd3b396ce8da8c17b1c1884fddc6d72715f3b9528333f"
+      },
+      {
+        "name": "incremental-diff-v2-command",
+        "exit": 0,
+        "source_sha": "6aae2616a06581a2439bd3b396ce8da8c17b1c1884fddc6d72715f3b9528333f"
+      },
+      {
+        "name": "own-tools-type",
+        "exit": 0,
+        "source_sha": "6aae2616a06581a2439bd3b396ce8da8c17b1c1884fddc6d72715f3b9528333f"
+      },
+      {
+        "name": "patch-check",
+        "exit": 0,
+        "source_sha": "6aae2616a06581a2439bd3b396ce8da8c17b1c1884fddc6d72715f3b9528333f"
+      },
+      {
+        "name": "pyright-final",
+        "exit": 1,
+        "source_sha": "d6f78771265c5d6d2cfe60e637028033a60ea99666e8b2d08e2ff6f42498056a"
+      },
+      {
+        "name": "pyright-final-v2",
+        "exit": 0,
+        "source_sha": "6aae2616a06581a2439bd3b396ce8da8c17b1c1884fddc6d72715f3b9528333f"
+      },
+      {
+        "name": "readback-01",
+        "exit": 0,
+        "source_sha": "6aae2616a06581a2439bd3b396ce8da8c17b1c1884fddc6d72715f3b9528333f"
+      },
+      {
+        "name": "tests-01",
+        "exit": 0,
+        "source_sha": "d6f78771265c5d6d2cfe60e637028033a60ea99666e8b2d08e2ff6f42498056a"
+      },
+      {
+        "name": "tests-final-v2",
+        "exit": 0,
+        "source_sha": "6aae2616a06581a2439bd3b396ce8da8c17b1c1884fddc6d72715f3b9528333f"
+      }
+    ],
+    "protected_count": 12122,
+    "protected_mismatches": [],
+    "final_scope_count": 24,
+    "changed_paths": [
+      "README.md",
+      "dayu/documents/docling_runtime.py",
+      "tests/README.md",
+      "tests/documents/test_docling_runtime.py",
+      "tests/fins/test_docling_process_converter.py",
+      "tests/fins/test_xbrl_controlled_upload_integration.py"
+    ],
+    "backups": [
+      "workspace/evidence/upload-material-unified-repair-20261002/runner-streams/upload-material-unified-s3-review-fix-sol-20261003-01",
+      "output/evidence-backup/upload-material-unified-repair-20261002/runner-streams/upload-material-unified-s3-review-fix-sol-20261003-01"
+    ],
+    "source_sha256": "6aae2616a06581a2439bd3b396ce8da8c17b1c1884fddc6d72715f3b9528333f",
+    "report_sha256": "1cd61860db260e2d7ff01f157945e6976a86686eded67c144a8fddfd50694d20"
+  },
+  "command_receipts": {
+    "cli-r01-01": {
+      "index": {
+        "actual_exit": 1,
+        "actual_wait": true,
+        "receipt_path": "workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/cli-r01-01/receipt.json",
+        "receipt_sha256": "5352721cb2c7d273e567cd6fe59656709fe67009f3a767679d5be00d40e321ae",
+        "command_sha256": "a7c477171a20f830baca4aab5723eb09015b1be083804e62aa5966c8f912c362",
+        "stdout_sha256": "2f83cd812f83da5b0378ca7803c61eec53dd3c53edf7a378b4bdcc8658f78482",
+        "stderr_sha256": "b9068240330ea955f883f3b81bf751021e590ecb34f1b26f5621a961157451c6",
+        "source_manifest_sha256": "d6f78771265c5d6d2cfe60e637028033a60ea99666e8b2d08e2ff6f42498056a"
+      },
+      "receipt": {
+        "pid": 69161,
+        "actual_exit": 1,
+        "actual_wait": true,
+        "utc_end": "2026-10-03T00:07:22.329596+00:00",
+        "duration_wall_s": 3.67539275001036,
+        "sha256": {
+          "command.json": "a7c477171a20f830baca4aab5723eb09015b1be083804e62aa5966c8f912c362",
+          "stdout": "2f83cd812f83da5b0378ca7803c61eec53dd3c53edf7a378b4bdcc8658f78482",
+          "stderr": "b9068240330ea955f883f3b81bf751021e590ecb34f1b26f5621a961157451c6"
+        }
+      },
+      "command": {
+        "argv": [
+          "workspace/tmp/upload-material-unified-s3-implement-sol-20261003-01/standard-venv/bin/python",
+          "-m",
+          "dayu.cli",
+          "upload_material",
+          "--base",
+          "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/store-r01-01",
+          "--ticker",
+          "MLAC",
+          "--action",
+          "auto",
+          "--forms",
+          "MATERIAL_OTHER",
+          "--material-name",
+          "S3 R01 routed content failure",
+          "--company-name",
+          "Mountain Lake Acquisition Corp.",
+          "--files",
+          "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/routed-bad.xml"
+        ],
+        "cwd": "/Users/leo/workspace/dayu-agent-r",
+        "utc_start": "2026-10-03T00:07:18.654245+00:00",
+        "environment": {
+          "VIRTUAL_ENV": "/Users/leo/workspace/dayu-agent-r/.venv",
+          "DAYU_XBRL_CONFIG": "/private/tmp/dayu-xbrl-s3-admin-qmid1407/config.json",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "TMPDIR": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/"
+        },
+        "source_manifest": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/source-final.json",
+        "source_manifest_sha256": "d6f78771265c5d6d2cfe60e637028033a60ea99666e8b2d08e2ff6f42498056a"
+      },
+      "stdout_tail": "Fins progress: operation=\"upload_material\" ticker=\"MLAC\" filing_kind=\"material\" document=\"mat_6fdc16b1a442b45da17c8b0a0a127e8ea1e939eb\" stage=\"upload.preparing\" message=\"上传准备中\"\nFins progress: operation=\"upload_material\" ticker=\"MLAC\" filing_kind=\"material\" document=\"mat_6fdc16b1a442b45da17c8b0a0a127e8ea1e939eb\" stage=\"upload.started\" message=\"上传已开始\"\nFins progress: operation=\"upload_material\" ticker=\"MLAC\" filing_kind=\"material\" document=\"mat_6fdc16b1a442b45da17c8b0a0a127e8ea1e939eb\" stage=\"upload.completed_with_failures\" message=\"上传已完成，存在失败\"\n",
+      "stderr_tail": "sandbox initialization failed: Operation not permitted\nFins failure: operation=\"upload_material\" ticker=\"MLAC\" filing_kind=\"material\" status=\"failure\" message=\"文件无法解析或已损坏，请检查文件后重试\"\nFins summary: source_kind=\"material\" status=\"failed\" requested_files=\"1\" stored_files=\"0\" published_amended=\"null\" failure_kind=\"content\" failure_code=\"docling_converter_construction\" file=\"routed-bad.xml\"\n"
+    },
+    "closeout-integrity-command": {
+      "index": {
+        "actual_exit": 0,
+        "actual_wait": true,
+        "receipt_path": "workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/closeout-integrity-command/receipt.json",
+        "receipt_sha256": "37d6f089cb249d4e2d955f2a3cc675143d4269fd4c7419da63cf65df9b2d5c6c",
+        "command_sha256": "f7fd4630f67388bbe06cdb6899c5b637aa7e730c3ff858e9698a8f968bc42fd9",
+        "stdout_sha256": "0e8024638919e5c1d29fabb88da89d86d40658dd12b3994c495f4c4b6e6332de",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "source_manifest_sha256": "6aae2616a06581a2439bd3b396ce8da8c17b1c1884fddc6d72715f3b9528333f"
+      },
+      "receipt": {
+        "pid": 70578,
+        "actual_exit": 0,
+        "actual_wait": true,
+        "utc_end": "2026-10-03T00:15:58.802854+00:00",
+        "duration_wall_s": 0.8588472499977797,
+        "sha256": {
+          "command.json": "f7fd4630f67388bbe06cdb6899c5b637aa7e730c3ff858e9698a8f968bc42fd9",
+          "stdout": "0e8024638919e5c1d29fabb88da89d86d40658dd12b3994c495f4c4b6e6332de",
+          "stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "command": {
+        "argv": [
+          "workspace/tmp/upload-material-unified-s3-implement-sol-20261003-01/standard-venv/bin/python",
+          "workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/verify_closeout.py"
+        ],
+        "cwd": "/Users/leo/workspace/dayu-agent-r",
+        "utc_start": "2026-10-03T00:15:57.944037+00:00",
+        "environment": {
+          "VIRTUAL_ENV": "/Users/leo/workspace/dayu-agent-r/.venv",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "TMPDIR": "/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/"
+        },
+        "source_manifest": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/source-final-v2.json",
+        "source_manifest_sha256": "6aae2616a06581a2439bd3b396ce8da8c17b1c1884fddc6d72715f3b9528333f"
+      },
+      "stdout_tail": "{\"protected_count\": 12122, \"protected_mismatches\": 0, \"source_count\": 24, \"changed_count\": 6, \"identity_match\": true}\n",
+      "stderr_tail": ""
+    },
+    "final-integrity-command": {
+      "index": {
+        "actual_exit": 0,
+        "actual_wait": true,
+        "receipt_path": "workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/final-integrity-command/receipt.json",
+        "receipt_sha256": "fe2301347b9b4d781f2a63e544a2fdcfc3638bbb4b7b33453548284696d73919",
+        "command_sha256": "18cd67e96889d04c67ef7ed3e5202772e426cc01330904cebf88faeb6be098ee",
+        "stdout_sha256": "0e8024638919e5c1d29fabb88da89d86d40658dd12b3994c495f4c4b6e6332de",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "source_manifest_sha256": "6aae2616a06581a2439bd3b396ce8da8c17b1c1884fddc6d72715f3b9528333f"
+      },
+      "receipt": {
+        "pid": 69692,
+        "actual_exit": 0,
+        "actual_wait": true,
+        "utc_end": "2026-10-03T00:10:37.864674+00:00",
+        "duration_wall_s": 0.8405966249993071,
+        "sha256": {
+          "command.json": "18cd67e96889d04c67ef7ed3e5202772e426cc01330904cebf88faeb6be098ee",
+          "stdout": "0e8024638919e5c1d29fabb88da89d86d40658dd12b3994c495f4c4b6e6332de",
+          "stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "command": {
+        "argv": [
+          "workspace/tmp/upload-material-unified-s3-implement-sol-20261003-01/standard-venv/bin/python",
+          "workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/verify_final.py"
+        ],
+        "cwd": "/Users/leo/workspace/dayu-agent-r",
+        "utc_start": "2026-10-03T00:10:37.024078+00:00",
+        "environment": {
+          "VIRTUAL_ENV": "/Users/leo/workspace/dayu-agent-r/.venv",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "TMPDIR": "/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/"
+        },
+        "source_manifest": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/source-final-v2.json",
+        "source_manifest_sha256": "6aae2616a06581a2439bd3b396ce8da8c17b1c1884fddc6d72715f3b9528333f"
+      },
+      "stdout_tail": "{\"protected_count\": 12122, \"protected_mismatches\": 0, \"source_count\": 24, \"changed_count\": 6, \"identity_match\": true}\n",
+      "stderr_tail": ""
+    },
+    "incremental-diff-command": {
+      "index": {
+        "actual_exit": 1,
+        "actual_wait": true,
+        "receipt_path": "workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/incremental-diff-command/receipt.json",
+        "receipt_sha256": "1ad446937b614da1167ba839c5712ea364b7eef891536697ef99e1b044ab5928",
+        "command_sha256": "0ba00ca8df06c20b349e4bbf35e5eaf55dabcb7fb7293bde61c7753315143bde",
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stderr_sha256": "8b68a952fee6ddf088b02a1ea4550597acd809b21140550c8bfe03fa3fd7e3fb",
+        "source_manifest_sha256": "6aae2616a06581a2439bd3b396ce8da8c17b1c1884fddc6d72715f3b9528333f"
+      },
+      "receipt": {
+        "pid": 69837,
+        "actual_exit": 1,
+        "actual_wait": true,
+        "utc_end": "2026-10-03T00:11:38.831152+00:00",
+        "duration_wall_s": 0.03729279100662097,
+        "sha256": {
+          "command.json": "0ba00ca8df06c20b349e4bbf35e5eaf55dabcb7fb7293bde61c7753315143bde",
+          "stdout": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderr": "8b68a952fee6ddf088b02a1ea4550597acd809b21140550c8bfe03fa3fd7e3fb"
+        }
+      },
+      "command": {
+        "argv": [
+          "workspace/tmp/upload-material-unified-s3-implement-sol-20261003-01/standard-venv/bin/python",
+          "workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/build_diff.py"
+        ],
+        "cwd": "/Users/leo/workspace/dayu-agent-r",
+        "utc_start": "2026-10-03T00:11:38.793895+00:00",
+        "environment": {
+          "VIRTUAL_ENV": "/Users/leo/workspace/dayu-agent-r/.venv",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "TMPDIR": "/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/"
+        },
+        "source_manifest": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/source-final-v2.json",
+        "source_manifest_sha256": "6aae2616a06581a2439bd3b396ce8da8c17b1c1884fddc6d72715f3b9528333f"
+      },
+      "stdout_tail": "",
+      "stderr_tail": "Traceback (most recent call last):\n  File \"/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/build_diff.py\", line 49, in <module>\n    main()\n  File \"/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/build_diff.py\", line 42, in main\n    assert hashlib.sha256(before.encode()).hexdigest() == hashes[path], path\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: tests/fins/test_docling_process_converter.py\n"
+    },
+    "incremental-diff-v2-command": {
+      "index": {
+        "actual_exit": 0,
+        "actual_wait": true,
+        "receipt_path": "workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/incremental-diff-v2-command/receipt.json",
+        "receipt_sha256": "96e63b7b42ff15eb86f2d19a2f47d9aead70c53d11e7c8a23ef1da9912df75e3",
+        "command_sha256": "b64d177747b700ab3492e8febc12bac11d1e217d36ddc2e3ed78aaa3a9815091",
+        "stdout_sha256": "f4abd41ed94f47485dc3443b7b3ffd35d9edcd64960f0933592cf1415f623341",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "source_manifest_sha256": "6aae2616a06581a2439bd3b396ce8da8c17b1c1884fddc6d72715f3b9528333f"
+      },
+      "receipt": {
+        "pid": 69879,
+        "actual_exit": 0,
+        "actual_wait": true,
+        "utc_end": "2026-10-03T00:12:13.219013+00:00",
+        "duration_wall_s": 0.03667770800529979,
+        "sha256": {
+          "command.json": "b64d177747b700ab3492e8febc12bac11d1e217d36ddc2e3ed78aaa3a9815091",
+          "stdout": "f4abd41ed94f47485dc3443b7b3ffd35d9edcd64960f0933592cf1415f623341",
+          "stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "command": {
+        "argv": [
+          "workspace/tmp/upload-material-unified-s3-implement-sol-20261003-01/standard-venv/bin/python",
+          "workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/build_diff_v2.py"
+        ],
+        "cwd": "/Users/leo/workspace/dayu-agent-r",
+        "utc_start": "2026-10-03T00:12:13.182364+00:00",
+        "environment": {
+          "VIRTUAL_ENV": "/Users/leo/workspace/dayu-agent-r/.venv",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "TMPDIR": "/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/"
+        },
+        "source_manifest": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/source-final-v2.json",
+        "source_manifest_sha256": "6aae2616a06581a2439bd3b396ce8da8c17b1c1884fddc6d72715f3b9528333f"
+      },
+      "stdout_tail": "{\"verified_frozen_before_paths\": 6, \"diff_sha256\": \"1c62604df9b11490c71a70c0c52c8293ea359d3b9f3f7c513ebd73616342db57\"}\n",
+      "stderr_tail": ""
+    },
+    "own-tools-type": {
+      "index": {
+        "actual_exit": 0,
+        "actual_wait": true,
+        "receipt_path": "workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/own-tools-type/receipt.json",
+        "receipt_sha256": "6f7442f8b46317a407fc7c9dd482087a49e3cf7d6233324d770a5f2941ede876",
+        "command_sha256": "8ec3c362affdb33a908bb2db8403442556faf85ed7c474aa74586fa0a9b1fb64",
+        "stdout_sha256": "46a6c7834c9080ada23a415afd925abecc37d531f5c6e3d14ad0a7ff579096cb",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "source_manifest_sha256": "6aae2616a06581a2439bd3b396ce8da8c17b1c1884fddc6d72715f3b9528333f"
+      },
+      "receipt": {
+        "pid": 69884,
+        "actual_exit": 0,
+        "actual_wait": true,
+        "utc_end": "2026-10-03T00:12:14.178373+00:00",
+        "duration_wall_s": 0.8932633749791421,
+        "sha256": {
+          "command.json": "8ec3c362affdb33a908bb2db8403442556faf85ed7c474aa74586fa0a9b1fb64",
+          "stdout": "46a6c7834c9080ada23a415afd925abecc37d531f5c6e3d14ad0a7ff579096cb",
+          "stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "command": {
+        "argv": [
+          "python",
+          "-m",
+          "pyright",
+          "workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/collect.py",
+          "workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/collect-v2.py",
+          "workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/public_readback.py",
+          "workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/verify_final.py",
+          "workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/build_diff.py",
+          "workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/build_diff_v2.py"
+        ],
+        "cwd": "/Users/leo/workspace/dayu-agent-r",
+        "utc_start": "2026-10-03T00:12:13.285141+00:00",
+        "environment": {
+          "VIRTUAL_ENV": "/Users/leo/workspace/dayu-agent-r/.venv",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "TMPDIR": "/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/"
+        },
+        "source_manifest": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/source-final-v2.json",
+        "source_manifest_sha256": "6aae2616a06581a2439bd3b396ce8da8c17b1c1884fddc6d72715f3b9528333f"
+      },
+      "stdout_tail": "0 errors, 0 warnings, 0 informations\nWARNING: there is a new pyright version available (v1.1.409 -> v1.1.414).\nPlease install the new version or set PYRIGHT_PYTHON_FORCE_VERSION to `latest`\n\n",
+      "stderr_tail": ""
+    },
+    "patch-check": {
+      "index": {
+        "actual_exit": 0,
+        "actual_wait": true,
+        "receipt_path": "workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/patch-check/receipt.json",
+        "receipt_sha256": "0c3a43256796279165acf06fa60a3ec5ba61f31c44dd25ae14684ca99196525e",
+        "command_sha256": "84d12300fc97c112e272caf72cba98b9518854a09062e636742d1bcf7c41dfdc",
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "source_manifest_sha256": "6aae2616a06581a2439bd3b396ce8da8c17b1c1884fddc6d72715f3b9528333f"
+      },
+      "receipt": {
+        "pid": 70154,
+        "actual_exit": 0,
+        "actual_wait": true,
+        "utc_end": "2026-10-03T00:13:13.645933+00:00",
+        "duration_wall_s": 0.014705458015669137,
+        "sha256": {
+          "command.json": "84d12300fc97c112e272caf72cba98b9518854a09062e636742d1bcf7c41dfdc",
+          "stdout": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "command": {
+        "argv": [
+          "git",
+          "apply",
+          "--reverse",
+          "--check",
+          "workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/repair-only.patch"
+        ],
+        "cwd": "/Users/leo/workspace/dayu-agent-r",
+        "utc_start": "2026-10-03T00:13:13.631261+00:00",
+        "environment": {
+          "VIRTUAL_ENV": "/Users/leo/workspace/dayu-agent-r/.venv",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "TMPDIR": "/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/"
+        },
+        "source_manifest": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/source-final-v2.json",
+        "source_manifest_sha256": "6aae2616a06581a2439bd3b396ce8da8c17b1c1884fddc6d72715f3b9528333f"
+      },
+      "stdout_tail": "",
+      "stderr_tail": ""
+    },
+    "pyright-final": {
+      "index": {
+        "actual_exit": 1,
+        "actual_wait": true,
+        "receipt_path": "workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/pyright-final/receipt.json",
+        "receipt_sha256": "29f17990cb91177a5be7e6459a07afdce5566b0165567eeef4c8bd85ffd285d9",
+        "command_sha256": "be280f78625fa17ee0f7f74331ba88e87e65c2dfc51cbaa432db1628d4c07c36",
+        "stdout_sha256": "cf319e57f96a5a07707c6bade13c986ec458ef23f4349820c278b61a3fa876eb",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "source_manifest_sha256": "d6f78771265c5d6d2cfe60e637028033a60ea99666e8b2d08e2ff6f42498056a"
+      },
+      "receipt": {
+        "pid": 69157,
+        "actual_exit": 1,
+        "actual_wait": true,
+        "utc_end": "2026-10-03T00:07:54.151855+00:00",
+        "duration_wall_s": 36.66930433397647,
+        "sha256": {
+          "command.json": "be280f78625fa17ee0f7f74331ba88e87e65c2dfc51cbaa432db1628d4c07c36",
+          "stdout": "cf319e57f96a5a07707c6bade13c986ec458ef23f4349820c278b61a3fa876eb",
+          "stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "command": {
+        "argv": [
+          "python",
+          "-m",
+          "pyright"
+        ],
+        "cwd": "/Users/leo/workspace/dayu-agent-r",
+        "utc_start": "2026-10-03T00:07:17.482572+00:00",
+        "environment": {
+          "VIRTUAL_ENV": "/Users/leo/workspace/dayu-agent-r/.venv",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "TMPDIR": "/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/"
+        },
+        "source_manifest": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/source-final.json",
+        "source_manifest_sha256": "d6f78771265c5d6d2cfe60e637028033a60ea99666e8b2d08e2ff6f42498056a"
+      },
+      "stdout_tail": "/Users/leo/workspace/dayu-agent-r/tests/fins/test_docling_process_converter.py\n  /Users/leo/workspace/dayu-agent-r/tests/fins/test_docling_process_converter.py:24:36 - error: \"DoclingDocument\" is not exported from module \"docling_core.types.doc\"\n    Import from \"docling_core.types.doc.document\" instead (reportPrivateImportUsage)\n1 error, 0 warnings, 0 informations\nWARNING: there is a new pyright version available (v1.1.409 -> v1.1.414).\nPlease install the new version or set PYRIGHT_PYTHON_FORCE_VERSION to `latest`\n\n",
+      "stderr_tail": ""
+    },
+    "pyright-final-v2": {
+      "index": {
+        "actual_exit": 0,
+        "actual_wait": true,
+        "receipt_path": "workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/pyright-final-v2/receipt.json",
+        "receipt_sha256": "04516e2c3faf772da2f5b12d994728c87e7338151a69583c9f0fc258eb1b4598",
+        "command_sha256": "83bf9bfd345b34341df1a42e8c22b869e1e2835300ea79312db05f5ad4009fe7",
+        "stdout_sha256": "46a6c7834c9080ada23a415afd925abecc37d531f5c6e3d14ad0a7ff579096cb",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "source_manifest_sha256": "6aae2616a06581a2439bd3b396ce8da8c17b1c1884fddc6d72715f3b9528333f"
+      },
+      "receipt": {
+        "pid": 69535,
+        "actual_exit": 0,
+        "actual_wait": true,
+        "utc_end": "2026-10-03T00:09:18.705032+00:00",
+        "duration_wall_s": 36.36977124999976,
+        "sha256": {
+          "command.json": "83bf9bfd345b34341df1a42e8c22b869e1e2835300ea79312db05f5ad4009fe7",
+          "stdout": "46a6c7834c9080ada23a415afd925abecc37d531f5c6e3d14ad0a7ff579096cb",
+          "stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "command": {
+        "argv": [
+          "python",
+          "-m",
+          "pyright"
+        ],
+        "cwd": "/Users/leo/workspace/dayu-agent-r",
+        "utc_start": "2026-10-03T00:08:42.335279+00:00",
+        "environment": {
+          "VIRTUAL_ENV": "/Users/leo/workspace/dayu-agent-r/.venv",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "TMPDIR": "/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/"
+        },
+        "source_manifest": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/source-final-v2.json",
+        "source_manifest_sha256": "6aae2616a06581a2439bd3b396ce8da8c17b1c1884fddc6d72715f3b9528333f"
+      },
+      "stdout_tail": "0 errors, 0 warnings, 0 informations\nWARNING: there is a new pyright version available (v1.1.409 -> v1.1.414).\nPlease install the new version or set PYRIGHT_PYTHON_FORCE_VERSION to `latest`\n\n",
+      "stderr_tail": ""
+    },
+    "readback-01": {
+      "index": {
+        "actual_exit": 0,
+        "actual_wait": true,
+        "receipt_path": "workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/readback-01/receipt.json",
+        "receipt_sha256": "b5f6becdcb87a95a5fbe88aaa6e4a6a9d4ad61fee04367247a91d27abac3899a",
+        "command_sha256": "c964c53ee0c56d9e33fb4a9874b8bb5dc1883335b374d571ac4cb815ffa152c0",
+        "stdout_sha256": "a3c9ac3fe9723dbdb04204a4bac18d6b00977f61df999f3fe2d57df6d5237e74",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "source_manifest_sha256": "6aae2616a06581a2439bd3b396ce8da8c17b1c1884fddc6d72715f3b9528333f"
+      },
+      "receipt": {
+        "pid": 69608,
+        "actual_exit": 0,
+        "actual_wait": true,
+        "utc_end": "2026-10-03T00:09:26.763115+00:00",
+        "duration_wall_s": 0.6316761669877451,
+        "sha256": {
+          "command.json": "c964c53ee0c56d9e33fb4a9874b8bb5dc1883335b374d571ac4cb815ffa152c0",
+          "stdout": "a3c9ac3fe9723dbdb04204a4bac18d6b00977f61df999f3fe2d57df6d5237e74",
+          "stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "command": {
+        "argv": [
+          "workspace/tmp/upload-material-unified-s3-implement-sol-20261003-01/standard-venv/bin/python",
+          "workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/public_readback.py"
+        ],
+        "cwd": "/Users/leo/workspace/dayu-agent-r",
+        "utc_start": "2026-10-03T00:09:26.131475+00:00",
+        "environment": {
+          "VIRTUAL_ENV": "/Users/leo/workspace/dayu-agent-r/.venv",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "TMPDIR": "/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/"
+        },
+        "source_manifest": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/source-final-v2.json",
+        "source_manifest_sha256": "6aae2616a06581a2439bd3b396ce8da8c17b1c1884fddc6d72715f3b9528333f"
+      },
+      "stdout_tail": "{\"cli_actual_exit\": 1, \"cli_actual_wait\": true, \"failure_code\": \"docling_converter_construction\", \"stored_files\": 0, \"document_id\": \"mat_6fdc16b1a442b45da17c8b0a0a127e8ea1e939eb\", \"material_status\": \"missing\", \"material_publication_present\": false, \"material_ids\": [], \"company_present\": true, \"company_name\": \"Mountain Lake Acquisition Corp.\", \"cli_content_execution_observed\": false, \"gap\": \"sandbox_init Operation not permitted; content parsing was not reached\"}\n",
+      "stderr_tail": ""
+    },
+    "tests-01": {
+      "index": {
+        "actual_exit": 0,
+        "actual_wait": true,
+        "receipt_path": "workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/tests-01/receipt.json",
+        "receipt_sha256": "9ba8ca938d51a112b20a716d14d32dab5824c2214f8f6a29ad10f16962ec73ce",
+        "command_sha256": "3ea3e0f761d4a1b298f64a5dcae0fed539ba397ac79f6a8c4203af2839f4740d",
+        "stdout_sha256": "a6cc1b445f8b84d8ff9ea9db36e92a5aaa80e17e9106d064275dd35598dece9d",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "source_manifest_sha256": "d6f78771265c5d6d2cfe60e637028033a60ea99666e8b2d08e2ff6f42498056a"
+      },
+      "receipt": {
+        "pid": 69092,
+        "actual_exit": 0,
+        "actual_wait": true,
+        "utc_end": "2026-10-03T00:06:48.125946+00:00",
+        "duration_wall_s": 12.728427291003754,
+        "sha256": {
+          "command.json": "3ea3e0f761d4a1b298f64a5dcae0fed539ba397ac79f6a8c4203af2839f4740d",
+          "stdout": "a6cc1b445f8b84d8ff9ea9db36e92a5aaa80e17e9106d064275dd35598dece9d",
+          "stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "command": {
+        "argv": [
+          "workspace/tmp/upload-material-unified-s3-implement-sol-20261003-01/standard-venv/bin/python",
+          "-m",
+          "pytest",
+          "tests/documents/test_docling_runtime.py",
+          "tests/fins/test_docling_process_converter.py",
+          "tests/fins/test_xbrl_controlled_upload_integration.py",
+          "-k",
+          "not test_real_external_instance_cli_manifest_and_repository_readback and not test_real_invalid_content_no_success",
+          "--basetemp",
+          "workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/pytest-tmp-01",
+          "-o",
+          "cache_dir=workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/pytest-cache-01",
+          "--cov=dayu.documents.docling_runtime",
+          "--cov-report=json:workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/coverage-owner.json",
+          "--cov-report=term",
+          "-q"
+        ],
+        "cwd": "/Users/leo/workspace/dayu-agent-r",
+        "utc_start": "2026-10-03T00:06:35.397556+00:00",
+        "environment": {
+          "VIRTUAL_ENV": "/Users/leo/workspace/dayu-agent-r/.venv",
+          "COVERAGE_FILE": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/coverage-owner",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "TMPDIR": "/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/"
+        },
+        "source_manifest": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/source-final.json",
+        "source_manifest_sha256": "d6f78771265c5d6d2cfe60e637028033a60ea99666e8b2d08e2ff6f42498056a"
+      },
+      "stdout_tail": "........................................................................ [ 87%]\n..........                                                               [100%]\n================================ tests coverage ================================\n______________ coverage: platform darwin, python 3.11.15-final-0 _______________\n\nName                                Stmts   Miss  Cover\n-------------------------------------------------------\ndayu/documents/docling_runtime.py     235     21    91%\n-------------------------------------------------------\nTOTAL                                 235     21    91%\nCoverage JSON written to file workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/coverage-owner.json\n82 passed, 5 deselected in 11.75s\n",
+      "stderr_tail": ""
+    },
+    "tests-final-v2": {
+      "index": {
+        "actual_exit": 0,
+        "actual_wait": true,
+        "receipt_path": "workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/tests-final-v2/receipt.json",
+        "receipt_sha256": "2659b26bffa8de24ac8c5d4bc24934fac2d24d81fb342b11fce86130542f37e3",
+        "command_sha256": "3a4d1201f0f806b12d0d93c14df6d0eddfe17cfae063c4b6e62f3432f112cea8",
+        "stdout_sha256": "253e37c45e49474c87bead60bb671b67c7e62ad699b1817c90dc87938011f8fd",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "source_manifest_sha256": "6aae2616a06581a2439bd3b396ce8da8c17b1c1884fddc6d72715f3b9528333f"
+      },
+      "receipt": {
+        "pid": 69610,
+        "actual_exit": 0,
+        "actual_wait": true,
+        "utc_end": "2026-10-03T00:09:38.810908+00:00",
+        "duration_wall_s": 11.992186833987944,
+        "sha256": {
+          "command.json": "3a4d1201f0f806b12d0d93c14df6d0eddfe17cfae063c4b6e62f3432f112cea8",
+          "stdout": "253e37c45e49474c87bead60bb671b67c7e62ad699b1817c90dc87938011f8fd",
+          "stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      "command": {
+        "argv": [
+          "workspace/tmp/upload-material-unified-s3-implement-sol-20261003-01/standard-venv/bin/python",
+          "-m",
+          "pytest",
+          "tests/documents/test_docling_runtime.py",
+          "tests/fins/test_docling_process_converter.py",
+          "tests/fins/test_xbrl_controlled_upload_integration.py",
+          "-k",
+          "not test_real_external_instance_cli_manifest_and_repository_readback and not test_real_invalid_content_no_success",
+          "--basetemp",
+          "workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/pytest-tmp-v2",
+          "-o",
+          "cache_dir=workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/pytest-cache-v2",
+          "--cov=dayu.documents.docling_runtime",
+          "--cov-report=json:workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/coverage-owner-v2.json",
+          "--cov-report=term",
+          "-q"
+        ],
+        "cwd": "/Users/leo/workspace/dayu-agent-r",
+        "utc_start": "2026-10-03T00:09:26.803460+00:00",
+        "environment": {
+          "VIRTUAL_ENV": "/Users/leo/workspace/dayu-agent-r/.venv",
+          "COVERAGE_FILE": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/coverage-owner-v2",
+          "PYTHONDONTWRITEBYTECODE": "1",
+          "TMPDIR": "/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/"
+        },
+        "source_manifest": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/source-final-v2.json",
+        "source_manifest_sha256": "6aae2616a06581a2439bd3b396ce8da8c17b1c1884fddc6d72715f3b9528333f"
+      },
+      "stdout_tail": "........................................................................ [ 87%]\n..........                                                               [100%]\n================================ tests coverage ================================\n______________ coverage: platform darwin, python 3.11.15-final-0 _______________\n\nName                                Stmts   Miss  Cover\n-------------------------------------------------------\ndayu/documents/docling_runtime.py     235     21    91%\n-------------------------------------------------------\nTOTAL                                 235     21    91%\nCoverage JSON written to file workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/coverage-owner-v2.json\n82 passed, 5 deselected in 11.08s\n",
+      "stderr_tail": ""
+    }
+  },
+  "root_native_receipt": {
+    "pid": 70264,
+    "actual_exit": 1,
+    "actual_wait": true,
+    "utc_end": "2026-10-03T00:14:56.128364+00:00",
+    "duration_wall_s": 5.335335499985376,
+    "sha256": {
+      "command.json": "a4c1d5c2f312ee1a6731c9069ce41b3506b5b80b1510dee46800a96405ac0fd0",
+      "stdout": "3691d46e9ead2fd3afd64644b6acb23bcf2ebacb9d334216f8ae6020a6a4f324",
+      "stderr": "e87cae72678a15f4cd5b92d58264a376596aad0723861f6253e463a6a7816b52"
+    }
+  },
+  "root_native_command": {
+    "argv": [
+      "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-unified-s3-implement-sol-20261003-01/standard-venv/bin/python",
+      "-m",
+      "dayu.cli",
+      "upload_material",
+      "--base",
+      "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-unified-repair-20261002/s3-review-fix-01/root-audit/store-native-r01-01",
+      "--ticker",
+      "MLAC",
+      "--action",
+      "auto",
+      "--forms",
+      "MATERIAL_OTHER",
+      "--material-name",
+      "S3 R01 native routed content failure",
+      "--company-name",
+      "Mountain Lake Acquisition Corp.",
+      "--files",
+      "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/routed-bad.xml"
+    ],
+    "cwd": "/Users/leo/workspace/dayu-agent-r",
+    "utc_start": "2026-10-03T00:14:50.793056+00:00",
+    "environment": {
+      "DAYU_XBRL_CONFIG": "/private/tmp/dayu-xbrl-s3-admin-qmid1407/config.json",
+      "PYTHONDONTWRITEBYTECODE": "1",
+      "TMPDIR": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-unified-repair-20261002/s3-review-fix-01/root-audit"
+    },
+    "source_manifest": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-unified-s3-review-fix-sol-20261003-01/source-final-v2.json",
+    "source_manifest_sha256": "6aae2616a06581a2439bd3b396ce8da8c17b1c1884fddc6d72715f3b9528333f"
+  },
+  "root_native_public_readback": {
+    "cli_actual_exit": 1,
+    "cli_actual_wait": true,
+    "failure_code": "docling_converter_execution",
+    "stored_files": 0,
+    "document_id": "mat_a17a809c2488999141b6542d9aebb28b32a0d78b",
+    "material_status": "missing",
+    "publication_present": false,
+    "material_ids": [],
+    "company_present": true,
+    "company_name": "Mountain Lake Acquisition Corp.",
+    "source_manifest_sha256": "6aae2616a06581a2439bd3b396ce8da8c17b1c1884fddc6d72715f3b9528333f",
+    "source_count": 24,
+    "streams_sha256": {
+      "command.json": "a4c1d5c2f312ee1a6731c9069ce41b3506b5b80b1510dee46800a96405ac0fd0",
+      "stdout": "3691d46e9ead2fd3afd64644b6acb23bcf2ebacb9d334216f8ae6020a6a4f324",
+      "stderr": "e87cae72678a15f4cd5b92d58264a376596aad0723861f6253e463a6a7816b52"
+    },
+    "content_execution_observed": true,
+    "gap": null
+  },
+  "root_adjudication": "docs/gateflow/upload-material-unified-s3-review-fix-root-adjudication-20261003.md",
+  "next_entry": "re-review S3"
+}

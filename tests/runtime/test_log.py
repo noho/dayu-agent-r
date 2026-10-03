@@ -10,9 +10,14 @@ import io
 import logging
 import re
 import sys
+import traceback
 from collections.abc import Iterator
+from pathlib import Path
+from types import FrameType, TracebackType
+from typing import NoReturn
 
 import pytest
+import dayu.runtime.log as runtime_log
 
 from dayu.contracts.json_value import JsonValue
 from dayu.runtime.log import (
@@ -22,6 +27,7 @@ from dayu.runtime.log import (
     configure,
     configure_selected_diagnostics,
     log_verbose,
+    safe_exception_trace,
 )
 from dayu.runtime.log_levels import (
     CRITICAL_LOG_LEVEL,
@@ -54,6 +60,191 @@ _ORDINARY_RECORD_LEVELS: tuple[int, ...] = (
     ERROR_LOG_LEVEL,
     CRITICAL_LOG_LEVEL,
 )
+
+
+def test_safe_exception_trace_keeps_verified_frame_and_hides_raw_exception() -> None:
+    """安全诊断只保留可验证的包内帧、内建祖先和类型指纹。
+
+    :returns: 无。
+    :raises AssertionError: 原始异常、cause、外部绝对路径或受信行号丢失时抛出。
+    """
+
+    source_root = Path(runtime_log.__file__).parent.parent
+    secret = "https://secret.invalid/?token=contact-canary /Users/private/report.pdf"
+    try:
+        configure(level=LogLevel.QUIET, debug_stream=True)
+    except ValueError as exc:
+        exc.args = (secret,)
+        exc.__cause__ = RuntimeError(secret)
+        trace = safe_exception_trace(exc, source_root=source_root)
+    else:
+        pytest.fail("expected a Dayu frame")
+    assert "exception_type=ValueError custom_type=redacted" in trace
+    assert re.search(r"log\.py:[1-9][0-9]*", trace)
+    assert "[external]" in trace
+    assert "truncated=false" in trace
+    for forbidden in (secret, "token=", "https://", "/Users/", str(source_root), "quiet diagnostics"):
+        assert forbidden not in trace
+
+
+def test_safe_exception_trace_fingerprints_custom_types_without_names() -> None:
+    """两个动态异常类型只以可区分的固定十六进制指纹出现。
+
+    :returns: 无。
+    :raises AssertionError: 指纹长度、区分能力或脱敏契约失效时抛出。
+    """
+
+    source_root = Path(runtime_log.__file__).parent.parent
+    fingerprints: list[str] = []
+    for name in ("SecretAlphaTokenError", "SecretBetaTokenError"):
+        exception_class = type(name, (RuntimeError,), {"__module__": "secret.private.module"})
+        try:
+            raise exception_class("https://private.invalid/?token=contact-canary") from ValueError("/Users/private/cause")
+        except RuntimeError as exc:
+            trace = safe_exception_trace(exc, source_root=source_root)
+        assert "exception_type=RuntimeError" in trace
+        assert name not in trace
+        assert "secret.private.module" not in trace
+        assert "contact-canary" not in trace
+        assert "/Users/private" not in trace
+        match = re.search(r"custom_type=([0-9a-f]{16})\b", trace)
+        assert match is not None
+        fingerprints.append(match.group(1))
+    assert fingerprints[0] != fingerprints[1]
+
+
+def test_safe_exception_trace_redacts_external_filename_and_bad_type_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """外部伪造文件名不会进入诊断，非法类型元数据只产生固定遮盖词。
+
+    :param monkeypatch: 注入非法类型元数据。
+    :returns: 无。
+    :raises AssertionError: 外部路径或自定义类型元数据泄漏时抛出。
+    """
+
+    source_root = Path(runtime_log.__file__).parent.parent
+    code = compile(
+        "raise RuntimeError('https://private.invalid/?token=secret')",
+        "/Users/private/token_source.py",
+        "exec",
+    )
+    try:
+        exec(code)
+    except RuntimeError as exc:
+        trace = safe_exception_trace(exc, source_root=source_root)
+    else:
+        pytest.fail("expected an external traceback frame")
+    assert trace.count("[external]") >= 2
+    assert "/Users/private" not in trace
+    assert "https://" not in trace
+    assert "token=" not in trace
+
+    class BadMetadataError(RuntimeError):
+        """用于检验非法类型元数据降级。"""
+
+    monkeypatch.setattr(BadMetadataError, "__module__", 42)
+    bad_trace = safe_exception_trace(BadMetadataError("secret"), source_root=source_root)
+    assert "exception_type=RuntimeError custom_type=redacted" in bad_trace
+    assert "BadMetadataError" not in bad_trace
+
+
+def test_safe_exception_trace_bounds_deep_stack_and_handles_missing_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """深栈只校验并输出末十六帧，无 traceback 使用固定缺失标记。
+
+    :param monkeypatch: 观察受信帧校验调用而不改变校验结果。
+    :returns: 无。
+    :raises AssertionError: 校验范围、深栈边界或缺失 traceback 投影不符时抛出。
+    """
+
+    source_root = Path(runtime_log.__file__).parent.parent
+    validated_frames: list[tuple[FrameType, int]] = []
+    validate_frame = runtime_log._safe_trace_frame
+
+    def record_validation(frame: FrameType, line_number: int, root: Path) -> str:
+        """记录实际校验的帧并使用原校验规则生成诊断。
+
+        :param frame: 待校验的 traceback 帧。
+        :param line_number: traceback 记录的行号。
+        :param root: 调用方传入的受信包根。
+        :returns: 原校验规则生成的安全帧片段。
+        :raises Exception: 遵循原校验函数的异常契约。
+        """
+
+        validated_frames.append((frame, line_number))
+        return validate_frame(frame, line_number, root)
+
+    def raise_deep(depth: int) -> NoReturn:
+        """构造有界测试递归栈。
+
+        :param depth: 剩余递归层数。
+        :returns: 不返回。
+        :raises RuntimeError: 到达底层时抛出。
+        """
+
+        if depth == 0:
+            raise RuntimeError("token=hidden")
+        raise_deep(depth - 1)
+        raise AssertionError("unreachable")
+
+    try:
+        raise_deep(25)
+    except RuntimeError as exc:
+        original_frames = list(traceback.walk_tb(exc.__traceback__))
+        with monkeypatch.context() as patch:
+            patch.setattr(runtime_log, "_safe_trace_frame", record_validation)
+            trace = safe_exception_trace(exc, source_root=source_root)
+    assert len(original_frames) > 16
+    assert validated_frames == original_frames[-16:]
+    assert trace.count("[external]") == 16
+    assert trace.endswith("truncated=true")
+    assert "token=hidden" not in trace
+    assert "stack=[unavailable]" in safe_exception_trace(RuntimeError("secret"), source_root=source_root)
+
+
+def test_safe_exception_trace_internal_failures_return_fixed_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    """遍历或哈希故障都只返回同一个固定安全串。
+
+    :param monkeypatch: 注入 helper 内部失败。
+    :returns: 无。
+    :raises AssertionError: 内部失败抛出或泄漏原始文本时抛出。
+    """
+
+    source_root = Path(runtime_log.__file__).parent.parent
+    expected = "exception_type=redacted custom_type=redacted stack=[unavailable]"
+
+    def broken_walk(_tb: TracebackType | None) -> Iterator[tuple[FrameType, int]]:
+        """模拟 traceback 遍历故障。
+
+        :param _tb: 未使用的 traceback 输入。
+        :returns: 不返回。
+        :raises RuntimeError: 始终抛出。
+        """
+
+        raise RuntimeError("token=walk-secret")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime_log.traceback, "walk_tb", broken_walk)
+        assert safe_exception_trace(ValueError("/Users/private"), source_root=source_root) == expected
+
+    def broken_hash(_data: bytes) -> NoReturn:
+        """模拟指纹哈希故障。
+
+        :param _data: 指纹原始字节。
+        :returns: 不返回。
+        :raises RuntimeError: 始终抛出。
+        """
+
+        raise RuntimeError("token=hash-secret")
+
+    class CustomError(RuntimeError):
+        """用于触发自定义类型指纹的异常。"""
+
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime_log.hashlib, "sha256", broken_hash)
+        assert safe_exception_trace(CustomError("https://private.invalid"), source_root=source_root) == expected
 
 
 @pytest.fixture(autouse=True)

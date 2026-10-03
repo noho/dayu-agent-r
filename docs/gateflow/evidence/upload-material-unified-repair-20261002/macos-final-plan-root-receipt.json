@@ -1,0 +1,52 @@
+{
+  "outer_exit": 0,
+  "event_count": 108,
+  "command_count": 48,
+  "canary_tool_match": true,
+  "canary_final_match": true,
+  "stderr_size": 0,
+  "hash_checks": {
+    "protected": {
+      "count": 2883,
+      "before_after_equal": true,
+      "current_mismatches": []
+    },
+    "source-contract-hashes": {
+      "count": 15,
+      "before_after_equal": true,
+      "current_mismatches": []
+    },
+    "artifact_sha256": {
+      "count": 15,
+      "mismatches": []
+    },
+    "input_sha256": {
+      "count": 10,
+      "mismatches": []
+    }
+  },
+  "model": "unknown",
+  "root_harness_outer_exit": 1,
+  "root_harness_actual_spawn_child_exit": 1,
+  "root_inputs_unchanged": true,
+  "generation_ready": false,
+  "nonzero_events": [
+    {
+      "id": "item_8",
+      "exit": 2
+    },
+    {
+      "id": "item_16",
+      "exit": 1
+    },
+    {
+      "id": "item_17",
+      "exit": 1
+    },
+    {
+      "id": "item_25",
+      "exit": 1
+    }
+  ],
+  "runtime_schema_reference": "user-approved runtime read-only exception; rejected-with-reason, not fixed"
+}

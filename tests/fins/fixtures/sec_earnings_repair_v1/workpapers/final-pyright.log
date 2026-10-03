@@ -1,0 +1,5 @@
+ASCII guide only; this file is NOT the historical pyright stdout.
+The exact historical stdout is preserved in final-pyright.raw.json.
+Decode its payload as base64; decoded size is 191 bytes and SHA256 is
+70a0f3577f8953319fd286c94822becc2dd8c6ec2ba6d76e8bc67172b4e12691.
+The decoded bytes include the original final blank line; do not trim.

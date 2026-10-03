@@ -1,0 +1,80 @@
+{
+  "label": "upload-material-unified-s1-review-ds-flash-20261002-01",
+  "outer_exit": 0,
+  "actual_model": "deepseek-flash[1m]",
+  "structured_events": 89677,
+  "tool_uses": 148,
+  "canary_actual_tool_bytes_match": true,
+  "canary_final_match": true,
+  "artifact": "docs/reviews/code-review-20261002-213810.md",
+  "artifact_sha256": "d6ee01e69f85518fb6b2aa238d2f703aec281d65721828c413cec086bd52e481",
+  "stream_sha256": "6e9d9c2ce2c5a313047d58e46723559938966b7e16d1c2af5d73133edacbdfe4",
+  "stderr": "[claude-code:unrecognized_model] {\"model\":\"deepseek-flash[1m]\",\"query_source\":\"sdk\"}\n",
+  "warnings": [
+    {
+      "tool_index": 62,
+      "id": "call_00_iplR42fZ4SLtV3GIhiGj5090",
+      "classification": "explained task warning",
+      "resolution": "Later63/65/66/68 read canonical function and source inspection; root directly reads originally skipped 171-200 and300-345."
+    },
+    {
+      "tool_index": 64,
+      "id": "call_00_1nFOivjK2g5QPNmd1NFr4598",
+      "classification": "explained task warning",
+      "resolution": "65/66/68 actual source assignments and strict scan read; root skipped region read."
+    },
+    {
+      "tool_index": 113,
+      "id": "call_00_pzDk5KSx1PF29xr6K2sj0440",
+      "classification": "explained task warning",
+      "resolution": "114 actual workflow result/caller read; root directly reads sec_pipeline1713 result body."
+    },
+    {
+      "tool_index": 120,
+      "id": "call_00_kMTS05lVOpf2XFhfxb1g9072",
+      "classification": "explained task warning",
+      "resolution": "121 real repair writer read; root rg actual integrity has no JSON write sites (expected no match exit1), all core writes enumerated."
+    },
+    {
+      "tool_index": 128,
+      "id": "call_00_BFDd95wvL6X6s3UABWce2951",
+      "classification": "explained task warning",
+      "resolution": "129 actual create_source final publication read; root original _store_upload_assets read."
+    },
+    {
+      "tool_index": 135,
+      "id": "call_00_eCx6BbC3R9VAb5Ffc6Q03328",
+      "classification": "explained task warning",
+      "resolution": "Negative no-match grep only; 211pass1skip actual limitedpytest134=0, no new root coverage/cache claim limited to preserved receipts."
+    },
+    {
+      "tool_index": 131,
+      "classification": "compound hidden BSD cat-A failure recovered132 sed-l; sh-n2 valid counterexample independently root-reproduced"
+    },
+    {
+      "tool_index": 80,
+      "classification": "hidden compound unquoted --include=*.py glob failure",
+      "resolution": "81 locates true render_upload_script and both actual callers;83 full renderer owner read;root independent original renderer and real argv flow read/reproduction."
+    }
+  ],
+  "root_freeze_check": "9514/9514 zero drift",
+  "reviewer_limited_test": "211pass1skip actual tool134 exit0; pyright actual tool output0, no standalone exit files",
+  "root_independent_counterexample": "actual CLI0/sh-n2 streams/exit persisted in newline-cli-repro",
+  "acceptance": "review usable; finding1 accepted R02, finding2 mergedR01, finding3 rejected; S1 gate not passed",
+  "reviewer_full_pyright": {
+    "tool_index": 107,
+    "actual_exit": 0,
+    "stdout": "0 errors, 0 warnings, 0 informations",
+    "stderr_bytes": 0
+  },
+  "author_index_warning": "old validation-index command text mislabels pytest as pyright. Actual final pytest16.command.json exact argv exists and was root-read; hashes/exits/JUnit unaffected. Old raw preserved, new fix must write actual argv index.",
+  "setup_status": "ok",
+  "agent_status": "completed",
+  "tool_evidence": "yes",
+  "tool_trace": "complete",
+  "required_evidence": "complete",
+  "canary_status": "match",
+  "result_status": "accepted",
+  "evidence_gaps": [],
+  "retry_class": "none"
+}

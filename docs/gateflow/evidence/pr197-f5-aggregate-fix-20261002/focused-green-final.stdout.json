@@ -1,0 +1,7 @@
+{
+  "original_file": "focused-green-final.stdout",
+  "encoding": "base64",
+  "sha256": "ec1f59d8773ac2e649756d8371ad304d089d3b690083c825614be390c6c399d1",
+  "data": "Li4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4gICAgICAgICAgICAgICAgICAgICAgICAgICAgIFsxMDAlXQo0NCBwYXNzZWQsIDEyNiBkZXNlbGVjdGVkIGluIDEuNTNzCg==",
+  "reason": "原stdout逐字可逆保全，保原EOF空白，不以trim改证据"
+}

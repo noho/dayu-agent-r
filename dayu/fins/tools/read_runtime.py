@@ -46,6 +46,7 @@ from dayu.fins.processors.source_text import FinsSourceDecodeError, validate_sou
 from .error_contract import ErrorCode
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.domain.tool_models import Citation, SourceType
+from dayu.fins.storage.source_meta_contract import require_material_source_meta_amended
 from dayu.fins.storage import (
     CompanyMetaRepositoryProtocol,
     CompanyTickerIdentityCorruptionError,
@@ -604,16 +605,18 @@ def _raise_if_fins_cancelled(cancellation_token: CancellationToken | None) -> No
     raise_if_fins_cancelled(cancellation_token, message="财报读取工具调用已被取消。")
 
 
-def _parse_source_document_meta(raw_meta: Mapping[str, JsonValue]) -> _SourceDocumentMeta:
+def _parse_source_document_meta(raw_meta: Mapping[str, JsonValue], *, source_kind: SourceKind) -> _SourceDocumentMeta:
     """把仓储 raw meta 收窄为 read runtime 本地投影。
 
     Args:
         raw_meta: 仓储返回的 source meta JSON 对象。
+        source_kind: 权威材料或 filing 分支，决定修订标记的严格读取合同。
 
     Returns:
         read runtime 当前消费的 typed meta 投影。
 
     Raises:
+        KeyError: 材料修订标记缺失时抛出。
         ValueError: bool 字段存在但不是 bool 时抛出。
         RuntimeError: 其它字段收窄失败时抛出。
     """
@@ -629,7 +632,7 @@ def _parse_source_document_meta(raw_meta: Mapping[str, JsonValue]) -> _SourceDoc
         "fiscal_period": normalize_fiscal_period(raw_fiscal_period),
         "report_date": _normalize_json_scalar_text(raw_meta.get("report_date")),
         "filing_date": _normalize_json_scalar_text(raw_meta.get("filing_date")),
-        "amended": _read_bool_meta_field(raw_meta, field_name="amended", default=False),
+        "amended": require_material_source_meta_amended(raw_meta) if source_kind is SourceKind.MATERIAL else _read_bool_meta_field(raw_meta, field_name="amended", default=False),
         "internal_document_id": _normalize_json_scalar_text(raw_meta.get("internal_document_id")),
         "accession_number": _normalize_json_scalar_text(raw_meta.get("accession_number")),
         "ingest_method": _normalize_json_scalar_text(raw_meta.get("ingest_method")),
@@ -907,7 +910,7 @@ class FinsReadRuntime:
                     "fiscal_period": item["fiscal_period"],
                     "report_date": item["report_date"],
                     "filing_date": item["filing_date"],
-                    "amended": item["amended"],
+                    **({"published_amended": item["amended"]} if item["source_kind"] == SourceKind.MATERIAL.value else {"amended": item["amended"]}),
                     "has_financial_data": item["has_financial_data"],
                     "document_type": item["document_type"],
                 }
@@ -2409,7 +2412,7 @@ class FinsReadRuntime:
                             ticker,
                             candidate_document_id,
                             source_kind,
-                        )
+                        ), source_kind=source_kind,
                     )
                 except FileNotFoundError:
                     continue
@@ -2544,7 +2547,7 @@ class FinsReadRuntime:
             _raise_if_fins_cancelled(cancellation_token)
             try:
                 meta = _parse_source_document_meta(
-                    self._source_repository.get_source_meta(ticker, document_id, source_kind)
+                    self._source_repository.get_source_meta(ticker, document_id, source_kind), source_kind=source_kind,
                 )
             except FileNotFoundError:
                 continue
@@ -3041,7 +3044,7 @@ class FinsReadRuntime:
         _raise_if_fins_cancelled(cancellation_token)
         source = snapshot.get_primary_source()
         source_meta = snapshot.source_meta
-        parsed_source_meta = _parse_source_document_meta(source_meta)
+        parsed_source_meta = _parse_source_document_meta(source_meta, source_kind=SourceKind(snapshot.source_kind))
         if parsed_source_meta["is_deleted"] or not parsed_source_meta["ingest_complete"]:
             raise FileNotFoundError(
                 f"source document 当前不可读取: ticker={snapshot.ticker}, document_id={snapshot.document_id}"

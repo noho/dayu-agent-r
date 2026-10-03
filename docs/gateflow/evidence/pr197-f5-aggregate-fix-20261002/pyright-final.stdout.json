@@ -1,0 +1,7 @@
+{
+  "original_file": "pyright-final.stdout",
+  "encoding": "base64",
+  "sha256": "46a6c7834c9080ada23a415afd925abecc37d531f5c6e3d14ad0a7ff579096cb",
+  "data": "MCBlcnJvcnMsIDAgd2FybmluZ3MsIDAgaW5mb3JtYXRpb25zCldBUk5JTkc6IHRoZXJlIGlzIGEgbmV3IHB5cmlnaHQgdmVyc2lvbiBhdmFpbGFibGUgKHYxLjEuNDA5IC0+IHYxLjEuNDE0KS4KUGxlYXNlIGluc3RhbGwgdGhlIG5ldyB2ZXJzaW9uIG9yIHNldCBQWVJJR0hUX1BZVEhPTl9GT1JDRV9WRVJTSU9OIHRvIGBsYXRlc3RgCgo=",
+  "reason": "原stdout逐字可逆保全，保原EOF空白，不以trim改证据"
+}

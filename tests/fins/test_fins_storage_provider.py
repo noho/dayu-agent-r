@@ -22,6 +22,9 @@ from pathlib import Path
 from threading import Event, Lock
 from typing import Final, Literal, cast
 
+from docling_core.types.doc.document import DoclingDocument
+from docling_core.types.doc.labels import DocItemLabel
+
 import pytest
 
 from tests.fins.company_meta_test_support import stage_company_meta_fixture
@@ -1315,6 +1318,7 @@ def test_snapshot_explicit_source_kind_ignores_other_kind_with_same_document_id(
     blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
     batching = FsBatchingRepository(workspace_root, repository_set=repository_set)
     batch = batching.begin_batch("AAPL")
+    expected_primary_bytes: dict[SourceKind, bytes] = {}
     for source_kind, filename, payload in (
         (SourceKind.FILING, "filing.html", b"filing-version"),
         (SourceKind.MATERIAL, "material.html", b"material-version"),
@@ -1324,10 +1328,18 @@ def test_snapshot_explicit_source_kind_ignores_other_kind_with_same_document_id(
             document_id="shared-document",
             source_kind=source_kind.value,
         )
+        primary_name = filename
+        primary_bytes = payload
+        if source_kind is SourceKind.MATERIAL:
+            primary_name = f"{filename}_docling.json"
+            document = DoclingDocument(name=filename)
+            document.add_text(label=DocItemLabel.TEXT, text=payload.decode())
+            primary_bytes = document.model_dump_json().encode()
+        expected_primary_bytes[source_kind] = primary_bytes
         file_meta = blob_repository.store_file(
             handle,
-            filename,
-            io.BytesIO(payload),
+            primary_name,
+            io.BytesIO(primary_bytes),
             batch=batch,
             content_type="text/html",
         )
@@ -1336,11 +1348,11 @@ def test_snapshot_explicit_source_kind_ignores_other_kind_with_same_document_id(
             blob_repository.store_file(
                 handle,
                 original_name,
-                io.BytesIO(b"original filing version"),
+                io.BytesIO(payload if source_kind is SourceKind.MATERIAL else b"original filing version"),
                 batch=batch,
                 content_type="text/html",
             )
-            if source_kind is SourceKind.FILING
+            if source_kind in {SourceKind.FILING, SourceKind.MATERIAL}
             else None
         )
         repository.create_source_document(
@@ -1349,10 +1361,11 @@ def test_snapshot_explicit_source_kind_ignores_other_kind_with_same_document_id(
                 document_id="shared-document",
                 internal_document_id=f"{source_kind.value}-shared-document",
                 form_type="10-K" if source_kind is SourceKind.FILING else "EX-99",
-                primary_document=filename,
+                primary_document=primary_name,
                 meta={
                     "ingest_method": "upload",
                     "source_provider": "user_upload",
+                    "amended": False,
                 },
                 files=[file_meta] if original_meta is None else [],
                 file_entries=(
@@ -1367,7 +1380,7 @@ def test_snapshot_explicit_source_kind_ignores_other_kind_with_same_document_id(
                         ),
                         _fresh_upload_file_entry(
                             file_meta,
-                            name=filename,
+                            name=primary_name,
                             source="docling",
                             original_filename=filename,
                             derived_from=original_name,
@@ -1382,7 +1395,7 @@ def test_snapshot_explicit_source_kind_ignores_other_kind_with_same_document_id(
 
     for source_kind, expected_payload in (
         (SourceKind.FILING, b"filing-version"),
-        (SourceKind.MATERIAL, b"material-version"),
+        (SourceKind.MATERIAL, expected_primary_bytes[SourceKind.MATERIAL]),
     ):
         snapshot = repository.read_source_snapshot(
             "AAPL",
@@ -3328,44 +3341,22 @@ def test_list_documents_meta_less_corpus_coexists_with_healthy_alias_corpus(
     source_repository = FsSourceDocumentRepository(workspace_root, repository_set=repository_set)
     blob_repository = FsDocumentBlobRepository(workspace_root, repository_set=repository_set)
     batch = batching_repository.begin_batch("DELTA")
-    request = SourceDocumentUpsertRequest(
-        ticker="DELTA",
-        document_id="delta-material",
-        internal_document_id="delta-material",
-        form_type="material",
-        primary_document="delta.md",
-        meta={
-            "fiscal_year": 2025,
-            "fiscal_period": "FY",
-            "ingest_method": "upload",
-            "source_provider": "user_upload",
-        },
-    )
-    source_repository.create_source_document(request, SourceKind.MATERIAL, batch=batch)
-    handle = SourceHandle(
-        ticker="DELTA",
-        document_id="delta-material",
-        source_kind=SourceKind.MATERIAL.value,
-    )
-    file_meta = blob_repository.store_file(
-        handle,
-        "delta.md",
-        io.BytesIO(b"# Delta material\n"),
-        batch=batch,
-        content_type="text/markdown",
-    )
-    source_repository.update_source_document(
+    handle = SourceHandle(ticker="DELTA", document_id="delta-material", source_kind="material")
+    original = blob_repository.store_file(handle, "delta.md", io.BytesIO(b"# Delta material\n"), batch=batch, content_type="text/markdown")
+    # 此夹具仅补完整 Docling 主源及角色，保留原 namespace、财年和 meta-less 事实。
+    document = DoclingDocument(name="delta-material")
+    document.add_text(label=DocItemLabel.TEXT, text="Delta material")
+    primary = blob_repository.store_file(handle, "delta.md_docling.json", io.BytesIO(document.model_dump_json().encode()), batch=batch, content_type="application/json")
+    source_repository.create_source_document(
         SourceDocumentUpsertRequest(
-            ticker=request.ticker,
-            document_id=request.document_id,
-            internal_document_id=request.internal_document_id,
-            form_type=request.form_type,
-            primary_document=request.primary_document,
-            meta=request.meta,
-            files=[file_meta],
-        ),
-        SourceKind.MATERIAL,
-        batch=batch,
+            ticker="DELTA", document_id="delta-material", internal_document_id="delta-material",
+            form_type="material", primary_document="delta.md_docling.json",
+            meta={"fiscal_year": 2025, "fiscal_period": "FY", "ingest_method": "upload", "source_provider": "user_upload", "amended": False},
+            file_entries=[
+                _fresh_upload_file_entry(original, name="delta.md", source="original", original_filename="delta.md"),
+                _fresh_upload_file_entry(primary, name="delta.md_docling.json", source="docling", original_filename="delta.md", derived_from="delta.md"),
+            ],
+        ), SourceKind.MATERIAL, batch=batch,
     )
     batching_repository.commit_batch(batch)
 
@@ -5416,8 +5407,8 @@ def _create_source_document_for_provenance(
         batch=batch,
         content_type="text/markdown" if processor_compatible else "text/plain",
     )
-    is_fresh_upload_filing = (
-        source_kind is SourceKind.FILING
+    is_fresh_upload_source = (
+        source_kind in {SourceKind.FILING, SourceKind.MATERIAL}
         and ingest_method == "upload"
         and source_provider == FinsSourceProvider.USER_UPLOAD.to_storage_value()
     )
@@ -5460,7 +5451,7 @@ def _create_source_document_for_provenance(
             batch=batch,
             content_type="application/json",
         )
-        if is_fresh_upload_filing
+        if is_fresh_upload_source
         else None
     )
     file_entries = (

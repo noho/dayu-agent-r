@@ -1,0 +1,19 @@
+{
+  "scope": "local observation only, does not establish absence of remote runners",
+  "argv": [
+    "docker",
+    "info",
+    "--format",
+    "{{.OSType}} {{.Architecture}}"
+  ],
+  "exit": 1,
+  "stdout": " \n",
+  "stderr": "failed to connect to the docker API at unix:///Users/leo/.docker/run/docker.sock; check if the path is correct and if the daemon is running: dial unix /Users/leo/.docker/run/docker.sock: connect: no such file or directory\n",
+  "interpretation": "local Docker daemon not currently reachable; Linux/Windows validation resource not yet established",
+  "user_reply": {
+    "answer": "目前没有",
+    "question": "受控 XBRL 是否已有 Linux/Windows 执行环境",
+    "question_item_id": "[\"request_user_input_async\",\"call_HyomfTDZNhBRx3GNfVquK2Bk\",0]",
+    "interpretation": "resource unavailable; no authorization to waive validation or remove XBRL from scope"
+  }
+}

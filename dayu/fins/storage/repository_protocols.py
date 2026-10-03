@@ -11,11 +11,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Iterable, Callable
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from types import TracebackType
-from typing import BinaryIO, Final, Literal, Optional, Protocol
+from types import TracebackType, MappingProxyType
+from typing import BinaryIO, Final, Literal, Optional, Protocol, overload, SupportsIndex, TYPE_CHECKING
 
 from dayu.contracts.json_value import JsonValue
 from dayu.documents.processors.source import Source
@@ -49,8 +49,13 @@ from dayu.fins.domain.document_models import (
     SourceHandle,
 )
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.domain.filing_semantics import FiscalPeriod, FISCAL_PERIODS
 from dayu.fins.ticker_normalization import normalize_ticker
 
+if TYPE_CHECKING:
+    from _typeshed import SupportsRichComparison
+
+from .source_meta_read import SourceMetaIntegrityReadEntry, SourceMetaReadView
 from .source_integrity import SourceIntegrityClassification, SourceIntegrityStatus
 
 
@@ -502,6 +507,228 @@ class FilingUploadStateRepositoryProtocol(Protocol):
         ...
 
 
+
+class _FrozenJsonList(list[JsonValue]):
+    """保持 JSON 数组类型且禁止修改的深层快照。"""
+
+    @overload
+    def __setitem__(self, key: SupportsIndex, value: JsonValue) -> None: ...
+    @overload
+    def __setitem__(self, key: slice[SupportsIndex | None, SupportsIndex | None, SupportsIndex | None], value: Iterable[JsonValue]) -> None: ...
+    def __setitem__(self, key: SupportsIndex | slice[SupportsIndex | None, SupportsIndex | None, SupportsIndex | None], value: JsonValue | Iterable[JsonValue]) -> None:
+        """参数：索引和值；返回：无；异常：TypeError，快照禁止修改。"""
+        raise TypeError("材料快照不可修改")
+
+    def __delitem__(self, key: SupportsIndex | slice[SupportsIndex | None, SupportsIndex | None, SupportsIndex | None]) -> None:
+        """参数：索引；返回：无；异常：TypeError，快照禁止修改。"""
+        raise TypeError("材料快照不可修改")
+
+    def append(self, value: JsonValue) -> None:
+        """参数：值；返回：无；异常：TypeError，快照禁止修改。"""
+        raise TypeError("材料快照不可修改")
+
+    def extend(self, values: Iterable[JsonValue]) -> None:
+        """参数：值集合；返回：无；异常：TypeError，快照禁止修改。"""
+        raise TypeError("材料快照不可修改")
+
+    def insert(self, index: SupportsIndex, value: JsonValue) -> None:
+        """参数：索引和值；返回：无；异常：TypeError，快照禁止修改。"""
+        raise TypeError("材料快照不可修改")
+
+    def pop(self, index: SupportsIndex = -1) -> JsonValue:
+        """参数：索引；返回：无；异常：TypeError，快照禁止修改。"""
+        raise TypeError("材料快照不可修改")
+
+    def remove(self, value: JsonValue) -> None:
+        """参数：值；返回：无；异常：TypeError，快照禁止修改。"""
+        raise TypeError("材料快照不可修改")
+
+    def clear(self) -> None:
+        """参数：无；返回：无；异常：TypeError，快照禁止修改。"""
+        raise TypeError("材料快照不可修改")
+
+    def sort(self, *, key: Callable[[JsonValue], SupportsRichComparison] | None = None, reverse: bool = False) -> None:
+        """参数：排序选项；返回：无；异常：TypeError，快照禁止修改。"""
+        raise TypeError("材料快照不可修改")
+
+    def reverse(self) -> None:
+        """参数：无；返回：无；异常：TypeError，快照禁止修改。"""
+        raise TypeError("材料快照不可修改")
+
+    def __iadd__(self, values: Iterable[JsonValue]) -> "_FrozenJsonList":
+        """参数：值集合；返回：无；异常：TypeError，快照禁止修改。"""
+        raise TypeError("材料快照不可修改")
+
+    def __imul__(self, count: SupportsIndex) -> "_FrozenJsonList":
+        """参数：倍数；返回：无；异常：TypeError，快照禁止修改。"""
+        raise TypeError("材料快照不可修改")
+
+
+def _freeze_material_json(value: JsonValue) -> JsonValue:
+    """参数：JSON 事实；返回：独立深层不可变快照；异常：无。"""
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze_material_json(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return _FrozenJsonList([_freeze_material_json(item) for item in value])
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class MaterialUploadOriginalDescriptor:
+    """材料完整性检查或准备阶段产生的原件描述符。"""
+
+    name: str
+    sha256: str
+    size: int
+    source: Literal["original"]
+
+    def __post_init__(self) -> None:
+        """参数：无；返回：无；异常：ValueError，原件声明非法。"""
+        if not _is_path_free_asset_name(self.name) or not _is_canonical_sha256(self.sha256):
+            raise ValueError("材料原件名称或摘要非法")
+        if type(self.size) is not int or self.size < 0 or self.source != "original":
+            raise ValueError("材料原件大小或来源非法")
+
+
+@dataclass(frozen=True, slots=True)
+class MaterialUploadPublicationIdentity:
+    """同次材料检查或准备产生的精确业务身份，原件按 name 规范排序。
+
+    规范顺序只属于身份值，不改变请求处理或事件顺序，不重新生成 ID 或指纹。
+    """
+
+    ticker: str
+    document_id: str
+    internal_document_id: str
+    form_type: str
+    material_name: str
+    fiscal_year: int | None
+    fiscal_period: FiscalPeriod | None
+    source_fingerprint: str
+    primary_document: str
+    originals: tuple[MaterialUploadOriginalDescriptor, ...]
+    amended: bool
+    is_deleted: bool
+    document_version: str
+
+    def __post_init__(self) -> None:
+        """校验完整身份并建立原件规范顺序。
+
+        Args:
+            无，读取本实例的必填身份字段。
+        Returns:
+            无，验证成功后原件 tuple 按 name 排序。
+        Raises:
+            ValueError: 身份字段、类型或原件集合非法时抛出。
+        """
+        if normalize_ticker(self.ticker).canonical != self.ticker:
+            raise ValueError("材料 ticker 必须 canonical")
+        for value in (self.document_id, self.internal_document_id, self.form_type, self.material_name, self.document_version):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("材料身份文本必须非空")
+        if not _is_canonical_sha256(self.source_fingerprint) or not _is_path_free_asset_name(self.primary_document):
+            raise ValueError("材料指纹或主源非法")
+        if self.fiscal_year is not None and type(self.fiscal_year) is not int:
+            raise ValueError("材料年度非法")
+        if self.fiscal_period is not None and (not isinstance(self.fiscal_period, str) or self.fiscal_period not in FISCAL_PERIODS):
+            raise ValueError("材料期间非法")
+        if type(self.amended) is not bool or type(self.is_deleted) is not bool:
+            raise ValueError("材料标记必须 bool")
+        if not isinstance(self.originals, tuple) or not self.originals or any(type(item) is not MaterialUploadOriginalDescriptor for item in self.originals):
+            raise ValueError("材料原件必须完整 typed tuple")
+        if len({item.name for item in self.originals}) != len(self.originals):
+            raise ValueError("材料原件不得重复")
+        object.__setattr__(self, "originals", tuple(sorted(self.originals, key=lambda item: item.name)))
+
+
+@dataclass(frozen=True, slots=True)
+class MaterialUploadPublishedState:
+    """同一 guard 下公司、材料完整性及不可变业务事实。"""
+
+    company_meta: CompanyMeta | None
+    source_integrity: SourceIntegrityClassification
+    source_meta: Mapping[str, JsonValue] | None
+    publication_identity: MaterialUploadPublicationIdentity | None
+
+    def __post_init__(self) -> None:
+        """参数：无；返回：无；异常：ValueError，状态与业务事实不一致。"""
+        if self.source_integrity.source_kind is not SourceKind.MATERIAL:
+            raise ValueError("材料 state 必须引用 material")
+        status = self.source_integrity.status
+        if status in {SourceIntegrityStatus.MISSING, SourceIntegrityStatus.UNSAFE}:
+            if self.source_meta is not None or self.publication_identity is not None:
+                raise ValueError("missing/unsafe 不得携带材料事实")
+        elif self.source_meta is None:
+            raise ValueError("可信材料 state 必须携带 meta")
+        if status is SourceIntegrityStatus.REPAIR_REQUIRED and self.publication_identity is not None:
+            raise ValueError("待修材料不得携带 publication identity")
+        if self.publication_identity is not None and (self.publication_identity.ticker, self.publication_identity.document_id) != (self.source_integrity.ticker, self.source_integrity.document_id):
+            raise ValueError("材料 state 目标不一致")
+        if self.source_meta is not None:
+            frozen = _freeze_material_json(self.source_meta)
+            if not isinstance(frozen, Mapping):
+                raise TypeError("材料 meta 必须 mapping")
+            object.__setattr__(self, "source_meta", frozen)
+
+
+class MaterialUploadStateRepositoryProtocol(Protocol):
+    """材料受理、条件登记及 publication-final 事实仓储。"""
+
+    def read_material_upload_state(self, ticker: str, document_id: str) -> MaterialUploadPublishedState:
+        """参数：ticker/文档；返回：同 guard 快照；异常：身份、锁或 I/O 错误。"""
+        ...
+
+    def read_material_upload_state_in_batch(self, batch: BatchToken, document_id: str) -> MaterialUploadPublishedState:
+        """参数：open batch/文档；返回：writer acquisition 快照；异常：capability 或读取错误。"""
+        ...
+
+    def validate_material_upload_state(self, *, ticker: str, document_id: str, expected_source_state: MaterialUploadPublishedState | None, expected_company_meta: CompanyMeta | None) -> MaterialUploadPublishedState:
+        """在同一 guard 校验公司、alias 与显式材料条件。
+
+        Args:
+            ticker: 目标公司代码。
+            document_id: 目标材料身份。
+            expected_source_state: 必填；None 只校验公司与 alias，不表示材料缺席。
+            expected_company_meta: 必填的严格公司快照，None 表示预期公司缺席。
+        Returns:
+            guard 内读取的完整材料当前状态。
+        Raises:
+            SourceIntegrityRevisionConflictError: 非 None 的材料条件漂移。
+            CompanyMetaConcurrentUpdateError: 公司快照漂移。
+            CompanyTickerAliasConflictError: alias 已被其他公司占用。
+            OSError: 读取或锁操作失败。
+        """
+        ...
+
+    def register_material_upload_preconditions(self, *, batch: BatchToken, expected_source_state: MaterialUploadPublishedState, expected_company_meta: CompanyMeta | None) -> None:
+        """为材料写入登记完整的源与公司条件。
+
+        Args:
+            batch: 同一仓储且仍 open 的材料写入 batch。
+            expected_source_state: 必填的 MaterialUploadPublishedState 完整材料状态，不允许 None。
+            expected_company_meta: 严格公司快照，None 表示公司缺席。
+        Returns:
+            无返回值；校验成功后登记条件。
+        Raises:
+            TypeError: expected_source_state 不是 MaterialUploadPublishedState 类型。
+            ValueError: batch capability 非法、重复登记或材料身份非法。
+            CompanyMetaConcurrentUpdateError: 公司快照漂移。
+            SourceIntegrityRevisionConflictError: 材料条件漂移。
+            CompanyTickerIdentityCorruptionError: staging 公司身份或元数据损坏。
+            OSError: staging 状态读取失败。
+            RuntimeError: 材料检查结果缺少目标或可信业务元数据。
+        """
+        ...
+
+    def commit_material_upload_batch(self, batch: BatchToken) -> MaterialUploadPublishedState:
+        """参数：已登记条件 batch；返回：正常提交后的事实；异常：提交或释放失败。"""
+        ...
+
+    def commit_material_upload_company_batch(self, batch: BatchToken) -> CompanyMetaCommitOutcome:
+        """参数：材料公司 intent batch；返回：公司 final；异常：alias、冲突、I/O 或释放失败。"""
+        ...
+
+
 @dataclass(frozen=True, slots=True)
 class SourceSnapshotFileDescriptor:
     """source snapshot 内单个业务文件的无路径描述符。
@@ -830,6 +1057,10 @@ class CompanyMetaRepositoryProtocol(Protocol):
 class SourceDocumentRepositoryProtocol(Protocol):
     """源文档仓储协议。"""
 
+    def update_material_amended(self, *, batch: BatchToken, document_id: str, amended: bool) -> None:
+        """参数：已登记条件 batch、文档和真实修订值；返回：无；异常：capability、冲突、严格事实或 I/O 失败。"""
+        ...
+
     def has_source_storage_root(self, ticker: str, source_kind: SourceKind) -> bool:
         """判断 published tree 中某类源文档根目录是否存在。
 
@@ -1062,6 +1293,41 @@ class SourceDocumentRepositoryProtocol(Protocol):
             ValueError: ticker、document ID、source kind 或 meta 内容非法时抛出。
             RuntimeFileLockError: publication guard 获取或释放失败时抛出。
             OSError: published I/O 失败时抛出。
+        """
+        ...
+
+    def read_source_meta_integrity_view(
+        self, ticker: str, source_kind: SourceKind, *, batch: BatchToken | None,
+    ) -> tuple[SourceMetaIntegrityReadEntry, ...]:
+        """读取同一稳定根内的完整原始元数据和完整性分类。
+
+        参数：ticker 为公司身份；source_kind 为来源；batch 为同 core/ticker 的
+            open capability，None 时持短 publication guard。
+        返回：完整有序观察，每份独立 JSON 树顶层只读，嵌套值仅供只读消费。
+        异常：校验 ValueError、原读取 OSError、完整性异常及锁异常原样传播。
+        """
+        ...
+
+    def read_source_meta_view(
+        self, ticker: str, source_kind: SourceKind,
+    ) -> SourceMetaReadView:
+        """在同一个 publication guard 内按原 list/get 规则读取源元数据。
+
+        Args:
+            ticker: exact external ticker。
+            source_kind: 必填的 filing 或 material 来源类型。
+
+        Returns:
+            完整有序枚举的成功元数据前缀及首个原 ValueError/OSError 对象；
+            read_error 为 None 才表示全部读取完成。元数据顶层只读，独立于
+            其他公开读取与后续发布；嵌套 JSON 由消费者只读使用，
+            不代表完整性或写授权。
+
+        Raises:
+            ValueError: 输入或完整枚举不合法时抛出。
+            OSError: 完整枚举的 I/O 失败时抛出。
+            RuntimeFileLockError: publication guard 获取或释放失败时抛出。
+            Exception: 非 ValueError/OSError 的元数据读取异常原样传播。
         """
         ...
 

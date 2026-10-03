@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 from typing import Optional
 
 from dayu.contracts.json_value import JsonValue
@@ -35,7 +36,10 @@ from dayu.fins.domain.enums import SourceKind
 from dayu.fins.xbrl_file_discovery import has_xbrl_instance
 
 from .local_file_source import LocalFileSource
+from .source_manifest_contract import project_filing_manifest_item, project_material_manifest_item
+from .source_meta_contract import require_material_source_meta_primary_document, require_source_meta_is_deleted
 from ._fs_source_integrity import (
+    validate_material_source_primary,
     _SOURCE_REVISION_META_FIELD,
     _SourceKindPublicationInspection,
     _inspect_source_kind_unguarded,
@@ -73,9 +77,12 @@ from ._fs_storage_utils import (
     _write_json,
 )
 from .repository_protocols import SourceSnapshotProtocol
+from .source_meta_read import SourceMetaIntegrityReadEntry, SourceMetaReadEntry, SourceMetaReadView
 from .source_integrity import (
     SourceIntegrityClassification,
     SourceIntegrityPreflightError,
+    SourceIntegrityPreflightReason,
+    SourceIntegrityRepairRequiredError,
     SourceIntegrityRepairBlockedError,
     SourceIntegrityRepairBlockedReason,
     SourceIntegrityRevisionConflictError,
@@ -135,6 +142,39 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
     """源文档（filing / material）操作 mixin。"""
 
     # ========== material CRUD ==========
+
+    def update_material_amended(self, *, batch: BatchToken, document_id: str, amended: bool) -> None:
+        """只修改当前材料修订标记及仓储维护事实。
+
+        Args:
+            batch: 已登记材料条件的 writer capability。
+            document_id: 与登记目标一致的文档 ID。
+            amended: 显式真实 bool。
+
+        Returns:
+            无，仍属于 staged mutation。
+
+        Raises:
+            ValueError: capability、标记或目标非法。
+            SourceIntegrityRevisionConflictError: stage 前事实漂移。
+            OSError: 严格读写失败。
+        """
+        if type(amended) is not bool:
+            raise ValueError("材料 amended 必须 bool")
+        state = self._resolve_active_batch(batch, batch.ticker)
+        if state.material_preconditions is None or state.material_preconditions[0].source_integrity.document_id != document_id:
+            raise ValueError("材料 metadata mutation 必须已登记同目标条件")
+        expected, company = state.material_preconditions
+        fresh = self._read_material_state_unguarded(batch.ticker, document_id, state.staging_ticker_dir)
+        self._require_material_state_matches(fresh, expected, company)
+        if fresh.source_integrity.status is not SourceIntegrityStatus.COMPLETE or fresh.source_meta is None or require_source_meta_is_deleted(fresh.source_meta):
+            raise ValueError("材料 metadata mutation 只允许健康 active")
+        # writer 稳定视图中读取同一已校验元数据，保留可序列化 canonical JSON；不从投影重算业务字段。
+        meta = _read_json_object(self._source_meta_path(batch.ticker, document_id, SourceKind.MATERIAL, state))
+        meta["amended"] = amended
+        meta["updated_at"] = now_iso8601()
+        self.replace_source_meta(batch.ticker, document_id, SourceKind.MATERIAL, meta, batch=batch)
+
 
     def create_material(
         self,
@@ -567,6 +607,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
 
         Raises:
             FileNotFoundError: 对应来源目录下的 meta.json 不存在时抛出。
+            CompanyTickerIdentityCorruptionError: published ticker 身份损坏时原样抛出。
             ValueError: 元数据文件内容非法时抛出。
             RuntimeFileLockError: publication guard 获取或释放失败时抛出。
             OSError: published meta 读取失败时抛出。
@@ -584,6 +625,122 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
                 external_ticker,
                 external_document_id,
                 normalized_source_kind,
+            )
+        finally:
+            self._release_lock_token(guard_token)
+
+    def read_source_meta_integrity_view(
+        self, ticker: str, source_kind: SourceKind, *, batch: BatchToken | None,
+    ) -> tuple[SourceMetaIntegrityReadEntry, ...]:
+        """读取同一稳定根内的完整原始元数据和完整性分类。
+
+        参数：ticker 为公司身份；source_kind 为来源；batch 为同 core/ticker 的
+            open capability，None 时持短 publication guard。
+        返回：完整有序观察，每份独立 JSON 树顶层只读，嵌套值仅供只读消费。
+        异常：校验 ValueError、原读取 OSError、完整性异常及锁异常原样传播。
+        """
+        external_ticker = _require_external_identity(ticker, field_name="ticker")
+        kind = _normalize_source_kind(source_kind)
+        if batch is not None:
+            state = self._resolve_active_batch(batch, external_ticker)
+            return self._read_source_meta_integrity_at_root(external_ticker, kind, state.staging_ticker_dir)
+        guard = self._acquire_publication_guard(external_ticker)
+        try:
+            return self._read_source_meta_integrity_at_root(external_ticker, kind, self._target_ticker_dir(external_ticker))
+        finally:
+            self._release_lock_token(guard)
+
+    def _read_source_meta_integrity_at_root(
+        self, ticker: str, kind: SourceKind, ticker_dir: Path,
+    ) -> tuple[SourceMetaIntegrityReadEntry, ...]:
+        """在调用方已稳定的根内严格读取全部来源事实。
+
+        参数：ticker 为公司外部身份；kind 为来源类型；ticker_dir 为已持锁的发布根或 staging 根。
+        返回：有序完整同窗观察，每份原始 JSON 与该根完整性分类绑定。
+        异常：原始 JSON、身份、I/O 和完整性检查异常原样传播，不返回成功前缀。"""
+        ids = self._list_source_ids_at_root(ticker_dir, kind)
+        # 所有 raw 解析先于 inspector，保全 JSON 错误原对象，不能降级为无年度证据。
+        metas = tuple(self._get_source_meta_at_root(ticker, doc, kind, ticker_dir) for doc in ids)
+        inspection = _inspect_source_kind_unguarded(
+            ticker=ticker, source_kind=kind, ticker_dir=ticker_dir,
+            source_root=ticker_dir / _source_dir_name(kind), requested_document_id=None,
+        )
+        classifications = {item.classification.document_id: item.classification for item in inspection.inventory}
+        return tuple(
+            SourceMetaIntegrityReadEntry(doc, MappingProxyType(meta), classifications[doc])
+            for doc, meta in zip(ids, metas, strict=True)
+        )
+
+    def _list_source_ids_at_root(self, ticker_dir: Path, kind: SourceKind) -> list[str]:
+        """从稳定根枚举来源外部身份。
+
+        参数：ticker_dir 为稳定公司根；kind 为来源类型。
+        返回：有序来源文档 ID 列表。
+        异常：descriptor 校验 ValueError 和 I/O 异常原样传播。"""
+        root = self._storage_subdirectory_for_read(ticker_dir, _source_dir_name(kind))
+        namespace = _FILING_IDENTITY_NAMESPACE if kind is SourceKind.FILING else _MATERIAL_IDENTITY_NAMESPACE
+        return _list_external_identities(root, namespace)
+
+    def _get_source_meta_at_root(
+        self, ticker: str, document_id: str, kind: SourceKind, ticker_dir: Path,
+    ) -> dict[str, JsonValue]:
+        """从显式稳定根严格读取原始业务元数据。
+
+        参数：ticker 为公司外部身份；document_id 为文档外部身份；kind 为来源类型；
+            ticker_dir 为已稳定的公司根。
+        返回：本次独立解析的原始业务 JSON 字典。
+        异常：JSON/身份校验 ValueError 与 I/O 异常原样传播。"""
+        root = self._storage_subdirectory_for_read(ticker_dir, _source_dir_name(kind))
+        namespace = _FILING_IDENTITY_NAMESPACE if kind is SourceKind.FILING else _MATERIAL_IDENTITY_NAMESPACE
+        meta = _read_json_object(_identity_directory_for_read(root, namespace, document_id) / "meta.json")
+        if meta.get("ticker") != ticker or meta.get("document_id") != document_id or meta.get("source_kind") != kind.value:
+            raise ValueError("source meta 与 identity descriptor/source kind 不一致")
+        return _source_meta_without_revision(meta)
+
+    def read_source_meta_view(
+        self, ticker: str, source_kind: SourceKind,
+    ) -> SourceMetaReadView:
+        """在同一个 publication guard 内按原 list/get 规则读取源元数据。
+
+        Args:
+            ticker: exact external ticker。
+            source_kind: 必填的 filing 或 material 来源类型。
+
+        Returns:
+            完整有序枚举的成功元数据前缀及首个原 ValueError/OSError 对象；
+            read_error 为 None 才表示全部读取完成。每份元数据来自本次独立
+            JSON 解析，顶层只读；嵌套 JSON 由消费者只读使用，独立于其他
+            公开读取与后续发布，不代表完整性或写授权。
+
+        Raises:
+            CompanyTickerIdentityCorruptionError: published ticker 身份损坏时在枚举阶段抛出。
+            ValueError: 输入或完整枚举不合法时抛出。
+            OSError: 完整枚举的 I/O 失败时抛出。
+            RuntimeFileLockError: publication guard 获取或释放失败时抛出。
+            Exception: 非 ValueError/OSError 的元数据读取异常原样传播。
+        """
+
+        external_ticker = _require_external_identity(ticker, field_name="ticker")
+        normalized_source_kind = _normalize_source_kind(source_kind)
+        guard_token = self._acquire_publication_guard(external_ticker)
+        try:
+            # 完整枚举先于所有 get；不得将 list 失败变为元数据前缀。
+            document_ids = self._list_document_ids_unguarded(external_ticker, normalized_source_kind)
+            entries: list[SourceMetaReadEntry] = []
+            read_error: ValueError | OSError | None = None
+            for document_id in document_ids:
+                try:
+                    meta = self._get_source_meta_unguarded(
+                        external_ticker, document_id, normalized_source_kind,
+                    )
+                except (ValueError, OSError) as error:
+                    read_error = error
+                    break
+                # getter 每次解析独立 JSON 树并生成业务字典，无其他公开持有者；
+                # 直接包装可保全独立观察，避免递归复制新增合法 JSON 的拒绝。
+                entries.append(SourceMetaReadEntry(document_id, MappingProxyType(meta)))
+            return SourceMetaReadView(
+                external_ticker, normalized_source_kind, tuple(entries), read_error,
             )
         finally:
             self._release_lock_token(guard_token)
@@ -803,7 +960,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
         external_ticker: str,
         external_document_id: str,
         normalized_source_kind: SourceKind,
-    ) -> DocumentMeta:
+    ) -> dict[str, JsonValue]:
         """在 caller 已持 publication guard 时读取 source meta。
 
         Args:
@@ -815,16 +972,16 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             source meta。
 
         Raises:
-            FileNotFoundError: source meta 不存在或 source 已删除时抛出。
-            ValueError: meta 内容非法时抛出。
+            FileNotFoundError: source meta 不存在时抛出；逻辑删除仍可读取原始元数据。
+            CompanyTickerIdentityCorruptionError: published ticker 身份损坏时原样抛出。
+            ValueError: 文档 descriptor、source root 或 meta 内容非法时抛出。
+            OSError: published tree 读取失败时原样抛出。
         """
 
-        persisted_meta = self._get_persisted_source_meta_unguarded(
-            external_ticker,
-            external_document_id,
-            normalized_source_kind,
+        ticker_dir = self._ticker_dir_for_read(external_ticker)
+        return self._get_source_meta_at_root(
+            external_ticker, external_document_id, normalized_source_kind, ticker_dir,
         )
-        return _source_meta_without_revision(persisted_meta)
 
     def _get_persisted_source_meta_unguarded(
         self,
@@ -995,17 +1152,19 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             document_id=external_document_id,
             source_kind=normalized_source_kind,
         )
+        if normalized_source_kind is SourceKind.MATERIAL:
+            validate_material_source_primary(source_meta=normalized_meta, source_directory=meta_path.parent)
         _write_json(meta_path, normalized_meta)
 
         if normalized_source_kind == SourceKind.FILING:
             self._upsert_filing_manifest(
                 state,
-                [FilingManifestItem.from_source_meta(normalized_meta)],
+                [project_filing_manifest_item(normalized_meta)],
             )
         else:
             self._upsert_material_manifest(
                 state,
-                [MaterialManifestItem.from_source_meta(normalized_meta)],
+                [project_material_manifest_item(normalized_meta)],
             )
 
     def list_documents(self, ticker: str, query: DocumentQuery) -> list[DocumentSummary]:
@@ -1105,6 +1264,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             已排序文档 ID 列表。
 
         Raises:
+            CompanyTickerIdentityCorruptionError: published ticker 身份损坏时原样抛出。
             ValueError: ticker、source kind、descriptor 或 source root 不合法时抛出。
             RuntimeFileLockError: publication guard 获取或释放失败时抛出。
             OSError: 读取目录失败时抛出。
@@ -1133,28 +1293,16 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             已排序文档 ID 列表。
 
         Raises:
+            CompanyTickerIdentityCorruptionError: published ticker 身份损坏时原样抛出。
             ValueError: descriptor 或 source root 不合法时抛出。
             OSError: 读取目录失败时抛出。
         """
 
-        if source_kind == SourceKind.FILING:
-            return _list_external_identities(
-                self._source_root_for_read(normalized_ticker, SourceKind.FILING),
-                _FILING_IDENTITY_NAMESPACE,
-            )
-        if source_kind == SourceKind.MATERIAL:
-            return _list_external_identities(
-                self._source_root_for_read(normalized_ticker, SourceKind.MATERIAL),
-                _MATERIAL_IDENTITY_NAMESPACE,
-            )
-        filings = _list_external_identities(
-            self._source_root_for_read(normalized_ticker, SourceKind.FILING),
-            _FILING_IDENTITY_NAMESPACE,
-        )
-        materials = _list_external_identities(
-            self._source_root_for_read(normalized_ticker, SourceKind.MATERIAL),
-            _MATERIAL_IDENTITY_NAMESPACE,
-        )
+        ticker_dir = self._ticker_dir_for_read(normalized_ticker)
+        if source_kind is not None:
+            return self._list_source_ids_at_root(ticker_dir, source_kind)
+        filings = self._list_source_ids_at_root(ticker_dir, SourceKind.FILING)
+        materials = self._list_source_ids_at_root(ticker_dir, SourceKind.MATERIAL)
         return sorted(set(filings + materials))
 
     def has_source_storage_root(self, ticker: str, source_kind: SourceKind) -> bool:
@@ -1534,6 +1682,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             主文件元数据。
 
         Raises:
+            KeyError: material 元数据缺少必填 primary_document 时抛出。
             FileNotFoundError: 主文件无法定位时抛出。
             ValueError: 元数据格式非法时抛出。
             RuntimeFileLockError: publication guard 获取或释放失败时抛出。
@@ -1557,6 +1706,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             主文件元数据。
 
         Raises:
+            KeyError: material 元数据缺少必填 primary_document 时抛出。
             FileNotFoundError: source 或主文件无法定位时抛出。
             ValueError: meta 内容非法时抛出。
         """
@@ -1567,13 +1717,22 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             raise ValueError("meta.files 必须为 list")
         if not files:
             raise FileNotFoundError("源文档未绑定文件，无法定位主文件")
-        primary_name = str(meta.get("primary_document", "")).strip()
-        if not primary_name:
-            raise FileNotFoundError("源文档 primary_document 不能为空")
+        source_kind = _normalize_source_kind(handle.source_kind)
+        if source_kind is SourceKind.MATERIAL:
+            primary_name = require_material_source_meta_primary_document(meta)
+            source_directory = self._source_meta_path_for_read(
+                handle.ticker, handle.document_id, source_kind
+            ).parent
+            validate_material_source_primary(source_meta=meta, source_directory=source_directory)
+        else:
+            primary_name = str(meta.get("primary_document", "")).strip()
+            if not primary_name:
+                raise FileNotFoundError("源文档 primary_document 不能为空")
         for item in files:
             if not isinstance(item, dict):
                 continue
-            name = str(item.get("name") or _infer_filename_from_uri(item.get("uri", ""))).strip()
+            name = (item["name"] if source_kind is SourceKind.MATERIAL else
+                    str(item.get("name") or _infer_filename_from_uri(item.get("uri", ""))).strip())
             if name == primary_name:
                 return _file_object_meta_from_dict(item)
         raise FileNotFoundError("源文档 primary_document 未命中 files")
@@ -1678,6 +1837,7 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             Source 抽象。
 
         Raises:
+            KeyError: material 元数据缺少必填 primary_document 时抛出。
             FileNotFoundError: 文档或主文件不存在时抛出。
             ValueError: 文件元数据非法时抛出。
             RuntimeFileLockError: publication guard 获取或释放失败时抛出。
@@ -1793,17 +1953,19 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             source_kind=source_kind,
         )
 
+        if source_kind is SourceKind.MATERIAL:
+            validate_material_source_primary(source_meta=merged_meta, source_directory=meta_path.parent)
         _write_json(meta_path, merged_meta)
 
         if source_kind == SourceKind.FILING:
             self._upsert_filing_manifest(
                 state,
-                [FilingManifestItem.from_source_meta(merged_meta)],
+                [project_filing_manifest_item(merged_meta)],
             )
         else:
             self._upsert_material_manifest(
                 state,
-                [MaterialManifestItem.from_source_meta(merged_meta)],
+                [project_material_manifest_item(merged_meta)],
             )
 
         primary_file_uri = (
@@ -1840,8 +2002,12 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             更新后的文档句柄。
 
         Raises:
+            KeyError: 既有源元数据缺少 is_deleted 时抛出。
             FileNotFoundError: 文档不存在。
             ValueError: ticker、document identity、descriptor 或 source meta 不合法时抛出。
+            SourceIntegrityRepairRequiredError: 重删目标或其 manifest 仍需修复时抛出。
+            SourceIntegrityPreflightError: 重删目标完整性不可信时抛出。
+            RuntimeError: exact inspector 未返回目标时抛出。
             OSError: 写入失败。
         """
 
@@ -1860,27 +2026,47 @@ class _FsSourceDocumentMixin(_FsStorageInfra):
             raise FileNotFoundError(f"文档不存在: ticker={external_ticker} document_id={external_document_id}")
 
         meta = _read_json_object(meta_path)
-        meta["is_deleted"] = deleted
-        meta["deleted_at"] = now_iso8601() if deleted else None
-        meta["updated_at"] = now_iso8601()
-        meta = _prepare_complete_source_meta(
-            meta,
-            ticker=external_ticker,
-            document_id=external_document_id,
-            source_kind=source_kind,
-        )
-        _write_json(meta_path, meta)
-
-        if source_kind == SourceKind.FILING:
-            self._upsert_filing_manifest(
-                state,
-                [FilingManifestItem.from_source_meta(meta)],
+        current_deleted = require_source_meta_is_deleted(meta)
+        if deleted and current_deleted:
+            # 同一个 writer view 的完整事实才允许重删 no-op；损坏不能借删除修复。
+            inspection = _inspect_source_kind_unguarded(
+                ticker=external_ticker,
+                source_kind=source_kind,
+                ticker_dir=state.staging_ticker_dir,
+                source_root=self._source_root(external_ticker, source_kind, state),
+                requested_document_id=external_document_id,
             )
+            target = inspection.target
+            if target is None:
+                raise RuntimeError("重删完整性检查缺少 exact target")
+            if target.classification.status is SourceIntegrityStatus.REPAIR_REQUIRED:
+                raise SourceIntegrityRepairRequiredError()
+            if target.classification.status is not SourceIntegrityStatus.COMPLETE:
+                raise SourceIntegrityPreflightError(SourceIntegrityPreflightReason.UNSAFE_PUBLICATION)
         else:
-            self._upsert_material_manifest(
-                state,
-                [MaterialManifestItem.from_source_meta(meta)],
+            meta["is_deleted"] = deleted
+            meta["deleted_at"] = now_iso8601() if deleted else None
+            meta["updated_at"] = now_iso8601()
+            meta = _prepare_complete_source_meta(
+                meta,
+                ticker=external_ticker,
+                document_id=external_document_id,
+                source_kind=source_kind,
             )
+            if source_kind is SourceKind.MATERIAL:
+                validate_material_source_primary(source_meta=meta, source_directory=meta_path.parent)
+            _write_json(meta_path, meta)
+
+            if source_kind == SourceKind.FILING:
+                self._upsert_filing_manifest(
+                    state,
+                    [project_filing_manifest_item(meta)],
+                )
+            else:
+                self._upsert_material_manifest(
+                    state,
+                    [project_material_manifest_item(meta)],
+                )
 
         file_payloads = _extract_file_payloads(meta)
         return DocumentHandle(

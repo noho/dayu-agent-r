@@ -1,0 +1,166 @@
+{
+  "all_at_least_80": true,
+  "files": [
+    {
+      "path": "dayu/cli/output.py",
+      "percent_covered": 85.4368932038835,
+      "covered_lines": 176,
+      "num_statements": 206,
+      "missing_lines": 30
+    },
+    {
+      "path": "dayu/fins/direct_event_text.py",
+      "percent_covered": 87.05882352941177,
+      "covered_lines": 74,
+      "num_statements": 85,
+      "missing_lines": 11
+    },
+    {
+      "path": "dayu/fins/direct_events.py",
+      "percent_covered": 89.45054945054945,
+      "covered_lines": 407,
+      "num_statements": 455,
+      "missing_lines": 48
+    },
+    {
+      "path": "dayu/fins/download_contract.py",
+      "percent_covered": 87.73784355179704,
+      "covered_lines": 415,
+      "num_statements": 473,
+      "missing_lines": 58
+    },
+    {
+      "path": "dayu/fins/downloaders/cninfo_downloader.py",
+      "percent_covered": 90.11976047904191,
+      "covered_lines": 301,
+      "num_statements": 334,
+      "missing_lines": 33
+    },
+    {
+      "path": "dayu/fins/downloaders/hkexnews_downloader.py",
+      "percent_covered": 85.1528384279476,
+      "covered_lines": 390,
+      "num_statements": 458,
+      "missing_lines": 68
+    },
+    {
+      "path": "dayu/fins/ingestion_runtime.py",
+      "percent_covered": 91.24897288414134,
+      "covered_lines": 2221,
+      "num_statements": 2434,
+      "missing_lines": 213
+    },
+    {
+      "path": "dayu/fins/pipelines/cn_download_models.py",
+      "percent_covered": 97.34513274336283,
+      "covered_lines": 110,
+      "num_statements": 113,
+      "missing_lines": 3
+    },
+    {
+      "path": "dayu/fins/pipelines/cn_download_protocols.py",
+      "percent_covered": 100.0,
+      "covered_lines": 40,
+      "num_statements": 40,
+      "missing_lines": 0
+    },
+    {
+      "path": "dayu/fins/pipelines/cn_download_rebuild.py",
+      "percent_covered": 86.02150537634408,
+      "covered_lines": 160,
+      "num_statements": 186,
+      "missing_lines": 26
+    },
+    {
+      "path": "dayu/fins/pipelines/cn_download_source_upsert.py",
+      "percent_covered": 86.07594936708861,
+      "covered_lines": 68,
+      "num_statements": 79,
+      "missing_lines": 11
+    },
+    {
+      "path": "dayu/fins/pipelines/cn_download_workflow.py",
+      "percent_covered": 95.18900343642612,
+      "covered_lines": 277,
+      "num_statements": 291,
+      "missing_lines": 14
+    },
+    {
+      "path": "dayu/fins/pipelines/cn_pipeline.py",
+      "percent_covered": 94.63519313304721,
+      "covered_lines": 441,
+      "num_statements": 466,
+      "missing_lines": 25
+    },
+    {
+      "path": "dayu/fins/pipelines/cn_report_selection.py",
+      "percent_covered": 92.09621993127148,
+      "covered_lines": 268,
+      "num_statements": 291,
+      "missing_lines": 23
+    },
+    {
+      "path": "dayu/fins/pipelines/hk_download_rebuild.py",
+      "percent_covered": 91.83673469387755,
+      "covered_lines": 90,
+      "num_statements": 98,
+      "missing_lines": 8
+    },
+    {
+      "path": "dayu/fins/pipelines/hk_fiscal_calendar.py",
+      "percent_covered": 96.55172413793103,
+      "covered_lines": 56,
+      "num_statements": 58,
+      "missing_lines": 2
+    },
+    {
+      "path": "dayu/fins/pipelines/sec_pipeline.py",
+      "percent_covered": 86.38297872340425,
+      "covered_lines": 406,
+      "num_statements": 470,
+      "missing_lines": 64
+    },
+    {
+      "path": "dayu/fins/storage/__init__.py",
+      "percent_covered": 100.0,
+      "covered_lines": 15,
+      "num_statements": 15,
+      "missing_lines": 0
+    },
+    {
+      "path": "dayu/fins/storage/_fs_source_document_core.py",
+      "percent_covered": 85.88007736943908,
+      "covered_lines": 444,
+      "num_statements": 517,
+      "missing_lines": 73
+    },
+    {
+      "path": "dayu/fins/storage/fs_source_document_repository.py",
+      "percent_covered": 96.7741935483871,
+      "covered_lines": 90,
+      "num_statements": 93,
+      "missing_lines": 3
+    },
+    {
+      "path": "dayu/fins/storage/repository_protocols.py",
+      "percent_covered": 85.32423208191126,
+      "covered_lines": 250,
+      "num_statements": 293,
+      "missing_lines": 43
+    },
+    {
+      "path": "dayu/fins/storage/source_meta_read.py",
+      "percent_covered": 100.0,
+      "covered_lines": 20,
+      "num_statements": 20,
+      "missing_lines": 0
+    },
+    {
+      "path": "dayu/service/fins_wait_adapter.py",
+      "percent_covered": 93.53233830845771,
+      "covered_lines": 188,
+      "num_statements": 201,
+      "missing_lines": 13
+    }
+  ]
+}

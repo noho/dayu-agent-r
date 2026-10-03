@@ -89,6 +89,7 @@ def test_documents_import_boundary_scan_covers_docling_runtime() -> None:
 
     scanned_names = {file_path.name for file_path in _iter_python_files()}
     assert "docling_runtime.py" in scanned_names
+    assert "xbrl_config.py" in scanned_names
 
 
 def test_documents_import_boundary_scan_covers_processors() -> None:
