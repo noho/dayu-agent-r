@@ -37,7 +37,7 @@
 ## 当前 gate / 下一入口
 
 - goal confirmation：沿用户已明确批准范围及最新排程纠正确认；本文件固定边界。
-- current gate / next entry：accepted PR review commit；正式完整main...44双审及491delta双复审均已ended outer0/root核收，UPR-R01/R02已修，MiMo未来访问假设finding rejected-with-reason。详见formal-pr-final-root-adjudication与findings register。fullpyright0/生产source88同hash；当前remote44还未含localfix，继续普通commit/push/readback→draft-PR-pass→finalcloseout，后独立完整CLI/registry。
+- current gate / next entry：修复WU final closeout pass / completed；accepted PR review checkpoint b1c675e75748abdcd8989cf6dffba257427feda5 已普通push、local/tracking/live/PR同值/source8所审bytes相等，draft-PR-pass及finalcloseout均核收。详见upload-material-unified-repair-final-closeout-20261003.md。下一独立完整CLI CI calibration-real与oracle/scenario/readiness，不并入WU；先纯治理checkpoint/push冻结最终target。main不动、PR保持draft，整体任务尚未完成。
 
 - planreview 必须挑战切片成本、机械拆分、可合并性与 future-slice 漂移；默认避免超过 3 slices，超过须直接理由。
 - 所有成立新修复即时写 artifact/控制表；accepted finding 必须已修并经复审才通过。普通 gate 通过后继续固定顺序，不因 gate 完成停机。
