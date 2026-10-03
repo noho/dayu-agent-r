@@ -181,6 +181,9 @@ dayu-cli <command> --help
 `--debug-stream` 可以单独使用，也可以与 `debug`、`verbose`、`info`、`warn` / `warning`、
 `error` 或 `critical` 组合。
 
+财报转换器的诊断也遵循这些日志参数；`--quiet` 关闭诊断，仍保留业务进度和终态。
+没有可信源等级的原生转换诊断按 `info` 留存，选择 `warning` 或更高等级时不留存这类诊断。
+
 用户可见回答和进度仍写 stdout/stderr。未传 `--log-file` 时，诊断日志只保留到
 当前 CLI 进程结束；需要排障留档时必须显式指定路径：
 

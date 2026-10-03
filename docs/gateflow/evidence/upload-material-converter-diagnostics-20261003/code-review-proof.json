@@ -1,0 +1,217 @@
+{
+  "gate": "code-review-loop-pass; accepted slice commit pending",
+  "workspace": "/Users/leo/workspace/dayu-agent-r",
+  "branch": "codex/upload-material-oracle",
+  "source_parent": "8009ba4e100081fd1b56f64ddf5bc0c42a06e808",
+  "source11": [
+    {
+      "relative_path": "dayu/runtime/process_diagnostics.py",
+      "sha256": "47ed4b45a44aed212fe440347488f8bd7eded30088c81a9f2f68e5ad61c12f3d",
+      "bytes": 21774
+    },
+    {
+      "relative_path": "dayu/runtime/log.py",
+      "sha256": "52ba9519fd7cc1f78fc9aad91160cc3230651e1ccbd10af800771b041b46ecef",
+      "bytes": 20268
+    },
+    {
+      "relative_path": "dayu/fins/pipelines/docling_process_converter.py",
+      "sha256": "d8847701fc17c3f825afedb3c3138dabfa03e8050961545ee227819b22075864",
+      "bytes": 46098
+    },
+    {
+      "relative_path": "tests/runtime/test_process_diagnostics.py",
+      "sha256": "5403e8b493ac8305d981702a2963a17e3f0ffd374915b7db232167532f6b7188",
+      "bytes": 37514
+    },
+    {
+      "relative_path": "tests/runtime/test_log.py",
+      "sha256": "84ea75e1e9caa5fb3f3427a49a8a7751895f84eb69c7743cc176eb5621330f5a",
+      "bytes": 41099
+    },
+    {
+      "relative_path": "tests/fins/test_docling_process_converter.py",
+      "sha256": "85302386e6b4224020a4cb0462e4c08aa1be01ddc888591ca6eee1b2ebfedae9",
+      "bytes": 83281
+    },
+    {
+      "relative_path": "tests/fins/test_xbrl_controlled_upload_integration.py",
+      "sha256": "c6ce413b0a304e4fec1fb16d13d4b4396765b102295a07be4b22951a16add51e",
+      "bytes": 20364
+    },
+    {
+      "relative_path": "tests/cli/test_fins_commands.py",
+      "sha256": "d1624c66adbae1300ebe0a29a5d4cf654d6c3858fd0a2570ce1079f66a91dbf0",
+      "bytes": 177403
+    },
+    {
+      "relative_path": "README.md",
+      "sha256": "1ef37729e9c7b29971c3e63b977a4937fd83acb861b43e2f7f61b007a26e2ae3",
+      "bytes": 40885
+    },
+    {
+      "relative_path": "dayu/fins/README.md",
+      "sha256": "8c62102e1da7d86328726cb8f1560e6607143d41dde1498e6a7542e27618bda5",
+      "bytes": 109479
+    },
+    {
+      "relative_path": "tests/README.md",
+      "sha256": "52a12daf99e8656f74962893a8fba44fb2689ccdd657d307496f0b1043ce7756",
+      "bytes": 135464
+    }
+  ],
+  "plan_sha256": "cbd771224d4fc88bcafa6a03c8e786d4e1cef6dc22e15937ed38d7dc73461709",
+  "accepted_findings": {
+    "C01": {
+      "decision": "accepted",
+      "status": "已修复",
+      "re_review_verified": true
+    },
+    "C02": {
+      "decision": "accepted",
+      "status": "已修复",
+      "re_review_verified": true
+    },
+    "C03": {
+      "decision": "accepted",
+      "status": "已修复",
+      "re_review_verified": true
+    },
+    "C04": {
+      "decision": "accepted",
+      "status": "已修复",
+      "re_review_verified": true
+    }
+  },
+  "validation": {
+    "production_and_other_six_tests": "code-fix-sol-01 final02 889passed6skip actual0, precise unchanged-byte inheritance; not new full889 run",
+    "current_test_file": "fix02 196passed0skip actual0",
+    "full_pyright": "fix02 actual0 0errors0warnings",
+    "mutation": "same current test / scratch source delete1 re-raise; child1 pytest1 expected / healthycleanup proof",
+    "whole_production_coverage": {
+      "converter": 90.78651685393258,
+      "log": 94.28571428571429,
+      "process": 90.60052219321149,
+      "excluded": [],
+      "raw_count": 318,
+      "incomplete": 0
+    },
+    "fresh04": "4 actual91page PDF success/loglevels/stdout-onlybusiness/quiet/SIGINT130; trueXBRLCLI plus native11; originalkernel unchanged; not802 rerun"
+  },
+  "review_reports": [
+    {
+      "path": "docs/reviews/code-review-20261003-221150.md",
+      "sha256": "73cc05a7cdb1b1eb442b7b7f1d7be655b37ea2d13f36634c87aaa46628aac0f4"
+    },
+    {
+      "path": "docs/reviews/code-review-20261003-222514.md",
+      "sha256": "c8a42cd17aeaaac110dce63008e6a6a66166cd38e64c6dee1ecc148bbd8fe503"
+    },
+    {
+      "path": "docs/reviews/code-review-20261003-234824.md",
+      "sha256": "614985b87d912b8f5d27310dec73371cad4cbd0e87a8df66ac743ea1ec2d36f5"
+    },
+    {
+      "path": "docs/reviews/code-review-20261004-000944.md",
+      "sha256": "80e6ed9fc097c43d0b2f0f4a0347f03154e05bb2301f632de86dc357d594da0c"
+    },
+    {
+      "path": "docs/reviews/code-review-20261004-074311.md",
+      "sha256": "d4ac51fca733ec82166fe5baa45d0544023eae52b209ec4e2164b8ac912d5491"
+    },
+    {
+      "path": "docs/reviews/code-review-20261004-075136.md",
+      "sha256": "045948c6fb8532839c104dbf3e64154224fccaf1ecc8e298b4b70cb59154ce6f"
+    }
+  ],
+  "retention": [
+    {
+      "receipt_ref": "workspace/tmp/upload-material-converter-diagnostics-20261003/root-c04-rereview-ds-02-retention.json",
+      "receipt_sha256": "37c23787feb1eda65d3d5e14728675e7c3ccdd423cf5a675c3b3f2953a93ce8d",
+      "retention": {
+        "sha256": "8bbcef1dd0364494f697930fe9d818bd53a8867654c7c37976be97918966c364",
+        "bytes": 1186692,
+        "copies": [
+          "workspace/evidence/upload-material-post-ci-gate-runners-20261003/private/root-c04-rereview-ds-02.tar.gz",
+          "output/evidence-backup/upload-material-post-ci-gate-runners-20261003/private/root-c04-rereview-ds-02.tar.gz"
+        ]
+      }
+    },
+    {
+      "receipt_ref": "workspace/tmp/upload-material-converter-diagnostics-20261003/root-c04-rereview-mimo-02-retention.json",
+      "receipt_sha256": "4269bfb49849836d46d58d9f042a1d7bc8383bf2ba899fa2bc1e425170d39536",
+      "retention": {
+        "sha256": "03bcbee1f3f1eb1483a427c3427604b96029eaabbc1c1174b0b365722e8e3f81",
+        "bytes": 419258,
+        "copies": [
+          "workspace/evidence/upload-material-post-ci-gate-runners-20261003/private/root-c04-rereview-mimo-02.tar.gz",
+          "output/evidence-backup/upload-material-post-ci-gate-runners-20261003/private/root-c04-rereview-mimo-02.tar.gz"
+        ]
+      }
+    },
+    {
+      "receipt_ref": "workspace/tmp/upload-material-converter-diagnostics-20261003/root-code-fix-sol-01-retention.json",
+      "receipt_sha256": "785f683849143b82cb6b07f916a36a3fad27f886f8e392711185040ecde61eb0",
+      "retention": {
+        "bytes": 10393004,
+        "sha256": "1eebba3d163d8fd556046996ce0466773a08c40a2b4ecbde7ca7e080e02d808d",
+        "primary": "workspace/evidence/upload-material-post-ci-gate-runners-20261003/private/diagnostics-code-fix-sol-01.tar.gz",
+        "backup": "output/evidence-backup/upload-material-post-ci-gate-runners-20261003/private/diagnostics-code-fix-sol-01.tar.gz",
+        "equal": true,
+        "mode": "0600",
+        "contains": "full runner+ownfix/cov/raw/scripts+current11 source exact+fresh04realraw/workspaces/nativekernel/admin, unchangedinputs/cache refexisting802dualarchive"
+      }
+    },
+    {
+      "receipt_ref": "workspace/tmp/upload-material-converter-diagnostics-20261003/root-code-fix-sol-02-retention.json",
+      "receipt_sha256": "27a7fdaf6b251c344abf4e6396d93ea2a89d23da288e97bedfeae667e4fb4985",
+      "retention": {
+        "sha256": "7c56fe861d0fc9dd1a704a2fb7fd20fd2bc08e4aeee2b220235fadccb816f222",
+        "bytes": 924447,
+        "copies": [
+          "workspace/evidence/upload-material-post-ci-gate-runners-20261003/private/root-code-fix-sol-02.tar.gz",
+          "output/evidence-backup/upload-material-post-ci-gate-runners-20261003/private/root-code-fix-sol-02.tar.gz"
+        ]
+      }
+    },
+    {
+      "receipt_ref": "workspace/tmp/upload-material-converter-diagnostics-20261003/root-code-rereview-ds-01-retention.json",
+      "receipt_sha256": "a574a4c10ef76ab3d297d9197c40081d0a55268100147e8bdcdd3258269c088e",
+      "retention": {
+        "bytes": 1900454,
+        "sha256": "c4bce81b1be22bd7dc39d95d295be54c3c2bceafe7221b35a68707308b4dd2d3",
+        "primary": "workspace/evidence/upload-material-post-ci-gate-runners-20261003/private/diagnostics-code-rereview-ds-flash-01.tar.gz",
+        "backup": "output/evidence-backup/upload-material-post-ci-gate-runners-20261003/private/diagnostics-code-rereview-ds-flash-01.tar.gz",
+        "equal": true,
+        "mode": "0600"
+      }
+    },
+    {
+      "receipt_ref": "workspace/tmp/upload-material-converter-diagnostics-20261003/root-code-rereview-mimo-01-retention.json",
+      "receipt_sha256": "69c8eef99064b6f232bd7f44258b1838295b297373192ce9d76e92a4008d25b7",
+      "retention": {
+        "sha256": "a26af304a3ff9eee6541b07e5686cc04e60015c3d3131049b854da3c2d653c71",
+        "bytes": 810791,
+        "copies": [
+          "workspace/evidence/upload-material-post-ci-gate-runners-20261003/private/root-code-rereview-mimo-01.tar.gz",
+          "output/evidence-backup/upload-material-post-ci-gate-runners-20261003/private/root-code-rereview-mimo-01.tar.gz"
+        ]
+      }
+    },
+    {
+      "receipt_ref": "workspace/tmp/upload-material-converter-diagnostics-20261003/root-code-review-mimo-01-retention.json",
+      "receipt_sha256": "c3b329e9d29954b577354feaffac54015befc08639a644104d979668996cb4f0",
+      "retention": {
+        "bytes": 867640,
+        "sha256": "5e48cfd6caf2a3e91ebe7e51b5370894a644aae1fc0517cb29bff1807589d70d",
+        "primary": "workspace/evidence/upload-material-post-ci-gate-runners-20261003/private/diagnostics-code-review-mimo-01.tar.gz",
+        "backup": "output/evidence-backup/upload-material-post-ci-gate-runners-20261003/private/diagnostics-code-review-mimo-01.tar.gz",
+        "equal": true,
+        "mode": "0600"
+      }
+    }
+  ],
+  "risk_classification": "WinLinux laterplatformWU; registry independent nextWU; extractionquality upstream; quota/daemon/nonstandardlogger/real-time globalorder outsidegoal no new unapproved implementation",
+  "business_success": "Docling generated and manifest registered; diagnostics not third success gate",
+  "CI_lineage": "immutable802 target79977b3a remains, fresh04 independent current11source; no recovery claim deleted oldRaw"
+}

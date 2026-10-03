@@ -19,6 +19,10 @@ XBRL 部署 owner 测试分布在 Documents 配置/快照、Fins converter facto
 
 无外部资源的常规 XBRL 回归还验证 worker 的单次 XBRL 调度、PDF 零调用、内容状态及 errors 的 execution 分类、export 的 serialization 分类和持有结果后的单次释放。合成状态矩阵只证明控制流；合成坏内容则由真实 Docling 路由和解析，断言构造拒绝时 backend 属性未绑定且原 execution 保留到父侧。这两类测试均不替代真实 CLI 内核隔离或合法财报转换的验收。
 
+`runtime/test_process_diagnostics.py` 在独立 spawn worker 中验证双标准 fd、晚创建的标准 logger、自装 handler、原生缓冲及 finalizer 隔离，并覆盖严格诊断 schema、健康在途记录与关闭交错、坏 record/媒体、四类控制流原对象及各阶段资源回收。不得在 pytest 父进程进入不可恢复的 worker fd 隔离范围。`runtime/test_log.py` 通过实际 configure owner 验证同一准入矩阵、真实 Formatter 缺字段、投递故障、root/lastResort 不触达及跨线程锁释放；converter 和 CLI 测试联验诊断不改 success/failure/cancel 与业务输出。
+
+spawn 覆盖率使用独占目录中的 coverage 配置，显式开启 `concurrency=multiprocessing`、`parallel=true` 与 `COVERAGE_PROCESS_START`，以 `coverage run -m pytest -p no:pytest_cov` 避免双 collector；保留原始 child 数据，使用 `coverage combine --keep` 合并，按完整生产文件统计，不排除生产行。真实 XBRL 内核测试须另外解除所有 coverage 环境变量并配置外部资源；`test_real_kernel_diagnostics_respects_original_xbrl_permissions` 同时验证真实转换、原 work 内诊断及 workspace/private/用户日志、admin/runtime/taxonomy 写入和 network 的拒绝。无资源时的 skip 不能作为该内核合同通过证据。
+
 ## 常用命令
 
 `test_source_meta_contract.py` 验证精确布尔删除/修订字段；`test_source_manifest_contract.py` 验证两类 manifest 使用同一严格删除投影。`test_fins_storage_atomicity.py` 的真实 Fs 生命周期回归核对 filing/material 首删、健康重删的全部发布字节/revision/时间不变、恢复后再删，以及坏删除字段和损坏 tombstone 的失败关闭。

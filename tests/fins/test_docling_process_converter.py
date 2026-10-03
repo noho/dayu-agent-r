@@ -5,7 +5,10 @@ from __future__ import annotations
 import asyncio
 import errno
 import hashlib
+import json
 import logging
+import multiprocessing
+import multiprocessing.queues
 import os
 import pickle
 import signal
@@ -368,12 +371,13 @@ class _SpawnBoundaryProbeTarget:
             replacement,
         )
         try:
+            (Path(self.input_path).parent / "diagnostics").mkdir(mode=0o700)
             return docling_process_converter._DoclingProcessTarget(
                 input_path=self.input_path,
                 output_path=self.output_path,
                 stream_name="annual-report.pdf",
                 config=docling_process_converter.DEFAULT_FINS_DOCLING_CONVERSION_CONFIG,
-            xbrl_input=None, sandbox_profile=None)()
+            xbrl_input=None, sandbox_profile=None, diagnostics_directory=str(Path(self.input_path).parent / "diagnostics"))()
         finally:
             child_monkeypatch.undo()
 
@@ -416,7 +420,7 @@ class _RecordingHandle:
 
         self.calls.append("start")
         if self.invoke_target:
-            self._target_result = self.target()
+            self._target_result = _run_target_spawn(cast(docling_process_converter._DoclingProcessTarget, self.target), "success")
 
     async def wait(self, timeout_seconds: float | None) -> ProcessWaitResult:
         """返回配置 terminal，或先推进 token 再返回 still-running。
@@ -529,6 +533,7 @@ class _IgnoringTerminateNestedTarget:
     config: docling_process_converter.DoclingConversionConfig
     xbrl_input: PreparedXbrlInput | None
     sandbox_profile: str | None
+    diagnostics_directory: str
 
     def __call__(self) -> JsonValue:
         """等待 nested child ready 后发布 parent PID 并阻塞。
@@ -675,377 +680,113 @@ def _successful_convert(
     return _FakeConversion(document=_FakeDocument(stream_name=stream_name))
 
 
+
+@dataclass(frozen=True, slots=True)
+class _TargetSpawnProbe:
+    """在独立真实 spawn 内安装明确转换边界并回传观察。"""
+    target: docling_process_converter._DoclingProcessTarget
+    mode: str
+
+    def __call__(self) -> JsonValue:
+        """参数：无；返回：原 descriptor；异常：未闭合控制流传播。"""
+        patch = pytest.MonkeyPatch()
+        replacement = {"success": _successful_convert, "construction": _spawn_construction_failure_convert,
+                       "execution": _spawn_execution_failure_convert, "serialization": _spawn_serialization_failure_convert,
+                       "leak": _diagnostic_convert}.get(self.mode, _successful_convert)
+        patch.setattr(docling_process_converter, "convert_pdf_bytes_with_docling", replacement)
+        if self.mode == "flush":
+            patch.setattr(sys, "stderr", _ExitFlushFailureStderr(sys.stderr))
+            patch.setattr(docling_process_converter, "convert_pdf_bytes_with_docling", _spawn_construction_failure_convert)
+        if self.mode == "isolation":
+            patch.setattr(docling_process_converter.os, "dup2", _fail_dup2)
+            patch.setattr(docling_process_converter, "convert_pdf_bytes_with_docling", _forbidden_xbrl_pdf_dispatch)
+        try:
+            return self.target()
+        finally:
+            patch.undo()
+
+
+def _fail_dup2(fd: int, target: int) -> None:
+    """参数：两个 fd；返回：永不返回；异常：模拟隔离无法建立。"""
+    raise OSError("isolation setup")
+
+
+def _diagnostic_convert(raw_bytes: bytes, *, stream_name: str, do_ocr: bool,
+                        do_table_structure: bool, table_mode: str, do_cell_matching: bool) -> _FakeConversion:
+    """参数：真实转换输入配置；返回：合成成功；异常：断言或控制流传播。"""
+    # installed owner 在 capture 之后才 import，且强制添加 handler，避免 hasHandlers 偶然拒加。
+    from docling_ibm_models.tableformer.settings import get_custom_logger
+    logger = get_custom_logger("MatchingPostProcessor", logging.INFO)
+    logger.addHandler(logging.StreamHandler(sys.stdout))
+    logger.propagate = False
+    logger.warning("installed late-created warning")
+    logger.warning("%d", "invalid-format")
+    os.write(1, b"native stdout WARNING\n")
+    os.write(2, b"native stderr\n")
+    return _successful_convert(raw_bytes, stream_name=stream_name, do_ocr=do_ocr,
+                               do_table_structure=do_table_structure, table_mode=table_mode, do_cell_matching=do_cell_matching)
+
+
+def _spawn_result_entry(probe: _TargetSpawnProbe, result: multiprocessing.queues.Queue[JsonValue]) -> None:
+    """参数：worker probe/专用结果队列；返回：无；异常：未闭合异常使测试失败。"""
+    result.put(probe())
+
+
+def _run_target_spawn(target: docling_process_converter._DoclingProcessTarget, mode: str) -> JsonValue:
+    """参数：真实 target/明确合成边界；返回：worker 原 descriptor；异常：超时/错误终态断言失败。"""
+    context = multiprocessing.get_context("spawn")
+    queue: multiprocessing.queues.Queue[JsonValue] = context.Queue()
+    worker = context.Process(target=_spawn_result_entry, args=(_TargetSpawnProbe(target, mode), queue))
+    worker.start()
+    try:
+        result = queue.get(timeout=30)
+        worker.join(30)
+        assert worker.exitcode == 0
+        return result
+    finally:
+        if worker.is_alive():
+            worker.kill(); worker.join()
+        worker.close(); queue.close(); queue.join_thread()
+
+
 @pytest.mark.parametrize("stream_name", ("annual-report.pdf", "annual-report.docx"))
-def test_child_target_is_pickleable_and_preserves_input_name_config_without_suffix_branch(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    stream_name: str,
-) -> None:
-    """PDF/DOCX 名称都只作为 Docling 输入，不触发 shared owner 特例。
-
-    :param tmp_path: pytest 临时目录。
-    :param monkeypatch: pytest 属性替换工具。
-    :param stream_name: 本例输入名。
-    :returns: ``None``。
-    :raises Exception: 文件、pickle 或 target 契约失败时抛出。
-    """
-
-    input_path = tmp_path / "input.bin"
-    output_path = tmp_path / "output.json"
-    input_path.write_bytes(_INPUT_BYTES)
-    target = docling_process_converter._DoclingProcessTarget(
-        input_path=str(input_path),
-        output_path=str(output_path),
-        stream_name=stream_name,
-        config=docling_process_converter.DEFAULT_FINS_DOCLING_CONVERSION_CONFIG,
-    xbrl_input=None, sandbox_profile=None)
-    monkeypatch.setattr(
-        docling_process_converter,
-        "convert_pdf_bytes_with_docling",
-        _successful_convert,
-    )
-
+def test_child_target_is_pickleable_and_preserves_input_name_config_without_suffix_branch(tmp_path: Path, stream_name: str) -> None:
+    """参数：独占目录/输入名；返回：无；异常：真实 spawn/pickle/配置合同漂移时失败。"""
+    target = _target_in_temp(tmp_path)
+    from dataclasses import replace
+    target = replace(target, stream_name=stream_name)
     restored = pickle.loads(pickle.dumps(target))
     assert restored == target
-    descriptor = restored()
-
-    assert output_path.read_bytes() == _OUTPUT_BYTES
-    assert descriptor == {
-        "schema_version": 1,
-        "status": "success",
-        "size": len(_OUTPUT_BYTES),
-        "sha256": hashlib.sha256(_OUTPUT_BYTES).hexdigest(),
-    }
+    descriptor = _run_target_spawn(restored, "success")
+    assert (tmp_path / "output.json").read_bytes() == _OUTPUT_BYTES
+    assert descriptor == docling_process_converter._success_descriptor(_OUTPUT_BYTES)
 
 
-@pytest.mark.parametrize(
-    ("failure", "expected_kind", "expected_message"),
-    (
-        (
-            DoclingRuntimeInitializationError("sensitive construction detail"),
-            docling_process_converter.DoclingConversionFailureKind.CONVERTER_CONSTRUCTION,
-            "Docling converter construction failed",
-        ),
-        (
-            RuntimeError("sensitive execution detail"),
-            docling_process_converter.DoclingConversionFailureKind.CONVERTER_EXECUTION,
-            "Docling conversion execution failed",
-        ),
-    ),
-)
-def test_child_target_maps_construction_and_execution_to_exact_failure_descriptor(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    failure: Exception,
-    expected_kind: docling_process_converter.DoclingConversionFailureKind,
-    expected_message: str,
-) -> None:
-    """helper 的 construction/execution 失败在 child 内正常返回安全 descriptor。
-
-    :param tmp_path: pytest 临时目录。
-    :param monkeypatch: pytest 属性替换工具。
-    :param failure: helper 抛出的原始异常。
-    :param expected_kind: 预期 closed kind。
-    :param expected_message: 预期固定安全文本。
-    :returns: ``None``。
-    :raises Exception: 文件或 target 契约失败时抛出。
-    """
-
-    target = _target_in_temp(tmp_path)
-
-    def failing_convert(
-        raw_bytes: bytes,
-        *,
-        stream_name: str,
-        do_ocr: bool,
-        do_table_structure: bool,
-        table_mode: str,
-        do_cell_matching: bool,
-    ) -> _FakeConversion:
-        """抛出本参数例指定的 helper 异常。
-
-        :param raw_bytes: 输入字节。
-        :param stream_name: 输入名。
-        :param do_ocr: OCR 配置。
-        :param do_table_structure: 表格结构配置。
-        :param table_mode: 表格模式。
-        :param do_cell_matching: 单元格匹配配置。
-        :returns: 永不返回。
-        :raises Exception: 始终抛出 ``failure``。
-        """
-
-        _ = (
-            raw_bytes,
-            stream_name,
-            do_ocr,
-            do_table_structure,
-            table_mode,
-            do_cell_matching,
-        )
-        raise failure
-
-    monkeypatch.setattr(
-        docling_process_converter,
-        "convert_pdf_bytes_with_docling",
-        failing_convert,
-    )
-
-    assert target() == {
-        "schema_version": 1,
-        "status": "failure",
-        "failure_kind": expected_kind.value,
-        "message": expected_message,
-    }
+@pytest.mark.parametrize("mode,kind", [("construction", "converter_construction"), ("execution", "converter_execution"),
+                                       ("serialization", "result_serialization"), ("flush", "converter_construction"),
+                                       ("isolation", "converter_construction")])
+def test_child_target_exact_failure_and_flush_secondary(tmp_path: Path, mode: str, kind: str, capfd: pytest.CaptureFixture[str]) -> None:
+    """参数：目录/故障阶段/公开双流；返回：无；异常：原 descriptor 或隔离/flush 合同漂移时失败。"""
+    descriptor = _run_target_spawn(_target_in_temp(tmp_path), mode)
+    assert descriptor == docling_process_converter._failure_descriptor(docling_process_converter.DoclingConversionFailureKind(kind))
+    public = capfd.readouterr()
+    assert public.out == public.err == ""
+    if mode == "flush":
+        from dayu.runtime.process_diagnostics import ProcessCaptureIncident, ProcessCaptureIncidentCode, read_process_diagnostics
+        assert ProcessCaptureIncident(ProcessCaptureIncidentCode.SCOPE_FLUSH) in list(read_process_diagnostics(tmp_path / "diagnostics", require_complete=True))
 
 
-def test_child_target_isolates_inherited_stderr_while_preserving_failure_descriptor(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capfd: pytest.CaptureFixture[str],
-) -> None:
-    """第三方 conversion 的 stderr 与 logger 输出不得越过 child adapter。
-
-    :param tmp_path: pytest 临时目录。
-    :param monkeypatch: pytest 属性替换工具。
-    :param capfd: OS 文件描述符级标准流捕获夹具。
-    :returns: ``None``。
-    :raises Exception: stderr 泄漏或 descriptor contract 漂移时抛出。
-    """
-
-    target = _target_in_temp(tmp_path)
-    leaking_logger = logging.getLogger("third_party.docling.stderr_owner_test")
-    root_logger = logging.getLogger()
-    original_handlers = tuple(leaking_logger.handlers)
-    original_level = leaking_logger.level
-    original_propagate = leaking_logger.propagate
-    original_disabled = leaking_logger.disabled
-    original_root_handlers = tuple(root_logger.handlers)
-
-    def failing_convert(
-        raw_bytes: bytes,
-        *,
-        stream_name: str,
-        do_ocr: bool,
-        do_table_structure: bool,
-        table_mode: str,
-        do_cell_matching: bool,
-    ) -> _FakeConversion:
-        """模拟第三方 callback 与 lastResort logger 泄漏后失败。
-
-        :param raw_bytes: 输入字节。
-        :param stream_name: 输入名。
-        :param do_ocr: OCR 配置。
-        :param do_table_structure: 表格结构配置。
-        :param table_mode: 表格模式。
-        :param do_cell_matching: 单元格匹配配置。
-        :returns: 永不返回。
-        :raises RuntimeError: 始终在写入敏感 stderr 后抛出。
-        """
-
-        _ = (
-            raw_bytes,
-            stream_name,
-            do_ocr,
-            do_table_structure,
-            table_mode,
-            do_cell_matching,
-        )
-        sys.stderr.write(f"Traceback: sensitive input path {tmp_path / 'corrupt.pdf'}\n")
-        leaking_logger.warning("third-party logger leaked repo path /private/dayu-agent-r")
-        raise RuntimeError("sensitive conversion failure")
-
-    leaking_logger.handlers.clear()
-    leaking_logger.setLevel(logging.WARNING)
-    leaking_logger.propagate = True
-    leaking_logger.disabled = False
-    root_logger.handlers.clear()
-    monkeypatch.setattr(
-        docling_process_converter,
-        "convert_pdf_bytes_with_docling",
-        failing_convert,
-    )
-    try:
-        assert logging.lastResort is not None
-        leaking_logger.warning(_LAST_RESORT_CONTROL_MARKER)
-        assert capfd.readouterr().err == f"{_LAST_RESORT_CONTROL_MARKER}\n"
-        descriptor = target()
-    finally:
-        leaking_logger.handlers[:] = original_handlers
-        leaking_logger.setLevel(original_level)
-        leaking_logger.propagate = original_propagate
-        leaking_logger.disabled = original_disabled
-        root_logger.handlers[:] = original_root_handlers
-
-    captured = capfd.readouterr()
-    assert captured.err == ""
-    assert descriptor == {
-        "schema_version": 1,
-        "status": "failure",
-        "failure_kind": "converter_execution",
-        "message": "Docling conversion execution failed",
-    }
-
-
-def test_child_target_preserves_primary_exception_when_exit_flush_fails(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capfd: pytest.CaptureFixture[str],
-) -> None:
-    """exit flush 次生异常不得遮蔽主异常，且必须恢复并关闭 FD。
-
-    :param tmp_path: pytest 临时目录。
-    :param monkeypatch: pytest 属性替换工具。
-    :param capfd: OS 文件描述符级标准流捕获夹具。
-    :returns: ``None``。
-    :raises Exception: 原始分类、FD2 恢复或复制 FD 关闭契约失败时抛出。
-    """
-
-    target = _target_in_temp(tmp_path)
-    stderr_observer = _ExitFlushFailureStderr(sys.stderr)
-    duplicated_descriptors: list[int] = []
-    closed_descriptors: list[int] = []
-    original_dup = os.dup
-    original_close = os.close
-
-    def recording_dup(file_descriptor: int) -> int:
-        """复制并记录 inherited stderr descriptor。
-
-        :param file_descriptor: 待复制的 FD2。
-        :returns: 真实复制 descriptor。
-        :raises OSError: 系统 descriptor 复制失败时抛出。
-        """
-
-        duplicated_descriptor = original_dup(file_descriptor)
-        duplicated_descriptors.append(duplicated_descriptor)
-        return duplicated_descriptor
-
-    def recording_close(file_descriptor: int) -> None:
-        """关闭并记录 inherited stderr 复制 descriptor。
-
-        :param file_descriptor: 待关闭的 descriptor。
-        :returns: ``None``。
-        :raises OSError: 系统 descriptor 关闭失败时抛出。
-        """
-
-        closed_descriptors.append(file_descriptor)
-        original_close(file_descriptor)
-
-    def construction_failure_convert(
-        raw_bytes: bytes,
-        *,
-        stream_name: str,
-        do_ocr: bool,
-        do_table_structure: bool,
-        table_mode: str,
-        do_cell_matching: bool,
-    ) -> _FakeConversion:
-        """模拟隔离区主体的 converter construction 失败。
-
-        :param raw_bytes: 输入字节。
-        :param stream_name: 输入名。
-        :param do_ocr: OCR 配置。
-        :param do_table_structure: 表格结构配置。
-        :param table_mode: 表格模式。
-        :param do_cell_matching: 单元格匹配配置。
-        :returns: 永不返回。
-        :raises DoclingRuntimeInitializationError: 始终抛出主异常。
-        """
-
-        _ = (
-            raw_bytes,
-            stream_name,
-            do_ocr,
-            do_table_structure,
-            table_mode,
-            do_cell_matching,
-        )
-        raise DoclingRuntimeInitializationError("owner-test primary construction failure")
-
-    with monkeypatch.context() as patch_context:
-        patch_context.setattr(docling_process_converter.sys, "stderr", stderr_observer)
-        patch_context.setattr(docling_process_converter.os, "dup", recording_dup)
-        patch_context.setattr(docling_process_converter.os, "close", recording_close)
-        patch_context.setattr(
-            docling_process_converter,
-            "convert_pdf_bytes_with_docling",
-            construction_failure_convert,
-        )
-        descriptor = target()
-
-    assert descriptor == {
-        "schema_version": 1,
-        "status": "failure",
-        "failure_kind": "converter_construction",
-        "message": "Docling converter construction failed",
-    }
-    assert stderr_observer.flush_calls == _EXIT_FLUSH_CALL_NUMBER
-    assert len(duplicated_descriptors) == 1
-    assert closed_descriptors == duplicated_descriptors
-    with pytest.raises(OSError) as closed_error:
-        os.fstat(duplicated_descriptors[0])
-    assert closed_error.value.errno == errno.EBADF
-
-    os.write(sys.stderr.fileno(), _RESTORED_STDERR_MARKER)
-    assert capfd.readouterr().err == _RESTORED_STDERR_MARKER.decode("utf-8")
-
-
-def test_child_target_maps_export_failure_to_exact_serialization_descriptor(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """export/JSON/output 边界失败必须映射 serialization descriptor。
-
-    :param tmp_path: pytest 临时目录。
-    :param monkeypatch: pytest 属性替换工具。
-    :returns: ``None``。
-    :raises Exception: 文件或 target 契约失败时抛出。
-    """
-
-    target = _target_in_temp(tmp_path)
-
-    def serialization_failure_convert(
-        raw_bytes: bytes,
-        *,
-        stream_name: str,
-        do_ocr: bool,
-        do_table_structure: bool,
-        table_mode: str,
-        do_cell_matching: bool,
-    ) -> _SerializationFailureConversion:
-        """返回 export 阶段失败的 conversion fake。
-
-        :param raw_bytes: 输入字节。
-        :param stream_name: 输入名。
-        :param do_ocr: OCR 配置。
-        :param do_table_structure: 表格结构配置。
-        :param table_mode: 表格模式。
-        :param do_cell_matching: 单元格匹配配置。
-        :returns: 导出失败 conversion。
-        :raises Exception: 本函数不抛出异常。
-        """
-
-        _ = (
-            raw_bytes,
-            stream_name,
-            do_ocr,
-            do_table_structure,
-            table_mode,
-            do_cell_matching,
-        )
-        return _SerializationFailureConversion()
-
-    monkeypatch.setattr(
-        docling_process_converter,
-        "convert_pdf_bytes_with_docling",
-        serialization_failure_convert,
-    )
-
-    assert target() == {
-        "schema_version": 1,
-        "status": "failure",
-        "failure_kind": "result_serialization",
-        "message": "Docling conversion result serialization failed",
-    }
+def test_child_installed_late_handler_and_native_diagnostics(tmp_path: Path, capfd: pytest.CaptureFixture[str]) -> None:
+    """参数：独占目录/真实双流；返回：无；异常：installed owner 或 fd 诊断外泄/等级漂移时失败。"""
+    from dayu.runtime.process_diagnostics import ProcessLogDiagnostic, ProcessCaptureIncident, ProcessRawDiagnostic, read_process_diagnostics
+    result = _run_target_spawn(_target_in_temp(tmp_path), "leak")
+    assert result == docling_process_converter._success_descriptor(_OUTPUT_BYTES)
+    diagnostics = list(read_process_diagnostics(tmp_path / "diagnostics", require_complete=True))
+    records = [value for value in diagnostics if isinstance(value, ProcessLogDiagnostic)]
+    assert len(records) == 1 and records[0].source_name == "MatchingPostProcessor" and records[0].source_level == logging.WARNING
+    assert any(isinstance(value, ProcessCaptureIncident) for value in diagnostics)
+    assert any(isinstance(value, ProcessRawDiagnostic) and b"native stdout WARNING" in value.data for value in diagnostics)
+    public = capfd.readouterr(); assert public.out == public.err == ""
 
 
 @pytest.mark.asyncio
@@ -1097,7 +838,7 @@ async def test_child_three_failures_are_runtime_completed_descriptors(
     )
     try:
         handle.start()
-        terminal = await handle.wait(timeout_seconds=2.0)
+        terminal = await handle.wait(timeout_seconds=30.0)
     finally:
         await handle.close(kill_grace_seconds=_TEST_KILL_GRACE_SECONDS)
 
@@ -1998,12 +1739,13 @@ def _target_in_temp(tmp_path: Path) -> docling_process_converter._DoclingProcess
 
     input_path = tmp_path / "input.bin"
     input_path.write_bytes(_INPUT_BYTES)
+    (tmp_path / "diagnostics").mkdir(mode=0o700)
     return docling_process_converter._DoclingProcessTarget(
         input_path=str(input_path),
         output_path=str(tmp_path / "output.json"),
         stream_name="annual-report.pdf",
         config=docling_process_converter.DEFAULT_FINS_DOCLING_CONVERSION_CONFIG,
-    xbrl_input=None, sandbox_profile=None)
+    xbrl_input=None, sandbox_profile=None, diagnostics_directory=str(tmp_path / "diagnostics"))
 
 
 async def _convert_once(
@@ -2221,38 +1963,13 @@ def test_xbrl_worker_dispatch_classification_and_owned_release(
     input_path = tmp_path / 'input.bin'
     output_path = prepared.writable_root / 'output.json'
     input_path.write_bytes(_INPUT_BYTES)
-    backend = _XbrlBackendObservation()
-    in_doc = InputDocument.model_construct(
-        file=input_path, document_hash=hashlib.sha256(_INPUT_BYTES).hexdigest(),
-        valid=True, format=InputFormat.XML_XBRL,
-    )
-    in_doc._backend = cast(AbstractDocumentBackend, backend)
-    errors = [ErrorItem(component_type=DoclingComponentType.DOCUMENT_BACKEND,
-                        module_name='synthetic', error_message='synthetic content error')] if case == 'errors' else []
-    result = ConversionResult(
-        input=in_doc, status=ConversionStatus.FAILURE if case == 'status' else ConversionStatus.SUCCESS,
-        errors=errors, document=DoclingDocument(name='synthetic-control-flow'),
-    )
-    observed = _XbrlWorkerObservation(result, prepared, case == 'raises')
-    monkeypatch.setattr(docling_process_converter, 'convert_xbrl_bytes_with_docling', observed.convert)
-    monkeypatch.setattr(docling_process_converter, 'convert_pdf_bytes_with_docling', _forbidden_xbrl_pdf_dispatch)
-    monkeypatch.setattr(docling_process_converter, 'unload_xbrl_conversion', observed.release)
-    # 只测试控制流：明确不施加真实内核策略；快照复验仍使用真实 owner。
-    monkeypatch.setattr(docling_process_converter, 'apply_macos_sandbox', _observe_synthetic_policy)
-    if case == 'export':
-        monkeypatch.setattr(DoclingDocument, 'export_to_dict', _xbrl_export_failure)
-    monkeypatch.chdir(Path.cwd())
-    for key in ('TMPDIR', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME'):
-        monkeypatch.setenv(key, os.environ.get(key, 'synthetic-before'))
-    monkeypatch.setattr(docling_process_converter.tempfile, 'tempdir', docling_process_converter.tempfile.tempdir)
-    target = docling_process_converter._DoclingProcessTarget(
-        str(input_path), str(output_path), 'synthetic.xml',
-        docling_process_converter.DEFAULT_FINS_DOCLING_CONVERSION_CONFIG, prepared, 'synthetic-profile',
-    )
-    descriptor = target()
-    assert observed.dispatch_calls == 1
-    assert observed.release_calls == (0 if case == 'raises' else 1)
-    assert backend.unload_calls == (0 if case == 'raises' else 1)
+    diagnostics = prepared.writable_root / 'diagnostics'; diagnostics.mkdir(mode=0o700)
+    target = docling_process_converter._DoclingProcessTarget(str(input_path), str(output_path), 'synthetic.xml',
+        docling_process_converter.DEFAULT_FINS_DOCLING_CONVERSION_CONFIG, prepared, 'synthetic-profile', str(diagnostics))
+    observation_path = tmp_path / 'observation.json'
+    descriptor = _run_xbrl_spawn(_XbrlSpawnProbe(target, case, str(observation_path)))
+    observation = json.loads(observation_path.read_text())
+    assert observation == {'dispatch': 1, 'release': 0 if case == 'raises' else 1, 'unload': 0 if case == 'raises' else 1}
     terminal = InterruptibleProcessCompleted(value=descriptor, exitcode=0)
     if case == 'success':
         public = docling_process_converter._read_terminal_result(output_path=output_path, wait_result=terminal)
@@ -2270,3 +1987,145 @@ def test_xbrl_worker_dispatch_classification_and_owned_release(
 def _observe_synthetic_policy(profile: str) -> None:
     """参数：合成策略标签；返回：无；异常：非预期标签时断言失败；不施加内核策略。"""
     assert profile == 'synthetic-profile'
+
+
+@dataclass(frozen=True, slots=True)
+class _XbrlSpawnProbe:
+    """独立 worker 内合成 XBRL 状态与真实 owner 释放观察。"""
+    target: docling_process_converter._DoclingProcessTarget
+    case: str
+    observation_path: str
+
+    def __call__(self) -> JsonValue:
+        """参数：无；返回：原 descriptor；异常：owner 断言失败传播。"""
+        patch = pytest.MonkeyPatch()
+        backend = _XbrlBackendObservation()
+        in_doc = InputDocument.model_construct(file=Path(self.target.input_path), document_hash=hashlib.sha256(_INPUT_BYTES).hexdigest(), valid=True, format=InputFormat.XML_XBRL)
+        in_doc._backend = cast(AbstractDocumentBackend, backend)
+        errors = [ErrorItem(component_type=DoclingComponentType.DOCUMENT_BACKEND, module_name='synthetic', error_message='synthetic content error')] if self.case == 'errors' else []
+        result = ConversionResult(input=in_doc, status=ConversionStatus.FAILURE if self.case == 'status' else ConversionStatus.SUCCESS, errors=errors, document=DoclingDocument(name='synthetic-control-flow'))
+        assert self.target.xbrl_input is not None
+        observed = _XbrlWorkerObservation(result, self.target.xbrl_input, self.case == 'raises')
+        patch.setattr(docling_process_converter, 'convert_xbrl_bytes_with_docling', observed.convert)
+        patch.setattr(docling_process_converter, 'convert_pdf_bytes_with_docling', _forbidden_xbrl_pdf_dispatch)
+        patch.setattr(docling_process_converter, 'unload_xbrl_conversion', observed.release)
+        patch.setattr(docling_process_converter, 'apply_macos_sandbox', _observe_synthetic_policy)
+        if self.case == 'export': patch.setattr(DoclingDocument, 'export_to_dict', _xbrl_export_failure)
+        try:
+            descriptor = self.target()
+            Path(self.observation_path).write_text(json.dumps({'dispatch': observed.dispatch_calls, 'release': observed.release_calls, 'unload': backend.unload_calls}))
+            return descriptor
+        finally:
+            patch.undo()
+
+
+def _xbrl_result_entry(probe: InterruptibleProcessTarget, queue: multiprocessing.queues.Queue[JsonValue]) -> None:
+    """参数：probe/测试队列；返回：无；异常：owner 失败传播。"""
+    queue.put(probe())
+
+
+def _run_xbrl_spawn(probe: InterruptibleProcessTarget) -> JsonValue:
+    """参数：显式合成状态 probe；返回：真实 spawn descriptor；异常：timeout 或异常终态失败。"""
+    context = multiprocessing.get_context('spawn')
+    queue: multiprocessing.queues.Queue[JsonValue] = context.Queue()
+    worker = context.Process(target=_xbrl_result_entry, args=(probe, queue))
+    worker.start()
+    try:
+        result = queue.get(timeout=30); worker.join(30); assert worker.exitcode == 0
+        return result
+    finally:
+        if worker.is_alive(): worker.kill(); worker.join()
+        worker.close(); queue.close(); queue.join_thread()
+
+
+class _DiagnosticRecordingHandle(_RecordingHandle):
+    """父状态机替身仍在真实 spawn 内产生 installed/native 诊断。"""
+    def start(self) -> None:
+        """参数：无；返回：记录原 descriptor；异常：真实 spawn 失败传播。"""
+        self.calls.append('start')
+        self._target_result = _run_target_spawn(cast(docling_process_converter._DoclingProcessTarget, self.target), 'leak')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('fault', ['missing', 'json', 'footer', 'read', 'projection', 'write', 'flush', 'format', 'missing_format'])
+@pytest.mark.parametrize('outcome', ['success', 'failure', 'cancel'])
+async def test_diagnostic_failure_never_rewrites_verified_outcome(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        fault: str, outcome: str, capfd: pytest.CaptureFixture[str]) -> None:
+    """参数：诊断坏路径/原终态/双流；返回：无；异常：普通 sidecar/真实投递错误覆盖业务时失败。"""
+    import io
+    from tests.runtime.test_log import _DiagnosticFaultStream, _DiagnosticFaultFormatter
+    from dayu.runtime.log import LogLevel, configure
+    temp_paths = _install_recording_converter_dependencies(monkeypatch)
+    monkeypatch.setattr(docling_process_converter, 'InterruptibleProcessHandle', _DiagnosticRecordingHandle)
+    error = OSError('diagnostic only')
+    stream = _DiagnosticFaultStream(fault, error) if fault in ('write', 'flush') else io.StringIO()
+    # WARNING owner 的准入保留真实源 WARNING，cleanup INFO 属既有 ordinary policy 被拒绝。
+    configure(level=LogLevel.WARNING, stream=stream)
+    if fault == 'format': logging.getLogger('dayu').handlers[0].setFormatter(_DiagnosticFaultFormatter(error))
+    if fault == 'missing_format': logging.getLogger('dayu').handlers[0].setFormatter(logging.Formatter('%(missing_required_field)s'))
+    original_close = _RecordingHandle.close
+    async def close_and_fault(self: _RecordingHandle, kill_grace_seconds: float) -> None:
+        """参数：handle/预算；返回：关闭后注入媒体缺口；异常：原 cleanup 错误传播。"""
+        await original_close(self, kill_grace_seconds=kill_grace_seconds)
+        target = cast(docling_process_converter._DoclingProcessTarget, self.target)
+        records = Path(target.diagnostics_directory) / 'records.jsonl'
+        if fault == 'missing': records.unlink()
+        elif fault == 'json': records.write_bytes(b'bad\n')
+        elif fault == 'footer': records.write_bytes(records.read_bytes().rsplit(b'\n', 2)[0] + b'\n')
+    monkeypatch.setattr(_DiagnosticRecordingHandle, 'close', close_and_fault)
+    if fault == 'read':
+        def fail_read(directory: Path, *, require_complete: bool) -> list[JsonValue]:
+            """参数：目录/策略；返回：永不返回；异常：普通 read fault。"""
+            raise OSError('read fault')
+        monkeypatch.setattr(docling_process_converter, 'read_process_diagnostics', fail_read)
+    if fault == 'projection':
+        def fail_projection(diagnostic: JsonValue) -> bool:
+            """参数：投影；返回：永不返回；异常：普通投影 fault。"""
+            raise ValueError('projection fault')
+        monkeypatch.setattr(docling_process_converter, 'emit_process_log_diagnostic', fail_projection)
+    token: _MutableCancellationToken | None = None
+    if outcome == 'failure':
+        _RecordingHandle.configured_wait_result = InterruptibleProcessCompleted(value=docling_process_converter._failure_descriptor(docling_process_converter.DoclingConversionFailureKind.CONVERTER_EXECUTION), exitcode=0)
+    if outcome == 'cancel':
+        token = _MutableCancellationToken(); _RecordingHandle.cancellation_to_request = token
+    try:
+        if outcome == 'success': assert (await _convert_once()).json_bytes == _OUTPUT_BYTES
+        elif outcome == 'failure':
+            with pytest.raises(docling_process_converter.DoclingConversionError) as caught: await _convert_once()
+            assert caught.value.kind is docling_process_converter.DoclingConversionFailureKind.CONVERTER_EXECUTION
+        else:
+            with pytest.raises(docling_process_converter.DoclingConversionCancelledError): await _convert_once(cancellation=token)
+    finally:
+        if isinstance(stream, _DiagnosticFaultStream): stream.phase = 'none'
+    assert temp_paths and all(not path.exists() for path in temp_paths)
+    public = capfd.readouterr(); assert public.out == public.err == ''
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('control', ['keyboard', 'exit', 'cancel', 'generator'])
+@pytest.mark.parametrize('phase', ['format', 'write', 'flush', 'release'])
+async def test_forward_control_flow_cleanup_preserves_object(monkeypatch: pytest.MonkeyPatch, control: str, phase: str) -> None:
+    """参数：原控制流；返回：无；异常：诊断控制流吞掉/替换对象或 temp 未清理失败。"""
+    from tests.runtime.test_log import _DiagnosticFaultFormatter, _DiagnosticFaultStream, _DiagnosticReleaseFaultHandler
+    from dayu.runtime.log import LogLevel, configure
+    import io
+    error = {'keyboard': KeyboardInterrupt(), 'exit': SystemExit(8), 'cancel': asyncio.CancelledError(), 'generator': GeneratorExit()}[control]
+    temp_paths = _install_recording_converter_dependencies(monkeypatch)
+    monkeypatch.setattr(docling_process_converter, 'InterruptibleProcessHandle', _DiagnosticRecordingHandle)
+    stream = _DiagnosticFaultStream(phase, error) if phase in ('write', 'flush') else io.StringIO()
+    configure(level=LogLevel.WARNING, stream=stream)
+    namespace = logging.getLogger('dayu'); owner = namespace.handlers[0]
+    release_owner: _DiagnosticReleaseFaultHandler | None = None
+    if phase == 'format': owner.setFormatter(_DiagnosticFaultFormatter(error))
+    if phase == 'release':
+        release_owner = _DiagnosticReleaseFaultHandler(stream=stream)
+        release_owner.setLevel(owner.level)
+        for admission in owner.filters: release_owner.addFilter(admission)
+        release_owner.setFormatter(owner.formatter); release_owner.release_error = error
+        namespace.handlers[:] = [release_owner]
+    try:
+        with pytest.raises(BaseException) as caught: await _convert_once()
+        assert caught.value is error and all(not path.exists() for path in temp_paths)
+    finally:
+        if isinstance(stream, _DiagnosticFaultStream): stream.phase = 'none'
+        if release_owner is not None: release_owner.release_error = None

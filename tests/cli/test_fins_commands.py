@@ -27,6 +27,7 @@ from functools import partial
 from pathlib import Path
 from unittest.mock import Mock
 from typing import NoReturn, TextIO, cast
+from dayu.runtime.interruptible_process import InterruptibleProcessHandle, InterruptibleProcessTarget
 
 import pytest
 
@@ -5100,3 +5101,37 @@ def test_real_material_cli_sigint_waits_for_cancelled_terminal(tmp_path: Path) -
     assert FsSourceDocumentRepository(workspace_root).list_source_document_ids("AAPL", SourceKind.MATERIAL) == []
     assert not (workspace_root / "sessions").exists()
     assert not (workspace_root / "artifacts").exists()
+
+
+class _DiagnosticsSpawnHandle:
+    """复用真实 process 生命周期，仅在 worker 替换转换内容结果。"""
+    def __new__(cls, target: 'InterruptibleProcessTarget') -> 'InterruptibleProcessHandle':
+        """参数：真实 production target；返回：真实 handle；异常：worker 装配错误传播。"""
+        from dayu.runtime.interruptible_process import InterruptibleProcessHandle
+        from dayu.fins.pipelines.docling_process_converter import _DoclingProcessTarget
+        from tests.fins.test_docling_process_converter import _TargetSpawnProbe
+        return InterruptibleProcessHandle(_TargetSpawnProbe(cast(_DoclingProcessTarget, target), 'leak'))
+
+
+@pytest.mark.parametrize('selector', ['default', 'quiet', 'info', 'error'])
+def test_upload_material_converter_diagnostics_cli_owner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capfd: pytest.CaptureFixture[str], selector: str) -> None:
+    """参数：真实 CLI/Service/Fs/worker 与 selector；返回：无；异常：双流泄漏/日志准入/业务终态漂移失败。"""
+    from dayu.fins.pipelines import docling_process_converter
+    monkeypatch.setattr(docling_process_converter, 'InterruptibleProcessHandle', _DiagnosticsSpawnHandle)
+    source = tmp_path / 'annual-report.pdf'; source.write_bytes(b'immutable-filing-input')
+    logfile = _redirect_default_log_file(tmp_path=tmp_path, monkeypatch=monkeypatch) if selector == 'default' else tmp_path / 'explicit.log'
+    args = ['upload_material', '--base', str(tmp_path / 'store'), '--ticker', 'MSFT', '--forms', 'MATERIAL_OTHER',
+            '--material-name', 'Diagnostic owner', '--company-name', 'Microsoft Corporation', '--files', str(source)]
+    if selector != 'default': args += ['--' + selector, '--log-file', str(logfile)]
+    if selector == 'info': logfile.write_text('append-prefix\n')
+    assert cli_main.main(tuple(args)) == EXIT_SUCCESS
+    public = capfd.readouterr()
+    assert public.err == '' and 'stored_files="1"' in public.out
+    assert 'installed late-created warning' not in public.out and 'native stdout WARNING' not in public.out
+    text = logfile.read_text()
+    if selector in ('default', 'info'):
+        assert '[WARNING] [MatchingPostProcessor] installed late-created warning' in text
+        assert 'source_level=unknown' in text and '转换诊断捕获异常' in text
+    else: assert 'installed late-created warning' not in text and 'native stdout WARNING' not in text
+    if selector == 'info': assert text.startswith('append-prefix\n')

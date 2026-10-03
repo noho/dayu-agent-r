@@ -35,9 +35,10 @@ from collections.abc import Mapping
 from enum import IntEnum, StrEnum
 from pathlib import Path
 from types import FrameType
-from typing import Final, TextIO, TypeAlias
+from typing import TYPE_CHECKING, Final, TextIO, TypeAlias
 
 from dayu.contracts.json_value import JsonValue
+from dayu.runtime.process_diagnostics import ProcessLogDiagnostic
 from dayu.runtime.log_levels import (
     CRITICAL_LOG_LEVEL,
     DEBUG_LOG_LEVEL,
@@ -277,6 +278,64 @@ class _DiagnosticAdmissionFilter(logging.Filter):
         return record.levelno >= int(self._ordinary_level)
 
 
+if TYPE_CHECKING:
+    _DiagnosticStreamHandlerBase = logging.StreamHandler[TextIO]
+else:
+    _DiagnosticStreamHandlerBase = logging.StreamHandler
+
+
+class _DiagnosticStreamHandler(_DiagnosticStreamHandlerBase):
+    """保持普通日志行为，仅提供进程诊断的安全投递边界。"""
+
+    stream: TextIO
+
+    def try_deliver_process_record(self, record: logging.LogRecord) -> bool:
+        """参数：干净源记录；返回：完成或拒绝 True、普通故障 False；异常：控制流释放锁后原样传播。"""
+        try:
+            if record.levelno < self.level or not self.filter(record):
+                return True
+            self.acquire()
+            delivery_error: BaseException | None = None
+            try:
+                message = self.format(record)
+                self.stream.write(message + self.terminator)
+                self.flush()
+            except BaseException as exc:
+                delivery_error = exc
+            finally:
+                try:
+                    self.release()
+                except BaseException as exc:
+                    # 释放锁仍必须尝试；已有控制流不能被后续释放故障替换。
+                    if delivery_error is None or isinstance(delivery_error, Exception) and not isinstance(exc, Exception):
+                        delivery_error = exc
+            if delivery_error is not None:
+                raise delivery_error
+            return True
+        except Exception:
+            return False
+
+
+def emit_process_log_diagnostic(diagnostic: ProcessLogDiagnostic) -> bool:
+    """参数：child 原等级诊断；返回：拒绝/完成 True、无唯一 owner/普通故障 False；异常：控制流传播。
+
+    仅投递现有 dayu marker owner，不触 root、lastResort 或源 logger 的路由。
+    """
+    try:
+        record = logging.LogRecord(diagnostic.source_name, diagnostic.source_level,
+                                   "", 0, diagnostic.message, (), None)
+        record.created = diagnostic.created_at
+        namespace = logging.getLogger(_NAMESPACE_LOGGER_NAME)
+        if not namespace.isEnabledFor(record.levelno) or namespace.disabled or not namespace.filter(record):
+            return True
+        owners = [handler for handler in namespace.handlers if isinstance(handler, _DiagnosticStreamHandler)]
+        if len(owners) != 1:
+            return False
+        return owners[0].try_deliver_process_record(record)
+    except Exception:
+        return False
+
+
 def configure(
     *,
     level: LogLevel,
@@ -413,7 +472,7 @@ def _build_marker_handler(
     :raises Exception: 不主动抛出异常。
     """
 
-    handler = logging.StreamHandler(stream=stream)
+    handler = _DiagnosticStreamHandler(stream=stream)
     handler.setLevel(int(gate_level))
     handler.addFilter(
         _DiagnosticAdmissionFilter(
@@ -447,5 +506,6 @@ __all__ = [
     "bounded_payload_keys",
     "configure",
     "configure_selected_diagnostics",
+    "emit_process_log_diagnostic",
     "log_verbose",
 ]
