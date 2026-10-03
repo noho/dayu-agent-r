@@ -15,6 +15,10 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING, TypedDict, cast
+
+if TYPE_CHECKING:
+    from utils.docling_schema_regression import ItemCounts, SchemaSummary
 
 DEFAULT_OUT = (
     Path(__file__).resolve().parents[1] / "workspace/tmp/docling-regression/samples-2.3.json"
@@ -27,28 +31,50 @@ PER_TICKER_MIN = 2
 DELTA_TOP_COUNT = 25
 
 
-def _load_layers() -> tuple[dict[str, dict], dict[str, dict]]:
+class DensityRow(TypedDict):
+    """样本清单消费的文本层密度字段视图，不验证磁盘内容。"""
+
+    stem: str
+    ticker: str
+    pages: int
+    density: float
+
+
+class SampleSummary(TypedDict):
+    """回归摘要的计数消费视图与本脚本产生的文本计数差。"""
+
+    stem: str
+    base_counts: ItemCounts
+    new_counts: ItemCounts
+    texts_delta: int
+
+
+def _load_layers() -> tuple[dict[str, DensityRow], dict[str, SampleSummary]]:
     """读取文本层密度与回归结果两层数据。
 
-    :returns: (stem 到密度行, stem 到回归摘要) 二元组。
-    :raises Exception: 数据文件缺失时由 Path 抛出。
+    :param: 无显式参数；读取 DATA_ROOT 下的既有 JSON。
+    :returns: (stem 到密度行, stem 到含文本计数差的回归摘要) 二元组。
+    :raises OSError, ValueError, KeyError, TypeError: 原读取、解析与字段消费异常原样传播。
     """
 
-    density_rows = json.loads((DATA_ROOT / "pdf-textlayers.json").read_text(encoding="utf-8"))
+    density_rows = cast("list[DensityRow]", json.loads((DATA_ROOT / "pdf-textlayers.json").read_text(encoding="utf-8")))
     layer_map = {row["stem"]: row for row in density_rows}
-    summary_map: dict[str, dict] = {}
+    summary_map: dict[str, SampleSummary] = {}
     for result_path in (DATA_ROOT / "results").glob("*.json"):
-        summary = json.loads(result_path.read_text(encoding="utf-8"))
+        summary = cast("SchemaSummary", json.loads(result_path.read_text(encoding="utf-8")))
         if "error" in summary or "new_counts" not in summary:
             continue
-        texts_delta = summary["new_counts"]["texts"] - summary["base_counts"]["texts"]
-        summary_map[summary["stem"]] = {**summary, "texts_delta": texts_delta}
+        # 此视图声明原下标读取所需字段，不验证内容；缺字段仍由原读取抛错。
+        count_view = cast("SampleSummary", summary)
+        texts_delta = count_view["new_counts"]["texts"] - count_view["base_counts"]["texts"]
+        summary_map[summary["stem"]] = cast("SampleSummary", {**summary, "texts_delta": texts_delta})
     return layer_map, summary_map
 
 
 def main() -> int:
     """生成清单并写 JSON。
 
+    :param: 无显式参数；从命令行读取既有参数。
     :returns: 成功返回 0。
     :raises Exception: 不主动抛出。
     """

@@ -17,6 +17,10 @@ import argparse
 import json
 import re
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from utils.build_semantic_digests import CompleteDigestResult
 
 DATA_ROOT = Path(__file__).resolve().parents[1] / "workspace/tmp/docling-regression"
 DIGEST_ROOT = DATA_ROOT / "digests"
@@ -38,13 +42,13 @@ def _is_financial_number(token: str) -> bool:
     return "," in body or "." in body or len(body) > 2
 
 
-def _token_block_evidence(digest: dict, token: str) -> list[str]:
+def _token_block_evidence(digest: CompleteDigestResult, token: str) -> list[str]:
     """返回 token 在 diff_blocks 中的证据行列表。
 
-    :param digest: digest dict。
+    :param digest: 生产者写出的摘要字段视图；类型声明不验证 JSON。
     :param token: 待追踪 token。
     :returns: 证据描述列表。
-    :raises Exception: 不主动抛出异常。
+    :raises KeyError, TypeError: 原字段读取或统计运算异常原样传播。
     """
 
     evidence: list[str] = []
@@ -62,6 +66,7 @@ def _token_block_evidence(digest: dict, token: str) -> list[str]:
 def main() -> int:
     """追踪 missing token 并分类。
 
+    :param: 无显式参数；从命令行读取既有参数。
     :returns: 成功返回 0。
     :raises Exception: 不主动抛出异常。
     """
@@ -71,7 +76,7 @@ def main() -> int:
     args = parser.parse_args()
 
     for stem in args.stems:
-        digest = json.loads((DIGEST_ROOT / f"{stem}.json").read_text(encoding="utf-8"))
+        digest = cast("CompleteDigestResult", json.loads((DIGEST_ROOT / f"{stem}.json").read_text(encoding="utf-8")))
         numbers = digest["numbers"]
         missing = numbers["missing_merged"]
         print(f"\n{'=' * 100}\nSTEM {stem}")

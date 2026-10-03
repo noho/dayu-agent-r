@@ -100,15 +100,26 @@ class DigestDocument(TypedDict):
     tables: NotRequired[list[DigestTable] | None]
 
 
-class DiffBlock(TypedDict):
-    """原始 diff 摘要字段。"""
+class DiffBlockContent(TypedDict):
+    """所有差异块由生产者写出的公共文本与长度字段。"""
 
     tag: str
     base_snippet: str
     new_snippet: str
     base_len: int
     new_len: int
+
+
+class DiffBlock(DiffBlockContent):
+    """任意差异块；仅 delete 块由生产者补入表格命中率。"""
+
     moved_to_table_ratio: NotRequired[float | None]
+
+
+class DeleteDiffBlock(DiffBlockContent):
+    """delete 块的既有字段视图；命中率必写，无数字时为 None。"""
+
+    moved_to_table_ratio: float | None
 
 
 class NumberTotals(TypedDict):
@@ -179,6 +190,23 @@ class DigestResult(TypedDict, total=False):
 
     stem: Required[str]
     error: str
+    closed_json: bool
+    text_lens: TextLens
+    diff_blocks: list[DiffBlock]
+    numbers: NumberDiff
+    tables: PairedTableSummary
+    headings: HeadingSummary
+    order: OrderSummary
+
+
+class CompleteDigestResult(TypedDict):
+    """成功完成摘要的消费契约；字段源于 _build_one 的原成功路径。
+
+    DigestResult 保留构建中及异常前的部分字段形状；此视图仅供原本就
+    下标读取完成摘要的消费者声明输入，不实施运行时完整性校验。
+    """
+
+    stem: str
     closed_json: bool
     text_lens: TextLens
     diff_blocks: list[DiffBlock]

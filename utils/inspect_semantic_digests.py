@@ -15,6 +15,10 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from utils.build_semantic_digests import CompleteDigestResult
 
 DATA_ROOT = Path(__file__).resolve().parents[1] / "workspace/tmp/docling-regression"
 DIGEST_ROOT = DATA_ROOT / "digests"
@@ -46,13 +50,13 @@ def _pair_missing_with_added(missing: list[str], added: list[str]) -> tuple[list
     return paired, unpaired
 
 
-def _print_diff_blocks(digest: dict, snippet_chars: int) -> None:
+def _print_diff_blocks(digest: CompleteDigestResult, snippet_chars: int) -> None:
     """打印 diff_blocks 摘要。
 
-    :param digest: digest dict。
+    :param digest: 生产者写出的摘要字段视图；类型声明不验证 JSON。
     :param snippet_chars: 每块片段裁剪字符数。
     :returns: 无。
-    :raises Exception: 不主动抛出异常。
+    :raises KeyError, TypeError: 原字段读取或统计运算异常原样传播。
     """
 
     print(f"\n--- diff_blocks（{len(digest['diff_blocks'])} 块） ---")
@@ -67,12 +71,12 @@ def _print_diff_blocks(digest: dict, snippet_chars: int) -> None:
         print(f"  new : {block['new_snippet'][:snippet_chars]!r}")
 
 
-def _print_numbers(digest: dict) -> None:
+def _print_numbers(digest: CompleteDigestResult) -> None:
     """打印数字保真指标与变形配对结果。
 
-    :param digest: digest dict。
+    :param digest: 生产者写出的摘要字段视图；类型声明不验证 JSON。
     :returns: 无。
-    :raises Exception: 不主动抛出异常。
+    :raises KeyError, TypeError: 原字段读取或统计运算异常原样传播。
     """
 
     numbers = digest["numbers"]
@@ -89,12 +93,12 @@ def _print_numbers(digest: dict) -> None:
     print(f"missing 中未配对({len(unpaired)}) = {unpaired}")
 
 
-def _print_structure(digest: dict) -> None:
+def _print_structure(digest: CompleteDigestResult) -> None:
     """打印表格与阅读顺序对比。
 
-    :param digest: digest dict。
+    :param digest: 生产者写出的摘要字段视图；类型声明不验证 JSON。
     :returns: 无。
-    :raises Exception: 不主动抛出异常。
+    :raises KeyError, TypeError: 原字段读取或统计运算异常原样传播。
     """
 
     tables = digest["tables"]
@@ -114,6 +118,7 @@ def _print_structure(digest: dict) -> None:
 def main() -> int:
     """详读指定样本并打印判定证据。
 
+    :param: 无显式参数；从命令行读取既有参数。
     :returns: 成功返回 0。
     :raises Exception: 不主动抛出异常。
     """
@@ -125,7 +130,7 @@ def main() -> int:
     args = parser.parse_args()
 
     for stem in args.stems:
-        digest = json.loads((DIGEST_ROOT / f"{stem}.json").read_text(encoding="utf-8"))
+        digest = cast("CompleteDigestResult", json.loads((DIGEST_ROOT / f"{stem}.json").read_text(encoding="utf-8")))
         print(f"\n{'=' * 100}\nSTEM {stem}")
         _print_numbers(digest)
         if not args.no_blocks:

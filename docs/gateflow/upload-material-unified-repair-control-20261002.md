@@ -37,7 +37,7 @@
 ## 当前 gate / 下一入口
 
 - goal confirmation：沿用户已明确批准范围及最新排程纠正确认；本文件固定边界。
-- current gate / next entry：accepted deepreview commit（aggregate双复审/总控pass，实际checkpoint尚待创建；随后ready-to-open-draft-PR→普通push→复用已有draftPR197→正式PRreview）。S1/S2/S3已accepted，四aggregatefinding已修复，MiMo31tests/6docs与DS ZIP尾/dayu README实际缺口均闭合，详 aggregate-final-root-adjudication-20261003.md。main不动，CLI/registry在修复WU后独立。
+- current gate / next entry：accepted PR review commit；正式完整main...44双审及491delta双复审均已ended outer0/root核收，UPR-R01/R02已修，MiMo未来访问假设finding rejected-with-reason。详见formal-pr-final-root-adjudication与findings register。fullpyright0/生产source88同hash；当前remote44还未含localfix，继续普通commit/push/readback→draft-PR-pass→finalcloseout，后独立完整CLI/registry。
 
 - planreview 必须挑战切片成本、机械拆分、可合并性与 future-slice 漂移；默认避免超过 3 slices，超过须直接理由。
 - 所有成立新修复即时写 artifact/控制表；accepted finding 必须已修并经复审才通过。普通 gate 通过后继续固定顺序，不因 gate 完成停机。

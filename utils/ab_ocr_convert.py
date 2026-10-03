@@ -23,6 +23,10 @@ import re
 import time
 from collections import Counter
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from docling_core.types.doc.document import DoclingDocument
 
 NUMBER_TOKEN_PATTERN = re.compile(r"-?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?%?")
 
@@ -56,20 +60,19 @@ def _extract_number_counter(text: str) -> Counter[str]:
     return Counter(NUMBER_TOKEN_PATTERN.findall(text))
 
 
-def _extract_full_text(document: object) -> str:
+def _extract_full_text(document: DoclingDocument) -> str:
     """按阅读顺序拼接文档全部 TextItem 文本。
 
     :param document: DoclingDocument 实例。
     :returns: 换行分隔的全文。
-    :raises Exception: 文档不支持 iterate_items 时由调用方处理。
+    :raises Exception: 文档迭代时发生的异常原样传播。
     """
 
     from docling_core.types.doc.items.text import TextItem
 
     # docling-core 2.96 起 iterate_items 产出 (item, level) 二元组。
-    iterate_items = getattr(document, "iterate_items")
     parts: list[str] = []
-    for item, _level in iterate_items():
+    for item, _level in document.iterate_items():
         if isinstance(item, TextItem):
             parts.append(item.text)
     return "\n".join(parts)
@@ -78,6 +81,7 @@ def _extract_full_text(document: object) -> str:
 def main() -> int:
     """执行单臂转换并写出 JSON 产物。
 
+    :param: 无显式参数；从命令行读取既有参数。
     :returns: 成功返回 0，失败返回 1。
     :raises Exception: 不主动抛出，失败以退出码呈现。
     """

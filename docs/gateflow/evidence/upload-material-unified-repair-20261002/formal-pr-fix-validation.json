@@ -1,0 +1,59 @@
+{
+  "outer_exit": 0,
+  "events": 80,
+  "commands": 32,
+  "nonzero_commands": [
+    {
+      "event": 38,
+      "id": "item_16",
+      "exit_code": 1,
+      "command": "/bin/zsh -c 'source .venv/bin/activate && python -B workspace/tmp/upload-material-unified-formal-pr-fix-sol-20261003-01/run_pyright.py'",
+      "output": "{\"pid\": 4925, \"exit_code\": 1, \"duration_s\": 36.904090881347656}\n"
+    }
+  ],
+  "turn_completed": true,
+  "canary_match": true,
+  "report": "docs/gateflow/upload-material-unified-formal-pr-fix-report-20261003.md",
+  "report_sha256": "e606862bb344920668dea186a5ed8778341b00b51826fc753a13f9fa48659b18",
+  "source_before": {
+    "utils/ab_ocr_convert.py": "d7909e7747b3cb320e0861ef9d34b542a2c75c6a0934a015c66552c14531e548",
+    "utils/build_semantic_sample_list.py": "52a4d07685cda080f61aa1522625a3d2b808d1bb665403b42bd10d63fbc286c1",
+    "utils/diagnose_semantic_digests.py": "b83ab4dd92c95999def70c0cd40835909b741fa4268e82bbc5884850f8af2838",
+    "utils/inspect_semantic_digests.py": "a830586aabd089618cfc7a387db1a7dc39e1915e9fb40f1e28079e3637f67400",
+    "utils/pptx_docx_smoke.py": "f3812c3c78eef42aa6a4c19db802479886b8b9755afefde4d708d81936785fcb",
+    "utils/trace_missing_tokens.py": "65231901d1817250a3786e36d361c3f76c6f009aa4f9e0886529d87a38726bc0",
+    "utils/build_semantic_digests.py": "9b5da92e8713cebdf5b2d3d3a47ee03d19792c6e5d22759784874b18d11a681e",
+    "utils/docling_schema_regression.py": "77481e460c2cc17586b1997921c8b450e42c48055eea7277e49e4592e4b47878"
+  },
+  "source_after": {
+    "utils/ab_ocr_convert.py": "db242df55627857d8c0dbfa83ca37c256b62c287ca848fc75f54408c062c8d2c",
+    "utils/build_semantic_sample_list.py": "10cb39f31b46a38e9cc3678203d373702f12105bf24c0fbb9a46de92025f6ed3",
+    "utils/diagnose_semantic_digests.py": "03f2bb69e4043e7e16efcd6161f42f16e12aa4579e20c3a841f2209393cb333c",
+    "utils/inspect_semantic_digests.py": "10e84931201d57759e0bf3366ca32fff9d22e0a8cae1e86efb72e5e6af7d48fc",
+    "utils/pptx_docx_smoke.py": "92be59a3f774ddef12434f35707ce74268ddc806bacb7a1ab705ef89d6d533c4",
+    "utils/trace_missing_tokens.py": "3f611fd22de030df2b024434daf2820a88062e28833fafda6868911f80ea8c27",
+    "utils/build_semantic_digests.py": "636d9fb60f4121623ac9745668df6fe803542fa7f6702293c62d6097b31186b0",
+    "utils/docling_schema_regression.py": "77481e460c2cc17586b1997921c8b450e42c48055eea7277e49e4592e4b47878"
+  },
+  "protected_count": 9382,
+  "protected_drift": 0,
+  "pyright_receipts": [
+    {
+      "path": "workspace/tmp/upload-material-unified-formal-pr-fix-sol-20261003-01/pyright-receipt.json",
+      "sha256": "7888a04155d2628c148e8a0832931e90ac4da98ce2846e9bfcca1c86ff4c1117",
+      "pid": 4925,
+      "actual_exit": 1
+    },
+    {
+      "path": "workspace/tmp/upload-material-unified-formal-pr-fix-sol-20261003-01/attempt-02/pyright-receipt.json",
+      "sha256": "1275991ad1f04b918925aa61b32ea0974bf78e5021cf4ebcc6f01aa85e013729",
+      "pid": 4979,
+      "actual_exit": 0
+    }
+  ],
+  "backups": [
+    "workspace/evidence/sub-agents/upload-material-unified-formal-pr-fix-sol-20261003-01",
+    "output/evidence-backup/sub-agents/upload-material-unified-formal-pr-fix-sol-20261003-01"
+  ],
+  "status": "implementation evidence accepted; same-source delta re-review pending"
+}

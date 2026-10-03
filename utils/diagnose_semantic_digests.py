@@ -26,6 +26,10 @@ import json
 import re
 from difflib import SequenceMatcher
 from pathlib import Path
+from typing import TYPE_CHECKING, TypedDict, cast
+
+if TYPE_CHECKING:
+    from utils.build_semantic_digests import CompleteDigestResult, DeleteDiffBlock, DigestManifest
 
 DATA_ROOT = Path(__file__).resolve().parents[1] / "workspace/tmp/docling-regression"
 YEAR_PATTERN = re.compile(r"^(19|20)\d{2}$")
@@ -62,12 +66,41 @@ def _order_similarity(new_order: list[str], base_order: list[str]) -> float:
     return SequenceMatcher(None, base_order, new_order).ratio()
 
 
-def _diagnose_one(digest: dict) -> dict:
+class DiagnosticRow(TypedDict):
+    """单份摘要产生并供可疑度评分与 TSV 输出共用的诊断指标。"""
+
+    stem: str
+    missing_n: int
+    missing_fin_n: int
+    missing_fin: list[str]
+    added_n: int
+    added_fin_n: int
+    merged_delta: int
+    texts_delta: int
+    tbl_count_delta: int
+    tbl_rows_delta: int
+    grid_max_delta: int
+    heading_delta: int
+    heading_new_count: int
+    heading_base_count: int
+    del_blocks: int
+    del_len: int
+    del_low_moved_n: int
+    del_low_moved_len: int
+    del_no_token_n: int
+    ins_blocks: int
+    ins_len: int
+    repl_blocks: int
+    textlen_delta: int
+    order_sim: float
+
+
+def _diagnose_one(digest: CompleteDigestResult) -> DiagnosticRow:
     """对单份 digest 抽取诊断指标。
 
-    :param digest: digest dict。
-    :returns: 诊断指标 dict。
-    :raises Exception: 不主动抛出异常。
+    :param digest: 生产者写出的摘要字段视图；类型声明不验证 JSON。
+    :returns: 本函数产生的完整诊断指标。
+    :raises KeyError, TypeError: 原字段读取或统计运算异常原样传播。
     """
 
     numbers = digest["numbers"]
@@ -82,13 +115,14 @@ def _diagnose_one(digest: dict) -> dict:
     new_max_area = (new_grids[0]["rows"] * new_grids[0]["cols"]) if new_grids else 0
     base_max_area = (base_grids[0]["rows"] * base_grids[0]["cols"]) if base_grids else 0
 
-    del_blocks = [b for b in digest["diff_blocks"] if b["tag"] == "delete"]
+    del_blocks = [cast("DeleteDiffBlock", b) for b in digest["diff_blocks"] if b["tag"] == "delete"]
     ins_blocks = [b for b in digest["diff_blocks"] if b["tag"] == "insert"]
     repl_blocks = [b for b in digest["diff_blocks"] if b["tag"] == "replace"]
+    # 保留原 get 与下标两次读取；cast 仅声明前置非空判断，不转换或验证值。
     low_moved = [
         b
         for b in del_blocks
-        if b.get("moved_to_table_ratio") is not None and b["moved_to_table_ratio"] < 0.5
+        if b.get("moved_to_table_ratio") is not None and cast(float, b["moved_to_table_ratio"]) < 0.5
     ]
     no_token_del = [b for b in del_blocks if b.get("moved_to_table_ratio") is None]
 
@@ -121,12 +155,12 @@ def _diagnose_one(digest: dict) -> dict:
     }
 
 
-def _suspect_score(row: dict) -> tuple[float, list[str]]:
+def _suspect_score(row: DiagnosticRow) -> tuple[float, list[str]]:
     """计算可疑度（降序）与命中规则说明。
 
-    :param row: 诊断指标 dict。
+    :param row: _diagnose_one 产生的完整诊断指标。
     :returns: (可疑度, 命中规则说明)。
-    :raises Exception: 不主动抛出异常。
+    :raises KeyError, TypeError: 原字段读取或统计运算异常原样传播。
     """
 
     score = 0.0
@@ -161,6 +195,7 @@ def _suspect_score(row: dict) -> tuple[float, list[str]]:
 def main() -> int:
     """全量分诊并输出 TSV 与可疑排序。
 
+    :param: 无显式参数；从命令行读取既有参数。
     :returns: 成功返回 0。
     :raises Exception: 不主动抛出。
     """
@@ -181,13 +216,13 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    manifest = json.loads((DATA_ROOT / "digests" / "_manifest.json").read_text(encoding="utf-8"))
+    manifest = cast("DigestManifest", json.loads((DATA_ROOT / "digests" / "_manifest.json").read_text(encoding="utf-8")))
     stems = manifest["stems"]
     mine = stems[0::2] if args.parity == "odd" else stems[1::2]
     mine = [stem for stem in mine if stems.index(stem) >= args.from_index]
-    rows = []
+    rows: list[DiagnosticRow] = []
     for stem in mine:
-        digest = json.loads((DATA_ROOT / "digests" / f"{stem}.json").read_text(encoding="utf-8"))
+        digest = cast("CompleteDigestResult", json.loads((DATA_ROOT / "digests" / f"{stem}.json").read_text(encoding="utf-8")))
         rows.append(_diagnose_one(digest))
 
     scored = [(row, *_suspect_score(row)) for row in rows]

@@ -29,6 +29,10 @@ import json
 import re
 from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from utils.build_semantic_digests import DigestDocument, DigestTable
 
 SENTINEL_NUMBERS: tuple[str, ...] = (
     "1234.56",
@@ -248,12 +252,12 @@ BUILDERS: tuple[tuple[str, Callable[[Path], set[str]]], ...] = (
 )
 
 
-def _table_cells_text(tables: list[dict]) -> str:
+def _table_cells_text(tables: list[DigestTable]) -> str:
     """拼接 tables 全部单元格文本。
 
     :param tables: exported tables 列表。
     :returns: 换行分隔的单元格文本。
-    :raises Exception: 不主动抛出异常。
+    :raises KeyError, TypeError: 原字段读取或统计运算异常原样传播。
     """
 
     parts: list[str] = []
@@ -264,12 +268,12 @@ def _table_cells_text(tables: list[dict]) -> str:
     return "\n".join(parts)
 
 
-def _merged_number_set(exported: dict) -> set[str]:
+def _merged_number_set(exported: DigestDocument) -> set[str]:
     """计算 merged 数字口径集合（texts ∪ table_cells）。
 
     :param exported: export_to_dict 输出。
     :returns: 数字 token 集合。
-    :raises Exception: 不主动抛出异常。
+    :raises KeyError, TypeError: 原字段读取或统计运算异常原样传播。
     """
 
     text = "\n".join(str(item.get("text", "")) for item in (exported.get("texts") or []))
@@ -280,6 +284,7 @@ def _merged_number_set(exported: dict) -> set[str]:
 def main() -> int:
     """生成样本、转换并判定，输出汇总 JSON。
 
+    :param: 无显式参数；从命令行读取既有参数。
     :returns: 全部通过返回 0，任一判定失败返回 1。
     :raises Exception: 不主动抛出。
     """
@@ -322,7 +327,7 @@ def main() -> int:
             entry["pictures"] = len(exported.get("pictures") or [])
             embedded = embedded_map[filename]
             if embedded:
-                numbers = _merged_number_set(exported)
+                numbers = _merged_number_set(cast("DigestDocument", exported))
                 missing_sentinels = [token for token in embedded if token not in numbers]
                 entry["sentinel_hit_rate"] = round(
                     (len(embedded) - len(missing_sentinels)) / len(embedded), 3
