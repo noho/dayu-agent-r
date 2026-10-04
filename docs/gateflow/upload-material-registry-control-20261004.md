@@ -77,3 +77,7 @@ accepted S1 commit 238b28980dcbdebc4b44005d75003f00a4a719da，29文件精确stag
 ## aggregate deepreview loop 总控通过
 
 双复审58181/95625实际0，root完整审计与双保、8项最终已修，aggregate-review-acceptance及bounded aggregate-review-proof已写。186/type0/批准-m strict0最终源保持；当前gate=accepted deepreview commit，下一入口ready-to-open-draft-PR→push→核既有draft197→正式PR review→accepted checkpoint/finalpush→draft-PR-pass→final closeout。普通gate通过继续，main/业务裁决/产品不变。
+
+## 正式PR197双审总控通过
+
+head3f44c82a/basefac 精确完整1163路径，MiMo30185/DS95628 actual0，root核43/82tools、来源/CANARY、失败恢复、最新GHclosing和双保。无新materialfinding，8项状态全已修；正式pr-review-acceptance/boundedpr-review-proof已写。当前gate=accepted PR review commit，next normalfinalpush→draft-PR-pass→finalcloseout；currentWU非issue，无新comment授权需求。main不动，产品同bytes/现成用户裁决不变。

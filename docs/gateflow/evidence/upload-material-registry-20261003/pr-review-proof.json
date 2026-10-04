@@ -1,0 +1,498 @@
+{
+  "gate": "PR review",
+  "created": "2026-10-04T16:02:06.027118+08:00",
+  "root_decision": "pass; no new material findings; no required fix/re-review",
+  "reviewed_target": {
+    "repository": "noho/dayu-agent-r",
+    "head_repository": "noho/dayu-agent-r",
+    "PR": 197,
+    "URL": "https://github.com/noho/dayu-agent-r/pull/197",
+    "head": "3f44c82a6a0e6aafde28cf7d919c51c884212979",
+    "base": "fac32ecbff9bfe792b63ee9667c8697826b631f4",
+    "compare_url": "repos/noho/dayu-agent-r/compare/fac32ecbff9bfe792b63ee9667c8697826b631f4...3f44c82a6a0e6aafde28cf7d919c51c884212979",
+    "diff_snapshot": "workspace/tmp/upload-material-registry-20261003/formal-pr-review-01/full-pr-diff.stdout",
+    "diff_sha256": "38089586a4c3fc33d7187945ca2c10330ba38353106274dd0670f7aef7dddee5",
+    "diff_bytes": 32930177
+  },
+  "frozen_manifest": {
+    "path": "workspace/tmp/upload-material-registry-20261003/formal-pr-review-01/manifest.json",
+    "sha256": "5ec8ec9f9d4869d5187e8b4a3f44a246f4691ffb1f6aab17db3982825d4daca9"
+  },
+  "complete_path_counts": {
+    "total": 1163,
+    "exact_previous_PR_inheritance": 1112,
+    "exact_registry_aggregate_code_inheritance": 35,
+    "fresh_governance": 16
+  },
+  "coverage": "all1163status/head/base identity; new51 sourceSHA/bytes and precise35 acceptedfinal inheritance; whole16 fresh gov collectively root/peers full read and currentowner callchain; historical875narratives remain partial, not allrepositoryexhaustive",
+  "current_validation": {
+    "cases": 186,
+    "pyright_errors": 0,
+    "strict_actual_exit": 0,
+    "strict_whole_sha": "196d933a99a8503a5cf6ae9550114fdcc0dd3d5b41d8cf4f32a9c435595ad532",
+    "actual_executions": [
+      {
+        "name": "pytest-recovered",
+        "argv": [
+          "/Users/leo/workspace/dayu-agent-r/.venv/bin/python",
+          "-m",
+          "pytest",
+          "tests/cli/test_cli_ci_upload_material_registry.py",
+          "tests/cli/test_cli_ci_run_observation.py",
+          "-q"
+        ],
+        "cwd": "/Users/leo/workspace/dayu-agent-r",
+        "actual_wait": true,
+        "actual_exit": 0,
+        "stdout": {
+          "path": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-registry-20261003/aggregate-fix-sol-01/pytest-recovered.stdout",
+          "bytes": 271,
+          "sha256": "27b7ace8b4a269962e0bcd0dc8f7604202dc4c6ff0234d261a8dc5322446df04"
+        },
+        "stderr": {
+          "path": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-registry-20261003/aggregate-fix-sol-01/pytest-recovered.stderr",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      {
+        "name": "pyright",
+        "argv": [
+          "pyright"
+        ],
+        "cwd": "/Users/leo/workspace/dayu-agent-r",
+        "actual_wait": true,
+        "actual_exit": 0,
+        "stdout": {
+          "path": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-registry-20261003/aggregate-fix-sol-01/pyright.stdout",
+          "bytes": 191,
+          "sha256": "46a6c7834c9080ada23a415afd925abecc37d531f5c6e3d14ad0a7ff579096cb"
+        },
+        "stderr": {
+          "path": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-registry-20261003/aggregate-fix-sol-01/pyright.stderr",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      {
+        "name": "strict",
+        "argv": [
+          "/Users/leo/workspace/dayu-agent-r/.venv/bin/python",
+          "-m",
+          "utils.cli_ci_upload_material_registry",
+          "--oracle-registry",
+          "docs/cli_ci_oracles.json",
+          "--scenario-registry",
+          "docs/cli_ci_scenarios.json",
+          "--authority-index",
+          "docs/gateflow/evidence/upload-material-registry-20261003/authority-index.json",
+          "--assignment",
+          "docs/gateflow/evidence/upload-material-registry-20261003/mandatory-assignment.json",
+          "--before-oracles",
+          "workspace/tmp/upload-material-unified-repair-20261002/post-wu-preparation/cli_ci_oracles.json.before",
+          "--before-scenarios",
+          "workspace/tmp/upload-material-unified-repair-20261002/post-wu-preparation/cli_ci_scenarios.json.before",
+          "--evidence-root",
+          "workspace/evidence/upload-material-cli-20261003-79977b3a-01/public",
+          "--backup-root",
+          "output/evidence-backup/upload-material-cli-20261003-79977b3a-01/public",
+          "--focused-evidence-root",
+          "workspace/evidence/upload-material-diagnostics-focused04-22eca6c3-01/public",
+          "--focused-backup-root",
+          "output/evidence-backup/upload-material-diagnostics-focused04-22eca6c3-01/public",
+          "--focused-source",
+          "docs/gateflow/evidence/upload-material-registry-20261003/focused-source.json",
+          "--source-root",
+          "/Users/leo/workspace/dayu-agent-r",
+          "--registration-target",
+          "22eca6c313005e3c5185340f2d6b535ab2583056",
+          "--check",
+          "--output",
+          "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-registry-20261003/aggregate-fix-sol-01/strict-result.json"
+        ],
+        "cwd": "/Users/leo/workspace/dayu-agent-r",
+        "actual_wait": true,
+        "actual_exit": 0,
+        "stdout": {
+          "path": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-registry-20261003/aggregate-fix-sol-01/strict.stdout",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "stderr": {
+          "path": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-registry-20261003/aggregate-fix-sol-01/strict.stderr",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "output": {
+          "path": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-registry-20261003/aggregate-fix-sol-01/strict-result.json",
+          "bytes": 129672,
+          "sha256": "196d933a99a8503a5cf6ae9550114fdcc0dd3d5b41d8cf4f32a9c435595ad532"
+        }
+      }
+    ]
+  },
+  "candidate_files": [
+    {
+      "path": "docs/cli_ci.md",
+      "bytes": 156772,
+      "sha256": "063fd969333ce628c1a0377c3f43b4a1df0d597cbf10f96ec4a5cec034a3a32b",
+      "before_sha256": "063fd969333ce628c1a0377c3f43b4a1df0d597cbf10f96ec4a5cec034a3a32b",
+      "changed": false
+    },
+    {
+      "path": "docs/cli_ci_oracles.json",
+      "bytes": 296547,
+      "sha256": "07523ad680e591c8c78a28378286ed718228798376e3366409ab811d592df64b",
+      "before_sha256": "07523ad680e591c8c78a28378286ed718228798376e3366409ab811d592df64b",
+      "changed": false
+    },
+    {
+      "path": "docs/cli_ci_scenarios.json",
+      "bytes": 11500453,
+      "sha256": "46e1e989c49758bf9cab252250ea8e63d29029791703d0fd62143780bfa96c7e",
+      "before_sha256": "46e1e989c49758bf9cab252250ea8e63d29029791703d0fd62143780bfa96c7e",
+      "changed": false
+    },
+    {
+      "path": "docs/gateflow/evidence/upload-material-registry-20261003/authority-index.json",
+      "bytes": 30404,
+      "sha256": "382a35bc7fe77206f00b49415e1fdc97dffbe29167c4366a3e2adbd28e4df45f",
+      "before_sha256": "382a35bc7fe77206f00b49415e1fdc97dffbe29167c4366a3e2adbd28e4df45f",
+      "changed": false
+    },
+    {
+      "path": "docs/gateflow/evidence/upload-material-registry-20261003/focused-source.json",
+      "bytes": 14667,
+      "sha256": "df57b9608886f8b1af3259f3cabbee7f7e40aa3f4228c278e97c661e1ee29c13",
+      "before_sha256": "df57b9608886f8b1af3259f3cabbee7f7e40aa3f4228c278e97c661e1ee29c13",
+      "changed": false
+    },
+    {
+      "path": "docs/gateflow/evidence/upload-material-registry-20261003/mandatory-assignment.json",
+      "bytes": 6289801,
+      "sha256": "27c710e86cbca486e89fdbb3559894b6ef3ce17e9c19d358ea11956d218c0a57",
+      "before_sha256": "27c710e86cbca486e89fdbb3559894b6ef3ce17e9c19d358ea11956d218c0a57",
+      "changed": false
+    },
+    {
+      "path": "docs/gateflow/evidence/upload-material-registry-20261003/readiness-proof.json",
+      "bytes": 129672,
+      "sha256": "196d933a99a8503a5cf6ae9550114fdcc0dd3d5b41d8cf4f32a9c435595ad532",
+      "before_sha256": "196d933a99a8503a5cf6ae9550114fdcc0dd3d5b41d8cf4f32a9c435595ad532",
+      "changed": false
+    },
+    {
+      "path": "docs/gateflow/evidence/upload-material-registry-20261003/retention-receipt.json",
+      "bytes": 559,
+      "sha256": "785f683849143b82cb6b07f916a36a3fad27f886f8e392711185040ecde61eb0",
+      "before_sha256": "785f683849143b82cb6b07f916a36a3fad27f886f8e392711185040ecde61eb0",
+      "changed": false
+    },
+    {
+      "path": "docs/gateflow/evidence/upload-material-registry-20261003/review-target.json",
+      "bytes": 2141,
+      "sha256": "ad334bcbcb336a395ebf31c1b224c060233346d1f86a063be1f6705428f87260",
+      "before_sha256": "ad334bcbcb336a395ebf31c1b224c060233346d1f86a063be1f6705428f87260",
+      "changed": false
+    },
+    {
+      "path": "docs/gateflow/evidence/upload-material-registry-20261003/validation.json",
+      "bytes": 34276,
+      "sha256": "56ad05393ffb9d9b5d12c9ffc91f106053d7c5edc044ca30250c851179408481",
+      "before_sha256": "56ad05393ffb9d9b5d12c9ffc91f106053d7c5edc044ca30250c851179408481",
+      "changed": false
+    },
+    {
+      "path": "docs/gateflow/upload-material-registry-implementation-20261004.md",
+      "bytes": 10007,
+      "sha256": "d99f966ab3d211a4fab5ff9a0d48448759a0414e65356662e61e733487067082",
+      "before_sha256": "d99f966ab3d211a4fab5ff9a0d48448759a0414e65356662e61e733487067082",
+      "changed": false
+    },
+    {
+      "path": "tests/README.md",
+      "bytes": 135693,
+      "sha256": "33490aebe3caf5c1579ec349263c756034414bc103b3d2f33af79ae65536a7d3",
+      "before_sha256": "33490aebe3caf5c1579ec349263c756034414bc103b3d2f33af79ae65536a7d3",
+      "changed": false
+    },
+    {
+      "path": "tests/cli/test_cli_ci_upload_material_registry.py",
+      "bytes": 50777,
+      "sha256": "1fc88191841ec6419b8fb58d43d60f38842e727ffbe6fe9f8f73a916cf1c2aec",
+      "before_sha256": "d319194d929d2f67c3d654ada27af04b86a630c5ada25a987ee698554396b5bc",
+      "changed": true
+    },
+    {
+      "path": "utils/cli_ci_upload_material_registry.py",
+      "bytes": 75632,
+      "sha256": "23cb69c240815114cd4475ee6a0b104dd2bf7587d4fc7823ae51b54a5e17b348",
+      "before_sha256": "153fe8f1a81f39c837b3b847ac583ed74969113cad89816274c24b9646e3cf2c",
+      "changed": true
+    }
+  ],
+  "historical_validation": {
+    "code_review_180": {
+      "path": "docs/gateflow/evidence/upload-material-registry-20261003/code-review-proof.json",
+      "bytes": 15620,
+      "sha256": "874ca76bcb57bc2b704100f130cd732d33bfbcb654a4ddf0913515f38fa4864f"
+    },
+    "bounded166": {
+      "path": "docs/gateflow/evidence/upload-material-registry-20261003/validation.json",
+      "bytes": 34276,
+      "sha256": "56ad05393ffb9d9b5d12c9ffc91f106053d7c5edc044ca30250c851179408481"
+    },
+    "meaning": "historical versions retained unchanged; current186 binds final helper/tests SHA, not a new product CI run"
+  },
+  "finding_final_states": {
+    "REG-C01": "已修复",
+    "REG-C02": "已修复",
+    "REG-C03": "已修复",
+    "REG-C04": "已修复",
+    "REG-R01": "已修复",
+    "REG-R02": "已修复",
+    "REG-R03": "已修复",
+    "REG-AG01": "已修复"
+  },
+  "reviews": [
+    {
+      "report": {
+        "path": "docs/reviews/pr-197-review-20261004-155501.md",
+        "bytes": 10213,
+        "sha256": "5a81a3951caa3b159f84030538556b4d49fc0e12b2653daa7bb59499a25b9ac5",
+        "created": "system clock date +%Y%m%d-%H%M%S = 20261004-155501; python open('x') O_EXCL"
+      },
+      "controller_adjudication": {
+        "setup_status": "ok",
+        "agent_status": "completed",
+        "tool_evidence": "yes",
+        "tool_trace": "complete",
+        "required_evidence": "complete",
+        "canary_status": "match",
+        "result_status": "accepted",
+        "warnings": [
+          "named unrecognized_model stderr warning",
+          "280 GH TLS actual1;328 repeat actualcaptured1 masked outer echo0;389 authorized readonly outside-sandbox request captured0/openexact,1899/3447/3899 direct API closed exacthead/base restores mandatory facts. Actor maskedfalse claim narrowed",
+          "780/923 inherited source comparison retained pre-fix blob OIDs for helper/tests, reported2 oid-differs despite finalSHA already matching;1036 direct currenthead blobSHA vs final14 exact matches recovers required identity; not retained code discrepancy",
+          "Inner shells largely omit absolute cd; actual runnercwd and exactOIDgitshow/tree/fullpath/SHA establish target; protocol deviation",
+          "1898 creates $TMPDIR/helper_head.py outside designated ownscratch; actual source content from exact3f44 Git object and necessary chunks read; no product/source mutation. Full Git snapshot and trace independently preserved in archive; no deletion of that temporary original",
+          "Report aggregate proof28540B is Unicode character count mislabeled bytes; actual28706 bytes SHA b9b8e1a4 exact. Helper1047 includes trailing empty line, actual1046 source lines; neither alters input identity",
+          "Claim current entire worktreeclean not freshly verified at end: initial frozen statusclean, peer review artifact nowuntracked. Exact Git objectsource and no codechanges valid; narrowed to source clean, not fullworkspace"
+        ],
+        "evidence_gaps": [],
+        "retry_class": "none",
+        "actual_managed_exit": 0,
+        "managed_session": 30185,
+        "runtime": "claude",
+        "provider": "mimo",
+        "label": "upload-material-registry-pr-review-mimo-20261004-01",
+        "events": 3957,
+        "tools": 43,
+        "observable_model": [
+          "mimo-v2.6-pro"
+        ],
+        "structured_terminal": {
+          "subtype": "success",
+          "is_error": false,
+          "num_turns": 44,
+          "no_permission_denials": true
+        },
+        "instructions": {
+          "AGENTS": 129,
+          "deepreview": 430,
+          "gateflow": 344,
+          "full_Read_exact": true
+        },
+        "report": {
+          "path": "docs/reviews/pr-197-review-20261004-155501.md",
+          "bytes": 10213,
+          "sha256": "5a81a3951caa3b159f84030538556b4d49fc0e12b2653daa7bb59499a25b9ac5",
+          "created": "system clock date +%Y%m%d-%H%M%S = 20261004-155501; python open('x') O_EXCL"
+        },
+        "PR": {
+          "head": "3f44c82a6a0e6aafde28cf7d919c51c884212979",
+          "base": "fac32ecbff9bfe792b63ee9667c8697826b631f4",
+          "manifest_sha256": "5ec8ec9f9d4869d5187e8b4a3f44a246f4691ffb1f6aab17db3982825d4daca9",
+          "diff_sha256": "38089586a4c3fc33d7187945ca2c10330ba38353106274dd0670f7aef7dddee5",
+          "full_paths": 1163,
+          "precise_previous_PR_inheritance": 1112,
+          "registry_precise_inheritance": 35,
+          "fresh_paths": 16,
+          "actual_open_close_oid_exact": true
+        },
+        "finding_final_states": {
+          "REG-C01": "已修复",
+          "REG-C02": "已修复",
+          "REG-C03": "已修复",
+          "REG-C04": "已修复",
+          "REG-R01": "已修复",
+          "REG-R02": "已修复",
+          "REG-R03": "已修复",
+          "REG-AG01": "已修复"
+        },
+        "new_material_findings": [],
+        "root_scope": "root both exact code deltas/whole16 gov and bounded canonicalproof/validation review plus source hashes, full1163path/blob identity; peer actual43 calls and both closingGH facts checked; previous875historical narratives partial inherited, no allrepo exhaustive claim",
+        "gate_pass": false
+      },
+      "retention": {
+        "archives": [
+          "workspace/evidence/upload-material-post-ci-gate-runners-20261003/private/registry-pr-review-mimo-01.tar.gz",
+          "output/evidence-backup/upload-material-post-ci-gate-runners-20261003/private/registry-pr-review-mimo-01.tar.gz"
+        ],
+        "bytes": 8837641,
+        "sha256": "aa38c21768b04f8cb6dfaebef70bad9f14c3579d4baed7e280b14997723f7d15"
+      }
+    },
+    {
+      "report": {
+        "path": "docs/reviews/pr-197-review-20261004-154912.md",
+        "bytes": 14069,
+        "sha256": "377befe281c5a3bbeda1282851e59e9d27b5087fd14345e6d2040d05df192f5e"
+      },
+      "controller_adjudication": {
+        "setup_status": "ok",
+        "agent_status": "completed",
+        "tool_evidence": "yes",
+        "tool_trace": "complete",
+        "required_evidence": "complete",
+        "canary_status": "match",
+        "result_status": "accepted",
+        "warnings": [
+          "named unrecognized_model stderr warning; actual success terminal/local mandatory evidence complete",
+          "1925 GH TLS x509 OSStatus failure masked pipelinehead0;3125 authorized readonly outside-sandbox query actual captured exit0 restores open facts,42166 closes exacthead/base and bytes",
+          "22767/22769 guessed aggregatefresh files missing;23125/23127 correct hashverified delta-source recovered both needed sources",
+          "9804 verify_manifest wrong removed vs deleted logic printed spurious mismatch, tee masks0;48033 explicit actual script1 preserved;48158 corrected and48161 explicit actual0/full1163 identity0fail restores identity",
+          "27928 guessed Service-only field on focused row KeyError actual1;28464 type/field-specific projection read restored, not product field requirement",
+          "15529 inheritance via tee0 not measured script0;48033 captured actual inheritance0 / ALL CHECKS restores; no pipeline0 substituted",
+          "Most inner shells omit absolute cd despite prompt, actual runnercwd/pwd and completeblob/head identities establish target; protocol deviation recorded",
+          "16 fresh full wording overstated:15 actualfullRead and diagnostics pr-review-proof JSON only structural depth2 walk; root current full Read of this exact6538byte proof independently supplements necessary overall16 coverage",
+          "Report scenarios total2127 prose includes6 oldoracle in scenario math; canonical1328+799=2127, oracles6+1=7; actual JSON counts and independent scripts correct",
+          "Result tests858-line range inaccurate: actual tests735 lines, actual grep inventory/new22line diff only; whole test bytes/inherited final code audit precise, not freshfulltest coverage",
+          "Claim own pyright unused-var failure unsupported: no actual pyright tool/diagnostic in82 calls;42002 ownscript edit observed only, do not invent failed typecheck",
+          "Root first oversized toolflags output truncated; recovered all82 concise actualtools plus entire report/result and requiredsource/instruction/identity records"
+        ],
+        "evidence_gaps": [],
+        "retry_class": "none",
+        "actual_managed_exit": 0,
+        "managed_session": 95628,
+        "runtime": "claude",
+        "provider": "ds-flash",
+        "label": "upload-material-registry-pr-review-ds-flash-20261004-01",
+        "events": 50268,
+        "tools": 82,
+        "observable_model": [
+          "deepseek-flash"
+        ],
+        "structured_terminal": {
+          "subtype": "success",
+          "is_error": false,
+          "num_turns": 83,
+          "no_permission_denials": true
+        },
+        "instructions": {
+          "AGENTS": 129,
+          "deepreview": 430,
+          "gateflow": 344,
+          "full_Read_exact": true
+        },
+        "report": {
+          "path": "docs/reviews/pr-197-review-20261004-154912.md",
+          "bytes": 14069,
+          "sha256": "377befe281c5a3bbeda1282851e59e9d27b5087fd14345e6d2040d05df192f5e"
+        },
+        "PR": {
+          "head": "3f44c82a6a0e6aafde28cf7d919c51c884212979",
+          "base": "fac32ecbff9bfe792b63ee9667c8697826b631f4",
+          "manifest_sha256": "5ec8ec9f9d4869d5187e8b4a3f44a246f4691ffb1f6aab17db3982825d4daca9",
+          "diff_sha256": "38089586a4c3fc33d7187945ca2c10330ba38353106274dd0670f7aef7dddee5",
+          "full_paths": 1163,
+          "precise_previous_PR_inheritance": 1112,
+          "registry_precise_inheritance": 35,
+          "fresh_paths": 16,
+          "actual_open_close_oid_exact": true
+        },
+        "finding_final_states": {
+          "REG-C01": "已修复",
+          "REG-C02": "已修复",
+          "REG-C03": "已修复",
+          "REG-C04": "已修复",
+          "REG-R01": "已修复",
+          "REG-R02": "已修复",
+          "REG-R03": "已修复",
+          "REG-AG01": "已修复"
+        },
+        "new_material_findings": [],
+        "root_scope": "root full new aggregate deltas/call chain/source IDs plus all16 current governance full-read/own-generated proof and accepted sameSHA35; all1163blob identities and checked compare; no allrepositoryexhaustive or historic875full claim",
+        "gate_pass": false
+      },
+      "retention": {
+        "archives": [
+          "workspace/evidence/upload-material-post-ci-gate-runners-20261003/private/registry-pr-review-ds-flash-01.tar.gz",
+          "output/evidence-backup/upload-material-post-ci-gate-runners-20261003/private/registry-pr-review-ds-flash-01.tar.gz"
+        ],
+        "bytes": 10444256,
+        "sha256": "86e412d4d16f9d5e0294dcc7ce0894b9e47fc86aabbea995d983055d13f96245"
+      }
+    }
+  ],
+  "root_actual_closing": {
+    "facts": {
+      "baseRefName": "main",
+      "baseRefOid": "fac32ecbff9bfe792b63ee9667c8697826b631f4",
+      "headRefName": "codex/upload-material-oracle",
+      "headRefOid": "3f44c82a6a0e6aafde28cf7d919c51c884212979",
+      "isDraft": true,
+      "mergeStateStatus": "CLEAN",
+      "mergeable": "MERGEABLE",
+      "state": "OPEN",
+      "statusCheckRollup": [],
+      "url": "https://github.com/noho/dayu-agent-r/pull/197"
+    },
+    "execution": {
+      "argv": [
+        "gh",
+        "pr",
+        "view",
+        "197",
+        "--repo",
+        "noho/dayu-agent-r",
+        "--json",
+        "headRefOid,baseRefOid,headRefName,baseRefName,isDraft,state,mergeable,mergeStateStatus,statusCheckRollup,body,url"
+      ],
+      "cwd": "/Users/leo/workspace/dayu-agent-r",
+      "actual_wait": true,
+      "actual_exit": 0,
+      "stdout_sha256": "5dc6b269170ac19e340d9e56e2b55953d17490e95ef25d89c443beff7722c866",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  "checks": [],
+  "checks_meaning": "no GitHub checks reported; no GitHubCIgreen claim; sourcebound local validations and actualCLI evidence separate",
+  "issue_status": {
+    "current_WU": "independent registry WU not a new GitHub issue; link/comment N/A",
+    "original198": "Closes #198 retained; issue still OPEN awaiting usermerge; authorized oldcomment verified, no duplicate new comment",
+    "closeout_comment": "https://github.com/noho/dayu-agent-r/issues/198#issuecomment-5893424991"
+  },
+  "residuals": {
+    "fixed in current slice": [
+      "REG-C01",
+      "REG-C02",
+      "REG-C03",
+      "REG-C04",
+      "REG-R01",
+      "REG-R02",
+      "REG-R03"
+    ],
+    "covered by later approved slice": [],
+    "assigned to later work unit": [
+      "Linux/Windows XBRL deployment verification (user approved deferral)",
+      "CNInfo historical disclosure dates migration",
+      "deleted historical Raw gap and existing 22 residuals"
+    ],
+    "tracked by existing issue": [
+      "Docling extraction quality #4437"
+    ],
+    "requiring new issue or explicit user decision": []
+  },
+  "next_entry": "accepted PR review commit then final push/draft-PR-pass/final closeout"
+}
