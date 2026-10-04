@@ -1,0 +1,40 @@
+{
+  "outer_exit": 0,
+  "event_count": 41,
+  "command_count": 16,
+  "canary_tool_match": true,
+  "canary_final_match": true,
+  "stderr_size": 0,
+  "model": "unknown",
+  "hash_checks": {
+    "protected": {
+      "count": 12004,
+      "before_after_equal": true,
+      "current_mismatches": []
+    },
+    "source": {
+      "count": 18,
+      "before_after_equal": true,
+      "current_mismatches": []
+    },
+    "input": {
+      "count": 14,
+      "before_after_equal": true,
+      "current_mismatches": []
+    },
+    "scripts": {
+      "count": 6,
+      "before_after_equal": true,
+      "current_mismatches": []
+    },
+    "delivery": {
+      "count": 64,
+      "current_mismatches": []
+    }
+  },
+  "parent_probe_outer_exit": 1,
+  "collector_false_predicate": "P0-R09 accepted; conversion success is not OS file-read success",
+  "remaining_probe_outer_exit": 0,
+  "policy_sha256": "758f5bfb55382273bc33ff7e3fe60939f8fd7dbcb2cea38f86116a0f459d7e96",
+  "standard_product_install_and_cli": "pending S3 implementation"
+}

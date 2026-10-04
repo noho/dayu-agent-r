@@ -41,6 +41,7 @@ from dayu.fins.direct_events import (
     FINS_RESULT_EXIT_SUCCESS,
     FinsDownloadPublicDocument,
     FinsDownloadPublicSummary,
+    FinsDownloadFailureReason,
     FinsErrorKind,
     FinsEvent,
     FinsEventDetail,
@@ -52,6 +53,7 @@ from dayu.fins.direct_events import (
     FinsResultStatus,
     FinsResultSummary,
     canonicalize_fins_public_file_label,
+    canonicalize_fins_rejected_file_label,
 )
 from dayu.fins.direct_events import ValidatedFinsEventStream
 from dayu.fins.download_contract import (
@@ -66,9 +68,11 @@ from dayu.fins.download_contract import (
     FinsDownloadSource,
     FinsDownloadTerminalDisposition,
     FinsDownloadTransportCategory,
+    validate_download_json_summary,
 )
 from dayu.fins.direct_event_text import (
     direct_download_no_source_documents_message,
+    direct_download_uncertain_period_message,
     direct_failure_message,
     direct_preprocess_no_requested_documents_message,
     direct_progress_message,
@@ -114,11 +118,19 @@ from dayu.fins.storage import (
     FilingMaintenanceRepositoryProtocol,
     FilingUploadPublishedState,
     FilingUploadStateRepositoryProtocol,
+    MaterialUploadPublishedState,
+    MaterialUploadStateRepositoryProtocol,
     ProcessedDocumentRepositoryProtocol,
     SourceDocumentRepositoryProtocol,
+    SourceIntegrityPreflightError,
+    SourceIntegrityPreflightReason,
+    SourceIntegrityRevisionConflictError,
+    SourceIntegrityRepairRequiredError,
     SourceIntegrityStatus,
 )
 from dayu.fins.pipelines.docling_upload_service import (
+    MaterialUploadIdentity,
+    build_material_ids,
     UploadOverwritePrecondition,
     build_cn_filing_ids,
     build_sec_filing_ids,
@@ -137,12 +149,37 @@ from dayu.fins.upload_failure import (
     fins_upload_source_integrity_unsafe_failure,
     upload_failure_reason_from_json,
 )
+from dayu.fins.upload_asset_plan import (
+    UploadAssetPlan,
+    UploadPrimarySelectionFailure,
+    UploadPrimarySelectionError,
+    UploadPrimarySelectionPathError,
+    UploadPrimaryDeleteFailure,
+    project_upload_primary_selection,
+    FinsUploadAssetPlanError,
+    has_duplicate_upload_asset_paths,
+    normalize_upload_asset_path,
+    plan_upload_assets,
+    upload_asset_path_identity,
+)
+from dayu.fins.upload_usage_contract import (
+    FinsUploadUsageCode,
+    FinsUploadUsageError,
+    FinsUploadUsageFailure,
+    fins_upload_usage_failure,
+    fins_upload_target_usage_failure,
+    fins_upload_primary_selection_usage_failure,
+    fins_upload_format_usage_failure,
+    fins_upload_asset_plan_usage_failure,
+)
 from dayu.fins.upload_format_contract import (
     FINS_UPLOAD_FORMAT_CAPABILITY,
+    MAX_FILING_UPLOAD_FILES,
+    MAX_MATERIAL_UPLOAD_FILES,
     FinsUploadFileRole,
     FinsUploadFilingFiles,
+    FinsUploadMaterialFiles,
     FinsUploadFormatError,
-    FinsUploadFormatFailureKind,
 )
 from dayu.fins.upload_repair_contract import (
     ExistingSourceAutoRepair,
@@ -151,8 +188,9 @@ from dayu.fins.upload_repair_contract import (
 )
 from dayu.fins.ticker_normalization import Exchange as NormalizedTickerExchange
 from dayu.fins.ticker_normalization import Market as NormalizedTickerMarket
-from dayu.fins.ticker_normalization import NormalizedTicker
+from dayu.fins.ticker_normalization import normalize_ticker, NormalizedTicker
 from dayu.runtime.filelock import file_lock
+from dayu.runtime.log import safe_exception_trace
 
 _DOWNLOAD_INGEST_METHOD: Final[FinsIngestMethod] = FinsIngestMethod.DOWNLOAD
 _DOWNLOAD_REJECTION_CLASSIFICATION_VERSION: Final[str] = "fins-download-runtime-v1"
@@ -264,6 +302,7 @@ _PROGRESS_PREPROCESS_COMPLETED: Final[str] = "preprocess.completed"
 _UPLOAD_RESULT_STATUS_OK: Final[str] = "ok"
 _UPLOAD_RESULT_STATUS_SKIPPED: Final[str] = "skipped"
 _UPLOAD_RESULT_STATUS_DELETED: Final[str] = "deleted"
+_UPLOAD_RESULT_STATUS_METADATA_UPDATED: Final[str] = "metadata_updated"
 _UPLOAD_RESULT_STATUS_FAILED: Final[str] = "failed"
 _PAYLOAD_TICKER: Final[str] = "ticker"
 _PAYLOAD_MARKET: Final[str] = "market"
@@ -327,6 +366,7 @@ class FinsUploadTerminalDisposition(str, Enum):
 _UPLOAD_TERMINAL_DISPOSITIONS: Final[dict[str, FinsUploadTerminalDisposition]] = {
     _UPLOAD_RESULT_STATUS_OK: FinsUploadTerminalDisposition.COMPLETED,
     _UPLOAD_RESULT_STATUS_SKIPPED: FinsUploadTerminalDisposition.COMPLETED,
+    _UPLOAD_RESULT_STATUS_METADATA_UPDATED: FinsUploadTerminalDisposition.COMPLETED,
     _UPLOAD_RESULT_STATUS_DELETED: FinsUploadTerminalDisposition.COMPLETED,
     _UPLOAD_RESULT_STATUS_FAILED: FinsUploadTerminalDisposition.FAILED,
     FinsUploadTerminalDisposition.CANCELLED.value: FinsUploadTerminalDisposition.CANCELLED,
@@ -518,7 +558,7 @@ class FinsDownloadProgressEvent:
     Attributes:
         stage: runtime 可直接投影的下载阶段标签。
         message: 用户可读进度说明。
-        document_id: 可选业务文档 ID。
+        document_id: 可选的实际业务文档 ID，用于标识进度或结果对应的文档。
         file_name: 可选文件名；存在时优先作为 CLI 文档短标签展示。
         payload: 额外有界业务摘要，不得包含本地路径或 provider raw payload。
     """
@@ -580,6 +620,34 @@ class FinsSourceDownloadAdapterResult:
     persisted_summary: _FinsDownloadResultSummary | None = None
 
 
+class FinsSourceDownloadAdapterFailure(Exception):
+    """携带已验证文档摘要和原始封闭异常的 Fins 私有失败。"""
+
+    def __init__(
+        self,
+        cause: SourceIntegrityPreflightError | SourceIntegrityRevisionConflictError | SourceIntegrityRepairRequiredError,
+        persisted_summary: _FinsDownloadResultSummary,
+    ) -> None:
+        """保存 source adapter 的失败快照。
+
+        Args:
+            cause: 原始完整性异常。
+            persisted_summary: 经 adapter 严格投影的已处理文档摘要。
+
+        Returns:
+            无。
+
+        Raises:
+            TypeError: 原异常不是封闭完整性类型时抛出。
+        """
+
+        if not isinstance(cause, SourceIntegrityPreflightError | SourceIntegrityRevisionConflictError | SourceIntegrityRepairRequiredError):
+            raise TypeError("adapter failure cause must be a source integrity exception")
+        super().__init__("下载来源完整性中止")
+        self.cause = cause
+        self.persisted_summary = persisted_summary
+
+
 class FinsSourceDownloadAdapter(Protocol):
     """Fins source-specific 下载 adapter 协议。"""
 
@@ -618,20 +686,17 @@ class FinsPreprocessRequest:
     rebuild_processed: bool = False
 
 
-_UPLOAD_ACTION_AUTO: Final[str] = "auto"
+FINS_UPLOAD_ACTION_AUTO: Final[str] = "auto"
 _UPLOAD_ACTION_CREATE: Final[str] = "create"
 _UPLOAD_ACTION_UPDATE: Final[str] = "update"
 _UPLOAD_ACTION_DELETE: Final[str] = "delete"
 _UPLOAD_ACTION_VALUES: Final[frozenset[str]] = frozenset(
     {
-        _UPLOAD_ACTION_AUTO,
+        FINS_UPLOAD_ACTION_AUTO,
         _UPLOAD_ACTION_CREATE,
         _UPLOAD_ACTION_UPDATE,
         _UPLOAD_ACTION_DELETE,
     }
-)
-_UNSUPPORTED_UPLOAD_RUNTIME_MESSAGE: Final[str] = (
-    "不支持的上传运行时 (unsupported upload runtime): production upload runner 尚未装配"
 )
 
 
@@ -657,7 +722,7 @@ class FinsUploadFilingRequest:
 
     ticker: str
     source_kind: SourceKind = SourceKind.FILING
-    action: str = _UPLOAD_ACTION_AUTO
+    action: str = FINS_UPLOAD_ACTION_AUTO
     files: tuple[Path, ...] = ()
     primary_selectors: tuple[Path, ...] = ()
     fiscal_year: int | None = None
@@ -668,98 +733,6 @@ class FinsUploadFilingRequest:
     company_name: str | None = None
     ticker_aliases: tuple[str, ...] = ()
     overwrite: bool = False
-
-
-class FinsUploadUsageCode(str, Enum):
-    """上传调用方可修正的 closed usage failure code。"""
-
-    EMPTY_TICKER = "empty_ticker"
-    INVALID_TICKER = "invalid_ticker"
-    INVALID_TICKER_ALIAS = "invalid_ticker_alias"
-    INVALID_SOURCE_KIND = "invalid_source_kind"
-    INVALID_ACTION = "invalid_action"
-    TOO_MANY_FILES = "too_many_files"
-    FILES_NOT_ALLOWED_FOR_DELETE = "files_not_allowed_for_delete"
-    DUPLICATE_FILE_PATH = "duplicate_file_path"
-    MULTIPLE_PRIMARY_SELECTORS = "multiple_primary_selectors"
-    MISSING_MULTI_FILE_PRIMARY = "missing_multi_file_primary"
-    PRIMARY_NOT_IN_FILES = "primary_not_in_files"
-    PRIMARY_NOT_ALLOWED_FOR_DELETE = "primary_not_allowed_for_delete"
-    MISSING_FISCAL_YEAR = "missing_fiscal_year"
-    INVALID_FISCAL_YEAR = "invalid_fiscal_year"
-    MISSING_FISCAL_PERIOD = "missing_fiscal_period"
-    FISCAL_PERIOD_TOO_LONG = "fiscal_period_too_long"
-    UNSUPPORTED_FISCAL_PERIOD = "unsupported_fiscal_period"
-    INVALID_FILING_DATE = "invalid_filing_date"
-    INVALID_REPORT_DATE = "invalid_report_date"
-    COMPANY_NAME_TOO_LONG = "company_name_too_long"
-    TOO_MANY_TICKER_ALIASES = "too_many_ticker_aliases"
-    MISSING_FILES = "missing_files"
-    INVALID_FILE_BASENAME = "invalid_file_basename"
-    FILE_NOT_FOUND = "file_not_found"
-    FILE_NOT_REGULAR = "file_not_regular"
-    COMPANY_NAME_REQUIRED = "company_name_required"
-    CREATE_TARGET_EXISTS = "create_target_exists"
-    UPDATE_TARGET_MISSING = "update_target_missing"
-    EXISTING_SOURCE_REPAIR_REQUIRES_AUTO = "existing_source_repair_requires_auto"
-
-
-@dataclass(frozen=True, slots=True)
-class FinsUploadUsageFailure:
-    """上传 usage failure 的 typed public fact。
-
-    Attributes:
-        code: closed usage failure code；格式错误直接使用角色 owner 的 failure kind。
-        message: 最大 240 字符的可行动中文文案。
-    """
-
-    code: FinsUploadUsageCode | FinsUploadFormatFailureKind
-    message: str
-
-    def __post_init__(self) -> None:
-        """校验 usage public fact 的 closed code 与消息边界。
-
-        Args:
-            无。
-
-        Returns:
-            无。
-
-        Raises:
-            TypeError: code 不属于 closed enum union 或 message 不是字符串时抛出。
-            ValueError: message 为空或超过 240 字符时抛出。
-        """
-
-        if not isinstance(self.code, (FinsUploadUsageCode, FinsUploadFormatFailureKind)):
-            raise TypeError("upload usage failure code 不属于 closed contract")
-        if not isinstance(self.message, str):
-            raise TypeError("upload usage failure message 必须是字符串")
-        if not self.message:
-            raise ValueError("upload usage failure message 不能为空")
-        if len(self.message) > _MAX_TEXT_CHARS:
-            raise ValueError("upload usage failure message 超出长度上限")
-
-
-class FinsUploadUsageError(ValueError):
-    """上传请求违反调用方可修正契约。"""
-
-    failure: FinsUploadUsageFailure
-
-    def __init__(self, failure: FinsUploadUsageFailure) -> None:
-        """初始化 typed usage error。
-
-        Args:
-            failure: owner 已产生的 usage failure。
-
-        Returns:
-            无。
-
-        Raises:
-            无。
-        """
-
-        self.failure = failure
-        super().__init__(failure.message)
 
 
 @dataclass(frozen=True, slots=True)
@@ -801,7 +774,7 @@ class ValidatedFinsUploadFilingRequest:
 
         Raises:
             TypeError: repair disposition 不属于封闭 union 时抛出。
-            FinsUploadUsageError: request path 在重建 authoritative selection 时无法规范化时抛出。
+            FinsUploadUsageError: 同一规范 request 与 authoritative selection 的用法组合错误时抛出。
             ValueError: target identity、状态、动作或文件选择与 repair 授权不一致时抛出。
         """
 
@@ -823,7 +796,7 @@ class ValidatedFinsUploadFilingRequest:
             raise TypeError("repair_disposition 必须属于封闭 repair contract")
         if self.repair_disposition.expected_integrity != integrity:
             raise ValueError("repair expected target 必须等于 validated published target")
-        if self.request.action != _UPLOAD_ACTION_AUTO:
+        if self.request.action != FINS_UPLOAD_ACTION_AUTO:
             raise ValueError("existing auto repair 要求 raw action 精确为 auto")
         if self.resolved_action != _UPLOAD_ACTION_UPDATE:
             raise ValueError("existing auto repair 的 resolved action 必须是 update")
@@ -839,134 +812,9 @@ class _StaticFinsUploadFilingValidation:
     normalized_fiscal_period: FiscalPeriod
     document_id: str
     internal_document_id: str
+    canonical_files: tuple[Path, ...]
+    canonical_selectors: tuple[Path, ...]
     file_selection: FinsUploadFilingFiles
-
-
-class _FinsUploadFilingSelectionFailure(str, Enum):
-    """filing files/selectors 无法投影唯一 selection 的封闭原因。"""
-
-    MISSING_FILES = "missing_files"
-    DUPLICATE_FILE_PATH = "duplicate_file_path"
-    MULTIPLE_PRIMARY_SELECTORS = "multiple_primary_selectors"
-    MISSING_MULTI_FILE_PRIMARY = "missing_multi_file_primary"
-    PRIMARY_NOT_IN_FILES = "primary_not_in_files"
-
-
-@dataclass(frozen=True, slots=True)
-class _FinsUploadFilingSelectionProjection:
-    """已从规范路径唯一投影的 filing primary 与 companions。
-
-    Attributes:
-        primary: 唯一 authoritative primary。
-        companions: 保持 files 原相对顺序的 companions。
-    """
-
-    primary: Path
-    companions: tuple[Path, ...]
-
-    def to_file_selection(self) -> FinsUploadFilingFiles:
-        """构造共享 projection 对应的 public immutable selection。
-
-        Args:
-            无。
-
-        Returns:
-            primary/companions 与 projection 精确一致的 filing selection。
-
-        Raises:
-            TypeError: projection 的路径类型违反内部不变量时抛出。
-            FinsUploadFormatError: 任一 projected path 不符合其 filing 角色格式时抛出。
-        """
-
-        return FinsUploadFilingFiles.for_upsert(
-            primary=self.primary,
-            companions=self.companions,
-        )
-
-
-_FILING_SELECTION_FAILURE_USAGE_CODES: Final[
-    Mapping[_FinsUploadFilingSelectionFailure, FinsUploadUsageCode]
-] = {
-    _FinsUploadFilingSelectionFailure.MISSING_FILES: FinsUploadUsageCode.MISSING_FILES,
-    _FinsUploadFilingSelectionFailure.DUPLICATE_FILE_PATH: (
-        FinsUploadUsageCode.DUPLICATE_FILE_PATH
-    ),
-    _FinsUploadFilingSelectionFailure.MULTIPLE_PRIMARY_SELECTORS: (
-        FinsUploadUsageCode.MULTIPLE_PRIMARY_SELECTORS
-    ),
-    _FinsUploadFilingSelectionFailure.MISSING_MULTI_FILE_PRIMARY: (
-        FinsUploadUsageCode.MISSING_MULTI_FILE_PRIMARY
-    ),
-    _FinsUploadFilingSelectionFailure.PRIMARY_NOT_IN_FILES: (
-        FinsUploadUsageCode.PRIMARY_NOT_IN_FILES
-    ),
-}
-
-
-def _normalize_fins_upload_paths(paths: tuple[Path, ...]) -> tuple[Path, ...]:
-    """用唯一 path owner 规范化一组保序 upload paths。
-
-    Args:
-        paths: raw files 或 primary selectors。
-
-    Returns:
-        保持输入顺序的 canonical absolute paths。
-
-    Raises:
-        TypeError: 任一路径不是 ``Path`` 时抛出。
-        FinsUploadUsageError: 任一路径无法展开或解析时抛出。
-    """
-
-    return tuple(_normalize_fins_upload_path(path) for path in paths)
-
-
-def _project_fins_upload_filing_selection(
-    *,
-    files: tuple[Path, ...],
-    primary_selectors: tuple[Path, ...],
-) -> _FinsUploadFilingSelectionProjection | _FinsUploadFilingSelectionFailure:
-    """从规范 files/selectors 纯投影唯一 primary/companions 或封闭失败原因。
-
-    本 owner 不读取 filesystem、不规范化路径、不产生 public usage exception。调用边界负责
-    将 closed failure 投影为自身的异常面。
-
-    Args:
-        files: 已规范化且保持 raw 顺序的 upsert 文件。
-        primary_selectors: 已规范化且保持 raw cardinality 的 primary selectors。
-
-    Returns:
-        唯一 primary/companions projection；无法唯一投影时返回封闭 failure enum。
-
-    Raises:
-        TypeError: 任一输入或其中路径不符合严格 tuple/Path contract 时抛出。
-    """
-
-    if not isinstance(files, tuple) or not isinstance(primary_selectors, tuple):
-        raise TypeError("filing selection projection 要求 Path tuple")
-    if any(not isinstance(path, Path) for path in (*files, *primary_selectors)):
-        raise TypeError("filing selection projection 只接受 Path")
-    if not files:
-        return _FinsUploadFilingSelectionFailure.MISSING_FILES
-    file_identities = tuple(_fins_upload_path_identity(path) for path in files)
-    if len(set(file_identities)) != len(file_identities):
-        return _FinsUploadFilingSelectionFailure.DUPLICATE_FILE_PATH
-    if len(primary_selectors) > 1:
-        return _FinsUploadFilingSelectionFailure.MULTIPLE_PRIMARY_SELECTORS
-    if len(files) > 1 and not primary_selectors:
-        return _FinsUploadFilingSelectionFailure.MISSING_MULTI_FILE_PRIMARY
-    primary = primary_selectors[0] if primary_selectors else next(iter(files))
-    primary_identity = _fins_upload_path_identity(primary)
-    if primary_identity not in file_identities:
-        return _FinsUploadFilingSelectionFailure.PRIMARY_NOT_IN_FILES
-    companions = tuple(
-        path
-        for path, path_identity in zip(files, file_identities, strict=True)
-        if path_identity != primary_identity
-    )
-    return _FinsUploadFilingSelectionProjection(
-        primary=primary,
-        companions=companions,
-    )
 
 
 def _validate_filing_selection_matches_request(
@@ -979,7 +827,7 @@ def _validate_filing_selection_matches_request(
     也不根据 published state 反推角色。
 
     Args:
-        request: validated request 保存的原始 filing 请求。
+        request: validated request 保存的首次规范 filing 请求。
         selection: static admission 产生的 authoritative 文件选择。
 
     Returns:
@@ -987,7 +835,7 @@ def _validate_filing_selection_matches_request(
 
     Raises:
         TypeError: request 或 selection 类型不符合契约时抛出。
-        FinsUploadUsageError: request path 无法由唯一 path owner 规范化时抛出。
+        FinsUploadUsageError: 规范 request 的用法组合不合法时抛出。
         ValueError: delete 空状态或 upsert 完整文件选择不一致时抛出。
     """
 
@@ -1000,107 +848,29 @@ def _validate_filing_selection_matches_request(
         if request.files or request.primary_selectors or not selection.is_empty:
             raise ValueError("delete request 必须与唯一空 file selection 一致")
         return
-    normalized_files = _normalize_fins_upload_paths(request.files)
-    normalized_selectors = _normalize_fins_upload_paths(request.primary_selectors)
-    projection = _project_fins_upload_filing_selection(
+    normalized_files = request.files
+    normalized_selectors = request.primary_selectors
+    projection = project_upload_primary_selection(
         files=normalized_files,
         primary_selectors=normalized_selectors,
     )
-    if isinstance(projection, _FinsUploadFilingSelectionFailure):
+    if isinstance(projection, UploadPrimarySelectionFailure):
         raise ValueError(
             "validated filing raw selection 无法唯一投影: "
             f"{projection.value}"
         )
     if selection.is_empty:
         raise ValueError("filing upsert request 必须携带非空完整 file selection")
-    expected_selection = projection.to_file_selection()
+    expected_selection = FinsUploadFilingFiles.for_upsert(primary=projection.primary, companions=projection.companions)
     if selection != expected_selection:
         raise ValueError("validated filing file selection 与 raw request 不完整一致")
-
-
-_FILE_USAGE_CODES: Final[frozenset[FinsUploadUsageCode]] = frozenset(
-    {
-        FinsUploadUsageCode.FILE_NOT_FOUND,
-        FinsUploadUsageCode.FILE_NOT_REGULAR,
-    }
-)
-_USAGE_MESSAGES: Final[Mapping[FinsUploadUsageCode, str]] = {
-    FinsUploadUsageCode.EMPTY_TICKER: "--ticker 不能为空，请提供公司代码",
-    FinsUploadUsageCode.INVALID_TICKER: "--ticker 无法识别，请提供有效公司代码",
-    FinsUploadUsageCode.INVALID_TICKER_ALIAS: "--ticker 别名无法识别，请提供有效公司代码",
-    FinsUploadUsageCode.INVALID_SOURCE_KIND: "upload_filing 必须使用 filing source kind",
-    FinsUploadUsageCode.INVALID_ACTION: "--action 仅支持 auto、create、update、delete",
-    FinsUploadUsageCode.TOO_MANY_FILES: "--files 数量不能超过 100 个",
-    FinsUploadUsageCode.FILES_NOT_ALLOWED_FOR_DELETE: "delete 不得提供 --files",
-    FinsUploadUsageCode.DUPLICATE_FILE_PATH: "--files 不能包含解析后相同的重复路径",
-    FinsUploadUsageCode.MULTIPLE_PRIMARY_SELECTORS: "--primary 只能指定一次",
-    FinsUploadUsageCode.MISSING_MULTI_FILE_PRIMARY: "多文件 filing 必须使用 --primary 明确指定主文件",
-    FinsUploadUsageCode.PRIMARY_NOT_IN_FILES: "--primary 必须精确匹配 --files 中的一个文件",
-    FinsUploadUsageCode.PRIMARY_NOT_ALLOWED_FOR_DELETE: "delete 不得提供 --primary",
-    FinsUploadUsageCode.MISSING_FISCAL_YEAR: "--fiscal-year 不能为空",
-    FinsUploadUsageCode.INVALID_FISCAL_YEAR: "财年（fiscal_year）必须是 1000..9999 的整数",
-    FinsUploadUsageCode.MISSING_FISCAL_PERIOD: "--fiscal-period 不能为空",
-    FinsUploadUsageCode.FISCAL_PERIOD_TOO_LONG: "--fiscal-period 长度不能超过 240 个字符",
-    FinsUploadUsageCode.UNSUPPORTED_FISCAL_PERIOD: "--fiscal-period 仅支持 FY、H1、Q1、Q2、Q3、Q4",
-    FinsUploadUsageCode.INVALID_FILING_DATE: "披露日期（filing_date）必须是实际存在的 YYYY-MM-DD 日期",
-    FinsUploadUsageCode.INVALID_REPORT_DATE: "报告期日期（report_date）必须是实际存在的 YYYY-MM-DD 日期",
-    FinsUploadUsageCode.COMPANY_NAME_TOO_LONG: "--company-name 长度不能超过 240 个字符",
-    FinsUploadUsageCode.TOO_MANY_TICKER_ALIASES: "--ticker 别名数量不能超过 100 个",
-    FinsUploadUsageCode.MISSING_FILES: "create/update 上传必须提供 --files",
-    FinsUploadUsageCode.INVALID_FILE_BASENAME: "上传文件名无效；请提供单个非空文件名",
-    FinsUploadUsageCode.FILE_NOT_FOUND: "上传文件不存在：{file_name}",
-    FinsUploadUsageCode.FILE_NOT_REGULAR: "上传路径不是普通文件：{file_name}",
-    FinsUploadUsageCode.COMPANY_NAME_REQUIRED: "当前公司缺少有效元数据；create/update 必须提供 --company-name",
-    FinsUploadUsageCode.CREATE_TARGET_EXISTS: "create 目标已存在；请改用 update 或允许覆盖",
-    FinsUploadUsageCode.UPDATE_TARGET_MISSING: "update 目标不存在；请改用 create",
-    FinsUploadUsageCode.EXISTING_SOURCE_REPAIR_REQUIRES_AUTO: (
-        "目标 filing 不完整；请使用 auto 并提供完整文件重新上传"
-    ),
-}
-
-
-def fins_upload_usage_failure(
-    code: FinsUploadUsageCode,
-    *,
-    file_name: str | None = None,
-) -> FinsUploadUsageFailure:
-    """由 closed code 构造唯一 usage failure 文案。
-
-    Args:
-        code: closed usage failure code。
-        file_name: 四个文件相关 code 使用的已去路径化 basename。
-
-    Returns:
-        code 与 bounded actionable message 组成的 failure。
-
-    Raises:
-        ValueError: 文件 code 缺 basename、basename 含路径，或非文件 code 收到 basename 时抛出。
-    """
-
-    template = _USAGE_MESSAGES[code]
-    if code in _FILE_USAGE_CODES:
-        if (
-            file_name is None
-            or file_name == ""
-            or Path(file_name).name != file_name
-            or "/" in file_name
-            or "\\" in file_name
-        ):
-            raise ValueError("文件 usage failure 必须提供不含路径的 basename")
-        message = template.format(file_name=file_name)
-    else:
-        if file_name is not None:
-            raise ValueError("非文件 usage failure 不接受 file_name")
-        message = template
-    if len(message) > _MAX_TEXT_CHARS:
-        raise ValueError("usage failure message 超出长度上限")
-    return FinsUploadUsageFailure(code=code, message=message)
 
 
 def _raise_upload_usage(
     code: FinsUploadUsageCode,
     *,
     file_name: str | None = None,
+    max_files: int | None = None,
 ) -> NoReturn:
     """抛出 owner 产生的 typed usage error。
 
@@ -1115,7 +885,7 @@ def _raise_upload_usage(
         FinsUploadUsageError: 始终抛出。
     """
 
-    raise FinsUploadUsageError(fins_upload_usage_failure(code, file_name=file_name))
+    raise FinsUploadUsageError(fins_upload_usage_failure(code, file_name=file_name, max_files=max_files))
 
 
 def _raise_upload_format_usage(error: FinsUploadFormatError) -> NoReturn:
@@ -1131,7 +901,7 @@ def _raise_upload_format_usage(error: FinsUploadFormatError) -> NoReturn:
         FinsUploadUsageError: 始终携带原始 role-specific failure kind 抛出。
     """
 
-    raise FinsUploadUsageError(FinsUploadUsageFailure(code=error.kind, message=str(error))) from error
+    raise FinsUploadUsageError(fins_upload_format_usage_failure(error)) from error
 
 
 def _admit_fins_upload_file_basename(basename: str) -> None:
@@ -1195,48 +965,26 @@ def _admit_fins_upload_ticker_identity(
     return normalized_ticker
 
 
-def _normalize_fins_upload_path(path: Path) -> Path:
-    """把 raw upload path 规范化为静态 admission 的 canonical path。
-
-    路径展开或解析失败属于调用方可修正的文件缺失事实；本 owner 只把 raw basename
-    投影给 public failure，不让底层异常中的本地路径进入业务消息。
+def _normalize_upload_path_for_filing(path: Path) -> Path:
+    """把共享路径解析失败投影到 filing 既有 usage code。
 
     Args:
-        path: 调用方提供的原始文件或 selector 路径。
+        path: 原始 filing 文件或 selector 路径。
 
     Returns:
-        经过用户目录展开与 ``resolve(strict=False)`` 的绝对路径。
+        共享 owner 规范化的绝对路径。
 
     Raises:
-        TypeError: ``path`` 不是 ``Path`` 时抛出。
-        FinsUploadUsageError: 用户目录展开或路径解析发生 ``OSError``/``RuntimeError`` 时，
-            携带既有 ``FILE_NOT_FOUND`` code 与 raw basename 文案抛出。
+        FinsUploadUsageError: 路径解析失败时抛出 FILE_NOT_FOUND。
     """
 
-    if not isinstance(path, Path):
-        raise TypeError("upload path 必须是 Path")
     try:
-        return path.expanduser().resolve(strict=False)
-    except (OSError, RuntimeError):
-        _raise_upload_usage(FinsUploadUsageCode.FILE_NOT_FOUND, file_name=path.name)
-
-
-def _fins_upload_path_identity(path: Path) -> str:
-    """投影规范路径的 case-sensitive exact string identity。
-
-    Args:
-        path: 已由 ``_normalize_fins_upload_path`` 规范化的路径。
-
-    Returns:
-        不进行 case folding、inode 查询或平台别名合并的路径字符串。
-
-    Raises:
-        TypeError: ``path`` 不是 ``Path`` 时抛出。
-    """
-
-    if not isinstance(path, Path):
-        raise TypeError("normalized upload path 必须是 Path")
-    return str(path)
+        return normalize_upload_asset_path(path)
+    except (OSError, ValueError):
+        _raise_upload_usage(
+            FinsUploadUsageCode.FILE_NOT_FOUND,
+            file_name=canonicalize_fins_rejected_file_label(path.name),
+        )
 
 
 def _validate_fins_upload_filing_static(
@@ -1263,8 +1011,8 @@ def _validate_fins_upload_filing_static(
     action = request.action.strip().lower()
     if action not in _UPLOAD_ACTION_VALUES:
         _raise_upload_usage(FinsUploadUsageCode.INVALID_ACTION)
-    if len(request.files) > _MAX_TUPLE_ITEMS:
-        _raise_upload_usage(FinsUploadUsageCode.TOO_MANY_FILES)
+    if len(request.files) > MAX_FILING_UPLOAD_FILES:
+        _raise_upload_usage(FinsUploadUsageCode.TOO_MANY_FILES, max_files=MAX_FILING_UPLOAD_FILES)
     if request.fiscal_year is None:
         _raise_upload_usage(FinsUploadUsageCode.MISSING_FISCAL_YEAR)
     try:
@@ -1288,6 +1036,8 @@ def _validate_fins_upload_filing_static(
     _validate_optional_upload_iso_date(request.filing_date, FinsUploadUsageCode.INVALID_FILING_DATE)
     _validate_optional_upload_iso_date(request.report_date, FinsUploadUsageCode.INVALID_REPORT_DATE)
     _validate_optional_upload_text(request.company_name, FinsUploadUsageCode.COMPANY_NAME_TOO_LONG)
+    normalized_files: tuple[Path, ...] = ()
+    normalized_selectors: tuple[Path, ...] = ()
     if action == _UPLOAD_ACTION_DELETE:
         if request.files:
             _raise_upload_usage(FinsUploadUsageCode.FILES_NOT_ALLOWED_FOR_DELETE)
@@ -1295,15 +1045,15 @@ def _validate_fins_upload_filing_static(
             _raise_upload_usage(FinsUploadUsageCode.PRIMARY_NOT_ALLOWED_FOR_DELETE)
         file_selection = FinsUploadFilingFiles.for_delete()
     else:
-        normalized_files = _normalize_fins_upload_paths(request.files)
-        normalized_selectors = _normalize_fins_upload_paths(request.primary_selectors)
-        projection = _project_fins_upload_filing_selection(
+        normalized_files = tuple(_normalize_upload_path_for_filing(path) for path in request.files)
+        normalized_selectors = tuple(_normalize_upload_path_for_filing(path) for path in request.primary_selectors)
+        projection = project_upload_primary_selection(
             files=normalized_files,
             primary_selectors=normalized_selectors,
         )
-        if isinstance(projection, _FinsUploadFilingSelectionFailure):
-            _raise_upload_usage(_FILING_SELECTION_FAILURE_USAGE_CODES[projection])
-        primary_identity = _fins_upload_path_identity(projection.primary)
+        if isinstance(projection, UploadPrimarySelectionFailure):
+            raise FinsUploadUsageError(fins_upload_primary_selection_usage_failure(UploadPrimarySelectionError(projection), source_kind=SourceKind.FILING))
+        primary_identity = upload_asset_path_identity(projection.primary)
         for file_path in normalized_files:
             basename = file_path.name
             _admit_fins_upload_file_basename(basename)
@@ -1313,7 +1063,7 @@ def _validate_fins_upload_filing_static(
                 _raise_upload_usage(FinsUploadUsageCode.FILE_NOT_REGULAR, file_name=basename)
             role = (
                 FinsUploadFileRole.PRIMARY
-                if _fins_upload_path_identity(file_path) == primary_identity
+                if upload_asset_path_identity(file_path) == primary_identity
                 else FinsUploadFileRole.COMPANION
             )
             try:
@@ -1321,7 +1071,7 @@ def _validate_fins_upload_filing_static(
             except FinsUploadFormatError as error:
                 _raise_upload_format_usage(error)
         try:
-            file_selection = projection.to_file_selection()
+            file_selection = FinsUploadFilingFiles.for_upsert(primary=projection.primary, companions=projection.companions)
         except FinsUploadFormatError as error:
             _raise_upload_format_usage(error)
     if normalized_ticker.market == "US":
@@ -1345,7 +1095,27 @@ def _validate_fins_upload_filing_static(
         document_id=document_id,
         internal_document_id=internal_document_id,
         file_selection=file_selection,
+        canonical_files=normalized_files,
+        canonical_selectors=normalized_selectors,
     )
+
+
+def admit_fins_upload_filing_selection(
+    request: FinsUploadFilingRequest,
+) -> FinsUploadFilingFiles:
+    """在任务或 observation 创建前公开 filing 静态准入的保序文件选择。
+
+    Args:
+        request: 原始 filing 上传请求。
+
+    Returns:
+        与静态身份、动作及文件规则同一次校验产生的主文件和随附文件选择。
+
+    Raises:
+        FinsUploadUsageError: 任一静态用法规则不满足时抛出。
+    """
+
+    return _validate_fins_upload_filing_static(request).file_selection
 
 
 def _validate_optional_upload_text(
@@ -1480,10 +1250,10 @@ def validate_fins_upload_filing_request(
     integrity = published_state.source_integrity
     if integrity.status is SourceIntegrityStatus.UNSAFE:
         raise FinsUploadPrevalidationError(
-            fins_upload_source_integrity_unsafe_failure()
+            fins_upload_source_integrity_unsafe_failure(source_kind=SourceKind.FILING)
         )
     if integrity.status is SourceIntegrityStatus.REPAIR_REQUIRED:
-        if request.action != _UPLOAD_ACTION_AUTO:
+        if request.action != FINS_UPLOAD_ACTION_AUTO:
             _raise_upload_usage(FinsUploadUsageCode.EXISTING_SOURCE_REPAIR_REQUIRES_AUTO)
         if static.file_selection.is_empty:
             raise ValueError("REPAIR_REQUIRED auto validator 缺少完整文件选择")
@@ -1493,7 +1263,7 @@ def validate_fins_upload_filing_request(
         )
     else:
         resolved_action_text = resolve_upload_action(
-            None if requested_action == _UPLOAD_ACTION_AUTO else requested_action,
+            None if requested_action == FINS_UPLOAD_ACTION_AUTO else requested_action,
             published_state.source_meta,
         )
         if resolved_action_text not in {
@@ -1505,13 +1275,15 @@ def validate_fins_upload_filing_request(
         resolved_action = cast(Literal["create", "update", "delete"], resolved_action_text)
         precondition = evaluate_upload_overwrite_precondition(
             action=resolved_action,
+            source_kind=SourceKind.FILING,
+            material_state=None,
             previous_meta=published_state.source_meta,
             overwrite=request.overwrite,
         )
         if precondition is UploadOverwritePrecondition.CREATE_TARGET_EXISTS:
-            _raise_upload_usage(FinsUploadUsageCode.CREATE_TARGET_EXISTS)
+            raise FinsUploadUsageError(fins_upload_target_usage_failure(FinsUploadUsageCode.CREATE_TARGET_EXISTS, source_kind=SourceKind.FILING))
         if precondition is UploadOverwritePrecondition.UPDATE_TARGET_MISSING:
-            _raise_upload_usage(FinsUploadUsageCode.UPDATE_TARGET_MISSING)
+            raise FinsUploadUsageError(fins_upload_target_usage_failure(FinsUploadUsageCode.UPDATE_TARGET_MISSING, source_kind=SourceKind.FILING))
         repair_disposition = NoExistingSourceRepair()
     try:
         company_decision = resolve_upload_company_meta_decision(
@@ -1524,7 +1296,7 @@ def validate_fins_upload_filing_request(
     except UploadCompanyNameRequiredError:
         _raise_upload_usage(FinsUploadUsageCode.COMPANY_NAME_REQUIRED)
     return ValidatedFinsUploadFilingRequest(
-        request=request,
+        request=replace(request, files=static.canonical_files, primary_selectors=static.canonical_selectors),
         normalized_ticker=static.normalized_ticker,
         normalized_fiscal_period=static.normalized_fiscal_period,
         document_id=static.document_id,
@@ -1545,11 +1317,10 @@ class FinsUploadMaterialRequest:
         ticker: 用户提供的 ticker 文本，运行时会先调用公共 ticker 归一化 API。
         source_kind: 源文档类别；material 上传必须为 ``SourceKind.MATERIAL``。
         action: 上传动作，允许 ``auto``、``create``、``update`` 或 ``delete``。
-        files: 待上传文件路径；Slice 1 只保存文件数量摘要，不读取文件。
-        form_type: 可选材料表单类型。
-        material_name: 可选材料名称。
-        document_id: 可选业务文档 ID。
-        internal_document_id: 可选来源内部文档 ID。
+        files: 待上传的保序原始路径；delete 不得提供。
+        form_type: 每个动作必填的材料类型，准入后为规范文本。
+        material_name: 每个动作必填的名称，去首尾空白后最多 240 个 Unicode 码点。
+        document_id: 可选生成身份一致性断言，不能覆盖材料身份。
         fiscal_year: 可选会计年度。
         fiscal_period: 可选会计期间。
         amended: 是否为修正材料。
@@ -1562,12 +1333,12 @@ class FinsUploadMaterialRequest:
 
     ticker: str
     source_kind: SourceKind = SourceKind.MATERIAL
-    action: str = _UPLOAD_ACTION_AUTO
+    action: str = FINS_UPLOAD_ACTION_AUTO
     files: tuple[Path, ...] = ()
     form_type: str | None = None
     material_name: str | None = None
     document_id: str | None = None
-    internal_document_id: str | None = None
+    primary_selectors: tuple[Path, ...] = ()
     fiscal_year: int | None = None
     fiscal_period: str | None = None
     amended: bool = False
@@ -1578,8 +1349,174 @@ class FinsUploadMaterialRequest:
     overwrite: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class FinsUploadMaterialActionDecision:
+    """不访问路径的材料动作及下游动作事实。"""
+
+    requested_action: Literal["auto", "create", "update", "delete"]
+    pipeline_action: Literal["create", "update", "delete"] | None
+
+    def __post_init__(self) -> None:
+        """参数：无；返回：无；异常：ValueError 表示动作对不一致。"""
+        if self.requested_action not in _UPLOAD_ACTION_VALUES or self.pipeline_action != (None if self.requested_action == FINS_UPLOAD_ACTION_AUTO else self.requested_action):
+            raise ValueError("材料动作事实不一致")
+
+
+def validate_fins_upload_material_action_files(action: str, files: tuple[Path, ...]) -> FinsUploadMaterialActionDecision:
+    """参数：原始动作与保序文件；返回：无 I/O 动作事实；异常：FinsUploadUsageError 表示动作或数量组合错误。"""
+    normalized = action.strip().lower()
+    if normalized not in _UPLOAD_ACTION_VALUES:
+        _raise_upload_usage(FinsUploadUsageCode.INVALID_ACTION)
+    if normalized == _UPLOAD_ACTION_DELETE:
+        if files:
+            _raise_upload_usage(FinsUploadUsageCode.FILES_NOT_ALLOWED_FOR_DELETE)
+    elif not files:
+        _raise_upload_usage(FinsUploadUsageCode.MISSING_FILES)
+    requested = cast(Literal["auto", "create", "update", "delete"], normalized)
+    pipeline = None if requested == FINS_UPLOAD_ACTION_AUTO else requested
+    return FinsUploadMaterialActionDecision(requested, pipeline)
+
+
+@dataclass(frozen=True, slots=True)
+class MaterialUploadStateAdmission:
+    """同版材料状态、解析动作与纯公司决策。"""
+
+    observed_state: MaterialUploadPublishedState
+    resolved_action: Literal["create", "update", "delete"]
+    company_decision: UploadCompanyMetaDecision
+
+    def __post_init__(self) -> None:
+        """参数：无；返回：无；异常：类型或非健康状态违约；不执行 I/O。"""
+        if type(self.observed_state) is not MaterialUploadPublishedState or type(self.company_decision) is not UploadCompanyMetaDecision:
+            raise TypeError("材料状态受理类型错误")
+        if self.observed_state.source_integrity.status not in {SourceIntegrityStatus.MISSING, SourceIntegrityStatus.COMPLETE} or self.resolved_action not in {_UPLOAD_ACTION_CREATE, _UPLOAD_ACTION_UPDATE, _UPLOAD_ACTION_DELETE}:
+            raise ValueError("材料受理状态或动作非法")
+
+
+@dataclass(frozen=True, slots=True)
+class ValidatedFinsUploadMaterialRequest:
+    """一次准入产生的规范请求、身份、动作与 exact 角色资产事实。"""
+
+    request: FinsUploadMaterialRequest
+    file_selection: FinsUploadMaterialFiles
+    asset_plan: UploadAssetPlan
+    identity: MaterialUploadIdentity
+    action_decision: FinsUploadMaterialActionDecision
+    state_admission: MaterialUploadStateAdmission
+
+    def __post_init__(self) -> None:
+        """参数：无；返回：无；异常：类型、用法或 ValueError 表示事实漂移；不访问文件系统。"""
+        self.validate()
+
+    def validate(self) -> None:
+        """参数：无；返回：无；异常：类型、用法或 ValueError 表示事实不一致；纯校验不解析路径。"""
+        if not isinstance(self.request, FinsUploadMaterialRequest) or not isinstance(self.file_selection, FinsUploadMaterialFiles) or not isinstance(self.asset_plan, UploadAssetPlan) or not isinstance(self.identity, MaterialUploadIdentity) or not isinstance(self.action_decision, FinsUploadMaterialActionDecision) or type(self.state_admission) is not MaterialUploadStateAdmission:
+            raise TypeError("材料准入事实类型错误")
+        raw = self.request
+        decision = validate_fins_upload_material_action_files(raw.action, raw.files)
+        if decision != self.action_decision or raw.action != decision.requested_action:
+            raise ValueError("材料动作事实发生漂移")
+        _admit_fins_upload_ticker_identity(raw.ticker, raw.ticker_aliases)
+        _validate_upload_source_kind(raw)
+        _validate_optional_upload_iso_date(raw.filing_date, FinsUploadUsageCode.INVALID_FILING_DATE)
+        _validate_optional_upload_iso_date(raw.report_date, FinsUploadUsageCode.INVALID_REPORT_DATE)
+        expected_identity = build_material_ids(form_type=raw.form_type, material_name=raw.material_name, fiscal_year=raw.fiscal_year, fiscal_period=raw.fiscal_period, document_id=raw.document_id)
+        if expected_identity != self.identity or (raw.form_type, raw.material_name, raw.fiscal_year, raw.fiscal_period) != (self.identity.form_type, self.identity.material_name, self.identity.fiscal_year, self.identity.fiscal_period):
+            raise ValueError("材料身份事实发生漂移")
+        state = self.state_admission.observed_state
+        if state.source_integrity.ticker != normalize_ticker(raw.ticker).canonical or state.source_integrity.document_id != self.identity.document_id:
+            raise ValueError("材料状态目标漂移")
+        if self.state_admission.resolved_action != resolve_upload_action(self.action_decision.pipeline_action, state.source_meta):
+            raise ValueError("材料解析动作漂移")
+        expected_company = resolve_upload_company_meta_decision(existing_meta=state.company_meta, ticker=normalize_ticker(raw.ticker).canonical, action=self.state_admission.resolved_action, company_name=raw.company_name, ticker_aliases=raw.ticker_aliases)
+        if expected_company != self.state_admission.company_decision:
+            raise ValueError("公司决策漂移")
+        precondition = evaluate_upload_overwrite_precondition(action=self.state_admission.resolved_action, source_kind=SourceKind.MATERIAL, material_state=state, previous_meta=state.source_meta, overwrite=raw.overwrite)
+        if precondition is not UploadOverwritePrecondition.ALLOWED:
+            raise ValueError("材料 handoff 的目标前置条件漂移")
+        self.asset_plan.validate()
+        if self.asset_plan.source_kind is not SourceKind.MATERIAL or tuple(pair.path for pair in self.asset_plan.ordered_pairs) != raw.files or self.file_selection.files != raw.files:
+            raise ValueError("材料文件事实发生漂移")
+        if decision.pipeline_action == _UPLOAD_ACTION_DELETE:
+            if raw.primary_selectors or self.asset_plan.primary_original_name is not None:
+                raise ValueError("删除不得携带主文件")
+            return
+        projection = project_upload_primary_selection(files=raw.files, primary_selectors=raw.primary_selectors)
+        if isinstance(projection, UploadPrimarySelectionFailure) or projection.primary.name != self.asset_plan.primary_original_name:
+            raise ValueError("材料主文件事实发生漂移")
+
+
+def _admit_material_upload_facts(request: FinsUploadMaterialRequest) -> tuple[FinsUploadMaterialRequest, FinsUploadMaterialFiles, UploadAssetPlan, MaterialUploadIdentity, FinsUploadMaterialActionDecision]:
+    """参数：原始材料请求；返回：完整规范事实；异常：用法、格式或路径错误；先静态准入后一次路径解析。"""
+    _admit_fins_upload_ticker_identity(request.ticker, request.ticker_aliases)
+    if request.action.strip().lower() not in _UPLOAD_ACTION_VALUES:
+        _raise_upload_usage(FinsUploadUsageCode.INVALID_ACTION)
+    _validate_upload_source_kind(request)
+    decision = validate_fins_upload_material_action_files(request.action, request.files)
+    _validate_optional_upload_iso_date(request.filing_date, FinsUploadUsageCode.INVALID_FILING_DATE)
+    _validate_optional_upload_iso_date(request.report_date, FinsUploadUsageCode.INVALID_REPORT_DATE)
+    identity = build_material_ids(form_type=request.form_type, material_name=request.material_name, fiscal_year=request.fiscal_year, fiscal_period=request.fiscal_period, document_id=request.document_id)
+    operation: Literal["upsert", "delete"] = "delete" if decision.pipeline_action == _UPLOAD_ACTION_DELETE else "upsert"
+    try:
+        selection, asset_plan = plan_upload_assets(source_kind=SourceKind.MATERIAL, operation=operation, files=request.files, material_primary_selectors=request.primary_selectors)
+    except FinsUploadAssetPlanError as error:
+        raise FinsUploadUsageError(fins_upload_asset_plan_usage_failure(error, max_files=MAX_MATERIAL_UPLOAD_FILES)) from error
+    except (UploadPrimarySelectionError, UploadPrimarySelectionPathError) as error:
+        raise FinsUploadUsageError(fins_upload_primary_selection_usage_failure(error, source_kind=SourceKind.MATERIAL)) from error
+    except FinsUploadFormatError as error:
+        raise FinsUploadUsageError(fins_upload_format_usage_failure(error)) from error
+    if not isinstance(selection, FinsUploadMaterialFiles):
+        raise AssertionError("material planner 返回错误选择类型")
+    canonical_files = tuple(pair.path for pair in asset_plan.ordered_pairs)
+    primary_paths = tuple(pair.path for pair in asset_plan.ordered_pairs if pair.original_name == asset_plan.primary_original_name)
+    normalized = replace(request, action=decision.requested_action, form_type=identity.form_type, material_name=identity.material_name, fiscal_year=identity.fiscal_year, fiscal_period=identity.fiscal_period, files=canonical_files, primary_selectors=primary_paths if request.primary_selectors else ())
+    return normalized, selection, asset_plan, identity, decision
+
+
+def admit_fins_upload_material_request(
+    request: FinsUploadMaterialRequest, *, state_repository: MaterialUploadStateRepositoryProtocol,
+) -> ValidatedFinsUploadMaterialRequest:
+    """参数：请求与必需状态仓储；返回：完整同版 handoff；异常：静态用法、完整性、目标、公司或真实 I/O 失败先于生命周期。"""
+    normalized, selection, asset_plan, identity, decision = _admit_material_upload_facts(request)
+    state = state_repository.read_material_upload_state(normalize_ticker(normalized.ticker).canonical, identity.document_id)
+    if state.source_integrity.status in {SourceIntegrityStatus.UNSAFE, SourceIntegrityStatus.REPAIR_REQUIRED}:
+        raise FinsUploadPrevalidationError(fins_upload_source_integrity_unsafe_failure(source_kind=SourceKind.MATERIAL))
+    action = resolve_upload_action(decision.pipeline_action, state.source_meta)
+    if action not in {_UPLOAD_ACTION_CREATE, _UPLOAD_ACTION_UPDATE, _UPLOAD_ACTION_DELETE}:
+        raise AssertionError("材料动作 owner 返回非法值")
+    resolved = cast(Literal["create", "update", "delete"], action)
+    precondition = evaluate_upload_overwrite_precondition(action=resolved, source_kind=SourceKind.MATERIAL, material_state=state, previous_meta=state.source_meta, overwrite=normalized.overwrite)
+    if precondition is not UploadOverwritePrecondition.ALLOWED:
+        raise FinsUploadUsageError(fins_upload_target_usage_failure(FinsUploadUsageCode(precondition.value), source_kind=SourceKind.MATERIAL))
+    try:
+        company = resolve_upload_company_meta_decision(existing_meta=state.company_meta, ticker=normalize_ticker(normalized.ticker).canonical, action=resolved, company_name=normalized.company_name, ticker_aliases=normalized.ticker_aliases)
+    except UploadCompanyNameRequiredError:
+        _raise_upload_usage(FinsUploadUsageCode.COMPANY_NAME_REQUIRED)
+    return ValidatedFinsUploadMaterialRequest(normalized, selection, asset_plan, identity, decision, MaterialUploadStateAdmission(state, resolved, company))
+
+
 FinsUploadRequest = FinsUploadFilingRequest | FinsUploadMaterialRequest
-FinsRuntimeUploadRequest = FinsUploadRequest | ValidatedFinsUploadFilingRequest
+FinsRuntimeUploadRequest = FinsUploadRequest | ValidatedFinsUploadFilingRequest | ValidatedFinsUploadMaterialRequest
+
+
+def validated_fins_upload_file_count(
+    request: ValidatedFinsUploadFilingRequest | ValidatedFinsUploadMaterialRequest,
+) -> int:
+    """从准入后的权威文件选择取得本次实际上传文件数。
+
+    Args:
+        request: filing 或 material 的已验证上传 handoff。
+
+    Returns:
+        filing 角色选择或 material 资产计划中的原件数；delete 为零。
+
+    Raises:
+        无。
+    """
+
+    if isinstance(request, ValidatedFinsUploadFilingRequest):
+        return len(request.file_selection.ordered_files)
+    return len(request.asset_plan.ordered_pairs)
 
 
 @dataclass(frozen=True)
@@ -1681,6 +1618,25 @@ class FinsPreprocessResultSummary:
         }
 
 
+def _validate_upload_published_amended(*, source_kind: SourceKind, status: str, published_amended: bool | None) -> None:
+    """参数：显式类型、状态与 actual 标记；返回：无；异常：材料成功缺严格 bool、失败非 null 或 filing 携材料状态。"""
+    if type(source_kind) is not SourceKind:
+        raise TypeError("上传来源必须显式 SourceKind")
+    if source_kind is SourceKind.FILING:
+        if status == _UPLOAD_RESULT_STATUS_METADATA_UPDATED or published_amended is not None:
+            raise ValueError("filing 不得消费材料 metadata_updated 或 published_amended")
+    elif status in {
+        _UPLOAD_RESULT_STATUS_OK,
+        _UPLOAD_RESULT_STATUS_SKIPPED,
+        _UPLOAD_RESULT_STATUS_DELETED,
+        _UPLOAD_RESULT_STATUS_METADATA_UPDATED,
+    }:
+        if type(published_amended) is not bool:
+            raise ValueError("材料成功必须含 storage-final bool")
+    elif published_amended is not None:
+        raise ValueError("材料失败或取消必须 published_amended=null")
+
+
 @dataclass(frozen=True)
 class FinsUploadPipelineResult:
     """production upload pipeline 返回给 runtime 的 typed 结果。
@@ -1688,7 +1644,7 @@ class FinsUploadPipelineResult:
     Attributes:
         status: 上传业务状态，pipeline 必须显式提供。
         stored_file_count: commit 成功后发布的用户输入 original 数。
-        document_id: 可选业务文档 ID。
+        document_id: 可选的实际业务文档 ID，用于标识进度或结果对应的文档。
         internal_document_id: 可选来源内部文档 ID。
         primary_document: 可选主文件名。
         deleted: 可选删除动作结果；缺失表示 pipeline 未声明。
@@ -1698,6 +1654,8 @@ class FinsUploadPipelineResult:
         warnings: filing terminal producer 显式给出的零或一个 typed 公司元数据警告。
     """
 
+    source_kind: SourceKind
+    published_amended: bool | None
     status: str
     stored_file_count: int
     document_id: str | None = None
@@ -1724,6 +1682,7 @@ class FinsUploadPipelineResult:
         """
 
         _upload_terminal_disposition_from_status(self.status)
+        _validate_upload_published_amended(source_kind=self.source_kind, status=self.status, published_amended=self.published_amended)
         _validate_required_non_negative_count(
             self.stored_file_count,
             _KEY_STORED_FILE_COUNT,
@@ -1737,6 +1696,8 @@ class FinsUploadPipelineResult:
             raise ValueError("failed upload pipeline result 必须包含 failure")
         if self.status != _UPLOAD_RESULT_STATUS_FAILED and self.failure_reason is not None:
             raise ValueError("非 failed upload pipeline result 禁止包含 failure")
+        if self.source_kind is SourceKind.MATERIAL and self.warnings:
+            raise ValueError("material 禁止携带公司元数据 warning")
         if len(self.warnings) > 1:
             raise ValueError("upload pipeline result 最多允许一个 warning")
         if any(type(warning) is not CompanyMetadataWarning for warning in self.warnings):
@@ -1779,7 +1740,17 @@ class FinsUploadPipelineResult:
             warnings = company_metadata_warnings_from_json(result["warnings"])
             if source_kind is SourceKind.MATERIAL and warnings:
                 raise ValueError("material terminal result 禁止携带 company metadata warning")
+        if source_kind is SourceKind.MATERIAL:
+            if "published_amended" not in result:
+                raise ValueError("材料结果必须声明 published_amended")
+            published = result["published_amended"]
+            if published is not None and type(published) is not bool:
+                raise ValueError("published_amended 必须是 bool 或 null")
+        else:
+            published = None
         return cls(
+            source_kind=source_kind,
+            published_amended=published,
             status=status,
             stored_file_count=_required_upload_result_int(result, _KEY_STORED_FILE_COUNT),
             document_id=_optional_upload_result_text(result, "document_id"),
@@ -1800,7 +1771,7 @@ class FinsUploadResultSummary:
 
     Attributes:
         source_kind: 源文档类别，使用已有 ``SourceKind`` 区分 filing/material。
-        document_id: 可选业务文档 ID。
+        document_id: 可选的实际业务文档 ID，用于标识进度或结果对应的文档。
         internal_document_id: 可选来源内部文档 ID。
         status: 上传业务状态摘要。
         requested_file_count: validated request 中的用户输入文件数。
@@ -1814,6 +1785,7 @@ class FinsUploadResultSummary:
     """
 
     source_kind: SourceKind
+    published_amended: bool | None
     status: str
     requested_file_count: int
     stored_file_count: int
@@ -1841,6 +1813,7 @@ class FinsUploadResultSummary:
             ValueError: status、计数、failure 或 warning 组合不符合闭集时抛出。
         """
 
+        _validate_upload_published_amended(source_kind=self.source_kind, status=self.status, published_amended=self.published_amended)
         disposition = _upload_terminal_disposition_from_status(self.status)
         _validate_required_non_negative_count(
             self.requested_file_count,
@@ -1855,7 +1828,7 @@ class FinsUploadResultSummary:
                 raise ValueError("ok upload summary 的 requested_file_count 必须大于等于 1")
             if self.stored_file_count != self.requested_file_count:
                 raise ValueError("ok upload summary 的 stored_file_count 必须等于 requested_file_count")
-        elif self.status == _UPLOAD_RESULT_STATUS_SKIPPED:
+        elif self.status in {_UPLOAD_RESULT_STATUS_SKIPPED, _UPLOAD_RESULT_STATUS_METADATA_UPDATED}:
             if self.requested_file_count < 1:
                 raise ValueError("skipped upload summary 的 requested_file_count 必须大于等于 1")
             if self.stored_file_count != 0:
@@ -1866,6 +1839,8 @@ class FinsUploadResultSummary:
             raise ValueError("failed upload summary 必须包含 failure_reason")
         if disposition is not FinsUploadTerminalDisposition.FAILED and self.failure_reason is not None:
             raise ValueError("非 failed upload summary 禁止包含 failure_reason")
+        if self.source_kind is SourceKind.MATERIAL and self.warnings:
+            raise ValueError("material 禁止携带公司元数据 warning")
         if len(self.warnings) > 1:
             raise ValueError("upload summary 最多允许一个 warning")
         if any(type(warning) is not CompanyMetadataWarning for warning in self.warnings):
@@ -1904,7 +1879,7 @@ class FinsUploadResultSummary:
             ValueError: 文档 ID、文件名或摘要大小超过 job record 边界时抛出。
         """
 
-        return {
+        result: dict[str, JsonValue] = {
             "source_kind": self.source_kind.value,
             "document_id": _optional_bounded_text(
                 self.document_id,
@@ -1939,6 +1914,9 @@ class FinsUploadResultSummary:
             "failure": None if self.failure_reason is None else self.failure_reason.to_json(),
             "warnings": company_metadata_warnings_to_json(self.warnings),
         }
+        if self.source_kind is SourceKind.MATERIAL:
+            result["published_amended"] = self.published_amended
+        return result
 
 
 class FinsJobCancellationChecker(CancellationToken, Protocol):
@@ -1965,7 +1943,7 @@ class FinsUploadRunner(Protocol):
 
     def run_upload(
         self,
-        request: ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest,
+        request: ValidatedFinsUploadFilingRequest | ValidatedFinsUploadMaterialRequest,
         *,
         cancellation_checker: FinsJobCancellationChecker,
     ) -> FinsUploadResultSummary:
@@ -2082,6 +2060,7 @@ class FinsIngestionJobStore(Protocol):
         job_id: str,
         *,
         result_summary: dict[str, JsonValue],
+        cancelled_result_summary: dict[str, JsonValue] | None,
         finished_at: str,
     ) -> FinsIngestionJobRecord:
         """按当前取消状态原子保存 succeeded 或 cancelled 终态。
@@ -2089,6 +2068,7 @@ class FinsIngestionJobStore(Protocol):
         Args:
             job_id: opaque job id。
             result_summary: succeeded 终态的有界业务结果摘要。
+            cancelled_result_summary: 已有 typed 结果的取消投影；尚无结果或非 download 为 None。
             finished_at: 本次终态写入时间。
 
         Returns:
@@ -2105,12 +2085,14 @@ class FinsIngestionJobStore(Protocol):
         self,
         job_id: str,
         *,
+        result_summary: dict[str, JsonValue] | None,
         finished_at: str,
     ) -> FinsIngestionJobRecord:
         """仅当当前 job 非终态时原子保存 cancelled 终态。
 
         Args:
             job_id: opaque job id。
+            result_summary: 调用方取消投影；尚无业务结果或非 download 为 None。
             finished_at: 本次 cancelled 终态写入时间。
 
         Returns:
@@ -2156,7 +2138,8 @@ class FinsIngestionJobStore(Protocol):
         job_id: str,
         *,
         failure_summary: dict[str, JsonValue],
-        result_summary: dict[str, JsonValue],
+        result_summary: dict[str, JsonValue] | None,
+        cancelled_result_summary: dict[str, JsonValue] | None,
         finished_at: str,
     ) -> FinsIngestionJobRecord:
         """按当前状态原子保存 failed 或 cancelled 终态。
@@ -2164,7 +2147,8 @@ class FinsIngestionJobStore(Protocol):
         Args:
             job_id: opaque job id。
             failure_summary: failed 终态的有界失败摘要。
-            result_summary: failed 终态的有界业务结果摘要。
+            result_summary: failed 终态的完整摘要；未形成 typed 结果为 None。
+            cancelled_result_summary: 对应取消投影；非 download 或尚无结果为 None。
             finished_at: 本次终态写入时间。
 
         Returns:
@@ -2829,7 +2813,7 @@ class _DirectUploadProducer:
     """direct upload producer 绑定参数。"""
 
     runtime: "FinsIngestionRuntime"
-    request: ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest
+    request: ValidatedFinsUploadFilingRequest | ValidatedFinsUploadMaterialRequest
 
     def __call__(self, context: _FinsIngestionExecutionContext) -> None:
         """执行 direct upload producer。
@@ -2946,6 +2930,7 @@ class FsFinsIngestionJobStore:
         job_id: str,
         *,
         result_summary: dict[str, JsonValue],
+        cancelled_result_summary: dict[str, JsonValue] | None,
         finished_at: str,
     ) -> FinsIngestionJobRecord:
         """按当前取消状态原子保存 succeeded 或 cancelled 终态。
@@ -2953,6 +2938,7 @@ class FsFinsIngestionJobStore:
         Args:
             job_id: opaque job id。
             result_summary: succeeded 终态的有界业务结果摘要。
+            cancelled_result_summary: 已有 typed 结果的取消投影；尚无结果或非 download 为 None。
             finished_at: 本次终态写入时间。
 
         Returns:
@@ -2965,11 +2951,18 @@ class FsFinsIngestionJobStore:
             ValueError: job id、record 或摘要字段非法时抛出。
         """
 
-        _assert_bounded_summary(result_summary, "result_summary")
+        if result_summary is not None:
+            _assert_bounded_summary(result_summary, "result_summary")
         with file_lock(self.root_dir / _LOCK_FILE_NAME):
             record = self._read_record_locked(job_id)
             if record.status in _TERMINAL_STATUSES:
                 return record
+            if record.operation_kind is FinsIngestionOperationKind.DOWNLOAD and (record.result_summary or result_summary):
+                if cancelled_result_summary is None or not cancelled_result_summary:
+                    raise ValueError("已有 download 业务结果必须提供取消投影")
+                validate_download_json_summary(cancelled_result_summary)
+                if cancelled_result_summary["terminal_disposition"] != FinsDownloadTerminalDisposition.CANCELLED.value:
+                    raise ValueError("取消投影必须由 typed owner 覆盖为 cancelled")
             if record.cancellation_requested or record.status is FinsIngestionJobStatus.CANCELLING:
                 cancelled = replace(
                     record,
@@ -2977,6 +2970,8 @@ class FsFinsIngestionJobStore:
                     updated_at=finished_at,
                     finished_at=finished_at,
                     cancellation_requested=True,
+                    result_summary=_terminal_job_result_projection(record, cancelled_result_summary, preserve_current=True, typed_result_exists=result_summary is not None and bool(result_summary)),
+                    failure_summary=dict(_EMPTY_SUMMARY),
                 )
                 self._write_record_locked(cancelled)
                 return cancelled
@@ -2995,12 +2990,14 @@ class FsFinsIngestionJobStore:
         self,
         job_id: str,
         *,
+        result_summary: dict[str, JsonValue] | None,
         finished_at: str,
     ) -> FinsIngestionJobRecord:
         """仅当当前 job 非终态时原子保存 cancelled 终态。
 
         Args:
             job_id: opaque job id。
+            result_summary: 调用方取消投影；尚无业务结果或非 download 为 None。
             finished_at: 本次 cancelled 终态写入时间。
 
         Returns:
@@ -3023,6 +3020,8 @@ class FsFinsIngestionJobStore:
                 updated_at=finished_at,
                 finished_at=finished_at,
                 cancellation_requested=True,
+                result_summary=_terminal_job_result_projection(record, result_summary, preserve_current=True, typed_result_exists=False),
+                failure_summary=dict(_EMPTY_SUMMARY),
             )
             self._write_record_locked(cancelled)
             return cancelled
@@ -3087,7 +3086,8 @@ class FsFinsIngestionJobStore:
         job_id: str,
         *,
         failure_summary: dict[str, JsonValue],
-        result_summary: dict[str, JsonValue],
+        result_summary: dict[str, JsonValue] | None,
+        cancelled_result_summary: dict[str, JsonValue] | None,
         finished_at: str,
     ) -> FinsIngestionJobRecord:
         """按当前状态原子保存 failed 或 cancelled 终态。
@@ -3095,7 +3095,8 @@ class FsFinsIngestionJobStore:
         Args:
             job_id: opaque job id。
             failure_summary: failed 终态的有界失败摘要。
-            result_summary: failed 终态的有界业务结果摘要。
+            result_summary: failed 终态的完整摘要；未形成 typed 结果为 None。
+            cancelled_result_summary: 对应取消投影；非 download 或尚无结果为 None。
             finished_at: 本次终态写入时间。
 
         Returns:
@@ -3110,11 +3111,18 @@ class FsFinsIngestionJobStore:
         """
 
         _assert_bounded_summary(failure_summary, "failure_summary")
-        _assert_bounded_summary(result_summary, "result_summary")
+        if result_summary is not None:
+            _assert_bounded_summary(result_summary, "result_summary")
         with file_lock(self.root_dir / _LOCK_FILE_NAME):
             record = self._read_record_locked(job_id)
             if record.status in _TERMINAL_STATUSES:
                 return record
+            if record.operation_kind is FinsIngestionOperationKind.DOWNLOAD and (record.result_summary or result_summary):
+                if cancelled_result_summary is None or not cancelled_result_summary:
+                    raise ValueError("已有 download 业务结果必须提供取消投影")
+                validate_download_json_summary(cancelled_result_summary)
+                if cancelled_result_summary["terminal_disposition"] != FinsDownloadTerminalDisposition.CANCELLED.value:
+                    raise ValueError("取消投影必须由 typed owner 覆盖为 cancelled")
             if record.cancellation_requested or record.status is FinsIngestionJobStatus.CANCELLING:
                 cancelled = replace(
                     record,
@@ -3122,6 +3130,8 @@ class FsFinsIngestionJobStore:
                     updated_at=finished_at,
                     finished_at=finished_at,
                     cancellation_requested=True,
+                    result_summary=_terminal_job_result_projection(record, cancelled_result_summary, preserve_current=True, typed_result_exists=result_summary is not None and bool(result_summary)),
+                    failure_summary=dict(_EMPTY_SUMMARY),
                 )
                 self._write_record_locked(cancelled)
                 return cancelled
@@ -3130,7 +3140,7 @@ class FsFinsIngestionJobStore:
                 status=FinsIngestionJobStatus.FAILED,
                 updated_at=finished_at,
                 finished_at=finished_at,
-                result_summary=result_summary,
+                result_summary=_terminal_job_result_projection(record, result_summary, preserve_current=False, typed_result_exists=False),
                 failure_summary=failure_summary,
             )
             self._write_record_locked(failed)
@@ -3504,6 +3514,7 @@ class FinsIngestionRuntime:
     blob_repository: DocumentBlobRepositoryProtocol
     filing_maintenance_repository: FilingMaintenanceRepositoryProtocol
     filing_upload_state_repository: FilingUploadStateRepositoryProtocol
+    material_upload_state_repository: MaterialUploadStateRepositoryProtocol
     processed_repository: ProcessedDocumentRepositoryProtocol
     processor_registry: ProcessorRegistry
     job_store: FinsIngestionJobStore
@@ -3523,6 +3534,7 @@ class FinsIngestionRuntime:
         blob_repository: DocumentBlobRepositoryProtocol,
         filing_maintenance_repository: FilingMaintenanceRepositoryProtocol,
         filing_upload_state_repository: FilingUploadStateRepositoryProtocol,
+        material_upload_state_repository: MaterialUploadStateRepositoryProtocol,
         processed_repository: ProcessedDocumentRepositoryProtocol,
         processor_registry: ProcessorRegistry,
         job_store: FinsIngestionJobStore,
@@ -3558,6 +3570,7 @@ class FinsIngestionRuntime:
             blob_repository=blob_repository,
             filing_maintenance_repository=filing_maintenance_repository,
             filing_upload_state_repository=filing_upload_state_repository,
+            material_upload_state_repository=material_upload_state_repository,
             processed_repository=processed_repository,
             processor_registry=processor_registry,
             job_store=job_store,
@@ -3674,8 +3687,8 @@ class FinsIngestionRuntime:
             normalized = normalized_request.normalized_ticker
             source_kind = normalized_request.request.source_kind
         else:
-            normalized = ticker_normalization.normalize_ticker(normalized_request.ticker)
-            source_kind = normalized_request.source_kind
+            normalized = ticker_normalization.normalize_ticker(normalized_request.request.ticker)
+            source_kind = normalized_request.request.source_kind
         direct_operation_kind = _direct_upload_operation_kind(normalized_request)
         return ValidatedFinsEventStream(
             self._run_direct_stream(
@@ -3871,8 +3884,8 @@ class FinsIngestionRuntime:
             normalized = normalized_request.normalized_ticker
             source_kind = normalized_request.request.source_kind
         else:
-            normalized = ticker_normalization.normalize_ticker(normalized_request.ticker)
-            source_kind = normalized_request.source_kind
+            normalized = ticker_normalization.normalize_ticker(normalized_request.request.ticker)
+            source_kind = normalized_request.request.source_kind
         return self._prepare_observed_stream(
             direct_operation_kind=_direct_upload_operation_kind(normalized_request),
             operation_kind=FinsIngestionOperationKind.UPLOAD,
@@ -4304,17 +4317,16 @@ class FinsIngestionRuntime:
         try:
             producer(context)
         except Exception as exc:
-            error_kind = _classify_direct_error(
-                exc,
-                operation_kind=context.direct_operation_kind,
-            )
+            cause = _download_exception_cause(exc)
+            typed_summary = exc.persisted_summary if isinstance(exc, FinsSourceDownloadAdapterFailure) else None
             download_summary = (
                 None
                 if context.download_request is None
                 else _public_download_summary(
-                    _empty_download_summary_from_request(
-                        context.download_request,
-                        terminal_disposition=FinsDownloadTerminalDisposition.FAILED,
+                    typed_summary
+                    if typed_summary is not None
+                    else _empty_download_summary_from_request(
+                        context.download_request, terminal_disposition=FinsDownloadTerminalDisposition.FAILED
                     )
                 )
             )
@@ -4322,9 +4334,14 @@ class FinsIngestionRuntime:
                 None
                 if context.download_request is None
                 else _download_public_failure_from_exception(
-                    exc,
+                    cause,
                     request=context.download_request,
                 )
+            )
+            error_kind = (
+                _DOWNLOAD_PUBLIC_ERROR_KINDS[public_failure.kind]
+                if public_failure is not None
+                else _classify_direct_error(cause)
             )
             self._emit_direct_result(
                 context,
@@ -4339,6 +4356,11 @@ class FinsIngestionRuntime:
                 download=download_summary,
                 failure=public_failure,
             )
+            if public_failure is not None and public_failure.kind is FinsPublicFailureKind.EXECUTION:
+                _LOGGER.error(
+                    "fins.download.unexpected_failure %s",
+                    safe_exception_trace(cause, source_root=Path(__file__).parent.parent),
+                )
         finally:
             _put_direct_queue(context, _DirectStreamProducerDone())
 
@@ -4377,19 +4399,19 @@ class FinsIngestionRuntime:
             },
         )
         if context.cancellation_checker():
-            self._emit_direct_cancelled_result(context)
+            self._emit_direct_cancelled_result(context, download_summary=None)
             return
         summary = self._execute_download_request(context, normalized, request)
-        if context.cancellation_checker():
-            self._emit_direct_cancelled_result(context)
+        if summary.terminal_disposition is FinsDownloadTerminalDisposition.CANCELLED or context.cancellation_checker():
+            self._emit_direct_cancelled_result(context, download_summary=summary)
             return
-        if summary.failed_count > 0 and summary.downloaded_count == 0 and summary.rejected_count == 0:
+        if summary.uncertain_count > 0 or (summary.failed_count > 0 and summary.downloaded_count == 0 and summary.rejected_count == 0):
             failure = FinsPublicFailure(
                 kind=FinsPublicFailureKind.EXECUTION,
                 source=summary.source,
                 transport_category=None,
-                safe_message=direct_download_no_source_documents_message(),
-                retry_hint="请检查文档失败分类后重试；若持续失败，请检查运行日志中的脱敏分类。",
+                safe_message=(direct_download_uncertain_period_message() if summary.uncertain_count else direct_download_no_source_documents_message()),
+                retry_hint=("请补齐可信年度截止日资料后重试。" if summary.uncertain_count else "请检查文档失败分类后重试；若持续失败，请检查运行日志中的脱敏分类。"),
             )
             self._emit_direct_result(
                 context,
@@ -4444,11 +4466,11 @@ class FinsIngestionRuntime:
             },
         )
         if context.cancellation_checker():
-            self._emit_direct_cancelled_result(context)
+            self._emit_direct_cancelled_result(context, download_summary=None)
             return
         summary = self._execute_preprocess_request(context, request)
         if context.cancellation_checker():
-            self._emit_direct_cancelled_result(context)
+            self._emit_direct_cancelled_result(context, download_summary=None)
             return
         if summary.result_status() is FinsPreprocessResultStatus.FAILED:
             self._emit_direct_result(
@@ -4471,7 +4493,7 @@ class FinsIngestionRuntime:
         self,
         *,
         context: _FinsIngestionExecutionContext,
-        request: ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest,
+        request: ValidatedFinsUploadFilingRequest | ValidatedFinsUploadMaterialRequest,
     ) -> None:
         """执行 direct upload producer。
 
@@ -4496,7 +4518,7 @@ class FinsIngestionRuntime:
             payload=_upload_context_request_progress_payload(context, request),
         )
         if context.cancellation_checker():
-            self._emit_direct_cancelled_result(context)
+            self._emit_direct_cancelled_result(context, download_summary=None)
             return
         if self.upload_runner is None:
             self._emit_direct_result(
@@ -4505,8 +4527,9 @@ class FinsIngestionRuntime:
                 details=_upload_result_details(
                     FinsUploadResultSummary(
                         source_kind=_raw_upload_request(request).source_kind,
+                        published_amended=None,
                         status=_UPLOAD_RESULT_STATUS_FAILED,
-                        requested_file_count=len(_raw_upload_request(request).files),
+                        requested_file_count=validated_fins_upload_file_count(request),
                         stored_file_count=0,
                         failure_reason=fins_upload_failure_from_exception(
                             RuntimeError(),
@@ -4590,7 +4613,7 @@ class FinsIngestionRuntime:
                 request_summary=request_summary,
             )
             if _is_start_cancelled(cancellation_token):
-                return _job_start_from_record(self._save_cancelled(start.record))
+                return _job_start_from_record(self._save_cancelled(start.record, result_summary=None))
             self.executor.submit(
                 start.job_id,
                 lambda: self._run_download_job(
@@ -4645,7 +4668,7 @@ class FinsIngestionRuntime:
                 request_summary=request_summary,
             )
             if _is_start_cancelled(cancellation_token):
-                return _job_start_from_record(self._save_cancelled(start.record))
+                return _job_start_from_record(self._save_cancelled(start.record, result_summary=None))
             self.executor.submit(
                 start.job_id,
                 lambda: self._run_preprocess_job(
@@ -4688,8 +4711,8 @@ class FinsIngestionRuntime:
             normalized = normalized_request.normalized_ticker
             source_kind = normalized_request.request.source_kind
         else:
-            normalized = ticker_normalization.normalize_ticker(normalized_request.ticker)
-            source_kind = normalized_request.source_kind
+            normalized = ticker_normalization.normalize_ticker(normalized_request.request.ticker)
+            source_kind = normalized_request.request.source_kind
         request_summary = _upload_request_summary(normalized_request)
         _raise_if_start_cancelled(cancellation_token)
         with self._start_lock:
@@ -4701,7 +4724,7 @@ class FinsIngestionRuntime:
                 request_summary=request_summary,
             )
             if _is_start_cancelled(cancellation_token):
-                return _job_start_from_record(self._save_cancelled(start.record))
+                return _job_start_from_record(self._save_cancelled(start.record, result_summary=None))
             self.executor.submit(
                 start.job_id,
                 lambda: self._run_upload_job(
@@ -4714,19 +4737,19 @@ class FinsIngestionRuntime:
     def _validate_runtime_upload_request(
         self,
         request: FinsRuntimeUploadRequest,
-    ) -> ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest:
+    ) -> ValidatedFinsUploadFilingRequest | ValidatedFinsUploadMaterialRequest:
         """在任何 producer/job/observation 创建前验证 upload request。
 
         Args:
             request: raw 或已 prevalidated 的 upload request。
 
         Returns:
-            filing 返回 validated typed request；material 返回既有 normalized request。
+            filing 与 material 均返回已校验的 typed request。
 
         Raises:
-            FinsUploadUsageError: raw filing request 违反 usage contract 时抛出。
+            FinsUploadUsageError: raw filing 或 material 请求违反 usage contract 时抛出。
             FinsUploadPrevalidationError: raw filing target 为 ``UNSAFE`` 时原样抛出。
-            ValueError: material request 非法或 published state 损坏时抛出。
+            ValueError: 已校验请求或 published state 损坏时抛出。
             OSError: filing published state 读取失败时抛出。
         """
 
@@ -4742,10 +4765,10 @@ class FinsIngestionRuntime:
                 request,
                 published_state=published_state,
             )
-        normalized_request = _normalize_upload_request(request)
-        if not isinstance(normalized_request, FinsUploadMaterialRequest):
-            raise AssertionError("material upload normalization 返回错误类型")
-        return normalized_request
+        if isinstance(request, ValidatedFinsUploadMaterialRequest):
+            request.validate()
+            return request
+        return admit_fins_upload_material_request(request, state_repository=self.material_upload_state_repository)
 
     def read_job(self, job_id: str) -> FinsIngestionJobRecord:
         """读取 ingestion job。
@@ -4899,18 +4922,19 @@ class FinsIngestionRuntime:
             summary = self._execute_preprocess_request(context, request)
             latest = self.job_store.read_job(job_id)
             if latest.cancellation_requested or latest.status is FinsIngestionJobStatus.CANCELLING:
-                self._save_cancelled(latest)
+                self._save_cancelled(latest, result_summary=None)
                 return
             if summary.result_status() is FinsPreprocessResultStatus.FAILED:
                 self._save_failed(
                     latest,
                     message=direct_preprocess_no_requested_documents_message(),
                     result_summary=summary.to_json_summary(),
+                    cancelled_result_summary=None,
                 )
                 return
-            self._save_succeeded(latest, summary.to_json_summary())
+            self._save_succeeded(latest, summary.to_json_summary(), cancelled_result_summary=None)
         except Exception as exc:
-            self._save_failed_from_exception(job_id, exc)
+            self._save_failed_from_exception(job_id, exc, result_summary=None, cancelled_result_summary=None)
 
     def _run_download_job(
         self,
@@ -4933,6 +4957,7 @@ class FinsIngestionRuntime:
             无。所有业务与运行时异常都会转换为 terminal job record。
         """
 
+        summary: _FinsDownloadResultSummary | None = None
         try:
             record = self._mark_job_running_or_cancelled(job_id)
             if record.status in _TERMINAL_STATUSES:
@@ -4943,27 +4968,72 @@ class FinsIngestionRuntime:
             )
             summary = self._execute_download_request(context, normalized, request)
             latest = self.job_store.read_job(job_id)
-            if latest.cancellation_requested or latest.status is FinsIngestionJobStatus.CANCELLING:
-                self._save_cancelled(latest)
+            if summary.terminal_disposition is FinsDownloadTerminalDisposition.CANCELLED or latest.cancellation_requested or latest.status is FinsIngestionJobStatus.CANCELLING:
+                self._save_cancelled(latest, result_summary=_cancelled_download_json_summary(summary))
                 return
-            if summary.failed_count > 0 and summary.downloaded_count == 0 and summary.rejected_count == 0:
+            if summary.uncertain_count > 0 or (summary.failed_count > 0 and summary.downloaded_count == 0 and summary.rejected_count == 0):
                 self._save_failed(
                     latest,
-                    message=direct_download_no_source_documents_message(),
-                    result_summary=summary.to_json_summary(),
+                    message=(direct_download_uncertain_period_message() if summary.uncertain_count else direct_download_no_source_documents_message()),
+                    result_summary=summary.to_json_summary(max_json_chars=_MAX_SUMMARY_JSON_CHARS),
+                    cancelled_result_summary=_cancelled_download_json_summary(summary),
                 )
                 return
-            self._save_succeeded(latest, summary.to_json_summary())
+            self._save_succeeded(latest, summary.to_json_summary(max_json_chars=_MAX_SUMMARY_JSON_CHARS), cancelled_result_summary=_cancelled_download_json_summary(summary))
         except _UnsupportedDownloadSourceError as exc:
             self._save_download_unsupported(job_id, request=request, message=str(exc))
+        except (FinsSourceDownloadAdapterFailure, SourceIntegrityPreflightError, SourceIntegrityRevisionConflictError, SourceIntegrityRepairRequiredError) as exc:
+            self._save_typed_download_failure(job_id, request=request, exc=exc)
         except Exception as exc:
-            self._save_failed_from_exception(job_id, exc)
+            self._save_failed_from_exception(
+                job_id, exc,
+                result_summary=None if summary is None else summary.to_json_summary(max_json_chars=_MAX_SUMMARY_JSON_CHARS),
+                cancelled_result_summary=None if summary is None else _cancelled_download_json_summary(summary),
+            )
+
+    def _save_typed_download_failure(
+        self,
+        job_id: str,
+        *,
+        request: FinsDownloadRequest,
+        exc: FinsSourceDownloadAdapterFailure | SourceIntegrityPreflightError | SourceIntegrityRevisionConflictError | SourceIntegrityRepairRequiredError,
+    ) -> None:
+        """用与 direct 同源的安全失败及已验证摘要保存 typed job。
+
+        Args:
+            job_id: 后台任务标识。
+            request: 当前下载请求。
+            exc: 私有部分摘要或初始请求级封闭完整性失败。
+
+        Returns:
+            无。
+
+        Raises:
+            无。二次读写失败只记录固定安全事件。
+        """
+
+        cause = _download_exception_cause(exc)
+        failure = _download_public_failure_from_exception(cause, request=request)
+        summary = (
+            exc.persisted_summary
+            if isinstance(exc, FinsSourceDownloadAdapterFailure)
+            else _empty_download_summary_from_request(
+                request, terminal_disposition=FinsDownloadTerminalDisposition.FAILED
+            )
+        )
+        try:
+            record = self.job_store.read_job(job_id)
+            if record.status in _TERMINAL_STATUSES:
+                return
+            self._save_failed(record, message=failure.safe_message, result_summary=summary.to_json_summary(max_json_chars=_MAX_SUMMARY_JSON_CHARS), cancelled_result_summary=_cancelled_download_json_summary(summary))
+        except Exception:
+            _LOGGER.warning("fins.download.typed_failed_record_save_failed")
 
     def _run_upload_job(
         self,
         *,
         job_id: str,
-        request: ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest,
+        request: ValidatedFinsUploadFilingRequest | ValidatedFinsUploadMaterialRequest,
     ) -> None:
         """执行上传后台 job，并把异常收口到 job store。
 
@@ -4978,25 +5048,13 @@ class FinsIngestionRuntime:
             无。所有业务与运行时异常都会转换为 terminal job record。
         """
 
+        terminal_saved = False
         try:
             record = self._mark_job_running_or_cancelled(job_id)
             if record.status in _TERMINAL_STATUSES:
                 return
             if self.upload_runner is None:
-                self._save_failed(
-                    record,
-                    message=_UNSUPPORTED_UPLOAD_RUNTIME_MESSAGE,
-                    result_summary=FinsUploadResultSummary(
-                        source_kind=_raw_upload_request(request).source_kind,
-                        status=_UPLOAD_RESULT_STATUS_FAILED,
-                        requested_file_count=len(_raw_upload_request(request).files),
-                        stored_file_count=0,
-                        failure_reason=fins_upload_failure_from_exception(
-                            RuntimeError(),
-                            file_label=None,
-                        ),
-                    ).to_json_summary(),
-                )
+                self._save_upload_failure_if_active(job_id, request, RuntimeError())
                 return
             context = self._job_execution_context(
                 record,
@@ -5018,6 +5076,7 @@ class FinsIngestionRuntime:
             if disposition is FinsUploadTerminalDisposition.CANCELLED:
                 saved = self.job_store.save_cancelled_if_active(
                     job_id,
+                    result_summary=summary.to_json_summary() if summary.source_kind is SourceKind.MATERIAL else None,
                     finished_at=finished_at,
                 )
             else:
@@ -5033,6 +5092,7 @@ class FinsIngestionRuntime:
                     failure_summary=failure_summary,
                     finished_at=finished_at,
                 )
+            terminal_saved = True
             saved_disposition = _upload_terminal_disposition_from_job_record(saved)
             if saved_disposition is not FinsUploadTerminalDisposition.CANCELLED:
                 progress_type = _upload_completed_progress_type(saved_disposition)
@@ -5049,7 +5109,17 @@ class FinsIngestionRuntime:
                 )
             self._append_terminal_job_event_warn(saved)
         except Exception as exc:
-            self._save_failed_from_exception(job_id, exc)
+            if terminal_saved:
+                _LOGGER.warning("upload 终态已落盘，终态进度投影失败，保留原记录", exc_info=True)
+                return
+            self._save_upload_failure_if_active(job_id, request, exc)
+
+    def _save_upload_failure_if_active(self, job_id: str, request: ValidatedFinsUploadFilingRequest | ValidatedFinsUploadMaterialRequest, error: Exception) -> None:
+        """参数：job、同次请求与异常；返回：无；异常：仓储异常透传；双摘要共享 typed reason，终态保持。"""
+        reason = fins_upload_failure_from_exception(error, file_label=None)
+        summary = FinsUploadResultSummary(source_kind=request.request.source_kind, published_amended=None, status=_UPLOAD_RESULT_STATUS_FAILED, requested_file_count=validated_fins_upload_file_count(request), stored_file_count=0, failure_reason=reason)
+        saved = self.job_store.save_accepted_upload_terminal_if_active(job_id, disposition=FinsUploadTerminalDisposition.FAILED, result_summary=summary.to_json_summary(), failure_summary=reason.to_json(), finished_at=_utc_now())
+        self._append_terminal_job_event_warn(saved)
 
     def _mark_job_running_or_cancelled(self, job_id: str) -> FinsIngestionJobRecord:
         """把 queued job 标记为 running，或按取消请求收口为 cancelled。
@@ -5278,7 +5348,7 @@ class FinsIngestionRuntime:
         """执行单个下载请求。
 
         Args:
-            record: 已进入 running 的 job record。
+            context: 当前下载执行上下文。
             normalized: 已归一化 ticker。
             request: 下载请求。
 
@@ -5289,6 +5359,7 @@ class FinsIngestionRuntime:
             _UnsupportedDownloadSourceError: 没有匹配 adapter 时抛出。
             ValueError: adapter 返回字段非法时抛出。
             OSError: 仓储读取或写入失败时抛出。
+            FinsSourceDownloadAdapterFailure: adapter 已验证文档快照的封闭中止。
         """
 
         adapter = self._select_download_adapter(source=request.source.value, market=normalized.market)
@@ -5309,7 +5380,12 @@ class FinsIngestionRuntime:
             document_id=None,
             payload=_download_context_request_progress_payload(context, adapter_request),
         )
-        adapter_result = adapter.download(adapter_request)
+        try:
+            adapter_result = adapter.download(adapter_request)
+        except FinsSourceDownloadAdapterFailure as exc:
+            summary = _bounded_download_summary(exc.persisted_summary)
+            _validate_download_summary_request_identity(summary, request=request)
+            raise
         if adapter_result.persisted_summary is not None:
             if adapter_result.documents or adapter_result.rejected_artifacts:
                 raise ValueError("adapter persisted_summary 不得与 documents/rejected_artifacts 同时返回")
@@ -5407,6 +5483,7 @@ class FinsIngestionRuntime:
                 rebuild_local_artifacts=request.rebuild_local_artifacts,
             ),
             document_rows=rows,
+            uncertain_reports=(),
             missing_periods=(),
         )
         self._emit_context_progress(
@@ -5856,12 +5933,15 @@ class FinsIngestionRuntime:
         self,
         record: FinsIngestionJobRecord,
         result_summary: dict[str, JsonValue],
+        *,
+        cancelled_result_summary: dict[str, JsonValue] | None,
     ) -> FinsIngestionJobRecord:
         """保存 succeeded 终态。
 
         Args:
             record: 当前 job record。
             result_summary: 有界业务结果摘要。
+            cancelled_result_summary: 下载的完整取消投影，非 download 为 None。
 
         Returns:
             更新后的 job record。
@@ -5876,16 +5956,18 @@ class FinsIngestionRuntime:
         saved = self.job_store.save_succeeded_or_cancelled(
             record.job_id,
             result_summary=result_summary,
+            cancelled_result_summary=cancelled_result_summary,
             finished_at=now,
         )
         self._append_terminal_job_event_warn(saved)
         return saved
 
-    def _save_cancelled(self, record: FinsIngestionJobRecord) -> FinsIngestionJobRecord:
+    def _save_cancelled(self, record: FinsIngestionJobRecord, *, result_summary: dict[str, JsonValue] | None) -> FinsIngestionJobRecord:
         """保存 cancelled 终态。
 
         Args:
             record: 当前 job record。
+            result_summary: 调用方取消投影；尚无结果或非 download 为 None。
 
         Returns:
             更新后的 job record。
@@ -5895,7 +5977,7 @@ class FinsIngestionRuntime:
         """
 
         now = _utc_now()
-        saved = self.job_store.save_cancelled_if_active(record.job_id, finished_at=now)
+        saved = self.job_store.save_cancelled_if_active(record.job_id, result_summary=result_summary, finished_at=now)
         self._append_terminal_job_event_warn(saved)
         return saved
 
@@ -5904,14 +5986,16 @@ class FinsIngestionRuntime:
         record: FinsIngestionJobRecord,
         *,
         message: str,
-        result_summary: dict[str, JsonValue] | None = None,
+        result_summary: dict[str, JsonValue] | None,
+        cancelled_result_summary: dict[str, JsonValue] | None,
     ) -> FinsIngestionJobRecord:
         """保存 failed 终态。
 
         Args:
             record: 当前 job record。
             message: 有界失败说明。
-            result_summary: 可选业务结果摘要。
+            result_summary: 未形成 typed 结果时为 None，否则为完整业务摘要。
+            cancelled_result_summary: 对应取消投影；非 download 或尚无结果为 None。
 
         Returns:
             更新后的 job record。
@@ -5929,13 +6013,14 @@ class FinsIngestionRuntime:
             )
         }
         _assert_bounded_summary(failure_summary, "failure_summary")
-        final_result = result_summary or dict(_EMPTY_SUMMARY)
-        _assert_bounded_summary(final_result, "result_summary")
+        if result_summary is not None:
+            _assert_bounded_summary(result_summary, "result_summary")
         now = _utc_now()
         saved = self.job_store.save_failed_or_cancelled_if_active(
             record.job_id,
             failure_summary=failure_summary,
-            result_summary=final_result,
+            result_summary=result_summary,
+            cancelled_result_summary=cancelled_result_summary,
             finished_at=now,
         )
         self._append_terminal_job_event_warn(saved)
@@ -5972,7 +6057,8 @@ class FinsIngestionRuntime:
                 result_summary=_empty_download_summary_from_request(
                     request,
                     terminal_disposition=FinsDownloadTerminalDisposition.FAILED,
-                ).to_json_summary(),
+                ).to_json_summary(max_json_chars=_MAX_SUMMARY_JSON_CHARS),
+                cancelled_result_summary=_cancelled_download_json_summary(_empty_download_summary_from_request(request, terminal_disposition=FinsDownloadTerminalDisposition.FAILED)),
             )
         except Exception as terminal_exc:
             _LOGGER.warning(
@@ -5983,12 +6069,14 @@ class FinsIngestionRuntime:
             )
             return
 
-    def _save_failed_from_exception(self, job_id: str, exc: Exception) -> None:
+    def _save_failed_from_exception(self, job_id: str, exc: Exception, *, result_summary: dict[str, JsonValue] | None, cancelled_result_summary: dict[str, JsonValue] | None) -> None:
         """把后台异常转换为 failed job record。
 
         Args:
             job_id: opaque job id。
             exc: 后台执行异常。
+            result_summary: 已返回 typed 结果的正常投影；尚无结果为 None。
+            cancelled_result_summary: 同一 typed 结果的取消投影；尚无结果为 None。
 
         Returns:
             无。
@@ -6001,7 +6089,7 @@ class FinsIngestionRuntime:
             record = self.job_store.read_job(job_id)
             if record.status in _TERMINAL_STATUSES:
                 return
-            self._save_failed(record, message=str(exc) or type(exc).__name__)
+            self._save_failed(record, message=str(exc) or type(exc).__name__, result_summary=result_summary, cancelled_result_summary=cancelled_result_summary)
         except Exception as terminal_exc:
             _LOGGER.warning(
                 "fins.ingestion.failed_terminalization_failed job_id=%s error_type=%s original_error_type=%s",
@@ -6050,7 +6138,7 @@ class FinsIngestionRuntime:
             record: 事件对应的 running job record 快照。
             source_event_type: runtime 内部进度标签，只用于消费方展示分类。
             message: 有界进度说明。
-            document_id: 可选业务文档 ID；不得放本地文件路径。
+            document_id: 可选的实际业务文档 ID；不得放本地文件路径。
             payload: 有界 JSON-compatible 业务摘要。
 
         Returns:
@@ -6106,7 +6194,7 @@ class FinsIngestionRuntime:
             context: legacy job 或 direct stream 执行上下文。
             source_event_type: runtime 内部进度标签。
             message: 用户可读进度说明。
-            document_id: 可选业务文档 ID。
+            document_id: 可选的实际业务文档 ID，用于标识进度或结果对应的文档。
             payload: 有界业务摘要。
 
         Returns:
@@ -6261,11 +6349,12 @@ class FinsIngestionRuntime:
         )
         _put_direct_queue(context, event)
 
-    def _emit_direct_cancelled_result(self, context: _FinsIngestionExecutionContext) -> None:
+    def _emit_direct_cancelled_result(self, context: _FinsIngestionExecutionContext, *, download_summary: _FinsDownloadResultSummary | None) -> None:
         """向 direct stream 投递取消 RESULT。
 
         Args:
             context: direct stream 执行上下文。
+            download_summary: 已返回的 typed 下载结果；尚未执行或非 download 为 None。
 
         Returns:
             无。
@@ -6287,9 +6376,9 @@ class FinsIngestionRuntime:
                 None
                 if context.download_request is None
                 else _public_download_summary(
-                    _empty_download_summary_from_request(
-                        context.download_request,
-                        terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED,
+                    replace(download_summary, terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED)
+                    if download_summary is not None else _empty_download_summary_from_request(
+                        context.download_request, terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED,
                     )
                 )
             ),
@@ -6423,7 +6512,7 @@ def _direct_progress_event(
         context: direct stream 执行上下文。
         source_event_type: runtime 进度阶段。
         message: 用户可读进度说明。
-        document_id: 可选业务文档 ID。
+        document_id: 可选的实际业务文档 ID，用于标识进度或结果对应的文档。
         payload: 有界业务摘要。
         emitted_at: 调用方提供的带时区事件构造时间。
 
@@ -6492,7 +6581,7 @@ def _direct_result_event(
             error_kind=FinsErrorKind.CANCELLED,
             fallback_message=None,
         )
-        download = (
+        download = replace(download, terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED) if download is not None else (
             None
             if context.download_request is None
             else _public_download_summary(
@@ -6534,7 +6623,7 @@ def _direct_result_event(
 def _direct_upload_terminal_events(
     *,
     context: _FinsIngestionExecutionContext,
-    request: ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest,
+    request: ValidatedFinsUploadFilingRequest | ValidatedFinsUploadMaterialRequest,
     summary: FinsUploadResultSummary,
     disposition: FinsUploadTerminalDisposition,
     emitted_at: datetime,
@@ -6571,7 +6660,7 @@ def _direct_upload_terminal_events(
     result_event = _direct_result_event(
         context=context,
         status=_direct_upload_result_status(disposition),
-        details=(() if disposition is FinsUploadTerminalDisposition.CANCELLED else _upload_result_details(summary)),
+        details=(() if disposition is FinsUploadTerminalDisposition.CANCELLED and summary.source_kind is SourceKind.FILING else _upload_result_details(summary)),
         error_kind=(FinsErrorKind.EXECUTION if disposition is FinsUploadTerminalDisposition.FAILED else None),
         error_message=(
             summary.failure_reason.message
@@ -6659,7 +6748,7 @@ def _direct_document_label(document_id: str | None) -> str | None:
     """构造 direct event 的文档短标签。
 
     Args:
-        document_id: 可选业务文档 ID。
+        document_id: 可选的实际业务文档 ID，用于标识进度或结果对应的文档。
 
     Returns:
         文档短标签；为空时返回 ``None``。
@@ -6692,7 +6781,7 @@ def _direct_filing_kind(source_kind: SourceKind | None) -> str | None:
 
 
 def _direct_upload_operation_kind(
-    request: ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest,
+    request: ValidatedFinsUploadFilingRequest | ValidatedFinsUploadMaterialRequest,
 ) -> FinsOperationKind:
     """按上传请求类型选择 direct operation kind。
 
@@ -6708,7 +6797,7 @@ def _direct_upload_operation_kind(
 
     if isinstance(request, ValidatedFinsUploadFilingRequest):
         return FinsOperationKind.UPLOAD_FILING
-    if isinstance(request, FinsUploadMaterialRequest):
+    if isinstance(request, ValidatedFinsUploadMaterialRequest):
         return FinsOperationKind.UPLOAD_MATERIAL
     assert_never(request)
 
@@ -6764,7 +6853,8 @@ def _public_download_summary(
         )
         for row in summary.document_rows[:FINS_DOWNLOAD_PUBLIC_MAX_DOCUMENT_ROWS]
     )
-    omitted_count = summary.discovered_count - len(public_rows)
+    omitted_count = len(summary.document_rows) - len(public_rows)
+    uncertain_reports = summary.public_uncertain_reports(max_json_chars=_MAX_SUMMARY_JSON_CHARS)
     return FinsDownloadPublicSummary(
         source=summary.source,
         canonical_ticker=summary.canonical_ticker,
@@ -6774,6 +6864,9 @@ def _public_download_summary(
         skipped_count=summary.skipped_count,
         rejected_count=summary.rejected_count,
         failed_count=summary.failed_count,
+        uncertain_count=summary.uncertain_count,
+        uncertain_reports=uncertain_reports,
+        omitted_uncertain_count=summary.uncertain_count - len(uncertain_reports),
         document_rows=public_rows,
         missing_periods=summary.missing_periods,
         omitted_count=omitted_count,
@@ -6814,10 +6907,43 @@ def _empty_download_summary_from_request(
         skipped_count=0,
         rejected_count=0,
         failed_count=0,
+        uncertain_count=0,
+        uncertain_reports=(),
         document_rows=(),
         terminal_disposition=terminal_disposition,
         missing_periods=(),
     )
+
+
+_SOURCE_INTEGRITY_PUBLIC_REASONS: Final[Mapping[SourceIntegrityPreflightReason, FinsDownloadFailureReason]] = {
+    SourceIntegrityPreflightReason.MULTIPLE_REPAIR_REQUIRED: FinsDownloadFailureReason.MULTIPLE_REPAIR_REQUIRED,
+    SourceIntegrityPreflightReason.UNSELECTED_REPAIR_REQUIRED: FinsDownloadFailureReason.UNSELECTED_REPAIR_REQUIRED,
+    SourceIntegrityPreflightReason.SELECTED_REJECTED_REPAIR_REQUIRED: FinsDownloadFailureReason.SELECTED_REJECTED_REPAIR_REQUIRED,
+    SourceIntegrityPreflightReason.UNSAFE_PUBLICATION: FinsDownloadFailureReason.UNSAFE_PUBLICATION,
+}
+
+_DOWNLOAD_PUBLIC_ERROR_KINDS: Final[Mapping[FinsPublicFailureKind, FinsErrorKind]] = {
+    FinsPublicFailureKind.STORAGE: FinsErrorKind.STORAGE,
+    FinsPublicFailureKind.EXECUTION: FinsErrorKind.EXECUTION,
+    FinsPublicFailureKind.CONFIGURATION: FinsErrorKind.PROVIDER,
+    FinsPublicFailureKind.PROVIDER_TRANSPORT: FinsErrorKind.PROVIDER,
+}
+
+
+def _download_exception_cause(exc: Exception) -> Exception:
+    """在 Fins 边界唯一解出 adapter 持有的原始 typed cause。
+
+    Args:
+        exc: adapter 或 storage 抛出的异常。
+
+    Returns:
+        原始完整性异常；其它异常保持原对象。
+
+    Raises:
+        无。
+    """
+
+    return exc.cause if isinstance(exc, FinsSourceDownloadAdapterFailure) else exc
 
 
 def _download_public_failure_from_exception(
@@ -6838,6 +6964,7 @@ def _download_public_failure_from_exception(
         ValueError: public failure contract 校验失败时抛出。
     """
 
+    exc = _download_exception_cause(exc)
     if isinstance(exc, FinsDownloadProviderError):
         kind = (
             FinsPublicFailureKind.CONFIGURATION
@@ -6860,6 +6987,33 @@ def _download_public_failure_from_exception(
             safe_message=exc.safe_message,
             retry_hint=retry_hint,
         )
+    if isinstance(exc, SourceIntegrityPreflightError):
+        return FinsPublicFailure(
+            kind=FinsPublicFailureKind.STORAGE,
+            source=request.source,
+            transport_category=None,
+            safe_message="本地来源完整性预检失败",
+            retry_hint="请检查并修复工作区来源状态后重试；重复下载不会自行修复。",
+            reason_code=_SOURCE_INTEGRITY_PUBLIC_REASONS[exc.reason],
+        )
+    if isinstance(exc, SourceIntegrityRevisionConflictError):
+        return FinsPublicFailure(
+            kind=FinsPublicFailureKind.STORAGE,
+            source=request.source,
+            transport_category=None,
+            safe_message="本地来源版本持续变化，本次下载已停止",
+            retry_hint="请等待其它来源写入完成后重新发起下载；若仍失败，请检查并发写入。",
+            reason_code=FinsDownloadFailureReason.SOURCE_REVISION_CONFLICT,
+        )
+    if isinstance(exc, SourceIntegrityRepairRequiredError):
+        return FinsPublicFailure(
+            kind=FinsPublicFailureKind.STORAGE,
+            source=request.source,
+            transport_category=None,
+            safe_message="本地来源仍需修复，本次下载已停止",
+            retry_hint="请检查并修复工作区来源状态后重新发起下载；不要仅按并发冲突反复重试。",
+            reason_code=FinsDownloadFailureReason.SOURCE_REPAIR_REQUIRED,
+        )
     if isinstance(exc, OSError):
         return FinsPublicFailure(
             kind=FinsPublicFailureKind.STORAGE,
@@ -6873,7 +7027,7 @@ def _download_public_failure_from_exception(
         source=request.source,
         transport_category=None,
         safe_message="下载执行失败",
-        retry_hint="请重新发起下载；若持续失败，请检查运行日志中的脱敏分类。",
+        retry_hint="请保存脱敏诊断并排查失败原因后重试。",
     )
 
 
@@ -6920,6 +7074,8 @@ def _upload_result_details(summary: FinsUploadResultSummary) -> tuple[FinsEventD
         FinsEventDetail("requested files", str(summary.requested_file_count)),
         FinsEventDetail("stored files", str(summary.stored_file_count)),
     ]
+    if summary.source_kind is SourceKind.MATERIAL:
+        details.append(FinsEventDetail("published amended", "null" if summary.published_amended is None else str(summary.published_amended).lower()))
     if summary.failure_reason is not None:
         details.extend(
             (
@@ -7045,14 +7201,11 @@ def _optional_upload_result_bool(result: Mapping[str, JsonValue], key: str) -> b
 
 def _classify_direct_error(
     exc: Exception,
-    *,
-    operation_kind: FinsOperationKind,
 ) -> FinsErrorKind:
     """把 runtime 异常归类为 direct error kind。
 
     Args:
         exc: runtime 异常。
-        operation_kind: 当前 direct operation。
 
     Returns:
         direct 失败分类。
@@ -7061,12 +7214,9 @@ def _classify_direct_error(
         无。
     """
 
+    exc = _download_exception_cause(exc)
     if isinstance(exc, FinsDownloadProviderError):
         return FinsErrorKind.PROVIDER
-    if operation_kind is FinsOperationKind.DOWNLOAD:
-        if isinstance(exc, OSError):
-            return FinsErrorKind.STORAGE
-        return FinsErrorKind.EXECUTION
     if isinstance(exc, _UnsupportedDownloadSourceError | ValueError | FileNotFoundError):
         return FinsErrorKind.USER_INPUT
     if isinstance(exc, OSError):
@@ -7691,36 +7841,14 @@ def _download_document_meta(meta: Mapping[str, JsonValue]) -> DocumentMeta:
     return result
 
 
-def _normalize_upload_request(request: FinsUploadRequest) -> FinsUploadRequest:
-    """校验并归一化上传请求。
-
-    Args:
-        request: 原始上传请求。
-
-    Returns:
-        已归一化 action 字段的上传请求。
-
-    Raises:
-        ValueError: source_kind、action 或有界字段非法时抛出。
-    """
-
-    _admit_fins_upload_ticker_identity(request.ticker, request.ticker_aliases)
-    action = _normalize_upload_action(request.action)
-    _validate_upload_source_kind(request)
-    if isinstance(request, FinsUploadFilingRequest):
-        return replace(request, action=action)
-    if isinstance(request, FinsUploadMaterialRequest):
-        return replace(request, action=action)
-    assert_never(request)
-
 
 def _raw_upload_request(
-    request: ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest,
+    request: ValidatedFinsUploadFilingRequest | ValidatedFinsUploadMaterialRequest,
 ) -> FinsUploadFilingRequest | FinsUploadMaterialRequest:
     """返回 validated handoff 中携带的原始 upload request。
 
     Args:
-        request: filing validated request 或 material request。
+        request: filing 或 material 的 validated handoff。
 
     Returns:
         原始 immutable upload request。
@@ -7729,9 +7857,7 @@ def _raw_upload_request(
         无。
     """
 
-    if isinstance(request, ValidatedFinsUploadFilingRequest):
-        return request.request
-    return request
+    return request.request
 
 
 def _normalize_upload_action(action: str) -> str:
@@ -7779,7 +7905,7 @@ def _validate_upload_source_kind(request: FinsUploadRequest) -> None:
 
 
 def _upload_request_summary(
-    request: ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest,
+    request: ValidatedFinsUploadFilingRequest | ValidatedFinsUploadMaterialRequest,
 ) -> dict[str, JsonValue]:
     """构建有界上传请求摘要。
 
@@ -7801,7 +7927,7 @@ def _upload_request_summary(
     summary: dict[str, JsonValue] = {
         "source_kind": raw_request.source_kind.value,
         "action": summary_action,
-        "file_count": len(raw_request.files),
+        "file_count": validated_fins_upload_file_count(request),
         "overwrite": raw_request.overwrite,
         "fiscal_year": _optional_non_negative_int(raw_request.fiscal_year, "fiscal_year"),
         "fiscal_period": _optional_bounded_text(
@@ -7829,31 +7955,13 @@ def _upload_request_summary(
             _bounded_text_tuple(raw_request.ticker_aliases, "ticker_aliases", reject_path_separators=False)
         ),
     }
-    if isinstance(raw_request, FinsUploadMaterialRequest):
-        summary.update(
-            {
-                "form_type": _optional_bounded_text(
-                    raw_request.form_type,
-                    "form_type",
-                    reject_path_separators=False,
-                ),
-                "material_name": _optional_bounded_text(
-                    raw_request.material_name,
-                    "material_name",
-                    reject_path_separators=False,
-                ),
-                "document_id": _optional_bounded_text(
-                    raw_request.document_id,
-                    "document_id",
-                    reject_path_separators=False,
-                ),
-                "internal_document_id": _optional_bounded_text(
-                    raw_request.internal_document_id,
-                    "internal_document_id",
-                    reject_path_separators=False,
-                ),
-            }
-        )
+    if isinstance(request, ValidatedFinsUploadMaterialRequest):
+        identity = request.identity
+        del summary["amended"]
+        summary["requested_amended"] = raw_request.amended
+        summary.update({"form_type": identity.form_type, "material_name": identity.material_name,
+            "fiscal_year": identity.fiscal_year, "fiscal_period": identity.fiscal_period,
+            "document_id": identity.document_id, "internal_document_id": identity.internal_document_id})
     _assert_bounded_summary(summary, "upload_request_summary")
     return summary
 
@@ -8134,13 +8242,13 @@ def _download_completed_progress_type(summary: _FinsDownloadResultSummary) -> st
         无。
     """
 
-    if summary.failed_count > 0:
+    if summary.failed_count + summary.uncertain_count > 0:
         return _PROGRESS_DOWNLOAD_COMPLETED_WITH_FAILURES
     return _PROGRESS_DOWNLOAD_COMPLETED
 
 
 def _upload_request_document_id(
-    request: ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest,
+    request: ValidatedFinsUploadFilingRequest | ValidatedFinsUploadMaterialRequest,
 ) -> str | None:
     """从上传请求提取可用于 progress 的业务文档 ID。
 
@@ -8148,26 +8256,22 @@ def _upload_request_document_id(
         request: 上传请求。
 
     Returns:
-        material 请求中的显式 document_id；filing 请求返回 ``None``。
+        material 返回已准入身份生成的 document_id；filing 返回已准入 request.document_id。
 
     Raises:
-        ValueError: 文档 ID 越界时抛出。
+        无。仅提取已准入请求持有的业务 ID，不重新校验。
     """
 
     if isinstance(request, ValidatedFinsUploadFilingRequest):
         return request.document_id
-    if isinstance(request, FinsUploadMaterialRequest):
-        return _optional_bounded_text(
-            request.document_id,
-            "upload_document_id",
-            reject_path_separators=False,
-        )
+    if isinstance(request, ValidatedFinsUploadMaterialRequest):
+        return request.identity.document_id
     assert_never(request)
 
 
 def _upload_context_request_progress_payload(
     context: _FinsIngestionExecutionContext,
-    request: ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest,
+    request: ValidatedFinsUploadFilingRequest | ValidatedFinsUploadMaterialRequest,
 ) -> dict[str, JsonValue]:
     """构建 upload started progress payload。
 
@@ -8183,19 +8287,21 @@ def _upload_context_request_progress_payload(
     """
 
     raw_request = _raw_upload_request(request)
-    _validate_upload_file_count(raw_request.files)
+    action = (request.action_decision.requested_action
+              if isinstance(request, ValidatedFinsUploadMaterialRequest)
+              else _normalize_upload_action(raw_request.action))
     return {
         _PAYLOAD_TICKER: context.normalized_ticker,
         _PAYLOAD_MARKET: context.market,
         _PAYLOAD_SOURCE_KIND: raw_request.source_kind.value,
-        _PAYLOAD_ACTION: _normalize_upload_action(raw_request.action),
-        _PAYLOAD_FILE_COUNT: len(raw_request.files),
+        _PAYLOAD_ACTION: action,
+        _PAYLOAD_FILE_COUNT: validated_fins_upload_file_count(request),
     }
 
 
 def _upload_context_summary_progress_payload(
     context: _FinsIngestionExecutionContext,
-    request: ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest,
+    request: ValidatedFinsUploadFilingRequest | ValidatedFinsUploadMaterialRequest,
     summary: FinsUploadResultSummary,
 ) -> dict[str, JsonValue]:
     """构建 upload completed progress payload。
@@ -8261,7 +8367,7 @@ def _upload_terminal_disposition_from_job_record(
 def _upload_persisted_document_id(
     record: FinsIngestionJobRecord,
     *,
-    request: ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest,
+    request: ValidatedFinsUploadFilingRequest | ValidatedFinsUploadMaterialRequest,
 ) -> str | None:
     """从最终 upload record 投影 progress document id。
 
@@ -8284,7 +8390,7 @@ def _upload_persisted_document_id(
 
 def _upload_context_persisted_summary_progress_payload(
     context: _FinsIngestionExecutionContext,
-    request: ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest,
+    request: ValidatedFinsUploadFilingRequest | ValidatedFinsUploadMaterialRequest,
     record: FinsIngestionJobRecord,
 ) -> dict[str, JsonValue]:
     """从最终 upload record 构建 completed progress payload。
@@ -8728,6 +8834,40 @@ def _validate_event_read_window(*, after_sequence: int, limit: int) -> None:
         raise ValueError("limit 超出 Fins ingestion job event 读取上限")
 
 
+def _terminal_job_result_projection(
+    record: FinsIngestionJobRecord,
+    result_summary: dict[str, JsonValue] | None,
+    *,
+    preserve_current: bool,
+    typed_result_exists: bool,
+) -> dict[str, JsonValue]:
+    """在 store 锁内选择调用方的终态投影，不从 JSON 推导取消事实。
+
+    参数：record 为当前记录；result_summary 为调用方投影或尚未产生结果的 None；
+        preserve_current 表示非 download 取消保留原摘要；typed_result_exists 表示本次已形成业务结果。
+    返回：要持久化的完整摘要，未形成 download 结果时为空字典。
+    异常：已有 download 结果却缺投影抛 ValueError；预算或 schema 错误原样抛出。
+    """
+    if result_summary is not None:
+        if record.operation_kind is FinsIngestionOperationKind.DOWNLOAD and not result_summary and (record.result_summary or typed_result_exists):
+            raise ValueError("已有 download 业务结果不得降为空摘要")
+        _assert_bounded_summary(result_summary, "result_summary")
+        return result_summary
+    if record.operation_kind is FinsIngestionOperationKind.DOWNLOAD and (record.result_summary or typed_result_exists):
+        raise ValueError("已有 download 业务结果，必须提供对应终态投影")
+    return record.result_summary if preserve_current else dict(_EMPTY_SUMMARY)
+
+
+def _cancelled_download_json_summary(summary: _FinsDownloadResultSummary) -> dict[str, JsonValue]:
+    """从完整 typed 结果产生取消投影，保留已发布与未知事实。
+
+    参数：summary 为已形成的完整下载结果。
+    返回：只覆盖终态的有界新 schema JSON。
+    异常：typed 不变量或预算不足抛 ValueError。
+    """
+    return replace(summary, terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED).to_json_summary(max_json_chars=_MAX_SUMMARY_JSON_CHARS)
+
+
 def _record_to_json(record: FinsIngestionJobRecord) -> dict[str, JsonValue]:
     """把 job record 转换为 JSON-compatible 字典。
 
@@ -8814,7 +8954,7 @@ def _validate_record_operation_fields(record: FinsIngestionJobRecord) -> None:
         无。
 
     Raises:
-        ValueError: 操作类型与 source 或 source_kind 字段组合不一致时抛出。
+        ValueError: 操作类型、来源身份、业务摘要或 job 终态相互矛盾时抛出。
     """
 
     if record.operation_kind is FinsIngestionOperationKind.DOWNLOAD:
@@ -8822,6 +8962,16 @@ def _validate_record_operation_fields(record: FinsIngestionJobRecord) -> None:
             raise ValueError("download job record 必须包含 source")
         if record.source_kind is not None:
             raise ValueError("download job record 不得包含 source_kind")
+        if record.result_summary:
+            validate_download_json_summary(record.result_summary)
+            if record.result_summary["source"] != record.source or record.result_summary["ticker"] != record.normalized_ticker:
+                raise ValueError("download summary identity differs from job")
+            if record.status is FinsIngestionJobStatus.SUCCEEDED and record.result_summary["uncertain_count"] != 0:
+                raise ValueError("成功下载任务不得包含未确认财期的报告")
+            if record.status is FinsIngestionJobStatus.CANCELLED and record.result_summary["terminal_disposition"] != FinsDownloadTerminalDisposition.CANCELLED.value:
+                raise ValueError("cancelled download requires caller cancelled projection")
+        elif record.status is FinsIngestionJobStatus.SUCCEEDED:
+            raise ValueError("succeeded download requires complete typed summary")
         return
     if record.operation_kind is FinsIngestionOperationKind.PREPROCESS:
         if record.source is not None:

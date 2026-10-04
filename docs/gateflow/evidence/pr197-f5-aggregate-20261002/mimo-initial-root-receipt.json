@@ -1,0 +1,77 @@
+{
+  "outer_exit": 0,
+  "events": 16231,
+  "paired_tools": 78,
+  "unpaired": [],
+  "actual_canary_reads": [
+    "call_e9312c1c727a437a967208c5"
+  ],
+  "terminal_subtype": "success",
+  "modelUsage": {
+    "mimo-v2.6-pro[1m]": {
+      "inputTokens": 285695,
+      "outputTokens": 67998,
+      "cacheReadInputTokens": 14287488,
+      "cacheCreationInputTokens": 0,
+      "webSearchRequests": 0,
+      "costUSD": 10.272168999999998,
+      "contextWindow": 1000000,
+      "maxOutputTokens": 32000,
+      "thinkingTokens": 0,
+      "canonicalModel": "mimo-v2.6-pro[1m]",
+      "provider": "firstParty",
+      "costBasis": "unknown"
+    }
+  },
+  "source_mismatches": {
+    "files": [],
+    "validation": []
+  },
+  "report": "docs/reviews/code-review-20261002-113431.md",
+  "report_sha256": "bd0e4b038c47fa0ac0dcfbbce2f2808d0b134eef1a352ba103075cf133d575b0",
+  "errors": [
+    {
+      "call": {
+        "type": "tool_use",
+        "id": "call_9a7da17ad69c44458bd28d32",
+        "name": "Bash",
+        "input": {
+          "command": "grep -n \"def _ticker_dir_for_read\\|def _source_dir_name\\|def _source_identity_namespace\\|def _read_json_object\\|def _list_external_identities\\|def _identity_directory_for_read\" dayu/fins/storage/_fs_storage_infra.py dayu/fins/storage/_fs_storage_utils.py dayu/fins/storage/_fs_identity.py; echo ====; sed -n '138,160p' dayu/fins/storage/_fs_storage_utils.py; echo ====; grep -n \"_ticker_dir_for_read\" dayu/fins/storage/_fs_storage_infra.py | head; echo ====; sed -n \"$(grep -n 'def _ticker_dir_for_read' dayu/fins/storage/_fs_storage_infra.py | cut -d: -f1),+30p\" dayu/fins/storage/_fs_storage_infra.py",
+          "description": "核对路径辅助函数等价性"
+        }
+      },
+      "result": {
+        "type": "tool_result",
+        "content": "Exit code 1\ndayu/fins/storage/_fs_identity.py:286:def _identity_directory_for_read(\ndayu/fins/storage/_fs_identity.py:361:def _list_external_identities(\ndayu/fins/storage/_fs_storage_utils.py:138:def _source_dir_name(source_kind: SourceKind) -> str:\ndayu/fins/storage/_fs_storage_utils.py:612:def _read_json_object(path: Path) -> dict[str, Any]:\ndayu/fins/storage/_fs_storage_infra.py:285:def _source_identity_namespace(source_kind: SourceKind) -> _IdentityNamespace:\ndayu/fins/storage/_fs_storage_infra.py:2926:    def _ticker_dir_for_read(self, ticker: str) -> Path:\n(eval):1: === not found",
+        "is_error": true,
+        "tool_use_id": "call_9a7da17ad69c44458bd28d32"
+      }
+    },
+    {
+      "call": {
+        "type": "tool_use",
+        "id": "call_134443a4498f48ebb0a3d643",
+        "name": "Bash",
+        "input": {
+          "command": "sed -n '1040,1100p' tests/fins/test_company_identity_storage_contract.py; echo =====; sed -n '2330,2400p' tests/fins/test_fins_storage_provider.py",
+          "description": "读取 descriptor 损坏测试的调用入口"
+        }
+      },
+      "result": {
+        "type": "tool_result",
+        "content": "Exit code 1\n    elif corruption == \"meta_symlink\":\n        outside_meta = tmp_path / \"outside-meta.json\"\n        outside_meta.write_bytes(meta_path.read_bytes())\n        meta_path.unlink()\n        meta_path.symlink_to(outside_meta)\n    elif corruption == \"meta_directory\":\n        meta_path.unlink()\n        meta_path.mkdir()\n    else:\n        payload = json.loads(meta_path.read_text(encoding=\"utf-8\"))\n        payload[\"ticker\"] = \"MSFT\"\n        meta_path.write_text(json.dumps(payload), encoding=\"utf-8\")\n\n    with pytest.raises(CompanyTickerIdentityCorruptionError) as read_exc_info:\n        company.get_company_meta(\"DELTA\")\n    assert read_exc_info.value.kind == expected_kind\n\n    with pytest.raises(CompanyTickerIdentityCorruptionError) as exc_info:\n        company.resolve_company_ticker(\"DELTA\")\n\n    assert exc_info.value.kind == expected_kind\n\n\ndef test_duplicate_published_alias_is_typed_corruption_not_incoming_conflict(\n    tmp_path: Path,\n) -> None:\n    \"\"\"已持久化的多 owner lookup key 应分类为 duplicate_owner corruption。\n\n    Args:\n        tmp_path: pytest 临时目录。\n\n    Returns:\n        无。\n\n    Raises:\n        AssertionError: durable duplicate 被误投影为 incoming conflict 时抛出。\n    \"\"\"\n\n    workspace_root = tmp_path / \"workspace\"\n    batching, company, _ = _build_repositories(workspace_root)\n    for ticker, alias in ((\"DELTA\", \"DLTA\"), (\"MSFT\", \"MSF\")):\n        batch = batching.begin_batch(ticker)\n        stage_company_meta_fixture(company, _meta(ticker, aliases=(alias,)), batch=batch)\n        batching.commit_batch(batch)\n    msft_meta_path = workspace_root / \"portfolio\" / \"MSFT\" / \"meta.json\"\n    payload = json.loads(msft_meta_path.read_text(encoding=\"utf-8\"))\n    payload[\"ticker_aliases\"] = [\"DLTA\"]\n    msft_meta_path.write_text(json.dumps(payload), encoding=\"utf-8\")\n\n    with pytest.raises(CompanyTickerIdentityCorruptionError) as exc_info:\n        company.resolve_company_ticker(\"DLTA\")\n\n    assert exc_info.value.kind == \"duplicate_owner\"\n    assert exc_info.value.lookup_ticker == \"DLTA\"\n\n\n@pytest.mark.parametrize(\"protected_target\", (\"descriptor\", \"directory\"))\ndef test_descriptor_scan_preserves_permission_io_category(\n    tmp_path: Path,\n    monkeypatch: pytest.MonkeyPatch,\n    protected_target: str,\n(eval):1: ==== not found",
+        "is_error": true,
+        "tool_use_id": "call_134443a4498f48ebb0a3d643"
+      }
+    }
+  ],
+  "recovered_errors": {
+    "call_9a7da17ad69c44458bd28d32": "zsh unquoted echo==== failure; call_243798fb5f774d4da11f15e6 realhelpers fullread recovered",
+    "call_134443a4498f48ebb0a3d643": "same unquoted echo failure skips second read; call_b069a17f2b83434da405f384 recovered provider corruption tests",
+    "call_dd8288aa200047a8837998a1": "coverage list/dict AttributeError hidden by trailing shell output; call_6e526a66801e4831a2eb2f9e correct full23 records read recovered"
+  },
+  "stderr": "[claude-code:unrecognized_model] {\"model\":\"mimo-v2.6-pro[1m]\",\"query_source\":\"sdk\"}\n",
+  "root_decision": "qualified evidence; sole material finding F5-AG01 independently accepted/unfixed; aggregate NOT PASS",
+  "reuse_boundary": "1703/fullpyright/23coverage samebytes formal originals; no new test invocation claim",
+  "report_model_note": "actual terminal metadata authoritative, header shortened model spelling not newfixloop"
+}

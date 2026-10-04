@@ -1,0 +1,1391 @@
+{
+  "gate": "implementation S2",
+  "work_unit": "unified upload_material repair",
+  "workspace": "/Users/leo/workspace/dayu-agent-r",
+  "head": "f7e60c9d3e4c6e77a6c2abf18d09cd8020c19235",
+  "runner_label": "upload-material-unified-s2-final-completion-sol-20261003-01",
+  "outer_exit": 0,
+  "events": 423,
+  "completed_commands": 200,
+  "stream_error_items": [],
+  "canary_actual_read_and_report": "gpt-6-sol-0c78ee24",
+  "model": "unknown; runtime did not expose ID",
+  "seal": {
+    "docs/gateflow/upload-material-unified-s2-final-completion-report-20261003.md": "81706c40ee0bf3e7c46dbca5961bebc6ee8ecc481248ab3511d499135271afba",
+    "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/delivery-machine-index.json": "8d8cf99f3d9be428835f4f9a896c8fb38b83fa0ab0280adfbdf259e47d7c463a",
+    "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/final-freeze.json": "8666e28aea221ccb294481e5fdfd3f1d8b1771e6a0035888f314841a78abd944",
+    "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/final-audit/changed-files.json": "013bb2fb1dcbc3620125e1620bad3fc0cc8625c45be9876959fa80dd49453015",
+    "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/final-audit/coverage-products.json": "1168e6c47912314fc7de86802653188e8c7fa57c00756902cca9faa0e032ce31",
+    "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/final-audit/validation-summary.json": "2f4dd7dcdeda1d25ecb2c8f5ab66138f2e7f8c8d15f3c607eea69141d6855e1d",
+    "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/final-audit/constructor-inventory.json": "d99f8f94f301e6f91203ae827a9875472c215d315bd7ebc3d63602d748e08225",
+    "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/failure-recovery.json": "a45992180ad8847ac4c1bec1bc0008d56e7ad8178c26e4986ed954369ce39553"
+  },
+  "candidate_count": 60,
+  "production_count": 28,
+  "candidate_files": [
+    {
+      "path": "README.md",
+      "sha256": "add3e58124e9a538a841192f3eb121dfdcaf6409662f169a0c41ba92524b11c5",
+      "bytes": 38523,
+      "changed_this_run": true,
+      "input_sha256": "7a8b9ee639fcee9684e170cf9a5101a41b2d4cd884090de391e146168a55f6c0",
+      "kind": "README",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "dayu/cli/commands/fins.py",
+      "sha256": "f2b8f55f35de49f4431790213fd775f65f1876d0afec86d294a9dbae261fbcac",
+      "bytes": 47760,
+      "changed_this_run": true,
+      "input_sha256": "65e3f7166a3f00c40784f6e003d5a6609b8abf944e8b2e4744de54dfc0193c36",
+      "kind": "production",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "dayu/fins/README.md",
+      "sha256": "1131466fdc27137861c19229dd875b08b3b7ac3335d17ede9c7fa681e1128354",
+      "bytes": 107266,
+      "changed_this_run": true,
+      "input_sha256": "f35e59871957055cc2dea61cee523de50b1e1efc743fbd6c4ecc95182e84ef2a",
+      "kind": "README",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "dayu/fins/domain/company_meta_contract.py",
+      "sha256": "8ce7c5683e4b30186d1a230ea6c08cff27a475dc7fa9f9adf666d1d6be78b81d",
+      "bytes": 17223,
+      "changed_this_run": false,
+      "input_sha256": "8ce7c5683e4b30186d1a230ea6c08cff27a475dc7fa9f9adf666d1d6be78b81d",
+      "kind": "production",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "dayu/fins/domain/document_models.py",
+      "sha256": "d04206ce9be11aac14b6245915742f2c6a5421176d8c9ad823dc0483d2687f4c",
+      "bytes": 37666,
+      "changed_this_run": false,
+      "input_sha256": "d04206ce9be11aac14b6245915742f2c6a5421176d8c9ad823dc0483d2687f4c",
+      "kind": "production",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "dayu/fins/ingestion_runtime.py",
+      "sha256": "7c55dd5a3e820cdd74a1470c7d790544d3b6500621a30b02b9c6fb356c1069a6",
+      "bytes": 340995,
+      "changed_this_run": true,
+      "input_sha256": "c4203ebb828be726b3a814906c28039237f8c1dbf126b2d971a811fa1227fe33",
+      "kind": "production",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "dayu/fins/pipelines/cn_pipeline.py",
+      "sha256": "2e0f76c7b5eede0447c2b7fd3d191686d2d293ee93fd88aa46950e5aa9774f3b",
+      "bytes": 75754,
+      "changed_this_run": true,
+      "input_sha256": "b28591538d5335ff4ccfd5987d74942764e5d30987950c5b7df010e2c902ddca",
+      "kind": "production",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "dayu/fins/pipelines/docling_upload_service.py",
+      "sha256": "707a9f814c7ce67ead75f625ea1f4ffda75172e29aaa2a1ce2d0ec3156dd1ad3",
+      "bytes": 86982,
+      "changed_this_run": true,
+      "input_sha256": "ad66b833c3cfe47af09210a73c98de92866fbada33491bf49cce416239751002",
+      "kind": "production",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "dayu/fins/pipelines/filing_upload_publication.py",
+      "sha256": "f31c72b9352ea6aa8de2bbc015c97840608231ec2c72c458fe732ddb458e062d",
+      "bytes": 34990,
+      "changed_this_run": true,
+      "input_sha256": "260df5a1ff046ae4fedfa6f909b570426b9dac0b7171ee05e26ffe726df6af84",
+      "kind": "production",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "dayu/fins/pipelines/material_upload_publication.py",
+      "sha256": "1cc7c31f2fb427e0c8aabb6772feda3f39296920a131176c3a2984816aee9c50",
+      "bytes": 11230,
+      "changed_this_run": true,
+      "input_sha256": null,
+      "kind": "production",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "dayu/fins/pipelines/sec_pipeline.py",
+      "sha256": "89ff1069ca86da1652e823fe062686afa3549902d12ef1483be7d8ed2eda87ba",
+      "bytes": 80343,
+      "changed_this_run": true,
+      "input_sha256": "5225081bd8b54d67e6ef96cb842497c75d27c19b5a361349e6a0e750a4dcd718",
+      "kind": "production",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "dayu/fins/pipelines/sec_upload_workflow.py",
+      "sha256": "bd3a8d2ccaccf0b666f8891795534c2a5c317b6216dba94048940c935aa5104e",
+      "bytes": 24871,
+      "changed_this_run": true,
+      "input_sha256": "31d408b426fb699241b9b3c3cab73fff6e13f6ccba085a617feb5aa3c447b51f",
+      "kind": "production",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "dayu/fins/pipelines/upload_company_meta.py",
+      "sha256": "43b0ce1f57ef750cb92b47bb577e5f6dc45662628f5d9c7c71821400407f85e8",
+      "bytes": 7934,
+      "changed_this_run": true,
+      "input_sha256": "41585b93bb907f13bf34b53ff2ee68ef1b8ae80d9c3df820872b8c22a81d9df0",
+      "kind": "production",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "dayu/fins/service_runtime.py",
+      "sha256": "ab89c89054b4b3f3388c8fcb6bce1445dd04c07bfe2cbdf84acc587f4e0721af",
+      "bytes": 22414,
+      "changed_this_run": true,
+      "input_sha256": "2d9c9108e193311f1886f03178a72e9b301b842a7a42e699dcaa48abdd132fe1",
+      "kind": "production",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "dayu/fins/storage/__init__.py",
+      "sha256": "92e7560b335dd4daf8808a2fe29141ed39c6a2f0fbdfa9336ffd88ed8393d944",
+      "bytes": 4040,
+      "changed_this_run": false,
+      "input_sha256": "92e7560b335dd4daf8808a2fe29141ed39c6a2f0fbdfa9336ffd88ed8393d944",
+      "kind": "production",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "dayu/fins/storage/_fs_material_upload_state_core.py",
+      "sha256": "2a55d3fbd0ef021baafead223bb3509d7a836191e39c7ef9f8db19c5b20fd9f6",
+      "bytes": 8864,
+      "changed_this_run": false,
+      "input_sha256": "2a55d3fbd0ef021baafead223bb3509d7a836191e39c7ef9f8db19c5b20fd9f6",
+      "kind": "production",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "dayu/fins/storage/_fs_source_document_core.py",
+      "sha256": "4002cc67116cd773dc959e3eb27617289a0e69ed6b210a882480b71b0a0db4f3",
+      "bytes": 82789,
+      "changed_this_run": false,
+      "input_sha256": "4002cc67116cd773dc959e3eb27617289a0e69ed6b210a882480b71b0a0db4f3",
+      "kind": "production",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "dayu/fins/storage/_fs_source_integrity.py",
+      "sha256": "89f7adee03e68fc434db8cbe061b8dcfb14d81c422d6079df1d04dcf8a3e67eb",
+      "bytes": 73306,
+      "changed_this_run": false,
+      "input_sha256": "89f7adee03e68fc434db8cbe061b8dcfb14d81c422d6079df1d04dcf8a3e67eb",
+      "kind": "production",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "dayu/fins/storage/_fs_storage_core.py",
+      "sha256": "897588e86d7e206a9abf5677f27240e395c3d0a08269d614b9b62485e2e1497d",
+      "bytes": 1440,
+      "changed_this_run": false,
+      "input_sha256": "897588e86d7e206a9abf5677f27240e395c3d0a08269d614b9b62485e2e1497d",
+      "kind": "production",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "dayu/fins/storage/_fs_storage_infra.py",
+      "sha256": "5acf5445ea60f98d33a04f11469cde121fdcc9b5b22fda1b09acec711c47ad37",
+      "bytes": 132949,
+      "changed_this_run": false,
+      "input_sha256": "5acf5445ea60f98d33a04f11469cde121fdcc9b5b22fda1b09acec711c47ad37",
+      "kind": "production",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "dayu/fins/storage/fs_material_upload_state_repository.py",
+      "sha256": "701b8e73e22153b595cc6c7736b7bed1197544320cd9538847517d459eeda2ec",
+      "bytes": 5071,
+      "changed_this_run": false,
+      "input_sha256": "701b8e73e22153b595cc6c7736b7bed1197544320cd9538847517d459eeda2ec",
+      "kind": "production",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "dayu/fins/storage/fs_source_document_repository.py",
+      "sha256": "3443fae747ad326b3f96a325d3c586364369d298684f11dd8d03756565227b51",
+      "bytes": 30256,
+      "changed_this_run": false,
+      "input_sha256": "3443fae747ad326b3f96a325d3c586364369d298684f11dd8d03756565227b51",
+      "kind": "production",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "dayu/fins/storage/repository_protocols.py",
+      "sha256": "1d55f4c40b9b7bad1a2ab20e115b0f20f785fd2be5a13d0aaf2760a8901b86e3",
+      "bytes": 75085,
+      "changed_this_run": false,
+      "input_sha256": "1d55f4c40b9b7bad1a2ab20e115b0f20f785fd2be5a13d0aaf2760a8901b86e3",
+      "kind": "production",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "dayu/fins/storage/source_manifest_contract.py",
+      "sha256": "6aad93fc998b512b120fa69cf2f855facb9c353ad7adbb7343c7290fa6a58216",
+      "bytes": 1453,
+      "changed_this_run": false,
+      "input_sha256": "6aad93fc998b512b120fa69cf2f855facb9c353ad7adbb7343c7290fa6a58216",
+      "kind": "production",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "dayu/fins/storage/source_meta_contract.py",
+      "sha256": "c4657260b8c30cf2e799eac84579bfa8c418679a7c2fc206cd505cefc6799855",
+      "bytes": 2205,
+      "changed_this_run": false,
+      "input_sha256": "c4657260b8c30cf2e799eac84579bfa8c418679a7c2fc206cd505cefc6799855",
+      "kind": "production",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "dayu/fins/tools/fins_tools.py",
+      "sha256": "b086c50c17f5abe03dc2274903e496970a0043538bf683aff78523f2c266d63d",
+      "bytes": 66182,
+      "changed_this_run": true,
+      "input_sha256": "75dabfbdc265032c212b8ceeda89bca28ea2e4d827cabba040f766309c19e8c4",
+      "kind": "production",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "dayu/fins/tools/read_runtime.py",
+      "sha256": "1b48a88e3ec593c4463559a6e9c4b1d55e30455d77c0a995a62778dbbb90ef53",
+      "bytes": 129115,
+      "changed_this_run": true,
+      "input_sha256": "f7e1d0163668ab0ad73bddc5a44989ed23932357ec7bc4c2c79a87bfb4a85a47",
+      "kind": "production",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "dayu/fins/tools/upload_tools.py",
+      "sha256": "f5ef3dfb66c04479e96d02eeb7ce2781b231804dfdc982bc85998b4f4b0f64a1",
+      "bytes": 21917,
+      "changed_this_run": true,
+      "input_sha256": "34cefd287a627247502e0c6769f3d19b0675fdaab7a047c8fe0c77974060ed02",
+      "kind": "production",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "dayu/fins/upload_failure.py",
+      "sha256": "9f722aa9156aa107c5b8cc88a72e1c3f668e1540be4f6fcbead1f9c02e24744b",
+      "bytes": 22466,
+      "changed_this_run": true,
+      "input_sha256": "172b02ce6f9933fc81f58bdeb8f79ff9ca9edb9fefef3e5e6eae2141ffa787d5",
+      "kind": "production",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "dayu/fins/upload_usage_contract.py",
+      "sha256": "fbe84d8d1dd36a3813d4ff965f41f4ff80e82003dc7da701391b81a73d77cb8e",
+      "bytes": 18690,
+      "changed_this_run": true,
+      "input_sha256": "dc1c309dcf68b505b9aed1d87dddbac06e878c5c6bbbb319f23837e2a1577004",
+      "kind": "production",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "docs/gateflow/upload-material-unified-s2-final-completion-report-20261003.md",
+      "sha256": "81706c40ee0bf3e7c46dbca5961bebc6ee8ecc481248ab3511d499135271afba",
+      "bytes": 7845,
+      "changed_this_run": true,
+      "input_sha256": null,
+      "kind": "report",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "tests/README.md",
+      "sha256": "efdda340fbe75cdf08a365e0795ad2dbe27e498a117b30cedb5f21763e4b2d7f",
+      "bytes": 131912,
+      "changed_this_run": true,
+      "input_sha256": "aabd1c91665d2d7086f47882cca2f6343e7106d637211cfa2df0bfdf0a6dedbb",
+      "kind": "README",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "tests/cli/test_fins_commands.py",
+      "sha256": "238259ec537166919b61db2f3e50e5a00429d6d2091609e7e44a2dd9bc9cbf4f",
+      "bytes": 170360,
+      "changed_this_run": true,
+      "input_sha256": "8aeb38b86871d12b8cdb0878ab4ecc64085b9e1fe3220f150128d5437ba85961",
+      "kind": "test",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "tests/fins/test_cn_download_runtime.py",
+      "sha256": "d1f5cbb1c694408272690d24d120f45560145ef7cd25892968d6c763923d8175",
+      "bytes": 101200,
+      "changed_this_run": true,
+      "input_sha256": "deda2ef42250861d8a26bd47ee9812a782b170171f6b87dc4bd0c8c6f546207d",
+      "kind": "test",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "tests/fins/test_cn_download_workflow.py",
+      "sha256": "e4141bc4c20f9dcc7080b6e02f88c0cabd52dd87c6b8a6ef54043a8f64a5b68f",
+      "bytes": 183792,
+      "changed_this_run": true,
+      "input_sha256": "590a4b694bd56868b6ddd17dd4dd3db4ca1834b956f713e6e57269423accbdef",
+      "kind": "test",
+      "authority": "C03/C04/C07"
+    },
+    {
+      "path": "tests/fins/test_cn_pipeline.py",
+      "sha256": "23fe62e9e088ed49906ed5f114674ccd14cdf335c1954bb349cd43946b7cfc90",
+      "bytes": 109327,
+      "changed_this_run": true,
+      "input_sha256": "f7d21453a89614a7bdd322317ae771be61a601bb7865d82645807eb3e524aefa",
+      "kind": "test",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "tests/fins/test_company_identity_storage_contract.py",
+      "sha256": "6ab4681046f038fdf0206b4f21f78a2fd57f589892107a12c565da10f45f2896",
+      "bytes": 69464,
+      "changed_this_run": true,
+      "input_sha256": "ab93affcee75d19faa781767434abbdd5046a2d58da66337d27c39b65b34f005",
+      "kind": "test",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "tests/fins/test_docling_upload_service.py",
+      "sha256": "4a7b351925e8d3ec6fa13c35499967a1540371eab8d8e8acc75f002ea3cd7024",
+      "bytes": 215567,
+      "changed_this_run": true,
+      "input_sha256": "55f6d051a77de1a1ea5c33a3717593a49938d4bd7d28f2ff5274ed7e47b581d0",
+      "kind": "test",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "tests/fins/test_docling_upload_service_integration.py",
+      "sha256": "05c3331af7657e4ab2f50a66c5009d3e5ba32f9ac50bd03b33a973e042e36356",
+      "bytes": 7715,
+      "changed_this_run": true,
+      "input_sha256": "2cad9909fad3e8a6b2b62283fb396f22187749230bee4a9866e2097d12817309",
+      "kind": "test",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "tests/fins/test_filing_upload_publication.py",
+      "sha256": "a119e2c06d3d64efad04753df8e1512e163a4b9b6ac037b0b259e45540a6e8dd",
+      "bytes": 84737,
+      "changed_this_run": true,
+      "input_sha256": "8a5a92a161deb3d724abe316d25f01a16f5e95517bd73717d90b4ef8b6907d1e",
+      "kind": "test",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "tests/fins/test_fins_ingestion_runtime.py",
+      "sha256": "a6ed008b26cb969a184c48f0a65d875ddabaa1b6dd8e5bdebf278ef1e2137635",
+      "bytes": 463312,
+      "changed_this_run": true,
+      "input_sha256": "0b6d43a92b27a4788aa2945b380fc0201034ab030401e7afcc9edd33e2788fba",
+      "kind": "test",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "tests/fins/test_fins_ingestion_tools.py",
+      "sha256": "7b49bb082b3060c4b9b95c284225fea2bcc62a129e32bc5e0136449fa3f76368",
+      "bytes": 137400,
+      "changed_this_run": true,
+      "input_sha256": "76b03c296f915eb2cc64b38e65d8bdc9346d1eeb9a316c17b42b5ed6b63c6ea4",
+      "kind": "test",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "tests/fins/test_fins_service_runtime.py",
+      "sha256": "5f550a5763f76da09360b2d9e914395d74a4a4f5b21b4965f08a94d8bd2b2282",
+      "bytes": 27346,
+      "changed_this_run": true,
+      "input_sha256": "fa820f2db5be311f884a054221ec22785baa84bf049ab91ca9c0994ac250e081",
+      "kind": "test",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "tests/fins/test_fins_storage_atomicity.py",
+      "sha256": "531d4abc228164c40f76db74c6c072278132bc9bfff29c81adea4713b26b0928",
+      "bytes": 347762,
+      "changed_this_run": false,
+      "input_sha256": "531d4abc228164c40f76db74c6c072278132bc9bfff29c81adea4713b26b0928",
+      "kind": "test",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "tests/fins/test_fins_storage_provider.py",
+      "sha256": "3799f8b0269f5a177bf2fa6c2ebf6069130ecccb8463ededd73e27f964e0fe73",
+      "bytes": 230717,
+      "changed_this_run": false,
+      "input_sha256": "3799f8b0269f5a177bf2fa6c2ebf6069130ecccb8463ededd73e27f964e0fe73",
+      "kind": "test",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "tests/fins/test_fiscal_normalization_contracts.py",
+      "sha256": "04c7ebe568f18f09c0ee4f36ed3e1f064410b3d919acca2071a809d34d35a404",
+      "bytes": 14744,
+      "changed_this_run": true,
+      "input_sha256": "71024259f3f0a84ae59cf74d74c526af4232496e2068f2936a6243538ff33c71",
+      "kind": "test",
+      "authority": "C03/C04/C07"
+    },
+    {
+      "path": "tests/fins/test_material_identity_contract.py",
+      "sha256": "6eab6dac9f534ccbc81456f890876bba65797a9f0cec1d810e1ccdbbf239c24a",
+      "bytes": 18157,
+      "changed_this_run": true,
+      "input_sha256": "2098f0e35a860605210eee673cb57a9d11a743a514384d5ae55eea45c9fd6952",
+      "kind": "test",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "tests/fins/test_material_upload_publication.py",
+      "sha256": "1cb02695976d76d36925ad9ea3570c2c7ee7448cbb1b1a45e176b19805d4a6a7",
+      "bytes": 41765,
+      "changed_this_run": true,
+      "input_sha256": null,
+      "kind": "test",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "tests/fins/test_material_upload_state_repository.py",
+      "sha256": "54360147789688735654d237fc4ef9d5cec2181fb72d8d6746fe5b723d3b4076",
+      "bytes": 21062,
+      "changed_this_run": false,
+      "input_sha256": "54360147789688735654d237fc4ef9d5cec2181fb72d8d6746fe5b723d3b4076",
+      "kind": "test",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "tests/fins/test_processor_read_consistency.py",
+      "sha256": "7038fb52cabbc7c87293593e52ffca8f7bc7a3d22716cd1abed1c24f03d2983d",
+      "bytes": 121088,
+      "changed_this_run": true,
+      "input_sha256": "135f77414ae6006dc81b52eb5df34a61cc393b345aa03fb92635c5892302fa59",
+      "kind": "test",
+      "authority": "C03/C04/C07"
+    },
+    {
+      "path": "tests/fins/test_read_runtime_semantic_ownership_guards.py",
+      "sha256": "15847c0ad7534de4fa20445491eb1712d266a9ebacca0daf42f8c8d7f62ab40f",
+      "bytes": 69137,
+      "changed_this_run": true,
+      "input_sha256": "f0349754d63393215d83c986432ee05f7bd3f972d505f60013e8a9cc9a7fbce2",
+      "kind": "test",
+      "authority": "C03/C04/C07"
+    },
+    {
+      "path": "tests/fins/test_sec_pipeline_download.py",
+      "sha256": "bb16216f4f0af38a6f0d2d73efa5bbdc211d791cdd821aa6ae05b8b9fb9d06fd",
+      "bytes": 218982,
+      "changed_this_run": true,
+      "input_sha256": "2856675842d4f2bbf85fa3fdf9b063baa9a37cd7a2b81b8dc62f96dbef7d7a4e",
+      "kind": "test",
+      "authority": "C03/C04/C07"
+    },
+    {
+      "path": "tests/fins/test_sec_pipeline_download_stream.py",
+      "sha256": "e1113587bbaf92e9da0d08d9ec3faa96e7d27a31a391ddb533cc727bf3ab893a",
+      "bytes": 84022,
+      "changed_this_run": true,
+      "input_sha256": "dc2f9a18dc3dd6a7e8514a91c51aa7330e6e44bda2fa48a9e20863f69a76331d",
+      "kind": "test",
+      "authority": "C03/C04/C07"
+    },
+    {
+      "path": "tests/fins/test_sec_pipeline_upload_filing_stream.py",
+      "sha256": "28ccfcb10894ef6fc204dbbb9cb09aed7be1a4b1f064e7c150c300c52470594d",
+      "bytes": 133965,
+      "changed_this_run": true,
+      "input_sha256": "84521943a1452de7ac23c3299b5ba35655f925f7cb3298f50d58aa644c5e008c",
+      "kind": "test",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "tests/fins/test_sec_pipeline_upload_material_stream.py",
+      "sha256": "7b198f8e2e77e47be3d0aa4749eac4b88f2a68a9211db095d3895f07af1edd79",
+      "bytes": 33604,
+      "changed_this_run": true,
+      "input_sha256": "a47a6804448e713faea2d45a4f5a50132a1536284313eab6fc285deb8e0e3b53",
+      "kind": "test",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "tests/fins/test_source_manifest_contract.py",
+      "sha256": "b6cd458c39ca31333a9c54e78350b81676c9f7e9a3dcecce5c4bdfb09e6846c9",
+      "bytes": 18887,
+      "changed_this_run": true,
+      "input_sha256": "8f9a243c86cca66023d31c00575eac97587a15998df5fe336e036f242364af57",
+      "kind": "test",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "tests/fins/test_source_meta_contract.py",
+      "sha256": "c2022ac19541a41e449e6d797662e6e31119721bb4489e9634dd7cb290cff4e4",
+      "bytes": 3222,
+      "changed_this_run": false,
+      "input_sha256": "c2022ac19541a41e449e6d797662e6e31119721bb4489e9634dd7cb290cff4e4",
+      "kind": "test",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "tests/fins/test_upload_failure.py",
+      "sha256": "167dd8f8fff733aa436d889fff7e0015de72c390fd9ae0de26db9cc8602bdb1a",
+      "bytes": 11978,
+      "changed_this_run": true,
+      "input_sha256": "a8b8dd4760005d18f225d0ef81b3b467473606d6dd55507e6d2be5f764d3df35",
+      "kind": "test",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "tests/fins/test_upload_usage_contract.py",
+      "sha256": "8424199cfc94456676f1846354716268ae16ebb616492ebb13a922e88de4f69e",
+      "bytes": 21305,
+      "changed_this_run": true,
+      "input_sha256": "b17692fc647cb9698ca3b5d5790d8149463f4883410a3a0de866624fce2bfab0",
+      "kind": "test",
+      "authority": "original allowed manifest"
+    },
+    {
+      "path": "tests/service/test_fins_direct.py",
+      "sha256": "b731b98b2d2be7c9f91e6c5544f769397265cd5a79d2e98139151288b4de6fa4",
+      "bytes": 34891,
+      "changed_this_run": true,
+      "input_sha256": "fded52461a89750f242f6bd5434a902077bcebc225fc4d24618d2b52de20b89c",
+      "kind": "test",
+      "authority": "original allowed manifest"
+    }
+  ],
+  "technical_file_count": 55992,
+  "input_file_count": 10160,
+  "protected_drift": [],
+  "coverage": [
+    {
+      "path": "dayu/cli/commands/fins.py",
+      "sha256": "f2b8f55f35de49f4431790213fd775f65f1876d0afec86d294a9dbae261fbcac",
+      "percent_covered": 88.6509635974304
+    },
+    {
+      "path": "dayu/fins/domain/company_meta_contract.py",
+      "sha256": "8ce7c5683e4b30186d1a230ea6c08cff27a475dc7fa9f9adf666d1d6be78b81d",
+      "percent_covered": 95.08196721311475
+    },
+    {
+      "path": "dayu/fins/domain/document_models.py",
+      "sha256": "d04206ce9be11aac14b6245915742f2c6a5421176d8c9ad823dc0483d2687f4c",
+      "percent_covered": 95.55555555555556
+    },
+    {
+      "path": "dayu/fins/ingestion_runtime.py",
+      "sha256": "7c55dd5a3e820cdd74a1470c7d790544d3b6500621a30b02b9c6fb356c1069a6",
+      "percent_covered": 91.73652694610779
+    },
+    {
+      "path": "dayu/fins/pipelines/cn_pipeline.py",
+      "sha256": "2e0f76c7b5eede0447c2b7fd3d191686d2d293ee93fd88aa46950e5aa9774f3b",
+      "percent_covered": 93.88646288209607
+    },
+    {
+      "path": "dayu/fins/pipelines/docling_upload_service.py",
+      "sha256": "707a9f814c7ce67ead75f625ea1f4ffda75172e29aaa2a1ce2d0ec3156dd1ad3",
+      "percent_covered": 90.1470588235294
+    },
+    {
+      "path": "dayu/fins/pipelines/filing_upload_publication.py",
+      "sha256": "f31c72b9352ea6aa8de2bbc015c97840608231ec2c72c458fe732ddb458e062d",
+      "percent_covered": 87.4074074074074
+    },
+    {
+      "path": "dayu/fins/pipelines/material_upload_publication.py",
+      "sha256": "1cc7c31f2fb427e0c8aabb6772feda3f39296920a131176c3a2984816aee9c50",
+      "percent_covered": 91.91919191919192
+    },
+    {
+      "path": "dayu/fins/pipelines/sec_pipeline.py",
+      "sha256": "89ff1069ca86da1652e823fe062686afa3549902d12ef1483be7d8ed2eda87ba",
+      "percent_covered": 87.63102725366876
+    },
+    {
+      "path": "dayu/fins/pipelines/sec_upload_workflow.py",
+      "sha256": "bd3a8d2ccaccf0b666f8891795534c2a5c317b6216dba94048940c935aa5104e",
+      "percent_covered": 94.61077844311377
+    },
+    {
+      "path": "dayu/fins/pipelines/upload_company_meta.py",
+      "sha256": "43b0ce1f57ef750cb92b47bb577e5f6dc45662628f5d9c7c71821400407f85e8",
+      "percent_covered": 98.0
+    },
+    {
+      "path": "dayu/fins/service_runtime.py",
+      "sha256": "ab89c89054b4b3f3388c8fcb6bce1445dd04c07bfe2cbdf84acc587f4e0721af",
+      "percent_covered": 94.26229508196721
+    },
+    {
+      "path": "dayu/fins/storage/__init__.py",
+      "sha256": "92e7560b335dd4daf8808a2fe29141ed39c6a2f0fbdfa9336ffd88ed8393d944",
+      "percent_covered": 100.0
+    },
+    {
+      "path": "dayu/fins/storage/_fs_material_upload_state_core.py",
+      "sha256": "2a55d3fbd0ef021baafead223bb3509d7a836191e39c7ef9f8db19c5b20fd9f6",
+      "percent_covered": 97.26027397260275
+    },
+    {
+      "path": "dayu/fins/storage/_fs_source_document_core.py",
+      "sha256": "4002cc67116cd773dc959e3eb27617289a0e69ed6b210a882480b71b0a0db4f3",
+      "percent_covered": 86.87050359712231
+    },
+    {
+      "path": "dayu/fins/storage/_fs_source_integrity.py",
+      "sha256": "89f7adee03e68fc434db8cbe061b8dcfb14d81c422d6079df1d04dcf8a3e67eb",
+      "percent_covered": 88.88888888888889
+    },
+    {
+      "path": "dayu/fins/storage/_fs_storage_core.py",
+      "sha256": "897588e86d7e206a9abf5677f27240e395c3d0a08269d614b9b62485e2e1497d",
+      "percent_covered": 100.0
+    },
+    {
+      "path": "dayu/fins/storage/_fs_storage_infra.py",
+      "sha256": "5acf5445ea60f98d33a04f11469cde121fdcc9b5b22fda1b09acec711c47ad37",
+      "percent_covered": 87.31665228645385
+    },
+    {
+      "path": "dayu/fins/storage/fs_material_upload_state_repository.py",
+      "sha256": "701b8e73e22153b595cc6c7736b7bed1197544320cd9538847517d459eeda2ec",
+      "percent_covered": 100.0
+    },
+    {
+      "path": "dayu/fins/storage/fs_source_document_repository.py",
+      "sha256": "3443fae747ad326b3f96a325d3c586364369d298684f11dd8d03756565227b51",
+      "percent_covered": 96.84210526315789
+    },
+    {
+      "path": "dayu/fins/storage/repository_protocols.py",
+      "sha256": "1d55f4c40b9b7bad1a2ab20e115b0f20f785fd2be5a13d0aaf2760a8901b86e3",
+      "percent_covered": 84.28927680798004
+    },
+    {
+      "path": "dayu/fins/storage/source_manifest_contract.py",
+      "sha256": "6aad93fc998b512b120fa69cf2f855facb9c353ad7adbb7343c7290fa6a58216",
+      "percent_covered": 100.0
+    },
+    {
+      "path": "dayu/fins/storage/source_meta_contract.py",
+      "sha256": "c4657260b8c30cf2e799eac84579bfa8c418679a7c2fc206cd505cefc6799855",
+      "percent_covered": 100.0
+    },
+    {
+      "path": "dayu/fins/tools/fins_tools.py",
+      "sha256": "b086c50c17f5abe03dc2274903e496970a0043538bf683aff78523f2c266d63d",
+      "percent_covered": 86.49425287356321
+    },
+    {
+      "path": "dayu/fins/tools/read_runtime.py",
+      "sha256": "1b48a88e3ec593c4463559a6e9c4b1d55e30455d77c0a995a62778dbbb90ef53",
+      "percent_covered": 86.59160696008189
+    },
+    {
+      "path": "dayu/fins/tools/upload_tools.py",
+      "sha256": "f5ef3dfb66c04479e96d02eeb7ce2781b231804dfdc982bc85998b4f4b0f64a1",
+      "percent_covered": 94.96402877697842
+    },
+    {
+      "path": "dayu/fins/upload_failure.py",
+      "sha256": "9f722aa9156aa107c5b8cc88a72e1c3f668e1540be4f6fcbead1f9c02e24744b",
+      "percent_covered": 95.0
+    },
+    {
+      "path": "dayu/fins/upload_usage_contract.py",
+      "sha256": "fbe84d8d1dd36a3813d4ff965f41f4ff80e82003dc7da701391b81a73d77cb8e",
+      "percent_covered": 91.33333333333333
+    }
+  ],
+  "junit": {
+    "testcases": 2646,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 3
+  },
+  "validation_summary": {
+    "aggregate": {
+      "actual_exit": {
+        "pid": 39523,
+        "exit": 0,
+        "start": 195842.609579083,
+        "end": 196042.104442125,
+        "timed_out": false
+      },
+      "testcases": 2646,
+      "skipped": [
+        {
+          "class": "tests.cli.test_upload_filings_from_command",
+          "name": "test_windows_cmd_script_round_trips_adversarial_argv_with_real_cmd",
+          "reason": "requires real cmd.exe"
+        },
+        {
+          "class": "tests.cli.test_upload_filings_from_command",
+          "name": "test_windows_generated_script_runs_real_cli_into_temp_storage",
+          "reason": "requires real cmd.exe"
+        },
+        {
+          "class": "tests.fins.test_docling_upload_service_integration",
+          "name": "test_real_docling_upload_service_conversion_when_enabled",
+          "reason": "设置 DAYU_RUN_DOCLING_UPLOAD_INTEGRATION=1 后运行真实 Docling upload 集成测试"
+        }
+      ]
+    },
+    "production_count": 28,
+    "minimum_percent": 84.28927680798004,
+    "source_identity": "final-candidate-before.json (aggregate); final-candidate-delivery-before.json (one test job-store inspection uses concrete public assembly store instead of protocol attribute)",
+    "source_delta": {
+      "tests/fins/test_material_upload_publication.py": {
+        "wide": "6a102a9dd58a980b5d455cf86d6ddb3970a6a7d39104bb3046e61e7718e1d2df",
+        "delivered": "1cb02695976d76d36925ad9ea3570c2c7ee7448cbb1b1a45e176b19805d4a6a7"
+      }
+    }
+  },
+  "failed_tickets_with_recovery": [
+    {
+      "label": "company-race-root-cause",
+      "actual": {
+        "pid": 38237,
+        "exit": 1,
+        "start": 195313.258969041,
+        "end": 195314.763439208,
+        "timed_out": false
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/company-race-root-cause/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/company-race-root-cause/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/company-race-root-cause/stderr.txt",
+      "nonzero_cause": "真实 Fs 公司 None 的 read→B commit→validate 误拒，未进入公司 owner 等价判定",
+      "recovery_and_validation": "公司 stage 交 C01 commit owner；company-race-fixed / closure-09 / final-wide-03 / race-final-09–14",
+      "failure_retained": true
+    },
+    {
+      "label": "core-d-01",
+      "actual": {
+        "pid": 33683,
+        "exit": 1,
+        "start": 192446.514419875,
+        "end": 192454.395798083,
+        "timed_out": false
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/core-d-01/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/core-d-01/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/core-d-01/stderr.txt",
+      "nonzero_cause": "D/真实仓储测试fixture缺fiscal/amended、独立core及旧commit spy owner",
+      "recovery_and_validation": "required同组repo、完整schema、实际material commit/释放/取消owner；core-d-03 / final-wide-03",
+      "failure_retained": true
+    },
+    {
+      "label": "core-d-02",
+      "actual": {
+        "pid": 33827,
+        "exit": 1,
+        "start": 192526.856564875,
+        "end": 192532.899042708,
+        "timed_out": false
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/core-d-02/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/core-d-02/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/core-d-02/stderr.txt",
+      "nonzero_cause": "剩余7fixture/旧生命周期spy不对应新的材料commit owner",
+      "recovery_and_validation": "真实MaterialStateRepo fault/barrier不fake final；core-d-03 / final-wide-03",
+      "failure_retained": true
+    },
+    {
+      "label": "final-owner-10",
+      "actual": {
+        "pid": 39417,
+        "exit": 1,
+        "start": 195734.668326,
+        "end": 195738.104868666,
+        "timed_out": false
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/final-owner-10/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/final-owner-10/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/final-owner-10/stderr.txt",
+      "nonzero_cause": "1failure：测试用外部 document_id 猜opaque物理路径，StopIteration；未到目标损坏断言",
+      "recovery_and_validation": "独占单材料fixture明确只有1个source meta；final-owner-11与12真实unsafe/repair四例通过",
+      "failure_retained": true
+    },
+    {
+      "label": "final-pyright-02",
+      "actual": {
+        "pid": 39476,
+        "exit": 1,
+        "start": 195787.293188,
+        "end": 195824.831855083,
+        "timed_out": false
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/final-pyright-02/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/final-pyright-02/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/final-pyright-02/stderr.txt",
+      "nonzero_cause": "1error：测试把协议job_store当具体Fs并访问root_dir",
+      "recovery_and_validation": "使用同一DefaultRuntime具体公开assembly store；final-owner-12 / final-pyright-03",
+      "failure_retained": true
+    },
+    {
+      "label": "final-wide-01",
+      "actual": {
+        "pid": 36344,
+        "exit": 1,
+        "start": 194553.290553958,
+        "end": 194755.891696375,
+        "timed_out": false
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/final-wide-01/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/final-wide-01/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/final-wide-01/stderr.txt",
+      "nonzero_cause": "2633pass/3skip/3fail；原件作材料primary的三个旧read fixture被真实storage拒",
+      "recovery_and_validation": "C07精确授权真实original+Docling/roles/primary；c07-final189pass；最终2643pass/3skip",
+      "failure_retained": true
+    },
+    {
+      "label": "fixtures-04",
+      "actual": {
+        "pid": 34884,
+        "exit": 2,
+        "start": 193650.938061583,
+        "end": 193653.851106125,
+        "timed_out": false
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/fixtures-04/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/fixtures-04/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/fixtures-04/stderr.txt",
+      "nonzero_cause": "收集2exit：两条错误测试import，未运行断言",
+      "recovery_and_validation": "修正真实ticker_normalization及storage异常导入；fixtures-05 / final-wide-03",
+      "failure_retained": true
+    },
+    {
+      "label": "fixtures-05",
+      "actual": {
+        "pid": 34906,
+        "exit": 1,
+        "start": 193696.18829375,
+        "end": 193773.459378208,
+        "timed_out": false
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/fixtures-05/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/fixtures-05/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/fixtures-05/stderr.txt",
+      "nonzero_cause": "5fail：测试failure helper缺file_label必填参数",
+      "recovery_and_validation": "显式None、正确to_json，publication后续与final-wide-03",
+      "failure_retained": true
+    },
+    {
+      "label": "matrix-smoke",
+      "actual": {
+        "pid": 33242,
+        "exit": 1,
+        "start": 192090.715288625,
+        "end": 192092.268370333,
+        "timed_out": false
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/matrix-smoke/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/matrix-smoke/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/matrix-smoke/stderr.txt",
+      "nonzero_cause": "前置新公司名称必填，旧runtime failure fixture先被受理拒",
+      "recovery_and_validation": "合法company fixture、真实stage故障注入；closure-09 / final-wide-03",
+      "failure_retained": true
+    },
+    {
+      "label": "new-owner-01",
+      "actual": {
+        "pid": 33497,
+        "exit": 1,
+        "start": 192403.653193,
+        "end": 192405.592394291,
+        "timed_out": false
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/new-owner-01/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/new-owner-01/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/new-owner-01/stderr.txt",
+      "nonzero_cause": "异步测试内调用同步pipeline导致已运行loop错误",
+      "recovery_and_validation": "隔离真实同步调用ThreadPool，保持producer/仓储；new-owner-02以后/最终",
+      "failure_retained": true
+    },
+    {
+      "label": "new-owner-02",
+      "actual": {
+        "pid": 33826,
+        "exit": 1,
+        "start": 192524.794607125,
+        "end": 192526.820147375,
+        "timed_out": false
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/new-owner-02/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/new-owner-02/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/new-owner-02/stderr.txt",
+      "nonzero_cause": "真实fixture缺必要ingest_method，storage拒",
+      "recovery_and_validation": "完整显式storage schema fixture；core-d-03 / final-wide-03",
+      "failure_retained": true
+    },
+    {
+      "label": "owner-01",
+      "actual": {
+        "pid": 32724,
+        "exit": -15,
+        "start": 191746.815690625,
+        "end": 191980.712811125
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/owner-01/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/owner-01/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/owner-01/stderr.txt",
+      "nonzero_cause": "中断 -15；未完成 JUnit，不计 pass；两个独立 core 的测试装配造成 writer 等待",
+      "recovery_and_validation": "同组真实仓储迁移，core-d-03 与 final-wide-03；全局 ps 违约单独保留",
+      "failure_retained": true
+    },
+    {
+      "label": "owner-02",
+      "actual": {
+        "pid": 33088,
+        "exit": -15,
+        "start": 191980.793531333,
+        "end": 192220.817235916,
+        "timed_out": true
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/owner-02/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/owner-02/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/owner-02/stderr.txt",
+      "nonzero_cause": "240 秒 owned Popen 超时、-15；旧测试装配仍非同组 core",
+      "recovery_and_validation": "shared core fixture 修复，core-d-03 / final-wide-03",
+      "failure_retained": true
+    },
+    {
+      "label": "probe-types-02",
+      "actual": {
+        "pid": 36459,
+        "exit": 1,
+        "start": 194582.031271625,
+        "end": 194584.440788625,
+        "timed_out": false
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/probe-types-02/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/probe-types-02/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/probe-types-02/stderr.txt",
+      "nonzero_cause": "绝对 include 被拒/缺导入根，错误扩扫临时脚本，30errors；不计正确范围检查",
+      "recovery_and_validation": "独占相对 include 与实际 extraPaths；probe-types-04 / probe-types-delivery",
+      "failure_retained": true
+    },
+    {
+      "label": "probe-types-03",
+      "actual": {
+        "pid": 36719,
+        "exit": 1,
+        "start": 194648.926781958,
+        "end": 194650.10830575,
+        "timed_out": false
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/probe-types-03/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/probe-types-03/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/probe-types-03/stderr.txt",
+      "nonzero_cause": "独立探针真实 6typing errors：JsonValue 容器不变性/winner 可能未赋值",
+      "recovery_and_validation": "显式 typed JSON 容器和 winner 条件；probe-types-04 / probe-types-delivery",
+      "failure_retained": true
+    },
+    {
+      "label": "publication-04",
+      "actual": {
+        "pid": 35161,
+        "exit": 1,
+        "start": 193830.923020583,
+        "end": 193833.691830583,
+        "timed_out": false
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/publication-04/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/publication-04/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/publication-04/stderr.txt",
+      "nonzero_cause": "5fail：公司更新在同resolver下实际no-op；猜不存在swap方法",
+      "recovery_and_validation": "真实aliases竞争提交并断言确有变化；真实_replace_directory故障注入；publication-05以后/最终",
+      "failure_retained": true
+    },
+    {
+      "label": "publication-05",
+      "actual": {
+        "pid": 35274,
+        "exit": 1,
+        "start": 193871.213471625,
+        "end": 193874.219825166,
+        "timed_out": false
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/publication-05/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/publication-05/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/publication-05/stderr.txt",
+      "nonzero_cause": "5fail：测试使用不存在的to_json_value方法",
+      "recovery_and_validation": "唯一typed failure.to_json；publication-06以后/最终",
+      "failure_retained": true
+    },
+    {
+      "label": "publication-06",
+      "actual": {
+        "pid": 35675,
+        "exit": 1,
+        "start": 194053.470594041,
+        "end": 194061.666469166,
+        "timed_out": false
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/publication-06/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/publication-06/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/publication-06/stderr.txt",
+      "nonzero_cause": "1fail：测试给typed original descriptor传不存在role字段",
+      "recovery_and_validation": "使用真实name/sha/primary身份差异；owner-07 / final-wide-03",
+      "failure_retained": true
+    },
+    {
+      "label": "race-01-run",
+      "actual": {
+        "pid": 33288,
+        "exit": 1,
+        "start": 192188.032885,
+        "end": 192195.618051583,
+        "timed_out": false
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/race-01-run/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/race-01-run/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/race-01-run/stderr.txt",
+      "nonzero_cause": "真实双 CLI 内层0/0、差异空；父脚本误匹配文本，actual1，不计父通过",
+      "recovery_and_validation": "精确正常 CLI 字符串；race-02-run；最终按C06/R01绑定重验race-final-13/14",
+      "failure_retained": true
+    },
+    {
+      "label": "race-final-01-run",
+      "actual": {
+        "pid": 36282,
+        "exit": 1,
+        "start": 194529.071678083,
+        "end": 194536.38481,
+        "timed_out": false
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/race-final-01-run/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/race-final-01-run/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/race-final-01-run/stderr.txt",
+      "nonzero_cause": "CLI实际0/0；父 durable 查询调用不存在 list_jobs，actual1",
+      "recovery_and_validation": "用公开 job-store owner 派生 root 的实际零文件查询；race-final-02以后及13/14",
+      "failure_retained": true
+    },
+    {
+      "label": "race-final-06-run",
+      "actual": {
+        "pid": 37813,
+        "exit": 1,
+        "start": 195125.9735115,
+        "end": 195128.383361875,
+        "timed_out": false
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/race-final-06-run/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/race-final-06-run/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/race-final-06-run/stderr.txt",
+      "nonzero_cause": "真实产品提前 source_publication_conflict：A1、B被父finally terminate -15、父1",
+      "recovery_and_validation": "与 root R01/作者F08同项：真实owner traceback复现，C01修复；新probe两 owned PID 均wait，顺序/同时13/14通过",
+      "failure_retained": true
+    },
+    {
+      "label": "read-fixture-02",
+      "actual": {
+        "pid": 37115,
+        "exit": 1,
+        "start": 194850.450424041,
+        "end": 194852.939438166,
+        "timed_out": false
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/read-fixture-02/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/read-fixture-02/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/read-fixture-02/stderr.txt",
+      "nonzero_cause": "2fail：FileObjectMeta无name属性，测试尚未进入真实create",
+      "recovery_and_validation": "使用显式共享docling_storage_name及生产文件名；read-fixture-03 / c07-final / final-wide-03",
+      "failure_retained": true
+    },
+    {
+      "label": "runtime-01",
+      "actual": {
+        "pid": 33956,
+        "exit": 1,
+        "start": 192697.09716,
+        "end": 192712.896163958,
+        "timed_out": false
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/runtime-01/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/runtime-01/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/runtime-01/stderr.txt",
+      "nonzero_cause": "44fail：required材料JSON事实、缺目标删除fixture、原终态异常测试期待覆盖",
+      "recovery_and_validation": "显式published bool/null、真实seed完整目标、保已存terminal；runtime后续及final-wide-03",
+      "failure_retained": true
+    },
+    {
+      "label": "runtime-02",
+      "actual": {
+        "pid": 34378,
+        "exit": 1,
+        "start": 193125.966977458,
+        "end": 193137.330874125,
+        "timed_out": false
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/runtime-02/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/runtime-02/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/runtime-02/stderr.txt",
+      "nonzero_cause": "12fail：fixture根不一致、同步/异步seed和重复seed问题",
+      "recovery_and_validation": "同根真实仓储、正确市场producer/一次seed；runtime-03以后/最终",
+      "failure_retained": true
+    },
+    {
+      "label": "runtime-03",
+      "actual": {
+        "pid": 34454,
+        "exit": 1,
+        "start": 193219.146244083,
+        "end": 193230.367781541,
+        "timed_out": false
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/runtime-03/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/runtime-03/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/runtime-03/stderr.txt",
+      "nonzero_cause": "6fail：no-runner旧文本、重复seed、CN使用SEC、静态拒绝仍断言空树/错根",
+      "recovery_and_validation": "同typed双摘要/真实CN seed/冻结前后业务树不变；fixtures后续/最终",
+      "failure_retained": true
+    },
+    {
+      "label": "surface-01",
+      "actual": {
+        "pid": 33983,
+        "exit": 1,
+        "start": 192752.299654166,
+        "end": 192843.643722458,
+        "timed_out": false
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/surface-01/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/surface-01/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/surface-01/stderr.txt",
+      "nonzero_cause": "14fail：旧公司缺名、损坏应前置拒、CLI合法fixture未装配、CLI直接storage import",
+      "recovery_and_validation": "合法producer fixtures、保原业务错误目的，C06 Service handoff；service-c06及final-wide-03",
+      "failure_retained": true
+    },
+    {
+      "label": "types-01",
+      "actual": {
+        "pid": 32504,
+        "exit": 1,
+        "start": 191449.650998833,
+        "end": 191485.025076791
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/types-01/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/types-01/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/types-01/stderr.txt",
+      "nonzero_cause": "127errors，新增required constructor全集迁移与C03保护caller缺口",
+      "recovery_and_validation": "对应严格显式owner/caller/合法fixture迁移，最终full final-pyright-03 actual0/0errors；无ignore/Any/默认兼容",
+      "failure_retained": true
+    },
+    {
+      "label": "types-02",
+      "actual": {
+        "pid": 32665,
+        "exit": 1,
+        "start": 191729.268713666,
+        "end": 191764.631401666
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/types-02/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/types-02/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/types-02/stderr.txt",
+      "nonzero_cause": "43errors，C04来源类型必填caller及fixture签名",
+      "recovery_and_validation": "对应严格显式owner/caller/合法fixture迁移，最终full final-pyright-03 actual0/0errors；无ignore/Any/默认兼容",
+      "failure_retained": true
+    },
+    {
+      "label": "types-03",
+      "actual": {
+        "pid": 33036,
+        "exit": 1,
+        "start": 191890.560234916,
+        "end": 191925.456067791
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/types-03/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/types-03/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/types-03/stderr.txt",
+      "nonzero_cause": "46errors，旧测试wrapper/required字段与source-kind迁移未完整",
+      "recovery_and_validation": "对应严格显式owner/caller/合法fixture迁移，最终full final-pyright-03 actual0/0errors；无ignore/Any/默认兼容",
+      "failure_retained": true
+    },
+    {
+      "label": "types-04",
+      "actual": {
+        "pid": 33358,
+        "exit": 1,
+        "start": 192289.808449416,
+        "end": 192326.083838458,
+        "timed_out": false
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/types-04/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/types-04/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/types-04/stderr.txt",
+      "nonzero_cause": "8errors，shared repository_set fixture局部赋值及签名",
+      "recovery_and_validation": "对应严格显式owner/caller/合法fixture迁移，最终full final-pyright-03 actual0/0errors；无ignore/Any/默认兼容",
+      "failure_retained": true
+    },
+    {
+      "label": "types-05",
+      "actual": {
+        "pid": 34186,
+        "exit": 1,
+        "start": 192986.433875208,
+        "end": 193021.021405083,
+        "timed_out": false
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/types-05/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/types-05/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/types-05/stderr.txt",
+      "nonzero_cause": "1error，错误把Validated handoff交raw seed",
+      "recovery_and_validation": "对应严格显式owner/caller/合法fixture迁移，最终full final-pyright-03 actual0/0errors；无ignore/Any/默认兼容",
+      "failure_retained": true
+    },
+    {
+      "label": "types-06",
+      "actual": {
+        "pid": 34880,
+        "exit": 1,
+        "start": 193649.794850708,
+        "end": 193684.407570083,
+        "timed_out": false
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/types-06/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/types-06/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/types-06/stderr.txt",
+      "nonzero_cause": "17errors，JsonValue断言未收窄、错误import、file_label缺参数",
+      "recovery_and_validation": "对应严格显式owner/caller/合法fixture迁移，最终full final-pyright-03 actual0/0errors；无ignore/Any/默认兼容",
+      "failure_retained": true
+    },
+    {
+      "label": "types-07",
+      "actual": {
+        "pid": 35276,
+        "exit": 1,
+        "start": 193872.330713291,
+        "end": 193906.985495125,
+        "timed_out": false
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/types-07/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/types-07/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/types-07/stderr.txt",
+      "nonzero_cause": "1error，typed failure不存在to_json_value",
+      "recovery_and_validation": "对应严格显式owner/caller/合法fixture迁移，最终full final-pyright-03 actual0/0errors；无ignore/Any/默认兼容",
+      "failure_retained": true
+    },
+    {
+      "label": "types-08",
+      "actual": {
+        "pid": 36286,
+        "exit": 1,
+        "start": 194530.209908958,
+        "end": 194568.533190375,
+        "timed_out": false
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/types-08/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/types-08/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/types-08/stderr.txt",
+      "nonzero_cause": "5errors，新工具测试job局部可能未赋值",
+      "recovery_and_validation": "对应严格显式owner/caller/合法fixture迁移，最终full final-pyright-03 actual0/0errors；无ignore/Any/默认兼容",
+      "failure_retained": true
+    },
+    {
+      "label": "types-09",
+      "actual": {
+        "pid": 37193,
+        "exit": 1,
+        "start": 194922.296272458,
+        "end": 194957.20642375,
+        "timed_out": false
+      },
+      "command": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/types-09/command.json",
+      "stdout": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/types-09/stdout.txt",
+      "stderr": "workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/types-09/stderr.txt",
+      "nonzero_cause": "2errors，两个实际CN/HK adapter factory caller缺required repo",
+      "recovery_and_validation": "对应严格显式owner/caller/合法fixture迁移，最终full final-pyright-03 actual0/0errors；无ignore/Any/默认兼容",
+      "failure_retained": true
+    }
+  ],
+  "outer_nonzero_commands": [
+    {
+      "id": "item_4",
+      "exit": 1,
+      "command": "/bin/zsh -c \"source .venv/bin/activate\nrg -n '\"'^## |''^### '\"' docs/gateflow/upload-material-unified-repair-plan-20261002.md\nsed -n '205,410p' docs/gateflow/upload-material-unified-repair-plan-20261002.md\nsed -n '1,180p' dayu/fins/storage/repository_protocols.py\ncat dayu/fins/pipelines/material_upload_publication.py\"",
+      "impact": "Historical read/search locator or in-flight ticket unavailable; actual source and required tickets subsequently read and restored. Not final validation pass evidence."
+    },
+    {
+      "id": "item_33",
+      "exit": 1,
+      "command": "/bin/zsh -c \"source .venv/bin/activate\nsed -n '40,92p' dayu/fins/upload_failure.py\ncat workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/types-02/stdout.txt | head -85\ncat workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/owner-01/stdout.txt | head -38\nrg -n 'amended|metadata_updated' dayu/fins/tools/_ingestion_tool_helpers.py dayu/service/fins_direct.py dayu/fins/tools/upload_tools.py\nrg -n 'def .*precondition' tests/fins/test_upload_usage_contract.py tests/fins/test_docling_upload_service.py\"",
+      "impact": "Historical read/search locator or in-flight ticket unavailable; actual source and required tickets subsequently read and restored. Not final validation pass evidence."
+    },
+    {
+      "id": "item_73",
+      "exit": 1,
+      "command": "/bin/zsh -c \"source .venv/bin/activate\ncat dayu/fins/storage/fs_company_meta_repository.py | sed -n '72,143p'\nsed -n '426,450p' dayu/fins/domain/document_models.py\ncat workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/runtime-01/actual-exit.json\nrg -n '\"'^FAILED'\"' workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/runtime-01/stdout.txt | tail -65\ncat workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/surface-01/actual-exit.json\"",
+      "impact": "Historical read/search locator or in-flight ticket unavailable; actual source and required tickets subsequently read and restored. Not final validation pass evidence."
+    },
+    {
+      "id": "item_78",
+      "exit": 1,
+      "command": "/bin/zsh -c \"source .venv/bin/activate\ncat docs/gateflow/upload-material-unified-s2-c05-root-adjudication-20261003.md\npython - <<'PY'\nimport xml.etree.ElementTree as ET\nroot=ET.parse('workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/surface-01/junit.xml').getroot()\nfor c in root.iter('testcase'):\n f=c.find('failure')\n if f is not None: print(c.attrib['name'],f.attrib.get('message','')[:200])\nPY\nsed -n '403,442p' tests/fins/test_fins_ingestion_runtime.py\nsed -n '12670,12690p' tests/fins/test_fins_ingestion_runtime.py\nrg -n '_LOGGER' dayu/fins/ingestion_runtime.py | head -8\ncat workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/types-05/actual-exit.json\"",
+      "impact": "Historical read/search locator or in-flight ticket unavailable; actual source and required tickets subsequently read and restored. Not final validation pass evidence."
+    },
+    {
+      "id": "item_118",
+      "exit": 1,
+      "command": "/bin/zsh -c \"sed -n '2598,2645p' dayu/fins/ingestion_runtime.py\nsed -n '5340,5450p' tests/fins/test_fins_ingestion_runtime.py\nsed -n '6400,6433p' tests/fins/test_fins_ingestion_runtime.py\nsed -n '11030,11074p' tests/fins/test_fins_ingestion_runtime.py\nrg -n -A38 'def _validate_cancelled.*summary|def _validate_cancel.*projection' dayu/fins/ingestion_runtime.py\"",
+      "impact": "Historical read/search locator or in-flight ticket unavailable; actual source and required tickets subsequently read and restored. Not final validation pass evidence."
+    },
+    {
+      "id": "item_119",
+      "exit": 1,
+      "command": "/bin/zsh -c \"rg -n -A38 'def save_cancelled_if_active' dayu/fins/ingestion_runtime.py | tail -n 44\nrg -n 'result_summary.*None|save_cancelled' dayu/fins/ingestion_runtime.py | tail -n 22\nrg -n -A13 'def _start_upload_job' dayu/fins/ingestion_runtime.py\nrg -n 'FinsUploadPipelineResult|published_amended' dayu/service/fins_direct.py dayu/fins/tools/_ingestion_tool_helpers.py\"",
+      "impact": "Historical read/search locator or in-flight ticket unavailable; actual source and required tickets subsequently read and restored. Not final validation pass evidence."
+    },
+    {
+      "id": "item_123",
+      "exit": 1,
+      "command": "/bin/zsh -c \"rg -n -A38 'class _FinsIngestionExecutionContext' dayu/fins/ingestion_runtime.py\nsed -n '6644,6664p' dayu/fins/ingestion_runtime.py\nrg -n 'details == \\\\(\\\\)' tests/fins/test_fins_ingestion_runtime.py tests/fins/test_fins_direct_stream.py tests/service/test_fins_direct.py | head -n 15\nrg -n 'upload_request:' dayu/fins/ingestion_runtime.py\"",
+      "impact": "Historical read/search locator or in-flight ticket unavailable; actual source and required tickets subsequently read and restored. Not final validation pass evidence."
+    },
+    {
+      "id": "item_205",
+      "exit": 1,
+      "command": "/bin/zsh -c \"rg -n 'ingestion_job_store:' dayu/fins/service_runtime.py\nrg -n 'root_dir' workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/final-pyright-02/stdout.txt\nrg --files docs/gateflow | rg 'upload-material-unified-s2-.*-root-adjudication-.*\\\\.md\"'$'\"'\ncat workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01/final-wide-03/actual-exit.json\"",
+      "impact": "Historical read/search locator or in-flight ticket unavailable; actual source and required tickets subsequently read and restored. Not final validation pass evidence."
+    }
+  ],
+  "root_audit_correction": "First technical digest check compared digest string with record dict; corrected to record.sha256 plus bytes and rechecked all entries, zero mismatch. No source mutation or product finding.",
+  "direct_review": [
+    "R01 real company read→validate traceback and company commit owner",
+    "storage material registration/final guard/COMPLETE before COMMITTED",
+    "D capability transfer and exact same final result",
+    "latest real CLI barrier, consumer bindings, both actual exits, sequential business diff, durable queries"
+  ],
+  "controller": {
+    "setup_status": "ok",
+    "agent_status": "completed",
+    "tool_evidence": "present",
+    "tool_trace": "reviewed",
+    "required_evidence": "complete",
+    "canary_status": "match",
+    "result_status": "accepted",
+    "warnings": [
+      "Historical ps protocol breach recorded in execution-root artifact; no later global process queries accepted.",
+      "Historical owner-01 interruption and owner-02 timeout retained and excluded from pass.",
+      "Actual Docling child PID unknown in success cleanup logs; no global discovery claim.",
+      "Two Windows and one optional PDF tests skipped; text production CLI separately executed."
+    ],
+    "evidence_gaps": [],
+    "retry_class": "not_needed"
+  },
+  "decision": "Accept complete S2 implementation as frozen code-review input only; no S2 gate pass/commit before dual review and fixing accepted findings.",
+  "finding_status": "C01/C02/C03/C04/C06/C07/R01/R01-M candidates await same-version dual review; C05 second-list premise rejected.",
+  "next_gate": "code review S2; S3 not implemented; PR review after all slices/aggregate; full CLI campaign/registry after WU closeout"
+}

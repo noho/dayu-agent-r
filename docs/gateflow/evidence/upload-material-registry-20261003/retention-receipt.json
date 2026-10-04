@@ -1,0 +1,9 @@
+{
+  "bytes": 10393004,
+  "sha256": "1eebba3d163d8fd556046996ce0466773a08c40a2b4ecbde7ca7e080e02d808d",
+  "primary": "workspace/evidence/upload-material-post-ci-gate-runners-20261003/private/diagnostics-code-fix-sol-01.tar.gz",
+  "backup": "output/evidence-backup/upload-material-post-ci-gate-runners-20261003/private/diagnostics-code-fix-sol-01.tar.gz",
+  "equal": true,
+  "mode": "0600",
+  "contains": "full runner+ownfix/cov/raw/scripts+current11 source exact+fresh04realraw/workspaces/nativekernel/admin, unchangedinputs/cache refexisting802dualarchive"
+}

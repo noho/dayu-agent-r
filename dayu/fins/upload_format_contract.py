@@ -20,7 +20,10 @@ from dayu.fins.direct_events import (
     canonicalize_fins_public_file_label,
     validate_fins_public_file_label,
 )
+from dayu.fins.storage.asset_filename_contract import DOCUMENT_SOURCE_CONTROL_FILENAMES
 
+MAX_FILING_UPLOAD_FILES: Final[int] = 100
+MAX_MATERIAL_UPLOAD_FILES: Final[int] = 100
 _XSD_COMPANION_SUFFIX: Final[str] = ".xsd"
 _FORMAT_ERROR_MESSAGE_MAX_CHARS: Final[int] = 240
 _PRIMARY_UNSUPPORTED_TEMPLATE: Final[str] = "财报主文件格式不受支持：{file_label}"
@@ -87,6 +90,7 @@ class FinsUploadFormatError(ValueError):
 
     kind: FinsUploadFormatFailureKind
     file_label: str
+    retry_hint: str
 
     def __init__(self, kind: FinsUploadFormatFailureKind, file_label: str) -> None:
         """初始化有界、去路径化的格式错误。
@@ -108,6 +112,7 @@ class FinsUploadFormatError(ValueError):
         validate_fins_public_file_label(file_label)
         self.kind = kind
         self.file_label = file_label
+        self.retry_hint = "请查看上传帮助中的支持格式后重试"
         super().__init__(_bounded_format_failure_message(kind, file_label=file_label))
 
 
@@ -545,7 +550,7 @@ class FinsUploadFormatTextProjection:
         material_files: material ``--files`` 的自足说明。
         upload_tool_files: 同时覆盖 filing 与 material 的工具字段说明。
         upload_tool_primary: 工具 ``primary`` 字段的自足说明。
-        upload_tool_material_primary_failure: material 携带 ``primary`` 时的工具失败说明。
+        material_primary: 材料主文件选择的自足说明。
 
     Raises:
         无。
@@ -556,7 +561,7 @@ class FinsUploadFormatTextProjection:
     material_files: str
     upload_tool_files: str
     upload_tool_primary: str
-    upload_tool_material_primary_failure: str
+    material_primary: str
 
 
 def _project_filing_primary_rules(
@@ -603,6 +608,7 @@ def project_fins_upload_format_text(
 
     suffixes = ", ".join(capability.primary_suffixes)
     companion_only_suffixes = ", ".join(sorted(capability.companion_only_suffixes))
+    control_names = "、".join(sorted(DOCUMENT_SOURCE_CONTROL_FILENAMES))
     filing_primary = _project_filing_primary_rules(
         files_label="--files",
         primary_label="--primary",
@@ -611,11 +617,14 @@ def project_fins_upload_format_text(
         files_label="files",
         primary_label="primary",
     )
-    upload_tool_material_primary_failure = (
-        "upload_kind=material 不得提供 primary；请省略 primary 字段"
+    material_primary = (
+        "单文件材料可省略 --primary，省略时唯一文件就是主文件；多文件材料必须恰好指定一个 --primary；"
+        "--primary 必须精确匹配 --files 中的一个路径；文件顺序不决定主文件。delete 必须省略 --files 和 --primary。"
     )
+    material_tool_primary = material_primary.replace("--primary", "primary").replace("--files", "files")
     filing_files = (
         "auto/create/update 必须至少提供一个文件。已选主文件必须实际转换成功；"
+        f"filing 一次最多 {MAX_FILING_UPLOAD_FILES} 个文件；"
         "其余文件是仅原样保存、不转换的随附文件。"
         f"主文件支持后缀：{suffixes}；随附文件支持这些后缀以及 {companion_only_suffixes}，"
         f"且 {companion_only_suffixes} 只能作为随附文件。"
@@ -626,23 +635,32 @@ def project_fins_upload_format_text(
     material_files = (
         "auto/create/update 必须至少提供一个文件；"
         f"每个文件都必须使用转换器支持的后缀：{suffixes}，并逐个实际转换成功；"
-        "后缀通过只表示具备转换资格，不保证文件内容转换成功。delete 不得提供文件。"
+        "后缀通过只表示具备转换资格，不保证文件内容转换成功。"
+        ".json 仅是 Docling 格式的 JSON 文档候选，不代表任意 JSON 内容可转换。"
+        ".xml/.xbrl 仅是 XBRL 财报实例文档候选，不代表任意 XML 或独立 linkbase 文件可转换。"
+        "XBRL 转换需要管理员完成受控部署配置；未配置或配置校验失败时上传失败。"
+        "delete 不得提供文件。"
     )
     return FinsUploadFormatTextProjection(
         filing_files=filing_files,
         filing_primary=filing_primary,
-        material_files=material_files,
+        material_files=material_files + material_primary,
         upload_tool_files=(
             f"upload_kind=filing 时，{filing_files}"
-            f"upload_kind=material 时，{material_files}"
-            "每个路径必须指向已存在、非空的普通文件。"
+            f"upload_kind=material 时，{material_files}{material_tool_primary}"
+            "每个路径必须指向已存在的普通文件。文件为空，无法上传；请提供非空文件后重试。"
+            f"material 一次最多 {MAX_MATERIAL_UPLOAD_FILES} 个文件；不同路径的原件不能有相同完整文件名，"
+            f"文件名也不能与工作区控制文件（{control_names}）或本批原件及转换结果冲突；"
+            "大小写不同的文件名也可能冲突。"
+            "每个转换结果的文件名是完整原件文件名后追加 _docling.json，"
+            "例如 deck.txt 对应 deck.txt_docling.json；请在上传前避开这些冲突。"
         ),
         upload_tool_primary=(
-            f"仅用于 upload_kind=filing：{upload_tool_primary_rules}"
-            f"{upload_tool_material_primary_failure}。"
+            f"upload_kind=filing：{upload_tool_primary_rules}"
+            f"upload_kind=material：{material_tool_primary}"
             "primary 是用户选择的业务角色，不能根据质量、重要性或转换是否成功推断。"
         ),
-        upload_tool_material_primary_failure=upload_tool_material_primary_failure,
+        material_primary=material_primary,
     )
 
 
@@ -654,6 +672,8 @@ FINS_UPLOAD_FORMAT_TEXT: Final[FinsUploadFormatTextProjection] = project_fins_up
 __all__: tuple[str, ...] = (
     "FINS_UPLOAD_FORMAT_CAPABILITY",
     "FINS_UPLOAD_FORMAT_TEXT",
+    "MAX_FILING_UPLOAD_FILES",
+    "MAX_MATERIAL_UPLOAD_FILES",
     "FinsUploadFileRole",
     "FinsUploadFilingFiles",
     "FinsUploadFormatCapability",

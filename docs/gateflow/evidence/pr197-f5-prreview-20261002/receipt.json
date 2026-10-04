@@ -1,0 +1,21 @@
+{
+  "repository": "noho/dayu-agent-r",
+  "head_repository": {
+    "id": "R_kgDOST7jrQ",
+    "name": "dayu-agent-r",
+    "nameWithOwner": "noho/dayu-agent-r"
+  },
+  "PR": 197,
+  "head": "3d0d390206739a8bb255dee517b5b61bfc4497b6",
+  "base": "fac32ecbff9bfe792b63ee9667c8697826b631f4",
+  "compare_url": "repos/noho/dayu-agent-r/compare/fac32ecbff9bfe792b63ee9667c8697826b631f4...3d0d390206739a8bb255dee517b5b61bfc4497b6",
+  "compare_exit": 0,
+  "compare_diff_sha256": "b2583bc8595eba7dfe7be4f8fab68f6e516097fee52558ead60faa506613534d",
+  "compare_bytes": 14789831,
+  "compare_files": 846,
+  "local_diff_files": 846,
+  "head_base_before_after_equal": true,
+  "code_source": "local exact HEAD matches PR head; product working-tree equality must be independently checked",
+  "checks_exit": 1,
+  "checks_status": "read raw JSON/stderr; never treat absence or pending as pass"
+}

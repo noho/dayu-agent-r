@@ -1,0 +1,618 @@
+{
+  "gate": "aggregate deepreview fix/re-review root accepted",
+  "created": "2026-10-04T15:38:54.299690+08:00",
+  "workspace": "/Users/leo/workspace/dayu-agent-r",
+  "branch": "codex/upload-material-oracle",
+  "reviewed_parent": "238b28980dcbdebc4b44005d75003f00a4a719da",
+  "accepted_plan": "d054c0fece08d3fb5b3ed71207b3dbb8ec7f5d8c",
+  "accepted_S1": "238b28980dcbdebc4b44005d75003f00a4a719da",
+  "initial_aggregate": {
+    "path": "workspace/tmp/upload-material-registry-20261003/aggregate-freeze-01/manifest.json",
+    "bytes": 19154,
+    "sha256": "58fb15ced4ef11dc4c3f442e8f9920a013c46aaa53c44e2ee66fe9e22f3b3c47"
+  },
+  "final_delta_freeze": {
+    "path": "workspace/tmp/upload-material-registry-20261003/aggregate-rereview-freeze-01/manifest.json",
+    "bytes": 11690,
+    "sha256": "cf1cef96c8f45f56c705a228e17dbe589b0282ea33af8806335d0df358a965e8"
+  },
+  "candidate_files": [
+    {
+      "path": "docs/cli_ci.md",
+      "bytes": 156772,
+      "sha256": "063fd969333ce628c1a0377c3f43b4a1df0d597cbf10f96ec4a5cec034a3a32b",
+      "before_sha256": "063fd969333ce628c1a0377c3f43b4a1df0d597cbf10f96ec4a5cec034a3a32b",
+      "changed": false
+    },
+    {
+      "path": "docs/cli_ci_oracles.json",
+      "bytes": 296547,
+      "sha256": "07523ad680e591c8c78a28378286ed718228798376e3366409ab811d592df64b",
+      "before_sha256": "07523ad680e591c8c78a28378286ed718228798376e3366409ab811d592df64b",
+      "changed": false
+    },
+    {
+      "path": "docs/cli_ci_scenarios.json",
+      "bytes": 11500453,
+      "sha256": "46e1e989c49758bf9cab252250ea8e63d29029791703d0fd62143780bfa96c7e",
+      "before_sha256": "46e1e989c49758bf9cab252250ea8e63d29029791703d0fd62143780bfa96c7e",
+      "changed": false
+    },
+    {
+      "path": "docs/gateflow/evidence/upload-material-registry-20261003/authority-index.json",
+      "bytes": 30404,
+      "sha256": "382a35bc7fe77206f00b49415e1fdc97dffbe29167c4366a3e2adbd28e4df45f",
+      "before_sha256": "382a35bc7fe77206f00b49415e1fdc97dffbe29167c4366a3e2adbd28e4df45f",
+      "changed": false
+    },
+    {
+      "path": "docs/gateflow/evidence/upload-material-registry-20261003/focused-source.json",
+      "bytes": 14667,
+      "sha256": "df57b9608886f8b1af3259f3cabbee7f7e40aa3f4228c278e97c661e1ee29c13",
+      "before_sha256": "df57b9608886f8b1af3259f3cabbee7f7e40aa3f4228c278e97c661e1ee29c13",
+      "changed": false
+    },
+    {
+      "path": "docs/gateflow/evidence/upload-material-registry-20261003/mandatory-assignment.json",
+      "bytes": 6289801,
+      "sha256": "27c710e86cbca486e89fdbb3559894b6ef3ce17e9c19d358ea11956d218c0a57",
+      "before_sha256": "27c710e86cbca486e89fdbb3559894b6ef3ce17e9c19d358ea11956d218c0a57",
+      "changed": false
+    },
+    {
+      "path": "docs/gateflow/evidence/upload-material-registry-20261003/readiness-proof.json",
+      "bytes": 129672,
+      "sha256": "196d933a99a8503a5cf6ae9550114fdcc0dd3d5b41d8cf4f32a9c435595ad532",
+      "before_sha256": "196d933a99a8503a5cf6ae9550114fdcc0dd3d5b41d8cf4f32a9c435595ad532",
+      "changed": false
+    },
+    {
+      "path": "docs/gateflow/evidence/upload-material-registry-20261003/retention-receipt.json",
+      "bytes": 559,
+      "sha256": "785f683849143b82cb6b07f916a36a3fad27f886f8e392711185040ecde61eb0",
+      "before_sha256": "785f683849143b82cb6b07f916a36a3fad27f886f8e392711185040ecde61eb0",
+      "changed": false
+    },
+    {
+      "path": "docs/gateflow/evidence/upload-material-registry-20261003/review-target.json",
+      "bytes": 2141,
+      "sha256": "ad334bcbcb336a395ebf31c1b224c060233346d1f86a063be1f6705428f87260",
+      "before_sha256": "ad334bcbcb336a395ebf31c1b224c060233346d1f86a063be1f6705428f87260",
+      "changed": false
+    },
+    {
+      "path": "docs/gateflow/evidence/upload-material-registry-20261003/validation.json",
+      "bytes": 34276,
+      "sha256": "56ad05393ffb9d9b5d12c9ffc91f106053d7c5edc044ca30250c851179408481",
+      "before_sha256": "56ad05393ffb9d9b5d12c9ffc91f106053d7c5edc044ca30250c851179408481",
+      "changed": false
+    },
+    {
+      "path": "docs/gateflow/upload-material-registry-implementation-20261004.md",
+      "bytes": 10007,
+      "sha256": "d99f966ab3d211a4fab5ff9a0d48448759a0414e65356662e61e733487067082",
+      "before_sha256": "d99f966ab3d211a4fab5ff9a0d48448759a0414e65356662e61e733487067082",
+      "changed": false
+    },
+    {
+      "path": "tests/README.md",
+      "bytes": 135693,
+      "sha256": "33490aebe3caf5c1579ec349263c756034414bc103b3d2f33af79ae65536a7d3",
+      "before_sha256": "33490aebe3caf5c1579ec349263c756034414bc103b3d2f33af79ae65536a7d3",
+      "changed": false
+    },
+    {
+      "path": "tests/cli/test_cli_ci_upload_material_registry.py",
+      "bytes": 50777,
+      "sha256": "1fc88191841ec6419b8fb58d43d60f38842e727ffbe6fe9f8f73a916cf1c2aec",
+      "before_sha256": "d319194d929d2f67c3d654ada27af04b86a630c5ada25a987ee698554396b5bc",
+      "changed": true
+    },
+    {
+      "path": "utils/cli_ci_upload_material_registry.py",
+      "bytes": 75632,
+      "sha256": "23cb69c240815114cd4475ee6a0b104dd2bf7587d4fc7823ae51b54a5e17b348",
+      "before_sha256": "153fe8f1a81f39c837b3b847ac583ed74969113cad89816274c24b9646e3cf2c",
+      "changed": true
+    }
+  ],
+  "counts": {
+    "oracles": {
+      "old_preserved": 6,
+      "current": 7
+    },
+    "scenarios": {
+      "old_preserved": 1328,
+      "current": 2127
+    }
+  },
+  "finding_final_states": {
+    "REG-C01": "已修复",
+    "REG-C02": "已修复",
+    "REG-C03": "已修复",
+    "REG-C04": "已修复",
+    "REG-R01": "已修复",
+    "REG-R02": "已修复",
+    "REG-R03": "已修复",
+    "REG-AG01": "已修复"
+  },
+  "current_validation": {
+    "cases": 186,
+    "pyright_errors": 0,
+    "strict_actual_exit": 0,
+    "strict_whole_sha": "196d933a99a8503a5cf6ae9550114fdcc0dd3d5b41d8cf4f32a9c435595ad532",
+    "actual_executions": [
+      {
+        "name": "pytest-recovered",
+        "argv": [
+          "/Users/leo/workspace/dayu-agent-r/.venv/bin/python",
+          "-m",
+          "pytest",
+          "tests/cli/test_cli_ci_upload_material_registry.py",
+          "tests/cli/test_cli_ci_run_observation.py",
+          "-q"
+        ],
+        "cwd": "/Users/leo/workspace/dayu-agent-r",
+        "actual_wait": true,
+        "actual_exit": 0,
+        "stdout": {
+          "path": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-registry-20261003/aggregate-fix-sol-01/pytest-recovered.stdout",
+          "bytes": 271,
+          "sha256": "27b7ace8b4a269962e0bcd0dc8f7604202dc4c6ff0234d261a8dc5322446df04"
+        },
+        "stderr": {
+          "path": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-registry-20261003/aggregate-fix-sol-01/pytest-recovered.stderr",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      {
+        "name": "pyright",
+        "argv": [
+          "pyright"
+        ],
+        "cwd": "/Users/leo/workspace/dayu-agent-r",
+        "actual_wait": true,
+        "actual_exit": 0,
+        "stdout": {
+          "path": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-registry-20261003/aggregate-fix-sol-01/pyright.stdout",
+          "bytes": 191,
+          "sha256": "46a6c7834c9080ada23a415afd925abecc37d531f5c6e3d14ad0a7ff579096cb"
+        },
+        "stderr": {
+          "path": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-registry-20261003/aggregate-fix-sol-01/pyright.stderr",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      {
+        "name": "strict",
+        "argv": [
+          "/Users/leo/workspace/dayu-agent-r/.venv/bin/python",
+          "-m",
+          "utils.cli_ci_upload_material_registry",
+          "--oracle-registry",
+          "docs/cli_ci_oracles.json",
+          "--scenario-registry",
+          "docs/cli_ci_scenarios.json",
+          "--authority-index",
+          "docs/gateflow/evidence/upload-material-registry-20261003/authority-index.json",
+          "--assignment",
+          "docs/gateflow/evidence/upload-material-registry-20261003/mandatory-assignment.json",
+          "--before-oracles",
+          "workspace/tmp/upload-material-unified-repair-20261002/post-wu-preparation/cli_ci_oracles.json.before",
+          "--before-scenarios",
+          "workspace/tmp/upload-material-unified-repair-20261002/post-wu-preparation/cli_ci_scenarios.json.before",
+          "--evidence-root",
+          "workspace/evidence/upload-material-cli-20261003-79977b3a-01/public",
+          "--backup-root",
+          "output/evidence-backup/upload-material-cli-20261003-79977b3a-01/public",
+          "--focused-evidence-root",
+          "workspace/evidence/upload-material-diagnostics-focused04-22eca6c3-01/public",
+          "--focused-backup-root",
+          "output/evidence-backup/upload-material-diagnostics-focused04-22eca6c3-01/public",
+          "--focused-source",
+          "docs/gateflow/evidence/upload-material-registry-20261003/focused-source.json",
+          "--source-root",
+          "/Users/leo/workspace/dayu-agent-r",
+          "--registration-target",
+          "22eca6c313005e3c5185340f2d6b535ab2583056",
+          "--check",
+          "--output",
+          "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-registry-20261003/aggregate-fix-sol-01/strict-result.json"
+        ],
+        "cwd": "/Users/leo/workspace/dayu-agent-r",
+        "actual_wait": true,
+        "actual_exit": 0,
+        "stdout": {
+          "path": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-registry-20261003/aggregate-fix-sol-01/strict.stdout",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "stderr": {
+          "path": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-registry-20261003/aggregate-fix-sol-01/strict.stderr",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "output": {
+          "path": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-registry-20261003/aggregate-fix-sol-01/strict-result.json",
+          "bytes": 129672,
+          "sha256": "196d933a99a8503a5cf6ae9550114fdcc0dd3d5b41d8cf4f32a9c435595ad532"
+        }
+      }
+    ]
+  },
+  "strict_whole_report": {
+    "path": "docs/gateflow/evidence/upload-material-registry-20261003/readiness-proof.json",
+    "bytes": 129672,
+    "sha256": "196d933a99a8503a5cf6ae9550114fdcc0dd3d5b41d8cf4f32a9c435595ad532"
+  },
+  "historical_validation": {
+    "code_review_180": {
+      "path": "docs/gateflow/evidence/upload-material-registry-20261003/code-review-proof.json",
+      "bytes": 15620,
+      "sha256": "874ca76bcb57bc2b704100f130cd732d33bfbcb654a4ddf0913515f38fa4864f"
+    },
+    "bounded166": {
+      "path": "docs/gateflow/evidence/upload-material-registry-20261003/validation.json",
+      "bytes": 34276,
+      "sha256": "56ad05393ffb9d9b5d12c9ffc91f106053d7c5edc044ca30250c851179408481"
+    },
+    "meaning": "historical versions retained unchanged; current186 binds final helper/tests SHA, not a new product CI run"
+  },
+  "fix_report": {
+    "path": "docs/gateflow/upload-material-registry-aggregate-fix-20261004.md",
+    "bytes": 4456,
+    "sha256": "4f85e6a4ca3431c26bf82ae797fc7636156ed7ad36e4c480af705a1f465cbdc8"
+  },
+  "fix_audit": {
+    "setup_status": "ok",
+    "agent_status": "completed",
+    "tool_evidence": "yes",
+    "tool_trace": "complete",
+    "required_evidence": "complete",
+    "canary_status": "match",
+    "result_status": "accepted",
+    "warnings": [
+      "3 optional startup OpenAI docs MCP transport failures; no MCP calls required/performed, all mandatory local source/validation complete; actual turn.completed and exit0",
+      "item39 actual4: root task misstated observation test filename; first logs preserved, actual correct existing test_cli_ci_run_observation.py found inHEAD and recovered item48 real186pass",
+      "item43 exploratory rg old human filename no-match1; correct actual prior execution argv already in frozen proof, recovered source catalog item44/45",
+      "item69 rg traceback/failed/truncat no-match1 on final logs is expected, not validation failure",
+      "report first12 manifest paths are a frozen subset; root independently verifies all12 unchanged original14 candidates excluding two allowed changed source files; no false full37 fresh claim",
+      "historical peer human argv typo does not replace actual command-execution argv correct in committed code proof",
+      "actual_backend unknown; explicit runner -m gpt-6-sol, not profile inferred"
+    ],
+    "evidence_gaps": [],
+    "retry_class": "none",
+    "actual_managed_exit": 0,
+    "managed_session": 66642,
+    "runtime": "codex",
+    "provider": "gpt-6-sol",
+    "label": "upload-material-registry-aggregate-fix-sol-20261004-01",
+    "events": 141,
+    "commands": 59,
+    "instructions": [
+      {
+        "path": "AGENTS.md",
+        "bytes": 10036,
+        "sha256": "cb26618ab566804c97a3ef2f269537b7313e59370e5ddd0258d9b753b08ac45e",
+        "actual_full_cat_output_exact": true
+      },
+      {
+        "path": "/Users/leo/.codex/skills/gateflow/SKILL.md",
+        "bytes": 15415,
+        "sha256": "e1228941de4b0d74919c0ebb3b0d79fc27234a0477ae6449428f29a9d1ac1d7a",
+        "actual_full_cat_output_exact": true
+      }
+    ],
+    "validated_commands": [
+      {
+        "name": "pytest-recovered",
+        "argv": [
+          "/Users/leo/workspace/dayu-agent-r/.venv/bin/python",
+          "-m",
+          "pytest",
+          "tests/cli/test_cli_ci_upload_material_registry.py",
+          "tests/cli/test_cli_ci_run_observation.py",
+          "-q"
+        ],
+        "cwd": "/Users/leo/workspace/dayu-agent-r",
+        "actual_wait": true,
+        "actual_exit": 0,
+        "stdout": {
+          "path": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-registry-20261003/aggregate-fix-sol-01/pytest-recovered.stdout",
+          "bytes": 271,
+          "sha256": "27b7ace8b4a269962e0bcd0dc8f7604202dc4c6ff0234d261a8dc5322446df04"
+        },
+        "stderr": {
+          "path": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-registry-20261003/aggregate-fix-sol-01/pytest-recovered.stderr",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      {
+        "name": "pyright",
+        "argv": [
+          "pyright"
+        ],
+        "cwd": "/Users/leo/workspace/dayu-agent-r",
+        "actual_wait": true,
+        "actual_exit": 0,
+        "stdout": {
+          "path": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-registry-20261003/aggregate-fix-sol-01/pyright.stdout",
+          "bytes": 191,
+          "sha256": "46a6c7834c9080ada23a415afd925abecc37d531f5c6e3d14ad0a7ff579096cb"
+        },
+        "stderr": {
+          "path": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-registry-20261003/aggregate-fix-sol-01/pyright.stderr",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      {
+        "name": "strict",
+        "argv": [
+          "/Users/leo/workspace/dayu-agent-r/.venv/bin/python",
+          "-m",
+          "utils.cli_ci_upload_material_registry",
+          "--oracle-registry",
+          "docs/cli_ci_oracles.json",
+          "--scenario-registry",
+          "docs/cli_ci_scenarios.json",
+          "--authority-index",
+          "docs/gateflow/evidence/upload-material-registry-20261003/authority-index.json",
+          "--assignment",
+          "docs/gateflow/evidence/upload-material-registry-20261003/mandatory-assignment.json",
+          "--before-oracles",
+          "workspace/tmp/upload-material-unified-repair-20261002/post-wu-preparation/cli_ci_oracles.json.before",
+          "--before-scenarios",
+          "workspace/tmp/upload-material-unified-repair-20261002/post-wu-preparation/cli_ci_scenarios.json.before",
+          "--evidence-root",
+          "workspace/evidence/upload-material-cli-20261003-79977b3a-01/public",
+          "--backup-root",
+          "output/evidence-backup/upload-material-cli-20261003-79977b3a-01/public",
+          "--focused-evidence-root",
+          "workspace/evidence/upload-material-diagnostics-focused04-22eca6c3-01/public",
+          "--focused-backup-root",
+          "output/evidence-backup/upload-material-diagnostics-focused04-22eca6c3-01/public",
+          "--focused-source",
+          "docs/gateflow/evidence/upload-material-registry-20261003/focused-source.json",
+          "--source-root",
+          "/Users/leo/workspace/dayu-agent-r",
+          "--registration-target",
+          "22eca6c313005e3c5185340f2d6b535ab2583056",
+          "--check",
+          "--output",
+          "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-registry-20261003/aggregate-fix-sol-01/strict-result.json"
+        ],
+        "cwd": "/Users/leo/workspace/dayu-agent-r",
+        "actual_wait": true,
+        "actual_exit": 0,
+        "stdout": {
+          "path": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-registry-20261003/aggregate-fix-sol-01/strict.stdout",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "stderr": {
+          "path": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-registry-20261003/aggregate-fix-sol-01/strict.stderr",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "output": {
+          "path": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-registry-20261003/aggregate-fix-sol-01/strict-result.json",
+          "bytes": 129672,
+          "sha256": "196d933a99a8503a5cf6ae9550114fdcc0dd3d5b41d8cf4f32a9c435595ad532"
+        }
+      }
+    ],
+    "report": {
+      "path": "docs/gateflow/upload-material-registry-aggregate-fix-20261004.md",
+      "bytes": 4456,
+      "sha256": "4f85e6a4ca3431c26bf82ae797fc7636156ed7ad36e4c480af705a1f465cbdc8"
+    },
+    "source_identities": {
+      "utils/cli_ci_upload_material_registry.py": {
+        "bytes": 75632,
+        "sha256": "23cb69c240815114cd4475ee6a0b104dd2bf7587d4fc7823ae51b54a5e17b348"
+      },
+      "tests/cli/test_cli_ci_upload_material_registry.py": {
+        "bytes": 50777,
+        "sha256": "1fc88191841ec6419b8fb58d43d60f38842e727ffbe6fe9f8f73a916cf1c2aec"
+      },
+      "docs/gateflow/upload-material-registry-aggregate-fix-20261004.md": {
+        "bytes": 4456,
+        "sha256": "4f85e6a4ca3431c26bf82ae797fc7636156ed7ad36e4c480af705a1f465cbdc8"
+      }
+    },
+    "findings": {
+      "REG-AG01": "candidate已修复, awaits dual re-review",
+      "REG-C04": "部分修复 until re-review",
+      "REG-R01": "部分修复 until re-review"
+    },
+    "root_scope": "Full result/fix report, all59 commands and every actual nonzero/stdout/stderr reviewed; actual twofile delta (26insert/3delete), six ownerAPI negatives, full instruction reads exact; current186/fulltype0/approved-m strict samewholeproof. All12 unchanged original candidate SHA verified; no repeated optional tests.",
+    "gate_pass": false
+  },
+  "fix_retention": {
+    "archives": [
+      "workspace/evidence/upload-material-post-ci-gate-runners-20261003/private/registry-aggregate-fix-sol-01.tar.gz",
+      "output/evidence-backup/upload-material-post-ci-gate-runners-20261003/private/registry-aggregate-fix-sol-01.tar.gz"
+    ],
+    "bytes": 297055,
+    "sha256": "6d147e88d5c601aec49c272e3bf3b23fddfda50c078643dcbdb50a3899a87fa7"
+  },
+  "reviews": [
+    {
+      "report": {
+        "path": "docs/reviews/code-review-20261004-153132.md",
+        "bytes": 16261,
+        "sha256": "8a92177ce863238d4fc9ab916bd779b73395ed5ab4982ba73a0b80fe148be091",
+        "created": "system-clock date +%Y%m%d-%H%M%S = 20261004-153132; python open('x') O_EXCL"
+      },
+      "controller_adjudication": {
+        "setup_status": "ok",
+        "agent_status": "completed",
+        "tool_evidence": "yes",
+        "tool_trace": "complete",
+        "required_evidence": "complete",
+        "canary_status": "match",
+        "result_status": "accepted",
+        "warnings": [
+          "named unrecognized_model stderr warning",
+          "117 project skills ls missing actual1;131/138 home location then143/145 actual full skill Read exact restore all mandatory instruction evidence",
+          "4014 shasum against directories failed with Is a directory, subsequent cat masks outer0;4035 files-only actual hashes recover all four before/after sources",
+          "4162 file/head wrong ownscratch path actual1; mandatory manifest fix_result/fix_report/rootqueue already fully read591/607/506, no required missing source",
+          "Several inner Bash lack absolute workspace cd or cd bounded freeze/scratch subdir; explicit runner cwd and364 actualworkspace/head/SHA plus root identities establish true target. Protocol deviation recorded",
+          "4503/4698 pytest piped through tee; outer0 is pipeline status not measured inner pytest0. Complete own6/3 pass logs no errors establish observed assertions; independently bound mandatory186 actualdirectexit0 retained, no additional claimed direct process exit",
+          "Fresh review only necessary changed hunks/call chain; all other previous accepted coverage precisely inherited, no full file/all-repository fresh claim"
+        ],
+        "evidence_gaps": [],
+        "retry_class": "none",
+        "actual_managed_exit": 0,
+        "managed_session": 58181,
+        "runtime": "claude",
+        "provider": "mimo",
+        "label": "upload-material-registry-aggregate-rereview-mimo-20261004-01",
+        "events": 7584,
+        "tools": 44,
+        "observable_model": [
+          "mimo-v2.6-pro"
+        ],
+        "structured_terminal": {
+          "subtype": "success",
+          "is_error": false,
+          "num_turns": 45,
+          "no_permission_denials": true
+        },
+        "instructions": {
+          "AGENTS": 129,
+          "deepreview": 430,
+          "gateflow": 344,
+          "full_Read_exact": true
+        },
+        "report": {
+          "path": "docs/reviews/code-review-20261004-153132.md",
+          "bytes": 16261,
+          "sha256": "8a92177ce863238d4fc9ab916bd779b73395ed5ab4982ba73a0b80fe148be091",
+          "created": "system-clock date +%Y%m%d-%H%M%S = 20261004-153132; python open('x') O_EXCL"
+        },
+        "finding_final_states": {
+          "REG-AG01": "已修复",
+          "REG-C04": "已修复",
+          "REG-R01": "已修复",
+          "REG-C01": "已修复",
+          "REG-C02": "已修复",
+          "REG-C03": "已修复",
+          "REG-R02": "已修复",
+          "REG-R03": "已修复"
+        },
+        "new_material_findings": [],
+        "root_scope": "root full both deltas, relevant terminal/formal/guard/error/proof/CLI and six tests; source IDs exact, required186/fulltype0/approved strict0 realrecords checked; two reviewer independent no current peer read; previous eight final states adjudicated from same owner facts",
+        "gate_pass": false
+      },
+      "private_retention": {
+        "archives": [
+          "workspace/evidence/upload-material-post-ci-gate-runners-20261003/private/registry-aggregate-rereview-mimo-01.tar.gz",
+          "output/evidence-backup/upload-material-post-ci-gate-runners-20261003/private/registry-aggregate-rereview-mimo-01.tar.gz"
+        ],
+        "bytes": 525907,
+        "sha256": "91888ab9146b745483e41ff9a34b23f3730a826e6acbc449cb0ce2b01abe5b7b"
+      }
+    },
+    {
+      "report": {
+        "path": "docs/reviews/code-review-20261004-152419.md",
+        "sha256": "72b52f4f4c9540ff6d0198a46f558cf00bd1b292889aa7316467f2d9887600f4"
+      },
+      "controller_adjudication": {
+        "setup_status": "ok",
+        "agent_status": "completed",
+        "tool_evidence": "yes",
+        "tool_trace": "complete",
+        "required_evidence": "complete",
+        "canary_status": "match",
+        "result_status": "accepted",
+        "warnings": [
+          "named unrecognized_model stderr warning; actual success terminal and mandatory local evidence unaffected",
+          "1423 missing project skill directories exit1;1491 repeats ls failure but later pipeline0 masks it;792 initial missing ls stderr suppressed. Actual home deepreview/gateflow full Read exact129/430/344 instructions restored",
+          "Most inner Bash omit explicit absolute cd contrary to task; runner explicit cwd, actual pwd and all frozen SHA/head checks establish actual input identity; protocol deviation recorded",
+          "Prose/result claim inherited reports full Read incorrect: actual tools14376/14594 only inventory grep and37692 exact SHA. Root already read full terminal reports and previous audits, precise unchanged inheritance supports mandatory overall coverage; peer fresh coverage narrowed",
+          "26149 probe exit echo0 and31865 pyright_exit0/run_exit0 observed separately; compound final0 not substituted for actual captured inner status. Final40234 grep-v expected no-match1 masked by ||true scope filter, no source input failure",
+          "Report creation used system clock path absence check then Write, not atomic O_EXCL; unique fresh timestamp identity/no overwrite confirmed; narrowed creation claim",
+          "Root first oversized alltools output truncated; recovered all54 tool summaries plus full result/report/probe and required numbered-source exact checks independently"
+        ],
+        "evidence_gaps": [],
+        "retry_class": "none",
+        "actual_managed_exit": 0,
+        "managed_session": 95625,
+        "runtime": "claude",
+        "provider": "ds-flash",
+        "label": "upload-material-registry-aggregate-rereview-ds-flash-20261004-01",
+        "events": 40901,
+        "tools": 54,
+        "observable_model": [
+          "deepseek-flash"
+        ],
+        "structured_terminal": {
+          "subtype": "success",
+          "is_error": false,
+          "num_turns": 55,
+          "no_permission_denials": true
+        },
+        "instructions": {
+          "AGENTS": 129,
+          "deepreview": 430,
+          "gateflow": 344,
+          "full_Read_exact": true
+        },
+        "report": {
+          "path": "docs/reviews/code-review-20261004-152419.md",
+          "sha256": "72b52f4f4c9540ff6d0198a46f558cf00bd1b292889aa7316467f2d9887600f4"
+        },
+        "finding_final_states": {
+          "REG-AG01": "已修复",
+          "REG-C04": "已修复",
+          "REG-R01": "已修复",
+          "REG-C01": "已修复",
+          "REG-C02": "已修复",
+          "REG-C03": "已修复",
+          "REG-R02": "已修复",
+          "REG-R03": "已修复"
+        },
+        "new_material_findings": [],
+        "root_scope": "both exact new deltas/call chain/test full root read; legal/fake crash six own API cases actual inner0 and exact legal proof; all14 SHA/queue/fix facts; five other states exact inherited; no full PR or all repository exhaustive claim",
+        "gate_pass": false
+      },
+      "private_retention": {
+        "archives": [
+          "workspace/evidence/upload-material-post-ci-gate-runners-20261003/private/registry-aggregate-rereview-ds-flash-01.tar.gz",
+          "output/evidence-backup/upload-material-post-ci-gate-runners-20261003/private/registry-aggregate-rereview-ds-flash-01.tar.gz"
+        ],
+        "bytes": 1475825,
+        "sha256": "d1cf81023c2e2aa90ea6db42f6c241047f319c7a3f06396288a39dfb9ec0f54f"
+      }
+    }
+  ],
+  "root_decision": "AG01 focused label crash now rejected at owner first semantic consumption after real0/130 terminal; C04/R01 both-source contract closed; legal proof byte exact; no new finding. Independent code/diff/test/source/terminal records adjudicated, not reviewer vote. Historical scope precisely inherited; not exhaustive all-repository fresh review.",
+  "residuals": {
+    "fixed in current slice": [
+      "REG-C01",
+      "REG-C02",
+      "REG-C03",
+      "REG-C04",
+      "REG-R01",
+      "REG-R02",
+      "REG-R03"
+    ],
+    "covered by later approved slice": [],
+    "assigned to later work unit": [
+      "Linux/Windows XBRL deployment verification (user approved deferral)",
+      "CNInfo historical disclosure dates migration",
+      "deleted historical Raw gap and existing 22 residuals"
+    ],
+    "tracked by existing issue": [
+      "Docling extraction quality #4437"
+    ],
+    "requiring new issue or explicit user decision": []
+  },
+  "next_entry": "accepted deepreview commit then ready-to-open-draft-PR/push/verify existing draft197/PR review"
+}

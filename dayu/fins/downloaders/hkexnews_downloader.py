@@ -15,6 +15,7 @@ import html
 import json
 import re
 import time
+from datetime import date
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -32,6 +33,7 @@ from dayu.fins.pipelines.cn_download_models import (
     CnFiscalPeriod,
     CnLanguage,
     CnReportCandidate,
+    CnReportDiscoveryResult,
     CnReportHeadMeta,
     CnReportQuery,
     DownloadedReportAsset,
@@ -272,18 +274,20 @@ class HkexnewsDiscoveryClient:
         query: CnReportQuery,
         profile: CnCompanyProfile,
         *,
+        local_annual_ends: tuple[date, ...],
         cancellation_checkpoint: Callable[[], None] | None = None,
-    ) -> tuple[CnReportCandidate, ...]:
+    ) -> CnReportDiscoveryResult:
         """列出符合窗口和财期的 HK 报告候选。
 
         Args:
             query: 单次 download 查询参数。
             profile: ``resolve_company`` 返回的公司元数据。
+            local_annual_ends: 同公司可信本地年度截止日，可为空；与当前窗口远端年度证据合并。
             cancellation_checkpoint: 可选 workflow-owned 无参取消检查点；
                 每个 title search 累计 GET 前和成功响应后调用。
 
         Returns:
-            候选报告 tuple。HK 季度报告查无返回空 tuple，不抛异常。
+            完整发现的确定候选和独立未知报告；查无时两个集合均为空。
 
         Raises:
             ValueError: market/provider/company_id 非法时抛出。
@@ -323,6 +327,7 @@ class HkexnewsDiscoveryClient:
         return select_hkexnews_report_candidates(
             query=query,
             announcements=tuple(raw_announcements),
+            local_annual_ends=local_annual_ends,
             read_head_meta=self._http_head_meta,
         )
 

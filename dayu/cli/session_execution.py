@@ -27,9 +27,9 @@ from dayu.cli.agent_entrypoint import (
     cancel_and_await_task,
     optional_stripped_text,
     package_config_root,
-    resolve_workspace_root,
     service_run_overrides_from_args,
 )
+from dayu.cli.workspace_root import resolve_workspace_root
 from dayu.cli.arg_parsing import ParsedCliArgs
 from dayu.cli.composer import (
     InteractiveComposer,

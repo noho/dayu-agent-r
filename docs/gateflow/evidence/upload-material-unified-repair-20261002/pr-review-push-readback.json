@@ -1,0 +1,103 @@
+{
+  "head": "b1c675e75748abdcd8989cf6dffba257427feda5",
+  "local_tracking_live_pr_equal": true,
+  "main_local_remote_base_unchanged": true,
+  "source8_gitblob_equals_reviewed_fixed_source": true,
+  "push_outer_exit": 0,
+  "draft": true,
+  "state": "OPEN",
+  "mergeable_observation_only": "MERGEABLE",
+  "merge_state_observation_only": "CLEAN",
+  "checks_observation_only": [],
+  "issue_link": "Closes #198",
+  "existing_comment_url": "https://github.com/noho/dayu-agent-r/issues/198#issuecomment-5893424991",
+  "existing_comment_body_sha256": "0d9ce292651ed5f1e53b494cc67a612eb7b8e751eeeeda8e04a685c05beda7b9",
+  "comment_not_republished": true,
+  "commands": {
+    "local": {
+      "argv": [
+        "git",
+        "rev-parse",
+        "HEAD"
+      ],
+      "pid": 8957,
+      "wait_returncode": 0,
+      "stdout_sha256": "0ea7bcea659a3223c95477912cdaf8cbe6e32b693460d387bb3938656f71b75d",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "tracking": {
+      "argv": [
+        "git",
+        "rev-parse",
+        "github/codex/upload-material-oracle"
+      ],
+      "pid": 8958,
+      "wait_returncode": 0,
+      "stdout_sha256": "0ea7bcea659a3223c95477912cdaf8cbe6e32b693460d387bb3938656f71b75d",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "live": {
+      "argv": [
+        "git",
+        "ls-remote",
+        "github",
+        "refs/heads/codex/upload-material-oracle"
+      ],
+      "pid": 8959,
+      "wait_returncode": 0,
+      "stdout_sha256": "42d8a1d07246e1ad789cfd4eb0a6b210f2af8fb414e1303c3597b3f0d16fe0e3",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "main": {
+      "argv": [
+        "git",
+        "rev-parse",
+        "main"
+      ],
+      "pid": 8962,
+      "wait_returncode": 0,
+      "stdout_sha256": "80c0c60e2e84393673bc5a7ac8adf55f2160c9678c1f62ba3a2691eb7999fbde",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "live-main": {
+      "argv": [
+        "git",
+        "ls-remote",
+        "github",
+        "refs/heads/main"
+      ],
+      "pid": 8963,
+      "wait_returncode": 0,
+      "stdout_sha256": "4b99c1979845600f90d28732439662088aac2472701951d55490c384823c9e7e",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "pr": {
+      "argv": [
+        "gh",
+        "pr",
+        "view",
+        "197",
+        "--repo",
+        "noho/dayu-agent-r",
+        "--json",
+        "headRefOid,baseRefOid,isDraft,state,url,body,mergeable,mergeStateStatus,statusCheckRollup"
+      ],
+      "pid": 8966,
+      "wait_returncode": 0,
+      "stdout_sha256": "7a4fddf076512a110a06aeeb1e9de6e833a6ebbaa9d562b728423cb81c5ea78a",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "issue-comment": {
+      "argv": [
+        "gh",
+        "api",
+        "repos/noho/dayu-agent-r/issues/comments/5893424991"
+      ],
+      "pid": 8969,
+      "wait_returncode": 0,
+      "stdout_sha256": "aead25e5f042964d13173e54109b909c02f8651ebffe4b7581ff98e2dae443a5",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  "checked_epoch": 1791006133.155744
+}

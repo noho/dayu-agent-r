@@ -13,15 +13,20 @@ from collections.abc import Callable
 from typing import TypeAlias
 
 from dayu.contracts.json_value import JsonValue
+from dayu.fins.download_contract import FinsDownloadUncertainReport
 from dayu.fins.domain.document_models import FinsIngestMethod, FilingUpdateRequest, now_iso8601
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.pipelines.cn_download_models import (
+    CN_DOWNLOAD_TERMINAL_CANCELLED,
+    CN_DOWNLOAD_TERMINAL_OK,
     CN_FISCAL_PERIOD_ORDER,
     CN_PIPELINE_DOWNLOAD_VERSION,
+    CnDownloadTerminalStatus,
     CnFiscalPeriod,
     CnMarketKind,
 )
 from dayu.fins.pipelines.cn_download_protocols import CnDownloadWorkflowHost
+from dayu.fins.pipelines.hk_download_rebuild import rebuild_hk_periods
 from dayu.fins.pipelines.cn_form_utils import (
     PeriodDownloadWindow,
     resolve_period_windows,
@@ -75,29 +80,33 @@ def rebuild_cn_download_artifacts(
     )
     started_at = time.perf_counter()
     filings: list[JsonObject] = []
-    document_ids = host.source_repository.list_source_document_ids(ticker, SourceKind.FILING)
-    cancelled = False
-    for document_id in document_ids:
-        if _is_cancel_requested(cancel_checker):
-            cancelled = True
-            break
-        previous_meta = host.source_repository.get_source_meta(ticker, document_id, SourceKind.FILING)
-        meta = dict(previous_meta)
-        period_projection = _resolve_rebuild_period_projection(meta=meta, period_windows=period_windows)
-        if period_projection is None:
-            continue
-        filings.append(
-            _rebuild_single_cn_download_document(
-                host=host,
-                ticker=ticker,
-                document_id=document_id,
-                previous_meta=meta,
-                covered_fiscal_periods=period_projection[1],
+    uncertain_reports: tuple[FinsDownloadUncertainReport, ...] = ()
+    if market == "HK":
+        filings, uncertain_reports, cancelled = rebuild_hk_periods(host, ticker, period_windows, cancel_checker)
+    else:
+        document_ids = host.source_repository.list_source_document_ids(ticker, SourceKind.FILING)
+        cancelled = False
+        for document_id in document_ids:
+            if _is_cancel_requested(cancel_checker):
+                cancelled = True
+                break
+            previous_meta = host.source_repository.get_source_meta(ticker, document_id, SourceKind.FILING)
+            meta = dict(previous_meta)
+            period_projection = _resolve_rebuild_period_projection(meta=meta, period_windows=period_windows)
+            if period_projection is None:
+                continue
+            filings.append(
+                _rebuild_single_cn_download_document(
+                    host=host,
+                    ticker=ticker,
+                    document_id=document_id,
+                    previous_meta=meta,
+                    covered_fiscal_periods=period_projection[1],
+                )
             )
-        )
     elapsed_ms = int((time.perf_counter() - started_at) * 1000)
     warnings: list[str] = []
-    if not filings:
+    if not filings and not uncertain_reports:
         warnings.append("未匹配到可重建的已下载 CN/HK filings")
     form_values: list[JsonValue] = [period for period in period_policy.effective_periods]
     warning_values: list[JsonValue] = [warning for warning in warnings]
@@ -105,10 +114,13 @@ def rebuild_cn_download_artifacts(
     if cancelled:
         note_values.append("cancelled")
     filing_values: list[JsonValue] = [filing for filing in filings]
+    terminal_status: CnDownloadTerminalStatus = (
+        CN_DOWNLOAD_TERMINAL_CANCELLED if cancelled else CN_DOWNLOAD_TERMINAL_OK
+    )
     result: JsonObject = {
         "pipeline": pipeline_name,
         "action": "download",
-        "status": "cancelled" if cancelled else "ok",
+        "status": terminal_status,
         "ticker": ticker,
         "company_info": {},
         "filters": {
@@ -121,9 +133,13 @@ def rebuild_cn_download_artifacts(
         "warnings": warning_values,
         "notes": note_values,
         "filings": filing_values,
+        "uncertain_reports": [report.to_json_value() for report in uncertain_reports],
         "missing_periods": [],
         "summary": _build_rebuild_summary(filings=filings, elapsed_ms=elapsed_ms),
     }
+    raw_summary = result["summary"]
+    if isinstance(raw_summary, dict):
+        raw_summary["uncertain_count"] = len(uncertain_reports)
     return result
 
 

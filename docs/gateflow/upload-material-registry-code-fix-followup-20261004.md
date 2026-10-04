@@ -1,0 +1,15 @@
+# upload_material 登记 S1 同版复审遗漏集中修复
+
+任务 `upload-material-registry-code-fix-sol-20261004-03`；当前 gate 为既有 code review 的 fix，下一入口为 root 同版 code re-review。唯一工作区 `/Users/leo/workspace/dayu-agent-r`、分支 `codex/upload-material-oracle`、HEAD `d054c0fece08d3fb5b3ed71207b3dbb8ec7f5d8c`，main `fac32ecbff9bfe792b63ee9667c8697826b631f4` 未动。accepted plan SHA `896762824e3de6ba7538fc710fc13fb8a5f33838788dd84335b7efea7f3ddad0`；上轮 re-review freeze SHA `1239e6137f32996b9d5dfcfff71e69e275ffc0251a61145c01619ef29ff88e01`。本轮仅按 root 最终裁决 SHA `556eba1d531bc8c2ccf13a9206573455eedd2858b3cd6b5a72adcb2688c60337` 修 REG-R01/R02/R03，不新增 slice、业务规则或字段。
+
+| finding | owner 修复与状态 | 回归 |
+|---|---|---|
+| REG-R01 | `_crash_path_kind` 现双向核对原始 SIGKILL、wait=-9、非 deadline 事实；无事实的 `crash` 拒绝，原两真实 crash 和 `execution_outcome=error` 保持。已修复，待 root 同版复审。 | `test_non_sigkill_result_rejects_false_crash_label`；原 `test_real_sigkill_result_requires_crash_class_without_rewriting_outcome` |
+| REG-R02 | `_oracle_guard` 在 owners 首次消费 `predicate_id` 时带 record/predicate 索引；material 的 `expected`/`forbidden` 缺失也定位 predicate 索引。已修复，待 root 同版复审。 | `test_material_predicate_missing_field_keeps_record_and_index` 三字段负例 |
+| REG-R03 | `_assignment_guard` 在 Service row 首次消费时定位 `actual_operation_observation`；其 `terminal_status`/`terminal_exit` 定位 row 索引和 ID。两类 `evidence_sources` 已消费的固定 `target`/`registration_target`/`measured_parent`/`report`/`scan` 走 `_field` 定位，保留各 source 原条件。已修复，待 root 同版复审。 | `test_service_observation_missing_field_keeps_row_locator` 三字段；`test_evidence_source_missing_consumed_field_has_locator` 七个来源/字段负例 |
+
+最终代码 `utils/cli_ci_upload_material_registry.py` SHA `153fe8f1a81f39c837b3b847ac583ed74969113cad89816274c24b9646e3cf2c`；测试 `tests/cli/test_cli_ci_upload_material_registry.py` SHA `d319194d929d2f67c3d654ada27af04b86a630c5ada25a987ee698554396b5bc`。冻结其余十二候选文件逐 SHA 不变。无正式 registry/proof 重投影：旧 6 oracle/1328 scenario 全值及 scenario 自有历史精确保持，新 oracle/十九 predicate 文本、799 正式 scenario、九排除及所有正式记录 SHA 不变。
+
+同版 `.venv` 验证：受影响两文件 pytest 实际 exit 0，`180 passed`；完整 pyright 实际 exit 0，`0 errors, 0 warnings, 0 informations`；原四 public roots、target `22eca6c313005e3c5185340f2d6b535ab2583056`、`--check` 的 strict CLI 仅输出路径改到本轮独占 scratch，实际 exit 0。strict whole report 与既有 `readiness-proof.json` 逐字节相同，SHA `196d933a99a8503a5cf6ae9550114fdcc0dd3d5b41d8cf4f32a9c435595ad532`；两 registry 各自嵌入 `proof[kind]` 值相同。focused 四十个 public 文件两副本和五个实测产品源码 SHA 不变。实际 argv/exit/wait、双流字节与 SHA 在 `workspace/tmp/upload-material-registry-20261003/code-fix-sol-03/execution.json`；结构化结论在同目录 `result.json`，同版审查目标在 `review-target.json`。无验证命令非零或截断；执行前一次 JS 工具语法错误已改正，两次合并源码输出截断后按必要行界重读，scratch 存在探针打印 1 后确认目录为空；详情在 result。
+
+文档决策：`tests/README.md` 现有登记 validator 测试描述仍涵盖本轮新增负例，测试层级与运行方式未变；无产品或用户工作流、架构边界变化，不触发其它 README。残余分类：本轮三项为 fixed in current slice；covered by later approved slice 无；Win/Linux XBRL、历史 Raw、既有 22 residual 为 assigned to later work unit；Docling 抽取质量由既有 #4437 tracked；requiring new issue or explicit user decision 无。本轮不宣 S1/WU pass；root 复审后才可裁决下一 gate。未 stage、commit、push、PR、改原报告或产品/source Raw。

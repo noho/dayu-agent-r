@@ -1,0 +1,62 @@
+{
+  "phase": "plan; repair WU only",
+  "CLI_CI_registry": "after repair final closeout, not started",
+  "commands": [
+    {
+      "argv": [
+        "git",
+        "branch",
+        "--show-current"
+      ],
+      "exit": 0,
+      "stdout": "codex/upload-material-oracle\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "git",
+        "rev-parse",
+        "HEAD"
+      ],
+      "exit": 0,
+      "stdout": "619d092ab4278645203c7ebe08515f7697d92b71\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "git",
+        "status",
+        "--short",
+        "--branch"
+      ],
+      "exit": 0,
+      "stdout": "## codex/upload-material-oracle...github/codex/upload-material-oracle\n M docs/gateflow/pr-197-review-repair-adjudication-20260930.md\n M docs/gateflow/upload-material-issue-198-repair-sequence-20260928.md\n M docs/gateflow/upload-material-repair-scope-and-ci-closeout-20261001.md\n M docs/upload_material_repair_handoff_prompt_3.md\n?? docs/gateflow/upload-material-unified-repair-control-20261002.md\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "git",
+        "ls-remote",
+        "github",
+        "refs/heads/codex/upload-material-oracle",
+        "refs/heads/main"
+      ],
+      "exit": 0,
+      "stdout": "619d092ab4278645203c7ebe08515f7697d92b71\trefs/heads/codex/upload-material-oracle\nfac32ecbff9bfe792b63ee9667c8697826b631f4\trefs/heads/main\n",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "gh",
+        "pr",
+        "view",
+        "197",
+        "--json",
+        "headRefOid,baseRefOid,isDraft,state"
+      ],
+      "exit": 0,
+      "stdout": "{\"baseRefOid\":\"fac32ecbff9bfe792b63ee9667c8697826b631f4\",\"headRefOid\":\"619d092ab4278645203c7ebe08515f7697d92b71\",\"isDraft\":true,\"state\":\"OPEN\"}\n",
+      "stderr": ""
+    }
+  ]
+}

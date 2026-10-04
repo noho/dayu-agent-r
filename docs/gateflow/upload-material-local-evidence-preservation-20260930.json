@@ -1,0 +1,983 @@
+{
+  "meaning": "Archive of unique missing docs from local WU worktrees; inclusion is not gate acceptance",
+  "records": [
+    {
+      "path": "docs/gateflow/fins-cninfo-single-day-goal-20260929.md",
+      "source": "/private/tmp/dayu-cninfo-single-day/docs/gateflow/fins-cninfo-single-day-goal-20260929.md",
+      "sha256": "0ac7e16403bf29a96b2198c42aba42a1082bbf83ac98e4b2b4a94bf461441603",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/fins-cninfo-single-day-plan-20260929.md",
+      "source": "/private/tmp/dayu-cninfo-single-day/docs/gateflow/fins-cninfo-single-day-plan-20260929.md",
+      "sha256": "d5c56f0680c8d885a78b31656b108f2dde28d0e3c004ddf5a719ae67c00ecba4",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/fins-cninfo-single-day-plan-adjudication-20260929.md",
+      "source": "/private/tmp/dayu-cninfo-single-day/docs/gateflow/fins-cninfo-single-day-plan-adjudication-20260929.md",
+      "sha256": "83efb0b898992f265930121fae38a92704ac10f5f1cbc9921959fa55485963b2",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/fins-cninfo-single-day-plan-fix-pr2-20260929.md",
+      "source": "/private/tmp/dayu-cninfo-single-day/docs/gateflow/fins-cninfo-single-day-plan-fix-pr2-20260929.md",
+      "sha256": "cad785fa254929ef4103faf94a70b454dc458f070b272431af435669f415aa21",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/fins-cninfo-single-day-plan-fix-pr3-20260929.md",
+      "source": "/private/tmp/dayu-cninfo-single-day/docs/gateflow/fins-cninfo-single-day-plan-fix-pr3-20260929.md",
+      "sha256": "20b49427cfb5dffad4d3d7a2f50cea3106cf0336f1c401f21415f3286096b70a",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/fins-cninfo-single-day-plan-fix-pr4-20260929.md",
+      "source": "/private/tmp/dayu-cninfo-single-day/docs/gateflow/fins-cninfo-single-day-plan-fix-pr4-20260929.md",
+      "sha256": "e48f645517c35160f7c1370b8818b345cca91b2d84a53a7b5fc9592b2ac96103",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/fins-cninfo-single-day-plan-local-day-fix-20260929.md",
+      "source": "/private/tmp/dayu-cninfo-single-day/docs/gateflow/fins-cninfo-single-day-plan-local-day-fix-20260929.md",
+      "sha256": "41b8f9fafd1e7b1f07fb90496034f1bf84c6bfc8bf916b7d02fe74e10ee3021d",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/issue-198-s2-plan-review-adjudication-20260929.md",
+      "source": "/private/tmp/dayu-upload-issue198-s2/docs/gateflow/issue-198-s2-plan-review-adjudication-20260929.md",
+      "sha256": "f961b5fa7d679220c57fe80dcd716d16563d8faa29c7846a53b5043617a6b130",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/issue-198-unknown-download-diagnostics-goal-20260929.md",
+      "source": "/private/tmp/dayu-upload-issue198-s2/docs/gateflow/issue-198-unknown-download-diagnostics-goal-20260929.md",
+      "sha256": "bb00c655a0bcc681dbca86265385b4f2669dd87a03fb789cdac1f525642dab61",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/issue-198-unknown-download-diagnostics-plan-20260929.md",
+      "source": "/private/tmp/dayu-upload-issue198-s2/docs/gateflow/issue-198-unknown-download-diagnostics-plan-20260929.md",
+      "sha256": "f3643583a29577e6aedbc87e52243028453c38dbd5834607011abd43ab1da4b8",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-assets-s1-code-rereview-r1r2-fix-20260929.md",
+      "source": "/private/tmp/dayu-upload-assets/docs/gateflow/upload-material-assets-s1-code-rereview-r1r2-fix-20260929.md",
+      "sha256": "32bd5870fb67d453466729eb670f2ad1d8d2eed34ce6c36c04030f83e54e837f",
+      "state": "already_present"
+    },
+    {
+      "path": "docs/gateflow/upload-material-assets-s1-code-review-adjudication-20260929.md",
+      "source": "/private/tmp/dayu-upload-assets/docs/gateflow/upload-material-assets-s1-code-review-adjudication-20260929.md",
+      "sha256": "46842227db3aa2735b3b1b64090bca6e69118bfa340040f9bb32eee2f7876675",
+      "state": "already_present"
+    },
+    {
+      "path": "docs/gateflow/upload-material-assets-s1-code-review-f12f13-fix-20260929.md",
+      "source": "/private/tmp/dayu-upload-assets/docs/gateflow/upload-material-assets-s1-code-review-f12f13-fix-20260929.md",
+      "sha256": "d5f91457ba73184933339afcae939adda0383a3f3a0570d15e7339f1c855b80d",
+      "state": "already_present"
+    },
+    {
+      "path": "docs/gateflow/upload-material-assets-s1-code-review-f14-fix-20260929.md",
+      "source": "/private/tmp/dayu-upload-assets/docs/gateflow/upload-material-assets-s1-code-review-f14-fix-20260929.md",
+      "sha256": "43764d1dfff9be8cc8cd2055b2910a820ae225c69debcaaf620fbe2d33663234",
+      "state": "already_present"
+    },
+    {
+      "path": "docs/gateflow/upload-material-assets-s1-code-review-f8-fix-20260929.md",
+      "source": "/private/tmp/dayu-upload-assets/docs/gateflow/upload-material-assets-s1-code-review-f8-fix-20260929.md",
+      "sha256": "6771d1767cb7d841e8284cdae1f39c454f714690a29238f338bce6f1852bab06",
+      "state": "already_present"
+    },
+    {
+      "path": "docs/gateflow/upload-material-assets-s1-code-review-f9f11-fix-20260929.md",
+      "source": "/private/tmp/dayu-upload-assets/docs/gateflow/upload-material-assets-s1-code-review-f9f11-fix-20260929.md",
+      "sha256": "5dbfdbc7d5a0da5a80e752412737fdf9464372249b760269adfe72cdfb5ff00a",
+      "state": "already_present"
+    },
+    {
+      "path": "docs/gateflow/upload-material-assets-s1-code-review-fix-20260929.md",
+      "source": "/private/tmp/dayu-upload-assets/docs/gateflow/upload-material-assets-s1-code-review-fix-20260929.md",
+      "sha256": "1db5c6ceb204d1ef4d4762373b9ca52a5b88b1c8579a2e429931be5a3670df8f",
+      "state": "already_present"
+    },
+    {
+      "path": "docs/gateflow/upload-material-assets-s1-code-review-fix2-20260929.md",
+      "source": "/private/tmp/dayu-upload-assets/docs/gateflow/upload-material-assets-s1-code-review-fix2-20260929.md",
+      "sha256": "82dc79d8666d61f33f62224e833eef744ae493251b5c167fe1259f743c5908d0",
+      "state": "already_present"
+    },
+    {
+      "path": "docs/gateflow/upload-material-assets-s1-implementation-20260929.md",
+      "source": "/private/tmp/dayu-upload-assets/docs/gateflow/upload-material-assets-s1-implementation-20260929.md",
+      "sha256": "010a845f070756cf9d8f60ebbcb4c0c4800611761fe9e5e5c1cfeb1b1ef1040a",
+      "state": "already_present"
+    },
+    {
+      "path": "docs/gateflow/upload-material-content-failure-goal-20260929.md",
+      "source": "/private/tmp/dayu-upload-content/docs/gateflow/upload-material-content-failure-goal-20260929.md",
+      "sha256": "187226820eb3b2e4ee692502860ed4b858fb12189940ddf413a75f0f7d6bece7",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-content-failure-plan-20260929.md",
+      "source": "/private/tmp/dayu-upload-content/docs/gateflow/upload-material-content-failure-plan-20260929.md",
+      "sha256": "95b1adecc95162ca64b67bf195c1e1f98e99a09c91c171e330f737221371f2fd",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-content-plan-review-adjudication-20260929.md",
+      "source": "/private/tmp/dayu-upload-content/docs/gateflow/upload-material-content-plan-review-adjudication-20260929.md",
+      "sha256": "364f38ff2511515ea81c8975ab571ab56bf5cc6e0735f50b52cdb6c2024a3a5a",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-fiscal-goal-20260929.md",
+      "source": "/private/tmp/dayu-upload-fiscal/docs/gateflow/upload-material-fiscal-goal-20260929.md",
+      "sha256": "084ce829ba87d50ea0848134a7ac976596000a441bd95cc9f4c092dbd7c92cd2",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-fiscal-plan-20260929.md",
+      "source": "/private/tmp/dayu-upload-fiscal/docs/gateflow/upload-material-fiscal-plan-20260929.md",
+      "sha256": "7c95474d37a986500664321efc589df3b6d8f28d3da14e2622eb23e36593a18a",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-fiscal-plan-fix-pr4-20260929.md",
+      "source": "/private/tmp/dayu-upload-fiscal/docs/gateflow/upload-material-fiscal-plan-fix-pr4-20260929.md",
+      "sha256": "b822608df86ee457f0e8e9fed0f334d7be9dc92b2c2c7f19dbd471bf5d98a9a2",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-fiscal-plan-review-adjudication-20260929.md",
+      "source": "/private/tmp/dayu-upload-fiscal/docs/gateflow/upload-material-fiscal-plan-review-adjudication-20260929.md",
+      "sha256": "1755ede2f3a0b8b83478c5bda9565745e73b47e9712fba1a161cc6390d2c73d9",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o05-plan-fix-c2-20260929.md",
+      "source": "/private/tmp/dayu-upload-o05/docs/gateflow/upload-material-o05-plan-fix-c2-20260929.md",
+      "sha256": "64a05aa8c14df8ea5b99f52b61931152d30b5b33936db79f7d24814f51c0caae",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o05-plan-review-adjudication-20260929.md",
+      "source": "/private/tmp/dayu-upload-o05/docs/gateflow/upload-material-o05-plan-review-adjudication-20260929.md",
+      "sha256": "66b2dd341d7975c477c603857451e18d1bb5901faf3967be7749ebc3ea78049e",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o05-required-identity-goal-20260929.md",
+      "source": "/private/tmp/dayu-upload-o05/docs/gateflow/upload-material-o05-required-identity-goal-20260929.md",
+      "sha256": "43838b255db45d3b1c7e7caeca04372d69905e2db58522d319be3a0dfb6aab2f",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o05-required-identity-plan-20260929.md",
+      "source": "/private/tmp/dayu-upload-o05/docs/gateflow/upload-material-o05-required-identity-plan-20260929.md",
+      "sha256": "ed83ceb378840c3ca47e5adbd1d4a41e6c078261a80d37315034819bd4cfaef8",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o06-name-length-goal-20260929.md",
+      "source": "/private/tmp/dayu-upload-o06/docs/gateflow/upload-material-o06-name-length-goal-20260929.md",
+      "sha256": "d4382bbb4de3750e2611b0730fd2190e9f50f6cf6433651e9e182a52c2649edb",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o06-name-length-plan-20260929.md",
+      "source": "/private/tmp/dayu-upload-o06/docs/gateflow/upload-material-o06-name-length-plan-20260929.md",
+      "sha256": "fd95ede94a6746da266630661b8802c564c556357c8aa882d8dbd1fe9fc24400",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o06-plan-review-adjudication-20260929.md",
+      "source": "/private/tmp/dayu-upload-o06/docs/gateflow/upload-material-o06-plan-review-adjudication-20260929.md",
+      "sha256": "e81c3094b34b5b9d19b1f0b3c8abe552d22fa7e72cb1cb25edfb12b4e296298c",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o07-ids-goal-20260929.md",
+      "source": "/private/tmp/dayu-upload-ids/docs/gateflow/upload-material-o07-ids-goal-20260929.md",
+      "sha256": "4c61161426a9514e1f9389f41d0c53e57f60d6c4f938c70fd1d470ea6158aa08",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o07-ids-plan-20260929.md",
+      "source": "/private/tmp/dayu-upload-ids/docs/gateflow/upload-material-o07-ids-plan-20260929.md",
+      "sha256": "346ee0689b5d54241eaa975004b504f25910b06275e5eb201a6c75e5ce2eb028",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o07-plan-review-adjudication-20260929.md",
+      "source": "/private/tmp/dayu-upload-ids/docs/gateflow/upload-material-o07-plan-review-adjudication-20260929.md",
+      "sha256": "78952d9d22715def0d9148f0b79d7b734c5b81c1deddb7896f045743e503b636",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o11-aggregate-deepreview-adjudication-20260929.md",
+      "source": "/private/tmp/dayu-upload-o11/docs/gateflow/upload-material-o11-aggregate-deepreview-adjudication-20260929.md",
+      "sha256": "e9eafe25dbfa254e50a5fb590fee2c9ad91502f78bb5bd99f0dd6aebfabd7937",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o13-plan-fix-pr2-20260929.md",
+      "source": "/private/tmp/dayu-upload-o13/docs/gateflow/upload-material-o13-plan-fix-pr2-20260929.md",
+      "sha256": "9e6a4fefbb2bb2a2889c55af819a94d7d7fde33877681b0beeff72b3a516a6bc",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o13-plan-fix-pr3-20260929.md",
+      "source": "/private/tmp/dayu-upload-o13/docs/gateflow/upload-material-o13-plan-fix-pr3-20260929.md",
+      "sha256": "3afac41ceff8c9f5dcdfd8dcd27212151ee348fa9e0fa50e4406ba2629614342",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o13-plan-fix-pr4-20260929.md",
+      "source": "/private/tmp/dayu-upload-o13/docs/gateflow/upload-material-o13-plan-fix-pr4-20260929.md",
+      "sha256": "405b12d8321feb92c19870f968354ce71b870b253017410f82a4fdd74f2edec9",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o13-plan-review-adjudication-20260929.md",
+      "source": "/private/tmp/dayu-upload-o13/docs/gateflow/upload-material-o13-plan-review-adjudication-20260929.md",
+      "sha256": "b4fe0f9cbe1d51e185cc5903816fafa7f0bb758c70c9c8b9ed1f8ce4c92b506d",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o13-tombstone-goal-20260929.md",
+      "source": "/private/tmp/dayu-upload-o13/docs/gateflow/upload-material-o13-tombstone-goal-20260929.md",
+      "sha256": "32b754b501b5fb4610852a92005650fd813562634fc496cb767041955bc9bf30",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o13-tombstone-plan-20260929.md",
+      "source": "/private/tmp/dayu-upload-o13/docs/gateflow/upload-material-o13-tombstone-plan-20260929.md",
+      "sha256": "ce9f3e7a55d17afb2894bd0d4eb98c4b051214abfe4500ba7d40a759f4a7870c",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o16-action-files-goal-20260928.md",
+      "source": "/private/tmp/dayu-upload-o16/docs/gateflow/upload-material-o16-action-files-goal-20260928.md",
+      "sha256": "fc3de44e3a2d74ef66315a4f44d4d5eab5ed558ae297ef89fcd801a1d995b9fe",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o16-action-files-plan-20260928.md",
+      "source": "/private/tmp/dayu-upload-o16/docs/gateflow/upload-material-o16-action-files-plan-20260928.md",
+      "sha256": "f50641e2ff0be5a1ad481400cdfa0a9926278e138d5435a389d2bebe77080ab1",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o16-plan-review-adjudication-20260929.md",
+      "source": "/private/tmp/dayu-upload-o16/docs/gateflow/upload-material-o16-plan-review-adjudication-20260929.md",
+      "sha256": "44d3fc11de97928b68c1606acc09d0d871c192b7841bf2d42906f65b7b0ab416",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o17-form-goal-20260929.md",
+      "source": "/private/tmp/dayu-upload-o17/docs/gateflow/upload-material-o17-form-goal-20260929.md",
+      "sha256": "2759a901c73c4a4d0af7cceb260b8514826b019209f442c7537749d109f34e9f",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o17-form-plan-20260929.md",
+      "source": "/private/tmp/dayu-upload-o17/docs/gateflow/upload-material-o17-form-plan-20260929.md",
+      "sha256": "7b37c7279183bf56af2acfe722062f4b768a1f2e868eb96db37721d2578dbe24",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o17-plan-fix-pr4-20260929.md",
+      "source": "/private/tmp/dayu-upload-o17/docs/gateflow/upload-material-o17-plan-fix-pr4-20260929.md",
+      "sha256": "b46d262eaaf2e9c8c64f60abde048fd09e705106a6b97b0ee0bcc3788911ca9e",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o17-plan-fix-pr5-20260929.md",
+      "source": "/private/tmp/dayu-upload-o17/docs/gateflow/upload-material-o17-plan-fix-pr5-20260929.md",
+      "sha256": "3558a1abc17a337b295b4d6eba842daaf1db455452994876c89f97753601a276",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o17-plan-review-adjudication-20260929.md",
+      "source": "/private/tmp/dayu-upload-o17/docs/gateflow/upload-material-o17-plan-review-adjudication-20260929.md",
+      "sha256": "066af92e081fdab888e1ee0bdc97c62ccca320f8af501479e9f619bafa35c680",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o18-amended-goal-20260929.md",
+      "source": "/private/tmp/dayu-upload-o18/docs/gateflow/upload-material-o18-amended-goal-20260929.md",
+      "sha256": "52ba3ce8a326ec35b8e391e616106776ac294d18df249911fb0ca66f0197794f",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o18-amended-plan-20260929.md",
+      "source": "/private/tmp/dayu-upload-o18/docs/gateflow/upload-material-o18-amended-plan-20260929.md",
+      "sha256": "0d3f109b2f538d26cddd8ca6b4dd89da03e3ac27cd7e57915aefaa4b055892ce",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o18-plan-fix-20260929.md",
+      "source": "/private/tmp/dayu-upload-o18/docs/gateflow/upload-material-o18-plan-fix-20260929.md",
+      "sha256": "4d1be20c995559b2aeecc3f2c288e01b6bbb19384509b3baa241cece2765ce1e",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o18-plan-fix-pr2-20260929.md",
+      "source": "/private/tmp/dayu-upload-o18/docs/gateflow/upload-material-o18-plan-fix-pr2-20260929.md",
+      "sha256": "8fe84d6414b0da3bcef362fd7f55b326d7cc8b8abb55b019112b83ddc3cac646",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o18-plan-fix-pr3-20260929.md",
+      "source": "/private/tmp/dayu-upload-o18/docs/gateflow/upload-material-o18-plan-fix-pr3-20260929.md",
+      "sha256": "b12cceda1b0a0bfb8079fb2e5ee96fdc35170f69a9c8b0bf385e10975c9026a1",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o18-plan-review-adjudication-20260929.md",
+      "source": "/private/tmp/dayu-upload-o18/docs/gateflow/upload-material-o18-plan-review-adjudication-20260929.md",
+      "sha256": "09439091c5cdb831b3528d45d47bbdd55c7e85115ccedc34734adf8782b8808a",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o20-f02-plan-fix-pr2-20260929.md",
+      "source": "/private/tmp/dayu-upload-o20-f02/docs/gateflow/upload-material-o20-f02-plan-fix-pr2-20260929.md",
+      "sha256": "ca2bbee078a4779289ddbe6ce1933e61df82599cdf06b1d5a646b6a3794feae1",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o20-f02-plan-fix-pr3-20260929.md",
+      "source": "/private/tmp/dayu-upload-o20-f02/docs/gateflow/upload-material-o20-f02-plan-fix-pr3-20260929.md",
+      "sha256": "08d37814da24d3b022d02a9c4a8506956a53fed57bc4948ee14cd73ce5049992",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o20-f02-plan-fix-pr4-20260929.md",
+      "source": "/private/tmp/dayu-upload-o20-f02/docs/gateflow/upload-material-o20-f02-plan-fix-pr4-20260929.md",
+      "sha256": "fc27984d2be66e36db71ca329f6b34fdca9c6a4fb7f36e1d0ed6830eae3bca40",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o20-f02-plan-fix-pr5-20260929.md",
+      "source": "/private/tmp/dayu-upload-o20-f02/docs/gateflow/upload-material-o20-f02-plan-fix-pr5-20260929.md",
+      "sha256": "d5fe4e01b2a9fd13363dbb29524958e03f9fe2222815dd2aaadeb1de9d1dada7",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o20-f02-plan-fix-pr6-20260929.md",
+      "source": "/private/tmp/dayu-upload-o20-f02/docs/gateflow/upload-material-o20-f02-plan-fix-pr6-20260929.md",
+      "sha256": "a14c059332bb9818289e87b306280041e57bea6a10ecd8cfd560368bc1c9f4e7",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o20-f02-plan-fix-pr7-20260929.md",
+      "source": "/private/tmp/dayu-upload-o20-f02/docs/gateflow/upload-material-o20-f02-plan-fix-pr7-20260929.md",
+      "sha256": "462f86868d4187152d75b3e59df8e81b9dd55666b3d0c3b37c516d4429e16042",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o20-f02-plan-fix-pr8-20260929.md",
+      "source": "/private/tmp/dayu-upload-o20-f02/docs/gateflow/upload-material-o20-f02-plan-fix-pr8-20260929.md",
+      "sha256": "95f2fbe57ba1a6553f6ed384c264e5f1d20899eb254bf4b40244b89dfa445a39",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o20-f02-plan-fix-pr9-20260929.md",
+      "source": "/private/tmp/dayu-upload-o20-f02/docs/gateflow/upload-material-o20-f02-plan-fix-pr9-20260929.md",
+      "sha256": "9e5369afbb1e9b2903e9fd11bf95ba4754ab3d8f78b29ebfabddb3272aec5e81",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o20-f02-probe-20260929.md",
+      "source": "/private/tmp/dayu-upload-o20-f02/docs/gateflow/upload-material-o20-f02-probe-20260929.md",
+      "sha256": "d87f58d78e005b9ec623d72bc6100b7881b7494fb0c5bd9685643068902c5383",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o20-pr197-review-adjudication-20260929.md",
+      "source": "/private/tmp/dayu-upload-pr197-integration/docs/gateflow/upload-material-o20-pr197-review-adjudication-20260929.md",
+      "sha256": "f40df5e6026de86811c03a59f892282b162138accdd3b5ecf31834b7a81003d8",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o20-xbrl-runtime-goal-20260929.md",
+      "source": "/private/tmp/dayu-upload-o20-f02/docs/gateflow/upload-material-o20-xbrl-runtime-goal-20260929.md",
+      "sha256": "e604d595085a5d03ec52ae705c2b719d4190e01b14b4518a665a55d1ef34d3a5",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o20-xbrl-runtime-plan-20260929.md",
+      "source": "/private/tmp/dayu-upload-o20-f02/docs/gateflow/upload-material-o20-xbrl-runtime-plan-20260929.md",
+      "sha256": "9d99f7bdc7bb0feb103bee9f71a7d6097cb10ee0a3a7d782c9fda4b33c58906c",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o20-xbrl-runtime-plan-review-adjudication-20260929.md",
+      "source": "/private/tmp/dayu-upload-o20-f02/docs/gateflow/upload-material-o20-xbrl-runtime-plan-review-adjudication-20260929.md",
+      "sha256": "2c5c070185bf02d22f6a2de5c0b79efc354124be3aab23dd8aadfb046d797d11",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o25-plan-review-adjudication-20260929.md",
+      "source": "/private/tmp/dayu-upload-o25/docs/gateflow/upload-material-o25-plan-review-adjudication-20260929.md",
+      "sha256": "060ee50c6a5fd5b19cfd594d9ddd1ee11b7ea7096e80954f8c5b9061edf83246",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o25-plan-review-pr1-fix-20260929.md",
+      "source": "/private/tmp/dayu-upload-o25/docs/gateflow/upload-material-o25-plan-review-pr1-fix-20260929.md",
+      "sha256": "255a28e5b0f1a2e4a7e72ea2ff9f3dafdda187a75c872cd8f459cccf2737c902",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o25-primary-goal-20260929.md",
+      "source": "/private/tmp/dayu-upload-o25/docs/gateflow/upload-material-o25-primary-goal-20260929.md",
+      "sha256": "e4dd228fc5cf820aebd489c020c65ce4123623c8c782035d626063483cf40ebd",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o25-primary-plan-20260929.md",
+      "source": "/private/tmp/dayu-upload-o25/docs/gateflow/upload-material-o25-primary-plan-20260929.md",
+      "sha256": "bd5b18013d0bc98d3467c867328de85278ebafff8fdb156247115978baadf72e",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o33-concurrency-plan-20260929.md",
+      "source": "/private/tmp/dayu-upload-o33/docs/gateflow/upload-material-o33-concurrency-plan-20260929.md",
+      "sha256": "2ea0660f2ac5a8a5868f97bd1f2788f41e0474069f0b0011ceca763c08ad5249",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-o33-plan-review-adjudication-20260929.md",
+      "source": "/private/tmp/dayu-upload-o33/docs/gateflow/upload-material-o33-plan-review-adjudication-20260929.md",
+      "sha256": "a1714c41e2776146fcf2b103aa9461072249d96f9318b9f05625aa8a8604b3ef",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-state-goal-20260929.md",
+      "source": "/private/tmp/dayu-upload-state/docs/gateflow/upload-material-state-goal-20260929.md",
+      "sha256": "6c673a48e7ed194fc060cf8569acf62974d2960ed7f9c580869cbaba92eb2c91",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-state-plan-20260929.md",
+      "source": "/private/tmp/dayu-upload-state/docs/gateflow/upload-material-state-plan-20260929.md",
+      "sha256": "4ab1546efdc7f73a5acbd79064299459b6062af95acc4db1283fbb9ae6f0b24d",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-state-plan-c3-fix-20260929.md",
+      "source": "/private/tmp/dayu-upload-state/docs/gateflow/upload-material-state-plan-c3-fix-20260929.md",
+      "sha256": "dd96384b15f501d478e92cf8fcbe492a94bdab25e74f11cfd9c05d5dcc0074bb",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-state-plan-prc3f1-fix-20260929.md",
+      "source": "/private/tmp/dayu-upload-state/docs/gateflow/upload-material-state-plan-prc3f1-fix-20260929.md",
+      "sha256": "823cc12bf09c8389cdad3325bd905790a476ff375b0800da9ecdd5c78acb2d92",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-state-plan-prc4-fix-20260929.md",
+      "source": "/private/tmp/dayu-upload-state/docs/gateflow/upload-material-state-plan-prc4-fix-20260929.md",
+      "sha256": "9411b5d6c5156b100b2af2bac7527c19ea4927b8330e7b8e01d8a5518bfc1388",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-state-plan-prc5-fix-20260929.md",
+      "source": "/private/tmp/dayu-upload-state/docs/gateflow/upload-material-state-plan-prc5-fix-20260929.md",
+      "sha256": "18db98215d1633f251681a6e24cddc090376cb4a80345270031b70eda144f13e",
+      "state": "copied"
+    },
+    {
+      "path": "docs/gateflow/upload-material-state-plan-review-adjudication-20260929.md",
+      "source": "/private/tmp/dayu-upload-state/docs/gateflow/upload-material-state-plan-review-adjudication-20260929.md",
+      "sha256": "2f807627282ff33f25fd898f2c41984c7a1d164ee0125049cea8070fd77e06db",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/code-rereview-assets-s1-mimo-20260929.md",
+      "source": "/private/tmp/dayu-upload-assets/docs/reviews/code-rereview-assets-s1-mimo-20260929.md",
+      "sha256": "936af67004090e0f3aae6a9ff67d3bc85519808a9c5c9d38d2b2ec7cc7b9afdc",
+      "state": "already_present"
+    },
+    {
+      "path": "docs/reviews/code-review-20260929-114318.md",
+      "source": "/private/tmp/dayu-upload-assets/docs/reviews/code-review-20260929-114318.md",
+      "sha256": "3c5609bdb875e566365f9e25aaf2ef955804a964d7804c6f6577317f1c33eb46",
+      "state": "already_present"
+    },
+    {
+      "path": "docs/reviews/code-review-20260929-130410.md",
+      "source": "/private/tmp/dayu-upload-assets/docs/reviews/code-review-20260929-130410.md",
+      "sha256": "64de4b21db317a9b7312b62c4716cc9863b52977c58b7d7ee84f698c76469866",
+      "state": "already_present"
+    },
+    {
+      "path": "docs/reviews/code-review-20260929-133817.md",
+      "source": "/private/tmp/dayu-upload-assets/docs/reviews/code-review-20260929-133817.md",
+      "sha256": "d7585ffa3f0783e30e4076ee51d03e7383e46bf22f6df2ec66dc2d208578fa2e",
+      "state": "already_present"
+    },
+    {
+      "path": "docs/reviews/code-review-20260929-142240.md",
+      "source": "/private/tmp/dayu-upload-assets/docs/reviews/code-review-20260929-142240.md",
+      "sha256": "7632acd85e32e733d887bccf2dbe8d6d7600869dbc210c16b30da8be9d8b19d9",
+      "state": "already_present"
+    },
+    {
+      "path": "docs/reviews/code-review-assets-s1-final-kimi-20260929.md",
+      "source": "/private/tmp/dayu-upload-assets/docs/reviews/code-review-assets-s1-final-kimi-20260929.md",
+      "sha256": "ac8d04e4940e119fb3a8b7896f9f9e6aff4cdcab0e4e59dc26f58f3c701b6cc7",
+      "state": "already_present"
+    },
+    {
+      "path": "docs/reviews/code-review-assets-s1-final-mimo-20260929.md",
+      "source": "/private/tmp/dayu-upload-assets/docs/reviews/code-review-assets-s1-final-mimo-20260929.md",
+      "sha256": "75afc5afffd41bd1487097381d83b1707b9834414f5d34b16b0b65243e14cea5",
+      "state": "already_present"
+    },
+    {
+      "path": "docs/reviews/deepreview-issue198-s1-aggregate-dsflash-20260929.md",
+      "source": "/private/tmp/dayu-issue198-s1-aggregate/docs/reviews/deepreview-issue198-s1-aggregate-dsflash-20260929.md",
+      "sha256": "f63dee440a4785fc652048a9d7b95f9938f20cfceacf61acc5870a2757d2c9ec",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/deepreview-issue198-s1-aggregate-mimo-20260929.md",
+      "source": "/private/tmp/dayu-issue198-s1-aggregate/docs/reviews/deepreview-issue198-s1-aggregate-mimo-20260929.md",
+      "sha256": "c62f1472e0f63e6ecd56f6b471315817c2df19566399f5c11ffa2c55e8258e49",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/deepreview-o11-aggregate-mimo-20260929.md",
+      "source": "/private/tmp/dayu-upload-o11/docs/reviews/deepreview-o11-aggregate-mimo-20260929.md",
+      "sha256": "e3d2873501f567ecfcd5e4e4e3ab3301b645be5b2bf81f4ac615e4f3369fae5a",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-002513.md",
+      "source": "/private/tmp/dayu-upload-o16/docs/reviews/plan-review-20260929-002513.md",
+      "sha256": "364b8862d5cd2021a868d310fa0dfa76d4e69eb437eaacd503caafa0f81536b2",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-013658.md",
+      "source": "/private/tmp/dayu-upload-o05/docs/reviews/plan-review-20260929-013658.md",
+      "sha256": "e252faf3bd05e30c374cb10460f3987707bba2cadc20de039aff8a9db93c9f7d",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-015320.md",
+      "source": "/private/tmp/dayu-upload-o16/docs/reviews/plan-review-20260929-015320.md",
+      "sha256": "2416476531f9f55949b880f68b6d23490b519635a8999936f032d2455a55fd56",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-020356.md",
+      "source": "/private/tmp/dayu-upload-o05/docs/reviews/plan-review-20260929-020356.md",
+      "sha256": "c62de6f9e780319027d93a03fb7384a5b60a19f3d1e43c2d2b14a362f6e3cce7",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-020741.md",
+      "source": "/private/tmp/dayu-upload-fiscal/docs/reviews/plan-review-20260929-020741.md",
+      "sha256": "8a2033d3bbeb6efea9072770d78d592c0649036e4b3b65acc1e9c4c79cab7694",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-025304.md",
+      "source": "/private/tmp/dayu-upload-o16/docs/reviews/plan-review-20260929-025304.md",
+      "sha256": "6e78e77005b3d536eac3933ad7680b766817a656c7b1f0fd03fbb745ab105bb6",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-025500.md",
+      "source": "/private/tmp/dayu-upload-content/docs/reviews/plan-review-20260929-025500.md",
+      "sha256": "d585a823b54f2ead604a8a12d1e5bb0935c69ea47b56fbfe24099f45a085442f",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-025745.md",
+      "source": "/private/tmp/dayu-upload-o16/docs/reviews/plan-review-20260929-025745.md",
+      "sha256": "3a01c1541e95d55dbd9e044db728eeb6189df8d019238530165d141d4cacf139",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-030208.md",
+      "source": "/private/tmp/dayu-upload-o17/docs/reviews/plan-review-20260929-030208.md",
+      "sha256": "fe7bbc9935889ee2a5de688156dd5ea84ddb46cacf2025d4501e7f2f53fbd003",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-030538.md",
+      "source": "/private/tmp/dayu-upload-ids/docs/reviews/plan-review-20260929-030538.md",
+      "sha256": "4c0cca6bcae7a9a179277d2fe9dcca6b63267c04e78211786b647ca08d46ec1f",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-031057.md",
+      "source": "/private/tmp/dayu-upload-fiscal/docs/reviews/plan-review-20260929-031057.md",
+      "sha256": "c068e380bb014692d90b8365d722d2bae080387aa6df6e8e26b4350b98205b45",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-033249.md",
+      "source": "/private/tmp/dayu-upload-ids/docs/reviews/plan-review-20260929-033249.md",
+      "sha256": "b83e245bfcc5d64b84713e67256a545f5f04731b463eddeabe191dff222c28e3",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-033846.md",
+      "source": "/private/tmp/dayu-upload-o17/docs/reviews/plan-review-20260929-033846.md",
+      "sha256": "fe6602bb7587860100f700657497e8cc4ce9163c89e95e2d7774691f60df4d6f",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-034144.md",
+      "source": "/private/tmp/dayu-upload-o16/docs/reviews/plan-review-20260929-034144.md",
+      "sha256": "190bcdcf049a98c5488e8dbba0e55d3c0a85f2eeb0dd50c650f4a9b25217ddd8",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-035228.md",
+      "source": "/private/tmp/dayu-upload-fiscal/docs/reviews/plan-review-20260929-035228.md",
+      "sha256": "74076d45cdacdb671a4201ccd7c72a651874b3fa673732aef20ee3ad4d937356",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-041253.md",
+      "source": "/private/tmp/dayu-upload-content/docs/reviews/plan-review-20260929-041253.md",
+      "sha256": "3f0ac46711710ea4ece9c50d646dd97a4bfdb569f095afa4abc29340a932223f",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-043830.md",
+      "source": "/private/tmp/dayu-upload-o13/docs/reviews/plan-review-20260929-043830.md",
+      "sha256": "3b6b6e05ba3766c000559e7f4191ad3c5d99723599d7cd9bc1efabdb5da538d4",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-044006.md",
+      "source": "/private/tmp/dayu-upload-o18/docs/reviews/plan-review-20260929-044006.md",
+      "sha256": "a704c74abde24086ff3a431c92e23b5fac467774725a24a10e6fd8811d9f5dc8",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-044233.md",
+      "source": "/private/tmp/dayu-upload-content/docs/reviews/plan-review-20260929-044233.md",
+      "sha256": "c3f1abd713acc19462e6ffbe5930b53ccf1979d0993ca15f155359388f1d5504",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-051004.md",
+      "source": "/private/tmp/dayu-upload-state/docs/reviews/plan-review-20260929-051004.md",
+      "sha256": "a3843f07de138b742d227faccdf7d516fac905c5e11284f9632772b54eb6e696",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-053621.md",
+      "source": "/private/tmp/dayu-upload-issue198-s2/docs/reviews/plan-review-20260929-053621.md",
+      "sha256": "6bf4e6acb8223b54d3ae69fb6ad142ab11bd95983d21f8f5e1db1105fe3080f6",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-054535-state-mimo.md",
+      "source": "/private/tmp/dayu-upload-state/docs/reviews/plan-review-20260929-054535-state-mimo.md",
+      "sha256": "da04d8bad9980b62501c8a6cd1ccf3e2757f806006daa5e12df0ca561c2d41ea",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-100231-s2-rereview2-kimi.md",
+      "source": "/private/tmp/dayu-upload-issue198-s2/docs/reviews/plan-review-20260929-100231-s2-rereview2-kimi.md",
+      "sha256": "acfb17438966ffacee4a2faac28355caf9a21faf5fe6a8e82c6fec03c2b7a60c",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-100903-s2-rereview2-mimo.md",
+      "source": "/private/tmp/dayu-upload-issue198-s2/docs/reviews/plan-review-20260929-100903-s2-rereview2-mimo.md",
+      "sha256": "306327108dea363cfbf4e6b890005cdf2b2d09ed26673516e44a7deb031639cd",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-120634.md",
+      "source": "/private/tmp/dayu-upload-o20-f02/docs/reviews/plan-review-20260929-120634.md",
+      "sha256": "a6b4348f76722152557eae5a7c38ee8599937d2189169d24c526691758e79deb",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-124741.md",
+      "source": "/private/tmp/dayu-upload-fiscal/docs/reviews/plan-review-20260929-124741.md",
+      "sha256": "b3457349aa09a20fb9fddff48003d15ef7458b8b199c9de1c1ecd57f1d791d1e",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-125449.md",
+      "source": "/private/tmp/dayu-upload-o25/docs/reviews/plan-review-20260929-125449.md",
+      "sha256": "f90f8794db25975dc0352053aecd5986458eb9303940ef11e28c739be5bbc203",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-130919.md",
+      "source": "/private/tmp/dayu-upload-o20-f02/docs/reviews/plan-review-20260929-130919.md",
+      "sha256": "9005f2747bda6e527974f4d4474849fe0c45ebc3f4624572e4f837bf43009282",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-131155.md",
+      "source": "/private/tmp/dayu-upload-o13/docs/reviews/plan-review-20260929-131155.md",
+      "sha256": "8b2736a63be3aeb2188d8dc8c28e97bd2d7be71a7daee2952dd624cd23013e7d",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-133246.md",
+      "source": "/private/tmp/dayu-upload-o20-f02/docs/reviews/plan-review-20260929-133246.md",
+      "sha256": "1c07e0e65a6a188f679faaa172798b01736a574e78d15a05b6f7a1060ce053bc",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-133330.md",
+      "source": "/private/tmp/dayu-upload-o13/docs/reviews/plan-review-20260929-133330.md",
+      "sha256": "2dfcc3e465f5bbe0e2330eaa482ae8911a996faaed7b2d320b6cc2ccac060a64",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-134300.md",
+      "source": "/private/tmp/dayu-upload-o25/docs/reviews/plan-review-20260929-134300.md",
+      "sha256": "4f69fb46a6786040af6b2cb6d08df536b80c5a047c17c5a20054fdfe4f5b85e9",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-135201.md",
+      "source": "/private/tmp/dayu-upload-o13/docs/reviews/plan-review-20260929-135201.md",
+      "sha256": "0385252925e708cf7474f4b512a2d395f624e99d1aade631459fba57a1525a2b",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-135825.md",
+      "source": "/private/tmp/dayu-upload-o20-f02/docs/reviews/plan-review-20260929-135825.md",
+      "sha256": "5d5ca92778dcfd61c5b094553d07c7cc60055318c5a658b49220a0817de69edd",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-140124.md",
+      "source": "/private/tmp/dayu-upload-o25/docs/reviews/plan-review-20260929-140124.md",
+      "sha256": "66fc1b662a3f09defbd6b784cd2c724268aadd1564b7cbdc2fb433691a92e40e",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-144041.md",
+      "source": "/private/tmp/dayu-upload-o20-f02/docs/reviews/plan-review-20260929-144041.md",
+      "sha256": "881643a9aaf91fbb87ffcfc6c39ffc8f37c9f36648b989de1142e12047a2d2be",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-150200.md",
+      "source": "/private/tmp/dayu-upload-state/docs/reviews/plan-review-20260929-150200.md",
+      "sha256": "5d7fb4e2aac166cf08e0ef8918f45b62d59fb85504791f84118c8fecfc90d0d7",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-164018.md",
+      "source": "/private/tmp/dayu-upload-o20-f02/docs/reviews/plan-review-20260929-164018.md",
+      "sha256": "4affa8e69bac29b13123557799e34b1e26d87b6808c83f4d79af7a9e3ec69399",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-164227.md",
+      "source": "/private/tmp/dayu-upload-o17/docs/reviews/plan-review-20260929-164227.md",
+      "sha256": "b996baeff88b60b2e251eaaaa325daa2b819f4508d8a3459566c79c498c9cf2c",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-164438.md",
+      "source": "/private/tmp/dayu-upload-state/docs/reviews/plan-review-20260929-164438.md",
+      "sha256": "c195066975ff055f787e5067815fbf300264ac643ade2ab3e6ab29aedd3eacd9",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-183812.md",
+      "source": "/private/tmp/dayu-cninfo-single-day/docs/reviews/plan-review-20260929-183812.md",
+      "sha256": "15b3c4f81a8e5cf71e150b6eccd50b5a8d142cbb5b1d233dfa53722d13209dad",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-191231.md",
+      "source": "/private/tmp/dayu-cninfo-single-day/docs/reviews/plan-review-20260929-191231.md",
+      "sha256": "37d2c594c4d2454486dd257a77db04bfdba441f2617160647341220d612ec148",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-191328.md",
+      "source": "/private/tmp/dayu-upload-o18/docs/reviews/plan-review-20260929-191328.md",
+      "sha256": "46281be9023172b20c40de52e63aabaf4844c67a22b1a03ebe898ead201d61a7",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-o06-mimo.md",
+      "source": "/private/tmp/dayu-upload-o06/docs/reviews/plan-review-20260929-o06-mimo.md",
+      "sha256": "734ad09b8c868598bdde46c63cd8a3ac8bbcf6d99461a1008f3794783fc31b42",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-o20-f02-kimi.md",
+      "source": "/private/tmp/dayu-upload-o20-f02/docs/reviews/plan-review-20260929-o20-f02-kimi.md",
+      "sha256": "d3308c7c06fe0d3f7a1129d59430956f8414374f30e30061854524e8caa4d5b4",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-o20-f02-mimo.md",
+      "source": "/private/tmp/dayu-upload-o20-f02/docs/reviews/plan-review-20260929-o20-f02-mimo.md",
+      "sha256": "2e15c64408763a9d478949694eab71b867970b848cfca66c13e358f1124d0bbb",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-s2-rereview-mimo.md",
+      "source": "/private/tmp/dayu-upload-issue198-s2/docs/reviews/plan-review-20260929-s2-rereview-mimo.md",
+      "sha256": "37d573ccef32a9db9af09e563c49ef8976edd7297b8150ae8f3584ca3fd1116c",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-20260929-state-rereview3-mimo.md",
+      "source": "/private/tmp/dayu-upload-state/docs/reviews/plan-review-20260929-state-rereview3-mimo.md",
+      "sha256": "e30bf3375da38ac56b2b8c797a9db6211ee3078c56ccca3e32d131ce78e0f478",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-fiscal-rereview4-mimo-20260929.md",
+      "source": "/private/tmp/dayu-upload-fiscal/docs/reviews/plan-review-fiscal-rereview4-mimo-20260929.md",
+      "sha256": "a2e967d56050ba1930d7f19178f010fdf5a3c28b6ada3f4289f1f6439d30f160",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-o13-rereview2-mimo-20260929.md",
+      "source": "/private/tmp/dayu-upload-o13/docs/reviews/plan-review-o13-rereview2-mimo-20260929.md",
+      "sha256": "c296accc3c28d8a1a3aa0e5eb9f67ab83fe1f8d8cac32b6ed94ee5fbbc96b073",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-o13-rereview3-mimo-20260929.md",
+      "source": "/private/tmp/dayu-upload-o13/docs/reviews/plan-review-o13-rereview3-mimo-20260929.md",
+      "sha256": "daa0a09f9b90d16226bbcb9d658da123e03f2511bb81dcf0dae0324ea12e8098",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-o16-rereview5-mimo-20260929.md",
+      "source": "/private/tmp/dayu-upload-o16/docs/reviews/plan-review-o16-rereview5-mimo-20260929.md",
+      "sha256": "15c0d03e19986068f13f8e485eaff3c0dd3fdb141adfad93a3daf1a321fef071",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-o17-pr4-kimi-20260929.md",
+      "source": "/private/tmp/dayu-upload-o17/docs/reviews/plan-review-o17-pr4-kimi-20260929.md",
+      "sha256": "6749930d99cf6d905c6f8983a108b98978c5bf65e821c30cd840951b9b24da9a",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-o17-pr4-mimo-20260929.md",
+      "source": "/private/tmp/dayu-upload-o17/docs/reviews/plan-review-o17-pr4-mimo-20260929.md",
+      "sha256": "040fdb7d242239f376c86e56e2235b9b2f136d55236e993b1d09749edd2dbd60",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-o17-pr5-kimi-20260929.md",
+      "source": "/private/tmp/dayu-upload-o17/docs/reviews/plan-review-o17-pr5-kimi-20260929.md",
+      "sha256": "de61c2609d783d57ed31544d7f5b5650a362ec0d31159997710e0ae83f2658dc",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-o17-pr5-mimo-20260929.md",
+      "source": "/private/tmp/dayu-upload-o17/docs/reviews/plan-review-o17-pr5-mimo-20260929.md",
+      "sha256": "f11fea4d302099b196db6c12106c59d969d817bb843a829b4b3ea766008b6cab",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-o17-rereview3-mimo-20260929.md",
+      "source": "/private/tmp/dayu-upload-o17/docs/reviews/plan-review-o17-rereview3-mimo-20260929.md",
+      "sha256": "3d8c74ded1200798158ec3c0b31f988529cac99d8eaf4ca701f882073e9e8b58",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-o18-pr3-dsflash-20260929.md",
+      "source": "/private/tmp/dayu-upload-o18/docs/reviews/plan-review-o18-pr3-dsflash-20260929.md",
+      "sha256": "1ca48829a9436e730c03f4c29deee351ad613ef3a11c04a794fbaf384ea49cf4",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-o18-pr3-mimo-20260929.md",
+      "source": "/private/tmp/dayu-upload-o18/docs/reviews/plan-review-o18-pr3-mimo-20260929.md",
+      "sha256": "0b7d6759647fb93df56b9d9c4844216a6dc02ceb347744ab73ff455acaab7662",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-o18-rereview2-mimo-20260929.md",
+      "source": "/private/tmp/dayu-upload-o18/docs/reviews/plan-review-o18-rereview2-mimo-20260929.md",
+      "sha256": "acfc1ee661fda7cb284c69dd9a83cb8b66784eb3ce3b2045f4ef2c4484557086",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-o20-f02-rereview3-mimo-20260929.md",
+      "source": "/private/tmp/dayu-upload-o20-f02/docs/reviews/plan-review-o20-f02-rereview3-mimo-20260929.md",
+      "sha256": "53ecdea96116ea8c4efc49c9a4dd392a29498dfce6bb25f46694c8a232986959",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-o20-pr8-kimi-20260929.md",
+      "source": "/private/tmp/dayu-upload-o20-f02/docs/reviews/plan-review-o20-pr8-kimi-20260929.md",
+      "sha256": "b9ce8c5890deeda7e42a307b25f6afb5654fde44d02e9e57bbf5ba71ec70d07a",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-o20-pr8-mimo-20260929.md",
+      "source": "/private/tmp/dayu-upload-o20-f02/docs/reviews/plan-review-o20-pr8-mimo-20260929.md",
+      "sha256": "29e2969c6011016598ab6b1d3f636f83fc594a9225eaa9d05c56400c99ae41e4",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-o20-pr9-kimi-20260929.md",
+      "source": "/private/tmp/dayu-upload-o20-f02/docs/reviews/plan-review-o20-pr9-kimi-20260929.md",
+      "sha256": "7e51102093010d3fca45caed63c8c476bd36ccb51356d3a0880a41b13e5d0658",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-o20-pr9-mimo-20260929.md",
+      "source": "/private/tmp/dayu-upload-o20-f02/docs/reviews/plan-review-o20-pr9-mimo-20260929.md",
+      "sha256": "3db40bd2852046759d68a0e04eaec5874f642d124bd7099cda2a34552a8554ca",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-o20-pr9-mimo-claude-retry-20260929.md",
+      "source": "/private/tmp/dayu-upload-o20-f02/docs/reviews/plan-review-o20-pr9-mimo-claude-retry-20260929.md",
+      "sha256": "dd92532ef3c933c8066ffd5c7a710363f9cf0ac5881da34f440f8912ecada680",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-state-prc4-kimi-20260929.md",
+      "source": "/private/tmp/dayu-upload-state/docs/reviews/plan-review-state-prc4-kimi-20260929.md",
+      "sha256": "840fb4c3f7b0a02cb3673af6dac6a8d8e50b4d50b6a277c51142f4c3593ffb83",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-state-prc4-mimo-20260929.md",
+      "source": "/private/tmp/dayu-upload-state/docs/reviews/plan-review-state-prc4-mimo-20260929.md",
+      "sha256": "500ea89980072c5791648217fcfc08ab61171d93f494840481a1a2083aa20494",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/plan-review-state-prc4-mimo-rereview-20260929.md",
+      "source": "/private/tmp/dayu-upload-state/docs/reviews/plan-review-state-prc4-mimo-rereview-20260929.md",
+      "sha256": "4eb10beec4ce54bc8a1286e4d08e96fabfd3818c889b926f3678256d6d1a53eb",
+      "state": "copied"
+    },
+    {
+      "path": "docs/reviews/pr-review-197-o20-mimo-20260929.md",
+      "source": "/private/tmp/dayu-upload-pr197-integration/docs/reviews/pr-review-197-o20-mimo-20260929.md",
+      "sha256": "8d22146b84ed69ed58ea0018d8a8e0221bb07dae9f5e16edbfb5bba191a52ecb",
+      "state": "copied"
+    }
+  ]
+}

@@ -25,6 +25,11 @@ from dayu.fins.download_contract import (
     FinsDownloadSource,
     FinsDownloadTerminalDisposition,
     FinsDownloadTransportCategory,
+    FinsDownloadUncertainReport,
+    FINS_DOWNLOAD_PUBLIC_MAX_DOCUMENT_ROWS,
+    FINS_DOWNLOAD_PUBLIC_MAX_TEXT_CHARS,
+    download_terminal_disposition_from_counts,
+    validate_download_uncertain_reports,
 )
 from dayu.fins.domain.filing_semantics import FISCAL_PERIODS
 
@@ -171,6 +176,17 @@ class FinsPublicFailureKind(str, Enum):
     EXECUTION = "execution"
 
 
+class FinsDownloadFailureReason(str, Enum):
+    """下载来源完整性预检、版本冲突和仍需修复的封闭公共失败原因。"""
+
+    MULTIPLE_REPAIR_REQUIRED = "multiple_repair_required"
+    UNSELECTED_REPAIR_REQUIRED = "unselected_repair_required"
+    SELECTED_REJECTED_REPAIR_REQUIRED = "selected_rejected_repair_required"
+    UNSAFE_PUBLICATION = "unsafe_publication"
+    SOURCE_REVISION_CONFLICT = "source_revision_conflict"
+    SOURCE_REPAIR_REQUIRED = "source_repair_required"
+
+
 @dataclass(frozen=True, slots=True)
 class FinsPublicFailure:
     """下载 terminal 对 CLI 与 LLM 共享的脱敏失败对象。
@@ -181,6 +197,7 @@ class FinsPublicFailure:
         transport_category: provider/configuration 失败的 transport 分类。
         safe_message: 不含敏感 transport 内容的用户可读说明。
         retry_hint: 用户可读恢复建议。
+        reason_code: 下载来源完整性失败的封闭公共原因；无细分原因时为空。
     """
 
     kind: FinsPublicFailureKind
@@ -188,6 +205,7 @@ class FinsPublicFailure:
     transport_category: FinsDownloadTransportCategory | None
     safe_message: str
     retry_hint: str
+    reason_code: FinsDownloadFailureReason | None = None
 
     def __post_init__(self) -> None:
         """校验 public failure 字段。
@@ -237,6 +255,11 @@ class FinsPublicFailure:
             max_chars=_MAX_MESSAGE_CHARS,
             allow_empty=False,
         )
+        if self.reason_code is not None:
+            if not isinstance(self.reason_code, FinsDownloadFailureReason):
+                raise TypeError("reason_code must be FinsDownloadFailureReason")
+            if self.kind is not FinsPublicFailureKind.STORAGE or self.transport_category is not None:
+                raise ValueError("reason_code requires storage failure without transport_category")
 
     def to_json_value(self) -> dict[str, JsonValue]:
         """转换为 CLI/wait 可共享的 JSON-compatible 业务字段。
@@ -254,6 +277,7 @@ class FinsPublicFailure:
             "transport_category": (None if self.transport_category is None else self.transport_category.value),
             "message": self.safe_message,
             "retry_hint": self.retry_hint,
+            "reason_code": None if self.reason_code is None else self.reason_code.value,
         }
 
 
@@ -300,7 +324,7 @@ class FinsDownloadPublicDocument:
         _validate_safe_text(
             self.document_id,
             field_name="download.row.document_id",
-            max_chars=_MAX_DOCUMENT_LABEL_CHARS,
+            max_chars=FINS_DOWNLOAD_PUBLIC_MAX_TEXT_CHARS,
             allow_empty=False,
         )
         _validate_optional_safe_text(self.form_or_period, "download.row.form_or_period")
@@ -378,6 +402,9 @@ class FinsDownloadPublicSummary:
     skipped_count: int
     rejected_count: int
     failed_count: int
+    uncertain_count: int
+    uncertain_reports: tuple[FinsDownloadUncertainReport, ...]
+    omitted_uncertain_count: int
     document_rows: tuple[FinsDownloadPublicDocument, ...]
     missing_periods: tuple[str, ...]
     omitted_count: int
@@ -416,13 +443,26 @@ class FinsDownloadPublicSummary:
             self.rejected_count,
             self.failed_count,
             self.omitted_count,
+            self.uncertain_count,
+            self.omitted_uncertain_count,
         )
-        if any(count < 0 for count in counts):
+        if any(type(count) is not int or count < 0 for count in counts):
             raise ValueError("download public counts must be non-negative")
-        if self.discovered_count != sum(counts[1:5]):
+        if self.discovered_count != sum(counts[1:5]) + self.uncertain_count:
             raise ValueError("public discovered_count must equal disposition counts")
-        if len(self.document_rows) + self.omitted_count != self.discovered_count:
+        if len(self.document_rows) + self.omitted_count + self.uncertain_count != self.discovered_count:
             raise ValueError("document_rows plus omitted_count must equal discovered_count")
+        validate_download_uncertain_reports(self.source, self.uncertain_reports)
+        if len(self.uncertain_reports) + self.omitted_uncertain_count != self.uncertain_count:
+            raise ValueError("public uncertain omission must conserve reports")
+        if len(self.uncertain_reports) > FINS_DOWNLOAD_PUBLIC_MAX_DOCUMENT_ROWS or len(self.document_rows) > FINS_DOWNLOAD_PUBLIC_MAX_DOCUMENT_ROWS:
+            raise ValueError("public lists exceed row limit")
+        if self.uncertain_count and not self.uncertain_reports:
+            raise ValueError("public unknown reports must retain at least one report")
+        if self.source is not FinsDownloadSource.HKEXNEWS and self.uncertain_count:
+            raise ValueError("non-HK source cannot contain uncertain counts")
+        if {r.document_id for r in self.document_rows} & {r.existing_document_id for r in self.uncertain_reports}:
+            raise ValueError("public known and uncertain IDs overlap")
         for row in self.document_rows:
             if not isinstance(row, FinsDownloadPublicDocument):
                 raise TypeError("document_rows must contain FinsDownloadPublicDocument")
@@ -440,17 +480,18 @@ class FinsDownloadPublicSummary:
             visible_counts[disposition] > total_counts[disposition] for disposition in FinsDownloadDocumentDisposition
         ):
             raise ValueError("visible document disposition count exceeds total count")
-        expected_terminal = _download_terminal_disposition(
+        expected_terminal = download_terminal_disposition_from_counts(
             downloaded_count=self.downloaded_count,
             rejected_count=self.rejected_count,
             failed_count=self.failed_count,
+            uncertain_count=self.uncertain_count,
         )
         # 公开对象只允许表达 adapter 启动前的零候选失败/取消，不接受伪造的 partial。
         empty_terminal_override = self.discovered_count == 0 and self.terminal_disposition in {
             FinsDownloadTerminalDisposition.FAILED,
             FinsDownloadTerminalDisposition.CANCELLED,
         }
-        if self.terminal_disposition is not expected_terminal and not empty_terminal_override:
+        if self.terminal_disposition is not expected_terminal and not empty_terminal_override and self.terminal_disposition is not FinsDownloadTerminalDisposition.CANCELLED:
             raise ValueError("terminal_disposition does not match public counts")
         for period in self.missing_periods:
             _validate_safe_text(
@@ -486,8 +527,11 @@ class FinsDownloadPublicSummary:
                 "skipped": self.skipped_count,
                 "rejected": self.rejected_count,
                 "failed": self.failed_count,
+                "uncertain": self.uncertain_count,
             },
             "documents": [row.to_json_value() for row in self.document_rows],
+            "uncertain_reports": [report.to_json_value() for report in self.uncertain_reports],
+            "omitted_uncertain_count": self.omitted_uncertain_count,
             "missing_periods": list(self.missing_periods),
             "omitted_count": self.omitted_count,
             "terminal_disposition": self.terminal_disposition.value,
@@ -661,12 +705,12 @@ class FinsResultSummary:
             if self.status is FinsResultStatus.FAILURE:
                 if self.failure is None:
                     raise ValueError("failed download result requires public failure")
-                if self.download.terminal_disposition is not FinsDownloadTerminalDisposition.FAILED:
-                    raise ValueError("failed download result requires failed disposition")
+                if self.download.terminal_disposition is FinsDownloadTerminalDisposition.CANCELLED:
+                    raise ValueError("failed download result cannot contain cancelled disposition")
             elif self.status is FinsResultStatus.CANCELLED:
                 if self.download.terminal_disposition is not FinsDownloadTerminalDisposition.CANCELLED:
                     raise ValueError("cancelled download result requires cancelled disposition")
-            elif self.download.terminal_disposition in {
+            elif self.download.uncertain_count or self.download.terminal_disposition in {
                 FinsDownloadTerminalDisposition.FAILED,
                 FinsDownloadTerminalDisposition.CANCELLED,
             }:
@@ -1097,6 +1141,28 @@ def canonicalize_fins_public_file_label(raw_basename: str) -> str:
     return raw_basename
 
 
+def canonicalize_fins_rejected_file_label(raw_basename: str) -> str:
+    """为已拒绝的原始文件名生成安全公开标签。
+
+    Args:
+        raw_basename: 规划失败关联路径的原始文件名。
+
+    Returns:
+        合法形状文件名的 canonical 标签，或固定隐藏标签。
+
+    Raises:
+        TypeError: 输入不是字符串时抛出。
+    """
+
+    if not isinstance(raw_basename, str):
+        raise TypeError("public file label 必须是字符串")
+    try:
+        _validate_public_file_basename_shape(raw_basename)
+    except ValueError:
+        return _HIDDEN_PUBLIC_FILE_LABEL
+    return canonicalize_fins_public_file_label(raw_basename)
+
+
 def validate_fins_public_file_label(value: str) -> None:
     """校验值属于 canonical public file label 的唯一接受集。
 
@@ -1147,7 +1213,7 @@ def _public_file_label_requires_hiding(value: str) -> bool:
         value: 已通过 basename shape 校验的文件名。
 
     Returns:
-        命中长度、Unicode control/format 或既有 public guard 时返回 ``True``。
+        命中长度、Unicode control/format/surrogate 或既有 public guard 时返回 ``True``。
 
     Raises:
         无。
@@ -1155,7 +1221,7 @@ def _public_file_label_requires_hiding(value: str) -> bool:
 
     if len(value) > _MAX_PUBLIC_FILE_LABEL_CHARS:
         return True
-    if any(unicodedata.category(character) in {"Cc", "Cf"} for character in value):
+    if any(unicodedata.category(character) in {"Cc", "Cf", "Cs"} for character in value):
         return True
     try:
         _validate_safe_text(
@@ -1209,33 +1275,6 @@ def _validate_safe_text(
         raise ValueError(f"{field_name} contains an absolute path")
 
 
-def _download_terminal_disposition(
-    *,
-    downloaded_count: int,
-    rejected_count: int,
-    failed_count: int,
-) -> FinsDownloadTerminalDisposition:
-    """从 public counts 机械派生下载终态。
-
-    Args:
-        downloaded_count: 下载成功数。
-        rejected_count: 业务拒绝数。
-        failed_count: 下载失败数。
-
-    Returns:
-        与 owner-level summary 相同规则的终态分类。
-
-    Raises:
-        无。
-    """
-
-    if failed_count == 0:
-        return FinsDownloadTerminalDisposition.SUCCEEDED
-    if downloaded_count == 0 and rejected_count == 0:
-        return FinsDownloadTerminalDisposition.FAILED
-    return FinsDownloadTerminalDisposition.PARTIAL_FAILURE
-
-
 __all__: tuple[str, ...] = (
     "FINS_RESULT_EXIT_CANCELLED",
     "FINS_RESULT_EXIT_FAILURE",
@@ -1244,6 +1283,7 @@ __all__: tuple[str, ...] = (
     "FinsDirectStreamProtocolErrorKind",
     "FinsDownloadPublicDocument",
     "FinsDownloadPublicSummary",
+    "FinsDownloadFailureReason",
     "FinsErrorKind",
     "FinsEvent",
     "FinsEventDetail",
@@ -1256,5 +1296,6 @@ __all__: tuple[str, ...] = (
     "FinsResultSummary",
     "ValidatedFinsEventStream",
     "canonicalize_fins_public_file_label",
+    "canonicalize_fins_rejected_file_label",
     "validate_fins_public_file_label",
 )

@@ -25,12 +25,22 @@ PYTHON_311_CONSTRAINT_NAMES: tuple[str, ...] = (
     "min-py311.txt",
     "lock-linux-x64-py311.txt",
     "lock-macos-arm64-py311.txt",
-    "lock-macos-x64-py311.txt",
     "lock-windows-x64-py311.txt",
 )
-TRANSFORMERS_RUNTIME_CONSTRAINT = "transformers>=4.57.6,<5.0.0"
-TRANSFORMERS_LOCK = "transformers==4.57.6"
-HUGGINGFACE_HUB_LOCK = "huggingface_hub==0.36.2"
+TRANSFORMERS_RUNTIME_CONSTRAINT = "transformers>=5.16.1,<6.0.0"
+# 各 3.11 约束文件承诺的模型栈锁定值（transformers, huggingface_hub）；
+# darwin 与 linux/win 的官方验证基线不同，需按文件逐项断言。
+PYTHON_311_MODEL_STACK_LOCKS: dict[str, tuple[str, str]] = {
+    "min-py311.txt": ("transformers==5.16.1", "huggingface_hub==1.5.0"),
+    "lock-macos-arm64-py311.txt": ("transformers==5.16.1", "huggingface_hub==1.31.0"),
+    "lock-linux-x64-py311.txt": ("transformers==5.17.0", "huggingface_hub==1.31.0"),
+    "lock-windows-x64-py311.txt": ("transformers==5.17.0", "huggingface_hub==1.31.0"),
+}
+# 已放弃的旧模型栈锁定前缀：transformers 4.x 与 huggingface_hub 0.x 不得回流任何约束文件。
+RETIRED_TRANSFORMERS_LOCK_PREFIX = "transformers==4."
+RETIRED_HUGGINGFACE_HUB_LOCK_PREFIX = "huggingface_hub==0."
+# 已否决的 OCR 引擎：ocrmac（Apple Vision）不得回流任何约束文件。
+RETIRED_OCR_ENGINE_MARKER = "ocrmac"
 
 
 def _load_project_scripts() -> dict[str, str]:
@@ -114,19 +124,37 @@ def test_pyproject_publishes_only_real_console_scripts() -> None:
 
 
 def test_docling_transformers_runtime_contract_is_consistent_for_python_311() -> None:
-    """Docling 模型栈必须在 package metadata 与所有 3.11 锁文件中同源。
+    """Docling 模型栈必须在 package metadata 与所有 3.11 约束文件间同源。
 
     :returns: ``None``。
-    :raises AssertionError: metadata 允许 transformers 5.x 或任一锁文件漂移时抛出。
+    :raises AssertionError: metadata 偏离 transformers 5.16.1+ 窗口、任一约束文件
+        缺少承诺的锁定值、或旧模型栈（transformers 4.x / huggingface_hub 0.x）回流时抛出。
     """
 
     assert TRANSFORMERS_RUNTIME_CONSTRAINT in _load_project_dependencies()
+    assert set(PYTHON_311_MODEL_STACK_LOCKS) == set(PYTHON_311_CONSTRAINT_NAMES)
     for constraint_name in PYTHON_311_CONSTRAINT_NAMES:
         constraint_text = (CONSTRAINTS_ROOT / constraint_name).read_text(encoding="utf-8")
-        assert TRANSFORMERS_LOCK in constraint_text, constraint_name
-        assert HUGGINGFACE_HUB_LOCK in constraint_text, constraint_name
-        assert "transformers==5." not in constraint_text, constraint_name
-        assert "huggingface_hub==1." not in constraint_text, constraint_name
+        transformers_lock, huggingface_hub_lock = PYTHON_311_MODEL_STACK_LOCKS[constraint_name]
+        assert transformers_lock in constraint_text, constraint_name
+        assert huggingface_hub_lock in constraint_text, constraint_name
+        assert RETIRED_TRANSFORMERS_LOCK_PREFIX not in constraint_text, constraint_name
+        assert RETIRED_HUGGINGFACE_HUB_LOCK_PREFIX not in constraint_text, constraint_name
+
+
+def test_ocr_engine_strategy_is_rapidocr_across_python_311_constraints() -> None:
+    """OCR 引擎策略为三平台统一 rapidocr PP-OCRv6，任何 3.11 约束文件不得出现 ocrmac。
+
+    macOS Apple Vision（ocrmac）已在 2026-09-16 A/B 实测中被否决：实扫页输出乱码且
+    出现疑似幻觉数字；darwin / linux / win32 统一走 rapidocr PP-OCRv6 路径。
+
+    :returns: ``None``。
+    :raises AssertionError: 任一 3.11 约束文件出现 ocrmac 时抛出。
+    """
+
+    for constraint_name in PYTHON_311_CONSTRAINT_NAMES:
+        constraint_text = (CONSTRAINTS_ROOT / constraint_name).read_text(encoding="utf-8")
+        assert RETIRED_OCR_ENGINE_MARKER not in constraint_text, constraint_name
 
 
 def test_wheel_excludes_placeholder_scripts_metadata_and_packages() -> None:

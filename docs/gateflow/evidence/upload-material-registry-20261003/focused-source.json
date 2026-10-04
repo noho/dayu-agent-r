@@ -1,0 +1,404 @@
+{
+  "schema_version": 1,
+  "source_id": "diagnostics-focused04",
+  "registration_target": "22eca6c313005e3c5185340f2d6b535ab2583056",
+  "measured_parent": "8009ba4e100081fd1b56f64ddf5bc0c42a06e808",
+  "measured_source": [
+    {
+      "relative_path": "dayu/runtime/process_diagnostics.py",
+      "bytes": 21774,
+      "sha256": "47ed4b45a44aed212fe440347488f8bd7eded30088c81a9f2f68e5ad61c12f3d"
+    },
+    {
+      "relative_path": "dayu/runtime/log.py",
+      "bytes": 20268,
+      "sha256": "52ba9519fd7cc1f78fc9aad91160cc3230651e1ccbd10af800771b041b46ecef"
+    },
+    {
+      "relative_path": "dayu/fins/pipelines/docling_process_converter.py",
+      "bytes": 46098,
+      "sha256": "d8847701fc17c3f825afedb3c3138dabfa03e8050961545ee227819b22075864"
+    },
+    {
+      "relative_path": "dayu/runtime/interruptible_process.py",
+      "bytes": 34083,
+      "sha256": "1a1ae877d60f4a483df75dac8158d0c69821e3d28b18d45c5a63448845961e91"
+    },
+    {
+      "relative_path": "dayu/runtime/macos_sandbox.py",
+      "bytes": 6986,
+      "sha256": "0794d0390706941f76d9250a02c7503aaeaaf35a08420fe27dccf5f890dd3a54"
+    }
+  ],
+  "reviewed_source": [
+    {
+      "relative_path": "dayu/runtime/process_diagnostics.py",
+      "sha256": "47ed4b45a44aed212fe440347488f8bd7eded30088c81a9f2f68e5ad61c12f3d",
+      "bytes": 21774
+    },
+    {
+      "relative_path": "dayu/runtime/log.py",
+      "sha256": "52ba9519fd7cc1f78fc9aad91160cc3230651e1ccbd10af800771b041b46ecef",
+      "bytes": 20268
+    },
+    {
+      "relative_path": "dayu/fins/pipelines/docling_process_converter.py",
+      "sha256": "d8847701fc17c3f825afedb3c3138dabfa03e8050961545ee227819b22075864",
+      "bytes": 46098
+    },
+    {
+      "relative_path": "tests/runtime/test_process_diagnostics.py",
+      "sha256": "5403e8b493ac8305d981702a2963a17e3f0ffd374915b7db232167532f6b7188",
+      "bytes": 37514
+    },
+    {
+      "relative_path": "tests/runtime/test_log.py",
+      "sha256": "84ea75e1e9caa5fb3f3427a49a8a7751895f84eb69c7743cc176eb5621330f5a",
+      "bytes": 41099
+    },
+    {
+      "relative_path": "tests/fins/test_docling_process_converter.py",
+      "sha256": "85302386e6b4224020a4cb0462e4c08aa1be01ddc888591ca6eee1b2ebfedae9",
+      "bytes": 83281
+    },
+    {
+      "relative_path": "tests/fins/test_xbrl_controlled_upload_integration.py",
+      "sha256": "c6ce413b0a304e4fec1fb16d13d4b4396765b102295a07be4b22951a16add51e",
+      "bytes": 20364
+    },
+    {
+      "relative_path": "tests/cli/test_fins_commands.py",
+      "sha256": "d1624c66adbae1300ebe0a29a5d4cf654d6c3858fd0a2570ce1079f66a91dbf0",
+      "bytes": 177403
+    },
+    {
+      "relative_path": "README.md",
+      "sha256": "1ef37729e9c7b29971c3e63b977a4937fd83acb861b43e2f7f61b007a26e2ae3",
+      "bytes": 40885
+    },
+    {
+      "relative_path": "dayu/fins/README.md",
+      "sha256": "8c62102e1da7d86328726cb8f1560e6607143d41dde1498e6a7542e27618bda5",
+      "bytes": 109479
+    },
+    {
+      "relative_path": "tests/README.md",
+      "sha256": "52a12daf99e8656f74962893a8fba44fb2689ccdd657d307496f0b1043ce7756",
+      "bytes": 135464
+    }
+  ],
+  "source_records": [
+    {
+      "source_id": "diagnostics-focused04",
+      "relative_path": "source-records.json",
+      "bytes": 63809,
+      "sha256": "359ae4b49579d7f3569211aa0361b266bd228628f236bfa5ae13de2459bd1e52"
+    }
+  ],
+  "original_source_descriptors": [
+    {
+      "label": "real-matrix-result.json",
+      "bytes": 41459,
+      "sha256": "3293641330337c0647e731b7666ace52478fc5ead2b12373ce3f8c1d7fc2f6b3"
+    },
+    {
+      "label": "result.json",
+      "bytes": 131498,
+      "sha256": "a120a1ca46b0f0a5681cdb2fbf89e69a3ca60c203972d6c03e38cb96f40dedcd"
+    },
+    {
+      "label": "source-final.json",
+      "bytes": 4058,
+      "sha256": "84d19555ea7212c00abffaae718f120867cbeb2611e6646085f705a7d2213784"
+    }
+  ],
+  "report": {
+    "source_id": "diagnostics-focused04",
+    "relative_path": "observed-behavior.md",
+    "bytes": 39030,
+    "sha256": "17a4c08a381fb7ae18d3a6b83ae8cc582cc9b01d55ce4e2e7d59005c47cc94dc"
+  },
+  "scan": {
+    "source_id": "diagnostics-focused04",
+    "relative_path": "secret-scan.json",
+    "bytes": 6826,
+    "sha256": "d2ded979d369fb54c56ee28beb0edabfb5745607f05416d083ea49df2b47607e"
+  },
+  "measurements": [
+    {
+      "measurement_id": "NATIVE-DEFAULT-04",
+      "source_scenario_id": "diagnostics-focused04.NATIVE-DEFAULT-04",
+      "required_evidence": [
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-DEFAULT-04/command.json",
+          "bytes": 2390,
+          "sha256": "1195639acc59d55c45512fb9905d8888d51a101f1281d069596577e24db83b78"
+        },
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-DEFAULT-04/stdout.bin",
+          "bytes": 848,
+          "sha256": "27efff735a4a6b8564c6100e58ea62dbdfc944d8d9e570f8493d0a7a242be762"
+        },
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-DEFAULT-04/stderr.bin",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-DEFAULT-04/public-before.json",
+          "bytes": 3,
+          "sha256": "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570"
+        },
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-DEFAULT-04/public-after.json",
+          "bytes": 2033,
+          "sha256": "15678173ff3ee3f69f672310914bdd70af50e9ba8083c50ceb2f6aea38df46b6"
+        },
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-DEFAULT-04/result.json",
+          "bytes": 7216,
+          "sha256": "34c4192602ffc958e30988c5750fc9220b11f244764c380bbc772839763c34e6"
+        }
+      ],
+      "actual_exit": 0,
+      "actual_wait": true
+    },
+    {
+      "measurement_id": "NATIVE-QUIET-04",
+      "source_scenario_id": "diagnostics-focused04.NATIVE-QUIET-04",
+      "required_evidence": [
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-QUIET-04/command.json",
+          "bytes": 2399,
+          "sha256": "3b575203732fcfc9f8349770640f8ac273ff6fbf7c700cb3ffa49499c8bbb070"
+        },
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-QUIET-04/stdout.bin",
+          "bytes": 848,
+          "sha256": "27efff735a4a6b8564c6100e58ea62dbdfc944d8d9e570f8493d0a7a242be762"
+        },
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-QUIET-04/stderr.bin",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-QUIET-04/public-before.json",
+          "bytes": 3,
+          "sha256": "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570"
+        },
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-QUIET-04/public-after.json",
+          "bytes": 2033,
+          "sha256": "9280dadab392caf5d3698f61fe657d2f17682fd51c7a12c830c625e8de154bbb"
+        },
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-QUIET-04/result.json",
+          "bytes": 7212,
+          "sha256": "add41eeb1942de24a046209a2ed9c8628e9d1821ec4090dab741eacac4316e68"
+        }
+      ],
+      "actual_exit": 0,
+      "actual_wait": true
+    },
+    {
+      "measurement_id": "NATIVE-LOG-04",
+      "source_scenario_id": "diagnostics-focused04.NATIVE-LOG-04",
+      "required_evidence": [
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-LOG-04/command.json",
+          "bytes": 2501,
+          "sha256": "fccef9bf847bacd034a7f65d6b0873e9261761b2a8991c38bdf555f7ac358d44"
+        },
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-LOG-04/stdout.bin",
+          "bytes": 848,
+          "sha256": "27efff735a4a6b8564c6100e58ea62dbdfc944d8d9e570f8493d0a7a242be762"
+        },
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-LOG-04/stderr.bin",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-LOG-04/public-before.json",
+          "bytes": 3,
+          "sha256": "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570"
+        },
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-LOG-04/public-after.json",
+          "bytes": 2033,
+          "sha256": "ec4aac6ef59e3820ee9a8197740abbc5a83a252a27845747d4e95a68388d6fb5"
+        },
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-LOG-04/result.json",
+          "bytes": 7455,
+          "sha256": "27a416cb368098db69e252883c37f33933ba5fc83af2bdc8c2205bb6300382fc"
+        },
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-LOG-04/operator.log",
+          "bytes": 22231,
+          "sha256": "0f577ecc5b124cef8681baf7489a88a220d76d8a4abdf99eb33646b0a6237c07"
+        }
+      ],
+      "actual_exit": 0,
+      "actual_wait": true
+    },
+    {
+      "measurement_id": "NATIVE-ERROR-04",
+      "source_scenario_id": "diagnostics-focused04.NATIVE-ERROR-04",
+      "required_evidence": [
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-ERROR-04/command.json",
+          "bytes": 2514,
+          "sha256": "b5902cff21314b750f130be4bf87616bbd95052b7702f095c94f83242ebb4f69"
+        },
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-ERROR-04/stdout.bin",
+          "bytes": 848,
+          "sha256": "27efff735a4a6b8564c6100e58ea62dbdfc944d8d9e570f8493d0a7a242be762"
+        },
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-ERROR-04/stderr.bin",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-ERROR-04/public-before.json",
+          "bytes": 3,
+          "sha256": "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570"
+        },
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-ERROR-04/public-after.json",
+          "bytes": 2033,
+          "sha256": "7ae5213e005627adef9e8f590acc1e36bf88ed6b39ebd5321a2bbc6744c79d06"
+        },
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-ERROR-04/result.json",
+          "bytes": 7459,
+          "sha256": "c92aa416af8b46e025aacde78fa8fde8f05db5ba329de9c5d353b03c1eb8973f"
+        },
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-ERROR-04/operator.log",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      ],
+      "actual_exit": 0,
+      "actual_wait": true
+    },
+    {
+      "measurement_id": "NATIVE-SIGINT-04",
+      "source_scenario_id": "diagnostics-focused04.NATIVE-SIGINT-04",
+      "required_evidence": [
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-SIGINT-04/command.json",
+          "bytes": 2387,
+          "sha256": "be70b76414832b92e5b4796f275113537332ed27b0b82e00a4b220440a0c74fe"
+        },
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-SIGINT-04/stdout.bin",
+          "bytes": 372,
+          "sha256": "0670f8acc3f50e47c78a937266853fa6acf6ed4c05a68f532d4b144bf81777c2"
+        },
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-SIGINT-04/stderr.bin",
+          "bytes": 159,
+          "sha256": "846c6f992c35f2b59c830c5e46bda850cbaf2eae6613a0a0a6477c9327d66e58"
+        },
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-SIGINT-04/public-before.json",
+          "bytes": 3,
+          "sha256": "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570"
+        },
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-SIGINT-04/public-after.json",
+          "bytes": 909,
+          "sha256": "7f4aeb58d75e7fd197b3aaf09a9a20ec037eb0d6a8ef2000b5a6e0a89691b607"
+        },
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "NATIVE-SIGINT-04/result.json",
+          "bytes": 6155,
+          "sha256": "8fe85cd41b4217277d0200ac8a6f2ac36bd7b25002e0040fdf773128785101b0"
+        }
+      ],
+      "actual_exit": 130,
+      "actual_wait": true
+    },
+    {
+      "measurement_id": "XBRL-REAL-NATIVE-04",
+      "source_scenario_id": "diagnostics-focused04.XBRL-REAL-NATIVE-04",
+      "required_evidence": [
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "XBRL-REAL-NATIVE-04/command.json",
+          "bytes": 752,
+          "sha256": "f4a12f2f813a42417deec1dd08b07725b72aabb3096c063f2c25ae871a044636"
+        },
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "XBRL-REAL-NATIVE-04/actual-exit.json",
+          "bytes": 40,
+          "sha256": "c6fb17752281f980ce29de4953ca456e53096b09546d6e761571e4584b2386af"
+        },
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "XBRL-REAL-NATIVE-04/stdout.bin",
+          "bytes": 848,
+          "sha256": "0f0ce768ee73ee87869c4ca2c3ba324b6511d465e302129cdcb95d8a02e34429"
+        },
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "XBRL-REAL-NATIVE-04/stderr.bin",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "source_id": "diagnostics-focused04",
+          "relative_path": "XBRL-REAL-NATIVE-04/owner-observation.json",
+          "bytes": 4369,
+          "sha256": "da54c9690bc26688ca775630dbb0ff6e354d9f376d8466cb356b8e9cc1b81bf0"
+        }
+      ],
+      "actual_exit": 0,
+      "actual_wait": true
+    }
+  ],
+  "retention_receipt": {
+    "relative_path": "docs/gateflow/evidence/upload-material-registry-20261003/retention-receipt.json",
+    "bytes": 559,
+    "sha256": "785f683849143b82cb6b07f916a36a3fad27f886f8e392711185040ecde61eb0"
+  }
+}

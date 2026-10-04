@@ -2249,7 +2249,7 @@ def test_publication_outcome_rejects_cancelled_warning(tmp_path: Path) -> None:
         stored_file_count=0,
         file_events=[],
         payload={"skip_reason": "cancelled"},
-    )
+     source_kind=SourceKind.FILING, published_amended=None, material_published_state=None,)
     warning = CompanyMetadataWarning(
         kind=CompanyMetadataWarningKind.COMPANY_NAME_IGNORED,
         message=COMPANY_NAME_IGNORED_WARNING_MESSAGE,
@@ -2299,7 +2299,7 @@ def test_publication_outcome_rejects_warning_commit_outcome_mismatch(
         file_events=[],
         payload={"skip_reason": "already_uploaded"},
         company_meta_commit_outcome=commit_outcome,
-    )
+     source_kind=SourceKind.FILING, published_amended=None, material_published_state=None,)
 
     with pytest.raises(ValueError, match="必须与内部 commit outcome 同源"):
         FilingUploadPublicationOutcome(

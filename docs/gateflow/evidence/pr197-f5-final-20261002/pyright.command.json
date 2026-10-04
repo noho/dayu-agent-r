@@ -1,0 +1,14 @@
+{
+  "argv": [
+    "/Users/leo/workspace/dayu-agent-r/.venv/bin/python",
+    "-m",
+    "pyright",
+    "dayu/",
+    "tests/",
+    "utils/"
+  ],
+  "cwd": "/Users/leo/workspace/dayu-agent-r",
+  "python": "3.11.15 (main, Mar  3 2026, 00:52:57) [Clang 17.0.0 (clang-1700.6.3.2)]",
+  "activated_virtual_env": "/Users/leo/workspace/dayu-agent-r/.venv",
+  "coverage_file": null
+}

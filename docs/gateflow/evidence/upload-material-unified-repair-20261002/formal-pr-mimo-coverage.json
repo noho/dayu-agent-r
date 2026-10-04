@@ -1,0 +1,65 @@
+{
+  "outer_exit": 0,
+  "events": 24193,
+  "tools": 188,
+  "paired_results": 188,
+  "actual_models": [
+    "mimo-v2.6-pro"
+  ],
+  "terminal_success": true,
+  "canary_match": true,
+  "frozen_count": 19,
+  "frozen_drift": [],
+  "report": {
+    "path": "docs/reviews/pr-197-review-20261003-124750.md",
+    "sha256": "0d3cdca944dd0dbbdb1c12a654d07a28b56459d8d4e598d9888ff08b0d3c73ba",
+    "timestamp": "20261003-124750",
+    "generated_from_system_clock": true
+  },
+  "path_count": 1059,
+  "coverage": {
+    "source.diff": {
+      "total": 14446,
+      "matched": 14444,
+      "missing": [
+        11415,
+        11416
+      ],
+      "mismatch": [],
+      "presentation_extra_eof_lines": [
+        14447
+      ]
+    },
+    "tests.diff": {
+      "total": 23749,
+      "matched": 23749,
+      "missing": [],
+      "mismatch": [],
+      "presentation_extra_eof_lines": [
+        23750
+      ]
+    },
+    "utils.diff": {
+      "total": 2862,
+      "matched": 2862,
+      "missing": [],
+      "mismatch": [],
+      "presentation_extra_eof_lines": [
+        2863
+      ]
+    },
+    "configuration-readme.diff": {
+      "total": 904,
+      "matched": 904,
+      "missing": [],
+      "mismatch": [],
+      "presentation_extra_eof_lines": [
+        905
+      ]
+    }
+  },
+  "backups": [
+    "workspace/evidence/sub-agents/upload-material-unified-formal-pr-mimo-20261003-01",
+    "output/evidence-backup/sub-agents/upload-material-unified-formal-pr-mimo-20261003-01"
+  ]
+}

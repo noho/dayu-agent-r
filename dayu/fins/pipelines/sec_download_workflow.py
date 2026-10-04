@@ -7,8 +7,8 @@ from dayu.contracts.json_value import JsonValue
 import datetime as dt
 import inspect
 import time
-from collections.abc import Sequence
-from typing import AsyncIterator, Awaitable, Callable, Final, Optional, Protocol, TypeVar, cast
+from collections.abc import Mapping, Sequence
+from typing import AsyncIterator, Awaitable, Callable, Final, Literal, Optional, Protocol, TypeVar, cast
 
 from dayu.fins.domain.company_meta_contract import CompanyMetaCommitIntent
 from dayu.fins.domain.document_models import BatchToken, DownloadRejectionRegistry
@@ -28,6 +28,8 @@ from dayu.fins.storage import (
     FilingMaintenanceRepositoryProtocol,
     SourceDocumentRepositoryProtocol,
     SourceIntegrityRevisionConflictError,
+    SourceIntegrityPreflightError,
+    SourceIntegrityRepairRequiredError,
     SelectedSourceRepairRequired,
     classify_source_integrity_preflight,
 )
@@ -37,6 +39,36 @@ _FILING_STATUS_DOWNLOADED: Final[str] = "downloaded"
 _FILING_STATUS_SKIPPED: Final[str] = "skipped"
 _FILING_STATUS_FAILED: Final[str] = "failed"
 _FILING_REASON_6K_FILTERED: Final[str] = "6k_filtered"
+_INTEGRITY_FAILED_REASON: Final[str] = "source_integrity_failed"
+_INTEGRITY_FAILED_MESSAGE: Final[str] = "本地来源完整性状态阻止文档处理"
+
+
+class SecDownloadIntegrityAbort(Exception):
+    """保存原完整性原因及工作流已确认行快照的私有中止。"""
+
+    def __init__(
+        self,
+        cause: SourceIntegrityPreflightError | SourceIntegrityRevisionConflictError | SourceIntegrityRepairRequiredError,
+        result: dict[str, JsonValue],
+    ) -> None:
+        """保存同一 owner 产生的原因与确认快照。
+
+        Args:
+            cause: 原始封闭完整性异常对象。
+            result: 工作流构造的现成 SEC 行快照。
+
+        Returns:
+            无。
+
+        Raises:
+            TypeError: 原因不属于封闭异常集合时抛出。
+        """
+
+        if not isinstance(cause, SourceIntegrityPreflightError | SourceIntegrityRevisionConflictError | SourceIntegrityRepairRequiredError):
+            raise TypeError("下载中止原因必须是封闭完整性异常")
+        super().__init__("下载来源完整性中止")
+        self.cause = cause
+        self.result = result
 
 
 class _DownloadWorkflowDownloader(Protocol):
@@ -357,6 +389,8 @@ async def run_download_stream_impl(
     Raises:
         ValueError: ticker 不合法或市场不匹配时抛出。
         RuntimeError: 下载执行失败时抛出。
+        SourceIntegrityPreflightError: 首候选前完整性预检无法安全修复时抛出。
+        SecDownloadIntegrityAbort: 文档开始后的封闭完整性错误保快照中止。
     """
 
     normalized = normalize_ticker(ticker)
@@ -646,27 +680,50 @@ async def run_download_stream_impl(
         )
         filing_terminal_seen = False
         filing_terminal_status: str | None = None
-        async for event in host._download_single_filing_stream(
-            ticker=normalized_ticker,
-            cik=cik,
-            filing=filing,
-            overwrite=overwrite,
-            rejection_registry=rejection_registry,
-            cancel_checker=cancel_checker,
-        ):
-            event_result = event.payload.get("filing_result")
-            if event.event_type in {
-                DownloadEventType.FILING_COMPLETED,
-                DownloadEventType.FILING_FAILED,
-            } and isinstance(event_result, dict):
-                filing_terminal_seen = True
-                filing_terminal_status = str(event_result.get("status", "failed"))
-                filing_results.append(cast(dict[str, JsonValue], event_result))
-                host._log_filing_download_result(
+        try:
+            async for event in host._download_single_filing_stream(
+                ticker=normalized_ticker,
+                cik=cik,
+                filing=filing,
+                overwrite=overwrite,
+                rejection_registry=rejection_registry,
+                cancel_checker=cancel_checker,
+            ):
+                event_result = event.payload.get("filing_result")
+                if event.event_type in {
+                    DownloadEventType.FILING_COMPLETED,
+                    DownloadEventType.FILING_FAILED,
+                } and isinstance(event_result, dict):
+                    filing_terminal_seen = True
+                    filing_terminal_status = str(event_result.get("status", "failed"))
+                    confirmed_filing_result: dict[str, JsonValue] = dict(event_result)
+                    filing_results.append(confirmed_filing_result)
+                    host._log_filing_download_result(
+                        ticker=normalized_ticker,
+                        filing_result=confirmed_filing_result,
+                    )
+                yield event
+        except (SourceIntegrityPreflightError, SourceIntegrityRevisionConflictError) as exc:
+            if not filing_terminal_seen:
+                # 当前文档已开始但未确认终态；只登记一次失败，不制造未执行行。
+                failed_result = _build_sec_integrity_failed_filing_result(filing=filing)
+                filing_results.append(failed_result)
+                host._log_filing_download_result(ticker=normalized_ticker, filing_result=failed_result)
+                yield DownloadEvent(
+                    event_type=DownloadEventType.FILING_FAILED,
                     ticker=normalized_ticker,
-                    filing_result=cast(dict[str, JsonValue], event_result),
+                    document_id=document_id,
+                    payload=build_download_filing_event_payload(failed_result),
                 )
-            yield event
+            raise SecDownloadIntegrityAbort(
+                exc,
+                _build_sec_download_result(
+                    host=host, normalized_ticker=normalized_ticker, normalized_market=normalized.market,
+                    form_windows=form_windows, end_date=download_end_date, overwrite=overwrite,
+                    warnings=warnings, filing_results=filing_results,
+                    elapsed_ms=int((time.perf_counter() - started_at) * 1000), status="ok",
+                ),
+            ) from exc
         if not filing_terminal_seen and cancel_checker is not None and cancel_checker():
             cancelled = True
             Log.info(
@@ -679,30 +736,42 @@ async def run_download_stream_impl(
             if filing_terminal_status == "failed":
                 # repair filing 已由其 owner 投影真实失败；禁止再制造第二个顶层错误原因。
                 break
-            post_repair = classify_source_integrity_preflight(
-                host._source_repository.list_source_integrity(normalized_ticker),
-                accepted_filing_ids=accepted_filing_ids,
-                rejected_filing_ids=rejected_filing_id_set,
-            )
-            if isinstance(post_repair, SelectedSourceRepairRequired):
-                raise SourceIntegrityRevisionConflictError
-            if cancel_checker is not None and cancel_checker():
-                cancelled = True
-                break
-            await _publish_sec_post_repair_mutations(
-                host=host,
-                ticker=normalized_ticker,
-                cik=cik,
-                company_name=company_name,
-                ticker_aliases=merged_ticker_aliases,
-                rejection_decisions=rejection_decisions,
-                rejection_registry=rejection_registry,
-                overwrite=overwrite,
-                record_rejection=record_rejection,
-                save_rejection_registry=save_rejection_registry,
-                cancel_checker=cancel_checker,
-            )
-            repair_gate_completed = True
+            try:
+                post_repair = classify_source_integrity_preflight(
+                    host._source_repository.list_source_integrity(normalized_ticker),
+                    accepted_filing_ids=accepted_filing_ids,
+                    rejected_filing_ids=rejected_filing_id_set,
+                )
+                if isinstance(post_repair, SelectedSourceRepairRequired):
+                    raise SourceIntegrityRepairRequiredError()
+                if cancel_checker is not None and cancel_checker():
+                    cancelled = True
+                    break
+                await _publish_sec_post_repair_mutations(
+                    host=host,
+                    ticker=normalized_ticker,
+                    cik=cik,
+                    company_name=company_name,
+                    ticker_aliases=merged_ticker_aliases,
+                    rejection_decisions=rejection_decisions,
+                    rejection_registry=rejection_registry,
+                    overwrite=overwrite,
+                    record_rejection=record_rejection,
+                    save_rejection_registry=save_rejection_registry,
+                    cancel_checker=cancel_checker,
+                )
+                repair_gate_completed = True
+            except (SourceIntegrityPreflightError, SourceIntegrityRevisionConflictError, SourceIntegrityRepairRequiredError) as exc:
+                # repair 行已经确认；复查或独立发布失败不改写该文档事实。
+                raise SecDownloadIntegrityAbort(
+                    exc,
+                    _build_sec_download_result(
+                        host=host, normalized_ticker=normalized_ticker, normalized_market=normalized.market,
+                        form_windows=form_windows, end_date=download_end_date, overwrite=overwrite,
+                        warnings=warnings, filing_results=filing_results,
+                        elapsed_ms=int((time.perf_counter() - started_at) * 1000), status="ok",
+                    ),
+                ) from exc
 
     for warning in warn_insufficient_filings(
         form_windows,
@@ -715,22 +784,15 @@ async def run_download_stream_impl(
         warnings.append(warning)
         Log.warn(warning, module=host.MODULE)
     elapsed_ms = int((time.perf_counter() - started_at) * 1000)
-    rejected_count = sum(1 for item in filing_results if _is_rejected_filing_result(item))
-    skipped_count = sum(
-        1
-        for item in filing_results
-        if item["status"] == _FILING_STATUS_SKIPPED and not _is_rejected_filing_result(item)
+    final_result = _build_sec_download_result(
+        host=host, normalized_ticker=normalized_ticker, normalized_market=normalized.market,
+        form_windows=form_windows, end_date=download_end_date, overwrite=overwrite,
+        warnings=warnings, filing_results=filing_results, elapsed_ms=elapsed_ms,
+        status="cancelled" if cancelled else "ok",
     )
-    summary = {
-        "total": len(filing_results),
-        "downloaded": sum(1 for item in filing_results if item["status"] == _FILING_STATUS_DOWNLOADED),
-        "skipped": skipped_count,
-        "rejected": rejected_count,
-        "failed": sum(1 for item in filing_results if item["status"] == _FILING_STATUS_FAILED),
-        "elapsed_ms": elapsed_ms,
-        "reused_downloads": 0,
-        "converted": 0,
-    }
+    summary = final_result["summary"]
+    if not isinstance(summary, Mapping):
+        raise ValueError("SEC 结果摘要必须是对象")
     Log.info(
         (
             "美股下载完成: "
@@ -740,31 +802,97 @@ async def run_download_stream_impl(
         ),
         module=host.MODULE,
     )
-    final_result = host._build_result(
-        action="download",
-        ticker=normalized_ticker,
-        market_profile={
-            "market": normalized.market,
-        },
-        filters=cast(
-            JsonValue,
-            {
-                "forms": sorted(form_windows.keys()),
-                "start_dates": {key: value.isoformat() for key, value in sorted(form_windows.items())},
-                "end_date": download_end_date.isoformat(),
-                "overwrite": overwrite,
-            },
-        ),
-        warnings=cast(JsonValue, warnings),
-        filings=cast(JsonValue, filing_results),
-        summary=cast(JsonValue, summary),
-        status="cancelled" if cancelled else "ok",
-    )
     yield DownloadEvent(
         event_type=DownloadEventType.PIPELINE_COMPLETED,
         ticker=normalized_ticker,
         payload={"result": final_result},
     )
+
+
+def _build_sec_download_result(
+    *,
+    host: SecDownloadWorkflowHost,
+    normalized_ticker: str,
+    normalized_market: str,
+    form_windows: Mapping[str, dt.date],
+    end_date: dt.date,
+    overwrite: bool,
+    warnings: Sequence[str],
+    filing_results: Sequence[dict[str, JsonValue]],
+    elapsed_ms: int,
+    status: Literal["ok", "cancelled"],
+) -> dict[str, JsonValue]:
+    """从同一确认行真源构造正常或中止的 SEC 结果快照。
+
+    Args:
+        host: 提供现成结果构造的工作流宿主。
+        normalized_ticker: canonical ticker。
+        normalized_market: 已验证市场。
+        form_windows: 已计算各表单日期窗口。
+        end_date: inclusive 截止日期。
+        overwrite: 本次覆盖策略。
+        warnings: 已确认业务警告。
+        filing_results: 已确认文档行。
+        elapsed_ms: 已耗时毫秒。
+        status: 正常调用方的 ok/cancelled；中止快照显式传 ok。
+
+    Returns:
+        原 SEC 结果形状；本函数不产生事件或完成日志。
+
+    Raises:
+        KeyError: 确认行缺少必填 status 时抛出。
+        ValueError: 宿主结果构造校验失败时原样传播。
+    """
+
+    summary: dict[str, JsonValue] = {
+        "total": len(filing_results),
+        "downloaded": sum(1 for item in filing_results if item["status"] == _FILING_STATUS_DOWNLOADED),
+        "skipped": sum(1 for item in filing_results if item["status"] == _FILING_STATUS_SKIPPED and not _is_rejected_filing_result(item)),
+        "rejected": sum(1 for item in filing_results if _is_rejected_filing_result(item)),
+        "failed": sum(1 for item in filing_results if item["status"] == _FILING_STATUS_FAILED),
+        "elapsed_ms": elapsed_ms,
+        "reused_downloads": 0,
+        "converted": 0,
+    }
+    forms: list[JsonValue] = [key for key in sorted(form_windows)]
+    filters: dict[str, JsonValue] = {
+        "forms": forms,
+        "start_dates": {key: value.isoformat() for key, value in sorted(form_windows.items())},
+        "end_date": end_date.isoformat(),
+        "overwrite": overwrite,
+    }
+    warning_snapshot: list[JsonValue] = [warning for warning in warnings]
+    filing_snapshot: list[JsonValue] = [dict(row) for row in filing_results]
+    return host._build_result(
+        action="download", ticker=normalized_ticker, market_profile={"market": normalized_market},
+        filters=filters, warnings=warning_snapshot, filings=filing_snapshot,
+        summary=summary, status=status,
+    )
+
+
+def _build_sec_integrity_failed_filing_result(*, filing: FilingRecord) -> dict[str, JsonValue]:
+    """为已经开始但未确认终态的文档产生唯一安全失败行。
+
+    Args:
+        filing: 当前真实候选的已验证身份和日期。
+
+    Returns:
+        现成 failed 文档行，不包含未执行候选或来源路径。
+
+    Raises:
+        无。
+    """
+
+    return {
+        "document_id": f"fil_{filing.accession_number}",
+        "internal_document_id": filing.accession_number,
+        "status": _FILING_STATUS_FAILED,
+        "form_type": filing.form_type,
+        "filing_date": filing.filing_date,
+        "report_date": filing.report_date,
+        "reason_code": _INTEGRITY_FAILED_REASON,
+        "reason_message": _INTEGRITY_FAILED_MESSAGE,
+    }
 
 
 async def _publish_sec_post_repair_mutations(

@@ -1,0 +1,14 @@
+[
+  {
+    "case": "annual-results",
+    "http_status": 200,
+    "rows": 2,
+    "sha256": "62582cfbfa1aaeb588971f339bbbb33767420528718b916877d0e05d0c6cb94a"
+  },
+  {
+    "case": "quarter-results",
+    "http_status": 200,
+    "rows": 1,
+    "sha256": "0d6bbb3ba351b9a8cdd1966dea75234efb9dbfdb686fba89a289cd5924b59f32"
+  }
+]

@@ -1,0 +1,41 @@
+{
+  "reviewed_head": "785bf8d5fa28bfe0fdc4fd036bb609883a46baff",
+  "base": "79977b3a52f8566672e3b462f786f1004dfd3f89",
+  "manifest_sha256": "92dacddda9276c64aaf4cddcb60624775c8bcc678db66a9a240f1d22620f0dcd",
+  "root_decision": "pass after explicit controller projectinstruction supplement",
+  "reports": [
+    {
+      "path": "docs/reviews/code-review-20261004-081443.md",
+      "sha256": "770fe7e3e202dae97b47a734ce01429c22a91fe864a39941225eb88c919d0adf",
+      "bytes": 5271
+    },
+    {
+      "path": "docs/reviews/code-review-20261004-080734.md",
+      "sha256": "f32e2b5c46112c24cd88ed5faf259f65bff0a1d57d89173e2b19c1840a066a9b",
+      "mode": "O_EXCL"
+    }
+  ],
+  "root_complement_sha256": "005ae6eebeefa8c9613cef51f22a89a385554172e2e0f073b76aded7969b5843",
+  "root_independent_chain_sha256": "1dbc509067edc1d0335f28808d8231d248cf43930c2ebe6a4c693acdb9b73dd7",
+  "retention": [
+    {
+      "sha256": "fdb91c85142d4a3987cfe53489ea566fabdd8c2523c939bbb60488284ab95de2",
+      "bytes": 357479,
+      "copies": [
+        "workspace/evidence/upload-material-post-ci-gate-runners-20261003/private/root-aggregate-mimo-01.tar.gz",
+        "output/evidence-backup/upload-material-post-ci-gate-runners-20261003/private/root-aggregate-mimo-01.tar.gz"
+      ]
+    },
+    {
+      "sha256": "bbcc392564509843abc427d8ccc134105f453c5b6e022b57d44fd2542bd1993a",
+      "bytes": 1541153,
+      "copies": [
+        "workspace/evidence/upload-material-post-ci-gate-runners-20261003/private/root-aggregate-ds-01.tar.gz",
+        "output/evidence-backup/upload-material-post-ci-gate-runners-20261003/private/root-aggregate-ds-01.tar.gz"
+      ]
+    }
+  ],
+  "production_changed_since_code_review": false,
+  "required_fixes": [],
+  "open_questions": []
+}

@@ -17,8 +17,8 @@ from dayu.cli.agent_entrypoint import (
     CliSigintMonitor,
     optional_stripped_text,
     package_config_root,
-    resolve_workspace_root,
 )
+from dayu.cli.workspace_root import resolve_workspace_root
 from dayu.cli.arg_parsing import (
     COMMAND_SESSION,
     SESSION_ACTION_LIST,

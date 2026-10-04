@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from docling_core.types.doc.document import DoclingDocument
 from collections.abc import Callable
 from io import BytesIO
 from pathlib import Path
@@ -51,6 +52,7 @@ from dayu.fins.storage import (
 )
 from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_repository_set
 from dayu.fins.storage.repository_protocols import SourceSnapshotProtocol
+from dayu.fins.upload_asset_plan import docling_storage_name
 from dayu.fins.tools.read_runtime import FinsReadRuntime, _parse_source_document_meta
 from dayu.fins.tools.read_runtime_helpers import (
     FinsReadArgumentError,
@@ -948,7 +950,7 @@ def test_parse_source_document_meta_preserves_bool_and_defaults() -> None:
         AssertionError: 断言失败时抛出。
     """
 
-    meta = _parse_source_document_meta({"amended": True, "is_deleted": False})
+    meta = _parse_source_document_meta({"amended": True, "is_deleted": False},  source_kind=SourceKind.FILING,)
 
     assert meta["amended"] is True
     assert meta["is_deleted"] is False
@@ -969,7 +971,7 @@ def test_parse_source_document_meta_preserves_valid_four_digit_fiscal_year(value
         AssertionError: read runtime 未原样保留合法年份时抛出。
     """
 
-    meta = _parse_source_document_meta({"fiscal_year": value})
+    meta = _parse_source_document_meta({"fiscal_year": value},  source_kind=SourceKind.FILING,)
 
     assert meta["fiscal_year"] == value
 
@@ -991,7 +993,7 @@ def test_parse_source_document_meta_fails_closed_for_invalid_historical_fiscal_y
     """
 
     with pytest.raises(ValueError, match=r"fiscal_year 必须是 1000\.\.9999 的整数"):
-        _parse_source_document_meta({"fiscal_year": value})
+        _parse_source_document_meta({"fiscal_year": value},  source_kind=SourceKind.FILING,)
 
 
 @pytest.mark.parametrize(
@@ -1024,7 +1026,7 @@ def test_parse_source_document_meta_rejects_non_bool_fields(field_name: str, val
     raw_meta[field_name] = value
 
     with pytest.raises(ValueError, match=f"source meta 字段 {field_name} 必须为 bool"):
-        _parse_source_document_meta(raw_meta)
+        _parse_source_document_meta(raw_meta,  source_kind=SourceKind.FILING,)
 
 
 def test_read_runtime_snapshot_processor_cache_is_bounded_and_releases_evicted_resources(
@@ -2139,13 +2141,27 @@ def _create_source_document(
         batch=batch,
         content_type="text/plain",
     )
+    entries: list[dict[str, JsonValue]] | None = None
+    primary = filename
+    if source_kind is SourceKind.MATERIAL:
+        primary = docling_storage_name(source_kind,filename)
+        docling = blob_repository.store_file(
+            SourceHandle("AAPL", document_id, source_kind.value), primary,
+            BytesIO(DoclingDocument(name=document_id).model_dump_json().encode()),
+            batch=batch, content_type="application/json",
+        )
+        entries = [
+            {"name": name, "uri": asset.uri, "size": asset.size, "sha256": asset.sha256, "content_type": asset.content_type, "source": role}
+            for asset, role, name in ((file_meta,"original",filename),(docling,"docling",primary))
+        ]
     source_repository.create_source_document(
         SourceDocumentUpsertRequest(
             ticker="AAPL",
             document_id=document_id,
             internal_document_id=document_id,
             form_type=form_type,
-            primary_document=filename,
+            primary_document=primary,
+            file_entries=entries,
             files=[file_meta],
             meta=meta,
         ),

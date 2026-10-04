@@ -1,0 +1,403 @@
+........................................................................ [  4%]
+........................................................................ [  8%]
+........................................................................ [ 12%]
+........................................................................ [ 16%]
+........................................................................ [ 21%]
+........................................................................ [ 25%]
+........................................................................ [ 29%]
+........................................................................ [ 33%]
+........................................................................ [ 38%]
+........................................................................ [ 42%]
+........................................................................ [ 46%]
+........................................................................ [ 50%]
+........................................................................ [ 54%]
+........................................................................ [ 59%]
+........................................................................ [ 63%]
+........................................................................ [ 67%]
+........................................................................ [ 71%]
+........................................................................ [ 76%]
+........................................................................ [ 80%]
+........................................................................ [ 84%]
+........................................................................ [ 88%]
+........................................................................ [ 93%]
+........................................................................ [ 97%]
+...............................................                          [100%]
+=============================== warnings summary ===============================
+.venv/lib/python3.11/site-packages/edgar/_markdown.py:9
+  /Users/leo/workspace/dayu-agent-r/.venv/lib/python3.11/site-packages/edgar/_markdown.py:9: DeprecationWarning: edgar.files.html_documents module (including HtmlDocument) is deprecated and will be removed in v6.0. Please use edgar.documents.HTMLParser instead. See migration guide: https://edgartools.readthedocs.io/en/latest/migration/
+    from edgar.files.html_documents import HtmlDocument
+
+.venv/lib/python3.11/site-packages/edgar/files/markdown.py:4
+  /Users/leo/workspace/dayu-agent-r/.venv/lib/python3.11/site-packages/edgar/files/markdown.py:4: DeprecationWarning: edgar.files.html module is deprecated and will be removed in v6.0. Please use edgar.documents.HTMLParser instead. See migration guide: https://edgartools.readthedocs.io/en/latest/migration/
+    from edgar.files.html import BaseNode, Document
+
+.venv/lib/python3.11/site-packages/edgar/_filings.py:58
+  /Users/leo/workspace/dayu-agent-r/.venv/lib/python3.11/site-packages/edgar/_filings.py:58: DeprecationWarning: edgar.files.htmltools module (including ChunkedDocument) is deprecated and will be removed in v6.0. Please use edgar.documents.HTMLParser instead. See migration guide: https://edgartools.readthedocs.io/en/latest/migration/
+    from edgar.files.htmltools import html_sections
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+================================ tests coverage ================================
+______________ coverage: platform darwin, python 3.11.15-final-0 _______________
+
+Name                                                             Stmts   Miss  Cover
+------------------------------------------------------------------------------------
+dayu/cli/__main__.py                                                17     17     0%
+dayu/cli/activity.py                                               115     67    42%
+dayu/cli/agent_entrypoint.py                                       104     43    59%
+dayu/cli/arg_parsing.py                                            348     11    97%
+dayu/cli/commands/__init__.py                                        8      2    75%
+dayu/cli/commands/fins.py                                          461    275    40%
+dayu/cli/commands/init.py                                          378    307    19%
+dayu/cli/commands/interactive.py                                    56     30    46%
+dayu/cli/commands/prompt.py                                         73     43    41%
+dayu/cli/commands/session.py                                       200    134    33%
+dayu/cli/commands/tool_trace.py                                     36     26    28%
+dayu/cli/composer.py                                               469    315    33%
+dayu/cli/host_api_errors.py                                         31     15    52%
+dayu/cli/host_context.py                                            86     40    53%
+dayu/cli/init_catalog.py                                           301    194    36%
+dayu/cli/init_environment.py                                       307    199    35%
+dayu/cli/init_workspace.py                                         588    451    23%
+dayu/cli/main.py                                                   102     31    70%
+dayu/cli/output.py                                                 206     30    85%
+dayu/cli/run_keys.py                                               191    130    32%
+dayu/cli/run_view.py                                               173     94    46%
+dayu/cli/runtime_display.py                                        210    141    33%
+dayu/cli/session_execution.py                                      847    670    21%
+dayu/cli/session_identity.py                                        33     15    55%
+dayu/cli/session_terminal_cursor.py                                134     95    29%
+dayu/cli/thinking.py                                                92     59    36%
+dayu/cli/upload_script.py                                          150    121    19%
+dayu/cli/workspace_root.py                                          19      4    79%
+dayu/contracts/_validation.py                                        7      1    86%
+dayu/contracts/tool_await.py                                        34      9    74%
+dayu/contracts/tool_call.py                                         81     20    75%
+dayu/contracts/tool_declaration.py                                  63      5    92%
+dayu/contracts/tool_execution.py                                    97      9    91%
+dayu/contracts/tool_outcome.py                                      56      5    91%
+dayu/contracts/tool_result.py                                       46      8    83%
+dayu/contracts/tool_schema.py                                      115     33    71%
+dayu/contracts/tool_source.py                                       22      1    95%
+dayu/documents/docling_runtime.py                                  221    128    42%
+dayu/documents/processors/_doc_processor_factory.py                 27     27     0%
+dayu/documents/processors/base.py                                  129      9    93%
+dayu/documents/processors/bs_processor.py                          713    265    63%
+dayu/documents/processors/docling_processor.py                     649    254    61%
+dayu/documents/processors/html_extraction.py                       191    148    23%
+dayu/documents/processors/html_markdown.py                          39     29    26%
+dayu/documents/processors/html_normalization.py                     79     60    24%
+dayu/documents/processors/html_pipeline.py                          59     38    36%
+dayu/documents/processors/local_file_source.py                      16      1    94%
+dayu/documents/processors/markdown_processor.py                    314     32    90%
+dayu/documents/processors/perf_utils.py                             36      9    75%
+dayu/documents/processors/processor_registry.py                     68     22    68%
+dayu/documents/processors/search_utils.py                          359    219    39%
+dayu/documents/processors/source_snapshot.py                       154    154     0%
+dayu/documents/processors/table_utils.py                            14      7    50%
+dayu/documents/processors/text_utils.py                             88     15    83%
+dayu/engine/_default_runner.py                                       7      1    86%
+dayu/engine/agent.py                                               747    563    25%
+dayu/engine/contracts/agent_policy.py                               31     14    55%
+dayu/engine/contracts/agent_run.py                                  89     11    88%
+dayu/engine/contracts/engine_events.py                             224     21    91%
+dayu/engine/contracts/error_codes.py                                64     23    64%
+dayu/engine/contracts/messages.py                                   53      8    85%
+dayu/engine/contracts/runner_events.py                             132     11    92%
+dayu/engine/contracts/runner_identity.py                           101     54    47%
+dayu/engine/contracts/runner_spec.py                               122     40    67%
+dayu/engine/contracts/structured_output.py                          75     49    35%
+dayu/engine/provider_extensions.py                                 127     84    34%
+dayu/engine/runners/openai/_choice_policy.py                       171    101    41%
+dayu/engine/runners/openai/diagnostic_payload.py                   176    113    36%
+dayu/engine/runners/openai/error_classifier.py                      72     54    25%
+dayu/engine/runners/openai/http_client.py                           38     22    42%
+dayu/engine/runners/openai/non_stream_parser.py                    196    151    23%
+dayu/engine/runners/openai/payload.py                              160    125    22%
+dayu/engine/runners/openai/reasoning_protocol.py                    18     11    39%
+dayu/engine/runners/openai/retry_policy.py                          53     38    28%
+dayu/engine/runners/openai/runner.py                               339    262    23%
+dayu/engine/runners/openai/sse_parser.py                           311    261    16%
+dayu/engine/runners/openai/tool_call_aggregator.py                 199    153    23%
+dayu/engine/runners/openai/usage.py                                 23      7    70%
+dayu/engine/runners/openai/xml_tag_extractor.py                    104     80    23%
+dayu/fins/_converters.py                                            25      9    64%
+dayu/fins/_log.py                                                   25      2    92%
+dayu/fins/company_metadata_warning.py                               62      9    85%
+dayu/fins/direct_event_text.py                                      85     11    87%
+dayu/fins/direct_events.py                                         455     48    89%
+dayu/fins/domain/company_meta_contract.py                          111     13    88%
+dayu/fins/domain/document_models.py                                451     20    96%
+dayu/fins/domain/filing_semantics.py                               141     15    89%
+dayu/fins/domain/financial_result_contract.py                      201    135    33%
+dayu/fins/domain/tool_models.py                                     87      3    97%
+dayu/fins/domain/xbrl_result_contract.py                           187     49    74%
+dayu/fins/download_contract.py                                     473     58    88%
+dayu/fins/downloaders/cninfo_downloader.py                         334     33    90%
+dayu/fins/downloaders/hkexnews_downloader.py                       458     68    85%
+dayu/fins/downloaders/sec_downloader.py                            919    629    32%
+dayu/fins/ingestion/awaiting_resolution.py                          22      9    59%
+dayu/fins/ingestion/observation_handle.py                          127     24    81%
+dayu/fins/ingestion_events.py                                       77     11    86%
+dayu/fins/ingestion_runtime.py                                    2434    213    91%
+dayu/fins/pipelines/_filing_upload_fresh_validation.py              24      6    75%
+dayu/fins/pipelines/cn_download_company_meta.py                     31      2    94%
+dayu/fins/pipelines/cn_download_filing_workflow.py                 209     15    93%
+dayu/fins/pipelines/cn_download_models.py                          113      3    97%
+dayu/fins/pipelines/cn_download_rebuild.py                         186     26    86%
+dayu/fins/pipelines/cn_download_source_upsert.py                    79     11    86%
+dayu/fins/pipelines/cn_download_staging.py                          31     31     0%
+dayu/fins/pipelines/cn_download_workflow.py                        291     14    95%
+dayu/fins/pipelines/cn_form_utils.py                               132     15    89%
+dayu/fins/pipelines/cn_pipeline.py                                 466     25    95%
+dayu/fins/pipelines/cn_report_selection.py                         291     23    92%
+dayu/fins/pipelines/docling_process_converter.py                   355    217    39%
+dayu/fins/pipelines/docling_upload_service.py                      582    123    79%
+dayu/fins/pipelines/filing_upload_publication.py                   269     77    71%
+dayu/fins/pipelines/hk_download_rebuild.py                          98      8    92%
+dayu/fins/pipelines/hk_fiscal_calendar.py                           58      2    97%
+dayu/fins/pipelines/sec_6k_primary_document_repair.py              181     13    93%
+dayu/fins/pipelines/sec_6k_rules.py                                448     59    87%
+dayu/fins/pipelines/sec_company_meta.py                             41      3    93%
+dayu/fins/pipelines/sec_download_diagnostics.py                     57      2    96%
+dayu/fins/pipelines/sec_download_event_mapping.py                   84     24    71%
+dayu/fins/pipelines/sec_download_filing_workflow.py                191     26    86%
+dayu/fins/pipelines/sec_download_persistence.py                    125     23    82%
+dayu/fins/pipelines/sec_download_source_upsert.py                   39      1    97%
+dayu/fins/pipelines/sec_download_state.py                          148     50    66%
+dayu/fins/pipelines/sec_download_workflow.py                       267     16    94%
+dayu/fins/pipelines/sec_filing_collection.py                        93      2    98%
+dayu/fins/pipelines/sec_fiscal_fields.py                           278     24    91%
+dayu/fins/pipelines/sec_form_utils.py                               67      8    88%
+dayu/fins/pipelines/sec_pipeline.py                                470     64    86%
+dayu/fins/pipelines/sec_rebuild_workflow.py                        129     13    90%
+dayu/fins/pipelines/sec_safe_meta_access.py                         35      4    89%
+dayu/fins/pipelines/sec_sc13_filtering.py                          257     42    84%
+dayu/fins/pipelines/sec_upload_workflow.py                         175     70    60%
+dayu/fins/pipelines/upload_company_meta.py                          60      1    98%
+dayu/fins/pipelines/upload_progress_helpers.py                      17      2    88%
+dayu/fins/processors/bs_def14a_processor.py                        148    112    24%
+dayu/fins/processors/bs_eight_k_processor.py                        19      3    84%
+dayu/fins/processors/bs_report_form_common.py                      166     78    53%
+dayu/fins/processors/bs_sc13_processor.py                           19      3    84%
+dayu/fins/processors/bs_six_k_processor.py                         348    206    41%
+dayu/fins/processors/bs_ten_q_processor.py                          18      6    67%
+dayu/fins/processors/bs_twenty_f_processor.py                       77     50    35%
+dayu/fins/processors/def14a_form_common.py                          57     45    21%
+dayu/fins/processors/def14a_processor.py                            13      2    85%
+dayu/fins/processors/eight_k_form_common.py                         23     16    30%
+dayu/fins/processors/eight_k_processor.py                           14      2    86%
+dayu/fins/processors/financial_enhancer.py                         130     51    61%
+dayu/fins/processors/html_financial_statement_common.py            712    615    14%
+dayu/fins/processors/registry.py                                    50      1    98%
+dayu/fins/processors/report_form_financial_statement_common.py      91     60    34%
+dayu/fins/processors/sc13_form_common.py                            52     40    23%
+dayu/fins/processors/sc13_processor.py                              25     12    52%
+dayu/fins/processors/sec_dom_helpers.py                            107     92    14%
+dayu/fins/processors/sec_form_section_common.py                   1125    334    70%
+dayu/fins/processors/sec_html_rules.py                              31      2    94%
+dayu/fins/processors/sec_processor.py                              290    220    24%
+dayu/fins/processors/sec_report_form_common.py                     416    146    65%
+dayu/fins/processors/sec_section_build.py                          303    247    18%
+dayu/fins/processors/sec_table_extraction.py                       863    755    13%
+dayu/fins/processors/sec_xbrl_query.py                             283    136    52%
+dayu/fins/processors/six_k_form_common.py                          514    405    21%
+dayu/fins/processors/source_text.py                                 36     13    64%
+dayu/fins/processors/ten_k_form_common.py                          657    349    47%
+dayu/fins/processors/ten_k_processor.py                             17      5    71%
+dayu/fins/processors/ten_q_form_common.py                          459    390    15%
+dayu/fins/processors/ten_q_processor.py                             18      6    67%
+dayu/fins/processors/twenty_f_form_common.py                      1054    913    13%
+dayu/fins/processors/twenty_f_processor.py                          19      5    74%
+dayu/fins/processors/value_normalization.py                         13      4    69%
+dayu/fins/resolver/fmp_company_info.py                             110     62    44%
+dayu/fins/service_runtime.py                                       116      8    93%
+dayu/fins/storage/_fs_blob_core.py                                  67      7    90%
+dayu/fins/storage/_fs_company_meta_core.py                         108     11    90%
+dayu/fins/storage/_fs_filing_upload_state_core.py                   56      3    95%
+dayu/fins/storage/_fs_identity.py                                  135     28    79%
+dayu/fins/storage/_fs_maintenance_core.py                          198     15    92%
+dayu/fins/storage/_fs_processed_core.py                            179     19    89%
+dayu/fins/storage/_fs_source_document_core.py                      517     73    86%
+dayu/fins/storage/_fs_source_integrity.py                          575     69    88%
+dayu/fins/storage/_fs_source_snapshot.py                           412     36    91%
+dayu/fins/storage/_fs_storage_infra.py                            1120    164    85%
+dayu/fins/storage/_fs_storage_utils.py                             228     38    83%
+dayu/fins/storage/asset_filename_contract.py                        13      1    92%
+dayu/fins/storage/fs_batching_repository.py                         19      1    95%
+dayu/fins/storage/fs_source_document_repository.py                  93      3    97%
+dayu/fins/storage/local_file_source.py                              20      2    90%
+dayu/fins/storage/local_file_store.py                               93      1    99%
+dayu/fins/storage/repository_protocols.py                          293     43    85%
+dayu/fins/storage/source_integrity.py                              129      9    93%
+dayu/fins/storage/source_meta_contract.py                           13      2    85%
+dayu/fins/ticker_normalization.py                                  124     11    91%
+dayu/fins/tools/_ingestion_tool_helpers.py                          65     48    26%
+dayu/fins/tools/bm25f_scorer.py                                    104     34    67%
+dayu/fins/tools/cache.py                                            63     19    70%
+dayu/fins/tools/download_provider.py                                19      6    68%
+dayu/fins/tools/download_tools.py                                   50     22    56%
+dayu/fins/tools/fins_tools.py                                      348     47    86%
+dayu/fins/tools/preprocess_provider.py                              19      6    68%
+dayu/fins/tools/preprocess_tools.py                                 62     32    48%
+dayu/fins/tools/provider.py                                         57      5    91%
+dayu/fins/tools/read_runtime.py                                    976    268    73%
+dayu/fins/tools/read_runtime_helpers.py                            485    181    63%
+dayu/fins/tools/result_types.py                                    138      5    96%
+dayu/fins/tools/search_engine.py                                   469    210    55%
+dayu/fins/tools/section_semantic.py                                 76     39    49%
+dayu/fins/tools/upload_provider.py                                  21     21     0%
+dayu/fins/tools/upload_tools.py                                    124     77    38%
+dayu/fins/upload_asset_plan.py                                     214     45    79%
+dayu/fins/upload_batch.py                                          316    195    38%
+dayu/fins/upload_failure.py                                        154     17    89%
+dayu/fins/upload_format_contract.py                                169     17    90%
+dayu/fins/upload_repair_contract.py                                 25      3    88%
+dayu/fins/upload_usage_contract.py                                 114     17    85%
+dayu/host/_durable_actor.py                                         78     55    29%
+dayu/host/_event_payload.py                                         60     36    40%
+dayu/host/_execution_config_projection.py                          158    118    25%
+dayu/host/_execution_health.py                                      96     59    39%
+dayu/host/_public_validation.py                                     17      9    47%
+dayu/host/_runner_call_manifest.py                                 561    362    35%
+dayu/host/_terminal_answer.py                                       47     33    30%
+dayu/host/_terminal_diagnostics.py                                  22     17    23%
+dayu/host/_wait_observation.py                                     167    105    37%
+dayu/host/accepted_result_projection.py                            278    182    35%
+dayu/host/accepted_tool_outcome.py                                  24      4    83%
+dayu/host/admission.py                                            1203    777    35%
+dayu/host/api.py                                                  1380    575    58%
+dayu/host/audit.py                                                 390    211    46%
+dayu/host/command.py                                               420    290    31%
+dayu/host/compact_artifact.py                                       71     71     0%
+dayu/host/compact_material.py                                     1142    850    26%
+dayu/host/compact_payload.py                                       295    223    24%
+dayu/host/compact_pipeline.py                                      307    159    48%
+dayu/host/compact_structure.py                                     223    163    27%
+dayu/host/compaction.py                                           1432    828    42%
+dayu/host/compaction_operation.py                                  711    478    33%
+dayu/host/compaction_terminal.py                                   112     72    36%
+dayu/host/context_anchor.py                                        433    309    29%
+dayu/host/context_budget.py                                        509    302    41%
+dayu/host/context_event_payload.py                                  44     21    52%
+dayu/host/context_events.py                                        647    429    34%
+dayu/host/context_fallback.py                                      308    195    37%
+dayu/host/context_governance.py                                    136    105    23%
+dayu/host/context_policy.py                                         67     31    54%
+dayu/host/dispatch.py                                             1682   1281    24%
+dayu/host/durable/_row_rules.py                                     62     13    79%
+dayu/host/durable/_validation.py                                    36     22    39%
+dayu/host/durable/artifact.py                                      241    197    18%
+dayu/host/durable/audit.py                                          47     22    53%
+dayu/host/durable/codec.py                                          28      8    71%
+dayu/host/durable/connection.py                                    178    140    21%
+dayu/host/durable/errors.py                                         34      8    76%
+dayu/host/durable/event_log.py                                     388    259    33%
+dayu/host/durable/idempotency.py                                   135     64    53%
+dayu/host/durable/liveness.py                                      135     81    40%
+dayu/host/durable/maintenance.py                                    73     39    47%
+dayu/host/durable/memory.py                                        351    224    36%
+dayu/host/durable/options.py                                        73     17    77%
+dayu/host/durable/outbox.py                                        273    169    38%
+dayu/host/durable/payload.py                                       168     97    42%
+dayu/host/durable/payload_resolution.py                            128     99    23%
+dayu/host/durable/projection.py                                    135     88    35%
+dayu/host/durable/purge.py                                         560    313    44%
+dayu/host/durable/read_model.py                                    127    127     0%
+dayu/host/durable/run_transition.py                               1417    883    38%
+dayu/host/durable/schema.py                                        353     99    72%
+dayu/host/durable/session_lifecycle.py                             175    102    42%
+dayu/host/durable/state.py                                        1388    959    31%
+dayu/host/durable/storage_lifecycle.py                             178     96    46%
+dayu/host/durable/tool_trace.py                                    522    292    44%
+dayu/host/durable/transaction.py                                   237    169    29%
+dayu/host/durable/wait_resolution_digest.py                         32     17    47%
+dayu/host/engine_ingest.py                                        1737   1222    30%
+dayu/host/evidence.py                                              200    106    47%
+dayu/host/lifecycle_events.py                                      147     26    82%
+dayu/host/llm_compaction.py                                        200    129    36%
+dayu/host/local_proxy.py                                           114     82    28%
+dayu/host/memory.py                                                935    523    44%
+dayu/host/memory_repair.py                                          92     54    41%
+dayu/host/opaque_ref.py                                             20     20     0%
+dayu/host/open_host.py                                             859    601    30%
+dayu/host/outbox.py                                                164     85    48%
+dayu/host/payload_resolution.py                                    140    102    27%
+dayu/host/proactive_compaction.py                                  391    292    25%
+dayu/host/projection.py                                            257    140    46%
+dayu/host/queue_policy.py                                           19      9    53%
+dayu/host/read_api.py                                              528    360    32%
+dayu/host/read_model.py                                            119    119     0%
+dayu/host/recovery.py                                              338    211    38%
+dayu/host/recovery_process.py                                      120     50    58%
+dayu/host/run_input.py                                            1919   1405    27%
+dayu/host/session_attachment.py                                    301    225    25%
+dayu/host/storage_maintenance.py                                   158     80    49%
+dayu/host/terminal_payload.py                                       26     12    54%
+dayu/host/terminal_post_commit.py                                   21     10    52%
+dayu/host/tool_call_request.py                                     105     44    58%
+dayu/host/tool_duplicate_governance.py                             239     74    69%
+dayu/host/tool_runtime.py                                         1993    738    63%
+dayu/host/tool_runtime_schema_projection.py                         37      3    92%
+dayu/host/tool_trace.py                                            760    508    33%
+dayu/host/tool_trace_analysis.py                                   144    106    26%
+dayu/host/tool_trace_analysis_contracts.py                         486    258    47%
+dayu/host/tool_trace_analysis_input.py                             507    332    35%
+dayu/host/tool_trace_analysis_rules.py                             591    418    29%
+dayu/host/tool_trace_signals.py                                     47      1    98%
+dayu/host/tooling.py                                                77     20    74%
+dayu/host/transient_delta.py                                       325    217    33%
+dayu/host/wait_adapter.py                                          722    435    40%
+dayu/host/wait_boundary.py                                          49     29    41%
+dayu/host/wait_callback.py                                         207    106    49%
+dayu/host/waiting.py                                               654    404    38%
+dayu/runtime/_digest.py                                             26      3    88%
+dayu/runtime/argparse_exit.py                                        7      7     0%
+dayu/runtime/assembly.py                                           228     99    57%
+dayu/runtime/cancellation.py                                       126     69    45%
+dayu/runtime/config_loader.py                                      695    361    48%
+dayu/runtime/diagnostic_text.py                                     21     10    52%
+dayu/runtime/filelock.py                                           109     16    85%
+dayu/runtime/interruptible_process.py                              339     92    73%
+dayu/runtime/lane.py                                               577    432    25%
+dayu/runtime/location.py                                            40     26    35%
+dayu/runtime/log.py                                                169     21    88%
+dayu/runtime/native_mutex.py                                       142    104    27%
+dayu/runtime/numeric.py                                             14      3    79%
+dayu/runtime/scene_prepare.py                                      644    429    33%
+dayu/runtime/tool_call_projection.py                               279     82    71%
+dayu/runtime/tool_truncation.py                                     36     16    56%
+dayu/runtime/tools_discovery.py                                    195     57    71%
+dayu/runtime/workspace_paths.py                                     66     19    71%
+dayu/service/entrypoint_runtime.py                                 895    617    31%
+dayu/service/fins_wait_adapter.py                                  201     13    94%
+dayu/service/host_admin.py                                          35     15    57%
+dayu/service/host_assembly.py                                      595    376    37%
+dayu/service/scene_context.py                                       73     39    47%
+dayu/service/tool_trace_analysis.py                                166    109    34%
+dayu/service/wait_callback_endpoint.py                             271    271     0%
+dayu/tools/__init__.py                                               1      1     0%
+dayu/tools/doc_provider.py                                          50     50     0%
+dayu/tools/doc_tools.py                                            770    770     0%
+dayu/tools/utils/__init__.py                                         3      3     0%
+dayu/tools/utils/provider.py                                        69     69     0%
+dayu/tools/web/__init__.py                                           3      3     0%
+dayu/tools/web/provider.py                                         114    114     0%
+dayu/tools/web/web_challenge_detection.py                          110    110     0%
+dayu/tools/web/web_diagnostics.py                                  182    182     0%
+dayu/tools/web/web_egress_policy.py                                139    139     0%
+dayu/tools/web/web_fetch_orchestrator.py                           517    517     0%
+dayu/tools/web/web_http_encoding.py                                 91     91     0%
+dayu/tools/web/web_http_session.py                                 285    285     0%
+dayu/tools/web/web_playwright_backend.py                           540    540     0%
+dayu/tools/web/web_recovery.py                                      28     28     0%
+dayu/tools/web/web_resource_budget.py                               72     72     0%
+dayu/tools/web/web_search_projection.py                             55     55     0%
+dayu/tools/web/web_search_providers.py                             295    295     0%
+dayu/tools/web/web_tool_projection_text.py                          22     22     0%
+dayu/tools/web/web_tools.py                                        712    712     0%
+------------------------------------------------------------------------------------
+TOTAL                                                            90132  46826    48%
+
+63 files skipped due to complete coverage.
+Coverage JSON written to file /Users/leo/workspace/dayu-agent-r/workspace/tmp/pr197-f5-iv05-code-fix-sol-20261002-01/validation/pytest-complete.coverage.json
+1703 passed, 3 warnings in 70.05s (0:01:10)

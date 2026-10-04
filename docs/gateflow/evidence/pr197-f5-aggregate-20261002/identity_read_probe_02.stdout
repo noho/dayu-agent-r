@@ -1,0 +1,17 @@
+{
+  "freeze_files": 77,
+  "freeze_validation": 11,
+  "source_unchanged": true,
+  "normal_before_corruption": "passed",
+  "strict_root_after_corruption": "CompanyTickerIdentityCorruptionError:invalid_descriptor",
+  "list_after_corruption": [
+    "A",
+    "B"
+  ],
+  "get_after_corruption": "A",
+  "view_after_corruption": {
+    "entries": 2,
+    "read_error": null
+  },
+  "finding": "F5-AG01 independently reproduced with real published documents"
+}

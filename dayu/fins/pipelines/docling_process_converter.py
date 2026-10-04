@@ -16,19 +16,38 @@ import shutil
 import sys
 import tempfile
 import time
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Final, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Final, Literal, Protocol, cast
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.json_value import JsonValue
 from dayu.documents.docling_runtime import (
     DoclingRuntimeInitializationError,
     convert_pdf_bytes_with_docling,
+    convert_xbrl_bytes_with_docling,
+    unload_xbrl_conversion,
 )
+from dayu.documents.xbrl_config import (
+    PreparedXbrlInput, XbrlConfigurationError, XbrlConversionConfig,
+    prepare_xbrl_input, verify_prepared_xbrl_input,
+)
+from dayu.documents.docling_runtime import DOCLING_CONVERTER_CAPABILITY
+from dayu.runtime.log import emit_process_log_diagnostic
+from dayu.runtime.log_levels import INFO_LOG_LEVEL, WARN_LOG_LEVEL
+from dayu.runtime.process_diagnostics import (
+    ProcessCaptureIncident, ProcessDiagnosticsError, ProcessDiagnosticsFailureReason,
+    ProcessLogDiagnostic, ProcessRawDiagnostic, capture_process_diagnostics, read_process_diagnostics,
+)
+from dayu.runtime.macos_sandbox import (
+    MacosSandboxError, apply_macos_sandbox, build_macos_sandbox_profile,
+    inspect_macos_runtime_dependencies,
+)
+
+if TYPE_CHECKING:
+    from docling.datamodel.document import ConversionResult
 from dayu.runtime.interruptible_process import (
     InterruptibleProcessCompleted,
     InterruptibleProcessFailed,
@@ -44,6 +63,9 @@ _DOCLING_KILL_GRACE_SECONDS: Final[float] = 1.0
 _DOCLING_TEMP_PREFIX: Final[str] = "dayu-docling-"
 _DOCLING_INPUT_FILE_NAME: Final[str] = "input.bin"
 _DOCLING_OUTPUT_FILE_NAME: Final[str] = "output.json"
+_DOCLING_DIAGNOSTICS_DIRECTORY: Final[str] = "diagnostics"
+_SECONDARY_DIAGNOSTIC: Final[str] = "转换诊断不完整或无法留存；转换结果按原规则处理。"
+_CAPTURE_INCIDENT_PREFIX: Final[str] = "转换诊断捕获异常"
 _DESCRIPTOR_SCHEMA_VERSION: Final[int] = 1
 _SCHEMA_VERSION_KEY: Final[str] = "schema_version"
 _STATUS_KEY: Final[str] = "status"
@@ -58,41 +80,32 @@ _LOWERCASE_HEX_DIGITS: Final[frozenset[str]] = frozenset("0123456789abcdef")
 _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 
 
-@contextmanager
-def _isolated_inherited_stderr() -> Iterator[None]:
-    """在当前 child conversion 动态范围内隔离继承的公开 stderr。
+def _xbrl_suffixes() -> tuple[str, ...]:
+    """参数：无；返回：共享候选合同的 XBRL 后缀；异常：合同无格式时抛 ValueError。"""
+    for format in DOCLING_CONVERTER_CAPABILITY.formats:
+        if format.format_id == "XML_XBRL":
+            return format.suffixes
+    raise ValueError("共享转换格式合同缺少 XML_XBRL")
 
-    这里操作底层文件描述符而不是只替换 ``sys.stderr``，确保第三方 logger、
-    native dependency 与第三方创建的后代进程都不能绕过 child adapter 写入
-    调用方公开 stderr。退出动态范围时恢复原 descriptor，不改变父进程日志边界。
 
-    :returns: 进入隔离范围的 context manager。
-    :raises OSError: descriptor 复制、重定向或恢复失败时抛出。
-    :raises Exception: 隔离区主体异常原样传播；无主体异常时 flush 异常传播。
-    """
-
-    stderr_stream = sys.stderr
-    stderr_stream.flush()
-    stderr_file_descriptor = stderr_stream.fileno()
-    inherited_stderr_copy = os.dup(stderr_file_descriptor)
-    try:
-        with open(os.devnull, "w", encoding="utf-8") as isolated_stderr:
-            os.dup2(isolated_stderr.fileno(), stderr_file_descriptor)
-            try:
-                yield
-            finally:
-                active_error = sys.exception()
-                try:
-                    try:
-                        stderr_stream.flush()
-                    except Exception:
-                        # flush 是退出清理；已有主体异常时不得改写其分类语义。
-                        if active_error is None:
-                            raise
-                finally:
-                    os.dup2(inherited_stderr_copy, stderr_file_descriptor)
-    finally:
-        os.close(inherited_stderr_copy)
+def _build_xbrl_sandbox_profile(*, input_root: Path, prepared: PreparedXbrlInput) -> str:
+    """参数：本请求输入与快照；返回：实际运行环境策略；异常：平台/库清单未闭合抛沙箱错误。"""
+    if sys.platform != "darwin":
+        raise MacosSandboxError("XBRL 受控运行尚未在当前平台验收")
+    base = Path(sys.base_prefix)
+    executable = Path(sys.executable)
+    app = base / "Resources/Python.app/Contents/MacOS/Python"
+    if not app.is_file():
+        raise MacosSandboxError("实际 Python.app 可执行文件缺失")
+    dependencies = inspect_macos_runtime_dependencies(executable, base)
+    libraries = tuple(sorted({path for dependency in dependencies for path in (dependency.declared_path.parent, dependency.resolved_path.parent)}))
+    files = tuple(path for dependency in dependencies for path in (dependency.declared_path, dependency.resolved_path))
+    return build_macos_sandbox_profile(
+        readonly_roots=(*libraries, Path(sys.prefix), base, Path("/usr/lib"), Path("/System/Library/Frameworks"), input_root, prepared.taxonomy_snapshot_root),
+        readonly_files=(*files, Path("/dev/null"), Path("/dev/urandom"), Path("/dev/random")),
+        writable_root=prepared.writable_root,
+        executable_files=(executable, app), allow_existing_posix_semaphores=True,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,12 +273,18 @@ class _DoclingProcessTarget:
     :param output_path: 父进程独占临时输出文件。
     :param stream_name: Docling 业务可读输入名。
     :param config: 闭合转换配置。
+    :param xbrl_input: XML_XBRL 请求的可信独占快照；其它格式为 None。
+    :param sandbox_profile: 父侧生成的完整强制策略；其它格式为 None。
+    :param diagnostics_directory: 本请求诊断目录，不是用户日志路径。
     """
 
     input_path: str
     output_path: str
     stream_name: str
     config: DoclingConversionConfig
+    xbrl_input: PreparedXbrlInput | None
+    sandbox_profile: str | None
+    diagnostics_directory: str
 
     def __call__(self) -> JsonValue:
         """执行 Docling 并返回闭合小型 descriptor。
@@ -275,34 +294,57 @@ class _DoclingProcessTarget:
         """
 
         try:
-            input_bytes = Path(self.input_path).read_bytes()
-            with _isolated_inherited_stderr():
-                conversion = convert_pdf_bytes_with_docling(
-                    input_bytes,
-                    stream_name=self.stream_name,
-                    do_ocr=self.config.do_ocr,
-                    do_table_structure=self.config.do_table_structure,
-                    table_mode=self.config.table_mode,
-                    do_cell_matching=self.config.do_cell_matching,
-                )
-        except DoclingRuntimeInitializationError:
-            return _failure_descriptor(DoclingConversionFailureKind.CONVERTER_CONSTRUCTION)
-        except Exception:
-            return _failure_descriptor(DoclingConversionFailureKind.CONVERTER_EXECUTION)
+            with capture_process_diagnostics(Path(self.diagnostics_directory)):
+                if self.xbrl_input is not None:
+                    try:
+                        if self.sandbox_profile is None:
+                            raise XbrlConfigurationError("XBRL 强制策略缺失")
+                        os.chdir(self.xbrl_input.writable_root)
+                        # 临时文件、Arelle 用户配置和模型 cache 都只能进入本请求 work。
+                        os.environ["TMPDIR"] = str(self.xbrl_input.writable_root)
+                        os.environ["XDG_CONFIG_HOME"] = str(self.xbrl_input.writable_root)
+                        os.environ["XDG_CACHE_HOME"] = str(self.xbrl_input.writable_root)
+                        tempfile.tempdir = str(self.xbrl_input.writable_root)
+                        apply_macos_sandbox(self.sandbox_profile)
+                        verify_prepared_xbrl_input(self.xbrl_input)
+                    except (XbrlConfigurationError, MacosSandboxError, OSError):
+                        return _failure_descriptor(DoclingConversionFailureKind.CONVERTER_CONSTRUCTION)
 
-        try:
-            exported = cast(JsonValue, conversion.document.export_to_dict())
-            if not isinstance(exported, Mapping) or not _is_closed_json_value(exported):
-                raise ValueError("Docling export is not a closed JSON mapping")
-            output_bytes = json.dumps(
-                exported,
-                ensure_ascii=False,
-                indent=2,
-            ).encode("utf-8")
-            Path(self.output_path).write_bytes(output_bytes)
-        except Exception:
-            return _failure_descriptor(DoclingConversionFailureKind.RESULT_SERIALIZATION)
-        return _success_descriptor(output_bytes)
+                conversion: ConversionResult | None = None
+                try:
+                    try:
+                        input_bytes = Path(self.input_path).read_bytes()
+                        if self.xbrl_input is not None:
+                            conversion = convert_xbrl_bytes_with_docling(input_bytes, stream_name=self.stream_name, xbrl_input=self.xbrl_input)
+                        else:
+                            conversion = convert_pdf_bytes_with_docling(
+                                input_bytes, stream_name=self.stream_name,
+                                do_ocr=self.config.do_ocr, do_table_structure=self.config.do_table_structure,
+                                table_mode=self.config.table_mode, do_cell_matching=self.config.do_cell_matching,
+                            )
+                    except DoclingRuntimeInitializationError:
+                        return _failure_descriptor(DoclingConversionFailureKind.CONVERTER_CONSTRUCTION)
+                    except Exception:
+                        return _failure_descriptor(DoclingConversionFailureKind.CONVERTER_EXECUTION)
+                    if self.xbrl_input is not None and (conversion.status.value != "success" or conversion.errors):
+                        return _failure_descriptor(DoclingConversionFailureKind.CONVERTER_EXECUTION)
+                    try:
+                        exported = cast(JsonValue, conversion.document.export_to_dict())
+                        if not isinstance(exported, Mapping) or not _is_closed_json_value(exported):
+                            raise ValueError("Docling export is not a closed JSON mapping")
+                        output_bytes = json.dumps(exported, ensure_ascii=False, indent=2).encode("utf-8")
+                        Path(self.output_path).write_bytes(output_bytes)
+                    except Exception:
+                        return _failure_descriptor(DoclingConversionFailureKind.RESULT_SERIALIZATION)
+                    return _success_descriptor(output_bytes)
+                finally:
+                    if self.xbrl_input is not None and conversion is not None:
+                        unload_xbrl_conversion(conversion)
+
+        except ProcessDiagnosticsError as exc:
+            if exc.reason is not ProcessDiagnosticsFailureReason.ISOLATION_SETUP:
+                raise
+            return _failure_descriptor(DoclingConversionFailureKind.CONVERTER_CONSTRUCTION)
 
 
 @dataclass(frozen=True, slots=True)
@@ -374,6 +416,10 @@ class _CleanupOutcome(Enum):
 class ProcessDoclingConverter:
     """基于公共 interruptible process primitive 的共享转换器。"""
 
+    def __init__(self, *, xbrl_config: XbrlConversionConfig | None) -> None:
+        """参数：管理员配置或显式未配置；返回：无；异常：本构造不抛出异常。"""
+        self._xbrl_config = xbrl_config
+
     async def convert_to_json_bytes(
         self,
         input_bytes: bytes,
@@ -408,12 +454,37 @@ class ProcessDoclingConverter:
         result: DoclingConversionResult | None = None
         child_pid: int | None = None
         child_pgid: int | None = None
+        xbrl_input: PreparedXbrlInput | None = None
+        sandbox_profile: str | None = None
+        output_path: Path | None = None
+        diagnostics_directory: Path | None = None
+        child_closed = False
+        is_xbrl = Path(stream_name).suffix.lower() in _xbrl_suffixes()
 
         try:
-            temp_root = Path(tempfile.mkdtemp(prefix=_DOCLING_TEMP_PREFIX))
-            input_path = temp_root / _DOCLING_INPUT_FILE_NAME
-            output_path = temp_root / _DOCLING_OUTPUT_FILE_NAME
+            temp_root = Path(tempfile.mkdtemp(prefix=_DOCLING_TEMP_PREFIX)).resolve(strict=True)
+            input_root = temp_root / "input"
+            input_root.mkdir(mode=0o700)
+            input_path = input_root / _DOCLING_INPUT_FILE_NAME
+            if is_xbrl:
+                if self._xbrl_config is None:
+                    raise XbrlConfigurationError("XBRL 尚未配置管理员输入")
+                xbrl_input = prepare_xbrl_input(self._xbrl_config, snapshot_root=temp_root / "taxonomy", writable_root=temp_root / "work", stream_name=stream_name)
+                sandbox_profile = _build_xbrl_sandbox_profile(input_root=input_root, prepared=xbrl_input)
+                output_path = xbrl_input.writable_root / _DOCLING_OUTPUT_FILE_NAME
+            else:
+                output_path = temp_root / _DOCLING_OUTPUT_FILE_NAME
+            diagnostics_directory = (xbrl_input.writable_root if xbrl_input is not None else temp_root) / _DOCLING_DIAGNOSTICS_DIRECTORY
+            try:
+                diagnostics_directory.mkdir(mode=0o700)
+            except Exception as exc:
+                raise _public_error(DoclingConversionFailureKind.CONVERTER_CONSTRUCTION, exit_code=None, cause=exc) from exc
             input_path.write_bytes(input_bytes)
+            input_path.chmod(0o400)
+        except DoclingConversionError as exc:
+            primary_error = exc
+        except (XbrlConfigurationError, MacosSandboxError) as exc:
+            primary_error = _public_error(DoclingConversionFailureKind.CONVERTER_CONSTRUCTION, exit_code=None, cause=exc)
         except Exception as exc:
             primary_error = _public_error(
                 DoclingConversionFailureKind.IPC_PROTOCOL,
@@ -428,6 +499,9 @@ class ProcessDoclingConverter:
                         output_path=str(output_path),
                         stream_name=stream_name,
                         config=config,
+                        xbrl_input=xbrl_input,
+                        sandbox_profile=sandbox_profile,
+                        diagnostics_directory=str(diagnostics_directory),
                     )
                 )
                 handle.start()
@@ -463,6 +537,7 @@ class ProcessDoclingConverter:
                 child_pid=child_pid,
                 child_pgid=child_pgid,
             )
+            child_closed = close_outcome.failure is None
             if close_outcome.outer_cancellation is not None:
                 primary_error = close_outcome.outer_cancellation
             if close_outcome.failure is not None:
@@ -475,11 +550,23 @@ class ProcessDoclingConverter:
             if not wait_outcome.request_cancelled:
                 try:
                     assert temp_root is not None
+                    assert output_path is not None
                     result = _read_terminal_result(
-                        output_path=temp_root / _DOCLING_OUTPUT_FILE_NAME,
+                        output_path=output_path,
                         wait_result=wait_outcome.wait_result,
                     )
                 except DoclingConversionError as exc:
+                    primary_error = exc
+
+        if child_closed and diagnostics_directory is not None:
+            try:
+                normal_exit = (wait_outcome is not None and not wait_outcome.request_cancelled
+                               and isinstance(wait_outcome.wait_result, InterruptibleProcessCompleted)
+                               and wait_outcome.wait_result.exitcode in (0, None))
+                _forward_converter_diagnostics(diagnostics_directory, require_complete=normal_exit)
+            except BaseException as exc:
+                # forward 仅让控制流出域；清理仍由原 owner 收口，已有控制流优先。
+                if primary_error is None or isinstance(primary_error, Exception):
                     primary_error = exc
 
         if temp_root is not None:
@@ -513,6 +600,33 @@ class ProcessDoclingConverter:
                 exit_code=None,
             )
         return result
+
+
+def _emit_converter_secondary_diagnostic() -> None:
+    """参数：无；返回：最多一次安全 warning；异常：普通投递故障包含，控制流传播。"""
+    try:
+        emit_process_log_diagnostic(ProcessLogDiagnostic(__name__, WARN_LOG_LEVEL, _SECONDARY_DIAGNOSTIC, time.time()))
+    except Exception:
+        pass
+
+
+def _forward_converter_diagnostics(directory: Path, *, require_complete: bool) -> None:
+    """参数：已关闭 child 的诊断目录/读取策略；返回：无；异常：普通诊断故障包含、控制流传播。"""
+    try:
+        for diagnostic in read_process_diagnostics(directory, require_complete=require_complete):
+            if isinstance(diagnostic, ProcessRawDiagnostic):
+                message = (f"转换原生诊断 raw_channel={diagnostic.channel} source_level=unknown "
+                           f"byte_offset={diagnostic.offset}\n" + diagnostic.data.decode("utf-8", errors="backslashreplace"))
+                record = ProcessLogDiagnostic(__name__, INFO_LOG_LEVEL, message, time.time())
+            elif isinstance(diagnostic, ProcessCaptureIncident):
+                record = ProcessLogDiagnostic(__name__, WARN_LOG_LEVEL,
+                                              f"{_CAPTURE_INCIDENT_PREFIX}：{diagnostic.code.value}", time.time())
+            else:
+                record = diagnostic
+            if not emit_process_log_diagnostic(record):
+                return
+    except Exception:
+        _emit_converter_secondary_diagnostic()
 
 
 async def _wait_for_terminal(

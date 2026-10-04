@@ -1,6 +1,6 @@
 """CLI Agent entrypoint 共享辅助能力。
 
-本模块提供 CLI entrypoint 共用的参数校验、路径解析、执行 override 映射和
+本模块提供 CLI entrypoint 共用的非 workspace 文本校验、执行 override 映射和
 运行阶段 SIGINT 观察基础实现。这里不承载 Service 语义，不调用 Host API，
 也不访问 Fins storage。
 """
@@ -21,7 +21,6 @@ from dayu.service.host_assembly import ServiceRunOverrides
 
 UsageErrorFactory = Callable[[str], ValueError]
 
-BASE_OPTION_NAME: str = "--base"
 FALLBACK_MODE_OPTION_NAME: str = "--fallback-mode"
 FALLBACK_PROMPT_OPTION_NAME: str = "--fallback-prompt"
 _TaskResult = TypeVar("_TaskResult")
@@ -182,23 +181,6 @@ async def cancel_and_await_task(task: asyncio.Task[_TaskResult]) -> None:
         await task
 
 
-def resolve_workspace_root(value: str, *, error_factory: UsageErrorFactory) -> Path:
-    """解析 CLI workspace root。
-
-    :param value: argparse 解析到的 workspace root 文本。
-    :param error_factory: 用于构造当前命令用法错误的异常工厂。
-    :returns: 解析后的绝对路径。
-    :raises ValueError: workspace root 为空时通过 ``error_factory`` 抛出。
-    """
-
-    stripped = require_cli_text(
-        value,
-        field_name=BASE_OPTION_NAME,
-        error_factory=error_factory,
-    )
-    return Path(stripped).expanduser().resolve(strict=False)
-
-
 def optional_stripped_text(
     value: str | None,
     *,
@@ -293,6 +275,5 @@ __all__: tuple[str, ...] = (
     "cancel_and_await_task",
     "package_config_root",
     "optional_stripped_text",
-    "resolve_workspace_root",
     "service_run_overrides_from_args",
 )

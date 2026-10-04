@@ -186,6 +186,7 @@ def test_upload_filings_from_default_output_generates_posix_script_and_summary(
     assert content.startswith("#!/usr/bin/env sh\nset -eu\n")
     assert "python -m dayu.cli upload_filing" in content
     assert "python -m dayu.cli upload_material" in content
+    assert content.count("--base") >= 3
     assert "--ticker AAPL,MSFT" in content
     assert "--action update" in content
     assert "--overwrite" in content
@@ -199,7 +200,14 @@ def test_material_form_candidate_reaches_fins_owner_and_maps_usage_exit(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """CLI 必须传播规范化候选，并把 Fins owner 的拒绝映射为 usage exit。"""
+    """CLI 必须传播原文候选，并把 Fins owner 的拒绝映射为 usage exit。
+
+    :param tmp_path: 当前测试独占的临时目录。
+    :param capsys: CLI 双流捕获夹具。
+    :param monkeypatch: 当前测试的调用观察与隔离夹具。
+    :returns: 无。
+    :raises AssertionError: 原文传播或用法退出不符合预期时抛出。
+    """
 
     _install_forbidden_direct_service(monkeypatch)
     _CAPTURED_BATCH_REQUESTS.clear()
@@ -231,9 +239,9 @@ def test_material_form_candidate_reaches_fins_owner_and_maps_usage_exit(
 
     assert exit_code == EXIT_USAGE_ERROR
     assert [request.material_form for request in _CAPTURED_BATCH_REQUESTS] == [
-        "ESG_REPORT"
+        " esg_report "
     ]
-    assert "unsupported material form: ESG_REPORT" in capsys.readouterr().err
+    assert "unsupported material form:  esg_report " in capsys.readouterr().err
     assert not (tmp_path / "workspace").exists()
 
 
@@ -463,6 +471,165 @@ def test_posix_script_round_trips_adversarial_argv_with_real_sh(tmp_path: Path) 
     assert not marker.exists()
 
 
+def test_posix_single_line_script_preserves_exact_bytes() -> None:
+    """锁定普通单行再生成注释和命令正文的既有字节。
+
+    :param: 无。
+    :returns: 无。
+    :raises AssertionError: 普通单行脚本发生字节变化时抛出。
+    """
+
+    content = upload_script.render_upload_script(
+        (("python", "recorder.py", "space value", ""),),
+        regeneration_argv=("python", "-m", "dayu.cli", "upload_filings_from"),
+        platform="posix",
+    )
+    assert content.encode("utf-8") == (
+        b"#!/usr/bin/env sh\nset -eu\n"
+        b"# Regenerate: python -m dayu.cli upload_filings_from\n"
+        b"python recorder.py 'space value' '' \"$@\"\n"
+    )
+
+
+@pytest.mark.parametrize("line_break", ("\n", "\r\n", "\r"))
+def test_posix_multiline_regeneration_remains_comment_and_argv_round_trips(
+    tmp_path: Path,
+    line_break: str,
+) -> None:
+    """真实 sh 核查再生成多行文本无执行效果且命令参数原字节往返。
+
+    :param tmp_path: 当前测试独占的 recorder 与 shell 工作目录。
+    :param line_break: LF、CRLF 或不拆行的 CR。
+    :returns: 无。
+    :raises AssertionError: 语法、注释隔离或 argv 字节往返不符合预期时抛出。
+    :raises OSError: 独占技术文件读写或子进程启动失败时透传。
+    """
+
+    recorder = tmp_path / "recorder.py"
+    output = tmp_path / "argv.json"
+    marker = tmp_path / "comment-executed"
+    recorder.write_text(
+        '"""独占 shell 参数字节记录器，不访问财报。"""\n'
+        "import json, os, pathlib, sys\n"
+        "def main() -> None:\n"
+        '    """参数：进程 argv；返回：无；异常：技术文件写入失败透传。"""\n'
+        "    values = [os.fsencode(value).hex() for value in sys.argv[2:]]\n"
+        "    pathlib.Path(sys.argv[1]).write_text(json.dumps(values), encoding='utf-8')\n"
+        "main()\n",
+        encoding="utf-8",
+    )
+    regeneration_value = (
+        f"{line_break}{line_break}raw'{line_break}"
+        f"touch '{marker}'{line_break}$(touch '{marker}'){line_break}{line_break}"
+    )
+    fixed = ("\nleading", "trailing\n", "\r\nCRLF\r\n", "\rCR\r", regeneration_value)
+    appended = ("\n\nappended\r\n", "中文\n'quoted'\n")
+    script = tmp_path / "multiline.sh"
+    content = upload_script.render_upload_script(
+        ((sys.executable, str(recorder), str(output), *fixed),),
+        regeneration_argv=("dayu-cli", "--material-forms", regeneration_value),
+        platform="posix",
+    )
+    script.write_bytes(content.encode("utf-8"))
+    syntax = subprocess.run(
+        ("/bin/sh", "-n", str(script)),
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+    )
+    execution = subprocess.run(
+        ("/bin/sh", str(script), *appended),
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+    )
+    for phase, argv, completed in (
+        ("syntax", ("/bin/sh", "-n", str(script)), syntax),
+        ("execution", ("/bin/sh", str(script), *appended), execution),
+    ):
+        (tmp_path / f"{phase}.command.json").write_text(json.dumps(argv), encoding="utf-8")
+        (tmp_path / f"{phase}.stdout").write_bytes(completed.stdout)
+        (tmp_path / f"{phase}.stderr").write_bytes(completed.stderr)
+        (tmp_path / f"{phase}.exit").write_text(str(completed.returncode), encoding="utf-8")
+    assert syntax.returncode == EXIT_SUCCESS, syntax.stderr
+    assert execution.returncode == EXIT_SUCCESS, execution.stderr
+    assert execution.stdout == b""
+    assert execution.stderr == b""
+    assert not marker.exists()
+    assert json.loads(output.read_text(encoding="utf-8")) == [
+        os.fsencode(value).hex() for value in (*fixed, *appended)
+    ]
+
+
+@pytest.mark.parametrize(
+    "raw_form",
+    (
+        "\nearnings_presentation",
+        "earnings_presentation\n",
+        "\r\nearnings_presentation",
+        "earnings_presentation\r\n",
+        "\n\nearnings_presentation\n\n",
+        "\r\n\r\nearnings_presentation\r\n\r\n",
+    ),
+)
+def test_real_batch_cli_generates_valid_script_for_raw_form_line_boundaries(
+    tmp_path: Path,
+    raw_form: str,
+) -> None:
+    """真实 CLI 保留合法 form 原文并生成通过 sh 语法检查的脚本。
+
+    :param tmp_path: 当前测试独占的源目录、输出目录与技术票据目录。
+    :param raw_form: 含首尾 LF、CRLF 或边界空行的合法原文候选。
+    :returns: 无；仅生成脚本，不执行上传。
+    :raises AssertionError: CLI、注释原文或命令业务 form 不符合预期时抛出。
+    :raises OSError: 独占技术文件读写或子进程启动失败时透传。
+    """
+
+    source_dir = tmp_path / "source"
+    base = tmp_path / "workspace"
+    source_dir.mkdir()
+    (source_dir / "2024 Earnings Presentation.txt").write_text("technical input", encoding="utf-8")
+    argv = (
+        sys.executable,
+        "-m",
+        "dayu.cli",
+        "upload_filings_from",
+        "--base",
+        str(base),
+        "--ticker",
+        "AAPL",
+        "--from",
+        str(source_dir),
+        "--material-forms",
+        raw_form,
+    )
+    generation = subprocess.run(
+        argv,
+        cwd=Path(__file__).resolve().parents[2],
+        check=False,
+        capture_output=True,
+    )
+    (tmp_path / "generation.command.json").write_text(json.dumps(argv), encoding="utf-8")
+    (tmp_path / "generation.stdout").write_bytes(generation.stdout)
+    (tmp_path / "generation.stderr").write_bytes(generation.stderr)
+    (tmp_path / "generation.exit").write_text(str(generation.returncode), encoding="utf-8")
+    assert generation.returncode == EXIT_SUCCESS, generation.stderr
+    script = base / "upload_filings_AAPL.sh"
+    syntax_argv = ("/bin/sh", "-n", str(script))
+    syntax = subprocess.run(syntax_argv, check=False, capture_output=True, cwd=tmp_path)
+    (tmp_path / "syntax.command.json").write_text(json.dumps(syntax_argv), encoding="utf-8")
+    (tmp_path / "syntax.stdout").write_bytes(syntax.stdout)
+    (tmp_path / "syntax.stderr").write_bytes(syntax.stderr)
+    (tmp_path / "syntax.exit").write_text(str(syntax.returncode), encoding="utf-8")
+    assert syntax.returncode == EXIT_SUCCESS, syntax.stderr
+    content = script.read_bytes().decode("utf-8")
+    comment, body = content.split("\n", maxsplit=2)[2].rsplit("\n", maxsplit=2)[:2]
+    # 只撤销 renderer 的注释前缀，验证原文未被 batch 或 renderer 裁剪。
+    assert raw_form in comment.replace("\n# ", "\n")
+    assert "--forms EARNINGS_PRESENTATION" in body
+    assert "Material files: 1" in generation.stdout.decode("utf-8")
+
+
 def test_windows_renderer_round_trips_fixed_argument_oracles() -> None:
     """独立 batch+CRT oracle 必须恢复 Windows fixed argv 并锁定安全头。"""
 
@@ -679,6 +846,87 @@ def test_publisher_allows_external_ancestor_symlink(tmp_path: Path) -> None:
     assert target == (workspace / "upload_filings_AAPL.sh").resolve()
 
 
+def test_upload_filings_from_file_base_precedes_plan_and_publish(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """批量脚本入口在扫描和发布前拒绝普通文件 base。
+
+    Args:
+        tmp_path: 隔离路径根目录。
+        capsys: 标准流捕获夹具。
+        monkeypatch: 禁止下游计划与发布的夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 下游被调用或 usage 投影错误时抛出。
+    """
+
+    base = tmp_path / "base"
+    base.write_bytes(b"original")
+    source = tmp_path / "source"
+    source.mkdir()
+    before = sorted(path.name for path in tmp_path.iterdir())
+
+    def forbidden_plan(_request: UploadBatchPlanRequest) -> UploadBatchPlan:
+        """禁止扫描和生成批量计划。
+
+        Args:
+            _request: 不应传入的计划请求。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 发生计划生成时抛出。
+        """
+
+        raise AssertionError("base 类型错误必须先于计划生成")
+
+    def forbidden_publish(
+        *,
+        workspace_root: Path,
+        output: Path | None,
+        canonical_ticker: str,
+        platform: upload_script.UploadScriptPlatform,
+        content: str,
+    ) -> Path:
+        """禁止发布批量脚本。
+
+        Args:
+            workspace_root: 不应收到的工作区路径。
+            output: 不应收到的输出路径。
+            canonical_ticker: 不应收到的代码。
+            platform: 不应收到的平台。
+            content: 不应收到的脚本内容。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 发生发布时抛出。
+        """
+
+        raise AssertionError("base 类型错误必须先于脚本发布")
+
+    monkeypatch.setattr(fins_command, "generate_upload_batch_plan", forbidden_plan)
+    monkeypatch.setattr(fins_command, "publish_upload_script", forbidden_publish)
+    exit_code = cli_main.main(
+        ("upload_filings_from", "--base", str(base), "--ticker", "AAPL", "--from", str(source))
+    )
+    output = capsys.readouterr()
+    assert exit_code == EXIT_USAGE_ERROR
+    assert output.err == (
+        "dayu-cli upload_filings_from: --base must point to a directory; "
+        "choose a directory path\n"
+    )
+    assert base.read_bytes() == b"original"
+    assert sorted(path.name for path in tmp_path.iterdir()) == before
+
+
 def test_upload_filings_from_usage_empty_and_write_failures(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -734,6 +982,133 @@ def test_upload_filings_from_usage_empty_and_write_failures(
     )
     assert outside == EXIT_FAILURE
     assert "escapes workspace root" in capsys.readouterr().err
+    assert not (tmp_path / "outside.sh").exists()
+
+
+def test_upload_filings_from_publish_contract_errors_project_specific_message(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同一 publisher contract 的三个 typed 错误变体必须投影具体消息且无发布副作用。"""
+
+    _install_forbidden_direct_service(monkeypatch)
+    monkeypatch.setattr(upload_script.os, "name", "posix")
+    source_dir = tmp_path / "source"
+    base = tmp_path / "workspace"
+    source_dir.mkdir()
+    (source_dir / "2024FY年报.pdf").write_text("filing", encoding="utf-8")
+
+    real_dir = base / "real"
+    real_dir.mkdir(parents=True)
+    linked_dir = base / "linked"
+    linked_dir.symlink_to(real_dir, target_is_directory=True)
+    _assert_publish_contract_failure(
+        (
+            "upload_filings_from",
+            "--base",
+            str(base),
+            "--ticker",
+            "AAPL",
+            "--from",
+            str(source_dir),
+            "--output",
+            str(linked_dir / "upload.sh"),
+        ),
+        expected_stderr_fragment="internal symlink",
+        target=real_dir / "upload.sh",
+        expect_target_absent=True,
+        workspace=base,
+        capsys=capsys,
+    )
+    _assert_publish_contract_failure(
+        (
+            "upload_filings_from",
+            "--base",
+            str(base),
+            "--ticker",
+            "AAPL",
+            "--from",
+            str(source_dir),
+            "--output",
+            str(base / "missing" / "upload.sh"),
+        ),
+        expected_stderr_fragment="output parent is not an existing directory",
+        target=base / "missing" / "upload.sh",
+        expect_target_absent=True,
+        workspace=base,
+        capsys=capsys,
+    )
+
+    (base / "upload_filings_AAPL.sh").mkdir()
+    _assert_publish_contract_failure(
+        (
+            "upload_filings_from",
+            "--base",
+            str(base),
+            "--ticker",
+            "AAPL",
+            "--from",
+            str(source_dir),
+        ),
+        expected_stderr_fragment="output target is not a regular file",
+        target=base / "upload_filings_AAPL.sh",
+        expect_target_absent=False,
+        workspace=base,
+        capsys=capsys,
+    )
+
+
+def test_upload_filings_from_unknown_failure_uses_generic_message(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """publisher 未知内部异常必须投影通用消息且不泄漏内部异常细节。"""
+
+    _install_forbidden_direct_service(monkeypatch)
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    (source_dir / "2024FY年报.pdf").write_text("filing", encoding="utf-8")
+
+    def fail_publish(
+        workspace_root: Path,
+        output: Path | None,
+        canonical_ticker: str,
+        platform: upload_script.UploadScriptPlatform,
+        content: str,
+    ) -> Path:
+        """模拟 publisher 内部未知失败。
+
+        :param workspace_root: workspace root。
+        :param output: 显式输出路径。
+        :param canonical_ticker: 默认文件名使用的 canonical ticker。
+        :param platform: 目标脚本平台。
+        :param content: renderer 已生成的完整文本。
+        :returns: 不返回。
+        :raises RuntimeError: 始终抛出。
+        """
+
+        raise RuntimeError("internal-boom-detail")
+
+    monkeypatch.setattr(fins_command, "publish_upload_script", fail_publish)
+
+    exit_code = cli_main.main(
+        (
+            "upload_filings_from",
+            "--base",
+            str(tmp_path / "workspace"),
+            "--ticker",
+            "AAPL",
+            "--from",
+            str(source_dir),
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_FAILURE
+    assert "命令执行失败，请使用 --log-file PATH 重试并查看日志" in captured.err
+    assert "internal-boom-detail" not in captured.err
 
 
 def test_upload_filings_from_keyboard_interrupt_exits_130(
@@ -764,13 +1139,17 @@ def test_upload_filings_from_keyboard_interrupt_exits_130(
     ) == EXIT_KEYBOARD_INTERRUPT
 
 
-def test_posix_generated_script_runs_real_cli_into_temp_storage() -> None:
-    """真实生成脚本必须经 parser→Service→Fins 写入临时 storage。"""
+def test_posix_generated_script_runs_real_cli_into_temp_storage(tmp_path: Path) -> None:
+    """真实生成脚本必须经 parser→Service→Fins 写入临时 storage。
+
+    :param tmp_path: 当前测试独占的临时目录。
+    :returns: 无。
+    :raises AssertionError: 脚本生成、执行或仓储结果不符合预期时抛出。
+    """
 
     if os.name == "nt":
         pytest.skip("POSIX real workflow is exercised on non-Windows runners")
-    smoke_root = Path(__file__).resolve().parents[2] / "workspace/tmp/r11-posix-real"
-    shutil.rmtree(smoke_root, ignore_errors=True)
+    smoke_root = tmp_path / "posix-real"
     source_dir = smoke_root / "source"
     storage = smoke_root / "storage"
     source_dir.mkdir(parents=True)
@@ -1184,6 +1563,45 @@ def _decode_windows_batch_fixed_token(value: str) -> str:
         decoded.append(character)
         index += 1
     return "".join(decoded)
+
+
+def _assert_publish_contract_failure(
+    argv: tuple[str, ...],
+    *,
+    expected_stderr_fragment: str,
+    target: Path,
+    expect_target_absent: bool,
+    workspace: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """执行一个 publisher contract 违例变体并断言安全失败与零发布副作用。
+
+    零副作用断言是 owner 级不变量：对 workspace 做条目集合快照，CLI 调用前后
+    必须完全一致。该断言不依赖 publisher 私有 temp 命名规则，因此 publisher
+    临时文件残留（无论命名如何变化）与任何其它新增条目都会被捕获。
+
+    :param argv: 完整 CLI argv（不含程序名）。
+    :param expected_stderr_fragment: typed contract 错误消息必须包含的片段。
+    :param target: 当前变体的最终 publish target 路径。
+    :param expect_target_absent: target 在变体中是否必然完全不存在；``True``
+        时断言 ``not target.exists()``，``False`` 时（target 是预建目录）仅
+        断言 ``not target.is_file()``。
+    :param workspace: workspace root，用于快照零副作用断言。
+    :param capsys: pytest stdout/stderr capture fixture。
+    :returns: ``None``。
+    :raises AssertionError: 退出码、stderr 投影或发布副作用断言失败时抛出。
+    """
+
+    before = {p.relative_to(workspace) for p in workspace.rglob("*")}
+    exit_code = cli_main.main(argv)
+    assert exit_code == EXIT_FAILURE
+    assert expected_stderr_fragment in capsys.readouterr().err
+    after = {p.relative_to(workspace) for p in workspace.rglob("*")}
+    assert after == before
+    if expect_target_absent:
+        assert not target.exists()
+    else:
+        assert not target.is_file()
 
 
 def _install_forbidden_direct_service(monkeypatch: pytest.MonkeyPatch) -> None:

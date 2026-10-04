@@ -7,6 +7,8 @@ material、执行同期去重和数量限制，并输出不可变 typed facts。
 
 from __future__ import annotations
 
+from dayu.fins.pipelines.docling_upload_service import normalize_material_form_type
+
 import os
 import re
 from dataclasses import dataclass
@@ -808,7 +810,7 @@ def _validated_material_form(
 
     if value is None:
         return None
-    normalized = value.strip().upper()
+    normalized = normalize_material_form_type(value)
     if normalized not in _MATERIAL_FORM_TYPES:
         raise UploadBatchPlanUsageError(f"unsupported material form: {value}")
     return cast(MaterialFormType, normalized)

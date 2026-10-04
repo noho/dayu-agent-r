@@ -966,11 +966,14 @@ class FilingManifestItem:
     def from_source_meta(
         cls,
         meta: Mapping[str, JsonValue],
+        *,
+        is_deleted: bool,
     ) -> "FilingManifestItem":
         """从完整 filing source meta 构建唯一 manifest 投影。
 
         Args:
             meta: storage owner 已补齐身份与完成态的 source meta。
+            is_deleted: 仓储严格读取的逻辑删除事实。
 
         Returns:
             与 source meta 同源的 filing manifest 项目。
@@ -999,7 +1002,7 @@ class FilingManifestItem:
             report_date=_optional_str(meta.get("report_date")),
             filing_date=_optional_str(meta.get("filing_date")),
             amended=meta.get("amended") is True,
-            is_deleted=meta.get("is_deleted") is True,
+            is_deleted=is_deleted,
             deleted_at=_optional_str(meta.get("deleted_at")),
             document_version=_optional_str(meta.get("document_version")) or "v1",
             source_fingerprint=_optional_str(meta.get("source_fingerprint")) or "",
@@ -1030,6 +1033,8 @@ class MaterialManifestItem:
     """`materials/material_manifest.json` 项目。"""
 
     document_id: str
+    primary_document: str
+    amended: bool
     internal_document_id: str
     ingest_method: FinsIngestMethod
     source_provider: FinsSourceProvider
@@ -1047,11 +1052,14 @@ class MaterialManifestItem:
     def from_source_meta(
         cls,
         meta: Mapping[str, JsonValue],
+        *, primary_document: str, amended: bool, is_deleted: bool,
     ) -> "MaterialManifestItem":
         """从完整 material source meta 构建唯一 manifest 投影。
 
         Args:
             meta: storage owner 已补齐身份与完成态的 source meta。
+            primary_document: storage strict reader 已验证的默认 Docling 主源名。
+            is_deleted: 仓储严格读取的逻辑删除事实；amended: 仓储严格读取的材料修订事实。
 
         Returns:
             与 source meta 同源的 material manifest 项目。
@@ -1070,6 +1078,8 @@ class MaterialManifestItem:
             raise ValueError("internal_document_id 必须为非空字符串")
         return cls(
             document_id=document_id,
+            primary_document=primary_document,
+            amended=amended,
             internal_document_id=internal_document_id,
             ingest_method=provenance.ingest_method,
             source_provider=provenance.source_provider,
@@ -1078,13 +1088,13 @@ class MaterialManifestItem:
             material_name=_optional_str(meta.get("material_name")),
             filing_date=_optional_str(meta.get("filing_date")),
             report_date=_optional_str(meta.get("report_date")),
-            is_deleted=meta.get("is_deleted") is True,
+            is_deleted=is_deleted,
             deleted_at=_optional_str(meta.get("deleted_at")),
             document_version=_optional_str(meta.get("document_version")) or "v1",
             source_fingerprint=_optional_str(meta.get("source_fingerprint")) or "",
         )
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, JsonValue]:
         """将对象转换为 manifest 字典。
 
         Args:
@@ -1097,10 +1107,15 @@ class MaterialManifestItem:
             无。
         """
 
-        payload = asdict(self)
-        payload["ingest_method"] = self.ingest_method.to_storage_value()
-        payload["source_provider"] = self.source_provider.to_storage_value()
-        return payload
+        return {
+            "document_id": self.document_id, "internal_document_id": self.internal_document_id,
+            "primary_document": self.primary_document, "amended": self.amended, "ingest_method": self.ingest_method.to_storage_value(),
+            "source_provider": self.source_provider.to_storage_value(), "ingest_complete": self.ingest_complete,
+            "form_type": self.form_type, "material_name": self.material_name,
+            "filing_date": self.filing_date, "report_date": self.report_date,
+            "is_deleted": self.is_deleted, "deleted_at": self.deleted_at,
+            "document_version": self.document_version, "source_fingerprint": self.source_fingerprint,
+        }
 
 
 @dataclass(frozen=True)

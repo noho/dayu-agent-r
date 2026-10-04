@@ -18,6 +18,7 @@ from dayu.cli.exit_codes import (
     EXIT_SUCCESS,
 )
 from dayu.cli.session_identity import display_identity_from_slot
+from dayu.contracts.json_value import JsonValue
 from dayu.fins.direct_events import (
     FinsDownloadPublicDocument,
     FinsDownloadPublicSummary,
@@ -27,6 +28,7 @@ from dayu.fins.direct_events import (
     FinsResultStatus,
     FinsResultSummary,
     FinsPublicFailure,
+    FinsPublicFailureKind,
 )
 from dayu.host.api import (
     HostTerminalStatus,
@@ -65,6 +67,7 @@ _FINS_EVENT_SUCCEEDED_PREFIX: Final[str] = "Fins succeeded"
 _FINS_SUMMARY_MAX_ITEMS: Final[int] = 8
 _FINS_TEXT_MAX_CHARS: Final[int] = 120
 _FINS_TRUNCATED_SUFFIX: Final[str] = "..."
+CLI_LOG_LOCATION_HINT: Final[str] = "请使用 --log-file PATH 重试并查看日志"
 
 
 def render_prompt_terminal_result(
@@ -247,6 +250,8 @@ def render_fins_direct_event(
             _fins_event_line(_FINS_EVENT_CANCELLED_PREFIX, event),
             file=effective_stderr,
         )
+        if event.result.download is not None:
+            _print_terminal_business_summary(event.result, effective_stderr)
         return
 
     print(
@@ -434,17 +439,39 @@ def _print_download_summary(summary: FinsDownloadPublicSummary, stream: TextIO) 
             f"skipped={summary.skipped_count} "
             f"rejected={summary.rejected_count} "
             f"failed={summary.failed_count} "
+            f"uncertain={summary.uncertain_count} "
+            f"omitted_uncertain={summary.omitted_uncertain_count} "
             f"omitted={summary.omitted_count}"
         ),
         file=stream,
     )
     for row in summary.document_rows:
         print(_download_document_line(row), file=stream)
+    for report in summary.uncertain_reports:
+        print(
+            f"Fins uncertain report: source={summary.source.value} source_id={_download_reference_literal(report.source_id)} "
+            f"existing_document_id={_download_reference_literal(report.existing_document_id)} "
+            f"filing_date={report.filing_date or _EMPTY_CELL} report_date={report.report_date or _EMPTY_CELL} "
+            f"reason={report.reason_message}",
+            file=stream,
+        )
     if summary.missing_periods:
         print(
             "Fins missing periods: " + _bounded_json_text(",".join(summary.missing_periods)),
             file=stream,
         )
+
+
+def _download_reference_literal(value: str | None) -> str:
+    """把下载引用完整编码为不会改变终端行结构的 JSON 字符串字面量。
+
+    :param value: 原始引用；``None`` 使用既有空单元约定。
+    :returns: 可通过 JSON 解码还原原引用的字面量，或空单元标记。
+    :raises Exception: 不主动抛出异常。
+    """
+
+    # ASCII 转义同时隔离 Unicode 行分隔符；不截断或归一化业务身份。
+    return _EMPTY_CELL if value is None else json.dumps(value, ensure_ascii=True)
 
 
 def _download_document_line(row: FinsDownloadPublicDocument) -> str:
@@ -457,7 +484,7 @@ def _download_document_line(row: FinsDownloadPublicDocument) -> str:
 
     parts = [
         "Fins document:",
-        f"document_id={_bounded_json_text(row.document_id)}",
+        f"document_id={_download_reference_literal(row.document_id)}",
         f"form_or_period={_bounded_json_text(row.form_or_period or _EMPTY_CELL)}",
         f"filing_date={_bounded_json_text(row.filing_date or _EMPTY_CELL)}",
         f"report_date={_bounded_json_text(row.report_date or _EMPTY_CELL)}",
@@ -474,25 +501,44 @@ def _download_document_line(row: FinsDownloadPublicDocument) -> str:
 
 
 def _print_download_failure(failure: FinsPublicFailure, stream: TextIO) -> None:
-    """机械投影 closed typed download failure。
+    """从单次公共 JSON 投影按既有 CLI 上界显示下载失败。
 
     :param failure: runtime 构造的 public failure。
     :param stream: 输出流。
     :returns: ``None``。
+    :raises TypeError: 公共投影的文本字段不是字符串时抛出。
     :raises OSError: 输出流写入失败时由底层 ``print`` 透传。
     """
 
-    transport = _EMPTY_CELL if failure.transport_category is None else failure.transport_category.value
+    projection = failure.to_json_value()
+    transport = _EMPTY_CELL if projection["transport_category"] is None else projection["transport_category"]
+    reason = _EMPTY_CELL if projection["reason_code"] is None else projection["reason_code"]
     print(
         (
             "Fins failure detail: "
-            f"classification={_bounded_json_text(failure.kind.value)} "
-            f"source={_bounded_json_text(failure.source.value)} "
-            f"transport={_bounded_json_text(transport)} "
-            f"retry_hint={_bounded_json_text(failure.retry_hint)}"
+            f"classification={_download_failure_json_text(projection['classification'])} "
+            f"source={_download_failure_json_text(projection['source'])} "
+            f"transport={_download_failure_json_text(transport)} "
+            f"reason_code={_download_failure_json_text(reason)} "
+            f"retry_hint={_download_failure_json_text(projection['retry_hint'])}"
         ),
         file=stream,
     )
+    if projection["classification"] == FinsPublicFailureKind.EXECUTION.value:
+        print(CLI_LOG_LOCATION_HINT, file=stream)
+
+
+def _download_failure_json_text(value: JsonValue) -> str:
+    """严格收窄公共失败文本后复用 CLI 有界编码。
+
+    :param value: 已承诺为文本的公共字段；可空字段已投影为既有空单元格。
+    :returns: 按 CLI 显示上界截断并编码的 JSON 字符串。
+    :raises TypeError: 公共文本字段不是字符串时抛出。
+    """
+
+    if not isinstance(value, str):
+        raise TypeError("下载失败公共文本字段必须为字符串")
+    return _bounded_json_text(value)
 
 
 def _summary_parts(values: tuple[FinsEventDetail, ...]) -> tuple[str, ...]:

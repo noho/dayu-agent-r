@@ -1,0 +1,36 @@
+{
+  "captured_at_utc": "2026-09-30T19:55:41.452073+00:00",
+  "endpoint": "https://www1.hkexnews.hk/search/titleSearchServlet.do",
+  "request_params": {
+    "lang": "zh",
+    "category": "0",
+    "market": "SEHK",
+    "stockId": "7609",
+    "searchType": "1",
+    "documentType": "-1",
+    "t1code": "10000",
+    "t2Gcode": "3",
+    "t2code": "-2",
+    "fromDate": "20251113",
+    "toDate": "20251113",
+    "MB-Daterange": "0",
+    "rowRange": "100",
+    "sortByOptions": "DateTime",
+    "sortDir": "0"
+  },
+  "http_status": 200,
+  "raw_response_body_sha256": "0d6bbb3ba351b9a8cdd1966dea75234efb9dbfdb686fba89a289cd5924b59f32",
+  "raw_response_body": "{\"result\":\"[{\\\"FILE_INFO\\\":\\\"936KB\\\",\\\"NEWS_ID\\\":\\\"11914784\\\",\\\"SHORT_TEXT\\\":\\\"公告及通告 - [季度業績]\\\\u003cbr/\\\\u003e\\\",\\\"TOTAL_COUNT\\\":\\\"1\\\",\\\"DOD_WEB_PATH\\\":\\\"\\\",\\\"STOCK_NAME\\\":\\\"騰訊控股\\\\u003cbr/\\\\u003e騰訊控股－Ｒ\\\",\\\"TITLE\\\":\\\"截至二零二五年九月三十日止三個月及九個月業績公佈\\\",\\\"FILE_TYPE\\\":\\\"PDF\\\",\\\"DATE_TIME\\\":\\\"13/11/2025 16:30\\\",\\\"LONG_TEXT\\\":\\\"公告及通告 - [季度業績]\\\",\\\"STOCK_CODE\\\":\\\"00700\\\\u003cbr/\\\\u003e80700\\\",\\\"FILE_LINK\\\":\\\"/listedco/listconews/sehk/2025/1113/2025111300287_c.pdf\\\"}]\",\"hasNextRow\":false,\"sortList\":\"[[0,0]]\",\"rowRange\":100,\"lang\":\"C\",\"loadedRecord\":1,\"recordCnt\":1}",
+  "raw_json_response": {
+    "result": "[{\"FILE_INFO\":\"936KB\",\"NEWS_ID\":\"11914784\",\"SHORT_TEXT\":\"公告及通告 - [季度業績]\\u003cbr/\\u003e\",\"TOTAL_COUNT\":\"1\",\"DOD_WEB_PATH\":\"\",\"STOCK_NAME\":\"騰訊控股\\u003cbr/\\u003e騰訊控股－Ｒ\",\"TITLE\":\"截至二零二五年九月三十日止三個月及九個月業績公佈\",\"FILE_TYPE\":\"PDF\",\"DATE_TIME\":\"13/11/2025 16:30\",\"LONG_TEXT\":\"公告及通告 - [季度業績]\",\"STOCK_CODE\":\"00700\\u003cbr/\\u003e80700\",\"FILE_LINK\":\"/listedco/listconews/sehk/2025/1113/2025111300287_c.pdf\"}]",
+    "hasNextRow": false,
+    "sortList": "[[0,0]]",
+    "rowRange": 100,
+    "lang": "C",
+    "loadedRecord": 1,
+    "recordCnt": 1
+  },
+  "capture_tool": "httpx public GET; trust_env=False; no cookies/auth/proxy credentials or headers retained",
+  "observed_result_rows": 1,
+  "provisional_company_scope": "stockId7609 from existing official 0700 protocol fixture; raw STOCK_CODE requires owner validation"
+}

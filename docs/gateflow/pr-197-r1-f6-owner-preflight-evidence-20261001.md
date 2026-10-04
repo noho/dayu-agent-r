@@ -1,0 +1,19 @@
+# F6 计划前 owner 边界取证
+
+时间：2026-10-01 09:15:02。仅只读取证，无新产品/schema选择，不扩已确认F6 goal；现成用户裁决优先。
+
+## 已核真实链
+
+- storage SourceIntegrityRevisionConflictError在source_integrity.py:211表达PhaseA/staged target publication identity不匹配；workflow cn_download_workflow.py:412把post_repair单个仍待repair分类冒称同冲突，实际新损坏与真实churn必须先在产生层分开，不能runtime按文案分类。
+- workflow mid-filing宽except Exception (:380)目前将RevisionConflict普通逐文档failed后继续；post-repairtyped分支(:413)则保cause/已处理snapshot中止。计划需逐行核phase/retry真正抛点与summary守恒，不只补runtimeisinstance。
+- ingestion_runtime.py:6925 public失败owner仅SourceIntegrityPreflightError专门映射封闭reason，RevisionConflict落genericEXECUTION，原因/提示需要同真源区分。
+- ingestion_runtime.py:4996 typedjob先用同public失败owner产生failure，但:5030仅传safe_message/resultsummary给_save_failed；:5980的_save_failed当前durablefailure_summary只有message。结构化kind/reason/retry_hint未保存是既已登记fins-download-job-reason-code-persistence的schema议题，不凭上述事实偷偷塞extra或反推字符串。
+- 重要读者边界：dayu/service/fins_wait_adapter.py:poll_wait通过FinsObservationRuntime.poll_observation读取lightweight observation，不读durablejob record（模块及class文档/真实调用一致）。CLI/direct/LLMwait可共享direct publicfailure；不能用“wait读取durablejob”的错误假设推导当前F6必须新增job schema。
+
+## 对后续plan的要求
+
+先明确F6在既有后台公开表达中如何保全同事实安全message/摘要、direct与observationwait完整publicreason/hint；后台structuredreason存取若确为目标必要，给真实缺口与原独立WU依赖交总控，不改#198不顺带schema。禁止把此取证当新schema已批准或F6已planpass，不发明字段/fallback/两真源。F4共享源码仍writer互斥；后续F6plan应在稳定当前源码快照读现成字段/状态机。
+
+根取证曾使用猜测job_models.py/job_repository.py/service/fins.py/tools/wait.py和zsh未匹配glob而读取失败，均未作为证据或得出不存在/通过结论；已用rg定位真源ingestion_runtime.py及fins_wait_adapter.py并读实际定义恢复。无provider派发失败、无产品代码改动。job记录模型2014字面fields、_save_failed5980真实单message对象、typed保存4996/5030同链，避免上下文压缩后误把job与observationwait等同。
+
+当前状态：F6待plan，jobreason独立候选待goal；分类assigned to对应既有WU。本文是依赖/owner证据，不增加repairfinding或实施权限。已确认的F6 source/public问题仍未修。

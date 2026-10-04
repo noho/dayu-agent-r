@@ -514,10 +514,18 @@ def _cancelled_outcome(tool_name: str, snapshot: FinsObservationSnapshot) -> Res
     :raises ValueError: outcome 字段非法时由底层契约抛出。
     """
 
+    result = _required_result(snapshot)
+    message = wait_cancelled_message()
+    if result.download is not None:
+        message = json.dumps({
+            "operation": snapshot.handle.operation_kind.value, "status": result.status.value,
+            "title": result.title, "download": result.download.to_json_value(),
+            "scope_note": _DOWNLOAD_FAILURE_SCOPE_MESSAGE,
+        }, ensure_ascii=False, sort_keys=True)
     return ResolveWaitCancelledOutcome(
         result=ToolCancelledOutcome(
             reason=TOOL_CANCELLED_REASON_HOST_CANCELLED,
-            message=wait_cancelled_message(),
+            message=message,
             hint=wait_cancelled_hint(),
             meta=_result_meta(tool_name, snapshot),
         ),
@@ -589,12 +597,20 @@ def _completed_result_value(
     return value
 
 
+_DOWNLOAD_FAILURE_SCOPE_MESSAGE = "文档计数统计已确认处理，未知报告单列；整体状态不撤销已发布文档。"
+
+
 def _failure_message(result: FinsResultSummary) -> str:
     """提取模型可读失败说明。
 
-    :param result: terminal result summary。
-    :returns: 非空失败说明。
-    :raises ValueError: failed result 缺少业务可读失败说明时抛出。
+    Args:
+        result: 已验证的 Fins 终态摘要。
+
+    Returns:
+        非空的业务可读失败说明。
+
+    Raises:
+        ValueError: 下载失败缺少文档摘要，或结果缺少业务可读失败说明时抛出。
     """
 
     if result.failure is not None:
@@ -607,6 +623,7 @@ def _failure_message(result: FinsResultSummary) -> str:
                 "title": result.title,
                 "download": result.download.to_json_value(),
                 "failure": result.failure.to_json_value(),
+                "scope_note": _DOWNLOAD_FAILURE_SCOPE_MESSAGE,
             },
             ensure_ascii=False,
             sort_keys=True,

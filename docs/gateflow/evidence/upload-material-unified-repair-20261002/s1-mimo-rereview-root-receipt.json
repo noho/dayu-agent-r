@@ -1,0 +1,74 @@
+{
+  "setup_status": "ok",
+  "agent_status": "completed",
+  "tool_evidence": "yes",
+  "tool_trace": "complete",
+  "required_evidence": "complete",
+  "canary_status": "match",
+  "result_status": "accepted",
+  "warnings": [
+    {
+      "tool_indexes": [
+        8,
+        31
+      ],
+      "classification": "Optional .claude/rules absent compound1; actualRead AGENTS31 succeeded. Author no-other-nonzero omitted this warning; root records."
+    },
+    {
+      "tool_indexes": [
+        78
+      ],
+      "classification": "Process substitution /dev/fd denied; same command direct diff recovered stale/final delta. Diff1 expected."
+    },
+    {
+      "tool_indexes": [
+        97,
+        98
+      ],
+      "classification": "First counterexample command substitution dropped trailing LF and did not test target; original retained, correct ANSI-C raw LF separate freshdir gives gen0/shn0."
+    },
+    {
+      "classification": "stderr exact unrecognized_model allowed; actual init mimo-v2.6-pro[1m]. Temp Write automatic import diagnostics are not product pyright failure or technical-script type pass; runtime probe actual96 passed. No technical-script type-pass claimed."
+    },
+    {
+      "tool_indexes": [
+        107
+      ],
+      "classification": "New exclusive report filename ls not-found is expected collision check."
+    },
+    {
+      "classification": "Root preliminary audit incorrectly required canary Read tool; actual Bash cat tool0/output exact byte match suffices. Audit failed before mutations; recovered here."
+    }
+  ],
+  "evidence_gaps": [],
+  "retry_class": "none",
+  "runtime": "claude",
+  "provider": "mimo",
+  "model": "mimo-v2.6-pro[1m]",
+  "label": "upload-material-unified-s1-rereview-mimo-20261002-01",
+  "outer_exit": 0,
+  "outer_exit_source": "managed write_stdin9296 returned0 in current turn",
+  "structured_events": 9829,
+  "tools": 112,
+  "num_turns": 113,
+  "canary_actual_tool_indexes": [
+    0
+  ],
+  "review_artifact": "docs/reviews/code-review-20261002-225937.md",
+  "review_sha256": "bc856b3cd8fb9a43861306d4995c9b78d45039975f7e5029e994489e5638859e",
+  "frozen_files": 9704,
+  "frozen_drift": [],
+  "findings": {
+    "US1-R01": "已修复",
+    "US1-R02": "已修复",
+    "US1-T01": "回归保持",
+    "MiMo new1": "US1-R03 accepted/未修复"
+  },
+  "independent_root_rechecks": [
+    "Actual raw form helper/caller/regeneration docs337-382/454-495/1212-1238",
+    "9704frozen allzero",
+    "86delivery/93hash/18exits/19coverage/broad2178-0-0-3/fulltype0 same-version root recomputed DS receipt",
+    "Actual tool96probe14pass/98CLIgen0shn0/99pytest11pass0 and rawfiles checked"
+  ],
+  "decision": "Evidence accepted; S1 not pass until R03 fix and dual exact-delta re-review."
+}

@@ -24,9 +24,9 @@
 
 ## 1. 安装
 
-项目默认和依赖锁定环境是 Python 3.11。Docling 模型栈统一约束为
-`transformers>=4.57.6,<5.0.0`；不要在受控约束上另行升级到 Transformers 5.x，
-否则使用 `torch 2.2.x` 的 macOS Intel 环境无法运行 Docling。
+项目默认和依赖锁定环境是 Python 3.11；macOS 需要 14 及以上版本。Docling 模型栈
+（docling / torch / transformers）的版本组合由平台约束文件锁定并经过验证，
+不要另行升降这些依赖。
 
 ### 1.1 从源码安装
 
@@ -39,7 +39,7 @@ python -m pip install -e ".[test,dev,browser]" \
 
 按平台替换约束文件：
 
-- macOS Intel：`constraints/lock-macos-x64-py311.txt`
+- macOS Apple Silicon：`constraints/lock-macos-arm64-py311.txt`
 - Linux x64：`constraints/lock-linux-x64-py311.txt`
 - Windows x64：`constraints/lock-windows-x64-py311.txt`
 
@@ -175,9 +175,14 @@ dayu-cli <command> --help
 | `--debug-stream` | 额外打开高频 stream/SSE 诊断，不改变普通日志等级；不可与 `quiet` 组合 |
 | `--log-file PATH` | 把诊断日志追加写入指定文件；可与任意合法日志等级选择组合 |
 
+普通 CLI 命令的 `--base` 若指向已有目标，该目标须是目录；指向普通文件时会提示改用目录并以用法错误 `2` 退出。`upload_material` 等直接财报命令可使用指向目录的符号链接。`init` 对符号链接另有禁止规则。
+
 `--log-level` 和所有日志等级快捷参数彼此互斥，一次调用只能选择其中一个。
 `--debug-stream` 可以单独使用，也可以与 `debug`、`verbose`、`info`、`warn` / `warning`、
 `error` 或 `critical` 组合。
+
+财报转换器的诊断也遵循这些日志参数；`--quiet` 关闭诊断，仍保留业务进度和终态。
+没有可信源等级的原生转换诊断按 `info` 留存，选择 `warning` 或更高等级时不留存这类诊断。
 
 用户可见回答和进度仍写 stdout/stderr。未传 `--log-file` 时，诊断日志只保留到
 当前 CLI 进程结束；需要排障留档时必须显式指定路径：
@@ -189,6 +194,10 @@ dayu-cli prompt "总结主要风险" --ticker AAPL \
 
 `--log-file` 不会创建缺失的父目录；请先创建父目录。父目录不存在或目标无法打开时，
 CLI 会显示可操作的错误并退出 `1`，不会开始本次分析。
+
+下载、上传或预处理等财报命令遇到外层未知内部错误时，stderr 会显示固定提示
+`命令执行失败，请使用 --log-file PATH 重试并查看日志`。按提示为 `PATH` 选择可写文件，
+重新执行命令即可留存运行日志。
 
 ## 4. 问答与交互
 
@@ -275,6 +284,48 @@ export SEC_USER_AGENT="Your Organization contact@example.com"
 重建下载元数据和 manifest，不发送数据提供方请求，也不新增、删除或替换源文档内容。
 两者是互斥模式，不能在同一命令中同时使用。
 
+巨潮同财期报告先按修订标记和公告日期选择；两者相同时，完整报告优先于“报告正文”，
+只有正文时仍保留该来源。已缓存的正文可能拥有完整的本地文件，因此普通增量仍会跳过；
+需要重新获取选中的完整报告时，对目标公司和披露窗口执行一次覆盖下载，例如：
+
+```bash
+dayu-cli download --base /path/to/workspace --ticker 000333 --forms Q1 --start 2021-04-29 --end 2021-04-30 --overwrite
+```
+
+完成后去掉 `--overwrite` 再运行应跳过。`--rebuild` 不会下载缺失的完整报告。
+下载成功表示文件已获取，分析所需财务原表是否齐全仍需核对报告内容。
+
+SEC 的 8-K 下载包含同一披露下识别到的 EX-99 HTML 附件。已有完整封面缓存不会在普通
+增量下载时重新检查附件；升级后需对受影响的公司、表单和披露日执行一次 `--overwrite`，例如：
+
+```bash
+dayu-cli download --base /path/to/workspace --ticker MSFT --forms 8-K --start 2025-07-30 --end 2025-07-30 --overwrite
+```
+
+该命令会重新获取所选披露的文件并更新登记，随后去掉 `--overwrite` 再运行应显示增量跳过。
+修正分类规则后，历史被拒的 6-K 也用这一方式重新下载并接受分类检查；`--rebuild` 不能补远端
+附件，也不能将被拒文件变成正式来源。当前下载筛选粒度是公司、表单和披露日，没有按文档 ID
+筛选的下载参数；同日存在多份匹配披露时会一起处理。
+
+港股已有季度识别错误时，使用本地重建重新核定财期，例如：
+
+```bash
+dayu-cli download --base /path/to/workspace --ticker 3690 --forms Q1 Q3 --start 2024-11-01 --end 2025-11-30 --rebuild
+```
+
+范围按披露日期和纠正前或纠正后的财期筛选。重建会使用同公司本地公告标题中的明确季度、
+截止日及邻近年度截止日，同步文档元数据与索引，保留文档 ID、正文和内容 hash。
+第二次执行应显示跳过且不再修改文档。下载和重建会先合并同公司可信本地年度截止日与本次取得的年度公告；
+依据不足或冲突的报告单列为“未知报告”，显示真实来源引用、已确认日期和说明，不猜其财年/财期。
+下载结果中的文档 ID、来源引用和既有文档 ID 用带引号的 JSON 字符串显示，特殊字符及 Unicode
+使用转义表示；JSON 解码可还原完整引用，缺失的既有文档 ID 显示为 `-`。
+已确认的报告继续处理；存在未知报告时整次命令退出码为 `1`，已发布文档保留。摘要中的
+`uncertain` 是未知总数，`omitted_uncertain` 是列表未展示的未知数，与已确认文档省略数分开。
+未知不表示报告未发现，重建也不会把旧季度标签当成本次确认事实或修改该报告原数据。
+仅“三个月”和九月末日期不足以判定财年 Q3。若缺少年度依据，可先通过 Dayu 下载对应
+年度业绩（`--forms Q4`，选择覆盖该年度业绩披露的日期范围），再执行重建。
+普通增量下载发现本地财期与来源识别不一致时会提示重建；它不会自动更改已有财期。
+
 未传 `--forms` 时，CN 默认请求 `FY H1 Q1 Q3`；HK 的必需基线是 `FY H1`，同时会发现
 来源实际披露的 Q1～Q4 可选业绩材料。缺失期间只针对当前市场适用的必需基线计算：例如
 HK 的中期业绩可显示覆盖 H1，但不能代替独立中期报告消除 H1 missing；末期业绩同样不能
@@ -283,8 +334,16 @@ HK 的中期业绩可显示覆盖 H1，但不能代替独立中期报告消除 H
 下载、上传和预处理命令会显示执行进度及最终摘要。下载摘要包含规范 ticker、实际表单与
 日期窗口、overwrite/rebuild 状态，以及发现、下载、跳过、拒绝、失败和缺失期间信息；
 每个下载文档行还会显示来源声明的 `covered_fiscal_periods` 数组。
+工作区来源目录中的 `.DS_Store` 等点号普通文件和 `.claude` 等不含链接或特殊文件的点号目录会被忽略。
+下载显示 `classification="storage"`、`reason_code="unsafe_publication"` 时，请检查工作区来源状态并修复后重试；重复下载不会自行修复。
+显示 `reason_code="source_revision_conflict"` 时，请等待其它来源写入完成后重新下载；持续失败时检查并发写入。显示 `reason_code="source_repair_required"` 时，请先检查并修复工作区来源状态，再重新下载，避免仅按并发冲突反复重试。失败输出中的文档摘要保留本次已经处理的结果，整体失败不表示先前成功文档丢失。
+下载失败详情显示 `classification="execution"` 时，详情后还会出现 §3.1 的
+`--log-file PATH` 提示；按该节选择可写文件并重新执行，可留存运行日志。并非每次此类
+失败都会产生未知异常诊断。下载未知异常的安全诊断只提供脱敏类型标签与有界的包内
+调用位置，不含原始异常消息或路径；其它普通运行日志仍可能包含用户路径。
 下载期间按下 `Ctrl-C` 会请求协作取消并等待当前操作收口；取消终态使用规范退出码
-`130`，不会用内部取消原因替代用户可见摘要。财报保存在
+`130`，不会用内部取消原因替代用户可见摘要。取消时仍展示本次已确认处理和未知报告摘要，
+已发布的文档保留。财报保存在
 `<workspace>/portfolio/<规范 ticker>/`，例如 AAPL 对应
 `workspace/portfolio/AAPL/`。
 
@@ -313,6 +372,7 @@ dayu-cli upload_material \
   --action create \
   --forms 10-K \
   --material-name "Investor Day" \
+  --company-name "Apple Inc." \
   --files ./investor-day.pdf
 ```
 
@@ -322,6 +382,22 @@ dayu-cli upload_material \
 dayu-cli upload_filing --help
 dayu-cli upload_material --help
 ```
+
+上传材料时，`.json` 仅是 Docling 格式的 JSON 文档候选，`.xml/.xbrl` 仅是
+XBRL 财报实例文档候选；后缀符合要求不保证文件内容转换成功。XBRL 转换当前仅在 macOS arm64 / Python 3.11 完成受控部署验证，其它平台尚未提供受控转换。当前支持的后缀清单
+以 `dayu-cli upload_material --help` 的即时输出为准。
+
+XBRL 转换前，管理员必须准备工作区外的可信 taxonomy 源目录、完整清单和配置，并设置 `DAYU_XBRL_CONFIG` 为配置 JSON 的绝对路径。程序按请求生成 taxonomy 快照；用户原件按上传合同进入本次请求独占的只读副本，不要求原件位于工作区外。例如：
+
+```bash
+export DAYU_XBRL_CONFIG=/private/tmp/dayu-xbrl-admin/config.json
+```
+
+配置恰含三个字段：`taxonomy_root`（taxonomy 目录绝对路径）、`manifest_path`（该目录之外的清单文件绝对路径）、`manifest_sha256`（清单原始字节的 64 位小写 SHA-256）。配置及清单同样必须在工作区外；路径不得含符号链接，文件及目录不得允许组或其他用户写入。程序不会从 HOME 或原件旁边猜测配置。
+
+清单恰含 `source_urls`（非空 HTTPS 来源列表）、`acquired_at`（带 UTC 时区的获取时间）、`license_urls`（非空 HTTPS 许可来源列表）和 `files`（非空完整文件列表）。每个文件声明 `relative_path`（不越界的相对路径）、`size_bytes`（非负整数字节数）、`sha256`（64 位小写摘要）、`archive_entries`；非 ZIP 的 `archive_entries` 必须为 `null`，ZIP 必须列出全部成员，每项恰含 `relative_path`、`size_bytes`、`sha256`，目录成员使用零字节及空内容摘要。目录中的文件及目录条目必须全部由这些声明覆盖。管理员应保留逐可信 URL、UTC、许可及文件摘要的来源记录，程序不自动下载 taxonomy。
+
+上传时只复制清单声明的 taxonomy 到请求独占快照，复验后再启动受控转换。已安装运行库及其中公开 XSD 可以只读访问；其它私有文件内容及出站网络被策略禁止，输出只写请求独占目录。未配置、清单/摘要不匹配或隔离启动失败会导致转换初始化失败，不会回退到普通转换器；转换失败或发布前取消不会提交部分材料。taxonomy 不会作为材料附件进入仓储。
 
 `upload_filing --files` 声明同一 filing 的文件集合，文件顺序不决定主文件角色。单文件
 filing 可以省略 `--primary`，省略时唯一文件就是 primary；多文件 filing 必须恰好提供
@@ -341,24 +417,44 @@ files 集合内；文件数超过 100；或 `delete` 携带 `--files` / `--prima
 
 `upload_filing` 与 `upload_material` 都会在上传任务启动前校验 `--ticker` 的逗号分隔值：首项必须是公司的规范主代码，后续项是用户声明、用于查询同一家公司归档的别名；每一项都必须符合支持市场的 ticker 写法，后续别名最多 100 个。ticker 写法非法或别名超过数量限制时，命令会作为用法错误输出一行具体原因并退出 `2`，不会创建上传任务或发布文件。
 
-`upload_filing` 还会在任务启动前校验文件与当前目标状态。文件解析、存储或执行失败会输出脱敏的可操作原因并退出 `1`；filing 的公司信息与文档内容只会一起发布，失败时不会留下只发布一半的结果。已有且仍新鲜的公司信息不会被单次 filing 上传改名；若本次填写的公司名称未被采用，命令仍按成功或跳过结果退出 `0`，stdout 摘要保持不变，并在 stderr 提示核对上传目标公司。上传成功后，使用主代码或任一已接收别名查询都会进入同一家公司归档；合法的新别名即使 filing 内容因完全相同而跳过，也会与公司信息原子保存。不要重复列出只是写法不同但含义相同的代码。若某个别名已属于工作区中的另一家公司，本次上传会在发布任何文件前拒绝，并提示移除冲突别名后重试。
+`upload_material` 每次可上传 1 到 100 个文件，全部文件都需要可转换。上传开始前会拒绝重复路径、重复文件名、与转换结果或工作区控制文件冲突的文件名，以及无法安全解析或保存的文件名，作为用法错误退出 `2`。同名主体但后缀不同的文件，例如 `deck.txt` 与 `deck.md`，可以一起上传；转换结果分别保存为 `deck.txt_docling.json` 与 `deck.md_docling.json`。文件内容能否转换仍以实际转换结果为准。
+同一批输入同时有文件名问题和不支持的后缀时，命令会先提示文件名问题，便于先修正可能影响工作区文件的名称。
+
+`upload_material` 的每个动作都必须提供非空 `--forms` 和 `--material-name`。类型去首尾空白并转大写；名称去首尾空白后最多 240 个 Unicode 码点。可选 `--fiscal-year` 只接受 1800..2100 的整数，`--fiscal-period` 只接受 FY、H1、Q1、Q2、Q3、Q4，两者可独立省略。`--document-id` 仅校验与这些字段生成的身份一致，不能覆盖身份；不接受内部文档 ID 参数。
+
+单文件材料可省略 `--primary`，多文件材料必须恰好指定一个 `--primary`，其路径必须精确匹配 `--files` 中的路径，不能只填文件名。全部文件转换成功并提交后才算上传成功；后续默认读取所选主文件。`upload_material --action delete` 必须省略 `--files` 和 `--primary`，携带时在访问路径前作为用法错误退出 `2`；删除摘要的文件数为 `0`。
+
+再次删除已逻辑删除且完整的材料，会保留当前删除时间、内容版本、清单和文件。若已有材料或清单损坏，重复删除会失败；请先排查损坏原因。
+
+如果 `upload_material --files` 路径解析遇到符号链接循环，会作为操作失败退出 `1`；`--primary` 路径无法解析则作为用法错误退出 `2`。两者均不会启动上传任务；请检查对应路径指向的链接。
+
+`upload_filing` 还会在任务启动前校验文件与当前目标状态。无法展开的用户目录、非法路径文本或不存在的文件会以安全文件标签提示并按用法错误退出 `2`；存储或执行失败会输出脱敏原因并退出 `1`。filing 的公司信息与文档内容只会一起发布，失败时不会留下只发布一半的结果。已有且仍新鲜的公司信息不会被单次 filing 上传改名；若本次填写的公司名称未被采用，命令仍按成功或跳过结果退出 `0`，stdout 摘要保持不变，并在 stderr 提示核对上传目标公司。上传成功后，使用主代码或任一已接收别名查询都会进入同一家公司归档；合法的新别名即使 filing 内容因完全相同而跳过，也会与公司信息原子保存。不要重复列出只是写法不同但含义相同的代码。若某个别名已属于工作区中的另一家公司，本次上传会在发布任何文件前拒绝，并提示移除冲突别名后重试。
 
 直接调用 `upload_filing` 或通过 `start_fins_upload` 工具上传 filing 时，`fiscal_year`
 必须是 `1000..9999` 的整数；`fiscal_period` 只接受 `FY`、`H1`、`Q1`、`Q2`、`Q3`、
 `Q4`，输入会忽略首尾空白并统一为大写，US、CN、HK 使用同一规则。CLI 收到其它值时
 会输出一行具体原因并以用法错误 `2` 退出；这两个入口都会在创建上传操作或改动 workspace
-前拒绝非法值。可选的 `filing_date` 与 `report_date` 若填写，必须是实际
-存在、月日补零且无首尾空白的 `YYYY-MM-DD`，完整日期年份允许 `0001..9999`。空串、
-纯空白、非补零日期和不存在的月日都会在运行期或上传任务创建前拒绝。该严格原始输入
-承诺只适用于这两个直接 filing 入口，不覆盖 `upload_filings_from` 的扫描与脚本生成元数据
-处理。
+前拒绝非法值。直接上传 filing 或 material 时，可选的 `filing_date` 与 `report_date`
+若提供非空日期，必须是实际存在、月日补零且无首尾空白的 `YYYY-MM-DD`，完整日期年份
+允许 `0001..9999`。非补零日期、不存在的月日，以及带首尾空白的非空日期会作为用法错误
+在上传任务启动前拒绝。CLI 的 `upload_filing` 两个日期参数若传入空串或纯空白，也会作为
+用法错误拒绝；工具调用中的空串和纯空白日期同样会拒绝。
 
-上传终态摘要中的 `requested files` 是本次已校验的输入文件数，`stored files` 是本次成功发布的原始文件数；Docling 派生文件不重复计数。空文件、任一原始文件读取失败，或 filing primary / material 任一需要转换的文件内容无法成功转换时，整批上传失败且 `stored files` 为 `0`，不会把先处理成功的文件计为已保存；filing 失败时也不会回退为只保存原文件或 companions。stderr 会同时显示触发失败的文件名和有界原因。若 direct 命令遇到无法归入这些已知原因的内部异常，普通 stderr 只显示 `命令执行失败，请使用 --log-file PATH 重试并查看日志`；按提示为 `PATH` 选择可写文件并重新执行命令，即可在该文件中保留完整诊断。
+CLI 的 `upload_material` 当前会将两个日期参数的空串或纯空白视为未提供。其中
+`--filing-date ""` 保持既有支持，表示未提供披露日期，保存时为 `null`；若要省略
+`--report-date` 或使用纯空白输入的日期，请直接不传对应参数。
+`upload_filings_from` 的扫描与脚本生成元数据处理不属于该直接上传日期承诺。
+
+上传终态摘要中的 `requested files` 是本次已校验的输入文件数，`stored files` 是本次成功发布的原始文件数；Docling 派生文件不重复计数。空文件、任一原始文件读取失败，或 filing primary / material 任一需要转换的文件内容无法成功转换时，整批上传失败且 `stored files` 为 `0`，不会把先处理成功的文件计为已保存；filing 失败时也不会回退为只保存原文件或 companions。stderr 会同时显示触发失败的文件名和有界原因。
 
 三个上传命令的 `--action` 默认都是 `auto`。单份上传还可显式使用
 `create`、`update` 或 `delete`；批量脚本只会生成 `auto`、`create` 或 `update`。
 
 `update` 只更新已经存在的同一 filing identity；目标不存在时即使同时传入 `--overwrite` 也会拒绝，请改用 `create`。`--overwrite` 不是 upsert 开关，只允许覆盖已存在的 create 目标或强制重建已存在目标。`auto` 遇到已逻辑删除的目标会执行 update 并恢复为 active，不会因输入内容相同而跳过；若本地目标已损坏但仍能由本次完整输入安全重建，`auto` 会原子替换全部原始文件和 Docling 文件并恢复完整索引。此类目标若显式使用 `create`、`update` 或 `delete` 会失败，并提示改用 `auto` 提供完整文件；无法确认身份或无法安全重建的本地状态也会在发布前失败，并提示先修复工作区。existing update 或安全重建后旧文件名不会残留，失败或发布前取消仍保留完整旧集合。
+
+材料的 `update`（含 `--overwrite`）与 `delete` 要求同一材料身份已有目标；首次上传需提供公司名称，已有当前公司信息时可以省略。active 材料显式 `create` 且未传 `--overwrite` 会拒绝；损坏或待修复的材料会在任务启动前拒绝，请先修复工作区。删除后的材料可用 `auto` 或 `update` 恢复，同内容保留内容版本，换内容才升版；健康目标重复删除不改动已发布内容或时间。
+
+材料内容相同、修订标记也相同时，非覆盖上传显示 `skipped`；仅修订标记变化显示 `metadata_updated`，`stored files` 为 `0`，不重新转换或升内容版。`--overwrite` 会强制重新转换，内容版本仍由内容是否变化决定。材料摘要的 `published amended` 是本次完成后的实际修订标记，失败或取消结果为 `null`；删除请求即使省略 `--amended`，也会显示已发布材料保留的标记。两份相同自动上传同时竞争时，完整发布后另一份可验证跳过；内容、主源角色或公司事实漂移会失败。
 
 上传期间第一次按下 `Ctrl-C` 只会请求一次协作取消，命令会继续等待并展示上传运行期给出的最终结果。若取消在文档发布前生效，最终显示 cancelled 并退出 `130`，不会先显示 completed；若文档发布或确定的跳过/删除结果已经完成，随后到达的 `Ctrl-C` 不会把该结果改写为 cancelled，也不会回滚已发布内容。
 
@@ -541,6 +637,14 @@ FIRST/RESET 的配置已经发布成功，warning 只表示本进程未完成两
 
 这是当前设计：未传 `--log-file` 的诊断流在进程结束时自动清理。重现问题时加上
 `--debug --log-file <path>`；排查高频流式链路时改用 `--debug-stream`。
+
+### 升级依赖后 Docling 报导入或初始化错误
+
+不要在已有 `.venv` 里就地升级 Docling 依赖：Docling 2.127 起代码拆分到 `docling-slim`
+包，就地升级时旧包卸载会连带删除新装文件，使 `docling` 导入残缺，上传或预处理时报
+Docling 初始化失败。解决方法是删除 `.venv` 后按第 1.1 节重新创建并安装；若必须就地
+修复，可在升级后执行
+`python -m pip install --force-reinstall --no-deps -c constraints/lock-<平台>-py311.txt docling-slim`。
 
 ### 批量上传脚本没有生成
 

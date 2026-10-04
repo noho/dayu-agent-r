@@ -23,7 +23,7 @@ from dayu.fins.domain.company_meta_contract import (
     build_company_meta_commit_intent,
 )
 from dayu.fins.domain.document_models import BatchToken, CompanyMeta
-from dayu.fins.pipelines.upload_company_meta import RESOLVER_VERSION, stage_company_meta_for_upload
+from dayu.fins.pipelines.upload_company_meta import RESOLVER_VERSION, stage_upload_company_meta_decision, resolve_upload_company_meta_decision
 from dayu.fins.storage import (
     CompanyTickerAliasConflictError,
     CompanyTickerIdentityCorruptionError,
@@ -1864,14 +1864,7 @@ def _commit_upload_alias_in_process(
             return
         batching, company, _ = _build_repositories(workspace_root)
         batch = batching.begin_batch("DELTA")
-        stage_company_meta_for_upload(
-            repository=company,
-            ticker="DELTA",
-            action="update",
-            company_name="Delta Inc.",
-            ticker_aliases=(alias,),
-            batch=batch,
-        )
+        stage_upload_company_meta_decision(repository=company, decision=resolve_upload_company_meta_decision(existing_meta=company.get_company_meta("DELTA"), ticker="DELTA", action="update", company_name="Delta Inc.", ticker_aliases=(alias,)), batch=batch)
         batching.commit_batch(batch)
         connection.send("ok")
     except Exception as exc:

@@ -1,0 +1,161 @@
+{
+  "label": "upload-material-unified-formal-pr-rereview-ds-flash-20261003-01",
+  "outer_exit": 0,
+  "structured_events": 61394,
+  "terminal": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 50
+  },
+  "actual_models": [
+    "deepseek-flash"
+  ],
+  "tools": {
+    "Read": 31,
+    "Bash": 17,
+    "Write": 1
+  },
+  "tool_results": 49,
+  "tool_is_error": [],
+  "canary_match": true,
+  "freeze_count": 21,
+  "freeze_current_match": true,
+  "coverage": {
+    "utils/ab_ocr_convert.py": {
+      "lines": 156,
+      "matched": 156,
+      "missing": [],
+      "mismatch": [],
+      "Read_virtual_trailing_blank": [
+        157
+      ]
+    },
+    "utils/build_semantic_sample_list.py": {
+      "lines": 150,
+      "matched": 150,
+      "missing": [],
+      "mismatch": [],
+      "Read_virtual_trailing_blank": [
+        151
+      ]
+    },
+    "utils/diagnose_semantic_digests.py": {
+      "lines": 277,
+      "matched": 277,
+      "missing": [],
+      "mismatch": [],
+      "Read_virtual_trailing_blank": [
+        278
+      ]
+    },
+    "utils/inspect_semantic_digests.py": {
+      "lines": 143,
+      "matched": 143,
+      "missing": [],
+      "mismatch": [],
+      "Read_virtual_trailing_blank": [
+        144
+      ]
+    },
+    "utils/pptx_docx_smoke.py": {
+      "lines": 355,
+      "matched": 355,
+      "missing": [],
+      "mismatch": [],
+      "Read_virtual_trailing_blank": [
+        356
+      ]
+    },
+    "utils/trace_missing_tokens.py": {
+      "lines": 97,
+      "matched": 97,
+      "missing": [],
+      "mismatch": [],
+      "Read_virtual_trailing_blank": [
+        98
+      ]
+    },
+    "utils/build_semantic_digests.py": {
+      "lines": 537,
+      "matched": 537,
+      "missing": [],
+      "mismatch": [],
+      "Read_virtual_trailing_blank": [
+        538
+      ]
+    },
+    "utils/docling_schema_regression.py": {
+      "lines": 307,
+      "matched": 307,
+      "missing": [],
+      "mismatch": [],
+      "Read_virtual_trailing_blank": [
+        308
+      ]
+    },
+    "workspace/tmp/upload-material-unified-repair-20261002/formal-pr-review-01/fix-delta.diff": {
+      "lines": 491,
+      "matched": 491,
+      "missing": [],
+      "mismatch": [],
+      "Read_virtual_trailing_blank": [
+        492
+      ]
+    }
+  },
+  "report_sha256": "828e54634b8e3fc73b309c66255f24387a5ea73bf5952d945121f099e9463fe3",
+  "own_summary_sha256": "8e65a0c37807c140c07d4a3e77a86837a21ceff6dd76378b657a3e38483a1e68",
+  "backups": [
+    {
+      "directory": "workspace/tmp/upload-material-unified-repair-20261002/formal-pr-review-01/runner-backups/upload-material-unified-formal-pr-rereview-ds-flash-20261003-01",
+      "files": {
+        "upload-material-unified-formal-pr-rereview-ds-flash-20261003-01.stderr": "af2f4f95914df9c684b8c6d9f07bfa793cb3ed8a4c9f15c3022ee6363d84537e",
+        "prompt.txt": "bbeeea697dedf1038c622b805eee5a94068e8111321b51287899de8e9346fcf9",
+        "canary.expected": "cf28483b18e4e040d34047b70565291f20bd90b715c6840809ccd8c9da32833b",
+        "upload-material-unified-formal-pr-rereview-ds-flash-20261003-01.jsonl": "0517d33090736af94b4bf2d1cb4a38c7d5edabfdba933dfd594e02b95b19f185",
+        "canary.txt": "cf28483b18e4e040d34047b70565291f20bd90b715c6840809ccd8c9da32833b"
+      }
+    },
+    {
+      "directory": "workspace/tmp/upload-material-unified-repair-20261002/formal-pr-review-01/runner-backups-secondary/upload-material-unified-formal-pr-rereview-ds-flash-20261003-01",
+      "files": {
+        "upload-material-unified-formal-pr-rereview-ds-flash-20261003-01.stderr": "af2f4f95914df9c684b8c6d9f07bfa793cb3ed8a4c9f15c3022ee6363d84537e",
+        "prompt.txt": "bbeeea697dedf1038c622b805eee5a94068e8111321b51287899de8e9346fcf9",
+        "canary.expected": "cf28483b18e4e040d34047b70565291f20bd90b715c6840809ccd8c9da32833b",
+        "upload-material-unified-formal-pr-rereview-ds-flash-20261003-01.jsonl": "0517d33090736af94b4bf2d1cb4a38c7d5edabfdba933dfd594e02b95b19f185",
+        "canary.txt": "cf28483b18e4e040d34047b70565291f20bd90b715c6840809ccd8c9da32833b"
+      }
+    }
+  ],
+  "trace": "workspace/tmp/upload-material-unified-repair-20261002/formal-pr-review-01/root-audit/rereview-ds-flash-full-trace.json",
+  "trace_sha256": "336c51ab24d76f57931410cea7898a60c844ef7b15196cb3d1d217239759a20a",
+  "result_status": "partially-accepted",
+  "accepted": [
+    "R01/R02 fixed",
+    "no new substantive finding",
+    "491 lines and 8 sources actual full Read",
+    "same-source actual pyright receipts"
+  ],
+  "rejected_claims": [
+    "only own tmp written: git diff successfully wrote /tmp/claude-501/git-delta-actual.diff",
+    "all governance/source backups full text read: some only hashed/listed",
+    "all failed commands fully recorded: masked errors omitted",
+    "model qualifier [1m] not actual stream model"
+  ],
+  "failures_recovered": [
+    10487,
+    12755,
+    28808,
+    36123,
+    41034,
+    48997
+  ],
+  "write_boundary_deviation": {
+    "event": 28809,
+    "path": "/tmp/claude-501/git-delta-actual.diff",
+    "sha256": "2f52f3f0f55a66f8ff2cbcedef5101ad6e379bdb37363d39dbafac65a00e305f",
+    "impact": "temporary diff only; no product/Git/registry mutation; original preserved"
+  },
+  "controller_recovery": "Initial line audit incorrectly treated Read virtual trailing empty line as mismatch; corrected by explicit EOF-only allowance, all 2513 real lines match.",
+  "backup_preservation": "secondary raw backup relocated losslessly to ignored workspace/tmp; report/proof tracked, raw stream remains in two independent directories"
+}

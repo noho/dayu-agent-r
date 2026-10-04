@@ -10,9 +10,14 @@ import io
 import logging
 import re
 import sys
+import traceback
 from collections.abc import Iterator
+from pathlib import Path
+from types import FrameType, TracebackType
+from typing import NoReturn
 
 import pytest
+import dayu.runtime.log as runtime_log
 
 from dayu.contracts.json_value import JsonValue
 from dayu.runtime.log import (
@@ -22,6 +27,7 @@ from dayu.runtime.log import (
     configure,
     configure_selected_diagnostics,
     log_verbose,
+    safe_exception_trace,
 )
 from dayu.runtime.log_levels import (
     CRITICAL_LOG_LEVEL,
@@ -54,6 +60,191 @@ _ORDINARY_RECORD_LEVELS: tuple[int, ...] = (
     ERROR_LOG_LEVEL,
     CRITICAL_LOG_LEVEL,
 )
+
+
+def test_safe_exception_trace_keeps_verified_frame_and_hides_raw_exception() -> None:
+    """安全诊断只保留可验证的包内帧、内建祖先和类型指纹。
+
+    :returns: 无。
+    :raises AssertionError: 原始异常、cause、外部绝对路径或受信行号丢失时抛出。
+    """
+
+    source_root = Path(runtime_log.__file__).parent.parent
+    secret = "https://secret.invalid/?token=contact-canary /Users/private/report.pdf"
+    try:
+        configure(level=LogLevel.QUIET, debug_stream=True)
+    except ValueError as exc:
+        exc.args = (secret,)
+        exc.__cause__ = RuntimeError(secret)
+        trace = safe_exception_trace(exc, source_root=source_root)
+    else:
+        pytest.fail("expected a Dayu frame")
+    assert "exception_type=ValueError custom_type=redacted" in trace
+    assert re.search(r"log\.py:[1-9][0-9]*", trace)
+    assert "[external]" in trace
+    assert "truncated=false" in trace
+    for forbidden in (secret, "token=", "https://", "/Users/", str(source_root), "quiet diagnostics"):
+        assert forbidden not in trace
+
+
+def test_safe_exception_trace_fingerprints_custom_types_without_names() -> None:
+    """两个动态异常类型只以可区分的固定十六进制指纹出现。
+
+    :returns: 无。
+    :raises AssertionError: 指纹长度、区分能力或脱敏契约失效时抛出。
+    """
+
+    source_root = Path(runtime_log.__file__).parent.parent
+    fingerprints: list[str] = []
+    for name in ("SecretAlphaTokenError", "SecretBetaTokenError"):
+        exception_class = type(name, (RuntimeError,), {"__module__": "secret.private.module"})
+        try:
+            raise exception_class("https://private.invalid/?token=contact-canary") from ValueError("/Users/private/cause")
+        except RuntimeError as exc:
+            trace = safe_exception_trace(exc, source_root=source_root)
+        assert "exception_type=RuntimeError" in trace
+        assert name not in trace
+        assert "secret.private.module" not in trace
+        assert "contact-canary" not in trace
+        assert "/Users/private" not in trace
+        match = re.search(r"custom_type=([0-9a-f]{16})\b", trace)
+        assert match is not None
+        fingerprints.append(match.group(1))
+    assert fingerprints[0] != fingerprints[1]
+
+
+def test_safe_exception_trace_redacts_external_filename_and_bad_type_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """外部伪造文件名不会进入诊断，非法类型元数据只产生固定遮盖词。
+
+    :param monkeypatch: 注入非法类型元数据。
+    :returns: 无。
+    :raises AssertionError: 外部路径或自定义类型元数据泄漏时抛出。
+    """
+
+    source_root = Path(runtime_log.__file__).parent.parent
+    code = compile(
+        "raise RuntimeError('https://private.invalid/?token=secret')",
+        "/Users/private/token_source.py",
+        "exec",
+    )
+    try:
+        exec(code)
+    except RuntimeError as exc:
+        trace = safe_exception_trace(exc, source_root=source_root)
+    else:
+        pytest.fail("expected an external traceback frame")
+    assert trace.count("[external]") >= 2
+    assert "/Users/private" not in trace
+    assert "https://" not in trace
+    assert "token=" not in trace
+
+    class BadMetadataError(RuntimeError):
+        """用于检验非法类型元数据降级。"""
+
+    monkeypatch.setattr(BadMetadataError, "__module__", 42)
+    bad_trace = safe_exception_trace(BadMetadataError("secret"), source_root=source_root)
+    assert "exception_type=RuntimeError custom_type=redacted" in bad_trace
+    assert "BadMetadataError" not in bad_trace
+
+
+def test_safe_exception_trace_bounds_deep_stack_and_handles_missing_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """深栈只校验并输出末十六帧，无 traceback 使用固定缺失标记。
+
+    :param monkeypatch: 观察受信帧校验调用而不改变校验结果。
+    :returns: 无。
+    :raises AssertionError: 校验范围、深栈边界或缺失 traceback 投影不符时抛出。
+    """
+
+    source_root = Path(runtime_log.__file__).parent.parent
+    validated_frames: list[tuple[FrameType, int]] = []
+    validate_frame = runtime_log._safe_trace_frame
+
+    def record_validation(frame: FrameType, line_number: int, root: Path) -> str:
+        """记录实际校验的帧并使用原校验规则生成诊断。
+
+        :param frame: 待校验的 traceback 帧。
+        :param line_number: traceback 记录的行号。
+        :param root: 调用方传入的受信包根。
+        :returns: 原校验规则生成的安全帧片段。
+        :raises Exception: 遵循原校验函数的异常契约。
+        """
+
+        validated_frames.append((frame, line_number))
+        return validate_frame(frame, line_number, root)
+
+    def raise_deep(depth: int) -> NoReturn:
+        """构造有界测试递归栈。
+
+        :param depth: 剩余递归层数。
+        :returns: 不返回。
+        :raises RuntimeError: 到达底层时抛出。
+        """
+
+        if depth == 0:
+            raise RuntimeError("token=hidden")
+        raise_deep(depth - 1)
+        raise AssertionError("unreachable")
+
+    try:
+        raise_deep(25)
+    except RuntimeError as exc:
+        original_frames = list(traceback.walk_tb(exc.__traceback__))
+        with monkeypatch.context() as patch:
+            patch.setattr(runtime_log, "_safe_trace_frame", record_validation)
+            trace = safe_exception_trace(exc, source_root=source_root)
+    assert len(original_frames) > 16
+    assert validated_frames == original_frames[-16:]
+    assert trace.count("[external]") == 16
+    assert trace.endswith("truncated=true")
+    assert "token=hidden" not in trace
+    assert "stack=[unavailable]" in safe_exception_trace(RuntimeError("secret"), source_root=source_root)
+
+
+def test_safe_exception_trace_internal_failures_return_fixed_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    """遍历或哈希故障都只返回同一个固定安全串。
+
+    :param monkeypatch: 注入 helper 内部失败。
+    :returns: 无。
+    :raises AssertionError: 内部失败抛出或泄漏原始文本时抛出。
+    """
+
+    source_root = Path(runtime_log.__file__).parent.parent
+    expected = "exception_type=redacted custom_type=redacted stack=[unavailable]"
+
+    def broken_walk(_tb: TracebackType | None) -> Iterator[tuple[FrameType, int]]:
+        """模拟 traceback 遍历故障。
+
+        :param _tb: 未使用的 traceback 输入。
+        :returns: 不返回。
+        :raises RuntimeError: 始终抛出。
+        """
+
+        raise RuntimeError("token=walk-secret")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime_log.traceback, "walk_tb", broken_walk)
+        assert safe_exception_trace(ValueError("/Users/private"), source_root=source_root) == expected
+
+    def broken_hash(_data: bytes) -> NoReturn:
+        """模拟指纹哈希故障。
+
+        :param _data: 指纹原始字节。
+        :returns: 不返回。
+        :raises RuntimeError: 始终抛出。
+        """
+
+        raise RuntimeError("token=hash-secret")
+
+    class CustomError(RuntimeError):
+        """用于触发自定义类型指纹的异常。"""
+
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime_log.hashlib, "sha256", broken_hash)
+        assert safe_exception_trace(CustomError("https://private.invalid"), source_root=source_root) == expected
 
 
 @pytest.fixture(autouse=True)
@@ -612,3 +803,240 @@ def test_caplog_can_attach_to_dayu_logger_explicitly(
         namespace_logger.removeHandler(caplog.handler)
 
     assert "captured-message" in [record.getMessage() for record in caplog.records]
+
+
+class _DiagnosticFaultStream(io.StringIO):
+    """真实配置 owner 的 write/flush 故障注入流。"""
+    def __init__(self, phase: str, error: BaseException) -> None:
+        """参数：阶段/原对象；返回：无；异常：无。"""
+        super().__init__(); self.phase = phase; self.error = error
+
+    def write(self, message: str) -> int:
+        """参数：消息；返回：原写长度；异常：指定故障传播原对象。"""
+        if self.phase == 'write': raise self.error
+        return super().write(message)
+
+    def flush(self) -> None:
+        """参数：无；返回：无；异常：指定故障传播原对象。"""
+        if self.phase == 'flush': raise self.error
+        super().flush()
+
+
+class _DiagnosticFaultFormatter(logging.Formatter):
+    """真实 marker 的 formatter 故障。"""
+    def __init__(self, error: BaseException) -> None:
+        """参数：原异常；返回：无；异常：无。"""
+        super().__init__(); self.error = error
+
+    def format(self, record: logging.LogRecord) -> str:
+        """参数：record；返回：永不返回；异常：指定原对象传播。"""
+        raise self.error
+
+
+class _DiagnosticReleaseFaultHandler(runtime_log._DiagnosticStreamHandler):
+    """仅外层 finally release 产生故障，真实 stdlib flush 内层 release 保持健康。"""
+    release_error: BaseException | None = None
+
+    def __init__(self, stream: io.StringIO) -> None:
+        """参数：真实目的流；返回：无；异常：stdlib handler 初始化错误传播。"""
+        super().__init__(stream=stream)
+        self._flush_active = False
+        self.inner_release_count = 0
+        self.healthy_flush_count = 0
+        self.outer_release_fault_count = 0
+
+    def flush(self) -> None:
+        """参数：无；返回：真实 stdlib flush；异常：真实流异常原样传播。"""
+        self._flush_active = True
+        try:
+            super().flush()
+            self.healthy_flush_count += 1
+        finally:
+            self._flush_active = False
+
+    def release(self) -> None:
+        """参数：无；返回：无；异常：释放后指定原对象传播。"""
+        super().release()
+        if self._flush_active:
+            self.inner_release_count += 1
+        elif self.release_error is not None:
+            self.outer_release_fault_count += 1
+            raise self.release_error
+
+
+def _assert_handler_lock_released(handler: logging.Handler) -> None:
+    """参数：实际 handler；返回：跨线程获得锁后无；异常：锁留在原线程失败。"""
+    import threading
+    acquired = threading.Event()
+    def acquire_elsewhere() -> None:
+        """参数：无；返回：取放锁；异常：无。"""
+        handler.acquire()
+        try: acquired.set()
+        finally: handler.release()
+    thread = threading.Thread(target=acquire_elsewhere, daemon=True)
+    thread.start(); thread.join(2); assert acquired.is_set() and not thread.is_alive()
+
+
+@pytest.mark.parametrize('level', list(DiagnosticLogLevel))
+def test_process_diagnostic_uses_configured_owner_once(level: DiagnosticLogLevel) -> None:
+    """参数：canonical selector；返回：无；异常：原级别/格式/重复投递或 quiet 漂移失败。"""
+    from dayu.runtime.process_diagnostics import ProcessLogDiagnostic
+    stream = io.StringIO()
+    configure_selected_diagnostics(level=level, debug_stream=False, stream=stream)
+    assert runtime_log.emit_process_log_diagnostic(ProcessLogDiagnostic('installed.source', WARN_LOG_LEVEL, 'source warning', 123.0))
+    text = stream.getvalue()
+    admitted = level in (DiagnosticLogLevel.DEBUG, DiagnosticLogLevel.VERBOSE, DiagnosticLogLevel.INFO, DiagnosticLogLevel.WARNING)
+    assert ('[WARNING] [installed.source] source warning' in text) is admitted
+    assert text.count('source warning') == int(admitted)
+
+
+@pytest.mark.parametrize('owner_state', ['unconfigured', 'missing', 'nonunique'])
+def test_process_diagnostic_missing_owner_never_routes_public(owner_state: str, capfd: pytest.CaptureFixture[str]) -> None:
+    """参数：真实配置缺 owner 场景/双流；返回：无；异常：root/lastResort 外泄或错误 bool 失败。"""
+    from dayu.runtime.process_diagnostics import ProcessLogDiagnostic
+    namespace = logging.getLogger('dayu'); stream = io.StringIO()
+    if owner_state != 'unconfigured': configure(level=LogLevel.INFO, stream=stream)
+    namespace.setLevel(INFO_LOG_LEVEL)
+    if owner_state in ('unconfigured', 'missing'): namespace.handlers.clear()
+    else:
+        namespace.addHandler(runtime_log._build_marker_handler(gate_level=LogLevel.INFO, ordinary_level=LogLevel.INFO, debug_stream=False, stream=stream))
+    assert runtime_log.emit_process_log_diagnostic(ProcessLogDiagnostic('actual.WARNING.source', WARN_LOG_LEVEL, 'must not escape', 123.0)) is False
+    assert stream.getvalue() == ''
+    public = capfd.readouterr(); assert public.out == public.err == ''
+
+
+@pytest.mark.parametrize('phase', ['write', 'flush', 'format'])
+@pytest.mark.parametrize('error', [OSError('ordinary diagnostic'), RecursionError('ordinary recursion')])
+def test_process_owner_ordinary_fault_is_false_and_no_public(phase: str, error: Exception, capfd: pytest.CaptureFixture[str]) -> None:
+    """参数：实际配置故障阶段/普通异常/双流；返回：无；异常：ordinary 故障外泄失败。"""
+    from dayu.runtime.process_diagnostics import ProcessLogDiagnostic
+    stream = _DiagnosticFaultStream(phase, error); configure(level=LogLevel.INFO, stream=stream)
+    owner = logging.getLogger('dayu').handlers[0]
+    if phase == 'format': owner.setFormatter(_DiagnosticFaultFormatter(error))
+    assert runtime_log.emit_process_log_diagnostic(ProcessLogDiagnostic('source', WARN_LOG_LEVEL, 'record', 123.0)) is False
+    _assert_handler_lock_released(owner)
+    public = capfd.readouterr(); assert public.out == public.err == ''
+    stream.phase = 'none'
+
+
+@pytest.mark.parametrize('phase', ['write', 'flush', 'format', 'release'])
+@pytest.mark.parametrize('control_kind', ['keyboard', 'exit', 'cancel', 'generator'])
+def test_process_owner_control_flow_identity_and_cross_thread_lock(phase: str, control_kind: str) -> None:
+    """参数：实际阶段/控制流；返回：无；异常：吞控制流、改对象或跨线程锁未释放失败。"""
+    import asyncio
+    from dayu.runtime.process_diagnostics import ProcessLogDiagnostic
+    error = {'keyboard': KeyboardInterrupt(), 'exit': SystemExit(7), 'cancel': asyncio.CancelledError(), 'generator': GeneratorExit()}[control_kind]
+    stream = _DiagnosticFaultStream(phase, error); configure(level=LogLevel.INFO, stream=stream)
+    namespace = logging.getLogger('dayu'); owner = namespace.handlers[0]
+    if phase == 'format': owner.setFormatter(_DiagnosticFaultFormatter(error))
+    if phase == 'release':
+        replacement = _DiagnosticReleaseFaultHandler(stream=stream)
+        replacement.setLevel(owner.level)
+        for admission in owner.filters: replacement.addFilter(admission)
+        replacement.setFormatter(owner.formatter)
+        replacement.release_error = error
+        namespace.handlers[:] = [replacement]; owner = replacement
+    try:
+        with pytest.raises(BaseException) as caught:
+            runtime_log.emit_process_log_diagnostic(ProcessLogDiagnostic('source', WARN_LOG_LEVEL, 'record', 123.0))
+        assert caught.value is error
+        if isinstance(owner, _DiagnosticReleaseFaultHandler):
+            assert owner.inner_release_count == 1 and owner.healthy_flush_count == 1
+            assert owner.outer_release_fault_count == 1
+            assert '[WARNING] [source] record' in stream.getvalue()
+    finally:
+        stream.phase = 'none'
+        if isinstance(owner, _DiagnosticReleaseFaultHandler): owner.release_error = None
+    _assert_handler_lock_released(owner)
+
+
+class _RouteObservationHandler(logging.Handler):
+    """记录任何不应触达的 root 或 lastResort 路由。"""
+
+    def __init__(self) -> None:
+        """参数：无；返回：无；异常：无。"""
+        super().__init__(); self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """参数：实际路由记录；返回：无；异常：无，只记录调用。"""
+        self.records.append(record)
+
+
+@pytest.mark.parametrize('owner_state', ['unconfigured', 'missing', 'nonunique'])
+def test_process_owner_never_touches_root_or_last_resort(owner_state: str, capfd: pytest.CaptureFixture[str]) -> None:
+    """参数：owner 状态/双流；返回：无；异常：实际 root/lastResort 被触发失败。"""
+    from dayu.runtime.process_diagnostics import ProcessLogDiagnostic
+    namespace = logging.getLogger('dayu'); root = logging.getLogger()
+    root_observer = _RouteObservationHandler(); last_observer = _RouteObservationHandler()
+    saved_last = logging.lastResort; saved_handlers = root.handlers[:]
+    try:
+        root.handlers[:] = [root_observer]; logging.lastResort = last_observer
+        stream = io.StringIO()
+        if owner_state != 'unconfigured': configure(level=LogLevel.INFO, stream=stream)
+        namespace.setLevel(INFO_LOG_LEVEL); namespace.propagate = True
+        if owner_state == 'nonunique':
+            namespace.addHandler(runtime_log._build_marker_handler(gate_level=LogLevel.INFO, ordinary_level=LogLevel.INFO, debug_stream=False, stream=stream))
+        else: namespace.handlers.clear()
+        assert runtime_log.emit_process_log_diagnostic(ProcessLogDiagnostic('third', WARN_LOG_LEVEL, 'must not route', 123.0)) is False
+        assert not root_observer.records and not last_observer.records and stream.getvalue() == ''
+        public = capfd.readouterr(); assert public.out == public.err == ''
+    finally:
+        logging.lastResort = saved_last; root.handlers[:] = saved_handlers
+
+
+def test_process_owner_real_formatter_missing_field(capfd: pytest.CaptureFixture[str]) -> None:
+    """参数：双流；返回：无；异常：真实 Formatter 缺字段泄漏或错误 bool 失败。"""
+    from dayu.runtime.process_diagnostics import ProcessLogDiagnostic
+    stream = io.StringIO(); configure(level=LogLevel.INFO, stream=stream)
+    owner = logging.getLogger('dayu').handlers[0]
+    owner.setFormatter(logging.Formatter('%(missing_field)s %(message)s'))
+    original_raise_exceptions = logging.raiseExceptions
+    assert runtime_log.emit_process_log_diagnostic(ProcessLogDiagnostic('third', WARN_LOG_LEVEL, 'message', 123.0)) is False
+    assert logging.raiseExceptions is original_raise_exceptions and stream.getvalue() == ''
+    _assert_handler_lock_released(owner)
+    public = capfd.readouterr(); assert public.out == public.err == ''
+
+
+@pytest.mark.parametrize('level', list(DiagnosticLogLevel))
+@pytest.mark.parametrize('record_level', [STREAM_DEBUG_LOG_LEVEL, *_ORDINARY_RECORD_LEVELS])
+@pytest.mark.parametrize('debug_stream', [False, True])
+def test_process_owner_reuses_exact_admission_matrix(level: DiagnosticLogLevel, record_level: int, debug_stream: bool) -> None:
+    """参数：selector/源等级/stream开关；返回：无；异常：helper 与 owner filter 准入、时间或重复输出漂移失败。"""
+    from dayu.runtime.process_diagnostics import ProcessLogDiagnostic
+    if level is DiagnosticLogLevel.QUIET and debug_stream:
+        with pytest.raises(ValueError): configure_selected_diagnostics(level=level, debug_stream=True, stream=io.StringIO())
+        return
+    stream = io.StringIO()
+    resolved = configure_selected_diagnostics(level=level, debug_stream=debug_stream, stream=stream)
+    configure(level=resolved, debug_stream=debug_stream, stream=stream, configure_root=True)
+    configure(level=resolved, debug_stream=debug_stream, stream=stream, configure_root=True)
+    owner = logging.getLogger('dayu').handlers[0]
+    owner.setFormatter(logging.Formatter('%(name)s|%(levelno)s|%(created)s|%(message)s'))
+    assert runtime_log.emit_process_log_diagnostic(ProcessLogDiagnostic('original.source', record_level, 'once', 123.0))
+    expected = debug_stream if record_level == STREAM_DEBUG_LOG_LEVEL else level is not DiagnosticLogLevel.QUIET and record_level >= int(resolved)
+    assert stream.getvalue() == (f'original.source|{record_level}|123.0|once\n' if expected else '')
+
+
+@pytest.mark.parametrize('release_kind', ['ordinary', 'control'])
+@pytest.mark.parametrize('control_kind', ['keyboard', 'exit', 'cancel', 'generator'])
+def test_process_owner_release_fault_preserves_prior_control(release_kind: str, control_kind: str) -> None:
+    """参数：release 故障类别/首控制流种类；返回：无；异常：首个 format 控制流被替换或锁残留失败。"""
+    import asyncio
+    from dayu.runtime.process_diagnostics import ProcessLogDiagnostic
+    first = {'keyboard': KeyboardInterrupt(), 'exit': SystemExit(7), 'cancel': asyncio.CancelledError(), 'generator': GeneratorExit()}[control_kind]
+    later = OSError('release') if release_kind == 'ordinary' else KeyboardInterrupt()
+    stream = io.StringIO(); configure(level=LogLevel.INFO, stream=stream)
+    namespace = logging.getLogger('dayu'); original = namespace.handlers[0]
+    owner = _DiagnosticReleaseFaultHandler(stream=stream)
+    owner.setLevel(original.level)
+    for admission in original.filters: owner.addFilter(admission)
+    owner.setFormatter(_DiagnosticFaultFormatter(first)); owner.release_error = later
+    namespace.handlers[:] = [owner]
+    try:
+        with pytest.raises(BaseException) as caught:
+            runtime_log.emit_process_log_diagnostic(ProcessLogDiagnostic('source', WARN_LOG_LEVEL, 'record', 123.0))
+        assert caught.value is first
+        assert owner.inner_release_count == 0 and owner.outer_release_fault_count == 1
+    finally:
+        owner.release_error = None
+    _assert_handler_lock_released(owner)

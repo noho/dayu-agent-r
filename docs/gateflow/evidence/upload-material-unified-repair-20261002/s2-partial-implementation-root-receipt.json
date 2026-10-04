@@ -1,0 +1,130 @@
+{
+  "setup_status": "ok",
+  "agent_status": "blocked",
+  "tool_evidence": "yes",
+  "tool_trace": "complete",
+  "required_evidence": "partial",
+  "canary_status": "match",
+  "result_status": "partial",
+  "warnings": [
+    "item_26 nonexistent time_utils lookup in compound outer0; actual document_models owner recovered",
+    "stderr apply_patch README hunk context mismatch; subsequent precise patches and actual diff inspected",
+    "item_83 read coverage before producer finished; item_82 exit0 then item_84 actual JSON read recovered",
+    "Root optional in-flight ls found delivery indexes not yet generated; final indexes now exist and audited"
+  ],
+  "evidence_gaps": [
+    "Full S2 state/publication/callers/amended/job/real dual CLI implementation remains absent",
+    "US2-T01 five stale material fixture failures remain to fix"
+  ],
+  "retry_class": "task",
+  "outer_exit": 0,
+  "events": 202,
+  "command_count": 76,
+  "model": "unknown",
+  "ticket_count": 114,
+  "ticket_mismatch": [],
+  "delivery_count": 13,
+  "delivery_mismatch": [],
+  "frozen_count": 9770,
+  "changed": [
+    "README.md",
+    "dayu/fins/README.md",
+    "dayu/fins/domain/document_models.py",
+    "dayu/fins/storage/_fs_source_document_core.py",
+    "dayu/fins/storage/_fs_source_integrity.py",
+    "dayu/fins/storage/source_manifest_contract.py",
+    "dayu/fins/storage/source_meta_contract.py",
+    "tests/README.md",
+    "tests/fins/test_fins_storage_atomicity.py",
+    "tests/fins/test_source_manifest_contract.py",
+    "tests/fins/test_source_meta_contract.py"
+  ],
+  "protected_drift": [],
+  "actual_exits": {
+    "delivery-audit-02": 0,
+    "storage-coverage-01": 1,
+    "storage-independent-02": 0,
+    "probe-pyright-01": 0,
+    "final-regression-01": 0,
+    "coverage-json-clean-02": 0,
+    "coverage-json-01": 0,
+    "audit-pyright-01": 0,
+    "scoped-diff-check-01": 0,
+    "delivery-audit-01": 0,
+    "final-pyright-03": 0,
+    "final-pyright-02": 0,
+    "coverage-combine-01": 0,
+    "audit-pyright-03": 0,
+    "coverage-combine-clean-02": 0,
+    "company-history-probe-01": 0,
+    "audit-pyright-02": 0,
+    "pyright-01": 0,
+    "focused-01": 0
+  },
+  "junit": {
+    "storage-coverage-01.junit.xml": [
+      {
+        "name": "pytest",
+        "errors": "0",
+        "failures": "5",
+        "skipped": "0",
+        "tests": "109",
+        "time": "26.896",
+        "timestamp": "2026-10-02T23:42:53.144905+08:00",
+        "hostname": "Mac-Studio.local"
+      }
+    ],
+    "focused-01.junit.xml": [
+      {
+        "name": "pytest",
+        "errors": "0",
+        "failures": "0",
+        "skipped": "0",
+        "tests": "32",
+        "time": "15.982",
+        "timestamp": "2026-10-02T23:34:58.498170+08:00",
+        "hostname": "Mac-Studio.local"
+      }
+    ],
+    "storage-independent-02.junit.xml": [
+      {
+        "name": "pytest",
+        "errors": "0",
+        "failures": "0",
+        "skipped": "0",
+        "tests": "104",
+        "time": "26.031",
+        "timestamp": "2026-10-02T23:47:27.544795+08:00",
+        "hostname": "Mac-Studio.local"
+      }
+    ],
+    "final-regression-01.junit.xml": [
+      {
+        "name": "pytest",
+        "errors": "0",
+        "failures": "0",
+        "skipped": "3",
+        "tests": "2014",
+        "time": "158.840",
+        "timestamp": "2026-10-02T23:38:33.301165+08:00",
+        "hostname": "Mac-Studio.local"
+      }
+    ]
+  },
+  "coverage": {
+    "dayu/fins/domain/document_models.py": 95.5456570155902,
+    "dayu/fins/storage/_fs_source_document_core.py": 85.76709796672829,
+    "dayu/fins/storage/_fs_source_integrity.py": 92.69949066213923,
+    "dayu/fins/storage/source_manifest_contract.py": 100.0,
+    "dayu/fins/storage/source_meta_contract.py": 100.0
+  },
+  "invalid_json": [],
+  "paths": {
+    "output": "/private/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/sub-agents.lPiuO8/upload-material-unified-s2-implement-sol-20261002-01.jsonl",
+    "stderr": "/private/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/sub-agents.lPiuO8/upload-material-unified-s2-implement-sol-20261002-01.stderr",
+    "last": "/private/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/sub-agents.lPiuO8/upload-material-unified-s2-implement-sol-20261002-01.last.md",
+    "artifact": "/Users/leo/workspace/dayu-agent-r/docs/gateflow/upload-material-unified-s2-implementation-report-20261002.md"
+  },
+  "head": "f7e60c9d3e4c6e77a6c2abf18d09cd8020c19235",
+  "main": "fac32ecbff9bfe792b63ee9667c8697826b631f4"
+}

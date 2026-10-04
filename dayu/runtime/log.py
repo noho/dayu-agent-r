@@ -26,12 +26,19 @@ stdlib logger，避免把模块归属收敛到 runtime。
 from __future__ import annotations
 
 import logging
+import builtins
+import hashlib
 import sys
+import traceback
+from collections import deque
 from collections.abc import Mapping
 from enum import IntEnum, StrEnum
-from typing import Final, TextIO, TypeAlias
+from pathlib import Path
+from types import FrameType
+from typing import TYPE_CHECKING, Final, TextIO, TypeAlias
 
 from dayu.contracts.json_value import JsonValue
+from dayu.runtime.process_diagnostics import ProcessLogDiagnostic
 from dayu.runtime.log_levels import (
     CRITICAL_LOG_LEVEL,
     DEBUG_LOG_LEVEL,
@@ -55,6 +62,13 @@ _QUIET_STREAM_CONFLICT_DIAGNOSTIC: Final[str] = (
 )
 DEFAULT_LOG_PAYLOAD_KEY_LIMIT: Final[int] = 8
 LogArgument: TypeAlias = str | int | float | bool | None
+_SAFE_TRACE_FRAME_LIMIT: Final[int] = 16
+_SAFE_TRACE_FINGERPRINT_LENGTH: Final[int] = 16
+_SAFE_TRACE_FRAME_PATH_MAX_CHARS: Final[int] = 160
+_SAFE_TRACE_MAX_LINE_NUMBER: Final[int] = 10_000_000
+_SAFE_TRACE_FALLBACK: Final[str] = "exception_type=redacted custom_type=redacted stack=[unavailable]"
+_SAFE_TRACE_EXTERNAL_FRAME: Final[str] = "[external]"
+_SAFE_TRACE_UNAVAILABLE: Final[str] = "[unavailable]"
 
 # 默认静默的第三方 logger（迁移自 OLD 行为）：避免 aiohttp / asyncio /
 # urllib3 等库在 DEBUG 下淹没 dayu 输出。configure() 会把这些 logger
@@ -73,6 +87,103 @@ _DEFAULT_THIRD_PARTY_SUPPRESSIONS: Final[tuple[str, ...]] = (
     "httpcore",
 )
 _DEFAULT_THIRD_PARTY_LEVEL: Final[int] = WARN_LOG_LEVEL
+
+
+def safe_exception_trace(exc: Exception, *, source_root: Path) -> str:
+    """把异常压缩为有界且不包含原始异常文本的 operator 诊断。
+
+    :param exc: 需要诊断的异常；只读取其类型和 traceback 代码位置。
+    :param source_root: 调用方确认的受信 ``dayu`` 包根目录。
+    :returns: 安全内建祖先、类型指纹和最多十六个受信相对帧；内部失败返回固定安全串。
+    :raises Exception: 不抛出异常。
+    """
+
+    try:
+        exception_type, custom_type = _safe_exception_type(exc)
+        frames: deque[tuple[FrameType, int]] = deque(maxlen=_SAFE_TRACE_FRAME_LIMIT)
+        frame_count = 0
+        for frame, line_number in traceback.walk_tb(exc.__traceback__):
+            frame_count += 1
+            frames.append((frame, line_number))
+        # 仅对最终可见的帧执行受信路径校验，避免深栈诊断重复触发文件系统 I/O。
+        stack = (
+            ",".join(_safe_trace_frame(frame, line_number, source_root) for frame, line_number in frames)
+            if frames
+            else _SAFE_TRACE_UNAVAILABLE
+        )
+        truncated = "true" if frame_count > _SAFE_TRACE_FRAME_LIMIT else "false"
+        return f"exception_type={exception_type} custom_type={custom_type} stack={stack} truncated={truncated}"
+    except Exception:
+        # 连诊断过程本身也可能失败；固定字面量不能承载原始异常。
+        return _SAFE_TRACE_FALLBACK
+
+
+def _safe_exception_type(exc: Exception) -> tuple[str, str]:
+    """只输出可按身份验证的内建异常祖先及自定义类型指纹。
+
+    :param exc: 待检查异常。
+    :returns: 安全内建祖先名和十六位十六进制指纹或固定遮盖词。
+    :raises Exception: 非预期类型元数据或哈希故障交给调用方统一降级。
+    """
+
+    concrete = type(exc)
+    builtins_dict = vars(builtins)
+    safe_ancestor = "redacted"
+    is_builtin = False
+    for ancestor in concrete.__mro__:
+        name = ancestor.__name__
+        if builtins_dict.get(name) is ancestor and issubclass(ancestor, BaseException):
+            safe_ancestor = name
+            is_builtin = ancestor is concrete
+            break
+    if is_builtin:
+        return safe_ancestor, "redacted"
+    try:
+        module = concrete.__module__
+        qualname = concrete.__qualname__
+    except (AttributeError, TypeError):
+        return safe_ancestor, "redacted"
+    if not isinstance(module, str) or not isinstance(qualname, str):
+        return safe_ancestor, "redacted"
+    digest = hashlib.sha256((module + "\0" + qualname).encode("utf-8")).hexdigest()
+    return safe_ancestor, digest[:_SAFE_TRACE_FINGERPRINT_LENGTH]
+
+
+def _safe_trace_frame(frame: FrameType, line_number: int, source_root: Path) -> str:
+    """验证帧确属受信模块后仅保留包内相对 Python 路径和抛出行号。
+
+    :param frame: traceback 中的执行帧。
+    :param line_number: traceback 记录的行号。
+    :param source_root: 受信 ``dayu`` 包根目录。
+    :returns: 已验证的相对位置，或固定外部帧标记。
+    :raises Exception: 不抛出异常；任何帧元数据故障都降级为外部帧。
+    """
+
+    try:
+        module_name = frame.f_globals["__name__"]
+        if not isinstance(module_name, str) or not (module_name == "dayu" or module_name.startswith("dayu.")):
+            return _SAFE_TRACE_EXTERNAL_FRAME
+        module = sys.modules.get(module_name)
+        if module is None or vars(module) is not frame.f_globals:
+            return _SAFE_TRACE_EXTERNAL_FRAME
+        module_file = module.__file__
+        code_file = frame.f_code.co_filename
+        if not isinstance(module_file, str) or not isinstance(code_file, str):
+            return _SAFE_TRACE_EXTERNAL_FRAME
+        module_path = Path(module_file).resolve(strict=True)
+        code_path = Path(code_file).resolve(strict=True)
+        if module_path != code_path:
+            return _SAFE_TRACE_EXTERNAL_FRAME
+        relative = code_path.relative_to(source_root.resolve(strict=True))
+        if relative.suffix != ".py" or not all(part.isidentifier() for part in relative.with_suffix("").parts):
+            return _SAFE_TRACE_EXTERNAL_FRAME
+        if len(relative.as_posix()) > _SAFE_TRACE_FRAME_PATH_MAX_CHARS:
+            return _SAFE_TRACE_EXTERNAL_FRAME
+        if type(line_number) is not int or not 0 < line_number <= _SAFE_TRACE_MAX_LINE_NUMBER:
+            return _SAFE_TRACE_EXTERNAL_FRAME
+        return f"{relative.as_posix()}:{line_number}"
+    except Exception:
+        return _SAFE_TRACE_EXTERNAL_FRAME
 
 
 # 在模块导入时注册 Dayu 自定义 level 到 stdlib logging，确保
@@ -165,6 +276,64 @@ class _DiagnosticAdmissionFilter(logging.Filter):
         if self._ordinary_level is LogLevel.QUIET:
             return False
         return record.levelno >= int(self._ordinary_level)
+
+
+if TYPE_CHECKING:
+    _DiagnosticStreamHandlerBase = logging.StreamHandler[TextIO]
+else:
+    _DiagnosticStreamHandlerBase = logging.StreamHandler
+
+
+class _DiagnosticStreamHandler(_DiagnosticStreamHandlerBase):
+    """保持普通日志行为，仅提供进程诊断的安全投递边界。"""
+
+    stream: TextIO
+
+    def try_deliver_process_record(self, record: logging.LogRecord) -> bool:
+        """参数：干净源记录；返回：完成或拒绝 True、普通故障 False；异常：控制流释放锁后原样传播。"""
+        try:
+            if record.levelno < self.level or not self.filter(record):
+                return True
+            self.acquire()
+            delivery_error: BaseException | None = None
+            try:
+                message = self.format(record)
+                self.stream.write(message + self.terminator)
+                self.flush()
+            except BaseException as exc:
+                delivery_error = exc
+            finally:
+                try:
+                    self.release()
+                except BaseException as exc:
+                    # 释放锁仍必须尝试；已有控制流不能被后续释放故障替换。
+                    if delivery_error is None or isinstance(delivery_error, Exception) and not isinstance(exc, Exception):
+                        delivery_error = exc
+            if delivery_error is not None:
+                raise delivery_error
+            return True
+        except Exception:
+            return False
+
+
+def emit_process_log_diagnostic(diagnostic: ProcessLogDiagnostic) -> bool:
+    """参数：child 原等级诊断；返回：拒绝/完成 True、无唯一 owner/普通故障 False；异常：控制流传播。
+
+    仅投递现有 dayu marker owner，不触 root、lastResort 或源 logger 的路由。
+    """
+    try:
+        record = logging.LogRecord(diagnostic.source_name, diagnostic.source_level,
+                                   "", 0, diagnostic.message, (), None)
+        record.created = diagnostic.created_at
+        namespace = logging.getLogger(_NAMESPACE_LOGGER_NAME)
+        if not namespace.isEnabledFor(record.levelno) or namespace.disabled or not namespace.filter(record):
+            return True
+        owners = [handler for handler in namespace.handlers if isinstance(handler, _DiagnosticStreamHandler)]
+        if len(owners) != 1:
+            return False
+        return owners[0].try_deliver_process_record(record)
+    except Exception:
+        return False
 
 
 def configure(
@@ -303,7 +472,7 @@ def _build_marker_handler(
     :raises Exception: 不主动抛出异常。
     """
 
-    handler = logging.StreamHandler(stream=stream)
+    handler = _DiagnosticStreamHandler(stream=stream)
     handler.setLevel(int(gate_level))
     handler.addFilter(
         _DiagnosticAdmissionFilter(
@@ -337,5 +506,6 @@ __all__ = [
     "bounded_payload_keys",
     "configure",
     "configure_selected_diagnostics",
+    "emit_process_log_diagnostic",
     "log_verbose",
 ]

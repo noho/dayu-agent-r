@@ -1,0 +1,369 @@
+{
+  "gate": "code review/fix/re-review accepted sole S1; checkpoint pending",
+  "created": "2026-10-04T14:34:52.333688+08:00",
+  "workspace": "/Users/leo/workspace/dayu-agent-r",
+  "branch": "codex/upload-material-oracle",
+  "reviewed_parent": "d054c0fece08d3fb5b3ed71207b3dbb8ec7f5d8c",
+  "candidate_files": [
+    {
+      "path": "docs/cli_ci.md",
+      "bytes": 156772,
+      "sha256": "063fd969333ce628c1a0377c3f43b4a1df0d597cbf10f96ec4a5cec034a3a32b"
+    },
+    {
+      "path": "docs/cli_ci_oracles.json",
+      "bytes": 296547,
+      "sha256": "07523ad680e591c8c78a28378286ed718228798376e3366409ab811d592df64b"
+    },
+    {
+      "path": "docs/cli_ci_scenarios.json",
+      "bytes": 11500453,
+      "sha256": "46e1e989c49758bf9cab252250ea8e63d29029791703d0fd62143780bfa96c7e"
+    },
+    {
+      "path": "docs/gateflow/evidence/upload-material-registry-20261003/authority-index.json",
+      "bytes": 30404,
+      "sha256": "382a35bc7fe77206f00b49415e1fdc97dffbe29167c4366a3e2adbd28e4df45f"
+    },
+    {
+      "path": "docs/gateflow/evidence/upload-material-registry-20261003/focused-source.json",
+      "bytes": 14667,
+      "sha256": "df57b9608886f8b1af3259f3cabbee7f7e40aa3f4228c278e97c661e1ee29c13"
+    },
+    {
+      "path": "docs/gateflow/evidence/upload-material-registry-20261003/mandatory-assignment.json",
+      "bytes": 6289801,
+      "sha256": "27c710e86cbca486e89fdbb3559894b6ef3ce17e9c19d358ea11956d218c0a57"
+    },
+    {
+      "path": "docs/gateflow/evidence/upload-material-registry-20261003/readiness-proof.json",
+      "bytes": 129672,
+      "sha256": "196d933a99a8503a5cf6ae9550114fdcc0dd3d5b41d8cf4f32a9c435595ad532"
+    },
+    {
+      "path": "docs/gateflow/evidence/upload-material-registry-20261003/retention-receipt.json",
+      "bytes": 559,
+      "sha256": "785f683849143b82cb6b07f916a36a3fad27f886f8e392711185040ecde61eb0"
+    },
+    {
+      "path": "docs/gateflow/evidence/upload-material-registry-20261003/review-target.json",
+      "bytes": 2141,
+      "sha256": "ad334bcbcb336a395ebf31c1b224c060233346d1f86a063be1f6705428f87260"
+    },
+    {
+      "path": "docs/gateflow/evidence/upload-material-registry-20261003/validation.json",
+      "bytes": 34276,
+      "sha256": "56ad05393ffb9d9b5d12c9ffc91f106053d7c5edc044ca30250c851179408481"
+    },
+    {
+      "path": "docs/gateflow/upload-material-registry-implementation-20261004.md",
+      "bytes": 10007,
+      "sha256": "d99f966ab3d211a4fab5ff9a0d48448759a0414e65356662e61e733487067082"
+    },
+    {
+      "path": "tests/README.md",
+      "bytes": 135693,
+      "sha256": "33490aebe3caf5c1579ec349263c756034414bc103b3d2f33af79ae65536a7d3"
+    },
+    {
+      "path": "tests/cli/test_cli_ci_upload_material_registry.py",
+      "bytes": 49146,
+      "sha256": "d319194d929d2f67c3d654ada27af04b86a630c5ada25a987ee698554396b5bc"
+    },
+    {
+      "path": "utils/cli_ci_upload_material_registry.py",
+      "bytes": 75501,
+      "sha256": "153fe8f1a81f39c837b3b847ac583ed74969113cad89816274c24b9646e3cf2c"
+    }
+  ],
+  "counts": {
+    "oracles": {
+      "old_preserved": 6,
+      "current": 7
+    },
+    "scenarios": {
+      "old_preserved": 1328,
+      "current": 2127
+    }
+  },
+  "finding_final_states": {
+    "REG-C01": "已修复",
+    "REG-C02": "已修复",
+    "REG-C03": "已修复",
+    "REG-C04": "已修复",
+    "REG-R01": "已修复",
+    "REG-R02": "已修复",
+    "REG-R03": "已修复"
+  },
+  "strict_whole_report": {
+    "path": "docs/gateflow/evidence/upload-material-registry-20261003/readiness-proof.json",
+    "bytes": 129672,
+    "sha256": "196d933a99a8503a5cf6ae9550114fdcc0dd3d5b41d8cf4f32a9c435595ad532",
+    "outer_vs_embedded": "each own proof equals outer.proof[kind]; not whole outer bytes"
+  },
+  "current_validation": {
+    "pytest_cases": 180,
+    "pyright_errors": 0,
+    "actor_actual_executions": [
+      {
+        "name": "pytest",
+        "argv": [
+          "/Users/leo/workspace/dayu-agent-r/.venv/bin/python",
+          "-m",
+          "pytest",
+          "tests/cli/test_cli_ci_upload_material_registry.py",
+          "tests/cli/test_cli_ci_run_observation.py",
+          "-q"
+        ],
+        "cwd": "/Users/leo/workspace/dayu-agent-r",
+        "actual_wait": true,
+        "actual_exit": 0,
+        "stdout": {
+          "path": "workspace/tmp/upload-material-registry-20261003/code-fix-sol-03/pytest.stdout",
+          "bytes": 261,
+          "sha256": "9fae77b8cc0807866504a949100fa493c21f386d2b55a471aa7345c58ccce346"
+        },
+        "stderr": {
+          "path": "workspace/tmp/upload-material-registry-20261003/code-fix-sol-03/pytest.stderr",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      {
+        "name": "pyright",
+        "argv": [
+          "/Users/leo/workspace/dayu-agent-r/.venv/bin/python",
+          "-m",
+          "pyright"
+        ],
+        "cwd": "/Users/leo/workspace/dayu-agent-r",
+        "actual_wait": true,
+        "actual_exit": 0,
+        "stdout": {
+          "path": "workspace/tmp/upload-material-registry-20261003/code-fix-sol-03/pyright.stdout",
+          "bytes": 191,
+          "sha256": "46a6c7834c9080ada23a415afd925abecc37d531f5c6e3d14ad0a7ff579096cb"
+        },
+        "stderr": {
+          "path": "workspace/tmp/upload-material-registry-20261003/code-fix-sol-03/pyright.stderr",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      },
+      {
+        "name": "strict",
+        "argv": [
+          "/Users/leo/workspace/dayu-agent-r/.venv/bin/python",
+          "-c",
+          "import runpy; runpy.run_path('utils/cli_ci_upload_material_registry.py', run_name='__main__')",
+          "--oracle-registry",
+          "docs/cli_ci_oracles.json",
+          "--scenario-registry",
+          "docs/cli_ci_scenarios.json",
+          "--authority-index",
+          "docs/gateflow/evidence/upload-material-registry-20261003/authority-index.json",
+          "--assignment",
+          "docs/gateflow/evidence/upload-material-registry-20261003/mandatory-assignment.json",
+          "--before-oracles",
+          "workspace/tmp/upload-material-unified-repair-20261002/post-wu-preparation/cli_ci_oracles.json.before",
+          "--before-scenarios",
+          "workspace/tmp/upload-material-unified-repair-20261002/post-wu-preparation/cli_ci_scenarios.json.before",
+          "--evidence-root",
+          "workspace/evidence/upload-material-cli-20261003-79977b3a-01/public",
+          "--backup-root",
+          "output/evidence-backup/upload-material-cli-20261003-79977b3a-01/public",
+          "--focused-evidence-root",
+          "workspace/evidence/upload-material-diagnostics-focused04-22eca6c3-01/public",
+          "--focused-backup-root",
+          "output/evidence-backup/upload-material-diagnostics-focused04-22eca6c3-01/public",
+          "--focused-source",
+          "docs/gateflow/evidence/upload-material-registry-20261003/focused-source.json",
+          "--source-root",
+          "/Users/leo/workspace/dayu-agent-r",
+          "--registration-target",
+          "22eca6c313005e3c5185340f2d6b535ab2583056",
+          "--check",
+          "--output",
+          "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-registry-20261003/code-fix-sol-03/strict-result.json"
+        ],
+        "cwd": "/Users/leo/workspace/dayu-agent-r",
+        "actual_wait": true,
+        "actual_exit": 0,
+        "stdout": {
+          "path": "workspace/tmp/upload-material-registry-20261003/code-fix-sol-03/strict.stdout",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "stderr": {
+          "path": "workspace/tmp/upload-material-registry-20261003/code-fix-sol-03/strict.stderr",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }
+      }
+    ],
+    "root_original_module_cli": {
+      "argv": [
+        "/Users/leo/workspace/dayu-agent-r/.venv/bin/python",
+        "-m",
+        "utils.cli_ci_upload_material_registry",
+        "--oracle-registry",
+        "docs/cli_ci_oracles.json",
+        "--scenario-registry",
+        "docs/cli_ci_scenarios.json",
+        "--authority-index",
+        "docs/gateflow/evidence/upload-material-registry-20261003/authority-index.json",
+        "--assignment",
+        "docs/gateflow/evidence/upload-material-registry-20261003/mandatory-assignment.json",
+        "--before-oracles",
+        "workspace/tmp/upload-material-unified-repair-20261002/post-wu-preparation/cli_ci_oracles.json.before",
+        "--before-scenarios",
+        "workspace/tmp/upload-material-unified-repair-20261002/post-wu-preparation/cli_ci_scenarios.json.before",
+        "--evidence-root",
+        "workspace/evidence/upload-material-cli-20261003-79977b3a-01/public",
+        "--backup-root",
+        "output/evidence-backup/upload-material-cli-20261003-79977b3a-01/public",
+        "--focused-evidence-root",
+        "workspace/evidence/upload-material-diagnostics-focused04-22eca6c3-01/public",
+        "--focused-backup-root",
+        "output/evidence-backup/upload-material-diagnostics-focused04-22eca6c3-01/public",
+        "--focused-source",
+        "docs/gateflow/evidence/upload-material-registry-20261003/focused-source.json",
+        "--source-root",
+        "/Users/leo/workspace/dayu-agent-r",
+        "--registration-target",
+        "22eca6c313005e3c5185340f2d6b535ab2583056",
+        "--check",
+        "--output",
+        "/Users/leo/workspace/dayu-agent-r/workspace/tmp/upload-material-registry-20261003/root-fix03-strict-module.json"
+      ],
+      "cwd": "/Users/leo/workspace/dayu-agent-r",
+      "actual_wait": true,
+      "actual_exit": 0,
+      "reason": "actor changed strict launch from -m to -c runpy; root restores approved original module CLI, only output path differs",
+      "streams": {
+        "stdout": {
+          "path": "workspace/tmp/upload-material-registry-20261003/root-fix03-strict-module.stdout",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "stderr": {
+          "path": "workspace/tmp/upload-material-registry-20261003/root-fix03-strict-module.stderr",
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "output": {
+          "path": "workspace/tmp/upload-material-registry-20261003/root-fix03-strict-module.json",
+          "bytes": 129672,
+          "sha256": "196d933a99a8503a5cf6ae9550114fdcc0dd3d5b41d8cf4f32a9c435595ad532"
+        }
+      }
+    },
+    "root_actual_wait_exit": {
+      "managed_session": 69855,
+      "actual_exit": 0
+    }
+  },
+  "historical_validation": {
+    "path": "docs/gateflow/evidence/upload-material-registry-20261003/validation.json",
+    "cases": 166,
+    "sha256": "56ad05393ffb9d9b5d12c9ffc91f106053d7c5edc044ca30250c851179408481",
+    "meaning": "fix02 historical snapshot; current validation above supersedes without rewriting historical bytes"
+  },
+  "reviews": [
+    {
+      "route": "mimo",
+      "adjudication": {
+        "setup_status": "ok",
+        "agent_status": "completed",
+        "tool_evidence": "yes",
+        "tool_trace": "complete",
+        "required_evidence": "complete",
+        "canary_status": "match",
+        "result_status": "accepted",
+        "warnings": [
+          "named unrecognized_model stderr warning",
+          "3758 missing project skill dirs ls exit1 recovered via actual full home skills Read exact byte check",
+          "3677 AGENTS no extension ls exit1 masked by compound; actual AGENTS.md full Read recovered",
+          "3774 missing project skills ls stderr redirected/compound final0; home skills fully read, no required gap",
+          "Bash many inner commands omit explicit absolute cd; runner explicit workspace and exact source identity/git cwd verified, protocol deviation",
+          "report says focused manifest 36 entries: actual focused manifest has 40; 36 lineage subset, root corrects count; DS80-copy check independently verified",
+          "report non-delta fallback line551 is typo, actual line951; old generic KeyError handling not new evidence of defect under addressed three contracts",
+          "R02 tests 474-525 fresh primarily diff text; full current code outside necessary delta inherited; no all-source fresh claim accepted",
+          "report says 12 same candidates spot-hashed8 but two are plan/freeze outside14 set; root full14 SHA independently exact, inheritance not based on spotcheck"
+        ],
+        "evidence_gaps": [],
+        "retry_class": "none"
+      },
+      "report": {
+        "path": "docs/reviews/code-review-20261004-142937.md",
+        "sha256": "92c0c682814d319db01ce15623de7a8809282c20c9dd7f203f69f49de0bcb841",
+        "bytes": 14086,
+        "created": "system clock O_EXCL (python open('x'))"
+      },
+      "retention": {
+        "archives": [
+          "workspace/evidence/upload-material-post-ci-gate-runners-20261003/private/registry-code-rereview-mimo-02.tar.gz",
+          "output/evidence-backup/upload-material-post-ci-gate-runners-20261003/private/registry-code-rereview-mimo-02.tar.gz"
+        ],
+        "bytes": 435089,
+        "sha256": "bab4989f614f0e39d0acaa2e15b1ccabcb2cdd1dffb82c21e6101953376c32b5"
+      }
+    },
+    {
+      "route": "ds-flash",
+      "adjudication": {
+        "setup_status": "ok",
+        "agent_status": "completed",
+        "tool_evidence": "yes",
+        "tool_trace": "complete",
+        "required_evidence": "complete",
+        "canary_status": "match",
+        "result_status": "accepted",
+        "warnings": [
+          "named unrecognized_model stderr warning",
+          "4226 missing project skills ls exit1; actual full home skills Read exact byte verification recovered",
+          "39026 utils/__init__.py absent ls exit1; namespace package is valid; consumer search recovered at 45088 actual0",
+          "Bash inner commands often omit explicit absolute cd; runner explicit workspace, exact source identity and actual git cwd verified; recorded protocol deviation"
+        ],
+        "evidence_gaps": [],
+        "retry_class": "none"
+      },
+      "report": {
+        "path": "docs/reviews/code-review-20261004-142329.md",
+        "bytes": 14724,
+        "sha256": "84d5e3d26bc2c69ea031e9cbedf66a4452007a4c5af91a4d069925270d7541ed",
+        "created_with": "O_EXCL, system clock 20261004-142329"
+      },
+      "retention": {
+        "archives": [
+          "workspace/evidence/upload-material-post-ci-gate-runners-20261003/private/registry-code-rereview-ds-flash-02.tar.gz",
+          "output/evidence-backup/upload-material-post-ci-gate-runners-20261003/private/registry-code-rereview-ds-flash-02.tar.gz"
+        ],
+        "bytes": 1847381,
+        "sha256": "8e26c590fc0729ebbaeae418d67349fd9ce6bafd9944a4923df33dc4571a2c1e"
+      }
+    }
+  ],
+  "residuals": {
+    "fixed in current slice": [
+      "REG-C01",
+      "REG-C02",
+      "REG-C03",
+      "REG-C04",
+      "REG-R01",
+      "REG-R02",
+      "REG-R03"
+    ],
+    "covered by later approved slice": [],
+    "assigned to later work unit": [
+      "Linux/Windows XBRL deployment verification (user approved deferral)",
+      "CNInfo historical disclosure dates migration",
+      "deleted historical Raw gap and existing 22 residuals"
+    ],
+    "tracked by existing issue": [
+      "Docling extraction quality #4437"
+    ],
+    "requiring new issue or explicit user decision": []
+  },
+  "next_entry": "accepted slice commit -> aggregate deepreview; not WU complete"
+}

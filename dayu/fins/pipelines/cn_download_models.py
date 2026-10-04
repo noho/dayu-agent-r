@@ -21,10 +21,29 @@ from dataclasses import dataclass
 from typing import Final, Literal, Optional, TypeAlias
 
 from dayu.fins.domain.filing_semantics import FiscalPeriod
+from dayu.fins.download_contract import FinsDownloadUncertainReport
 
 CnMarketKind = Literal["CN", "HK"]
 """CN 下载链路覆盖的市场标识。``ticker_normalization.NormalizedTicker.market``
 取值 ``"CN"`` / ``"HK"`` / ``"US"``，本字面量是 CN 链路允许的子集。"""
+
+CnDownloadTerminalStatus: TypeAlias = Literal["ok", "cancelled", "integrity_failed"]
+"""CN/HK 下载与本地重建共享的 pipeline 终态；不表示每文档状态。"""
+
+CN_DOWNLOAD_TERMINAL_OK: Final[CnDownloadTerminalStatus] = "ok"
+"""普通下载或重建完成；文档是否成功由各行结果表达。"""
+
+CN_DOWNLOAD_TERMINAL_CANCELLED: Final[CnDownloadTerminalStatus] = "cancelled"
+"""普通下载或重建已取消，保留已处理文档摘要。"""
+
+CN_DOWNLOAD_TERMINAL_INTEGRITY_FAILED: Final[CnDownloadTerminalStatus] = "integrity_failed"
+"""私有完整性中止快照的终态，仅由完整性快照入口消费。"""
+
+CN_DOWNLOAD_NORMAL_TERMINAL_STATUSES: Final[tuple[CnDownloadTerminalStatus, ...]] = (
+    CN_DOWNLOAD_TERMINAL_OK,
+    CN_DOWNLOAD_TERMINAL_CANCELLED,
+)
+"""普通结果入口的合法终态子集，直接派生自同一词表。"""
 
 CnFiscalPeriod: TypeAlias = FiscalPeriod
 """CN/HK 财期类型别名，消费共享 domain 财期真源。
@@ -188,7 +207,7 @@ class CnReportCandidate:
     """单份候选报告的远端元数据。
 
     downloader 返回此对象，但**不**生成 ``document_id``（document_id 由
-    ``build_cn_filing_ids`` 在 pipeline 层统一生成）。``content_length`` /
+    pipeline 的来源身份绑定规则统一分配或复用）。``content_length`` /
     ``etag`` / ``last_modified`` 用于参与 ``remote_fingerprint`` 计算。
 
     Attributes:
@@ -197,6 +216,8 @@ class CnReportCandidate:
             ``DOC_ID``）。
         source_url: 直接可下载 PDF 的绝对 URL。
         title: 公告标题（用于诊断、白/黑名单匹配）。
+        category_text: 原始 provider 分类；缺少时为空。
+        report_date: 从原始标题识别的截止日；缺少时为 None。
         language: 候选语言；副语言不入主 candidate。
         filing_date: 公告披露日期，``YYYY-MM-DD``。
         fiscal_year: 推断财年；``fiscal_year_source`` 在 source meta 标记为
@@ -221,6 +242,9 @@ class CnReportCandidate:
     content_length: Optional[int]
     etag: Optional[str]
     last_modified: Optional[str]
+
+    category_text: str = ""
+    report_date: str | None = None
 
 
 @dataclass(frozen=True)
@@ -312,9 +336,15 @@ class DownloadedReportAsset:
 
 
 __all__ = [
+    "CnReportDiscoveryResult",
+    "CN_DOWNLOAD_NORMAL_TERMINAL_STATUSES",
+    "CN_DOWNLOAD_TERMINAL_OK",
+    "CN_DOWNLOAD_TERMINAL_CANCELLED",
+    "CN_DOWNLOAD_TERMINAL_INTEGRITY_FAILED",
     "CN_FISCAL_PERIOD_ORDER",
     "CN_PIPELINE_DOWNLOAD_VERSION",
     "CnDownloadCancelledError",
+    "CnDownloadTerminalStatus",
     "CnCompanyProfile",
     "CnFilingStage",
     "CnFiscalPeriod",
@@ -329,3 +359,11 @@ __all__ = [
     "DownloadedReportAsset",
     "HkexnewsRawAnnouncement",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class CnReportDiscoveryResult:
+    """完整发现的确定候选与独立未知来源；两个集合均必填，不做身份分配。"""
+
+    candidates: tuple[CnReportCandidate, ...]
+    uncertain_reports: tuple[FinsDownloadUncertainReport, ...]

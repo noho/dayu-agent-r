@@ -40,12 +40,14 @@ import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, TypeVar, cast
 
+from dayu.documents.xbrl_config import PreparedXbrlInput
+
 if TYPE_CHECKING:
     from docling.backend.abstract_backend import AbstractDocumentBackend
     from docling.datamodel.accelerator_options import AcceleratorOptions
     from docling.datamodel.base_models import DocumentStream, InputFormat
     from docling.datamodel.document import ConversionResult
-    from docling.datamodel.pipeline_options import PipelineOptions, TableFormerMode
+    from docling.datamodel.pipeline_options import OcrOptions, PipelineOptions, TableFormerMode
     from docling.document_converter import DocumentConverter
 
 DOCLING_DEVICE_ENV = "DAYU_DOCLING_DEVICE"
@@ -61,6 +63,8 @@ _PYPDFIUM2_BACKEND_NAME = "pypdfium2"
 _SUPPORTED_DOCLING_BACKENDS = frozenset({_DOCLING_PARSE_BACKEND_NAME, _PYPDFIUM2_BACKEND_NAME})
 _TABLE_MODE_ACCURATE = "accurate"
 _TABLE_MODE_FAST = "fast"
+_OCR_BACKEND_TORCH = "torch"
+_OCR_LANGUAGE_CHINESE = "ch"
 _LOGGER = logging.getLogger(__name__)
 _WINDOWS_PLATFORM_NAME = "win32"
 _TResult = TypeVar("_TResult")
@@ -250,6 +254,7 @@ class _DoclingPdfPipelineOptionsProtocol(Protocol):
     do_table_structure: bool
     accelerator_options: "AcceleratorOptions | None"
     table_structure_options: _DoclingTableStructureOptionsProtocol
+    ocr_options: "OcrOptions"
 
 
 class _DoclingPdfConvertOperation(Protocol[_TResultCovariant]):
@@ -643,7 +648,9 @@ def build_docling_pdf_pipeline_options(
             AcceleratorDevice,
         )
         from docling.datamodel.pipeline_options import (
+            OcrMode,
             PdfPipelineOptions,
+            RapidOcrOptions,
             TableFormerMode,
         )
     except ImportError as exc:  # pragma: no cover - 依赖缺失保护
@@ -657,6 +664,18 @@ def build_docling_pdf_pipeline_options(
     pipeline_options.do_ocr = do_ocr
     pipeline_options.do_table_structure = do_table_structure
     pipeline_options.accelerator_options = AcceleratorOptions(device=AcceleratorDevice(normalized_device_name))
+    # OCR 引擎选择由本模块显式拥有，不依赖 Docling 的 auto 选择：auto 会按平台与
+    # 已安装包改写引擎（darwin 优先 ocrmac、linux 优先 nemotron），导致同一份文档
+    # 因环境差异被不同引擎识别（实测 Apple Vision 在未配置语言偏好时会把中文识别为
+    # 乱码），且代码与测试都无法感知。显式选择使结果环境无关、可测试。
+    # - backend=torch：本产品未安装 onnxruntime/easyocr，实测生效的 RapidOCR 后端
+    #   就是 torch；而 RapidOcrOptions 默认值是 onnxruntime，不显式写会与实测不符。
+    # - lang=ch：PP-OCR 简体中文识别器覆盖中英混排，与语料（中文财报）一致。
+    pipeline_options.ocr_options = RapidOcrOptions(
+        backend=_OCR_BACKEND_TORCH,
+        mode=OcrMode.DEFAULT,
+        lang=[_OCR_LANGUAGE_CHINESE],
+    )
 
     if do_table_structure:
         table_structure_options = cast(
@@ -876,3 +895,45 @@ def convert_pdf_bytes_with_docling(
         table_mode=table_mode,
         do_cell_matching=do_cell_matching,
     )
+
+
+def convert_xbrl_bytes_with_docling(
+    input_bytes: bytes, *, stream_name: str, xbrl_input: PreparedXbrlInput
+) -> "ConversionResult":
+    """只执行一次受控 XBRL 转换，调用者在导出后的 finally 释放返回结果。
+
+    参数：原件字节、名称、完整复验的请求快照。
+    返回：真实第三方转换结果，包括失败结果；调用者不能把失败结果登记为成功。
+    异常：第三方装配失败抛 DoclingRuntimeInitializationError；实际转换异常透传。
+    """
+    # spawn bootstrap 不导入第三方；这里只能在 worker 强制策略及复验之后调用。
+    try:
+        from docling.datamodel.backend_options import XBRLBackendOptions
+        from docling.datamodel.base_models import InputFormat
+        from docling.document_converter import DocumentConverter, XBRLFormatOption
+
+        converter = DocumentConverter(
+            allowed_formats=[InputFormat.XML_XBRL],
+            format_options={InputFormat.XML_XBRL: XBRLFormatOption(backend_options=XBRLBackendOptions(
+                taxonomy=xbrl_input.taxonomy_snapshot_root,
+                enable_local_fetch=True,
+                enable_remote_fetch=False,
+            ))},
+        )
+    except Exception as exc:
+        raise DoclingRuntimeInitializationError("XBRL 转换器初始化失败") from exc
+    # 让 pipeline 错误作为结果返回，保证实际 backend 可在调用者 finally 中释放。
+    return converter.convert(_build_docling_document_stream(input_bytes, stream_name=stream_name), raises_on_error=False)
+
+
+def unload_xbrl_conversion(conversion: "ConversionResult") -> None:
+    """参数：本次真实结果；返回：无；异常：原 backend 卸载失败透传。
+
+    SimplePipeline 的 _unload 是 no-op；本函数只供持有结果的调用者 finally 调用一次。
+    未构造 backend 时不宣称模型已关闭。
+    """
+    # Docling 构造 backend 失败时仅设置 valid=False，尚未绑定 _backend。
+    # 无效输入不授予本调用者 backend 所有权，不能访问或宣称释放模型。
+    if not conversion.input.valid:
+        return
+    conversion.input._backend.unload()

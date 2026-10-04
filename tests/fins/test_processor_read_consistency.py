@@ -2,6 +2,14 @@
 
 from __future__ import annotations
 
+from docling_core.types.doc.document import DoclingDocument
+from dayu.fins.upload_asset_plan import docling_storage_name
+
+from dayu.fins.storage import FsBatchingRepository, FsCompanyMetaRepository, FsSourceDocumentRepository, FsDocumentBlobRepository, FsFilingMaintenanceRepository, FsFilingUploadStateRepository, FsProcessedDocumentRepository
+from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
+
+from dayu.fins.storage import FsMaterialUploadStateRepository
+
 import gc
 import hashlib
 import json
@@ -1419,7 +1427,7 @@ async def test_repaired_snapshot_and_process_entry_consume_only_new_primary(
         filing_maintenance_repository=default_runtime.filing_maintenance_repository,
         filing_upload_state_repository=default_runtime.filing_upload_state_repository,
         docling_converter=converter,
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(workspace_root, repository_set=(_material_test_repository_set := build_fs_repository_set(workspace_root=workspace_root, create_directories=False))),)
     primary = tmp_path / "repair-process-primary.pdf"
     companion = tmp_path / "repair-process-companion.xlsx"
     primary.write_bytes(b"authoritative primary")
@@ -3616,19 +3624,33 @@ def test_document_alias_across_source_kinds_is_rejected_as_ambiguous(tmp_path: P
             batch=batch,
             content_type="text/plain",
         )
+        primary = docling_storage_name(SourceKind.MATERIAL,"material.txt")
+        docling_file = repository._blob_repository.store_file(
+            SourceHandle("AAPL", material_document_id, SourceKind.MATERIAL.value),
+            primary, BytesIO(DoclingDocument(name=material_document_id).model_dump_json().encode()),
+            batch=batch, content_type="application/json",
+        )
+        file_entries: list[dict[str, JsonValue]] = [
+            {"name": name, "uri": asset.uri, "size": asset.size, "sha256": asset.sha256, "content_type": asset.content_type, "source": role}
+            for asset, role, name in ((material_file,"original","material.txt"),(docling_file,"docling",primary))
+        ]
         repository.create_source_document(
             SourceDocumentUpsertRequest(
                 ticker="AAPL",
                 document_id=material_document_id,
                 internal_document_id=shared_alias,
                 form_type="EX-99",
-                primary_document="material.txt",
+                primary_document=primary,
+                file_entries=file_entries,
                 files=[material_file],
                 meta={
                     "ingest_method": "upload",
                     "source_provider": FinsSourceProvider.USER_UPLOAD.to_storage_value(),
                     "ingest_complete": True,
                     "is_deleted": False,
+                    "amended": False,
+                    "fiscal_year": None,
+                    "fiscal_period": None,
                 },
             ),
             SourceKind.MATERIAL,

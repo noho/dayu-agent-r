@@ -8,12 +8,14 @@
 from __future__ import annotations
 
 import calendar
+import json
+from collections.abc import Mapping
 import datetime as dt
 import re
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import PurePosixPath
-from typing import Final
+from typing import Final, Literal
 
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.filing_semantics import (
@@ -316,6 +318,96 @@ class FinsDownloadDocumentResult:
             raise ValueError("downloaded document result requires artifact_locator")
 
 
+_UNCERTAIN_REASON: Literal["uncertain_hk_period"] = "uncertain_hk_period"
+_UNCERTAIN_MESSAGE: Final[str] = "已发现报告，但财期依据不足或冲突；未确认其财年/财期，未按猜测财期发布。"
+_UNCERTAIN_NO_DATE: Final[str] = "报告截止日也未确认。"
+
+
+@dataclass(frozen=True, slots=True)
+class FinsDownloadUncertainReport:
+    """来源可定位但财期尚未确认的港股报告；不承诺文档身份或发布成功。"""
+
+    source_id: str
+    filing_date: str | None
+    report_date: str | None
+    existing_document_id: str | None
+    reason_category: Literal["uncertain_hk_period"]
+
+    def __post_init__(self) -> None:
+        """参数：无。返回：无。异常：非法引用、日期或原因抛 TypeError/ValueError。"""
+        _validate_public_text(self.source_id, field_name="source_id", allow_none=False)
+        _validate_public_text(self.existing_document_id, field_name="existing_document_id", allow_none=True)
+        _parse_optional_iso_date(self.filing_date, field_name="filing_date")
+        _parse_optional_iso_date(self.report_date, field_name="report_date")
+        if self.reason_category != _UNCERTAIN_REASON:
+            raise ValueError("uncertain report reason must be uncertain_hk_period")
+
+    @property
+    def reason_message(self) -> str:
+        """参数无；返回与截止日状态同源的固定业务说明；异常无。"""
+        return _UNCERTAIN_MESSAGE + (_UNCERTAIN_NO_DATE if self.report_date is None else "")
+
+    def to_json_value(self) -> dict[str, JsonValue]:
+        """参数无；返回完整六字段安全 JSON；异常无。"""
+        return {
+            "source_id": self.source_id, "filing_date": self.filing_date,
+            "report_date": self.report_date, "existing_document_id": self.existing_document_id,
+            "reason_category": self.reason_category, "reason_message": self.reason_message,
+        }
+
+    @classmethod
+    def from_json_value(cls, value: Mapping[str, JsonValue]) -> "FinsDownloadUncertainReport":
+        """严格解码未知报告的新 JSON。
+
+        参数：value 为完整六字段映射，日期和既有身份的显式 null 不等于缺字段。
+        返回：安全引用、日期和业务说明一致的未知对象。
+        异常：缺字段、字段类型或说明不符抛 ValueError；引用或日期校验异常原样传播。"""
+        if set(value) != {"source_id", "filing_date", "report_date", "existing_document_id", "reason_category", "reason_message"}:
+            raise ValueError("uncertain report requires complete schema")
+        source_id = _required_json_text(value, "source_id")
+        if source_id is None or value["reason_category"] != _UNCERTAIN_REASON:
+            raise ValueError("invalid uncertain source or reason")
+        result = cls(
+            source_id=source_id, filing_date=_required_json_text(value, "filing_date"),
+            report_date=_required_json_text(value, "report_date"),
+            existing_document_id=_required_json_text(value, "existing_document_id"), reason_category=_UNCERTAIN_REASON,
+        )
+        if value["reason_message"] != result.reason_message:
+            raise ValueError("uncertain reason_message does not match date fact")
+        return result
+
+
+def _required_json_text(value: Mapping[str, JsonValue], key: str) -> str | None:
+    """读取必填可空 JSON 文本。
+
+    参数：value 为 JSON 映射；key 为必填字段名。
+    返回：未经转换的文本或显式 null。
+    异常：缺键原样抛 KeyError；非文本且非 null 值抛 ValueError。"""
+    item = value[key]
+    if item is not None and not isinstance(item, str):
+        raise ValueError(f"{key} must be text or null")
+    return item
+
+
+def validate_download_uncertain_reports(
+    source: FinsDownloadSource, reports: tuple[FinsDownloadUncertainReport, ...],
+) -> None:
+    """校验未知报告的来源与引用唯一性。
+
+    参数：source 为已解析下载来源；reports 为完整或公开的 typed 未知列表。
+    返回：无。
+    异常：列表类型、来源或重复引用不符合契约时抛 ValueError。"""
+    if not isinstance(reports, tuple) or any(not isinstance(item, FinsDownloadUncertainReport) for item in reports):
+        raise ValueError("uncertain_reports must contain typed reports")
+    if reports and source is not FinsDownloadSource.HKEXNEWS:
+        raise ValueError("only HKEXNEWS may contain uncertain reports")
+    if len({item.source_id for item in reports}) != len(reports):
+        raise ValueError("uncertain source references must be unique")
+    existing = tuple(item.existing_document_id for item in reports if item.existing_document_id is not None)
+    if len(set(existing)) != len(existing):
+        raise ValueError("uncertain existing document IDs must be unique")
+
+
 @dataclass(frozen=True, slots=True)
 class FinsDownloadResultSummary:
     """一次 source adapter operation 的完整 typed 下载结果。
@@ -332,6 +424,8 @@ class FinsDownloadResultSummary:
     skipped_count: int
     rejected_count: int
     failed_count: int
+    uncertain_count: int
+    uncertain_reports: tuple[FinsDownloadUncertainReport, ...]
     document_rows: tuple[FinsDownloadDocumentResult, ...]
     terminal_disposition: FinsDownloadTerminalDisposition
     missing_periods: tuple[str, ...] = ()
@@ -367,15 +461,21 @@ class FinsDownloadResultSummary:
             self.skipped_count,
             self.rejected_count,
             self.failed_count,
+            self.uncertain_count,
         )
-        if any(count < 0 for count in counts):
+        if any(type(count) is not int or count < 0 for count in counts):
             raise ValueError("download counts must be non-negative")
         if self.discovered_count != sum(counts[1:]):
             raise ValueError("discovered_count must equal disposition counts")
         for row in self.document_rows:
             if not isinstance(row, FinsDownloadDocumentResult):
                 raise TypeError("document_rows must contain FinsDownloadDocumentResult")
-        if len(self.document_rows) != self.discovered_count:
+        validate_download_uncertain_reports(self.source, self.uncertain_reports)
+        if len(self.uncertain_reports) != self.uncertain_count:
+            raise ValueError("uncertain_count must equal uncertain_reports length")
+        if {row.document_id for row in self.document_rows} & {r.existing_document_id for r in self.uncertain_reports}:
+            raise ValueError("known and uncertain existing document IDs overlap")
+        if len(self.document_rows) + self.uncertain_count != self.discovered_count:
             raise ValueError("document_rows must contain every discovered document")
         disposition_counts = {
             disposition: sum(1 for row in self.document_rows if row.disposition is disposition)
@@ -389,18 +489,18 @@ class FinsDownloadResultSummary:
             raise ValueError("rejected_count does not match document_rows")
         if disposition_counts[FinsDownloadDocumentDisposition.FAILED] != self.failed_count:
             raise ValueError("failed_count does not match document_rows")
-        expected_terminal = _terminal_disposition_from_counts(
-            discovered_count=self.discovered_count,
+        expected_terminal = download_terminal_disposition_from_counts(
             downloaded_count=self.downloaded_count,
             rejected_count=self.rejected_count,
             failed_count=self.failed_count,
+            uncertain_count=self.uncertain_count,
         )
         # 零候选通常表示正常完成且没有命中；只有 adapter 启动前失败或取消可覆盖终态。
         empty_terminal_override = self.discovered_count == 0 and self.terminal_disposition in {
             FinsDownloadTerminalDisposition.FAILED,
             FinsDownloadTerminalDisposition.CANCELLED,
         }
-        if self.terminal_disposition is not expected_terminal and not empty_terminal_override:
+        if self.terminal_disposition is not expected_terminal and not empty_terminal_override and self.terminal_disposition is not FinsDownloadTerminalDisposition.CANCELLED:
             raise ValueError("terminal_disposition does not match download outcome")
         if len(set(self.missing_periods)) != len(self.missing_periods):
             raise ValueError("missing_periods must not contain duplicates")
@@ -415,6 +515,7 @@ class FinsDownloadResultSummary:
         canonical_ticker: str,
         effective_filters: FinsDownloadEffectiveFilters,
         document_rows: tuple[FinsDownloadDocumentResult, ...],
+        uncertain_reports: tuple[FinsDownloadUncertainReport, ...],
         missing_periods: tuple[str, ...] = (),
     ) -> "FinsDownloadResultSummary":
         """从完整 typed rows 唯一派生 counts 与正常终态。
@@ -424,6 +525,7 @@ class FinsDownloadResultSummary:
             canonical_ticker: canonical ticker。
             effective_filters: workflow 实际采用的筛选条件。
             document_rows: 完整 operation-local document rows。
+            uncertain_reports: 完整未知来源 tuple，非 HK 显式为空。
             missing_periods: 不计入 discovered 的缺失财期。
 
         Returns:
@@ -438,7 +540,8 @@ class FinsDownloadResultSummary:
         skipped_count = sum(row.disposition is FinsDownloadDocumentDisposition.SKIPPED for row in document_rows)
         rejected_count = sum(row.disposition is FinsDownloadDocumentDisposition.REJECTED for row in document_rows)
         failed_count = sum(row.disposition is FinsDownloadDocumentDisposition.FAILED for row in document_rows)
-        discovered_count = len(document_rows)
+        uncertain_count = len(uncertain_reports)
+        discovered_count = len(document_rows) + uncertain_count
         return cls(
             source=source,
             canonical_ticker=canonical_ticker,
@@ -448,12 +551,14 @@ class FinsDownloadResultSummary:
             skipped_count=skipped_count,
             rejected_count=rejected_count,
             failed_count=failed_count,
+            uncertain_count=uncertain_count,
+            uncertain_reports=uncertain_reports,
             document_rows=document_rows,
-            terminal_disposition=_terminal_disposition_from_counts(
-                discovered_count=discovered_count,
+            terminal_disposition=download_terminal_disposition_from_counts(
                 downloaded_count=downloaded_count,
                 rejected_count=rejected_count,
                 failed_count=failed_count,
+                uncertain_count=uncertain_count,
             ),
             missing_periods=missing_periods,
         )
@@ -488,68 +593,171 @@ class FinsDownloadResultSummary:
 
         return 0
 
-    def to_json_summary(self) -> dict[str, JsonValue]:
-        """投影 legacy job record 使用的同源有界摘要。
+    def _bounded_projection(self, *, max_json_chars: int) -> tuple[dict[str, JsonValue], tuple[FinsDownloadUncertainReport, ...]]:
+        """在同一预算算法中投影持久摘要与公开未知前缀。
 
-        Returns:
-            计数、downloaded IDs、missing periods 与 effective filters。
-
-        Raises:
-            无。
-        """
-
-        written_document_ids = self.written_document_ids[:FINS_DOWNLOAD_PUBLIC_MAX_DOCUMENT_ROWS]
-        return {
-            "source": self.source.value,
-            "ticker": self.canonical_ticker,
+        参数：max_json_chars 为 JSON 字符预算，采用与 job store 相同的序列化规则。
+        返回：完整持久摘要与保留真实引用的公开未知 tuple。
+        异常：基础事实及首条未知不能同时容纳时抛 ValueError。"""
+        reports = tuple(sorted(self.uncertain_reports, key=lambda r: (r.filing_date or "", r.source_id, r.existing_document_id or "")))
+        written = list(self.written_document_ids[:FINS_DOWNLOAD_PUBLIC_MAX_DOCUMENT_ROWS])
+        visible = list(reports[:1])
+        result: dict[str, JsonValue] = {
+            "source": self.source.value, "ticker": self.canonical_ticker,
             "filters": {
-                "forms": list(self.effective_filters.form_types),
-                "start_date": self.effective_filters.start_date,
-                "end_date": self.effective_filters.end_date,
-                "overwrite": self.effective_filters.overwrite_existing,
+                "forms": list(self.effective_filters.form_types), "start_date": self.effective_filters.start_date,
+                "end_date": self.effective_filters.end_date, "overwrite": self.effective_filters.overwrite_existing,
                 "rebuild": self.effective_filters.rebuild_local_artifacts,
             },
-            "discovered_count": self.discovered_count,
-            "downloaded_count": self.downloaded_count,
-            "skipped_count": self.skipped_count,
-            "rejected_count": self.rejected_count,
-            "failed_count": self.failed_count,
-            "written_document_ids": list(written_document_ids),
-            "omitted_written_document_count": self.downloaded_count - len(written_document_ids),
-            "missing_periods": list(self.missing_periods),
-            "terminal_disposition": self.terminal_disposition.value,
+            "discovered_count": self.discovered_count, "downloaded_count": self.downloaded_count,
+            "skipped_count": self.skipped_count, "rejected_count": self.rejected_count, "failed_count": self.failed_count,
+            "uncertain_count": self.uncertain_count, "uncertain_reports": [r.to_json_value() for r in visible],
+            "omitted_uncertain_count": self.uncertain_count - len(visible),
+            "written_document_ids": list(written), "omitted_written_document_count": self.downloaded_count - len(written),
+            "missing_periods": list(self.missing_periods), "terminal_disposition": self.terminal_disposition.value,
         }
+        while len(json.dumps(result, ensure_ascii=False, sort_keys=True)) > max_json_chars and written:
+            written.pop()
+            result["written_document_ids"] = list(written)
+            result["omitted_written_document_count"] = self.downloaded_count - len(written)
+        if len(json.dumps(result, ensure_ascii=False, sort_keys=True)) > max_json_chars:
+            raise ValueError("download summary cannot fit required facts and first uncertain report")
+        for report in reports[1:FINS_DOWNLOAD_PUBLIC_MAX_DOCUMENT_ROWS]:
+            result["uncertain_reports"] = [r.to_json_value() for r in (*visible, report)]
+            result["omitted_uncertain_count"] = self.uncertain_count - len(visible) - 1
+            if len(json.dumps(result, ensure_ascii=False, sort_keys=True)) > max_json_chars:
+                result["uncertain_reports"] = [r.to_json_value() for r in visible]
+                result["omitted_uncertain_count"] = self.uncertain_count - len(visible)
+                break
+            visible.append(report)
+        return result, tuple(visible)
+
+    def public_uncertain_reports(self, *, max_json_chars: int) -> tuple[FinsDownloadUncertainReport, ...]:
+        """获取与持久摘要同源的公开未知前缀。
+
+        参数：max_json_chars 为持久摘要的 JSON 字符预算。
+        返回：与同预算持久摘要逐件相同的未知报告 tuple。
+        异常：预算不能容纳必要事实时抛 ValueError。"""
+        return self._bounded_projection(max_json_chars=max_json_chars)[1]
+
+    def to_json_summary(self, *, max_json_chars: int) -> dict[str, JsonValue]:
+        """生成完整新 schema 的有界持久摘要。
+
+        参数：max_json_chars 为 JSON 字符预算。
+        返回：计数、已发布身份、未知报告和两 omission 同源的 JSON 字典。
+        异常：预算不能容纳必要事实时抛 ValueError。"""
+        return self._bounded_projection(max_json_chars=max_json_chars)[0]
 
 
-def _terminal_disposition_from_counts(
-    *,
-    discovered_count: int,
-    downloaded_count: int,
-    rejected_count: int,
-    failed_count: int,
+def download_terminal_disposition_from_counts(
+    *, downloaded_count: int, rejected_count: int, failed_count: int, uncertain_count: int,
 ) -> FinsDownloadTerminalDisposition:
-    """从 owner counts 派生正常完成后的终态分类。
+    """由已确认文档与未知报告计数派生正常下载终态。
 
-    Args:
-        discovered_count: provider candidate 总数。
-        downloaded_count: 下载成功数。
-        rejected_count: 业务拒绝数。
-        failed_count: 下载失败数。
-
-    Returns:
-        succeeded、partial failure 或 failed。
-
-    Raises:
-        AssertionError: 调用方绕过计数守恒并传入不可达组合时抛出。
-    """
-
-    if failed_count == 0:
+    参数：downloaded_count 为已发布数；rejected_count 为拒绝数；failed_count 为失败文档数；
+        uncertain_count 为独立未知报告数，不计入失败文档数。
+    返回：正常完成、部分失败或失败的 typed 终态；取消由运行时显式覆盖。
+    异常：任何计数非非负整数时抛 ValueError。"""
+    if any(type(n) is not int or n < 0 for n in (downloaded_count, rejected_count, failed_count, uncertain_count)):
+        raise ValueError("download counts must be non-negative integers")
+    if failed_count + uncertain_count == 0:
         return FinsDownloadTerminalDisposition.SUCCEEDED
     if downloaded_count == 0 and rejected_count == 0:
         return FinsDownloadTerminalDisposition.FAILED
-    if discovered_count > 0:
-        return FinsDownloadTerminalDisposition.PARTIAL_FAILURE
-    raise AssertionError("mixed download failure requires discovered_count > 0")
+    return FinsDownloadTerminalDisposition.PARTIAL_FAILURE
+
+
+def validate_download_json_summary(value: Mapping[str, JsonValue]) -> None:
+    """严格验证完整持久下载摘要。
+
+    参数：value 为非空、新 schema 的持久下载 JSON 映射。
+    返回：无，不改写业务事实或终态。
+    异常：缺字段、字段类型、来源、计数、引用、omission 或终态矛盾时抛 ValueError；
+        文本与日期 owner 的校验异常原样传播。"""
+    keys = {
+        "source", "ticker", "filters", "discovered_count", "downloaded_count", "skipped_count", "rejected_count",
+        "failed_count", "uncertain_count", "uncertain_reports", "omitted_uncertain_count", "written_document_ids",
+        "omitted_written_document_count", "missing_periods", "terminal_disposition",
+    }
+    if set(value) != keys:
+        raise ValueError("download summary requires complete fresh schema")
+    source_text, ticker = _required_json_text(value, "source"), _required_json_text(value, "ticker")
+    if source_text is None or ticker is None:
+        raise ValueError("download source and ticker are required")
+    source = FinsDownloadSource(source_text)
+    _validate_public_text(ticker, field_name="ticker", allow_none=False)
+    filters = value["filters"]
+    if not isinstance(filters, dict) or set(filters) != {"forms", "start_date", "end_date", "overwrite", "rebuild"}:
+        raise ValueError("download filters require complete schema")
+    forms = _required_json_text_list(filters, "forms")
+    overwrite, rebuild = filters["overwrite"], filters["rebuild"]
+    if not isinstance(overwrite, bool) or not isinstance(rebuild, bool):
+        raise ValueError("download filter modes must be bool")
+    FinsDownloadEffectiveFilters(forms, _required_json_text(filters, "start_date"), _required_json_text(filters, "end_date"), overwrite, rebuild)
+    counts = {key: _required_json_count(value, key) for key in keys if key.endswith("_count")}
+    if counts["discovered_count"] != sum(counts[k] for k in ("downloaded_count", "skipped_count", "rejected_count", "failed_count", "uncertain_count")):
+        raise ValueError("download counts do not conserve discovered reports")
+    raw_reports = value["uncertain_reports"]
+    if not isinstance(raw_reports, list) or any(not isinstance(item, dict) for item in raw_reports):
+        raise ValueError("uncertain_reports must be JSON objects")
+    reports: list[FinsDownloadUncertainReport] = []
+    for item in raw_reports:
+        if not isinstance(item, dict):
+            raise ValueError("uncertain report must be object")
+        reports.append(FinsDownloadUncertainReport.from_json_value(item))
+    validate_download_uncertain_reports(source, tuple(reports))
+    if len(reports) > FINS_DOWNLOAD_PUBLIC_MAX_DOCUMENT_ROWS or len(reports) + counts["omitted_uncertain_count"] != counts["uncertain_count"]:
+        raise ValueError("uncertain omission does not conserve reports")
+    if counts["uncertain_count"] and not reports:
+        raise ValueError("at least one uncertain report must remain visible")
+    if source is not FinsDownloadSource.HKEXNEWS and counts["uncertain_count"]:
+        raise ValueError("non-HK source cannot contain uncertain counts")
+    written = _required_json_text_list(value, "written_document_ids")
+    _required_json_text_list(value, "missing_periods")
+    if len(written) > FINS_DOWNLOAD_PUBLIC_MAX_DOCUMENT_ROWS or len(written) + counts["omitted_written_document_count"] != counts["downloaded_count"]:
+        raise ValueError("written omission does not conserve downloaded documents")
+    if set(written) & {r.existing_document_id for r in reports}:
+        raise ValueError("written and uncertain document IDs overlap")
+    expected = download_terminal_disposition_from_counts(
+        downloaded_count=counts["downloaded_count"], rejected_count=counts["rejected_count"],
+        failed_count=counts["failed_count"], uncertain_count=counts["uncertain_count"],
+    )
+    terminal = value["terminal_disposition"]
+    if terminal != expected.value and terminal != FinsDownloadTerminalDisposition.CANCELLED.value:
+        if not (counts["discovered_count"] == 0 and terminal == FinsDownloadTerminalDisposition.FAILED.value):
+            raise ValueError("download terminal does not match counts")
+
+
+def _required_json_count(value: Mapping[str, JsonValue], key: str) -> int:
+    """读取必填非负 JSON 计数。
+
+    参数：value 为 JSON 映射；key 为必填计数字段名。
+    返回：非负整数，bool 不视为整数计数。
+    异常：缺键原样抛 KeyError；非法计数抛 ValueError。"""
+    item = value[key]
+    if not isinstance(item, int) or isinstance(item, bool) or item < 0:
+        raise ValueError(f"{key} must be a non-negative integer")
+    return item
+
+
+def _required_json_text_list(value: Mapping[str, JsonValue], key: str) -> tuple[str, ...]:
+    """读取必填唯一安全文本列表。
+
+    参数：value 为 JSON 映射；key 为必填列表字段名。
+    返回：保留输入顺序、不修改文本的 tuple。
+    异常：缺键原样抛 KeyError；类型或重复值抛 ValueError；安全文本校验异常原样传播。"""
+    items = value[key]
+    if not isinstance(items, list):
+        raise ValueError(f"{key} must be a list")
+    result: list[str] = []
+    for item in items:
+        if not isinstance(item, str):
+            raise ValueError(f"{key} must contain text")
+        _validate_public_text(item, field_name=key, allow_none=False)
+        result.append(item)
+    if len(set(result)) != len(result):
+        raise ValueError(f"{key} must contain unique text")
+    return tuple(result)
 
 
 @dataclass(frozen=True, slots=True)
@@ -914,6 +1122,10 @@ __all__: tuple[str, ...] = (
     "FinsDownloadProviderError",
     "FinsDownloadRequest",
     "FinsDownloadResultSummary",
+    "FinsDownloadUncertainReport",
+    "download_terminal_disposition_from_counts",
+    "validate_download_json_summary",
+    "validate_download_uncertain_reports",
     "FinsDownloadSource",
     "FinsDownloadTerminalDisposition",
     "FinsDownloadTransportCategory",

@@ -10,8 +10,8 @@ from __future__ import annotations
 import logging
 from typing import Final
 
+from dayu.fins.upload_usage_contract import FinsUploadUsageError
 from dayu.fins.ingestion_runtime import (
-    FinsUploadUsageError,
     ValidatedFinsUploadFilingRequest,
     validate_fins_upload_filing_request,
 )

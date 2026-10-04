@@ -30,10 +30,8 @@ from dayu.fins.download_contract import (
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.ingestion_runtime import (
     FinsPreprocessRequest,
-    FinsUploadFilingRequest,
-    FinsUploadMaterialRequest,
-    FinsUploadRequest,
     ValidatedFinsUploadFilingRequest,
+    ValidatedFinsUploadMaterialRequest,
 )
 from dayu.fins.service_runtime import DefaultFinsRuntime
 
@@ -81,7 +79,7 @@ class FinsDirectIngestionRuntime(Protocol):
 
     def upload(
         self,
-        request: ValidatedFinsUploadFilingRequest | FinsUploadMaterialRequest,
+        request: ValidatedFinsUploadFilingRequest | ValidatedFinsUploadMaterialRequest,
         *,
         cancellation_token: CancellationToken | None = None,
     ) -> ValidatedFinsEventStream:
@@ -298,68 +296,24 @@ class FinsDirectCommandService:
 
     def upload_material(
         self,
+        request: ValidatedFinsUploadMaterialRequest,
         *,
-        ticker: str,
-        action: str,
-        files: tuple[Path, ...],
-        form_type: str | None = None,
-        material_name: str | None = None,
-        document_id: str | None = None,
-        internal_document_id: str | None = None,
-        fiscal_year: int | None = None,
-        fiscal_period: str | None = None,
-        amended: bool = False,
-        filing_date: str | None = None,
-        report_date: str | None = None,
-        company_name: str | None = None,
-        ticker_aliases: tuple[str, ...] = (),
-        overwrite: bool = False,
         cancellation_token: CancellationToken | None = None,
     ) -> ValidatedFinsEventStream:
-        """执行 material 上传 direct stream。
+        """原样提交已准入的 material request 给 Fins runtime。
 
-        :param ticker: canonical ticker 文本。
-        :param action: 上传动作。
-        :param files: 用户提供且已通过入口前置校验的文件路径。
-        :param form_type: 可选关联表单类型。
-        :param material_name: 可选材料名称。
-        :param document_id: 可选业务文档 ID。
-        :param internal_document_id: 可选内部文档 ID。
-        :param fiscal_year: 可选会计年度。
-        :param fiscal_period: 可选会计期间。
-        :param amended: 是否为修订材料。
-        :param filing_date: 可选披露日期。
-        :param report_date: 可选报告期日期。
-        :param company_name: 可选公司名称。
-        :param ticker_aliases: ticker 别名，仅传给支持该字段的 upload request。
-        :param overwrite: 是否允许覆盖已有文档。
-        :param cancellation_token: 可选 operation-scoped 取消 token。
-        :returns: runtime 返回的同一个 Fins owner 已验证事件流。
-        :raises Exception: request 构造或 runtime 执行失败时由底层抛出。
+        Args:
+            request: CLI 构造的 authoritative validated handoff。
+            cancellation_token: 可选 operation-scoped 取消 token。
+
+        Returns:
+            Fins owner 已验证的 direct 事件流。
+
+        Raises:
+            Exception: runtime 执行失败时透传。
         """
 
-        request = FinsUploadMaterialRequest(
-            ticker=ticker,
-            source_kind=SourceKind.MATERIAL,
-            action=action,
-            files=files,
-            form_type=form_type,
-            material_name=material_name,
-            document_id=document_id,
-            internal_document_id=internal_document_id,
-            fiscal_year=fiscal_year,
-            fiscal_period=fiscal_period,
-            amended=amended,
-            filing_date=filing_date,
-            report_date=report_date,
-            company_name=company_name,
-            ticker_aliases=ticker_aliases,
-            overwrite=overwrite,
-        )
-        return self._runtime.upload(
-            request,
-            cancellation_token=cancellation_token,
-        )
+        return self._runtime.upload(request, cancellation_token=cancellation_token)
 
     def _preprocess(
         self,

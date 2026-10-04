@@ -1,0 +1,50 @@
+# UM-O33-F01：同一 material `auto` identity 并发幂等的条件性 implementation plan
+
+- Gate：plan；状态：**conditional，依赖未集成，implementation not ready**。工作区 `/private/tmp/dayu-upload-o33`，读码 HEAD `8d8d494fbbce0052372fb1b42097c9f7222cfa28`，分支 `codex/upload-material-o33`。本文件只规划，不代表修复、测试、review 或正式 scenario 已通过。
+- Binding goal：本 checkout `docs/gateflow/upload-material-o33-concurrency-goal-20260929.md`；当前 HEAD 补证：本 checkout `docs/gateflow/upload-material-o33-e01-evidence-20260929.md`。accepted 行为来源：本 checkout `docs/reviews/upload-material-um-o33-oracle-adjudication.md`。实施前须在集成基线重新核对其版本与 goal 的引用。
+- 只读依赖候选：`/private/tmp/dayu-upload-o12/docs/gateflow/upload-material-o12-company-plan-20260929.md` 及最新 `upload-material-o12-plan-review-adjudication-20260929.md`、`/private/tmp/dayu-upload-state/docs/gateflow/upload-material-state-plan-20260929.md`（O14/O15 合并计划）、`/private/tmp/dayu-upload-o13/docs/gateflow/upload-material-o13-tombstone-plan-20260929.md`、`/private/tmp/dayu-upload-assets/docs/gateflow/upload-material-assets-plan-20260929.md`（O04/O23）、`/private/tmp/dayu-upload-o25/docs/gateflow/upload-material-o25-primary-plan-20260929.md`；主工作区 O34 accepted oracle 只读核对；O12 与 O14/O15 旧计划的单 batch 前提已因 O34 冲突阻断。**上述依赖计划均未集成，不是本 HEAD API**；其函数名、字段和时序均须以最终 accepted 且 integrated 代码重核。
+
+## 第一性原理、直接证据与目标
+
+动机成立，严重性是用户可见的 typed 结果错误，并非本次证据证明了半发布。当前 `sec_upload_workflow.py:486-497` 在准备前用 `previous_meta` 将 fresh `auto` 解析为 `create`；转换后 `:520-566` 才提交材料 batch。E01 第二组在 workflow 捕获边界记录 `commit_prepared_upload_batch → publish_prepared_upload → _store_upload_assets → _create_source_document → _fs_source_document_core.py:1749` 的真实 `FileExistsError(文档已存在)`；该 create 检查只看到目标已存在，未证明目标和请求相同，最终泛映射成 `storage_io`。E01 的另一真实 CLI 组也一成一败，但不据此倒推冻结 UM-L06 的具体异常，亦不据两组推断发生率。仓储已有 writer/publication guard，缺口是**旧观察所决定的动作与 guard 内新发布状态之间，没有同源的竞争后相同性裁决**；当前公司 batch 在材料转换前可独立提交，符合 O34 已接受的合法公司事实保留边界；O12 旧单 batch 候选因此被阻断。本项只依赖未来 O12 的材料 publication 同版 guard 与公司独立决策，不另造跨事实批次补丁。
+
+成功信号：fresh 同 identity、同文件字节、同 O25 primary 角色的两进程 `auto` 只有一次完整材料发布；败者仅在权威 exact target 为完整 active、identity 与本请求 fingerprint 相同且没有更高优先级漂移时 `skipped`，`stored_files=0`，材料 source meta、manifest、资产业务字节、版本与时间不变。合法公司事实可按 O34 与最终 O12 公司决策独立提交并在 outcome/summary 如实保留，不能为制造全命令零 diff 而回滚或误称材料半发布。不同 fingerprint、损坏、发布结果不确定、alias 冲突及真实 I/O 分别保持 owner 产生的 typed conflict/integrity/operational 结果。顺序相同输入 `auto` skip、不同输入 `auto` 更新、O13 tombstone 恢复/重复 delete、O14 显式 create 严格冲突、O15 missing、O32 不同 identity/ticker 并发均保持。目标对应的测试和真实 CLI 门槛见下文；不扩展为通用重试框架、全局长锁或公开 schema 迁移。
+
+## 语义 owner 与可实施前置门槛
+
+Fins 唯一上传 admission/资产规划 owner 产生 stable material identity、requested `auto`、exact 资产计划和 O25 角色敏感的 source fingerprint；不得从 argv 顺序、派生文件名或 CLI summary 重算。`dayu.fins.storage` 的 material published-state/publication owner 在**材料提交的同一 ticker publication guard**内产生 exact target 的完整性、同版 canonical business meta、opaque revision 与材料提交可见性，并按 O12 最终合同协调公司/alias guard 的优先级；它负责比较材料 observed state 与 commit 时状态，并且是唯一能判断本次材料提交是否尚未开始、已完成或不确定的边界。公司事实由独立决策和提交 owner 持有，材料 skip 不撤销合法公司提交。Fins publication owner只消费该 typed 权威裁决并复用 O12/O14/O15 failure/skip 投影；direct、job、observation、SEC、CN/HK 和 CLI 不各做二次判定。`FinsUploadFailureReason` 与最终 result/event/summary 从同一 typed outcome 派生，并如实表示已提交的公司事实。
+
+实施前逐项核对，任一不成立就停在 plan/依赖 WU，不按候选签名编码：
+
+| 依赖 | 集成基线必须证明的合同 | 缺失时去向 |
+| --- | --- | --- |
+| O04/O23、O25 | 唯一可引用的 original/derived 资产计划、稳定 exact identity、角色敏感 fingerprint，且 prepared candidate 保留本次同一 fingerprint 与 `identical_skip_safe` 等资格；正逆序同角色不变、换 primary 改变。 | 回资产/primary owner 裁决；不得在 O33 复制命名或指纹。 |
+| O12 | material 专属同版 published-state、exact target 完整性和 meta/revision；材料 publication guard 在首次 backup/swap 前比较 observed/current，alias 优先级及公司独立决策/合法提交按 O34 保留，所有结果能 typed 投影。公司与材料可分阶段，不能要求同一 batch；材料 skip 的 summary 须与实际公司提交一致。 | 回 O12 公司决策或材料 storage/publication owner；不得在 workflow 拼第二套快照或回滚合法公司事实。 |
+| O14/O15 | 合并 state plan 须先按 O34/O12 最终分阶段合同修订；显式 create active 的 typed target-exists、update/delete missing 的 typed target-missing 及发布期冲突规则在共享状态机中；`auto` 竞争不能借其异常文本推断。 | 等修订后的最终 plan、review 与集成代码，复核优先级。 |
+| O13 | active 与可信 tombstone 严格区分，skip/重复 delete 不改业务字节；恢复保留历史版本/时间连续性。 | 回 O13 owner；不得把 tombstone 当作新建成功竞争。 |
+| storage/public failure | exact material `COMPLETE` 与 active、identity、同版 source fingerprint 可权威取得；`REPAIR_REQUIRED/UNSAFE`、读 I/O、guard 失败与材料 commit 已可能 swap 而 outcome 不确定均不能被判为 skip，并由现有 owner 给出与事实相符的 operational/typed 结果。此要求只核材料 publication certainty 真源，不以其它 download WU 已实施为前提。 | **停止 O33 实施**；若公开分类不足以如实表达不确定性，携最小反例回材料 storage/public failure owner 与 goal 裁决。 |
+
+最小反例：A 在 fresh 状态被接收并已转换，B 发布同 document ID 与看似相同的 `source_fingerprint`，但一个原件或 manifest 缺失；若 owner 只给 `source_meta.source_fingerprint` 或泛 `FileExistsError`，A 无法证明“完整相同”。另在本次材料 commit 已 swap 后 guard 释放报错时，owner 若无法确定并投影本次 outcome，就不能把该请求重判为 `skipped`。两种情形若返回 skip，分别会把损坏或不确定发布说成幂等成功。此时不设计重读 fallback 或新公开字段，先回正确 owner 裁决。当前 HEAD 没有可供 material 使用的 O12 同版合同，故当前明确 **implementation not ready**。
+
+## 条件性最小实现：一个端到端行为切片
+
+**S1：受 guard 保护的 `auto` 竞争后同一性裁决。** 仅在上表全部通过后，在已集成的 material storage/publication owner 的现有 observed-state precondition/冲突边界加入窄分支：仅 `requested_action=auto`、未 overwrite、非 repair、完整且可安全 skip 的本次 prepared fingerprint，且 exact observed state 因另一提交发生漂移时，允许把“一方先完成”判为候选；显式 create/update/delete 与初始顺序 skip 不进入。复用 O12 已持有的 guard 与 exact material 读取/比较：alias/identity 冲突优先；若当前权威目标为 `COMPLETE`、active、stable identity 精确相同、published fingerprint 与准备阶段**同一** fingerprint 相同，且公司/alias 独立决策没有阻断本次请求的优先冲突，返回 typed identical-publication/skip disposition；不得 stage 或 swap 本请求的材料 source/meta/manifest/资产。合法公司事实可已在独立公司阶段提交，应按最终 O12/O34 合同保留并如实投影；公司状态漂移若按最终 owner 合同构成冲突则仍须 typed 拒绝。若任一材料字段、revision 所代表的事实、primary 角色或完整性无法证明符合该判定，沿最终 O12/O14/O15 的 typed 冲突/完整性/operational 路径结束，不把所有 observed-state conflict 都放行为 skip。不同 fingerprint 的 `auto` 版本更新仍按其已接受规则，仅遇到真实竞争漂移时冲突，不盲目重试更新。
+
+**线性化与一次性重读的限定**：首选在 storage 已持有 publication guard、alias 优先检查后、第一次 backup/swap 前，复用 O12 比较 observed/current 时的**同一次** exact target 完整性读取；若最终接口只返回 typed conflict、但在该 guard 仍持有且任何 swap 未开始时确需一次重读，则只能由同一个 storage owner 在该临界区做一次 bounded authoritative reread/再裁决，返回封闭 disposition。此重读不是 CLI/Service catch 后重启请求，不重新转换、不为材料重读而重跑公司决策/提交，不释放 guard 后用旧结论，也不从 `FileExistsError` 文本推断。若本次材料 commit 已可能进入 backup/swap，或 guard 释放、post-commit 清理/释放失败使本次材料 outcome 不确定，禁止 success/skip；由材料 storage/publication owner 保留现有 operational/typed 结果。若公开分类不足以如实表达该不确定性，携直接证据回 owner 裁决并停止实施；不要求其它 download WU 已实现。避免把 staging 中本请求的文件误读为 published winner；比对对象须是 guard 下**当前 published** exact target。真正磁盘 read/write/OSError 保持 storage failure，不能纳入竞争分支。
+
+S1 涉及的候选路径是最终 `dayu/fins/storage/` material state/core 与 batch publication、`dayu/fins/pipelines/` material publication/Docling prepared result、`dayu/fins/upload_failure.py` 及对应 tests；以集成后实际 owner 文件为准列最终白名单。仅当真实调用链要求机械接线，才纳入 `ingestion_runtime.py`、`service_runtime.py`、SEC/CN pipeline；CLI 不增业务判断。不得复制 filing state 的字段或跨层依赖。一次切片是因为单独交付 storage 分支或下游 skip 投影均无法验证一成一跳；切片内先核对 owner/guard，再实现 typed outcome 与全入口同源投影，最后做真实并发验收。若必须改 O12 的 public contract/schema、改 O14/O15 优先级或跨 owner 新建协调器，S1 停止并回 goal/依赖 plan review。
+
+## 验证矩阵、命令和文档
+
+1. **owner/真实仓储可控 barrier**：用真实 `Fs` 仓储和可控同步点固定 A/B 都在 fresh admission 后，B 先完成 commit，A 在 guard 内裁决；断言恰一 `uploaded`、一 `skipped`、同一 document/manifest 与资产完整、败者材料 source meta/manifest/资产业务字节及版本/时间零 diff；有合法公司独立更新意图时另核对已提交的公司 identity/meta 及 result/event/summary 与最终 O12/O34 合同一致。另使 B 不同 fingerprint、只变 primary、损坏/缺失 original 或 manifest、REPAIR_REQUIRED/UNSAFE、仅 source revision 漂移、公司字段并发变化、alias 被第三方占用、读 I/O 与写 I/O、guard 释放或 commit 后不确定分别进入对应 typed 结果；公司变化分别覆盖最终 O12 认定的合法独立提交与应拒绝漂移；alias 与 target 同时冲突仍按最终 O12 优先级。barrier 放在 admission 后、O12 guard 前，以及 guard 内比较后/首次 swap 前，证明 writer 不能插入 check/swap；不得用只会抛 `FileExistsError` 的 fake 模拟同一性。断言材料失败/skip 不发布本请求材料半状态；合法公司独立提交保留，alias/公司冲突按最终 owner 优先级裁决，direct/job/observation summary 的 code、reason 和已提交事实同源。
+2. **回归**：顺序同输入 `auto` skip、不同输入升版、显式 create 同内容仍冲突、update/delete missing、健康 tombstone 恢复及重复 delete、不同 material identity/不同 ticker 并发；覆盖 SEC 与 CN/HK 的共同 owner 接线和 filing 不回归。覆盖“不满足 `identical_skip_safe`”不能因 digest 相同而 skip，以及取消后材料零发布；已合法提交的公司事实按 O34 保留。owner 级断言为主，CLI 只验证终端投影。
+3. **真实双进程 CLI 多轮**：先验证隔离 checkout `.venv` Python 3.11、`dayu.__file__`、editable `direct_url.json`、CLI shebang/入口均指向同一 checkout。每轮 fresh `--base` 与相同 hash 输入，两个独立 `.venv/bin/dayu-cli` 同 argv、stdin `DEVNULL`，由 barrier 同步启动；记录每进程 PID、单调/纳秒启动和结束时刻及实际启动时差、exit/timeout、stdout/stderr/log/summary、完整终态进程树，保存 before/after/diff、exact target meta/manifest/原件及派生资产 hash、公司 identity/meta hash 与各进程 outcome/summary。多轮必须每轮一 success、一 skipped、单 active 文档/单 manifest 条目、无残留进程；另跑不同指纹、alias 与 I/O 受控样本。只把真正同时越过 admission 的轮次计为并发证明，失败或未触发竞争的轮次原样保留，不以样本数推断概率；冻结 L06/E01 原始证据不覆盖。
+4. **代码门槛**：实施时先收敛最终生产/测试文件白名单并记录 diff；每改一个生产文件补 owner contract 测试。`source .venv/bin/activate` 后运行受影响 `tests/fins/`、`tests/cli/`、`tests/service/` 的精确文件及关联 filing 回归，覆盖率 `python -m pytest --cov=dayu --cov-report=json:workspace/tmp/um-o33-coverage.json <受影响测试文件>`，逐个修改/新增生产 `.py` 的 `summary.percent_covered >=80`，不以聚合值替代；再运行 `python -m pyright dayu/ tests/ utils/`，无新增/扩散错误。环境身份或依赖版本无法核实时停止验证，不借主工作区 venv。实现后按 AGENTS.md 触发规则先读各 README 的 Agent 更新约束：`dayu/fins/README.md`、`tests/README.md`、根 `README.md`，若分层/装配确有变化再核 `dayu/README.md`；只在读者职责命中时更新。当前 plan 轮无代码修改，故不运行这些实施测试、coverage 或 pyright，不改 README。
+
+## Stop conditions、残余风险与下一 gate
+
+- 上述任一依赖未 accepted/integrated、O14/O15 最终 plan 或调用图不可核对、material 同版 owner 无法证明完整 active identity + fingerprint、O34 公司独立事实与材料 guard 无法同时成立，或公开分类不足以表达相同/损坏/不确定发布：停止 implementation，给 exact 代码/最小数据反例回 goal/对应依赖 WU；不在 O33 做 fallback、兼容 shim 或 CLI 文本猜测。
+- guard/alias 优先级或 commit 前/后界限无法原子表达、一次重读需放锁或重跑转换、可控 barrier 证实检查后可被插入、skip 会重写材料业务字节：停止，先由 storage/publication owner 修正合同；不能靠多次盲 retry 或延长全局锁掩盖。
+- 依赖实施后若 O05/O16/O17/O09/O10/O07 改变稳定 identity/输入优先级，重核请求与 CLI 样本，超出 binding goal 的规则只记残余或回 goal，不吸入 S1。
+
+本 plan 与已确认 goal 一一对应：storage 原子裁决对应同指纹 success+skip 及材料零业务 diff；typed 分类对应非同一/损坏/I/O 保留；回归与多轮真实 CLI 对应跨入口及 O13/O14/O15/O32 兼容。设计只扩展最终唯一 owner 的竞争窗口，没有第二套快照或通用并发框架。下一入口是**依赖集成核对 → 独立 plan review**；核对未通过仍停在 conditional plan，不进入 implementation。完成报告须说明实际改动、验证证据、每文件覆盖率、pyright/README 决策、未覆盖风险与对应 owner，不把候选或冻结观察当作已修复。

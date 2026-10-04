@@ -34,6 +34,14 @@ _6K_TITLE_EXCLUDE_SCAN_CHARS = 420
 _6K_EXCLUDE_PREFIX_SCAN_CHARS = 1600
 _6K_ANNUAL_CONTEXT_SCAN_CHARS = 800
 _6K_KEEP_SCAN_CHARS = 4000
+_6K_CURRENT_QUARTER_RESULTS_PATTERN = (
+    r"\breports\s+(?:(?:its|the)\s+)?"
+    r"(?:(?:first|second|third|fourth)[-\s]+quarter|Q[1-4])"
+    r"(?:\s+(?:of\s+)?(?:19|20)\d{2})?"
+    r"(?:\s+and\s+(?:full[-\s]+year(?:\s+(?:of\s+)?(?:19|20)\d{2})?"
+    r"|(?:19|20)\d{2}\s+full[-\s]+year))?"
+    r"\s+(?:unaudited\s+)?(?:consolidated\s+)?financial\s+results?\b"
+)
 
 _6K_TITLE_EXCLUDE_PATTERNS: tuple[str, ...] = (
     r"\banalyst\s+(visit|day)\b",
@@ -64,6 +72,7 @@ _6K_STRONG_EXCLUDE_PATTERNS: tuple[str, ...] = (
 )
 
 _6K_STRONG_KEEP_PATTERNS: tuple[str, ...] = (
+    _6K_CURRENT_QUARTER_RESULTS_PATTERN,
     r"Financial Results and Business Updates",
     r"Key Highlights for the (First|Second|Third|Fourth) Quarter",
     r"Reports?\s+(?:the\s+)?(?:(?:First|Second|Third|Fourth)[-\s]+Quarter|Q[1-4])(?:\s+and\s+(?:Full[-\s]+Year(?:\s+\d{4})?|\d{4}\s+Full[-\s]+Year))?\s+Financial\s+Results",
@@ -567,6 +576,7 @@ def _has_future_result_announcement_signal(content: str) -> bool:
         r"\bboard\s+(meeting|of\s+directors)\b.{0,160}\b(considering|approving|approve)\b.{0,160}\b(interim|quarter|half.?year|full\s+year).{0,80}\bresults?\b",
     ]
     disclosed_result_patterns = [
+        _6K_CURRENT_QUARTER_RESULTS_PATTERN,
         r"\b(announced|announces)\b.{0,120}\b(financial\s+results?|interim\s+results?|quarter.{0,40}results?)\b(?!\s+release\s+schedule)",
         r"\breported\b.{0,80}\b(results?|earnings?)\b.{0,80}\b(for|ended)\b",
         r"\b(?:announced|announce[sd]?)\b.{0,120}\bhalf\s+year\b.{0,120}\bresults?\b",
@@ -1226,6 +1236,7 @@ def _has_strong_current_results_disclosure_signal(content: str) -> bool:
     return _match_any(
         normalized_prefix,
         [
+            _6K_CURRENT_QUARTER_RESULTS_PATTERN,
             r"\breported\s+its\s+financial\s+results?\s+for\b",
             r"\breported\s+its\s+unaudited,?\s+consolidated\s+financial\s+and\s+operating\s+results\s+for\b",
             r"\breports?\s+(?:its\s+)?financial\s+results?\s+for\b",

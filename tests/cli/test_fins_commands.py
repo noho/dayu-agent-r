@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
+from dayu.fins.storage import FsMaterialUploadStateRepository
+
+from dayu.fins.pipelines.docling_upload_service import build_material_ids
+from dayu.fins.storage import FsCompanyMetaRepository
+
 import ast
 import asyncio
 import errno
 import hashlib
 import io
 import logging
+import os
+import signal
+import select
+import time
+import json
 import subprocess
 import sys
 from collections.abc import AsyncGenerator
@@ -15,7 +25,9 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from functools import partial
 from pathlib import Path
+from unittest.mock import Mock
 from typing import NoReturn, TextIO, cast
+from dayu.runtime.interruptible_process import InterruptibleProcessHandle, InterruptibleProcessTarget
 
 import pytest
 
@@ -61,6 +73,8 @@ from dayu.fins.ingestion_runtime import (
     FinsJobCancellationChecker,
     FinsIngestionOperationKind,
     FinsUploadFilingRequest,
+    FinsUploadMaterialRequest,
+    ValidatedFinsUploadMaterialRequest,
     FinsUploadResultSummary,
     validate_fins_upload_filing_request,
 )
@@ -77,10 +91,13 @@ from dayu.fins.storage import (
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
 from dayu.fins.upload_failure import fins_upload_failure_from_exception
 from dayu.service.fins_direct import (
+    FinsDirectCommandService,
     FINS_DIRECT_EXIT_FAILURE,
     FINS_DIRECT_EXIT_KEYBOARD_INTERRUPT,
     FINS_DIRECT_EXIT_SUCCESS,
 )
+from tests.fins.test_fins_ingestion_runtime import _build_real_sec_integrity_runtime
+from tests.fins.test_material_upload_publication import seed_material_upload_target
 
 _NOW: datetime = datetime(2026, 6, 16, tzinfo=timezone.utc)
 _UNPARSABLE_PDF_BYTES = b"not a PDF"
@@ -411,63 +428,41 @@ class _FakeFinsDirectService:
 
     def upload_material(
         self,
+        request: ValidatedFinsUploadMaterialRequest,
         *,
-        ticker: str,
-        action: str,
-        files: tuple[Path, ...],
-        form_type: str | None = None,
-        material_name: str | None = None,
-        document_id: str | None = None,
-        internal_document_id: str | None = None,
-        fiscal_year: int | None = None,
-        fiscal_period: str | None = None,
-        amended: bool = False,
-        filing_date: str | None = None,
-        report_date: str | None = None,
-        company_name: str | None = None,
-        ticker_aliases: tuple[str, ...] = (),
-        overwrite: bool = False,
         cancellation_token: fins_command._CliFinsCancellationToken | None = None,
     ) -> ValidatedFinsEventStream:
-        """记录 upload_material 参数并返回 fake stream。
+        """记录 CLI 传入的同一次 material 准入 handoff。
 
-        :param ticker: canonical ticker。
-        :param action: 上传动作。
-        :param files: 上传文件路径。
-        :param form_type: 可选表单类型。
-        :param material_name: 可选材料名称。
-        :param document_id: 可选业务文档 ID。
-        :param internal_document_id: 可选内部文档 ID。
-        :param fiscal_year: 可选会计年度。
-        :param fiscal_period: 可选会计期间。
-        :param amended: 是否为修订材料。
-        :param filing_date: 可选披露日期。
-        :param report_date: 可选报告期日期。
-        :param company_name: 可选公司名称。
-        :param ticker_aliases: ticker aliases。
-        :param overwrite: 是否覆盖已有文档。
-        :param cancellation_token: CLI operation 取消 token。
-        :returns: Fins direct event stream。
-        :raises Exception: 不主动抛出异常。
+        Args:
+            request: 已准入的 material 请求、选择与资产计划。
+            cancellation_token: CLI operation 取消 token。
+
+        Returns:
+            Fins direct event stream。
+
+        Raises:
+            无。
         """
 
+        raw = request.request
         self.upload_material_requests.append(
             _UploadMaterialCall(
-                ticker=ticker,
-                action=action,
-                files=files,
-                form_type=form_type,
-                material_name=material_name,
-                document_id=document_id,
-                internal_document_id=internal_document_id,
-                fiscal_year=fiscal_year,
-                fiscal_period=fiscal_period,
-                amended=amended,
-                filing_date=filing_date,
-                report_date=report_date,
-                company_name=company_name,
-                ticker_aliases=ticker_aliases,
-                overwrite=overwrite,
+                ticker=raw.ticker,
+                action=raw.action,
+                files=raw.files,
+                form_type=raw.form_type,
+                material_name=raw.material_name,
+                document_id=raw.document_id,
+                internal_document_id=request.identity.internal_document_id,
+                fiscal_year=raw.fiscal_year,
+                fiscal_period=raw.fiscal_period,
+                amended=raw.amended,
+                filing_date=raw.filing_date,
+                report_date=raw.report_date,
+                company_name=raw.company_name,
+                ticker_aliases=raw.ticker_aliases,
+                overwrite=raw.overwrite,
             )
         )
         return self._stream(
@@ -605,6 +600,254 @@ def fake_service(monkeypatch: pytest.MonkeyPatch) -> _FakeFinsDirectService:
 
     monkeypatch.setattr(fins_command, "FINS_DIRECT_SERVICE_FACTORY", factory)
     return service
+
+
+def test_upload_material_file_base_rejected_before_factory_and_input(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """真实 parser/main 在装配和读取缺失上传输入前拒绝普通文件 base。
+
+    Args:
+        tmp_path: 隔离路径根目录。
+        capsys: 标准流捕获夹具。
+        monkeypatch: 替换 Service factory 的夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: factory 被调用或路径用法语义错误时抛出。
+    """
+
+    base = tmp_path / "base"
+    base.write_bytes(b"original base")
+    calls: list[Path] = []
+
+    def forbidden_factory(path: Path) -> fins_command.FinsDirectCommandService:
+        """记录不应发生的 Service 装配。
+
+        Args:
+            path: 请求的 workspace 路径。
+
+        Returns:
+            不返回。
+
+        Raises:
+            AssertionError: 一旦装配 Service 即抛出。
+        """
+
+        calls.append(path)
+        raise AssertionError("base 类型错误必须先于 Service 装配")
+
+    monkeypatch.setattr(fins_command, "FINS_DIRECT_SERVICE_FACTORY", forbidden_factory)
+    result = cli_main.main(
+        (
+            "upload_material", "--base", str(base), "--ticker", "AAPL",
+            "--forms", "10-K", "--material-name", "sample", "--files",
+            str(tmp_path / "missing-input.pdf"),
+        )
+    )
+    output = capsys.readouterr()
+    assert result == EXIT_USAGE_ERROR
+    assert output.err == (
+        "dayu-cli upload_material: --base must point to a directory; "
+        "choose a directory path\n"
+    )
+    assert "missing-input" not in output.err
+    assert calls == []
+    assert base.read_bytes() == b"original base"
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["base"]
+
+
+@pytest.mark.parametrize("option", ("--base", "-b", "--workspace"))
+def test_fins_workspace_aliases_use_one_resolved_target(
+    option: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """三个工作区参数别名都将同一规范化目录交给 Service。
+
+    Args:
+        option: 待验证的工作区参数别名。
+        tmp_path: 隔离路径根目录。
+        capsys: 标准流捕获夹具。
+        monkeypatch: 替换 Service factory 的夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 解析结果或 CLI 退出码错误时抛出。
+    """
+
+    base = tmp_path / "workspace"
+    base.mkdir()
+    calls: list[Path] = []
+    service = _FakeFinsDirectService()
+    monkeypatch.setattr(
+        fins_command, "FINS_DIRECT_SERVICE_FACTORY",
+        partial(_recording_direct_service_factory, service=service, factory_calls=calls),
+    )
+    assert cli_main.main(("download", option, str(base), "--ticker", "AAPL")) == EXIT_SUCCESS
+    capsys.readouterr()
+    assert calls == [base]
+
+
+def test_fins_repeated_base_uses_last_value(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """重复 scalar base 的最终值决定唯一装配路径。
+
+    Args:
+        tmp_path: 隔离路径根目录。
+        capsys: 标准流捕获夹具。
+        monkeypatch: 替换 Service factory 的夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 首值被使用或装配路径错误时抛出。
+    """
+
+    invalid = tmp_path / "file"
+    invalid.write_bytes(b"first")
+    valid = tmp_path / "directory"
+    valid.mkdir()
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        fins_command, "FINS_DIRECT_SERVICE_FACTORY",
+        partial(
+            _recording_direct_service_factory,
+            service=_FakeFinsDirectService(),
+            factory_calls=calls,
+        ),
+    )
+    assert cli_main.main(
+        ("download", "--base", str(invalid), "--base", str(valid), "--ticker", "AAPL")
+    ) == EXIT_SUCCESS
+    capsys.readouterr()
+    assert calls == [valid]
+    assert invalid.read_bytes() == b"first"
+
+
+def test_fins_default_base_resolves_against_current_directory(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """省略 base 参数时按当前 cwd 解析默认 workspace。
+
+    Args:
+        tmp_path: 隔离路径根目录。
+        capsys: 标准流捕获夹具。
+        monkeypatch: 切换 cwd 并替换 factory 的夹具。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 默认路径或退出码错误时抛出。
+    """
+
+    monkeypatch.chdir(tmp_path)
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        fins_command, "FINS_DIRECT_SERVICE_FACTORY",
+        partial(
+            _recording_direct_service_factory,
+            service=_FakeFinsDirectService(),
+            factory_calls=calls,
+        ),
+    )
+    assert cli_main.main(("download", "--ticker", "AAPL")) == EXIT_SUCCESS
+    capsys.readouterr()
+    assert calls == [tmp_path / "workspace"]
+
+
+def test_real_upload_material_cli_rejects_file_base_from_this_checkout(tmp_path: Path) -> None:
+    """真实子进程先证明 checkout 身份，再复验普通文件 base 的无副作用拒绝。
+
+    Args:
+        tmp_path: 子进程临时 cwd。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 解释器、导入树、错误或文件快照不符合契约时抛出。
+    """
+
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    expected_import = Path(__file__).resolve().parents[2] / "dayu" / "__init__.py"
+    identity = subprocess.run(
+        (
+            sys.executable, "-c",
+            "import dayu,pathlib,sys; print(pathlib.Path(dayu.__file__).resolve()); "
+            "print(pathlib.Path(sys.executable).resolve()); print(pathlib.Path(sys.prefix).resolve())",
+        ),
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert identity.returncode == 0, identity.stderr
+    assert identity.stdout.splitlines() == [
+        str(expected_import.resolve()),
+        str(Path(sys.executable).resolve()),
+        str(Path(sys.prefix).resolve()),
+    ]
+
+    base = tmp_path / "base"
+    original = b"ordinary file base"
+    base.write_bytes(original)
+    before = sorted(path.name for path in tmp_path.iterdir())
+    command = (
+        sys.executable, "-m", "dayu.cli", "upload_material", "--base", str(base),
+        "--ticker", "AAPL", "--forms", "10-K", "--material-name", "sample",
+        "--files", str(tmp_path / "missing-input.pdf"),
+    )
+    result = subprocess.run(
+        command,
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == EXIT_USAGE_ERROR
+    assert result.stderr == (
+        "dayu-cli upload_material: --base must point to a directory; "
+        "choose a directory path\n"
+    )
+    assert str(tmp_path) not in result.stderr
+    assert result.stdout == ""
+    assert base.read_bytes() == original
+    assert sorted(path.name for path in tmp_path.iterdir()) == before
+
+    directory = tmp_path / "directory"
+    directory.mkdir()
+    directory_link = tmp_path / "directory-link"
+    directory_link.symlink_to(directory, target_is_directory=True)
+    symlink_command = tuple(
+        str(directory_link) if part == str(base) else part for part in command
+    )
+    symlink_result = subprocess.run(
+        symlink_command,
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert "--base must point to a directory" not in symlink_result.stderr
 
 
 def _recording_direct_service_factory(
@@ -2128,6 +2371,104 @@ def test_upload_filing_non_first_primary_is_preserved_into_validated_service_req
     assert call.selected_primary == primary.resolve()
 
 
+@pytest.mark.parametrize("damage", ("bad_meta", "missing_original", "missing_docling", "missing_manifest"))
+@pytest.mark.parametrize("action", ("auto", "update", "delete"))
+def test_upload_material_real_corruption_prevalidation_keeps_cli_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    damage: str,
+    action: str,
+) -> None:
+    """真实损坏材料经 CLI 主入口拒绝，命令归属正确且零生命周期写入。
+
+    Args:
+        tmp_path: pytest 隔离目录。
+        monkeypatch: factory 与生命周期零调用观测夹具。
+        capsys: 标准流捕获夹具。
+        damage: 已发布材料的实际损坏形态。
+        action: 待执行的上传动作。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 错误归属、安全投影、准入顺序或业务字节保持漂移时抛出。
+    """
+
+    workspace_root = tmp_path / "workspace"
+    seed_material_upload_target(
+        FinsUploadMaterialRequest(
+            ticker="AAPL", action="delete", form_type="OTHER", material_name="Deck",
+            company_name="Apple Inc.",
+        ),
+        workspace_root,
+    )
+    material_root = workspace_root / "portfolio" / "AAPL" / "materials"
+    if damage == "bad_meta":
+        paths = tuple(material_root.rglob("meta.json"))
+        assert len(paths) == 1
+        paths[0].write_text("{}", encoding="utf-8")
+    else:
+        name = (
+            "seed-target.txt" if damage == "missing_original"
+            else "seed-target.txt_docling.json" if damage == "missing_docling"
+            else "material_manifest.json"
+        )
+        next(material_root.rglob(name)).unlink()
+    identity = build_material_ids(
+        form_type="OTHER", material_name="Deck", fiscal_year=None, fiscal_period=None, document_id=None,
+    )
+    state = FsMaterialUploadStateRepository(workspace_root).read_material_upload_state(
+        "AAPL", identity.document_id,
+    )
+    assert state.source_integrity.status in {SourceIntegrityStatus.UNSAFE, SourceIntegrityStatus.REPAIR_REQUIRED}
+    before_tree = _snapshot_cli_workspace_tree(workspace_root)
+    input_file = tmp_path / "deck.txt"
+    input_file.write_text("candidate", encoding="utf-8")
+    operator_log = tmp_path / "operator.log"
+    service = _FakeFinsDirectService()
+    factory_calls: list[Path] = []
+    monkeypatch.setattr(
+        fins_command, "FINS_DIRECT_SERVICE_FACTORY",
+        partial(_recording_direct_service_factory, service=service, factory_calls=factory_calls),
+    )
+    lifecycle_calls: list[Mock] = []
+    for owner, method in (
+        (ingestion_runtime.FinsIngestionRuntime, "upload"),
+        (ingestion_runtime.FinsIngestionRuntime, "prepare_observed_upload"),
+        (ingestion_runtime.FinsIngestionRuntime, "start_upload"),
+        (FsBatchingRepository, "begin_batch"),
+    ):
+        spy = Mock(side_effect=AssertionError("材料损坏必须在生命周期之前拒绝"))
+        monkeypatch.setattr(owner, method, spy)
+        lifecycle_calls.append(spy)
+
+    exit_code = cli_main.main(
+        (
+            "upload_material", "--base", str(workspace_root), "--log-file", str(operator_log),
+            "--ticker", "AAPL", "--action", action, "--forms", "OTHER", "--material-name", "Deck",
+            *(("--files", str(input_file)) if action != "delete" else ()),
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_FAILURE
+    assert captured.out == ""
+    assert captured.err == "dayu-cli upload_material: 工作区中的目标材料状态不完整，无法安全上传\n"
+    assert str(tmp_path) not in captured.err
+    assert "Traceback" not in captured.err and "FinsUploadPrevalidationError" not in captured.err
+    operator_diagnostic = operator_log.read_text(encoding="utf-8")
+    assert "upload_material prevalidation operational failure" in operator_diagnostic
+    assert "upload_filing prevalidation operational failure" not in operator_diagnostic
+    assert "FinsUploadPrevalidationError" in operator_diagnostic
+    assert factory_calls == []
+    assert service.upload_material_requests == [] and service.stream_calls == []
+    for spy in lifecycle_calls:
+        spy.assert_not_called()
+    assert _snapshot_cli_workspace_tree(workspace_root) == before_tree
+
+
 def test_upload_filing_prevalidation_io_failure_is_typed_bounded_and_path_free(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2432,6 +2773,8 @@ def test_download_mutation_mode_conflict_precedes_all_side_effects(
     assert not workspace_root.exists()
 
 
+@pytest.mark.parametrize("command_name", ("upload_filing", "upload_material"))
+@pytest.mark.parametrize("ticker", ("ICPD", "600519", "0700"))
 @pytest.mark.parametrize(
     ("file_name", "payload", "expected_reason", "expected_failure_code"),
     (
@@ -2456,8 +2799,10 @@ def test_real_cli_content_failure_has_bounded_stderr_and_zero_fresh_workspace_mu
     payload: bytes,
     expected_reason: str,
     expected_failure_code: str,
+    command_name: str,
+    ticker: str,
 ) -> None:
-    """真实 CLI empty/corrupt PDF/DOCX failure 必须安全投影且零 mutation。
+    """两类真实 CLI 在 US/CN/HK 的 empty/corrupt PDF/DOCX 保持五字段、安全路径与零文档发布，material 保留合法公司。
 
     Args:
         tmp_path: pytest 临时目录。
@@ -2477,17 +2822,18 @@ def test_real_cli_content_failure_has_bounded_stderr_and_zero_fresh_workspace_mu
     corrupt_file = tmp_path / file_name
     corrupt_file.write_bytes(payload)
     workspace_root = tmp_path / "fresh-workspace"
-    cli_executable = Path(sys.executable).with_name("dayu-cli")
     repository_root = Path(__file__).resolve().parents[2]
 
     completed = subprocess.run(
         (
-            str(cli_executable),
-            "upload_filing",
+            sys.executable,
+            "-m",
+            "dayu.cli",
+            command_name,
             "--base",
             str(workspace_root),
             "--ticker",
-            "ICPD",
+            ticker,
             "--files",
             str(corrupt_file),
             "--fiscal-year",
@@ -2496,6 +2842,7 @@ def test_real_cli_content_failure_has_bounded_stderr_and_zero_fresh_workspace_mu
             "FY",
             "--company-name",
             "ICPD Corp.",
+            *(("--forms", "MATERIAL_OTHER", "--material-name", "CLI Content") if command_name == "upload_material" else ()),
         ),
         cwd=repository_root,
         check=False,
@@ -2515,7 +2862,19 @@ def test_real_cli_content_failure_has_bounded_stderr_and_zero_fresh_workspace_mu
     assert "Traceback" not in completed.stderr
     assert str(repository_root) not in completed.stderr
     assert str(corrupt_file) not in completed.stderr
-    assert not workspace_root.exists()
+    (tmp_path / "cli.stdout").write_text(completed.stdout, encoding="utf-8")
+    (tmp_path / "cli.stderr").write_text(completed.stderr, encoding="utf-8")
+    (tmp_path / "cli.exit").write_text(str(completed.returncode) + "\n", encoding="utf-8")
+    (tmp_path / "cli.command.json").write_text(json.dumps(completed.args, ensure_ascii=False), encoding="utf-8")
+    if command_name == "upload_filing":
+        assert not workspace_root.exists()
+    else:
+        repository = FsSourceDocumentRepository(workspace_root)
+        assert repository.list_source_document_ids(ticker, SourceKind.MATERIAL) == []
+        assert FsCompanyMetaRepository(workspace_root).get_company_meta(ticker).company_name == "ICPD Corp."
+        assert not tuple((workspace_root / ".dayu" / "fins_ingestion" / "jobs").glob("*.json"))
+        assert not (workspace_root / "sessions").exists()
+        assert not (workspace_root / "artifacts").exists()
 
 
 def test_download_repeated_ticker_is_last_wins(
@@ -2627,18 +2986,18 @@ def test_upload_commands_map_args_and_validate_files(
         cli_main.main(
             (
                 "upload_material",
+                "--base", str(tmp_path / "workspace"),
+                "--company-name", "Apple Inc.",
                 "--ticker",
-                "DELTA,MSFT",
+                "AAPL,MSFT",
                 "--forms",
                 "8-K",
                 "--material-name",
                 "Investor Day",
                 "--files",
                 str(material_file),
-                "--document-id",
-                "doc-1",
-                "--internal-document-id",
-                "internal-1",
+
+
             )
         )
         == EXIT_SUCCESS
@@ -2663,23 +3022,86 @@ def test_upload_commands_map_args_and_validate_files(
     ]
     assert fake_service.upload_material_requests == [
         _UploadMaterialCall(
-            ticker="DELTA",
+            ticker="AAPL",
             action="auto",
             files=(material_file.resolve(),),
             form_type="8-K",
             material_name="Investor Day",
-            document_id="doc-1",
-            internal_document_id="internal-1",
+            document_id=None,
+            internal_document_id=build_material_ids(form_type="8-K", material_name="Investor Day", fiscal_year=None, fiscal_period=None, document_id=None).internal_document_id,
             fiscal_year=None,
             fiscal_period=None,
             amended=False,
             filing_date=None,
             report_date=None,
-            company_name=None,
+            company_name="Apple Inc.",
             ticker_aliases=("MSFT",),
             overwrite=False,
         )
     ]
+
+
+@pytest.mark.parametrize(
+    ("option", "raw_value", "expected_reason"),
+    (
+        ("--filing-date", "", None),
+        ("--filing-date", " 2024-02-29 ", "披露日期（filing_date）必须是实际存在的 YYYY-MM-DD 日期"),
+        ("--report-date", "2024-02-29 ", "报告期日期（report_date）必须是实际存在的 YYYY-MM-DD 日期"),
+    ),
+)
+def test_upload_material_cli_rejects_padded_dates_before_service(
+    tmp_path: Path,
+    fake_service: _FakeFinsDirectService,
+    capsys: pytest.CaptureFixture[str],
+    option: str,
+    raw_value: str,
+    expected_reason: str | None,
+) -> None:
+    """CLI 仅折叠空日期，非空非法原文在启动 Service 前被 owner 拒绝。
+
+    Args:
+        tmp_path: 测试材料文件所在临时目录。
+        fake_service: 记录 Service 参数的替身。
+        capsys: 捕获公开 usage 文案。
+        option: 当前日期命令参数。
+        raw_value: CLI 收到的原始文本。
+        expected_reason: 非空非法日期的公开拒绝原因；空值为 None。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: CLI 空值例外或非空日期前置拒绝漂移时抛出。
+    """
+
+    material_file = tmp_path / "material.html"
+    material_file.write_text("<html></html>", encoding="utf-8")
+    exit_code = cli_main.main(
+        (
+            "upload_material",
+                "--base", str(tmp_path / "workspace"),
+                "--company-name", "Apple Inc.",
+            "--ticker",
+            "AAPL",
+            "--forms",
+            "MATERIAL_OTHER",
+            "--material-name",
+            "Deck",
+            "--files",
+            str(material_file),
+            option,
+            raw_value,
+        )
+    )
+
+    if expected_reason is None:
+        assert exit_code == EXIT_SUCCESS
+        assert len(fake_service.upload_material_requests) == 1
+        assert fake_service.upload_material_requests[0].filing_date is None
+    else:
+        assert exit_code == EXIT_USAGE_ERROR
+        assert fake_service.upload_material_requests == []
+        assert expected_reason in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -2735,6 +3157,433 @@ def test_upload_material_cli_uses_bounded_converter_required_format_owner(
     assert captured.err == f"dayu-cli upload_material: {expected_message}\n"
     assert fake_service.upload_material_requests == []
     assert fake_service.stream_calls == []
+
+
+def test_upload_material_cli_names_conflicting_basename_without_path(
+    tmp_path: Path,
+    fake_service: _FakeFinsDirectService,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """CLI 将 planner 的安全冲突标签投影为可定位的 usage 文案。
+
+    Args:
+        tmp_path: 两个同名原件所在的隔离目录。
+        fake_service: 记录未被调用的 direct Service。
+        capsys: 捕获 CLI 输出。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 冲突文件标签、路径安全或零调用边界漂移时抛出。
+    """
+
+    first = tmp_path / "one" / "deck.pdf"
+    second = tmp_path / "two" / "deck.pdf"
+    first.parent.mkdir()
+    second.parent.mkdir()
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    exit_code = cli_main.main(
+        (
+            "upload_material", "--ticker", "AAPL", "--forms", "MATERIAL_OTHER",
+            "--material-name", "Deck", "--files", str(first), str(second),
+        )
+    )
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_USAGE_ERROR, captured.err
+    assert captured.out == ""
+    assert "deck.pdf" in captured.err
+    assert str(tmp_path) not in captured.err
+    assert fake_service.upload_material_requests == []
+
+
+@pytest.mark.parametrize(
+    ("names", "expected_code", "expected_message"),
+    (
+        (("META.JSON", "deck.zip"), "reserved_control_name",
+         "文件名与仓储控制文件冲突：META.JSON；请重命名后重试"),
+        (("same.txt", "same.txt", "deck.zip"), "duplicate_original_basename",
+         "原件文件名重复：same.txt；请重命名后重试"),
+    ),
+)
+def test_upload_material_cli_mixed_name_and_format_uses_plan_reason(
+    tmp_path: Path,
+    fake_service: _FakeFinsDirectService,
+    capsys: pytest.CaptureFixture[str],
+    names: tuple[str, ...],
+    expected_code: str,
+    expected_message: str,
+) -> None:
+    """CLI 对混合名称及格式错误使用计划 owner 的原因和完整安全文案。
+
+    Args:
+        tmp_path: 隔离输入路径。
+        fake_service: 记录不应发生的 Service 调用。
+        capsys: CLI 输出捕获。
+        names: 原件名的保序组合。
+        expected_code: owner 用法错误码。
+        expected_message: 完整安全文案。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 公开错误与 owner 分裂或启动 Service 时抛出。
+    """
+
+    from dayu.fins.ingestion_runtime import FinsUploadMaterialRequest, admit_fins_upload_material_request
+    from dayu.fins.upload_usage_contract import FinsUploadUsageError
+
+    paths = tuple(tmp_path / str(index) / name for index, name in enumerate(names))
+    for path in paths:
+        path.parent.mkdir()
+        path.write_bytes(b"input")
+    with pytest.raises(FinsUploadUsageError) as raised:
+        admit_fins_upload_material_request(FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="AAPL", files=paths,  company_name="Apple Inc.",),  state_repository=FsMaterialUploadStateRepository(tmp_path),)
+    assert raised.value.failure.code.value == expected_code
+    assert raised.value.failure.message == expected_message
+    exit_code = cli_main.main((
+        "upload_material", "--ticker", "AAPL", "--forms", "MATERIAL_OTHER",
+        "--material-name", "Deck", "--files", *(str(path) for path in paths),
+    ))
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_USAGE_ERROR
+    assert captured.out == ""
+    assert captured.err == f"dayu-cli upload_material: {expected_message}\n"
+    assert str(tmp_path) not in captured.err
+    assert fake_service.upload_material_requests == []
+
+
+def test_real_cli_long_duplicate_basename_is_typed_usage_without_publication(
+    tmp_path: Path,
+) -> None:
+    """真实 CLI 对合法长同名原件返回有界用法错误且不发布。
+
+    Args:
+        tmp_path: 隔离输入目录与尚未建立的工作区。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: closed reason、退出码、路径安全或零发布漂移时抛出。
+        subprocess.TimeoutExpired: 真实 CLI 在期限内没有完成时抛出。
+    """
+
+    from dayu.fins.ingestion_runtime import (
+        FinsUploadMaterialRequest,
+        admit_fins_upload_material_request,
+    )
+    from dayu.fins.upload_usage_contract import FinsUploadUsageCode, FinsUploadUsageError
+
+    basename = "a" * 222 + ".txt"
+    first = tmp_path / "one" / basename
+    second = tmp_path / "two" / basename
+    first.parent.mkdir()
+    second.parent.mkdir()
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    with pytest.raises(FinsUploadUsageError) as raised:
+        admit_fins_upload_material_request(
+            FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", primary_selectors=(first,), ticker="AAPL", files=(first, second),  company_name="Apple Inc.",)
+        ,  state_repository=FsMaterialUploadStateRepository(tmp_path),)
+    assert raised.value.failure.code is FinsUploadUsageCode.DUPLICATE_ORIGINAL_BASENAME
+
+    workspace_root = tmp_path / "fresh-workspace"
+    repository_root = Path(__file__).resolve().parents[2]
+    completed = subprocess.run(
+        (
+            sys.executable, "-m", "dayu.cli", "upload_material",
+            "--base", str(workspace_root), "--ticker", "AAPL", "--action", "create",
+            "--forms", "MATERIAL_OTHER", "--material-name", "Deck",
+            "--company-name", "Apple Inc.", "--files", str(first), str(second),
+        ),
+        cwd=repository_root,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60.0,
+    )
+
+    assert completed.returncode == EXIT_USAGE_ERROR
+    assert completed.stdout == ""
+    assert completed.stderr == (
+        f"dayu-cli upload_material: {raised.value.failure.message}\n"
+    )
+    assert len(raised.value.failure.message) <= 240
+    assert "…" in completed.stderr
+    assert ".txt" in completed.stderr
+    assert str(tmp_path) not in completed.stderr
+    assert str(repository_root) not in completed.stderr
+    assert "Traceback" not in completed.stderr
+    assert not workspace_root.exists()
+
+
+def test_real_cli_backslash_basename_is_typed_usage_without_publication(
+    tmp_path: Path,
+) -> None:
+    """真实 CLI 对可创建的反斜杠文件名给出封闭用法错误且不发布。
+
+    Args:
+        tmp_path: 隔离输入文件与尚未建立的工作区。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 退出码、公开标签或零发布边界漂移时抛出。
+        subprocess.TimeoutExpired: 真实 CLI 在期限内没有完成时抛出。
+    """
+
+    from dayu.fins.ingestion_runtime import (
+        FinsUploadMaterialRequest,
+        admit_fins_upload_material_request,
+    )
+    from dayu.fins.upload_usage_contract import FinsUploadUsageCode, FinsUploadUsageError
+
+    upload_file = tmp_path / "a\\b.txt"
+    upload_file.write_bytes(b"content")
+    with pytest.raises(FinsUploadUsageError) as raised:
+        admit_fins_upload_material_request(
+            FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="AAPL", files=(upload_file,),  company_name="Apple Inc.",)
+        ,  state_repository=FsMaterialUploadStateRepository(tmp_path),)
+    assert raised.value.failure.code is FinsUploadUsageCode.INVALID_ASSET_NAME
+
+    workspace_root = tmp_path / "fresh-workspace"
+    repository_root = Path(__file__).resolve().parents[2]
+    completed = subprocess.run(
+        (
+            sys.executable, "-m", "dayu.cli", "upload_material",
+            "--base", str(workspace_root), "--ticker", "AAPL", "--action", "create",
+            "--forms", "MATERIAL_OTHER", "--material-name", "Deck",
+            "--company-name", "Apple Inc.", "--files", str(upload_file),
+        ),
+        cwd=repository_root,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60.0,
+    )
+
+    assert completed.returncode == EXIT_USAGE_ERROR
+    assert completed.stdout == ""
+    assert completed.stderr == f"dayu-cli upload_material: {raised.value.failure.message}\n"
+    assert "输入文件（文件名已隐藏）" in completed.stderr
+    assert str(tmp_path) not in completed.stderr
+    assert "Traceback" not in completed.stderr
+    assert not workspace_root.exists()
+
+
+def test_real_cli_unknown_home_uses_planner_usage_without_publication(
+    tmp_path: Path,
+) -> None:
+    """可经 argv 传入的未知用户目录在真实 CLI 返回封闭用法错误。
+
+    Args:
+        tmp_path: 尚未建立的隔离工作区根。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 退出码、安全文案或零发布漂移时抛出。
+        subprocess.TimeoutExpired: CLI 未在期限内结束时抛出。
+    """
+
+    from dayu.fins.ingestion_runtime import FinsUploadMaterialRequest, admit_fins_upload_material_request
+    from dayu.fins.upload_usage_contract import FinsUploadUsageCode, FinsUploadUsageError
+
+    raw_name = "~dayu_assets_nonexistent_user_20260929/report.txt"
+    with pytest.raises(FinsUploadUsageError) as raised:
+        admit_fins_upload_material_request(
+            FinsUploadMaterialRequest(form_type="MATERIAL_OTHER", material_name="Deck", ticker="AAPL", files=(Path(raw_name),),  company_name="Apple Inc.",)
+        ,  state_repository=FsMaterialUploadStateRepository(tmp_path),)
+    assert raised.value.failure.code is FinsUploadUsageCode.INVALID_ASSET_NAME
+    workspace_root = tmp_path / "fresh-workspace"
+    repository_root = Path(__file__).resolve().parents[2]
+    completed = subprocess.run(
+        (
+            sys.executable, "-m", "dayu.cli", "upload_material",
+            "--base", str(workspace_root), "--ticker", "AAPL", "--action", "create",
+            "--forms", "MATERIAL_OTHER", "--material-name", "Deck",
+            "--company-name", "Apple Inc.", "--files", raw_name,
+        ),
+        cwd=repository_root,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60.0,
+    )
+    assert completed.returncode == EXIT_USAGE_ERROR
+    assert completed.stdout == ""
+    assert completed.stderr == f"dayu-cli upload_material: {raised.value.failure.message}\n"
+    assert "Could not determine home directory" not in completed.stderr
+    assert str(tmp_path) not in completed.stderr
+    assert not workspace_root.exists()
+
+
+def test_real_cli_filing_unknown_home_uses_typed_usage_before_workspace(
+    tmp_path: Path,
+) -> None:
+    """真实 filing CLI 不在参数层自行解析路径并遮蔽封闭失败。
+
+    Args:
+        tmp_path: 尚未建立的隔离工作区根。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: CLI 退出码、文案或工作区副作用漂移时抛出。
+        subprocess.TimeoutExpired: CLI 未在期限内结束时抛出。
+    """
+
+    workspace_root = tmp_path / "fresh-workspace"
+    raw_name = "~dayu_nonexistent_user_zz/report.pdf"
+    completed = subprocess.run(
+        (sys.executable, "-m", "dayu.cli", "upload_filing", "--base", str(workspace_root),
+         "--ticker", "AAPL", "--action", "create", "--fiscal-year", "2024",
+         "--fiscal-period", "FY", "--company-name", "Apple Inc.", "--files", raw_name),
+        cwd=Path(__file__).resolve().parents[2], check=False,
+        capture_output=True, text=True, timeout=60.0,
+    )
+    assert completed.returncode == EXIT_USAGE_ERROR
+    assert "上传文件不存在：report.pdf" in completed.stderr
+    assert "Could not determine home directory" not in completed.stderr
+    assert not workspace_root.exists()
+
+
+def test_real_cli_material_delete_rejects_files_before_path_access(tmp_path: Path) -> None:
+    """参数：隔离根；返回：无；异常：断言/超时；delete 所有 files 在解析路径前同源拒绝。"""
+    workspace_root = tmp_path / "fresh-workspace"
+    valid = tmp_path / "valid.pdf"
+    valid.write_bytes(b"valid")
+    prefix = (sys.executable, "-m", "dayu.cli", "upload_material", "--base", str(workspace_root),
+              "--ticker", "AAPL", "--action", "delete", "--forms", "MATERIAL_OTHER",
+              "--material-name", "Deck", "--company-name", "Apple Inc.", "--files")
+    for paths in ((str(valid),), (str(tmp_path / "missing.pdf"),), (str(tmp_path),), (str(valid),) * 101):
+        completed = subprocess.run((*prefix, *paths), cwd=Path(__file__).resolve().parents[2],
+                                   check=False, capture_output=True, text=True, timeout=60.0)
+        assert completed.returncode == EXIT_USAGE_ERROR
+        assert completed.stdout == ""
+        assert "delete 不得提供 --files" in completed.stderr
+        assert not workspace_root.exists()
+
+
+def test_real_cli_material_delete_unknown_home_is_closed_usage(tmp_path: Path) -> None:
+    """真实 delete CLI 将未知用户目录归入可修正的资产规划失败。
+
+    Args:
+        tmp_path: 隔离且未创建的工作区根。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 退出分类、公开标签或零副作用漂移时抛出。
+        subprocess.TimeoutExpired: CLI 未在期限内结束时抛出。
+    """
+
+    workspace_root = tmp_path / "fresh-workspace"
+    completed = subprocess.run(
+        (
+            sys.executable, "-m", "dayu.cli", "upload_material",
+            "--base", str(workspace_root), "--ticker", "AAPL", "--action", "delete",
+            "--forms", "MATERIAL_OTHER", "--material-name", "Deck",
+            "--company-name", "Apple Inc.", "--files",
+            "~dayu_assets_nonexistent_user_20260930/report.pdf",
+        ),
+        cwd=Path(__file__).resolve().parents[2],
+        check=False, capture_output=True, text=True, timeout=60.0,
+    )
+    assert completed.returncode == EXIT_USAGE_ERROR
+    assert completed.stdout == ""
+    assert "delete 不得提供 --files" in completed.stderr
+    assert "dayu_assets_nonexistent_user_20260930" not in completed.stderr
+    assert not workspace_root.exists()
+
+
+@pytest.mark.parametrize("action", ("create", "delete"))
+def test_real_cli_material_symlink_loop_is_operational_without_publication(
+    tmp_path: Path, action: str,
+) -> None:
+    """真实 CLI 将路径循环作为操作失败处理，不创建工作区资产。
+
+    Args:
+        tmp_path: 隔离链接和工作区。
+        action: 待验证的上传动作。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 退出分类、公开文案或零发布漂移时抛出。
+        subprocess.TimeoutExpired: CLI 未在期限内结束时抛出。
+    """
+
+    loop = tmp_path / "loop.pdf"
+    loop.symlink_to(loop.name)
+    workspace_root = tmp_path / "fresh-workspace"
+    repository_root = Path(__file__).resolve().parents[2]
+    completed = subprocess.run(
+        (
+            sys.executable, "-m", "dayu.cli", "upload_material",
+            "--base", str(workspace_root), "--ticker", "AAPL", "--action", action,
+            "--forms", "MATERIAL_OTHER", "--material-name", "Deck",
+            "--company-name", "Apple Inc.", "--files", str(loop),
+        ),
+        cwd=repository_root, check=False, capture_output=True, text=True, timeout=60.0,
+    )
+    assert completed.returncode == (EXIT_USAGE_ERROR if action == "delete" else EXIT_FAILURE)
+    assert completed.stdout == ""
+    assert "文件名无法安全保存" not in completed.stderr
+    assert str(loop) not in completed.stderr
+    assert not workspace_root.exists()
+
+
+@pytest.mark.parametrize("action", ("create", "delete"))
+def test_cli_nul_path_uses_planner_usage_before_service_factory(
+    tmp_path: Path,
+    fake_service: _FakeFinsDirectService,
+    capsys: pytest.CaptureFixture[str],
+    action: str,
+) -> None:
+    """无法经 argv 传入的 NUL 在 CLI 参数边界仍安全退出。
+
+    Args:
+        tmp_path: 尚未建立的隔离工作区根。
+        fake_service: 记录意外的 Service 调用。
+        capsys: 捕获公开标准输出和错误输出。
+        action: 待验证的上传动作。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: usage 退出、安全文案或零发布漂移时抛出。
+    """
+
+    workspace_root = tmp_path / "fresh-workspace"
+    exit_code = cli_main.main(
+        (
+            "upload_material", "--base", str(workspace_root), "--ticker", "AAPL",
+            "--action", action, "--forms", "MATERIAL_OTHER", "--material-name", "Deck",
+            "--company-name", "Apple Inc.", "--files", "a\x00b.txt",
+        )
+    )
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_USAGE_ERROR
+    assert captured.out == ""
+    if action == "delete":
+        assert "delete 不得提供 --files" in captured.err
+    else:
+        assert "文件名无法安全保存" in captured.err
+        assert "输入文件（文件名已隐藏）" in captured.err
+    assert "embedded null byte" not in captured.err
+    assert str(tmp_path) not in captured.err
+    assert fake_service.upload_material_requests == []
+    assert not workspace_root.exists()
 
 
 def test_upload_material_alias_count_uses_typed_upload_admission(
@@ -3086,12 +3935,12 @@ def test_stream_failure_propagates_to_cli_error(
     assert service.closed_streams == 1
 
 
-def test_unknown_fins_direct_failure_logs_traceback_and_hides_exception_from_stderr(
+def test_unknown_download_command_logs_safe_trace_and_hides_exception_from_stderr(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """未知 direct 异常只进入 operator traceback，普通 stderr 使用固定文案。
+    """未知 download 外层异常只记录安全诊断，普通 stderr 使用固定文案。
 
     Args:
         monkeypatch: direct async 主流程异常注入夹具。
@@ -3102,7 +3951,7 @@ def test_unknown_fins_direct_failure_logs_traceback_and_hides_exception_from_std
         无。
 
     Raises:
-        AssertionError: stderr 泄漏异常或 operator 日志缺少 traceback 时抛出。
+        AssertionError: stderr 或日志泄漏原文、安全诊断缺失时抛出。
     """
 
     monkeypatch.setattr(
@@ -3122,10 +3971,86 @@ def test_unknown_fins_direct_failure_logs_traceback_and_hides_exception_from_std
     assert "/absolute/path" not in captured.err
     assert "Traceback" not in captured.err
     assert "RuntimeError" not in captured.err
-    assert "Fins direct command failed; command=download" in caplog.text
+    assert "fins.download.command_unexpected_failure" in caplog.text
+    assert "exception_type=RuntimeError" in caplog.text
+    assert _UNKNOWN_DIRECT_FAILURE_MARKER not in caplog.text
+    assert "/absolute/path" not in caplog.text
+    assert "Traceback" not in caplog.text
+    records = [record for record in caplog.records if "fins.download.command_unexpected_failure" in record.getMessage()]
+    assert len(records) == 1
+    assert records[0].levelno == logging.ERROR
+    assert records[0].exc_info is None
+
+
+def test_unknown_download_command_log_file_is_readable_and_helper_failure_is_safe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """显式日志文件可读取安全诊断；共享 helper 内部故障不改变 CLI 终态。
+
+    :param tmp_path: 临时日志目录。
+    :param monkeypatch: 外层异常和 helper 内部故障注入。
+    :param capsys: 用户输出捕获。
+    :returns: 无。
+    :raises AssertionError: 文件不可读、泄密或退出码漂移时抛出。
+    """
+
+    monkeypatch.setattr(fins_command, "_run_fins_direct_command_async", _raise_unknown_fins_direct_error)
+    log_file = tmp_path / "download.log"
+    assert cli_main.main(("download", "--ticker", "AAPL", "--log-file", str(log_file))) == EXIT_FAILURE
+    first_output = capsys.readouterr()
+    assert first_output.err == _UNKNOWN_DIRECT_FAILURE_STDERR
+    log_text = log_file.read_text(encoding="utf-8")
+    assert "fins.download.command_unexpected_failure" in log_text
+    assert "exception_type=RuntimeError" in log_text
+    assert _UNKNOWN_DIRECT_FAILURE_MARKER not in log_text
+    assert "Traceback" not in log_text
+
+    def fail_type(_exc: Exception) -> tuple[str, str]:
+        """模拟共用 helper 内部类型判断失败。
+
+        :param _exc: 原始异常。
+        :returns: 不返回。
+        :raises RuntimeError: 始终抛出。
+        """
+
+        raise RuntimeError("token=helper-secret")
+
+    monkeypatch.setattr(fins_command.runtime_log, "_safe_exception_type", fail_type)
+    assert cli_main.main(("download", "--ticker", "AAPL", "--log-file", str(log_file))) == EXIT_FAILURE
+    second_output = capsys.readouterr()
+    assert second_output.err == _UNKNOWN_DIRECT_FAILURE_STDERR
+    log_text = log_file.read_text(encoding="utf-8")
+    assert "exception_type=redacted custom_type=redacted stack=[unavailable]" in log_text
+    assert "helper-secret" not in log_text
+    assert _UNKNOWN_DIRECT_FAILURE_MARKER not in log_text
+
+
+def test_non_download_unknown_command_keeps_original_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """非 download direct 外层异常保留既有 raw 日志与固定用户文案。
+
+    :param monkeypatch: 外层异常注入。
+    :param caplog: operator 日志捕获。
+    :param capsys: 用户输出捕获。
+    :returns: 无。
+    :raises AssertionError: 原有日志行为或固定文案漂移时抛出。
+    """
+
+    monkeypatch.setattr(fins_command, "_run_fins_direct_command_async", _raise_unknown_fins_direct_error)
+    caplog.set_level(logging.ERROR, logger=fins_command.__name__)
+    args = parse_cli_args(("process", "--ticker", "AAPL", "--document-id", "doc-1"))
+    assert fins_command.run_fins_direct_command(args) == EXIT_FAILURE
+    assert capsys.readouterr().err == (
+        "dayu-cli process: 命令执行失败，请使用 --log-file PATH 重试并查看日志\n"
+    )
+    assert "Fins direct command failed; command=process" in caplog.text
     assert _UNKNOWN_DIRECT_FAILURE_MARKER in caplog.text
     assert "Traceback" in caplog.text
-    assert "RuntimeError" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -3137,7 +4062,7 @@ def test_unknown_fins_direct_failure_logs_traceback_and_hides_exception_from_std
                 status="ok",
                 requested_file_count=2,
                 stored_file_count=2,
-            ),
+             published_amended=None,),
             "stdout",
             "",
         ),
@@ -3147,7 +4072,7 @@ def test_unknown_fins_direct_failure_logs_traceback_and_hides_exception_from_std
                 status="deleted",
                 requested_file_count=0,
                 stored_file_count=0,
-            ),
+             published_amended=None,),
             "stdout",
             "",
         ),
@@ -3157,7 +4082,7 @@ def test_unknown_fins_direct_failure_logs_traceback_and_hides_exception_from_std
                 status="skipped",
                 requested_file_count=2,
                 stored_file_count=0,
-            ),
+             published_amended=None,),
             "stdout",
             "",
         ),
@@ -3171,7 +4096,7 @@ def test_unknown_fins_direct_failure_logs_traceback_and_hides_exception_from_std
                     RuntimeError(),
                     file_label=None,
                 ),
-            ),
+             published_amended=None,),
             "stderr",
             "",
         ),
@@ -3187,7 +4112,7 @@ def test_unknown_fins_direct_failure_logs_traceback_and_hides_exception_from_std
                         message=COMPANY_NAME_IGNORED_WARNING_MESSAGE,
                     ),
                 ),
-            ),
+             published_amended=None,),
             "stdout",
             f"{COMPANY_NAME_IGNORED_WARNING_MESSAGE}\n",
         ),
@@ -3203,7 +4128,7 @@ def test_unknown_fins_direct_failure_logs_traceback_and_hides_exception_from_std
                         message=COMPANY_NAME_IGNORED_WARNING_MESSAGE,
                     ),
                 ),
-            ),
+             published_amended=None,),
             "stdout",
             f"{COMPANY_NAME_IGNORED_WARNING_MESSAGE}\n",
         ),
@@ -3922,7 +4847,7 @@ def _live_command_argv(command_name: str, tmp_path: Path) -> tuple[str, ...]:
     if command_name == "upload_material":
         upload_file = tmp_path / "material.pdf"
         upload_file.write_text("material", encoding="utf-8")
-        return ("upload_material", "--ticker", "AAPL", "--files", str(upload_file))
+        return ("upload_material", "--base", str(tmp_path / "workspace"), "--company-name", "Apple Inc.", "--forms", "MATERIAL_OTHER", "--material-name", "Deck", "--ticker", "AAPL", "--files", str(upload_file))
     raise ValueError(f"unknown live command: {command_name}")
 
 
@@ -4036,3 +4961,177 @@ def _result_event(
             error_message=error_message,
         ),
     )
+
+
+@pytest.mark.parametrize("path_kind", ("missing", "directory"))
+def test_material_cli_path_precheck_keeps_existing_usage_before_service(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    path_kind: str,
+) -> None:
+    """material 准入后对缺失路径与目录沿用原有文案且不打开 Service。
+
+    Args:
+        tmp_path: 隔离输入与 workspace 根。
+        monkeypatch: Service 构造观察点。
+        capsys: 双流捕获。
+        path_kind: 缺失路径或目录。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: CLI 预检、exit 或旧英文文案漂移时抛出。
+    """
+
+    bad_path = tmp_path / ("missing.pdf" if path_kind == "missing" else "directory.pdf")
+    if path_kind == "directory":
+        bad_path.mkdir()
+    service_factory = Mock(side_effect=AssertionError("Service 不应启动"))
+    monkeypatch.setattr(fins_command, "FINS_DIRECT_SERVICE_FACTORY", service_factory)
+    exit_code = cli_main.main(
+        (
+            "upload_material",
+            "--company-name", "Apple Inc.",
+            "--base",
+            str(tmp_path / "workspace"),
+            "--ticker",
+            "AAPL",
+            "--forms",
+            "MATERIAL_OTHER",
+            "--material-name",
+            "Deck",
+            "--files",
+            str(bad_path),
+        )
+    )
+    captured = capsys.readouterr()
+    expected = (
+        f"upload file does not exist: {bad_path.resolve(strict=False)}"
+        if path_kind == "missing"
+        else f"upload path is not a file: {bad_path.resolve(strict=False)}"
+    )
+    assert exit_code == EXIT_USAGE_ERROR
+    assert captured.out == ""
+    assert captured.err == f"dayu-cli upload_material: {expected}\n"
+    service_factory.assert_not_called()
+
+
+class _RealSecIntegrityServiceFactory:
+    """给真实 CLI 装配真实 runtime，仅下载器资产为离线合成。"""
+
+    def __init__(self, runtime: ingestion_runtime.FinsIngestionRuntime) -> None:
+        """保存授权工作区的真实 runtime。
+
+        参数：runtime 为真实运行时。返回：无。异常：无。
+        """
+        self.runtime = runtime
+
+    def __call__(self, workspace_root: Path) -> FinsDirectCommandService:
+        """提供真实 Service 消费入口。
+
+        参数：workspace_root 为 CLI 规范化工作区。返回：真实 direct Service。异常：无。
+        """
+        del workspace_root
+        return FinsDirectCommandService(self.runtime)
+
+
+@pytest.mark.parametrize("scenario", ("postrepair", "churn"))
+def test_fins_download_sec_integrity_failure_preserves_summary(
+    tmp_path: Path, scenario: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """CLI 主入口执行真实 SEC adapter 后返回失败并保全文档摘要和安全原因。
+
+    参数：tmp_path 为隔离根；scenario 为真实状态；monkeypatch 为 Service 装配；capsys 为输出观察器。
+    返回：无。异常：断言失败抛出 AssertionError。
+    """
+    runtime, _executor, pipeline = _build_real_sec_integrity_runtime(tmp_path, scenario)
+    monkeypatch.setattr(fins_command, "FINS_DIRECT_SERVICE_FACTORY", _RealSecIntegrityServiceFactory(runtime))
+    args = ["download", "--base", str(tmp_path), "--ticker", "AAPL", "--forms", "10-K", "6-K",
+        "--start", "2025-01-01", "--end", "2025-12-31"]
+    if scenario == "churn":
+        args.append("--overwrite")
+    code = cli_main.main(tuple(args))
+    captured = capsys.readouterr()
+    assert code == EXIT_FAILURE, captured.err
+    reason = "source_repair_required" if scenario == "postrepair" else "source_revision_conflict"
+    message = "本地来源仍需修复，本次下载已停止" if scenario == "postrepair" else "本地来源版本持续变化，本次下载已停止"
+    assert f'reason_code="{reason}"' in captured.err and message in captured.err
+    assert "downloaded=1" in captured.err
+    assert ("failed=0" if scenario == "postrepair" else "failed=1") in captured.err
+    assert str(tmp_path) not in captured.err and "://" not in captured.err
+    assert pipeline.source_repository.classify_source_integrity("AAPL", "fil_0000000000-25-000001", SourceKind.FILING).status is SourceIntegrityStatus.COMPLETE
+    print(captured.err)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="真实 SIGINT 验证需要 POSIX 信号")
+def test_real_material_cli_sigint_waits_for_cancelled_terminal(tmp_path: Path) -> None:
+    """参数：独占真实输入与根；返回：无；异常：断言/超时；首个真实进度后 SIGINT 请求协作取消，exit=130且无材料/job/Agent产物。"""
+    workspace_root = tmp_path / "workspace"
+    path = tmp_path / "cancel.txt"
+    path.write_text("Public cancellation probe text.\n" * 2000, encoding="utf-8")
+    argv = (sys.executable, "-m", "dayu.cli", "upload_material", "--base", str(workspace_root),
+            "--ticker", "AAPL", "--forms", "MATERIAL_OTHER", "--material-name", "Cancel Text",
+            "--company-name", "Apple Inc.", "--files", str(path))
+    started = time.monotonic()
+    process = subprocess.Popen(argv, cwd=Path(__file__).resolve().parents[2], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    first_line = ""
+    try:
+        assert process.stdout is not None
+        readable, _, _ = select.select((process.stdout,), (), (), 30.0)
+        assert readable, "CLI 未产生首个进度"
+        first_line = process.stdout.readline()
+        assert "Fins progress" in first_line
+        process.send_signal(signal.SIGINT)
+        stdout, stderr = process.communicate(timeout=30.0)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.communicate(timeout=10.0)
+    (tmp_path / "sigint.stdout").write_text(first_line + stdout, encoding="utf-8")
+    (tmp_path / "sigint.stderr").write_text(stderr, encoding="utf-8")
+    (tmp_path / "sigint.exit").write_text(str(process.returncode) + "\n", encoding="utf-8")
+    (tmp_path / "sigint.command.json").write_text(json.dumps({"argv": argv, "pid": process.pid,
+        "monotonic_start": started, "monotonic_end": time.monotonic(), "signal": "SIGINT"}), encoding="utf-8")
+    assert process.returncode == EXIT_KEYBOARD_INTERRUPT
+    assert "Fins cancelled" in stderr and "Traceback" not in stderr
+    assert not tuple((workspace_root / ".dayu" / "fins_ingestion" / "jobs").glob("*.json"))
+    assert FsSourceDocumentRepository(workspace_root).list_source_document_ids("AAPL", SourceKind.MATERIAL) == []
+    assert not (workspace_root / "sessions").exists()
+    assert not (workspace_root / "artifacts").exists()
+
+
+class _DiagnosticsSpawnHandle:
+    """复用真实 process 生命周期，仅在 worker 替换转换内容结果。"""
+    def __new__(cls, target: 'InterruptibleProcessTarget') -> 'InterruptibleProcessHandle':
+        """参数：真实 production target；返回：真实 handle；异常：worker 装配错误传播。"""
+        from dayu.runtime.interruptible_process import InterruptibleProcessHandle
+        from dayu.fins.pipelines.docling_process_converter import _DoclingProcessTarget
+        from tests.fins.test_docling_process_converter import _TargetSpawnProbe
+        return InterruptibleProcessHandle(_TargetSpawnProbe(cast(_DoclingProcessTarget, target), 'leak'))
+
+
+@pytest.mark.parametrize('selector', ['default', 'quiet', 'info', 'error'])
+def test_upload_material_converter_diagnostics_cli_owner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capfd: pytest.CaptureFixture[str], selector: str) -> None:
+    """参数：真实 CLI/Service/Fs/worker 与 selector；返回：无；异常：双流泄漏/日志准入/业务终态漂移失败。"""
+    from dayu.fins.pipelines import docling_process_converter
+    monkeypatch.setattr(docling_process_converter, 'InterruptibleProcessHandle', _DiagnosticsSpawnHandle)
+    source = tmp_path / 'annual-report.pdf'; source.write_bytes(b'immutable-filing-input')
+    logfile = _redirect_default_log_file(tmp_path=tmp_path, monkeypatch=monkeypatch) if selector == 'default' else tmp_path / 'explicit.log'
+    args = ['upload_material', '--base', str(tmp_path / 'store'), '--ticker', 'MSFT', '--forms', 'MATERIAL_OTHER',
+            '--material-name', 'Diagnostic owner', '--company-name', 'Microsoft Corporation', '--files', str(source)]
+    if selector != 'default': args += ['--' + selector, '--log-file', str(logfile)]
+    if selector == 'info': logfile.write_text('append-prefix\n')
+    assert cli_main.main(tuple(args)) == EXIT_SUCCESS
+    public = capfd.readouterr()
+    assert public.err == '' and 'stored_files="1"' in public.out
+    assert 'installed late-created warning' not in public.out and 'native stdout WARNING' not in public.out
+    text = logfile.read_text()
+    if selector in ('default', 'info'):
+        assert '[WARNING] [MatchingPostProcessor] installed late-created warning' in text
+        assert 'source_level=unknown' in text and '转换诊断捕获异常' in text
+    else: assert 'installed late-created warning' not in text and 'native stdout WARNING' not in text
+    if selector == 'info': assert text.startswith('append-prefix\n')

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dayu.fins.storage import FsMaterialUploadStateRepository, MaterialUploadStateRepositoryProtocol
+
 from dayu.contracts.json_value import JsonValue
 
 import asyncio
@@ -76,6 +78,7 @@ from dayu.fins.domain.filing_semantics import (
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.processors.registry import build_fins_processor_registry
 from dayu.fins.pipelines.sec_download_event_mapping import DownloadFileResult
+from dayu.fins.pipelines.sec_download_workflow import SecDownloadIntegrityAbort
 from dayu.fins.pipelines.sec_pipeline import (
     SEC_PIPELINE_DOWNLOAD_VERSION,
     SecPipeline as _SecPipeline,
@@ -90,6 +93,7 @@ from dayu.fins.storage import (
     SourceIntegrityClassification,
     SourceIntegrityPreflightError,
     SourceIntegrityPreflightReason,
+    SourceIntegrityRepairRequiredError,
     SourceIntegrityReason,
     SourceIntegrityStatus,
 )
@@ -1427,6 +1431,7 @@ def _as_sec_downloader(downloader: _TestDownloader) -> SecDownloader:
 
 def SecPipeline(
     *,
+    material_upload_state_repository: MaterialUploadStateRepositoryProtocol,
     workspace_root: Path,
     processor_registry: ProcessorRegistry,
     downloader: Optional[_TestDownloader] = None,
@@ -1434,7 +1439,7 @@ def SecPipeline(
     """构造测试用 SecPipeline，并在装配边界收窄 stub 类型。"""
 
     return _SecPipeline(
-        workspace_root=workspace_root,
+        material_upload_state_repository=material_upload_state_repository,        workspace_root=workspace_root,
         processor_registry=processor_registry,
         downloader=None if downloader is None else _as_sec_downloader(downloader),
     )
@@ -1612,7 +1617,7 @@ def test_sec_download_filing_provider_evidence_failure_is_unique_failed_row_and_
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     begin_calls = 0
     original_begin = pipeline._batching_repository.begin_batch
 
@@ -1728,7 +1733,7 @@ def test_sec_download_filing_6k_preview_provider_failure_stays_local_and_safe(
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     preview = asyncio.run(
         pipeline._precheck_6k_filter(
             remote_files=[descriptor],
@@ -2222,7 +2227,7 @@ def test_sec_pipeline_download_writes_meta_and_manifest(tmp_path: Path) -> None:
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     result = pipeline.download(ticker="AAPL", overwrite=False, start_is_explicit=False)
 
     assert result["summary"]["downloaded"] == 1
@@ -2265,7 +2270,7 @@ def test_sec_pipeline_download_merges_cli_aliases_with_sec_aliases(tmp_path: Pat
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
 
     pipeline.download(
         ticker="AAPL",
@@ -2366,7 +2371,7 @@ def test_sec_pipeline_rebuild_local_meta_manifest_without_redownload(tmp_path: P
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
 
     result = pipeline.download(ticker=ticker, rebuild=True, start_is_explicit=False)
 
@@ -2670,7 +2675,7 @@ def test_sec_pipeline_download_prefers_dei_fiscal_when_available(
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
 
     pipeline.download(ticker="AAPL", overwrite=False, start_is_explicit=False)
 
@@ -3093,7 +3098,7 @@ def test_sec_pipeline_skip_when_meta_matches(tmp_path: Path) -> None:
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     result = pipeline.download(ticker="AAPL", overwrite=False, start_is_explicit=False)
 
     assert result["summary"]["skipped"] == 1
@@ -3132,7 +3137,7 @@ def test_sec_pipeline_skip_with_etag_gzip_variant_without_re_download(tmp_path: 
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     result = pipeline.download(ticker="AAPL", overwrite=False, start_is_explicit=False)
 
     assert result["summary"]["skipped"] == 1
@@ -3196,7 +3201,7 @@ def test_sec_pipeline_all_files_not_modified_respects_download_version(
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     result = pipeline.download(ticker="AAPL", overwrite=False, start_is_explicit=False)
     after_text = meta_path.read_text(encoding="utf-8")
 
@@ -3248,7 +3253,7 @@ def test_sec_pipeline_failed_filing_does_not_write_meta(tmp_path: Path) -> None:
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     result = pipeline.download(ticker="AAPL", overwrite=False, start_is_explicit=False)
 
     assert result["summary"]["failed"] == 1
@@ -3323,7 +3328,7 @@ def test_sec_pipeline_remote_change_marks_reprocess(tmp_path: Path) -> None:
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
 
     # 非 overwrite 模式下，快速预检会直接跳过（不发远端请求）
     result_skip = pipeline.download(ticker="AAPL", overwrite=False, start_is_explicit=False)
@@ -3379,7 +3384,7 @@ def test_sec_ordinary_download_keeps_unselected_historical_document(tmp_path: Pa
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
 
     result = pipeline.download(ticker="AAPL", overwrite=False, start_is_explicit=False)
 
@@ -3419,7 +3424,7 @@ def test_sec_pipeline_download_parses_year_month_date_inputs(tmp_path: Path) -> 
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     result = pipeline.download(
         ticker="AAPL",
         start_date="2024",
@@ -3478,7 +3483,7 @@ def test_sec_pipeline_download_resolves_foreign_issuer_from_submissions(tmp_path
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     result = pipeline.download(ticker="TCOM", overwrite=False, start_is_explicit=False)
 
     assert result["summary"]["downloaded"] == 1
@@ -3554,7 +3559,7 @@ def test_sec_pipeline_filters_6k_excluded(
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     caplog.set_level(logging.INFO, logger="dayu.fins.FINS.SEC_PIPELINE")
 
     result = pipeline.download(ticker="TCOM", overwrite=False, start_is_explicit=False)
@@ -3630,7 +3635,7 @@ def test_sec_download_adapter_counts_6k_filtered_as_rejected_in_persisted_summar
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     adapter = sec_pipeline.SecDownloadAdapter(pipeline=pipeline)
 
     result = adapter.download(
@@ -3883,7 +3888,7 @@ def test_sec_pipeline_keeps_6k_results_release(tmp_path: Path) -> None:
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     result = pipeline.download(ticker="TCOM", overwrite=False, start_is_explicit=False)
 
     assert result["summary"]["downloaded"] == 1
@@ -3931,7 +3936,7 @@ def test_sec_pipeline_keeps_primary_only_6k_results_release(tmp_path: Path) -> N
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     result = pipeline.download(ticker="TCOM", overwrite=False, start_is_explicit=False)
 
     assert result["summary"]["downloaded"] == 1
@@ -4004,7 +4009,7 @@ def test_sec_pipeline_promotes_positive_6k_exhibit_when_cover_is_excluded(tmp_pa
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     result = pipeline.download(ticker="TCOM", overwrite=False, start_is_explicit=False)
 
     assert result["summary"]["downloaded"] == 1
@@ -4105,7 +4110,7 @@ def test_sec_pipeline_repairs_cover_primary_when_attachment_has_core_statements(
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     result = pipeline.download(ticker="ALVO", overwrite=False, start_is_explicit=False)
 
     assert result["summary"]["downloaded"] == 1
@@ -4188,7 +4193,7 @@ def test_sec_pipeline_rolls_back_when_prepared_primary_selection_raises(
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     with pytest.raises(RuntimeError, match="boom"):
         pipeline.download(ticker="TCOM", overwrite=False, start_is_explicit=False)
 
@@ -4591,6 +4596,9 @@ def test_sec_form_domain_parser_accepts_supported_aliases() -> None:
 
     assert parse_sec_form_type("10K") == "10-K"
     assert parse_sec_form_type("10-K/A") == "10-K/A"
+    assert parse_sec_form_type("F1") == "F-1"
+    assert parse_sec_form_type("F-1/A") == "F-1/A"
+    assert sec_pipeline.expand_form_aliases(["F1/A", "F-1"]) == ["F-1", "F-1/A"]
     assert parse_sec_form_type("def 14a") == "DEF 14A"
     assert parse_sec_form_filter_value("SC13D/G") == "SC 13D/G"
     assert expand_sec_form_aliases(["SC13D/G"]) == ["SC 13D", "SC 13D/A", "SC 13G", "SC 13G/A"]
@@ -4613,7 +4621,7 @@ def test_shared_domain_parsers_reject_invalid_values() -> None:
     with pytest.raises(ValueError, match="form_type 不能为空"):
         parse_sec_form_type("")
     with pytest.raises(ValueError, match="form_type 不支持"):
-        parse_sec_form_type("F-1")
+        parse_sec_form_type("S-1")
     with pytest.raises(ValueError, match="fiscal_period 非法"):
         normalize_fiscal_period("Q5")
     with pytest.raises(ValueError, match="quality 非法"):
@@ -4655,7 +4663,7 @@ def test_sec_pipeline_warns_missing_sc13(tmp_path: Path) -> None:
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     result = pipeline.download(ticker="AAPL", overwrite=False, start_is_explicit=False)
 
     warnings = result.get("warnings") or []
@@ -4701,7 +4709,7 @@ def test_sec_pipeline_sc13_direction_filters_gs_like_records(tmp_path: Path) -> 
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     result = pipeline.download(ticker="GS", form_type="SC13D/G", overwrite=False, start_is_explicit=False)
 
     assert result["summary"]["total"] == 0
@@ -4775,7 +4783,7 @@ def test_sec_pipeline_sc13_transport_failure_publishes_registry_only(
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
 
     result = pipeline.download(
         ticker="GS",
@@ -4843,7 +4851,7 @@ def test_sec_pipeline_sc13_direction_keeps_aapl_like_records(tmp_path: Path) -> 
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     result = pipeline.download(
         ticker="AAPL",
         form_type="SC13D/G",
@@ -4928,7 +4936,7 @@ def test_sec_pipeline_supplements_sc13_from_browse(tmp_path: Path) -> None:
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     result = pipeline.download(ticker="AAPL", form_type="SC13D/G", overwrite=False, start_is_explicit=False)
 
     assert result["summary"]["downloaded"] == 1
@@ -5001,7 +5009,7 @@ def test_sec_pipeline_sc13_keeps_latest_per_filer(tmp_path: Path) -> None:
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
 
     result = pipeline.download(ticker="AAPL", form_type="SC13D/G", overwrite=False, start_is_explicit=False)
 
@@ -5080,7 +5088,7 @@ def test_sc13_no_retry_when_found_in_initial_window(tmp_path: Path) -> None:
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     result = pipeline.download(ticker="AAPL", form_type="SC13D/G", overwrite=False, start_is_explicit=False)
 
     # 找到了 SC 13G，无需重试 → browse_calls 不应被调用（submissions 无 005- filenum 除自身外）
@@ -5135,7 +5143,7 @@ def test_sc13_retry_expands_window_and_finds_filing(tmp_path: Path) -> None:
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     result = pipeline.download(ticker="AAPL", form_type="SC13D/G", overwrite=False, start_is_explicit=False)
 
     # 初始1年窗口找不到（2024-01-15 在1年+60天之外），重试后应找到
@@ -5190,7 +5198,7 @@ def test_sc13_explicit_start_never_expands_lower_bound(tmp_path: Path) -> None:
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
 
     result = pipeline.download(
         ticker="AAPL",
@@ -5253,7 +5261,7 @@ def test_sc13_retry_warns_after_max_retries(tmp_path: Path) -> None:
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     result = pipeline.download(ticker="AAPL", overwrite=False, start_is_explicit=False)
 
     # 最大重试后仍无 SC 13 → 应有缺失警告
@@ -5297,7 +5305,7 @@ def test_sec_top_level_repairs_selected_corruption_before_company_mutation(
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
 
     result = pipeline.download(
         ticker="AAPL",
@@ -5356,7 +5364,7 @@ def test_sec_top_level_unselected_corruption_fails_before_company_batch(
             download_results=[],
         ),
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
 
     with pytest.raises(SourceIntegrityPreflightError) as exc_info:
         pipeline.download(
@@ -5408,7 +5416,7 @@ def test_sec_unsafe_phase_a_and_whole_tree_preflight_have_zero_mutation(
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     begin_calls = 0
 
     def reject_begin(ticker: str) -> BatchToken:
@@ -5525,7 +5533,7 @@ def test_sec_empty_inventory_manifest_preflight_has_zero_mutation(
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
 
     with pytest.raises(SourceIntegrityPreflightError) as exc_info:
         pipeline.download(
@@ -5585,7 +5593,7 @@ def test_sec_unsafe_phase_b_rolls_back_without_reset_blob_or_commit(
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     calls = _SecPhaseBMutationCalls()
     original_begin = pipeline._batching_repository.begin_batch
     original_rollback = pipeline._batching_repository.rollback_batch
@@ -5829,7 +5837,7 @@ def test_sec_whole_manifest_missing_with_multiple_actual_sources_fails_closed(
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
 
     with pytest.raises(SourceIntegrityPreflightError) as exc_info:
         pipeline.download(ticker="AAPL", overwrite=False, start_is_explicit=False)
@@ -5890,12 +5898,12 @@ def test_sec_same_target_overwrite_discards_stale_prefetch_and_last_writer_wins(
         workspace_root=tmp_path,
         downloader=first_downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     second_pipeline = SecPipeline(
         workspace_root=tmp_path,
         downloader=second_downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     original_first_commit = first_pipeline._batching_repository.commit_batch
 
     def observe_first_source_commit(batch: BatchToken) -> None:
@@ -6011,12 +6019,12 @@ def test_sec_different_target_overwrite_writers_publish_union(
         workspace_root=tmp_path,
         downloader=first_downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     second_pipeline = SecPipeline(
         workspace_root=tmp_path,
         downloader=second_downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     original_first_commit = first_pipeline._batching_repository.commit_batch
 
     def release_second_after_first_source(batch: BatchToken) -> None:
@@ -6101,7 +6109,7 @@ def test_rejected_prefetch_cancelled_before_begin_batch(
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
     begin_called = False
 
     def observe_begin(ticker: str) -> BatchToken:
@@ -6181,14 +6189,94 @@ def test_sec_selected_repair_that_6k_policy_rejects_fails_before_mutation(
         workspace_root=tmp_path,
         downloader=downloader,
         processor_registry=build_fins_processor_registry(),
-    )
+     material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
 
-    with pytest.raises(SourceIntegrityPreflightError) as exc_info:
+    with pytest.raises(SecDownloadIntegrityAbort) as exc_info:
         pipeline.download(ticker="TCOM", overwrite=False, start_is_explicit=False)
 
-    assert exc_info.value.reason is SourceIntegrityPreflightReason.SELECTED_REJECTED_REPAIR_REQUIRED
+    abort = exc_info.value
+    assert isinstance(abort.cause, SourceIntegrityPreflightError)
+    assert abort.__cause__ is abort.cause
+    assert abort.cause.reason is SourceIntegrityPreflightReason.SELECTED_REJECTED_REPAIR_REQUIRED
+    summary = abort.result["summary"]
+    assert isinstance(summary, dict) and summary["total"] == summary["failed"] == 1
+    rows = abort.result["filings"]
+    assert isinstance(rows, list) and len(rows) == 1
+    assert isinstance(rows[0], dict) and rows[0]["status"] == "failed"
     assert meta_path.read_bytes() == old_meta
     assert payload_path.read_bytes() == old_payload
     assert not _company_meta_path(tmp_path, "TCOM").exists()
     assert not _download_rejections_path(tmp_path, "TCOM").exists()
     assert not _rejected_meta_path(tmp_path, "TCOM", document_id).exists()
+
+
+class _PostrepairNewDamageInventory:
+    """在 repair 终态之后制造同长度 digest 损坏，真实 classifier 负责分类。"""
+
+    def __init__(self, source: SourceDocumentRepositoryProtocol, payload: Path) -> None:
+        """保存原仓储读取和目标合成文件。
+
+        参数：source 为真实仓储；payload 为第二来源字节。返回：无。异常：无。
+        """
+        self.read = source.list_source_integrity
+        self.payload = payload
+        self.views: list[tuple[SourceIntegrityClassification, ...]] = []
+
+    def __call__(self, ticker: str) -> tuple[SourceIntegrityClassification, ...]:
+        """第二次枚举前损坏第二来源，保留原 revision 和真实 reasons。
+
+        参数：ticker 为公司。返回：真实完整性 inventory。异常：文件操作传播 OSError。
+        """
+        if len(self.views) == 1:
+            self.payload.write_bytes(b"x" * len(self.payload.read_bytes()))
+        result = self.read(ticker)
+        self.views.append(result)
+        return result
+
+
+def test_sec_postrepair_new_corruption_aborts_after_confirmed_repair(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """两个真实来源中首个修复确认后第二个 digest 损坏，原首事实保全。
+
+    参数：tmp_path 为隔离根；monkeypatch 为枚举观察装配。返回：无。异常：断言失败抛出 AssertionError。
+    """
+    first_id, second_id, tail_id = ("fil_0000000000-25-000001", "fil_0000000000-25-000002", "fil_0000000000-25-000003")
+    first_meta = _seed_complete_sec_source(workspace_root=tmp_path, document_id=first_id)
+    second_meta = _seed_complete_sec_source(workspace_root=tmp_path, document_id=second_id)
+    first_payload = first_meta.parent / "sample-10k.htm"
+    first_payload.unlink()
+    submissions: dict[str, JsonValue] = {"filings": {"recent": {
+        "form": ["10-K", "10-K", "10-K"], "filingDate": ["2025-02-01", "2025-02-02", "2025-02-03"],
+        "reportDate": ["2024-12-31", "2024-12-31", "2024-12-31"],
+        "accessionNumber": [first_id[4:], second_id[4:], tail_id[4:]],
+        "primaryDocument": ["sample-10k.htm", "sample-10k.htm", "sample-10k.htm"]}, "files": []}}
+    descriptor = RemoteFileDescriptor(name="sample-10k.htm", source_url="https://synthetic.invalid/offline.htm",
+        http_etag="offline-v1", http_last_modified=None, remote_size=None, http_status=200)
+    repaired_payload = b"<html>offline repair</html>"
+    downloader = StubDownloader(submissions=submissions, remote_files=[descriptor],
+        download_results=[{"name": descriptor.name, "status": "downloaded", "source_url": descriptor.source_url}],
+        content_by_name={descriptor.name: repaired_payload})
+    pipeline = SecPipeline(workspace_root=tmp_path, downloader=downloader, processor_registry=build_fins_processor_registry(),  material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path),)
+    observation = _PostrepairNewDamageInventory(pipeline.source_repository, second_meta.parent / "sample-10k.htm")
+    monkeypatch.setattr(pipeline.source_repository, "list_source_integrity", observation)
+    with pytest.raises(SecDownloadIntegrityAbort) as raised:
+        pipeline.download(ticker="AAPL", form_type="10-K", start_date="2025-01-01", end_date="2025-12-31", start_is_explicit=True)
+    abort = raised.value
+    assert isinstance(abort.cause, SourceIntegrityRepairRequiredError) and abort.__cause__ is abort.cause
+    assert len(observation.views) == 2
+    initial_second = next(item for item in observation.views[0] if item.document_id == second_id)
+    after_second = next(item for item in observation.views[1] if item.document_id == second_id)
+    assert initial_second.status is SourceIntegrityStatus.COMPLETE
+    assert after_second.status is SourceIntegrityStatus.REPAIR_REQUIRED
+    assert after_second.revision == initial_second.revision
+    assert after_second.reasons == (SourceIntegrityReason.DIGEST_MISMATCH,)
+    rows = abort.result["filings"]
+    assert isinstance(rows, list) and len(rows) == 1
+    assert isinstance(rows[0], dict) and rows[0]["document_id"] == first_id and rows[0]["status"] == "downloaded"
+    summary = abort.result["summary"]
+    assert isinstance(summary, dict) and (summary["total"], summary["downloaded"], summary["failed"]) == (1, 1, 0)
+    assert first_payload.read_bytes() == repaired_payload
+    assert pipeline.source_repository.classify_source_integrity("AAPL", first_id, SourceKind.FILING).status is SourceIntegrityStatus.COMPLETE
+    assert downloader.list_filing_files_call_count == 1
+    assert not _company_meta_path(tmp_path, "AAPL").exists()
+    assert tail_id not in {item.document_id for item in observation.views[-1]}
+    print(json.dumps({"snapshot": abort.result, "before_revision": str(initial_second.revision), "after_revision": str(after_second.revision), "after_reasons": [item.value for item in after_second.reasons]}, ensure_ascii=False))

@@ -1,0 +1,70 @@
+"""总控以真实仓储核实 published 身份校验回归，不修改冻结源码。
+
+输入：命令行给出全新隔离根。输出：正常及损坏后的公开读取结果。
+异常：断言失败或非预期仓储异常直接令探针失败。
+"""
+
+from pathlib import Path
+import hashlib
+import json
+import sys
+
+from dayu.fins.domain.enums import SourceKind
+from dayu.fins.storage import (
+    CompanyTickerIdentityCorruptionError, FsBatchingRepository,
+    FsDocumentBlobRepository, FsSourceDocumentRepository,
+)
+from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
+from tests.fins.test_fins_storage_atomicity import _stage_meta_view_pair
+
+root = Path(sys.argv[1])
+assert not root.exists(), "要求全新隔离根，禁止重用已损坏目录"
+root.mkdir(parents=True)
+workspace = Path('/Users/leo/workspace/dayu-agent-r')
+freeze = json.loads((workspace / 'workspace/tmp/pr197-f5-aggregate-20261002/freeze.json').read_text())
+for category in ('files', 'validation'):
+    for relative, digest in freeze[category].items():
+        assert hashlib.sha256((workspace / relative).read_bytes()).hexdigest() == digest, relative
+
+repositories = build_fs_repository_set(workspace_root=root)
+batching = FsBatchingRepository(root, repository_set=repositories)
+source = FsSourceDocumentRepository(root, repository_set=repositories)
+blob = FsDocumentBlobRepository(root, repository_set=repositories)
+batch = batching.begin_batch('AAPL')
+_stage_meta_view_pair(source, blob, batch, 'A', replace_existing=False)
+batching.commit_batch(batch)
+assert source.list_source_document_ids('AAPL', SourceKind.FILING) == ['A', 'B']
+assert source.get_source_meta('AAPL', 'A', SourceKind.FILING)['version'] == 'A'
+assert len(source.read_source_meta_view('AAPL', SourceKind.FILING).entries) == 2
+
+ticker_dir = repositories.core._target_ticker_dir('AAPL')
+descriptors = [p for p in ticker_dir.iterdir() if p.name.startswith('.') and p.suffix == '.json']
+assert len(descriptors) == 1
+descriptor = descriptors[0]
+(root.parent / 'identity-descriptor-original.json').write_bytes(descriptor.read_bytes())
+descriptor.write_text('{}', encoding='utf-8')
+try:
+    repositories.core._ticker_dir_for_read('AAPL')
+except CompanyTickerIdentityCorruptionError as exc:
+    assert exc.kind == 'invalid_descriptor'
+else:
+    raise AssertionError('严格 published owner 应拒绝损坏 descriptor')
+
+# 当前回归直接表现为三个公开读取入口均成功返回；修复后本探针的这些断言将失败。
+ids = source.list_source_document_ids('AAPL', SourceKind.FILING)
+meta = source.get_source_meta('AAPL', 'A', SourceKind.FILING)
+view = source.read_source_meta_view('AAPL', SourceKind.FILING)
+assert ids == ['A', 'B']
+assert meta['version'] == 'A'
+assert len(view.entries) == 2 and view.read_error is None
+for category in ('files', 'validation'):
+    for relative, digest in freeze[category].items():
+        assert hashlib.sha256((workspace / relative).read_bytes()).hexdigest() == digest, relative
+print(json.dumps({
+    'freeze_files': len(freeze['files']), 'freeze_validation': len(freeze['validation']),
+    'source_unchanged': True, 'normal_before_corruption': 'passed',
+    'strict_root_after_corruption': 'CompanyTickerIdentityCorruptionError:invalid_descriptor',
+    'list_after_corruption': ids, 'get_after_corruption': meta['version'],
+    'view_after_corruption': {'entries': len(view.entries), 'read_error': view.read_error},
+    'finding': 'F5-AG01 independently reproduced with real published documents',
+}, ensure_ascii=False, indent=2))

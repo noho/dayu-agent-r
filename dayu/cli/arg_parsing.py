@@ -191,7 +191,6 @@ class ParsedCliArgs(argparse.Namespace):
     company_name: str | None
     material_name: str | None
     document_id: str | list[str] | None
-    internal_document_id: str | None
     source_dir: str | None
     output: str | None
     recursive: bool
@@ -363,7 +362,6 @@ def _new_default_namespace() -> ParsedCliArgs:
     namespace.company_name = None
     namespace.material_name = None
     namespace.document_id = None
-    namespace.internal_document_id = None
     namespace.source_dir = None
     namespace.output = None
     namespace.recursive = False
@@ -955,15 +953,15 @@ def _register_upload_material_command(
     )
     _add_upload_ticker_argument(parser)
     _add_upload_action_argument(parser, choices=FILING_ACTION_CHOICES)
-    parser.add_argument("--forms", nargs="+", help="关联的报表类型。")
-    parser.add_argument("--material-name", help="材料名称。")
+    parser.add_argument("--forms", nargs="+", help="材料类型，每个动作必填一个非空值，去首尾空白并转大写。")
+    parser.add_argument("--material-name", help="材料名称，每个动作必填，去首尾空白后最多 240 个 Unicode 码点。")
     parser.add_argument(
         "--files",
         nargs="+",
         help=FINS_UPLOAD_FORMAT_TEXT.material_files,
     )
-    parser.add_argument("--document-id", help="已有文档标识。")
-    parser.add_argument("--internal-document-id", help="内部文档标识。")
+    parser.add_argument("--document-id", help="可选生成材料身份一致性断言，不能覆盖身份；显式空文本非法。")
+    parser.add_argument("--primary", action="append", help=FINS_UPLOAD_FORMAT_TEXT.material_primary)
     _add_filing_metadata_arguments(parser)
     parser.add_argument("--overwrite", action="store_true", help="允许覆盖已有文档。")
 
@@ -1142,8 +1140,8 @@ def _add_filing_metadata_arguments(parser: argparse.ArgumentParser) -> None:
     :raises ValueError: argparse 参数注册失败时透传底层异常。
     """
 
-    parser.add_argument("--fiscal-year", type=int, help="财政年度。")
-    parser.add_argument("--fiscal-period", help="财政期间。")
+    parser.add_argument("--fiscal-year", type=int, help="财年。filing 必填 1000..9999 整数；material 可选 1800..2100 整数，与财期可独立省略。")
+    parser.add_argument("--fiscal-period", help="财期，去首尾空白并转大写后仅 FY、H1、Q1、Q2、Q3、Q4；filing 必填，material 可独立省略。")
     parser.add_argument("--amended", action="store_true", help="标记为修订文件。")
     parser.add_argument("--filing-date", help="filing 日期。")
     parser.add_argument("--report-date", help="报告日期。")

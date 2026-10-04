@@ -1,0 +1,25 @@
+{
+  "head": "3d0d390206739a8bb255dee517b5b61bfc4497b6",
+  "base": "fac32ecbff9bfe792b63ee9667c8697826b631f4",
+  "api_local_full_diff_byte_equal": false,
+  "files": 846,
+  "API_sha": "b2583bc8595eba7dfe7be4f8fab68f6e516097fee52558ead60faa506613534d",
+  "local_sha": "5324691c59dfd2ce841d98d85c33ae5dfc94bb28047f0466e0c6d63534c7b80d",
+  "checks": "no checks reported on the 'codex/upload-material-oracle' branch\n",
+  "setup_note": "initial unanchored split matched embedded diff text; before dispatch corrected anchored full diff headers, snapshot unchanged",
+  "push_managed_29109_exit": 0,
+  "all846_normalized_full_diff_equal": true,
+  "all846_added_removed_line_sequences_equal": true,
+  "format_difference": "GitHub index9 vs localindex8 and hunk function context labels differ; full paths/hunk ranges/content equal after only those header forms normalized",
+  "read_only_reverse_patch_check_exit": 0,
+  "full_PR_diff_check": {
+    "exit": 2,
+    "output": "tests/fins/fixtures/sec_earnings_repair_v1/workpapers/final-pyright.log:4: new blank line at EOF.",
+    "classification": "existing evidence hygiene, finalPR/CLI closeout owner; not code defect/new scope"
+  },
+  "local_tracking_remote_PR_head": "3d0d390206739a8bb255dee517b5b61bfc4497b6",
+  "main_local_tracking_remote": "fac32ecbff9bfe792b63ee9667c8697826b631f4",
+  "root_read_recovery": "initial exploratory rg guessed nonexistent ingestion_download_job_support.py exit2; real owner is ingestion_runtime.py, subsequently directly read _run_download_job/_save_failed/_terminal_job_result_projection/cancel atomic methods and wait chain; no key lookup gap",
+  "flash_nonblocking_observation": "zero A fixed statement retains confirmed processing: conditional/vacuous true, no incorrect business fact; reject material finding/no nit fixloop",
+  "flash_report_qualification": "clean statement only initial observed point; current root controllers tracked dirty, product/code freeze unchanged. Truncated jq pathlist result is not adopted as full-model reading; root full normalized846 compare proof provides mandatory manifest/snapshot integrity."
+}

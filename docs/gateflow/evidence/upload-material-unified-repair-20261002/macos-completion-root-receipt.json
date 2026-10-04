@@ -1,0 +1,66 @@
+{
+  "outer_exit": 0,
+  "terminal": "turn.completed",
+  "events": 172,
+  "commands": 78,
+  "canary_status": "match actual item_1/output+final",
+  "protected_files": 886,
+  "protected_mismatch": [],
+  "delivery_hashes_mismatch": [],
+  "actual_model": "unknown",
+  "conversion_observation": [
+    {
+      "mode": "path",
+      "status": "ConversionStatus.SUCCESS",
+      "errors": [],
+      "input": "04a015790c25d5a5371117bc64100335e65bfe1b3acdb71b4f2240c97e09cdf1",
+      "document": "c81acb63752a68a342cb1e1e6f01483e9f10f784720fd7c413d2e55d4445d95c",
+      "trace": {
+        "after_original_unload": 1,
+        "before_original_unload": 1,
+        "model_document_load_call": 2211,
+        "simple_pipeline_unload_boundary_snapshot": 1,
+        "zip_read_call": 32
+      },
+      "restored": true,
+      "unload_identity": true,
+      "closed": [
+        {
+          "event": "after_original_unload",
+          "closed": true,
+          "pid": 79547
+        }
+      ]
+    },
+    {
+      "mode": "stream",
+      "status": "ConversionStatus.SUCCESS",
+      "errors": [],
+      "input": "04a015790c25d5a5371117bc64100335e65bfe1b3acdb71b4f2240c97e09cdf1",
+      "document": "c81acb63752a68a342cb1e1e6f01483e9f10f784720fd7c413d2e55d4445d95c",
+      "trace": {
+        "after_original_unload": 1,
+        "before_original_unload": 1,
+        "model_document_load_call": 2211,
+        "simple_pipeline_unload_boundary_snapshot": 1,
+        "zip_read_call": 32
+      },
+      "restored": true,
+      "unload_identity": true,
+      "closed": [
+        {
+          "event": "after_original_unload",
+          "closed": true,
+          "pid": 79576
+        }
+      ]
+    }
+  ],
+  "root_parent_driver_exit": 1,
+  "root_startup_controls": {
+    "native_true": -6,
+    "python_start": -6,
+    "python_direct_init": -6
+  },
+  "generation_ready": false
+}

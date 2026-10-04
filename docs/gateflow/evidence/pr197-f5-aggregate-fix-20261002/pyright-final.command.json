@@ -1,0 +1,20 @@
+{
+  "argv": [
+    "/Users/leo/workspace/dayu-agent-r/.venv/bin/python",
+    "-m",
+    "pyright",
+    "dayu/",
+    "tests/",
+    "utils/"
+  ],
+  "cwd": "/Users/leo/workspace/dayu-agent-r",
+  "python": "3.11.15 (main, Mar  3 2026, 00:52:57) [Clang 17.0.0 (clang-1700.6.3.2)]",
+  "env": {
+    "VIRTUAL_ENV": "/Users/leo/workspace/dayu-agent-r/.venv",
+    "PATH": "/Users/leo/workspace/dayu-agent-r/.venv/bin:/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/codex-path:/Users/leo/.codex/tmp/arg0/codex-arg0Y5DWMe:/Users/leo/.codex/tmp/arg0/codex-arg0bnQM21:/opt/homebrew/Caskroom/miniconda/base/bin:/Users/leo/bin:/Users/leo/.local/bin:/opt/homebrew/bin:/Users/leo/workspace/python:/usr/local/bin:/System/Cryptexes/App/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/local/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/bin:/var/run/com.apple.security.cryptexd/codex.system/bootstrap/usr/appleinternal/bin:/pkg/env/global/bin:/Library/TeX/texbin:/opt/homebrew/Caskroom/miniconda/base/bin:/Users/leo/bin:/Users/leo/.local/bin:/opt/homebrew/bin:/Users/leo/workspace/python:/Applications/iTerm.app/Contents/Resources/utilities:/opt/homebrew/share/android-commandlinetools/ndk/29.0.14206865:/opt/homebrew/share/android-commandlinetools/platform-tools:/opt/homebrew/share/android-commandlinetools/ndk/29.0.14206865:/opt/homebrew/share/android-commandlinetools/platform-tools",
+    "COVERAGE_FILE": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/pr197-f5-aggregate-fix-sol-20261002-01/validation/pyright-final.coverage-data",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONPATH": null
+  },
+  "activation": "source .venv/bin/activate"
+}

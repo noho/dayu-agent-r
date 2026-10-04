@@ -1,0 +1,180 @@
+{
+  "mimo": {
+    "label": "upload-material-unified-s2-review-mimo-20261003-01",
+    "runtime": "claude",
+    "provider": "mimo",
+    "model_event": "mimo-v2.6-pro",
+    "model_usage": "mimo-v2.6-pro[1m]",
+    "outer_exit": 0,
+    "outer_exit_source": "prior managed write_stdin session30598 completed, preserved in turn summary",
+    "events": 25711,
+    "tool_uses": 122,
+    "tool_results": 122,
+    "terminal": [
+      {
+        "duration_api_ms": 2835326,
+        "stop_reason": "end_turn",
+        "session_id": "d7333c97-2c32-4b41-9eaf-a69a510cc591",
+        "total_cost_usd": 16.141528,
+        "usage": {
+          "input_tokens": 331907,
+          "cache_creation_input_tokens": 0,
+          "cache_read_input_tokens": 23921536,
+          "output_tokens": 100849,
+          "output_tokens_details": {
+            "thinking_tokens": 0
+          },
+          "server_tool_use": {
+            "web_search_requests": 0,
+            "web_fetch_requests": 0
+          },
+          "service_tier": "standard",
+          "cache_creation": {
+            "ephemeral_1h_input_tokens": 0,
+            "ephemeral_5m_input_tokens": 0
+          },
+          "inference_geo": "",
+          "iterations": [],
+          "speed": "standard",
+          "fallback_credit": null
+        },
+        "modelUsage": {
+          "mimo-v2.6-pro[1m]": {
+            "inputTokens": 331907,
+            "outputTokens": 100849,
+            "cacheReadInputTokens": 23921536,
+            "cacheCreationInputTokens": 0,
+            "webSearchRequests": 0,
+            "costUSD": 16.141528,
+            "contextWindow": 1000000,
+            "maxOutputTokens": 32000,
+            "thinkingTokens": 0,
+            "canonicalModel": "mimo-v2.6-pro[1m]",
+            "provider": "firstParty",
+            "costBasis": "unknown"
+          }
+        },
+        "permission_denials": [],
+        "terminal_reason": "completed",
+        "fast_mode_state": "off",
+        "fast_mode_disabled_reason": "sdk_opt_in_required",
+        "subagent_stats": {
+          "spawned": 0,
+          "requested": {
+            "background": 0,
+            "foreground": 0,
+            "unset": 0
+          },
+          "started_in_background": 0,
+          "max_depth": 0,
+          "spawned_by_subagents": 0,
+          "completed": 0,
+          "failed": 0,
+          "killed": {
+            "parent": 0,
+            "user": 0,
+            "system": 0
+          },
+          "refused": {
+            "depth_limit": 0,
+            "concurrency_limit": 0,
+            "budget": 0
+          },
+          "by_type": {}
+        },
+        "is_error": false,
+        "num_turns": 123,
+        "subtype": "success",
+        "api_error_status": null,
+        "result": "RUNTIME/PROVIDER/MODEL: claude/mimo/mimo-v2.6-pro[1m]\nCANARY=mimo-101d2b8e\n\n**结论**：完整 S2 独立审查完成，发现 1 个中级、2 低级实质问题，其余状态链（typed 准入/目标首错、两阶段 guard、八格 amended、tombstone 重删/恢复、C01 公司两分支、C02 final 传递、五 caller+executor 全集、job 双摘要、V12 真实双 CLI 顺序/同时放行）与已批准裁决一致，冻结输入首末零漂移。\n\n- **F1（中）**：O33 竞争 verified-skip 的 originals 顺序规范不对称——storage 投影按名排序（`_fs_source_integrity.py:2101`）而 D 候选保持请求顺序（`docling_upload_service.py:2215`），`material_upload_publication.py:116` 的 identity 相等比较顺序敏感；多文件非字典序请求并发时 loser 会误得 `source_publication_conflict` 而非 skipped（单文件 V12 探针未暴露）。\n- **F2（低）**：`execute_material_upload_company_stage` 对竞争 auto 的双读窗口（139 行读 fresh → validate 内部重读）可把 winner 竞争提交提前误判 conflict，已有公司并发变体的\"一 ok 一 skip\"存在窄缺口。\n- **F3（低）**：`_describe_material_candidate:2213` 用字面六值集合重复 `FISCAL_PERIODS` 值域真源（另有重复 import）。\n\nOpen Question 1 项（create-on-tombstone\"只锁现有拒绝\"的测试是否补）与 7 项分类 Residual Risk（多文件 race 探针缺口、tombstone-create 迟拒文案、深冻结序列化约定、Windows/可选集成 skip、WU 后 campaign/S3 边界等）见 artifact。验收证据（2643pass/3skip、pyright 0、28 prod≥80、race-final-13 business_diff={}、race-final-14 如实 null）均按真实票据核对，未发现虚报。\n\n输出：`docs/reviews/code-review-20261003-033327.md`",
+        "ttft_ms": 5114,
+        "type": "result",
+        "duration_ms": 2879805,
+        "uuid": "18549d57-df4b-457f-a037-e5c71f1aa321",
+        "ttft_stream_ms": 2619,
+        "time_to_request_ms": 24,
+        "first_content_frame_ms": 2900,
+        "queued_turn_count": 0,
+        "result_index": 0
+      }
+    ],
+    "tool_failures": [
+      {
+        "tool_use": {
+          "type": "tool_use",
+          "id": "call_bcf6eb2a0aa449b887312eaf",
+          "name": "Bash",
+          "input": {
+            "command": "E=workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01 && for d in race-final-13 race-final-14; do echo \"======== $d ========\"; cat $E/$d/result.json; echo; cat $E/$d/actual-terminal-exits.json; echo; cat $E/$d/gate/*.json 2>/dev/null | head -40; echo '---business-diff---'; cat $E/$d/business-diff.json 2>/dev/null; done",
+            "description": "读取 race-13/14 结果票据"
+          }
+        },
+        "result": {
+          "type": "tool_result",
+          "content": "Exit code 1\n======== race-final-13 ========\n{\n  \"statuses\": [\n    \"ok\",\n    \"skipped\"\n  ],\n  \"old_admission_proven\": true,\n  \"restored\": true,\n  \"source_unchanged\": true,\n  \"business_diff\": {},\n  \"mode\": \"sequential\"\n}\n\n{\n  \"a\": 0,\n  \"b\": 0\n}\n\n{\"service_runtime\": true, \"sec\": true, \"cn\": true, \"pid\": 39757, \"installed_source\": {\"admission\": {\"path\": \"/Users/leo/workspace/dayu-agent-r/dayu/fins/ingestion_runtime.py\", \"sha256\": \"7c55dd5a3e820cdd74a1470c7d790544d3b6500621a30b02b9c6fb356c1069a6\"}, \"service_runtime\": {\"path\": \"/Users/leo/workspace/dayu-agent-r/dayu/fins/service_runtime.py\", \"sha256\": \"ab89c89054b4b3f3388c8fcb6bce1445dd04c07bfe2cbdf84acc587f4e0721af\"}, \"sec\": {\"path\": \"/Users/leo/workspace/dayu-agent-r/dayu/fins/pipelines/sec_pipeline.py\", \"sha256\": \"89ff1069ca86da1652e823fe062686afa3549902d12ef1483be7d8ed2eda87ba\"}, \"cn\": {\"path\": \"/Users/leo/workspace/dayu-agent-r/dayu/fins/pipelines/cn_pipeline.py\", \"sha256\": \"2e0f76c7b5eede0447c2b7fd3d191686d2d293ee93fd88aa46950e5aa9774f3b\"}, \"publication\": {\"path\": \"/Users/leo/workspace/dayu-agent-r/dayu/fins/pipelines/material_upload_publication.py\", \"sha256\": \"1cc7c31f2fb427e0c8aabb6772feda3f39296920a131176c3a2984816aee9c50\"}}}\n{\n  \"pid\": 39757,\n  \"status\": \"returned\",\n  \"observed_company\": null,\n  \"actual_company\": {\n    \"company_id\": \"AAPL_US\",\n    \"company_name\": \"Apple Inc.\",\n    \"ticker\": \"AAPL\",\n    \"market\": \"US\",\n    \"resolver_version\": \"market_resolver_v1.0.0\",\n    \"updated_at\": \"2026-10-02T18:30:29+00:00\",\n    \"ticker_aliases\": []\n  }\n}\n{\"pid\": 39757, \"parent_pid\": 39743, \"session_id\": 39757, \"monotonic\": 195923.938789333, \"source_status\": \"missing\", \"revision\": null, \"company\": null, \"ticker\": \"AAPL\", \"document_id\": \"mat_8cb632e4d3f818fbf9dcd03d28e91822661f6c2e\", \"internal_document_id\": \"mat_8cb632e4d3f818fbf9dcd03d28e91822661f6c2e\", \"form_type\": \"MATERIAL_OTHER\", \"material_name\": \"Concurrent Same\"}{\"service_runtime\": true, \"sec\": true, \"cn\": true, \"pid\": 39758, \"installed_source\": {\"admission\": {\"path\": \"/Users/leo/workspace/dayu-agent-r/dayu/fins/ingestion_runtime.py\", \"sha256\": \"7c55dd5a3e820cdd74a1470c7d790544d3b6500621a30b02b9c6fb356c1069a6\"}, \"service_runtime\": {\"path\": \"/Users/leo/workspace/dayu-agent-r/dayu/fins/service_runtime.py\", \"sha256\": \"ab89c89054b4b3f3388c8fcb6bce1445dd04c07bfe2cbdf84acc587f4e0721af\"}, \"sec\": {\"path\": \"/Users/leo/workspace/dayu-agent-r/dayu/fins/pipelines/sec_pipeline.py\", \"sha256\": \"89ff1069ca86da1652e823fe062686afa3549902d12ef1483be7d8ed2eda87ba\"}, \"cn\": {\"path\": \"/Users/leo/workspace/dayu-agent-r/dayu/fins/pipelines/cn_pipeline.py\", \"sha256\": \"2e0f76c7b5eede0447c2b7fd3d191686d2d293ee93fd88aa46950e5aa9774f3b\"}, \"publication\": {\"path\": \"/Users/leo/workspace/dayu-agent-r/dayu/fins/pipelines/material_upload_publication.py\", \"sha256\": \"1cc7c31f2fb427e0c8aabb6772feda3f39296920a131176c3a2984816aee9c50\"}}}\n{\n  \"pid\": 39758,\n  \"status\": \"returned\",\n  \"observed_company\": null,\n  \"actual_company\": {\n    \"company_id\": \"AAPL_US\",\n    \"company_name\": \"Apple Inc.\",\n    \"ticker\": \"AAPL\",\n    \"market\": \"US\",\n    \"resolver_version\": \"market_resolver_v1.0.0\",\n    \"updated_at\": \"2026-10-02T18:30:29+00:00\",\n    \"ticker_aliases\": []\n  }\n}\n{\"pid\": 39758, \"parent_pid\": 39743, \"session_id\": 39758, \"monotonic\": 195923.938788708, \"source_status\": \"missing\", \"revision\": null, \"company\": null, \"ticker\": \"AAPL\", \"document_id\": \"mat_8cb632e4d3f818fbf9dcd03d28e91822661f6c2e\", \"internal_document_id\": \"mat_8cb632e4d3f818fbf9dcd03d28e91822661f6c2e\", \"form_type\": \"MATERIAL_OTHER\", \"material_name\": \"Concurrent Same\"}---business-diff---\n{}\n======== race-final-14 ========\n{\n  \"statuses\": [\n    \"skipped\",\n    \"ok\"\n  ],\n  \"old_admission_proven\": true,\n  \"restored\": true,\n  \"source_unchanged\": true,\n  \"business_diff\": null,\n  \"mode\": \"simultaneous\"\n}\n\n{\n  \"a\": 0,\n  \"b\": 0\n}\n\n{\"service_runtime\": true, \"sec\": true, \"cn\": true, \"pid\": 39780, \"installed_source\": {\"admission\": {\"path\": \"/Users/leo/workspace/dayu-agent-r/dayu/fins/ingestion_runtime.py\", \"sha256\": \"7c55dd5a3e820cdd74a1470c7d790544d3b6500621a30b02b9c6fb356c1069a6\"}, \"service_runtime\": {\"path\": \"/Users/leo/workspace/dayu-agent-r/dayu/fins/service_runtime.py\", \"sha256\": \"ab89c89054b4b3f3388c8fcb6bce1445dd04c07bfe2cbdf84acc587f4e0721af\"}, \"sec\": {\"path\": \"/Users/leo/workspace/dayu-agent-r/dayu/fins/pipelines/sec_pipeline.py\", \"sha256\": \"89ff1069ca86da1652e823fe062686afa3549902d12ef1483be7d8ed2eda87ba\"}, \"cn\": {\"path\": \"/Users/leo/workspace/dayu-agent-r/dayu/fins/pipelines/cn_pipeline.py\", \"sha256\": \"2e0f76c7b5eede0447c2b7fd3d191686d2d293ee93fd88aa46950e5aa9774f3b\"}, \"publication\": {\"path\": \"/Users/leo/workspace/dayu-agent-r/dayu/fins/pipelines/material_upload_publication.py\", \"sha256\": \"1cc7c31f2fb427e0c8aabb6772feda3f39296920a131176c3a2984816aee9c50\"}}}\n{\n  \"pid\": 39780,\n  \"status\": \"returned\",\n  \"observed_company\": null,\n  \"actual_company\": {\n    \"company_id\": \"AAPL_US\",\n    \"company_name\": \"Apple Inc.\",\n    \"ticker\": \"AAPL\",\n    \"market\": \"US\",\n    \"resolver_version\": \"market_resolver_v1.0.0\",\n    \"updated_at\": \"2026-10-02T18:30:36+00:00\",\n    \"ticker_aliases\": []\n  }\n}\n{\"pid\": 39780, \"parent_pid\": 39777, \"session_id\": 39780, \"monotonic\": 195931.244966, \"source_status\": \"missing\", \"revision\": null, \"company\": null, \"ticker\": \"AAPL\", \"document_id\": \"mat_8cb632e4d3f818fbf9dcd03d28e91822661f6c2e\", \"internal_document_id\": \"mat_8cb632e4d3f818fbf9dcd03d28e91822661f6c2e\", \"form_type\": \"MATERIAL_OTHER\", \"material_name\": \"Concurrent Same\"}{\"service_runtime\": true, \"sec\": true, \"cn\": true, \"pid\": 39781, \"installed_source\": {\"admission\": {\"path\": \"/Users/leo/workspace/dayu-agent-r/dayu/fins/ingestion_runtime.py\", \"sha256\": \"7c55dd5a3e820cdd74a1470c7d790544d3b6500621a30b02b9c6fb356c1069a6\"}, \"service_runtime\": {\"path\": \"/Users/leo/workspace/dayu-agent-r/dayu/fins/service_runtime.py\", \"sha256\": \"ab89c89054b4b3f3388c8fcb6bce1445dd04c07bfe2cbdf84acc587f4e0721af\"}, \"sec\": {\"path\": \"/Users/leo/workspace/dayu-agent-r/dayu/fins/pipelines/sec_pipeline.py\", \"sha256\": \"89ff1069ca86da1652e823fe062686afa3549902d12ef1483be7d8ed2eda87ba\"}, \"cn\": {\"path\": \"/Users/leo/workspace/dayu-agent-r/dayu/fins/pipelines/cn_pipeline.py\", \"sha256\": \"2e0f76c7b5eede0447c2b7fd3d191686d2d293ee93fd88aa46950e5aa9774f3b\"}, \"publication\": {\"path\": \"/Users/leo/workspace/dayu-agent-r/dayu/fins/pipelines/material_upload_publication.py\", \"sha256\": \"1cc7c31f2fb427e0c8aabb6772feda3f39296920a131176c3a2984816aee9c50\"}}}\n{\n  \"pid\": 39781,\n  \"status\": \"returned\",\n  \"observed_company\": null,\n  \"actual_company\": {\n    \"company_id\": \"AAPL_US\",\n    \"company_name\": \"Apple Inc.\",\n    \"ticker\": \"AAPL\",\n    \"market\": \"US\",\n    \"resolver_version\": \"market_resolver_v1.0.0\",\n    \"updated_at\": \"2026-10-02T18:30:36+00:00\",\n    \"ticker_aliases\": []\n  }\n}\n{\"pid\": 39781, \"parent_pid\": 39777, \"session_id\": 39781, \"monotonic\": 195931.2449205, \"source_status\": \"missing\", \"revision\": null, \"company\": null, \"ticker\": \"AAPL\", \"document_id\": \"mat_8cb632e4d3f818fbf9dcd03d28e91822661f6c2e\", \"internal_document_id\": \"mat_8cb632e4d3f818fbf9dcd03d28e91822661f6c2e\", \"form_type\": \"MATERIAL_OTHER\", \"material_name\": \"Concurrent Same\"}---business-diff---",
+          "is_error": true,
+          "tool_use_id": "call_bcf6eb2a0aa449b887312eaf"
+        }
+      },
+      {
+        "tool_use": {
+          "type": "tool_use",
+          "id": "call_fd1d239e544649d9abfd9d85",
+          "name": "Bash",
+          "input": {
+            "command": "E=workspace/tmp/upload-material-unified-s2-final-completion-sol-20261003-01 && python3 -c \"\nimport json\nd=json.load(open('$E/final-audit/coverage-products.json'))\nprint(type(d))\nif isinstance(d,list):\n    print(len(d)); print(json.dumps(d[:3],ensure_ascii=False,indent=1))\n    mins=sorted(d, key=lambda r: r.get('percent', r.get('coverage', 100)))\n    for r in mins[:6]: print(r)\nelif isinstance(d,dict):\n    print(list(d.keys())[:10])\n\"",
+            "description": "读取逐生产文件覆盖率数据"
+          }
+        },
+        "result": {
+          "type": "tool_result",
+          "content": "Exit code 1\nTraceback (most recent call last):\n  File \"<string>\", line 7, in <module>\nTypeError: '<' not supported between instances of 'dict' and 'dict'\n<class 'list'>\n28\n[\n {\n  \"file\": \"dayu/cli/commands/fins.py\",\n  \"sha256\": \"f2b8f55f35de49f4431790213fd775f65f1876d0afec86d294a9dbae261fbcac\",\n  \"coverage\": {\n   \"covered_lines\": 414,\n   \"num_statements\": 467,\n   \"percent_covered\": 88.6509635974304,\n   \"percent_covered_display\": \"89\",\n   \"missing_lines\": 53,\n   \"excluded_lines\": 0,\n   \"percent_statements_covered\": 88.6509635974304,\n   \"percent_statements_covered_display\": \"89\"\n  }\n },\n {\n  \"file\": \"dayu/fins/domain/company_meta_contract.py\",\n  \"sha256\": \"8ce7c5683e4b30186d1a230ea6c08cff27a475dc7fa9f9adf666d1d6be78b81d\",\n  \"coverage\": {\n   \"covered_lines\": 116,\n   \"num_statements\": 122,\n   \"percent_covered\": 95.08196721311475,\n   \"percent_covered_display\": \"95\",\n   \"missing_lines\": 6,\n   \"excluded_lines\": 0,\n   \"percent_statements_covered\": 95.08196721311475,\n   \"percent_statements_covered_display\": \"95\"\n  }\n },\n {\n  \"file\": \"dayu/fins/domain/document_models.py\",\n  \"sha256\": \"d04206ce9be11aac14b6245915742f2c6a5421176d8c9ad823dc0483d2687f4c\",\n  \"coverage\": {\n   \"covered_lines\": 430,\n   \"num_statements\": 450,\n   \"percent_covered\": 95.55555555555556,\n   \"percent_covered_display\": \"96\",\n   \"missing_lines\": 20,\n   \"excluded_lines\": 0,\n   \"percent_statements_covered\": 95.55555555555556,\n   \"percent_statements_covered_display\": \"96\"\n  }\n }\n]",
+          "is_error": true,
+          "tool_use_id": "call_fd1d239e544649d9abfd9d85"
+        }
+      }
+    ],
+    "failure_impact": "Conditional race14 business-diff file absent (result explicitly null); real result/dual wait/durable read succeeded. Coverage dict sort TypeError recovered by percent_covered read. All complete tool pairs persisted; compound exploratory no-matches/partial truncation not tests or frozen mismatch. Root checked exact candidate hashes and source paths. Neither error invalidates findings.",
+    "recovery_artifact": "workspace/tmp/upload-material-unified-repair-20261002/formal-s2-code-review-01/root-audit/mimo-recoveries.json",
+    "frozen_files": 886,
+    "candidate_files": 60,
+    "drift": [],
+    "artifact": "docs/reviews/code-review-20261003-033327.md",
+    "artifact_sha256": "cfa714dcc748276180e9e0eb881328e744e0a3334926d0a4788ade92029f6010",
+    "controller": {
+      "setup_status": "ok",
+      "agent_status": "completed",
+      "tool_evidence": "yes",
+      "tool_trace": "complete",
+      "required_evidence": "complete",
+      "canary_status": "match",
+      "result_status": "accepted",
+      "warnings": [
+        "stderr exact unrecognized_model prefix nonfatal",
+        "Two exploratory Bash failures recovered; report race14 missing-file failure disclosure incomplete; preserved full trace",
+        "F2 concurrency cause is direct code-path evidence; deterministic Fs interleave must be added by fix, not claimed already observed"
+      ],
+      "evidence_gaps": [],
+      "retry_class": "none"
+    },
+    "decision": "review evidence accepted; S2 blocked by accepted R02 R03 R04; not a slice pass"
+  },
+  "ds_flash_receipt": "workspace/tmp/upload-material-unified-repair-20261002/formal-s2-code-review-01/root-audit/ds-flash-receipt.json",
+  "ds_flash_artifact": "docs/reviews/code-review-20261003-025726.md",
+  "ds_flash_outer_exit": 0,
+  "ds_flash_result": "success; root full trace checked; seven shell errors and false all-zero claim explicitly rejected",
+  "frozen_identity": {
+    "head": "f7e60c9d3e4c6e77a6c2abf18d09cd8020c19235",
+    "base": "f7e60c9d3e4c6e77a6c2abf18d09cd8020c19235",
+    "main": "fac32ecbff9bfe792b63ee9667c8697826b631f4",
+    "branch": "codex/upload-material-oracle",
+    "candidate_files": 60,
+    "input_files": 886,
+    "input_manifest_sha256": "e354f6cb35df706599520f8de9d1df35449c09805be9cf5944dfdcf438fa15e3",
+    "diff_sha256": "282ae054d01718602e31a17a30984e2452f1ad96a46537bc5172d2a33b8e0ccc",
+    "changed_manifest_sha256": "013bb2fb1dcbc3620125e1620bad3fc0cc8625c45be9876959fa80dd49453015",
+    "author_report_sha256": "81706c40ee0bf3e7c46dbca5961bebc6ee8ecc481248ab3511d499135271afba",
+    "root_receipt_sha256": "9d8365b584607de452cf9cd6a6651b50714522416c3f8d61d44eb888495909ad"
+  },
+  "next": "fix S2; no accepted slice commit yet"
+}
