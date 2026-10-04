@@ -1,0 +1,121 @@
+{
+  "generated_at": "2026-10-04T00:56:20.471730+00:00",
+  "gate": "PR review",
+  "root_decision": "pass; no required fix/re-review",
+  "reviewed_target": {
+    "repository": "noho/dayu-agent-r",
+    "PR": 197,
+    "head": "d446d721d6f819d27aca6f53e4804f5bd1692bb2",
+    "base": "fac32ecbff9bfe792b63ee9667c8697826b631f4",
+    "compare_url": "repos/noho/dayu-agent-r/compare/fac32ecbff9bfe792b63ee9667c8697826b631f4...d446d721d6f819d27aca6f53e4804f5bd1692bb2",
+    "diff_sha256": "69767bc2fba9a2cae3836b6aaf3f9a2f5b28710eecf6007d740cfa1af223dcd7"
+  },
+  "manifest_sha256": "92ab1d7500650fa2df97c64bd2ee34b09b9fb4b35ed58e77dd7d20fdd7232217",
+  "full_paths": 1115,
+  "same_state_inherited_paths": 1072,
+  "delta_paths": 43,
+  "source11_current_git_bytes_match": true,
+  "fresh_coverage": "43 delta identity/current aggregate governance and complete runtime/converter/CLI/storage assembly; reviewer actual excerpt/full source coverage individually audited",
+  "inherited_coverage": "exact same-state prior accepted PR/code/delta/aggregate proof; not new1072 content or875 historical narrative fullread",
+  "reviews": [
+    {
+      "provider": "mimo",
+      "report": {
+        "path": "docs/reviews/pr-197-review-20261004-085033.md",
+        "sha256": "1fffbe7b2747f7d543a1badd6d10e0fd65c0886501d299db7615107887bdcd95",
+        "write_mode": "O_EXCL, timestamp=20261004-085033 本机时钟 date +%Y%m%d-%H%M%S"
+      },
+      "outer_exit": 0,
+      "events": 5829,
+      "actual_tools": 60,
+      "canary_match": true,
+      "full_instruction_reads_verified": true,
+      "actor_findings": [],
+      "root_reporting_corrections": [
+        "Report full-pr diff SHA has transcription typo; canonical actual SHA69767bc2fba9a2cae3836b6aaf3f9a2f5b28710eecf6007d740cfa1af223dcd7 verified in frozen manifest/root actual hash; report source conclusion input OID valid.",
+        "Tool803 zsh === error1 omitted by actor; subsequent correct source reads818/820 recover required symbols. Command4428 missing cli/args.py stderr suppressed; actual arg_parsing.py recovered4440. All preserved.",
+        "Manifest compare2939 first wrong1115-vs43 actualFalse, recovered3193 full1115-vs1115; no identity mismatch persisted.",
+        "Writes /tmp/claude/git_full.txt and ephemeral TaskCreate outside designated own scratch noted governance deviation; no product/registry/old evidence alteration.",
+        "Actor future body update requiring-user-decision rejected: body is dated scoped unified WU history with no false completion. Current diagnostic status documented in-tree; no approval needed for PR gate.",
+        "Deleted older202608 calibration Raw distinct from preserved new802/799 campaign. Do not interpret actor historical802 wording as deletion of current frozen campaign."
+      ],
+      "retention": {
+        "sha256": "7ea6156b8db6d31c4db78094745cd80d50eb26aa90b3c96dd7c0a58e0a46a4c3",
+        "bytes": 410501,
+        "copies": [
+          "workspace/evidence/upload-material-post-ci-gate-runners-20261003/private/root-pr-mimo-02.tar.gz",
+          "output/evidence-backup/upload-material-post-ci-gate-runners-20261003/private/root-pr-mimo-02.tar.gz"
+        ]
+      }
+    },
+    {
+      "provider": "ds-flash",
+      "report": {
+        "path": "docs/reviews/pr-197-review-20261004-085005.md",
+        "sha256": "b1da40388a78d8cf716923d0d8f7a0833cf1416b29fddc7bedd45c09598ed445"
+      },
+      "outer_exit": 0,
+      "events": 44339,
+      "actual_tools": 64,
+      "canary_match": true,
+      "full_instruction_reads_verified": true,
+      "actor_findings": [],
+      "root_reporting_corrections": [
+        "Actor omits manifest-inspection7078 KeyError and wrong locator23913/26071 compound failures; subsequent live identity paths restored. origin reference failure actual1 preserved.",
+        "Actor fresh test_log diff head220 is not all237; remaining same-source coverage inherited accepted code/aggregate, not new full read.",
+        "Scratch writes $TMPDIR/delta_local.txt outside designated own scratch noted governance deviation; no product/registry/old evidence change.",
+        "PRbody dated unified-repair history is explicitly scoped; current diagnostic status in committed controls/acceptance; not a material code finding or additional user decision."
+      ],
+      "retention": {
+        "sha256": "71ae9ad4769725ae7b9d3b74a043339b3a23fdcea3d1a9f29c869bb12d229ec2",
+        "bytes": 1702854,
+        "copies": [
+          "workspace/evidence/upload-material-post-ci-gate-runners-20261003/private/root-pr-ds-flash-02.tar.gz",
+          "output/evidence-backup/upload-material-post-ci-gate-runners-20261003/private/root-pr-ds-flash-02.tar.gz"
+        ]
+      }
+    }
+  ],
+  "root_live_closing": {
+    "argv": [
+      "gh",
+      "api",
+      "repos/noho/dayu-agent-r/pulls/197"
+    ],
+    "exit_code": 0,
+    "head": "d446d721d6f819d27aca6f53e4804f5bd1692bb2",
+    "base": "fac32ecbff9bfe792b63ee9667c8697826b631f4",
+    "draft": true,
+    "state": "open",
+    "stdout_sha256": "57392d499714abc0d162faf4d5cd2fbc6c3271c00ce8fc971b280d3e175fde7d",
+    "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "required_evidence": "complete across actual trace plus exact identity inheritance and root checks",
+  "findings": [],
+  "open_questions_adjudication": "dated PR body describes prior unified WU accurately, current diagnostics documented in tree; no new blocking decision or code repair",
+  "validation_lineage": "current196/fullpyright0 + other six test files from889 and three wholecov>=80 + focused04 real PDF/SIGINT/XBRL source-bound; no claim whole current889/890 or802 rerun",
+  "historical_lineage": "deleted older calibration Raw unavailable; new802/799 campaign remains preserved/frozen; focused04 new source independent",
+  "residuals": [
+    {
+      "classification": "covered-by-user-authorized-later-work-unit",
+      "owner": "registry WU/root",
+      "item": "formal oracle/scenario registration"
+    },
+    {
+      "classification": "deferred-with-owner",
+      "owner": "future platform validation",
+      "item": "Linux/Windows controlled XBRL, user deferred"
+    },
+    {
+      "classification": "outside-goal",
+      "owner": "Docling upstream",
+      "item": "extraction quality"
+    },
+    {
+      "classification": "outside-goal",
+      "owner": "future explicit goal",
+      "item": "quota/daemon/nonstandard Logger/global order"
+    }
+  ],
+  "next_entry": "accepted PR review commit then normal push; draft-PR-pass and final closeout remain pending"
+}

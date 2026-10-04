@@ -71,3 +71,7 @@ accepted slice commit=785bf8d5fa28bfe0fdc4fd036bb609883a46baff，25精确路径�
 ## 2026-10-04T00:25:02.124232+00:00 aggregate deepreview裁决
 
 两路实际终态0/canary/完整轨迹/39Gitblob与11source核验，无新materialfinding。子审本轮AGENTS/skills显式读取不全，报告事实采纳而完整指令遵守声明收窄；root已完整读取项目/用户约束及skills，结合独立跨调用链与samebyte code审查补齐此门禁，不冒子审全读。正式整体裁决见upload-material-converter-diagnostics-aggregate-acceptance-20261004.md。Current gate=accepted deepreview commit；next=正常push复用draft197→正式PRreview。
+
+## 2026-10-04T00:56:20.471730+00:00 正式PR review裁决
+
+accepteddeepreview checkpoint=d446d721，普通push实际0/localtrackingPR一致；完整1115 PR路径同OID冻结。MiMo12357/DS85538均实际0、root完整轨迹/身份/指令/报告/备份核验，未发现实质新问题；转录/coverage偏差明确收窄而原报告保全。正式总裁决 pr-review-acceptance-20261004.md、bounded pr-review-proof.json。Current gate=accepted PR review commit；next=正常finalpush→draft-PR-pass→finalcloseout→独立registry WU。registryplan继续排除。
