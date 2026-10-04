@@ -477,6 +477,20 @@ observation 自动裁决为 accepted scenario。
 产品当前违反新 accepted oracle 时，第 2-7 项仍可成立；readiness proof 记录对应 implementation finding，但不得把
 产品 failure 伪装为 coverage gap。反之，产品当前看似运行成功也不能填补 coverage、evidence 或 correctness gap。
 
+upload_material 独立登记使用 proof_version=6，schema_version 仍为1。v6 的 registry digest basis 是整个
+registry 仅去掉顶层 `registry_status` 与 `readiness_proof` 后的 UTF-8 canonical JSON
+（ensure_ascii=false、sort_keys=true、separators=(",", ":")）；record 内同名业务字段不删除。
+历史 v5 曾使用 records 数组的 canonical basis，其原 proof 作为 opaque JSON 全值保留，不用 v6 重算旧值。
+每个 v6 proof 的 `historical_ready_proofs` 恰为单元素数组 `[本 registry 原 readiness_proof]`，两份历史不混装。
+
+`campaigns.upload_material` 只表示本命令登记闭合，关联 wiring 不使其它命令获得新 ready scope。
+registration target22eca是登记源码绑定；原802实测target799、focused PDF实际parent8009及dirty源码、旧五命令target256786
+分别保留。只 live 核实测五模块；十一份既有 review 字节是冻结metadata，授权README新增不改写历史。
+新 predicate 从 `next-upload-material-conformance-run` 生效，原802观察和历史产品finding不追溯改写。
+只读 validator `utils/cli_ci_upload_material_registry.py` 唯一显式 CLI 模式为 `--check`；缺flag/参数或未知参数为2，
+引用/语义/gap拒绝为1，0仅证明登记readiness。候选唯一producer通过函数API生成，两proof/status由同一结果投影；
+strict CLI要求已有投影与重算一致。报告纯观察和predicate业务语义由code review/root逐项人工核，机器不判自然语言。
+
 ### 4.7 总控 Oracle 裁决算法
 
 总控只对 frozen `observed-behavior.md` 中有可复核 evidence refs 的 observed difference 执行以下算法：
@@ -601,6 +615,13 @@ Scenario 为 `not-run` / `blocked` 时没有 `execution_outcome`，必须记录�
 缺失、损坏或歧义到不足以复核实际行为时，也使 observation incomplete 并阻止 readiness。某场景得到
 error/timeout/cancel 后仍继续其余已获授权场景；只有越过授权、造成安全风险或受到真实依赖阻塞时，才可停止相关范围并
 逐项记录 gap。
+
+upload_material 的完整来源 assignment 保留原802所有行及明确不计信用理由；formal数从充分authority和实测refs逐行派生，
+不能预设802+6。新focused六measurement与原802使用两个固定source ID、四个严格publicroot；native11为支持事实。
+每维stable obligation独立核mandatory/covered/gap；help、Service、shell和cross场景保实际command与物理argv。
+六个失效batch诊断不计positive credit，alias100/101语法拒绝不证明数量cap，合法parser缩写仅为当前事实。
+两份观察报告、各自唯一sole scan、逐surface authority正文与before/after证据在bounded companion中双向映射；
+public投影与原件SHA分开，保历史source-final测试差异，不把私有归档保全当public信用。
 
 #### 5.1.1 `dayu-cli init` 最低 Mandatory Matrix 示例
 

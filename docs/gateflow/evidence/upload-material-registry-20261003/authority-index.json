@@ -1,0 +1,839 @@
+{
+  "schema_version": 1,
+  "sources": [
+    {
+      "authority_id": "UM-O01-O06",
+      "relative_path": "docs/reviews/upload-material-um-o01-o06-oracle-adjudication.md",
+      "bytes": 9970,
+      "sha256": "b7b825f334b63f6afeabd95d520d868479222ffe25b9147404927fbc47f3a810",
+      "kind": "user-decision",
+      "approval_provenance": "原用户逐项明确裁决；后续已确认选择优先于早期pending状态",
+      "anchors": [
+        {
+          "heading": "## UM-O01：help 与 public surface",
+          "start_byte": 1836,
+          "end_byte": 2726,
+          "body_sha256": "c7c4d9da2b216a586582ce1e6a5ff89f2ececf602560852da6b32cd748c63441"
+        },
+        {
+          "heading": "## UM-O02：usage/parser 基线",
+          "start_byte": 2726,
+          "end_byte": 3565,
+          "body_sha256": "4c9776eff951b9a210e08b159de769c47aacaa559d9d50bae09216395b0c7d94"
+        },
+        {
+          "heading": "## UM-O03：workspace 路径",
+          "start_byte": 3565,
+          "end_byte": 5014,
+          "body_sha256": "f61378b12618b8902dce4b591b0f511b99f3dba991ab955e66ee881963ac930f"
+        },
+        {
+          "heading": "## UM-O04：文件数量与重复输入",
+          "start_byte": 5014,
+          "end_byte": 6624,
+          "body_sha256": "f9e694f3e3366c25cf63679746e722299c3dedf4f11087f65a8654e66c874e53"
+        },
+        {
+          "heading": "## UM-O05：material 必填业务字段",
+          "start_byte": 6624,
+          "end_byte": 7796,
+          "body_sha256": "bbe3f6fcdfa761cc141261b664682f726261f5eb637917f399e6b510936f7e3d"
+        },
+        {
+          "heading": "## UM-O06：material_name 长度",
+          "start_byte": 7796,
+          "end_byte": 9016,
+          "body_sha256": "13beced6cea02b716b0d632d8bfc261d6907dc51ad7135b9bc188fa736b08a58"
+        }
+      ]
+    },
+    {
+      "authority_id": "UM-O07",
+      "relative_path": "docs/reviews/upload-material-um-o07-oracle-adjudication.md",
+      "bytes": 5498,
+      "sha256": "aef4943e3d2f756ba577b369a761343cdd3927ecc07048f5dc5b8bcba1d68cd5",
+      "kind": "user-decision",
+      "approval_provenance": "原用户逐项明确裁决；后续已确认选择优先于早期pending状态",
+      "anchors": [
+        {
+          "heading": "## Accepted 行为",
+          "start_byte": 1696,
+          "end_byte": 2394,
+          "body_sha256": "ad3721e0236cd2c60776b60045e4c3f6de4169b352a4b8662ea5aadb54c21c83"
+        }
+      ]
+    },
+    {
+      "authority_id": "UM-O08",
+      "relative_path": "docs/reviews/upload-material-um-o08-oracle-adjudication.md",
+      "bytes": 2721,
+      "sha256": "5d3915307516ff20d4e05aaa3e362b4d9c347f964381fc027e6b1c76ce4fa8cd",
+      "kind": "user-decision",
+      "approval_provenance": "原用户逐项明确裁决；后续已确认选择优先于早期pending状态",
+      "anchors": [
+        {
+          "heading": "## Accepted 行为",
+          "start_byte": 1312,
+          "end_byte": 1602,
+          "body_sha256": "dafd90e7e02f5e3ec7e6a8433c07c01b6cdb0a5251b350900270a0ecbb224d7d"
+        }
+      ]
+    },
+    {
+      "authority_id": "UM-O09",
+      "relative_path": "docs/reviews/upload-material-um-o09-oracle-adjudication.md",
+      "bytes": 3479,
+      "sha256": "9abc9a4536f8a704976dcba6078bf8fe7b98207fa21d68532638c47986b65278",
+      "kind": "user-decision",
+      "approval_provenance": "原用户逐项明确裁决；后续已确认选择优先于早期pending状态",
+      "anchors": [
+        {
+          "heading": "## Accepted 行为",
+          "start_byte": 1613,
+          "end_byte": 1750,
+          "body_sha256": "a434b8b321e6cb80af503a46e00d92b2d96b8ab9d6bf98be2fcc78a2dcdd9461"
+        }
+      ]
+    },
+    {
+      "authority_id": "UM-O10",
+      "relative_path": "docs/reviews/upload-material-um-o10-oracle-adjudication.md",
+      "bytes": 4796,
+      "sha256": "d088f46ab451970c16b79c9307c30d6abbf8fbab5384295e849d0549e770c204",
+      "kind": "user-decision",
+      "approval_provenance": "原用户逐项明确裁决；后续已确认选择优先于早期pending状态",
+      "anchors": [
+        {
+          "heading": "## Accepted 行为",
+          "start_byte": 1825,
+          "end_byte": 2294,
+          "body_sha256": "c9c29d5af9893378f88f2b609f969b928c2a565d21e75001b458195c716719d6"
+        }
+      ]
+    },
+    {
+      "authority_id": "UM-O11",
+      "relative_path": "docs/reviews/upload-material-um-o11-oracle-adjudication.md",
+      "bytes": 5482,
+      "sha256": "b524a57056519c7c774557ce2e2246493d3481ab4484de61ceffebca58b38df4",
+      "kind": "user-decision",
+      "approval_provenance": "原用户逐项明确裁决；后续已确认选择优先于早期pending状态",
+      "anchors": [
+        {
+          "heading": "## Accepted 行为",
+          "start_byte": 2297,
+          "end_byte": 2661,
+          "body_sha256": "28dbbf558e5850fc40c314979a0915e8ed9b1f281085d5f01bc4177317ee4a93"
+        }
+      ]
+    },
+    {
+      "authority_id": "UM-O12",
+      "relative_path": "docs/reviews/upload-material-um-o12-oracle-adjudication.md",
+      "bytes": 6585,
+      "sha256": "378c4ae972713c0d8d748373e597881f74b1644ac58c0d3404a42534d7724f47",
+      "kind": "user-decision",
+      "approval_provenance": "原用户逐项明确裁决；后续已确认选择优先于早期pending状态",
+      "anchors": [
+        {
+          "heading": "## Accepted 行为",
+          "start_byte": 2438,
+          "end_byte": 3063,
+          "body_sha256": "b9d033e086782c02228ec81d6944533c4fb2adce152bf875486220a1a961d4b8"
+        }
+      ]
+    },
+    {
+      "authority_id": "UM-O13",
+      "relative_path": "docs/reviews/upload-material-um-o13-oracle-adjudication.md",
+      "bytes": 5781,
+      "sha256": "6af375d8fc8ea07abae69d65a5146c2efae7303b42024cf44e6e97e6534a02eb",
+      "kind": "user-decision",
+      "approval_provenance": "原用户逐项明确裁决；后续已确认选择优先于早期pending状态",
+      "anchors": [
+        {
+          "heading": "## Accepted 行为",
+          "start_byte": 2595,
+          "end_byte": 3460,
+          "body_sha256": "5326e51902c61cb6db7c7abbfbd41c95ccebf9a7bdfc4d808045b3dd60456dba"
+        }
+      ]
+    },
+    {
+      "authority_id": "UM-O14",
+      "relative_path": "docs/reviews/upload-material-um-o14-oracle-adjudication.md",
+      "bytes": 5943,
+      "sha256": "e5fa2753e21e26b85e9fb9e2ee4720fb77a64f4dfafee449300bb7e275559aba",
+      "kind": "user-decision",
+      "approval_provenance": "原用户逐项明确裁决；后续已确认选择优先于早期pending状态",
+      "anchors": [
+        {
+          "heading": "## Accepted 行为",
+          "start_byte": 2713,
+          "end_byte": 3445,
+          "body_sha256": "e04bc7840145d636fdf342bb2554bc2c2e916c89a2ad1e30c009240141cf2d58"
+        }
+      ]
+    },
+    {
+      "authority_id": "UM-O15",
+      "relative_path": "docs/reviews/upload-material-um-o15-oracle-adjudication.md",
+      "bytes": 5760,
+      "sha256": "0d4c7d9402b494d7e9122e4c45c7f22e3c724185f9ae24bb2706b8771aa26193",
+      "kind": "user-decision",
+      "approval_provenance": "原用户逐项明确裁决；后续已确认选择优先于早期pending状态",
+      "anchors": [
+        {
+          "heading": "## Accepted 行为",
+          "start_byte": 2666,
+          "end_byte": 3287,
+          "body_sha256": "d2885da7623aca6cdb3f7bb849105fc34662b023439ea44daaf063de208681b4"
+        }
+      ]
+    },
+    {
+      "authority_id": "UM-O16",
+      "relative_path": "docs/reviews/upload-material-um-o16-oracle-adjudication.md",
+      "bytes": 6505,
+      "sha256": "7aafa0e148f8c3820bd7e16f65b6cebdaffe0327b18d4aaf6de26bebcf3374f9",
+      "kind": "user-decision",
+      "approval_provenance": "原用户逐项明确裁决；后续已确认选择优先于早期pending状态",
+      "anchors": [
+        {
+          "heading": "## Accepted 行为",
+          "start_byte": 3350,
+          "end_byte": 3935,
+          "body_sha256": "bb79d97fb6f7371d3b1e9bff871185fe64af1cfe35936eb060fa11133457fd2d"
+        }
+      ]
+    },
+    {
+      "authority_id": "UM-O17",
+      "relative_path": "docs/reviews/upload-material-um-o17-oracle-adjudication.md",
+      "bytes": 5661,
+      "sha256": "002dbf5505bb3fe4105a442e50e9d30a2412a5733fc1fe38fa779509c3a52e8d",
+      "kind": "user-decision",
+      "approval_provenance": "原用户逐项明确裁决；后续已确认选择优先于早期pending状态",
+      "anchors": [
+        {
+          "heading": "## Accepted 行为",
+          "start_byte": 2646,
+          "end_byte": 3195,
+          "body_sha256": "aa382634efcf948cb47dffe867b6c060ee1a2d7c2f759060dec37263635dc11b"
+        }
+      ]
+    },
+    {
+      "authority_id": "UM-O18",
+      "relative_path": "docs/reviews/upload-material-um-o18-oracle-adjudication.md",
+      "bytes": 6478,
+      "sha256": "fe7bacb4cffa52b37f3ba6602780077fe42b48baf491d5ebdffdeb6b9c54e8d0",
+      "kind": "user-decision",
+      "approval_provenance": "原用户逐项明确裁决；后续已确认选择优先于早期pending状态",
+      "anchors": [
+        {
+          "heading": "## Accepted 行为",
+          "start_byte": 2598,
+          "end_byte": 3543,
+          "body_sha256": "003610af5b1d5c3b5418ed1cd7c529cdeac3f2b921b48ef690487b1ca37e02d7"
+        },
+        {
+          "heading": "## 2026-09-29 补充用户裁决：同内容与 overwrite",
+          "start_byte": 5905,
+          "end_byte": 6478,
+          "body_sha256": "59d282f01fffd431200164bdede73a9c900ae770b2322a9b4b7c6f4d3fd4250c"
+        }
+      ]
+    },
+    {
+      "authority_id": "UM-O19",
+      "relative_path": "docs/reviews/upload-material-um-o19-oracle-adjudication.md",
+      "bytes": 7509,
+      "sha256": "9cdff8821343b5959b41fa63fcb4474693e58300cb5f68b18c062c723476c57d",
+      "kind": "user-decision",
+      "approval_provenance": "原用户逐项明确裁决；后续已确认选择优先于早期pending状态",
+      "anchors": [
+        {
+          "heading": "## Accepted 行为",
+          "start_byte": 3649,
+          "end_byte": 4980,
+          "body_sha256": "ad985675d0e4aee7b7b9d553476006f884d94fb5f552e85f4b59bb879247ccd0"
+        },
+        {
+          "heading": "## E01 后续补证状态（2026-09-29）",
+          "start_byte": 6751,
+          "end_byte": 7509,
+          "body_sha256": "453e20663fd9164bc507d1b14572c5eb7e5edce64bb6f68ab177f05efeb1b4eb"
+        }
+      ]
+    },
+    {
+      "authority_id": "UM-O20",
+      "relative_path": "docs/reviews/upload-material-um-o20-oracle-adjudication.md",
+      "bytes": 8015,
+      "sha256": "efa51b55d313fb4e541b154e926fa9cbf7f7ade8b2ac265faa11317134207ad8",
+      "kind": "user-decision",
+      "approval_provenance": "原用户逐项明确裁决；后续已确认选择优先于早期pending状态",
+      "anchors": [
+        {
+          "heading": "## Accepted 行为",
+          "start_byte": 3356,
+          "end_byte": 4357,
+          "body_sha256": "6644649ea35443e1681091c5affe85a1292209e74548a20a33c0c7610123a7e6"
+        }
+      ]
+    },
+    {
+      "authority_id": "UM-O21",
+      "relative_path": "docs/reviews/upload-material-um-o21-oracle-adjudication.md",
+      "bytes": 6326,
+      "sha256": "cb9ff3f4ae0ee45ad78d15d4f551cceda044c71db34bd402a5d12269a6bf3a8f",
+      "kind": "user-decision",
+      "approval_provenance": "原用户逐项明确裁决；后续已确认选择优先于早期pending状态",
+      "anchors": [
+        {
+          "heading": "## Accepted 行为",
+          "start_byte": 3197,
+          "end_byte": 4138,
+          "body_sha256": "0146454023672dc918b46dcc076d969739ff00926da2160fd486417fa1ee40e9"
+        }
+      ]
+    },
+    {
+      "authority_id": "UM-O22",
+      "relative_path": "docs/reviews/upload-material-um-o22-oracle-adjudication.md",
+      "bytes": 5887,
+      "sha256": "949ec065a1ce3d4f038e95f2457108d2dde079fb98824cdcc2512e14550fef1b",
+      "kind": "user-decision",
+      "approval_provenance": "原用户逐项明确裁决；后续已确认选择优先于早期pending状态",
+      "anchors": [
+        {
+          "heading": "## Accepted 行为",
+          "start_byte": 3019,
+          "end_byte": 3662,
+          "body_sha256": "6e011f4e75b5b51007b9aa2d3508921b5b6ee19a7e88170e31ab1b5e83f827e3"
+        }
+      ]
+    },
+    {
+      "authority_id": "UM-O23",
+      "relative_path": "docs/reviews/upload-material-um-o23-oracle-adjudication.md",
+      "bytes": 8842,
+      "sha256": "6560bdb0276ab3c644cfb53c8b4fad8a216022385bdfbf2728402c6ff032ece1",
+      "kind": "user-decision",
+      "approval_provenance": "原用户逐项明确裁决；后续已确认选择优先于早期pending状态",
+      "anchors": [
+        {
+          "heading": "## Accepted 行为与修复方向",
+          "start_byte": 5154,
+          "end_byte": 8280,
+          "body_sha256": "db212966c446d5440126760d410bc88662e9dae611e42b188433ce03c334cdf1"
+        }
+      ]
+    },
+    {
+      "authority_id": "UM-O24",
+      "relative_path": "docs/reviews/upload-material-um-o24-oracle-adjudication.md",
+      "bytes": 6570,
+      "sha256": "328f83d8fcf1caa920f8e31fcf4c3f7e5cf20e9bf20d8ada0e1ead22eaf8182f",
+      "kind": "user-decision",
+      "approval_provenance": "原用户逐项明确裁决；后续已确认选择优先于早期pending状态",
+      "anchors": [
+        {
+          "heading": "## Accepted 行为",
+          "start_byte": 5242,
+          "end_byte": 6570,
+          "body_sha256": "403cc227f67cebf17249364a8d3d6903f7c60043c446418119256f280d7f402b"
+        }
+      ]
+    },
+    {
+      "authority_id": "UM-O25",
+      "relative_path": "docs/reviews/upload-material-um-o25-oracle-adjudication.md",
+      "bytes": 7549,
+      "sha256": "495205c09876ac749739887db22baa898cc8a46cc898aa7377903ae14524ee01",
+      "kind": "user-decision",
+      "approval_provenance": "原用户逐项明确裁决；后续已确认选择优先于早期pending状态",
+      "anchors": [
+        {
+          "heading": "## Accepted 行为与修复方向",
+          "start_byte": 4280,
+          "end_byte": 6941,
+          "body_sha256": "195e397e196871844ccfc437690727ec7173ac4c5c0298df739852c6baac4283"
+        }
+      ]
+    },
+    {
+      "authority_id": "UM-O26",
+      "relative_path": "docs/reviews/upload-material-um-o26-oracle-adjudication.md",
+      "bytes": 6392,
+      "sha256": "00a86b4a14a6700ea3904c6332bc2eed24a6299584b7c8d8377c124a8956ed49",
+      "kind": "user-decision",
+      "approval_provenance": "原用户逐项明确裁决；后续已确认选择优先于早期pending状态",
+      "anchors": [
+        {
+          "heading": "## Accepted 行为与边界",
+          "start_byte": 4898,
+          "end_byte": 6392,
+          "body_sha256": "e3b34bfb45169234e156389852847f327349c61da1fd147bc75cbfa7fbe6471f"
+        }
+      ]
+    },
+    {
+      "authority_id": "UM-O27",
+      "relative_path": "docs/reviews/upload-material-um-o27-oracle-adjudication.md",
+      "bytes": 5641,
+      "sha256": "209a858d6632823963bd36963a74aac8cb86380e58b8a7ae6faf85e3f5726862",
+      "kind": "user-decision",
+      "approval_provenance": "原用户逐项明确裁决；后续已确认选择优先于早期pending状态",
+      "anchors": [
+        {
+          "heading": "## 语义 owner 与 Accepted 行为",
+          "start_byte": 3447,
+          "end_byte": 5641,
+          "body_sha256": "c0c14945baa6ba49ac2a8a8489a9f2604d078a79671203e262f64c48fcb8fb9c"
+        }
+      ]
+    },
+    {
+      "authority_id": "UM-O28",
+      "relative_path": "docs/reviews/upload-material-um-o28-oracle-adjudication.md",
+      "bytes": 4777,
+      "sha256": "9645c04a8863e96763d0471aa718b05fc03a33c7e8ff00996d8025cc18f8bc22",
+      "kind": "user-decision",
+      "approval_provenance": "原用户逐项明确裁决；后续已确认选择优先于早期pending状态",
+      "anchors": [
+        {
+          "heading": "## 语义 owner 与 Accepted 行为",
+          "start_byte": 3256,
+          "end_byte": 4777,
+          "body_sha256": "304b450f04bb3bd09d3ac0522fcf2182f636ed5710bc15b426a597f73e0acaf0"
+        }
+      ]
+    },
+    {
+      "authority_id": "UM-O29",
+      "relative_path": "docs/reviews/upload-material-um-o29-oracle-adjudication.md",
+      "bytes": 6432,
+      "sha256": "1ea88fbbdb2342c144ead9819636324eb8789154caccda8c791dfc191d0db922",
+      "kind": "user-decision",
+      "approval_provenance": "原用户逐项明确裁决；后续已确认选择优先于早期pending状态",
+      "anchors": [
+        {
+          "heading": "## 语义 owner 与 Accepted 行为",
+          "start_byte": 4900,
+          "end_byte": 6432,
+          "body_sha256": "585d5fbc18418efb6bd19be30249aba9478e77f3af0ab03b04c81791ee8b3e8b"
+        }
+      ]
+    },
+    {
+      "authority_id": "UM-O30",
+      "relative_path": "docs/reviews/upload-material-um-o30-oracle-adjudication.md",
+      "bytes": 5505,
+      "sha256": "b7326df1c56aaf470ad4a8f2d627568d35efbde68b709a53e7e2a93f33c96bb6",
+      "kind": "user-decision",
+      "approval_provenance": "原用户逐项明确裁决；后续已确认选择优先于早期pending状态",
+      "anchors": [
+        {
+          "heading": "## 语义 owner 与 Accepted 行为",
+          "start_byte": 3788,
+          "end_byte": 5505,
+          "body_sha256": "1a17721741139986b6a62f25bf0b37a0a494430c0e4035f38d448aa42e5cd4f2"
+        }
+      ]
+    },
+    {
+      "authority_id": "UM-O31",
+      "relative_path": "docs/reviews/upload-material-um-o31-oracle-adjudication.md",
+      "bytes": 4919,
+      "sha256": "54a9d560e40b0e86ab1104b254f15c3b73c34a1b700da348767c7522024e1dbd",
+      "kind": "user-decision",
+      "approval_provenance": "原用户逐项明确裁决；后续已确认选择优先于早期pending状态",
+      "anchors": [
+        {
+          "heading": "## 语义 owner 与 Accepted 行为",
+          "start_byte": 3719,
+          "end_byte": 4919,
+          "body_sha256": "44970ac021f3419e52ff2b31c7386543d8a8dd04ac4efe84a4f4b43b07343e03"
+        }
+      ]
+    },
+    {
+      "authority_id": "UM-O32",
+      "relative_path": "docs/reviews/upload-material-um-o32-oracle-adjudication.md",
+      "bytes": 5116,
+      "sha256": "036b66aa0faf3b71c484c18cbeb1faee5cee9c66e0d788faf7f8628303a7448c",
+      "kind": "user-decision",
+      "approval_provenance": "原用户逐项明确裁决；后续已确认选择优先于早期pending状态",
+      "anchors": [
+        {
+          "heading": "## 语义 owner 与 Accepted 行为",
+          "start_byte": 4011,
+          "end_byte": 5116,
+          "body_sha256": "893f7829927c1fb046c438f38128fc479f851e9def9f4254e3076f3a2d898a02"
+        }
+      ]
+    },
+    {
+      "authority_id": "UM-O33",
+      "relative_path": "docs/reviews/upload-material-um-o33-oracle-adjudication.md",
+      "bytes": 7359,
+      "sha256": "a45a3f5bdcfafdf5a6a0ed2de3c3d812658478077ff8a3082ec52f4227376c1c",
+      "kind": "user-decision",
+      "approval_provenance": "原用户逐项明确裁决；后续已确认选择优先于早期pending状态",
+      "anchors": [
+        {
+          "heading": "## 语义 owner、证据边界与 Accepted 行为",
+          "start_byte": 3684,
+          "end_byte": 6291,
+          "body_sha256": "25626648f9cb9119dc6795ce7b320da6f935ec00684bda59ca50b49051a5b28d"
+        }
+      ]
+    },
+    {
+      "authority_id": "UM-O34",
+      "relative_path": "docs/reviews/upload-material-um-o34-oracle-adjudication.md",
+      "bytes": 9722,
+      "sha256": "b354a4e702db85b9eddb76216df15bd75266342257bed875bf5b8c13f692ec47",
+      "kind": "user-decision",
+      "approval_provenance": "原用户逐项明确裁决；后续已确认选择优先于早期pending状态",
+      "anchors": [
+        {
+          "heading": "## Accepted 行为与范围",
+          "start_byte": 8207,
+          "end_byte": 9722,
+          "body_sha256": "d13c15689179e2fa06dc3c2d21620ffc01d2984fc0bffbed10b97f67e619b5d9"
+        }
+      ]
+    },
+    {
+      "authority_id": "UM-O35",
+      "relative_path": "docs/reviews/upload-material-um-o35-oracle-adjudication.md",
+      "bytes": 4379,
+      "sha256": "cf360a6fcfbf9e735e044f6d5b0285f3ae44c1d58e9fb7635812480d40d42501",
+      "kind": "user-decision",
+      "approval_provenance": "原用户逐项明确裁决；后续已确认选择优先于早期pending状态",
+      "anchors": [
+        {
+          "heading": "## 语义 owner 与 Accepted 行为",
+          "start_byte": 3269,
+          "end_byte": 4379,
+          "body_sha256": "f1361454f7afc1d350c75265df67b17b0f5d2dae8415cd656a234d0dfea6a2a4"
+        }
+      ]
+    },
+    {
+      "authority_id": "UM-O36",
+      "relative_path": "docs/reviews/upload-material-um-o36-oracle-adjudication.md",
+      "bytes": 5812,
+      "sha256": "d1a1c470ca631f11d642fc8f081c9479f1813ab91cf98221bf49ad610b747dc2",
+      "kind": "user-decision",
+      "approval_provenance": "原用户逐项明确裁决；后续已确认选择优先于早期pending状态",
+      "anchors": [
+        {
+          "heading": "## 证据纠错与 Accepted 范围",
+          "start_byte": 4225,
+          "end_byte": 5812,
+          "body_sha256": "b8bbc3ff3c6aaeb477c12b586b9e0f7fa59a6c5d67db358e8b7680f53246f7e3"
+        }
+      ]
+    },
+    {
+      "authority_id": "accepted-repair-design",
+      "relative_path": "docs/gateflow/upload-material-unified-repair-plan-20261002.md",
+      "bytes": 125224,
+      "sha256": "c99c35adba919a8baf371b0142e0ab1abf256a951e89b2fc15e8a2d38988e8ea",
+      "kind": "current-design",
+      "approval_provenance": "冻结accepted plan列明的既决后续选择/有效设计/硬约束；非实现作者新增裁决",
+      "anchors": [
+        {
+          "heading": "## 5. S1：完整准入、显式主源与内容失败传播",
+          "start_byte": 16569,
+          "end_byte": 44185,
+          "body_sha256": "67ad5aac05ed30b6cd4f706c8a44dd5e7b07fa47a6bf1a384ab4c4a5e9e431e4"
+        },
+        {
+          "heading": "## 6. S2：同版受理、独立公司与材料条件发布、并发可信终态",
+          "start_byte": 44185,
+          "end_byte": 78633,
+          "body_sha256": "ad9bbfcd3413421c5abba97b731a723c6725f2dca252955232e97b6189befbee"
+        },
+        {
+          "heading": "## 7. S3：受控 XBRL 部署／转换／真实材料提交（必要机制已核收，generation-ready候选）",
+          "start_byte": 78633,
+          "end_byte": 111804,
+          "body_sha256": "ee24c1ed277f5489c291e203e9cbaf3d454abaef55db3d5463fb8d93567ab2de"
+        }
+      ]
+    },
+    {
+      "authority_id": "diagnostic-design",
+      "relative_path": "docs/gateflow/upload-material-converter-diagnostics-plan-20261003.md",
+      "bytes": 58983,
+      "sha256": "cbd771224d4fc88bcafa6a03c8e786d4e1cef6dc22e15937ed38d7dc73461709",
+      "kind": "current-design",
+      "approval_provenance": "冻结accepted plan列明的既决后续选择/有效设计/硬约束；非实现作者新增裁决",
+      "anchors": [
+        {
+          "heading": "## 1. 目标、动机与成功信号",
+          "start_byte": 1517,
+          "end_byte": 3298,
+          "body_sha256": "670beb6ad38b50c7c281f475c6f470b9ed67a1e250f71fe145282711707b2c63"
+        },
+        {
+          "heading": "## 4. 可实现方案比较与选定方案",
+          "start_byte": 8093,
+          "end_byte": 26778,
+          "body_sha256": "f6a443ed5b995c2fb498e573664542400715249db158b3a7b2ab3692d9ec9f9d"
+        }
+      ]
+    },
+    {
+      "authority_id": "CLI-hard-contract",
+      "relative_path": "docs/cli_ci.md",
+      "bytes": 156772,
+      "sha256": "063fd969333ce628c1a0377c3f43b4a1df0d597cbf10f96ec4a5cec034a3a32b",
+      "kind": "hard-contract",
+      "approval_provenance": "冻结accepted plan列明的既决后续选择/有效设计/硬约束；非实现作者新增裁决",
+      "anchors": [
+        {
+          "heading": "### 4.6 Oracle Registry 与 Phaseflow 衔接",
+          "start_byte": 40171,
+          "end_byte": 46382,
+          "body_sha256": "1ae2c1e8afd804fa2d571e9b391f9c198f23a7fa9fc4e03d16fc6e477d9af3e4"
+        },
+        {
+          "heading": "### 5.1 Inventory、Mandatory Obligations 与场景 Registry",
+          "start_byte": 48563,
+          "end_byte": 102022,
+          "body_sha256": "081eefef55fd93094b0b6e0b5abb87a288946360dacdbd69be5d688a44bcf050"
+        },
+        {
+          "heading": "### 11.2 Host DB / SQLite observation safety boundary",
+          "start_byte": 143951,
+          "end_byte": 148425,
+          "body_sha256": "6d24f58d745184c7fe15e1ee0dc22325070753a417995892d35dd6a1ae1010d6"
+        }
+      ]
+    },
+    {
+      "authority_id": "project-hard-contract",
+      "relative_path": "AGENTS.md",
+      "bytes": 10036,
+      "sha256": "cb26618ab566804c97a3ef2f269537b7313e59370e5ddd0258d9b753b08ac45e",
+      "kind": "hard-contract",
+      "approval_provenance": "冻结accepted plan列明的既决后续选择/有效设计/硬约束；非实现作者新增裁决",
+      "anchors": [
+        {
+          "heading": "## 语义所有权与修复边界【必须遵守】",
+          "start_byte": 1162,
+          "end_byte": 2579,
+          "body_sha256": "431cb778a5b8536cddb4a523774fa56f9c27d8ba672ce9ba52006fe5ea02216d"
+        },
+        {
+          "heading": "## 架构硬约束",
+          "start_byte": 4777,
+          "end_byte": 5982,
+          "body_sha256": "af8895d60f61c45b2c7923cd4643c1b80525e976009a4f45efef2437c6b82fc4"
+        }
+      ]
+    },
+    {
+      "authority_id": "binding-goal",
+      "relative_path": "workspace/tmp/upload-material-registry-20261003/goal-confirmation.md",
+      "bytes": 3397,
+      "sha256": "3b19f1e9a5832635acb5d4cb72f22e33db036e64b93f31f1fe81f6b3bb61b4d8",
+      "kind": "user-decision",
+      "approval_provenance": "冻结accepted plan列明的既决后续选择/有效设计/硬约束；非实现作者新增裁决",
+      "anchors": [
+        {
+          "heading": "binding goal full text",
+          "start_byte": 0,
+          "end_byte": 3397,
+          "body_sha256": "3b19f1e9a5832635acb5d4cb72f22e33db036e64b93f31f1fe81f6b3bb61b4d8"
+        }
+      ]
+    },
+    {
+      "authority_id": "root-followup",
+      "relative_path": "docs/reviews/upload-material-cli-postrepair-root-adjudication-20261003.md",
+      "bytes": 7796,
+      "sha256": "baf1d5b647230b8b5a10a1d0f86ea20246572ace981de18cf50838b8cd0b55a8",
+      "kind": "user-decision",
+      "approval_provenance": "冻结accepted plan列明的既决后续选择/有效设计/硬约束；非实现作者新增裁决",
+      "anchors": [
+        {
+          "heading": "## 用户后续裁决",
+          "start_byte": 6368,
+          "end_byte": 6738,
+          "body_sha256": "b872b22820bce84287ff926c88d58203fcfded37669f1dbe91b6b7e9bad6b4e2"
+        }
+      ]
+    },
+    {
+      "authority_id": "UM-CI-N01",
+      "relative_path": "workspace/tmp/upload-material-unified-repair-20261002/post-wu-preparation/oracle-candidates.json",
+      "bytes": 3356,
+      "sha256": "dbeb48a6cff69e477034adf9e57e0b8dcf09fe0147ea64132df5992c75deec46",
+      "kind": "user-decision",
+      "approval_provenance": "冻结accepted plan列明的既决后续选择/有效设计/硬约束；非实现作者新增裁决",
+      "anchors": [
+        {
+          "heading": "UM-CI-N01.user_adjudication",
+          "start_byte": 2354,
+          "end_byte": 2895,
+          "body_sha256": "525ba0851418c1e24dde7170e6a185faf0097010f0544c5eee9738721ed9ee10"
+        }
+      ]
+    }
+  ],
+  "predicates": [
+    {
+      "predicate_id": "upload_material.public-parser",
+      "authority_refs": [
+        "UM-O01-O06",
+        "UM-O07",
+        "UM-O08"
+      ]
+    },
+    {
+      "predicate_id": "upload_material.workspace",
+      "authority_refs": [
+        "UM-O01-O06"
+      ]
+    },
+    {
+      "predicate_id": "upload_material.identity-admission",
+      "authority_refs": [
+        "UM-O01-O06",
+        "UM-O07",
+        "UM-O08",
+        "UM-O17",
+        "accepted-repair-design"
+      ]
+    },
+    {
+      "predicate_id": "upload_material.fiscal-date",
+      "authority_refs": [
+        "UM-O09",
+        "UM-O10",
+        "UM-O11",
+        "accepted-repair-design"
+      ]
+    },
+    {
+      "predicate_id": "upload_material.company-identity",
+      "authority_refs": [
+        "UM-O12",
+        "accepted-repair-design"
+      ]
+    },
+    {
+      "predicate_id": "upload_material.asset-selection",
+      "authority_refs": [
+        "UM-O01-O06",
+        "UM-O23",
+        "UM-O24",
+        "accepted-repair-design"
+      ]
+    },
+    {
+      "predicate_id": "upload_material.conversion-publication",
+      "authority_refs": [
+        "UM-O19",
+        "UM-O20",
+        "UM-O26",
+        "UM-O34",
+        "accepted-repair-design"
+      ]
+    },
+    {
+      "predicate_id": "upload_material.typed-content-failure",
+      "authority_refs": [
+        "UM-O21",
+        "UM-O22",
+        "UM-O34"
+      ]
+    },
+    {
+      "predicate_id": "upload_material.action-state",
+      "authority_refs": [
+        "UM-O13",
+        "UM-O14",
+        "UM-O15",
+        "UM-O16",
+        "accepted-repair-design"
+      ]
+    },
+    {
+      "predicate_id": "upload_material.amended-overwrite",
+      "authority_refs": [
+        "UM-O18"
+      ]
+    },
+    {
+      "predicate_id": "upload_material.primary-role",
+      "authority_refs": [
+        "UM-O24",
+        "UM-O25"
+      ]
+    },
+    {
+      "predicate_id": "upload_material.cross-consumption",
+      "authority_refs": [
+        "UM-O27",
+        "accepted-repair-design"
+      ]
+    },
+    {
+      "predicate_id": "upload_material.direct-boundary",
+      "authority_refs": [
+        "UM-O28",
+        "project-hard-contract"
+      ]
+    },
+    {
+      "predicate_id": "upload_material.operator-logging",
+      "authority_refs": [
+        "UM-O01-O06",
+        "UM-O29"
+      ]
+    },
+    {
+      "predicate_id": "upload_material.sigint",
+      "authority_refs": [
+        "UM-O30"
+      ]
+    },
+    {
+      "predicate_id": "upload_material.crash-retry-observation",
+      "authority_refs": [
+        "UM-O31"
+      ]
+    },
+    {
+      "predicate_id": "upload_material.concurrent-publication",
+      "authority_refs": [
+        "UM-O32",
+        "UM-O33",
+        "accepted-repair-design"
+      ]
+    },
+    {
+      "predicate_id": "upload_material.converter-diagnostic-channel",
+      "authority_refs": [
+        "UM-CI-N01",
+        "diagnostic-design"
+      ]
+    },
+    {
+      "predicate_id": "upload_material.evidence-lineage",
+      "authority_refs": [
+        "UM-O35",
+        "UM-O36",
+        "CLI-hard-contract"
+      ]
+    }
+  ]
+}

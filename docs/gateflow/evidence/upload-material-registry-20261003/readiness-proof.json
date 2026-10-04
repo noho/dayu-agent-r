@@ -1,0 +1,2849 @@
+{
+  "validation_result": "pass",
+  "registry_status": "ready",
+  "counts": {
+    "excluded": 9,
+    "new_formal_scenarios": 799,
+    "new_oracles": 1,
+    "new_predicates": 19,
+    "source_cli802": 802,
+    "source_focused": 6
+  },
+  "errors": [],
+  "gaps": [],
+  "proof": {
+    "oracles": {
+      "proof_version": 6,
+      "target_commit": "22eca6c313005e3c5185340f2d6b535ab2583056",
+      "registry_digest_basis": {
+        "oracles": "5fc1925a1c258647b159c017ec5ed6da0b863623a2793001a64065f72dba1575",
+        "scenarios": "195c66192a3b2c99bbb2c0e15c058f74b3ffdd10aefadb082923208c1bc71744"
+      },
+      "campaigns": {
+        "upload_material": {
+          "registration_target": "22eca6c313005e3c5185340f2d6b535ab2583056",
+          "counts": {
+            "source_cli802": 802,
+            "source_focused": 6,
+            "new_formal_scenarios": 799,
+            "new_oracles": 1,
+            "new_predicates": 19,
+            "excluded": 9
+          },
+          "matrix_counts": {
+            "matrix.json": 631,
+            "matrix-supplement.json": 118,
+            "failure-owner-matrix-v2.json": 35,
+            "batch-wiring-matrix.json": 5,
+            "batch-wiring-matrix-v2.json": 4,
+            "batch-consumption-matrix.json": 2,
+            "tree-retakes-matrix.json": 2,
+            "native-pdf-matrix.json": 1,
+            "parser-edges-matrix.json": 4
+          },
+          "classes": {
+            "authority-mapped": 733,
+            "objective-parser-evidence": 5,
+            "supporting-wiring-evidence": 15,
+            "diagnostic-no-removed-file-credit": 1,
+            "diagnostic-no-alias-cap-credit": 2,
+            "current-design-regression-only": 4,
+            "supporting-owner-evidence": 35,
+            "diagnostic-no-positive-credit": 6,
+            "historical-conversion-publication-only": 1,
+            "focused-actual-measurement": 6
+          },
+          "actual_Service_terminal_classes": {
+            "failure": 32,
+            "success": 3
+          },
+          "coverage_dimensions": {
+            "command_parameter_ids": {
+              "mandatory": 35,
+              "covered": 35,
+              "gaps": 0,
+              "obligation_ids": [
+                "command:process_filing",
+                "command:process_material",
+                "command:service.upload_material",
+                "command:sh",
+                "command:tool_trace analyze",
+                "command:upload_filing",
+                "command:upload_filings_from",
+                "command:upload_material",
+                "parameter:--action",
+                "parameter:--amended",
+                "parameter:--base",
+                "parameter:--company-name",
+                "parameter:--critical",
+                "parameter:--debug",
+                "parameter:--debug-stream",
+                "parameter:--document-id",
+                "parameter:--error",
+                "parameter:--files",
+                "parameter:--filing-date",
+                "parameter:--fiscal-period",
+                "parameter:--fiscal-year",
+                "parameter:--forms",
+                "parameter:--help",
+                "parameter:--info",
+                "parameter:--log-file",
+                "parameter:--log-level",
+                "parameter:--material-name",
+                "parameter:--overwrite",
+                "parameter:--primary",
+                "parameter:--quiet",
+                "parameter:--report-date",
+                "parameter:--ticker",
+                "parameter:--verbose",
+                "parameter:--warn",
+                "parameter:--warning"
+              ],
+              "not_applicable": null
+            },
+            "precondition_state_ids": {
+              "mandatory": 61,
+              "covered": 61,
+              "gaps": 0,
+              "obligation_ids": [
+                "state:active",
+                "state:active-company",
+                "state:active-role",
+                "state:active-samebytes",
+                "state:actual-published",
+                "state:chain:STATE-CN-create-deleted",
+                "state:chain:STATE-CN-create-existing-different",
+                "state:chain:STATE-CN-create-existing-same",
+                "state:chain:STATE-CN-create-overwrite",
+                "state:chain:STATE-CN-delete",
+                "state:chain:STATE-CN-delete-again",
+                "state:chain:STATE-CN-differentbytes",
+                "state:chain:STATE-CN-fresh-auto",
+                "state:chain:STATE-CN-repeat-delete",
+                "state:chain:STATE-CN-restore-auto",
+                "state:chain:STATE-CN-same-amended",
+                "state:chain:STATE-CN-same-overwrite",
+                "state:chain:STATE-CN-samebytes",
+                "state:chain:STATE-CN-update-same",
+                "state:chain:STATE-HK-create-deleted",
+                "state:chain:STATE-HK-create-existing-different",
+                "state:chain:STATE-HK-create-existing-same",
+                "state:chain:STATE-HK-create-overwrite",
+                "state:chain:STATE-HK-delete",
+                "state:chain:STATE-HK-delete-again",
+                "state:chain:STATE-HK-differentbytes",
+                "state:chain:STATE-HK-fresh-auto",
+                "state:chain:STATE-HK-repeat-delete",
+                "state:chain:STATE-HK-restore-auto",
+                "state:chain:STATE-HK-same-amended",
+                "state:chain:STATE-HK-same-overwrite",
+                "state:chain:STATE-HK-samebytes",
+                "state:chain:STATE-HK-update-same",
+                "state:chain:STATE-US-create-deleted",
+                "state:chain:STATE-US-create-existing-different",
+                "state:chain:STATE-US-create-existing-same",
+                "state:chain:STATE-US-create-overwrite",
+                "state:chain:STATE-US-delete",
+                "state:chain:STATE-US-delete-again",
+                "state:chain:STATE-US-differentbytes",
+                "state:chain:STATE-US-fresh-auto",
+                "state:chain:STATE-US-repeat-delete",
+                "state:chain:STATE-US-restore-auto",
+                "state:chain:STATE-US-same-amended",
+                "state:chain:STATE-US-same-overwrite",
+                "state:chain:STATE-US-samebytes",
+                "state:chain:STATE-US-update-same",
+                "state:deleted",
+                "state:explicit-repair",
+                "state:explicit-unsafe",
+                "state:fresh",
+                "state:fresh-pair",
+                "state:generated-script",
+                "state:independent-fresh",
+                "state:missing",
+                "state:other-company-active",
+                "state:post-signal",
+                "state:processed-A-preserved",
+                "state:role-changed",
+                "state:uploaded-chain",
+                "state:uploaded-processed"
+              ],
+              "not_applicable": null
+            },
+            "interactive_branch_option_ids": {
+              "mandatory": 0,
+              "covered": 0,
+              "gaps": 0,
+              "obligation_ids": [],
+              "not_applicable": "direct CLI has no interactive branches"
+            },
+            "input_class_ids": {
+              "mandatory": 166,
+              "covered": 166,
+              "gaps": 0,
+              "obligation_ids": [
+                "input:PTY-cancel-descendant-tree",
+                "input:PTY-external-kill-descendant-tree",
+                "input:Unicode-codepoints",
+                "input:absent",
+                "input:absent-files",
+                "input:activexautoxmultixplainxplain",
+                "input:activexcreatexonexplainxplain",
+                "input:activexdeletexmultixamendedxplain",
+                "input:activexupdatexonexplainxoverwrite",
+                "input:actual-help",
+                "input:actual-script-execution",
+                "input:actual-signal",
+                "input:alias-count-boundary",
+                "input:append-chain",
+                "input:backslash-name",
+                "input:blank-company",
+                "input:casefold",
+                "input:casefold-derived-reverse",
+                "input:casefold-original-derived",
+                "input:casefold-reverse",
+                "input:company-seed",
+                "input:concurrent-differentbytes",
+                "input:concurrent-differentidentity",
+                "input:concurrent-differentticker",
+                "input:concurrent-samebytes",
+                "input:conflicting-alias",
+                "input:content-boundary",
+                "input:control-meta",
+                "input:controlled-XBRL-instance",
+                "input:count-boundary",
+                "input:create-deleted",
+                "input:create-existing-different",
+                "input:create-existing-same",
+                "input:create-overwrite",
+                "input:csv-bad",
+                "input:csv-zero",
+                "input:current-run-json-primary-reverse",
+                "input:default-cwd",
+                "input:default-info",
+                "input:delete",
+                "input:delete-again",
+                "input:delete-forbidden-input",
+                "input:deletedxautoxonexamendedxoverwrite",
+                "input:deletedxcreatexmultixplainxplain",
+                "input:deletedxdeletexonexplainxplain",
+                "input:deletedxupdatexonexplainxplain",
+                "input:differentbytes",
+                "input:direct-stream",
+                "input:docx-bad",
+                "input:docx-zero",
+                "input:duplicate-basename",
+                "input:duplicate-path",
+                "input:empty",
+                "input:empty-file-value",
+                "input:exact-primary",
+                "input:failed-B",
+                "input:fresh-auto",
+                "input:freshxautoxonexplainxplain",
+                "input:freshxcreatexmultixamendedxoverwrite",
+                "input:freshxdeletexonexplainxoverwrite",
+                "input:freshxupdatexmultixamendedxplain",
+                "input:help",
+                "input:htm-bad",
+                "input:htm-zero",
+                "input:html-bad",
+                "input:html-zero",
+                "input:identity-control",
+                "input:isolated-usage",
+                "input:isolated-valid-other-inputs",
+                "input:json-bad",
+                "input:json-zero",
+                "input:long-derivative-name",
+                "input:long-near-filesystem",
+                "input:md-bad",
+                "input:md-zero",
+                "input:meta-uppercase",
+                "input:native-PDF",
+                "input:native-complete-public-financial-PDF",
+                "input:newline-name",
+                "input:nfc-name-collision",
+                "input:no-company-name",
+                "input:omitted-name",
+                "input:ordered-two-selectors",
+                "input:original-derived-forward",
+                "input:original-derived-reverse",
+                "input:owned-corruption",
+                "input:pdf-bad",
+                "input:pdf-zero",
+                "input:period-domain",
+                "input:piped-stdin",
+                "input:pptx-bad",
+                "input:pptx-zero",
+                "input:primary-invalid-first",
+                "input:primary-invalid-last",
+                "input:primary-repeated-two-distinct",
+                "input:public-analyzer",
+                "input:public-id-assertion",
+                "input:real-two-source-plan",
+                "input:repeat-booleans",
+                "input:repeat-delete",
+                "input:repeat-list-action",
+                "input:repeat-scalar-last",
+                "input:restore-auto",
+                "input:retry",
+                "input:root-leaf-ordered-selector-conflict",
+                "input:root-leaf-quiet-stream-conflict",
+                "input:root-selector-location",
+                "input:root-workspace-alias",
+                "input:same-amended",
+                "input:same-input-public-Service-consumption",
+                "input:same-overwrite",
+                "input:same-stem-forward",
+                "input:same-stem-reverse",
+                "input:samebytes",
+                "input:samebytes-role",
+                "input:seed",
+                "input:seed-delete",
+                "input:selector-stream-conflict",
+                "input:separate-exact-ID-process",
+                "input:separate-process",
+                "input:shared-owner-filing",
+                "input:signal-on-B",
+                "input:strict-calendar",
+                "input:supported-csv",
+                "input:supported-docx",
+                "input:supported-htm",
+                "input:supported-html",
+                "input:supported-json",
+                "input:supported-md",
+                "input:supported-pdf",
+                "input:supported-pptx",
+                "input:supported-txt",
+                "input:supported-xbrl",
+                "input:supported-xhtml",
+                "input:supported-xlsx",
+                "input:supported-xml",
+                "input:target-state",
+                "input:ticker-csv",
+                "input:trim-filename",
+                "input:txt-bad",
+                "input:txt-zero",
+                "input:unicode-normalization",
+                "input:unicode-reverse",
+                "input:update-deleted",
+                "input:update-same",
+                "input:valid-form",
+                "input:valid-native-derived-txt",
+                "input:valid-seed",
+                "input:whitespace",
+                "input:workspace-alias",
+                "input:workspace-file",
+                "input:workspace-relative",
+                "input:workspace-symlink",
+                "input:workspace-unicode",
+                "input:xbrl-bad",
+                "input:xbrl-zero",
+                "input:xhtml-bad",
+                "input:xhtml-zero",
+                "input:xlsx-bad",
+                "input:xlsx-zero",
+                "input:xml-bad",
+                "input:xml-zero",
+                "input:year-domain",
+                "input:year-period",
+                "input:year-period-dates",
+                "input:year-whitespace-period"
+              ],
+              "not_applicable": null
+            },
+            "combination_high_risk_ids": {
+              "mandatory": 217,
+              "covered": 217,
+              "gaps": 0,
+              "obligation_ids": [
+                "--action",
+                "--base",
+                "--company-name",
+                "--document-id",
+                "--files",
+                "--filing-date",
+                "--fiscal-period",
+                "--fiscal-year",
+                "--forms",
+                "--log-file",
+                "--material-name",
+                "--report-date",
+                "--ticker",
+                "--workspace",
+                "-b",
+                "A-RETAINED",
+                "ACTION-FILES-ADMISSION",
+                "ALIAS-CONFLICT",
+                "ALL-SUFFIX-NEGATIVE-CONTENT",
+                "APPEND-EXACT-PREFIX",
+                "CANCEL-A-RETAINED",
+                "CHILD-PYTHON-OWN-VENV",
+                "CONCURRENT-REAL-OVERLAP",
+                "CONDITIONAL-COMPANY-NAME",
+                "DATE-INDEPENDENT-STRICT",
+                "DEBUG-STREAM-DEFAULT",
+                "DEBUG-STREAM-ORTHOGONAL",
+                "DEFAULT-CWD-WORKSPACE",
+                "DELETE-BEFORE-PATH-ACCESS",
+                "DIRECT-HOST-ABSENCE",
+                "DIRECT-NO-SSE",
+                "DIRECT-NONINTERACTIVE",
+                "DOCID-ASSERTION",
+                "EXTERNAL-KILL-DESCENDANT-PROCESS-PROOF",
+                "FAILURE-PARTIAL-COMPANY-DOCUMENT",
+                "FILE-COUNT-OWNER-LIMIT",
+                "FIVE-FIELD-PUBLIC-OWNER",
+                "FIVE-FIELD-TYPED-FAILURE",
+                "FORM-SHARED-NORMALIZATION",
+                "FORMAT-13-ACTUAL-DOCLING",
+                "FULL-ASSET-NAME-PLAN",
+                "FULL-PDF-ACTUAL-CONVERSION",
+                "FY-INDEPENDENT-OPTIONAL-DOMAIN",
+                "GENERATED-SCRIPT-CONSUMPTION",
+                "GLOBAL-ASSET-PLAN-ORDER-INDEPENDENT",
+                "INDEPENDENT-OPERATION-NOT-CLI",
+                "INTEGRITY-ALL-ACTIONS",
+                "INTEGRITY-PRECONDITION",
+                "LEXICAL-ARGV",
+                "LOG-256-ORDERED-CONFLICTS",
+                "LOG-32-PRIMARY",
+                "LOG-E00",
+                "LOG-E01",
+                "LOG-E02",
+                "LOG-E03",
+                "LOG-E04",
+                "LOG-E05",
+                "LOG-E06",
+                "LOG-E07",
+                "LOG-E08",
+                "LOG-E09",
+                "LOG-E10",
+                "LOG-E11",
+                "LOG-E12",
+                "LOG-E13",
+                "LOG-E14",
+                "LOG-E15",
+                "MARKET-SHARED-OWNER",
+                "MATERIAL-NAME-FORM-GENERATED",
+                "MISSING-NO-UPSERT",
+                "NAME-240-NO-NFC-NO-TRUNCATION",
+                "NATIVE-FINANCIAL-SOURCE",
+                "OPTION-INDEPENDENCE-AND-REPETITION",
+                "ORDER-NOT-PRIMARY",
+                "OWNED-BOUNDARY-FIXTURE",
+                "PAIRWISE-PRECONDITION",
+                "PAIRWISE-STATE-OPTION-INPUT",
+                "PARSER-ABBREVIATION-AND-REMOVED-INPUT",
+                "PARSER-HELP",
+                "PER-DOCUMENT-REGISTRATION",
+                "PERIOD-ALL-INDEPENDENT-OPTIONAL",
+                "PRIMARY-CROSS-CONSUMPTION",
+                "PRIMARY-FULL-CONTRACT",
+                "PRIMARY-INPUT-ORDER",
+                "PRINT-VS-LOG",
+                "PROCESS-INDEPENDENT-COMMAND",
+                "PUBLIC-REPOSITORY-ID-CONSUMPTION",
+                "PW-0-active--1-auto",
+                "PW-0-active--1-create",
+                "PW-0-active--1-delete",
+                "PW-0-active--1-update",
+                "PW-0-active--2-multi",
+                "PW-0-active--2-one",
+                "PW-0-active--3-amended",
+                "PW-0-active--3-plain",
+                "PW-0-active--4-overwrite",
+                "PW-0-active--4-plain",
+                "PW-0-deleted--1-auto",
+                "PW-0-deleted--1-create",
+                "PW-0-deleted--1-delete",
+                "PW-0-deleted--1-update",
+                "PW-0-deleted--2-multi",
+                "PW-0-deleted--2-one",
+                "PW-0-deleted--3-amended",
+                "PW-0-deleted--3-plain",
+                "PW-0-deleted--4-overwrite",
+                "PW-0-deleted--4-plain",
+                "PW-0-fresh--1-auto",
+                "PW-0-fresh--1-create",
+                "PW-0-fresh--1-delete",
+                "PW-0-fresh--1-update",
+                "PW-0-fresh--2-multi",
+                "PW-0-fresh--2-one",
+                "PW-0-fresh--3-amended",
+                "PW-0-fresh--3-plain",
+                "PW-0-fresh--4-overwrite",
+                "PW-0-fresh--4-plain",
+                "PW-1-auto--2-multi",
+                "PW-1-auto--2-one",
+                "PW-1-auto--3-amended",
+                "PW-1-auto--3-plain",
+                "PW-1-auto--4-overwrite",
+                "PW-1-auto--4-plain",
+                "PW-1-create--2-multi",
+                "PW-1-create--2-one",
+                "PW-1-create--3-amended",
+                "PW-1-create--3-plain",
+                "PW-1-create--4-overwrite",
+                "PW-1-create--4-plain",
+                "PW-1-delete--2-multi",
+                "PW-1-delete--2-one",
+                "PW-1-delete--3-amended",
+                "PW-1-delete--3-plain",
+                "PW-1-delete--4-overwrite",
+                "PW-1-delete--4-plain",
+                "PW-1-update--2-multi",
+                "PW-1-update--2-one",
+                "PW-1-update--3-amended",
+                "PW-1-update--3-plain",
+                "PW-1-update--4-overwrite",
+                "PW-1-update--4-plain",
+                "PW-2-multi--3-amended",
+                "PW-2-multi--3-plain",
+                "PW-2-multi--4-overwrite",
+                "PW-2-multi--4-plain",
+                "PW-2-one--3-amended",
+                "PW-2-one--3-plain",
+                "PW-2-one--4-overwrite",
+                "PW-2-one--4-plain",
+                "PW-3-amended--4-overwrite",
+                "PW-3-amended--4-plain",
+                "PW-3-plain--4-overwrite",
+                "PW-3-plain--4-plain",
+                "QUIET-STREAM-TWO-ORDERS",
+                "RAW-DOCLING-JSON-PRIMARY",
+                "REPEAT-ACTION",
+                "REPEATED-SCALAR-LAST",
+                "REQUIRED-ALL-ACTIONS",
+                "ROLE-FINGERPRINT",
+                "ROOT-LEAF-MERGE-CONFLICT",
+                "ROOT-LOG-E00",
+                "ROOT-LOG-E01",
+                "ROOT-LOG-E02",
+                "ROOT-LOG-E03",
+                "ROOT-LOG-E04",
+                "ROOT-LOG-E05",
+                "ROOT-LOG-E06",
+                "ROOT-LOG-E07",
+                "ROOT-LOG-E08",
+                "ROOT-LOG-E09",
+                "ROOT-LOG-E10",
+                "ROOT-LOG-E11",
+                "ROOT-LOG-E12",
+                "ROOT-LOG-E13",
+                "ROOT-LOG-E14",
+                "ROOT-LOG-E15",
+                "ROOT-PARSER-OPTION",
+                "ROOT-PRIMARY-REAL",
+                "ROOT-QUIET-STREAM-TWO-ORDERS",
+                "SHARED-BATCH-WIRING",
+                "SHARED-WIRING-REGRESSION",
+                "SIGINT-GRACEFUL",
+                "SIGKILL-EXTERNAL",
+                "SIGNAL-DESCENDANT-PROCESS-PROOF",
+                "SIGNAL-RETRY",
+                "SOURCE-PROCESSED-CORRELATION",
+                "SOURCE-STORAGE-ZERO",
+                "STATE-FULL-ACTION",
+                "TICKER-ALIAS-OWNER-LIMIT",
+                "TICKER-CSV-IDENTITY",
+                "TYPED-FAILURE-PUBLIC-STORAGE",
+                "USAGE-ACTION-CHOICE",
+                "USAGE-FILES-DIRECTORY",
+                "USAGE-FILES-MISSING",
+                "USAGE-FILES-NO-VALUE",
+                "USAGE-FILES-UNSUPPORTED",
+                "USAGE-FORM-MULTIPLE",
+                "USAGE-LOG-INVALID",
+                "USAGE-LOGFILE-DIRECTORY",
+                "USAGE-LOGFILE-EMPTY",
+                "USAGE-MISSING-TICKER",
+                "USAGE-MISSING-TICKER-VALUE",
+                "USAGE-OLD-FILE-OPTION",
+                "USAGE-REMOVED-INTERNAL-EMPTY",
+                "USAGE-REMOVED-INTERNAL-NONEMPTY",
+                "USAGE-UNKNOWN-OPTION",
+                "WORKSPACE-PATH-OWNER",
+                "differentbytes",
+                "differentidentity",
+                "differentticker",
+                "focused:NATIVE-DEFAULT-04",
+                "focused:NATIVE-ERROR-04",
+                "focused:NATIVE-LOG-04",
+                "focused:NATIVE-QUIET-04",
+                "focused:NATIVE-SIGINT-04",
+                "focused:XBRL-REAL-NATIVE-04",
+                "samebytes"
+              ],
+              "not_applicable": null
+            },
+            "cross_command_assertion_ids": {
+              "mandatory": 50,
+              "covered": 50,
+              "gaps": 0,
+              "obligation_ids": [
+                "wiring:BATCH-HELP",
+                "wiring:BATCH2-GENERATE",
+                "wiring:BATCH2-SCRIPT-CONSUME",
+                "wiring:BATCH3-PROCESS_FILING",
+                "wiring:BATCH3-PROCESS_MATERIAL",
+                "wiring:FILING-WIRING-0",
+                "wiring:FILING-WIRING-1",
+                "wiring:FILING-WIRING-2",
+                "wiring:HELP-FILING",
+                "wiring:HELP-PROCESS",
+                "wiring:OWNER2-CONTENT-00",
+                "wiring:OWNER2-CONTENT-01",
+                "wiring:OWNER2-CONTENT-02",
+                "wiring:OWNER2-CONTENT-03",
+                "wiring:OWNER2-CONTENT-04",
+                "wiring:OWNER2-CONTENT-05",
+                "wiring:OWNER2-CONTENT-06",
+                "wiring:OWNER2-CONTENT-07",
+                "wiring:OWNER2-CONTENT-08",
+                "wiring:OWNER2-SUP-CONTENT-csv-bad",
+                "wiring:OWNER2-SUP-CONTENT-csv-zero",
+                "wiring:OWNER2-SUP-CONTENT-docx-bad",
+                "wiring:OWNER2-SUP-CONTENT-docx-zero",
+                "wiring:OWNER2-SUP-CONTENT-htm-bad",
+                "wiring:OWNER2-SUP-CONTENT-htm-zero",
+                "wiring:OWNER2-SUP-CONTENT-html-bad",
+                "wiring:OWNER2-SUP-CONTENT-html-zero",
+                "wiring:OWNER2-SUP-CONTENT-json-bad",
+                "wiring:OWNER2-SUP-CONTENT-json-zero",
+                "wiring:OWNER2-SUP-CONTENT-md-bad",
+                "wiring:OWNER2-SUP-CONTENT-md-zero",
+                "wiring:OWNER2-SUP-CONTENT-pdf-bad",
+                "wiring:OWNER2-SUP-CONTENT-pdf-zero",
+                "wiring:OWNER2-SUP-CONTENT-pptx-bad",
+                "wiring:OWNER2-SUP-CONTENT-pptx-zero",
+                "wiring:OWNER2-SUP-CONTENT-txt-bad",
+                "wiring:OWNER2-SUP-CONTENT-txt-zero",
+                "wiring:OWNER2-SUP-CONTENT-xbrl-bad",
+                "wiring:OWNER2-SUP-CONTENT-xbrl-zero",
+                "wiring:OWNER2-SUP-CONTENT-xhtml-bad",
+                "wiring:OWNER2-SUP-CONTENT-xhtml-zero",
+                "wiring:OWNER2-SUP-CONTENT-xlsx-bad",
+                "wiring:OWNER2-SUP-CONTENT-xlsx-zero",
+                "wiring:OWNER2-SUP-CONTENT-xml-bad",
+                "wiring:OWNER2-SUP-CONTENT-xml-zero",
+                "wiring:PROCESS-CN",
+                "wiring:PROCESS-HK",
+                "wiring:PROCESS-US",
+                "wiring:ROLE-PROCESS",
+                "wiring:TRACE-ABSENCE"
+              ],
+              "not_applicable": null
+            }
+          },
+          "pairwise": {
+            "mandatory": 66,
+            "covered": 66,
+            "gaps": 0,
+            "obligation_ids": [
+              "PW-0-active--1-auto",
+              "PW-0-active--1-create",
+              "PW-0-active--1-delete",
+              "PW-0-active--1-update",
+              "PW-0-active--2-multi",
+              "PW-0-active--2-one",
+              "PW-0-active--3-amended",
+              "PW-0-active--3-plain",
+              "PW-0-active--4-overwrite",
+              "PW-0-active--4-plain",
+              "PW-0-deleted--1-auto",
+              "PW-0-deleted--1-create",
+              "PW-0-deleted--1-delete",
+              "PW-0-deleted--1-update",
+              "PW-0-deleted--2-multi",
+              "PW-0-deleted--2-one",
+              "PW-0-deleted--3-amended",
+              "PW-0-deleted--3-plain",
+              "PW-0-deleted--4-overwrite",
+              "PW-0-deleted--4-plain",
+              "PW-0-fresh--1-auto",
+              "PW-0-fresh--1-create",
+              "PW-0-fresh--1-delete",
+              "PW-0-fresh--1-update",
+              "PW-0-fresh--2-multi",
+              "PW-0-fresh--2-one",
+              "PW-0-fresh--3-amended",
+              "PW-0-fresh--3-plain",
+              "PW-0-fresh--4-overwrite",
+              "PW-0-fresh--4-plain",
+              "PW-1-auto--2-multi",
+              "PW-1-auto--2-one",
+              "PW-1-auto--3-amended",
+              "PW-1-auto--3-plain",
+              "PW-1-auto--4-overwrite",
+              "PW-1-auto--4-plain",
+              "PW-1-create--2-multi",
+              "PW-1-create--2-one",
+              "PW-1-create--3-amended",
+              "PW-1-create--3-plain",
+              "PW-1-create--4-overwrite",
+              "PW-1-create--4-plain",
+              "PW-1-delete--2-multi",
+              "PW-1-delete--2-one",
+              "PW-1-delete--3-amended",
+              "PW-1-delete--3-plain",
+              "PW-1-delete--4-overwrite",
+              "PW-1-delete--4-plain",
+              "PW-1-update--2-multi",
+              "PW-1-update--2-one",
+              "PW-1-update--3-amended",
+              "PW-1-update--3-plain",
+              "PW-1-update--4-overwrite",
+              "PW-1-update--4-plain",
+              "PW-2-multi--3-amended",
+              "PW-2-multi--3-plain",
+              "PW-2-multi--4-overwrite",
+              "PW-2-multi--4-plain",
+              "PW-2-one--3-amended",
+              "PW-2-one--3-plain",
+              "PW-2-one--4-overwrite",
+              "PW-2-one--4-plain",
+              "PW-3-amended--4-overwrite",
+              "PW-3-amended--4-plain",
+              "PW-3-plain--4-overwrite",
+              "PW-3-plain--4-plain"
+            ]
+          },
+          "inventory": {
+            "parser": {
+              "source_id": "cli802",
+              "relative_path": "parser-inventory-canonical-v2.json",
+              "bytes": 18705,
+              "sha256": "66c4444b0be4855ba17ec7f89316766bdf299cbc6a26d9c949ac3ae45a33cd16"
+            },
+            "interactive": {
+              "source_id": "cli802",
+              "relative_path": "interactive-inventory.json",
+              "bytes": 481,
+              "sha256": "2f211215e1a503e0a9e3793beb67d8342a5fd0f9560d0c9d432d2d4a9c3289ea"
+            },
+            "pairwise": {
+              "source_id": "cli802",
+              "relative_path": "pairwise-method.json",
+              "bytes": 6603,
+              "sha256": "6b9b842b78f3068d8b2e483c6dd62d32ac583ee81e6598d412294b6e0eec0205"
+            },
+            "matrices": [
+              {
+                "name": "matrix.json",
+                "matrix": {
+                  "source_id": "cli802",
+                  "relative_path": "matrix.json",
+                  "bytes": 674817,
+                  "sha256": "8578aa5125e49bbb962a10bdcbd4edf6733444ac7059942bf516ccf6b018ce1b"
+                },
+                "execution_index": {
+                  "source_id": "cli802",
+                  "relative_path": "execution-index.json",
+                  "bytes": 766649,
+                  "sha256": "35b7f9cc61e593df154d128675a2cb32b26ff893b768e857b228735760d1cb49"
+                }
+              },
+              {
+                "name": "matrix-supplement.json",
+                "matrix": {
+                  "source_id": "cli802",
+                  "relative_path": "matrix-supplement.json",
+                  "bytes": 130986,
+                  "sha256": "29c352416dda5da3c0f3b1c0f447e21bb156f9eb68730c902ea9da928739b612"
+                },
+                "execution_index": {
+                  "source_id": "cli802",
+                  "relative_path": "execution-index-supplement.json",
+                  "bytes": 144230,
+                  "sha256": "28f6bc0c3b60d5c7388c92024d5eb6f58f650fcd34636deabdcdf51c7f60220d"
+                }
+              },
+              {
+                "name": "failure-owner-matrix-v2.json",
+                "matrix": {
+                  "source_id": "cli802",
+                  "relative_path": "failure-owner-matrix-v2.json",
+                  "bytes": 26161,
+                  "sha256": "dc95dc531d80e083ba2ec4c6db9df2c6dba39884d34fa2d6139dab4d888e48ce"
+                },
+                "execution_index": {
+                  "source_id": "cli802",
+                  "relative_path": "execution-index-owner-v2.json",
+                  "bytes": 42939,
+                  "sha256": "ad2fea11bd6673c10587890657e769346e8d54171429e28dd90c798fd5d3d78d"
+                }
+              },
+              {
+                "name": "batch-wiring-matrix.json",
+                "matrix": {
+                  "source_id": "cli802",
+                  "relative_path": "batch-wiring-matrix.json",
+                  "bytes": 3716,
+                  "sha256": "b1901e42470272d7f7e7180c81332b7ce411c9a3cbba6d4f46707549690c7249"
+                },
+                "execution_index": {
+                  "source_id": "cli802",
+                  "relative_path": "execution-index-batch.json",
+                  "bytes": 6043,
+                  "sha256": "4df222ad34475e3bdcae3ca29bda843b1f78f79797be1f783754b0a522137a89"
+                }
+              },
+              {
+                "name": "batch-wiring-matrix-v2.json",
+                "matrix": {
+                  "source_id": "cli802",
+                  "relative_path": "batch-wiring-matrix-v2.json",
+                  "bytes": 3195,
+                  "sha256": "3633736436d52c8e66871ce2dd000d58a28760583d4a6783419adb79ddbdd98b"
+                },
+                "execution_index": {
+                  "source_id": "cli802",
+                  "relative_path": "execution-index-batch-v2.json",
+                  "bytes": 4879,
+                  "sha256": "5baeebc76a454f2cfd64df1e6d98ee911093998b1d755903a6680745c7096715"
+                }
+              },
+              {
+                "name": "batch-consumption-matrix.json",
+                "matrix": {
+                  "source_id": "cli802",
+                  "relative_path": "batch-consumption-matrix.json",
+                  "bytes": 1607,
+                  "sha256": "655f5c697bf369771e0e76703b60cb685dc70a3809819b6630c1d4a557ef6fac"
+                },
+                "execution_index": {
+                  "source_id": "cli802",
+                  "relative_path": "execution-index-batch-consumption.json",
+                  "bytes": 2447,
+                  "sha256": "4081796e6ee7dab2dd37cdd482647ff7566cda52c60682bbcc19b027973be295"
+                }
+              },
+              {
+                "name": "tree-retakes-matrix.json",
+                "matrix": {
+                  "source_id": "cli802",
+                  "relative_path": "tree-retakes-matrix.json",
+                  "bytes": 1920,
+                  "sha256": "5a4f8a7a660fc5b0c9bf2723f94082363f753ee3f2cb8ead51e4be95837e3f28"
+                },
+                "execution_index": {
+                  "source_id": "cli802",
+                  "relative_path": "execution-index-tree.json",
+                  "bytes": 2341,
+                  "sha256": "aa2b54acfc94da38aa72e4cd60d818b6fceecc36507228aba5b86ae236dd2ca3"
+                }
+              },
+              {
+                "name": "native-pdf-matrix.json",
+                "matrix": {
+                  "source_id": "cli802",
+                  "relative_path": "native-pdf-matrix.json",
+                  "bytes": 1159,
+                  "sha256": "a6cc22438be7a93b87e3bb430cb1daf2b325182f853d6d7e1e24b91eba0251ba"
+                },
+                "execution_index": {
+                  "source_id": "cli802",
+                  "relative_path": "execution-index-native-pdf.json",
+                  "bytes": 1226,
+                  "sha256": "62537ca887aea464c1c02008d93a4ebc5e54411bf26ee44e9e0154065ee7b0aa"
+                }
+              },
+              {
+                "name": "parser-edges-matrix.json",
+                "matrix": {
+                  "source_id": "cli802",
+                  "relative_path": "parser-edges-matrix.json",
+                  "bytes": 4098,
+                  "sha256": "c701b381ce4f964b6173e050a0e3c53e8272052956ce9b16b55ab69541213251"
+                },
+                "execution_index": {
+                  "source_id": "cli802",
+                  "relative_path": "execution-index-parser-edges.json",
+                  "bytes": 4896,
+                  "sha256": "c7565f23c28e331e09741273ed3bb4fd690e6553b1c2efda16419e8095fcd20c"
+                }
+              }
+            ]
+          },
+          "product_finding_refs": [
+            "UM-CI-N01-F01 historical violation; independently closed; original observation retained"
+          ],
+          "checks": {
+            "historical_records": "unchanged",
+            "dangling": 0,
+            "duplicate": 0,
+            "uncovered": 0,
+            "pending": 0,
+            "gaps": 0
+          },
+          "evidence_sources": [
+            {
+              "source_id": "cli802",
+              "run_id": "upload-material-cli-20261003-79977b3a-01",
+              "target": "79977b3a52f8566672e3b462f786f1004dfd3f89",
+              "report": {
+                "source_id": "cli802",
+                "relative_path": "observed-behavior.md",
+                "bytes": 20705313,
+                "sha256": "f35d33f5ff62b1e45d6f6ecf7ae1bcf7db4139f33c5b2af714e59ea0680ef53c"
+              },
+              "scan": {
+                "source_id": "cli802",
+                "relative_path": "secret-scan.json",
+                "bytes": 3613197,
+                "sha256": "0d3809860ac41e6140b8bd52e7c1e07e85f8d312082447fc9fb929a442c4ff58"
+              }
+            },
+            {
+              "source_id": "diagnostics-focused04",
+              "run_id": "upload-material-diagnostics-focused04-22eca6c3-01",
+              "registration_target": "22eca6c313005e3c5185340f2d6b535ab2583056",
+              "measured_parent": "8009ba4e100081fd1b56f64ddf5bc0c42a06e808",
+              "measured_source": [
+                {
+                  "relative_path": "dayu/runtime/process_diagnostics.py",
+                  "bytes": 21774,
+                  "sha256": "47ed4b45a44aed212fe440347488f8bd7eded30088c81a9f2f68e5ad61c12f3d"
+                },
+                {
+                  "relative_path": "dayu/runtime/log.py",
+                  "bytes": 20268,
+                  "sha256": "52ba9519fd7cc1f78fc9aad91160cc3230651e1ccbd10af800771b041b46ecef"
+                },
+                {
+                  "relative_path": "dayu/fins/pipelines/docling_process_converter.py",
+                  "bytes": 46098,
+                  "sha256": "d8847701fc17c3f825afedb3c3138dabfa03e8050961545ee227819b22075864"
+                },
+                {
+                  "relative_path": "dayu/runtime/interruptible_process.py",
+                  "bytes": 34083,
+                  "sha256": "1a1ae877d60f4a483df75dac8158d0c69821e3d28b18d45c5a63448845961e91"
+                },
+                {
+                  "relative_path": "dayu/runtime/macos_sandbox.py",
+                  "bytes": 6986,
+                  "sha256": "0794d0390706941f76d9250a02c7503aaeaaf35a08420fe27dccf5f890dd3a54"
+                }
+              ],
+              "report": {
+                "source_id": "diagnostics-focused04",
+                "relative_path": "observed-behavior.md",
+                "bytes": 39030,
+                "sha256": "17a4c08a381fb7ae18d3a6b83ae8cc582cc9b01d55ce4e2e7d59005c47cc94dc"
+              },
+              "scan": {
+                "source_id": "diagnostics-focused04",
+                "relative_path": "secret-scan.json",
+                "bytes": 6826,
+                "sha256": "d2ded979d369fb54c56ee28beb0edabfb5745607f05416d083ea49df2b47607e"
+              }
+            }
+          ],
+          "authority_digest": "fb9e676a941b583fad2651b2ef2d715fba10c9c64bf790913c653458213567ac",
+          "assignment_digest": "0802c73b5e74557e3ab20571677358adc78ac90bdb3d9cd2dc286058025037c3",
+          "focused_source_digest": "ae02f0c21bc2a6f324ea0518f9e3c7dddc4cf85027b42eb91cc51e85b259ad29"
+        }
+      },
+      "validation_result": "pass",
+      "registry_status": "ready",
+      "commands": [
+        "init",
+        "prompt",
+        "interactive",
+        "download",
+        "upload_filing",
+        "upload_material"
+      ],
+      "historical_ready_proofs": [
+        {
+          "proof_version": 5,
+          "generated_at": "2026-08-12T00:00:00Z",
+          "target_commit": "256786b255021ee429a20f22aad726b1ad33916c",
+          "registry_scope": [
+            "init",
+            "prompt",
+            "interactive",
+            "download",
+            "upload_filing"
+          ],
+          "validation_result": "ready",
+          "accepted_oracle_count": 5,
+          "superseded_oracle_count": 1,
+          "accepted_predicate_count": 105,
+          "current_accepted_oracle_refs": [
+            "cli.init.workspace-initialization@1",
+            "cli.prompt.core-execution@1",
+            "cli.interactive.core-execution@2",
+            "cli.download.document-acquisition@1",
+            "cli.upload_filing.document-publication@1"
+          ],
+          "reference_validation": {
+            "missing_exact_oracle_refs": 0,
+            "unresolved_current_oracles": 0,
+            "unresolved_predicates": 0,
+            "unresolved_evidence_gaps": 0,
+            "unresolved_user_adjudications": 0,
+            "uncovered_correctness_surfaces": 0,
+            "dangling_local_report_refs": 0,
+            "local_report_digest_mismatches": 0
+          },
+          "latest_user_adjudication_identities": [
+            "cli.init.workspace-initialization@1:user-adjudication:2026-07-30",
+            "cli.prompt.core-execution@1:user-adjudication:2026-08-02",
+            "cli.interactive.core-execution@2:user-adjudication:2026-08-09",
+            "interactive.interactive.g06.summary-null@1:user-adjudication:2026-08-09",
+            "cli.download.document-acquisition@1:user-adjudication:2026-08-10",
+            "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12"
+          ],
+          "scenario_registry_digest_basis": "9de64adb659ee0027b52d803e011dbce473dbfee3a8ee3d4441862b464ae94b1",
+          "registry_digest_basis": "b99a73399013f4b6bf99bdc17678ac69b4be6101fc45b220b10b8ab7767422c0"
+        }
+      ]
+    },
+    "scenarios": {
+      "proof_version": 6,
+      "target_commit": "22eca6c313005e3c5185340f2d6b535ab2583056",
+      "registry_digest_basis": {
+        "oracles": "5fc1925a1c258647b159c017ec5ed6da0b863623a2793001a64065f72dba1575",
+        "scenarios": "195c66192a3b2c99bbb2c0e15c058f74b3ffdd10aefadb082923208c1bc71744"
+      },
+      "campaigns": {
+        "upload_material": {
+          "registration_target": "22eca6c313005e3c5185340f2d6b535ab2583056",
+          "counts": {
+            "source_cli802": 802,
+            "source_focused": 6,
+            "new_formal_scenarios": 799,
+            "new_oracles": 1,
+            "new_predicates": 19,
+            "excluded": 9
+          },
+          "matrix_counts": {
+            "matrix.json": 631,
+            "matrix-supplement.json": 118,
+            "failure-owner-matrix-v2.json": 35,
+            "batch-wiring-matrix.json": 5,
+            "batch-wiring-matrix-v2.json": 4,
+            "batch-consumption-matrix.json": 2,
+            "tree-retakes-matrix.json": 2,
+            "native-pdf-matrix.json": 1,
+            "parser-edges-matrix.json": 4
+          },
+          "classes": {
+            "authority-mapped": 733,
+            "objective-parser-evidence": 5,
+            "supporting-wiring-evidence": 15,
+            "diagnostic-no-removed-file-credit": 1,
+            "diagnostic-no-alias-cap-credit": 2,
+            "current-design-regression-only": 4,
+            "supporting-owner-evidence": 35,
+            "diagnostic-no-positive-credit": 6,
+            "historical-conversion-publication-only": 1,
+            "focused-actual-measurement": 6
+          },
+          "actual_Service_terminal_classes": {
+            "failure": 32,
+            "success": 3
+          },
+          "coverage_dimensions": {
+            "command_parameter_ids": {
+              "mandatory": 35,
+              "covered": 35,
+              "gaps": 0,
+              "obligation_ids": [
+                "command:process_filing",
+                "command:process_material",
+                "command:service.upload_material",
+                "command:sh",
+                "command:tool_trace analyze",
+                "command:upload_filing",
+                "command:upload_filings_from",
+                "command:upload_material",
+                "parameter:--action",
+                "parameter:--amended",
+                "parameter:--base",
+                "parameter:--company-name",
+                "parameter:--critical",
+                "parameter:--debug",
+                "parameter:--debug-stream",
+                "parameter:--document-id",
+                "parameter:--error",
+                "parameter:--files",
+                "parameter:--filing-date",
+                "parameter:--fiscal-period",
+                "parameter:--fiscal-year",
+                "parameter:--forms",
+                "parameter:--help",
+                "parameter:--info",
+                "parameter:--log-file",
+                "parameter:--log-level",
+                "parameter:--material-name",
+                "parameter:--overwrite",
+                "parameter:--primary",
+                "parameter:--quiet",
+                "parameter:--report-date",
+                "parameter:--ticker",
+                "parameter:--verbose",
+                "parameter:--warn",
+                "parameter:--warning"
+              ],
+              "not_applicable": null
+            },
+            "precondition_state_ids": {
+              "mandatory": 61,
+              "covered": 61,
+              "gaps": 0,
+              "obligation_ids": [
+                "state:active",
+                "state:active-company",
+                "state:active-role",
+                "state:active-samebytes",
+                "state:actual-published",
+                "state:chain:STATE-CN-create-deleted",
+                "state:chain:STATE-CN-create-existing-different",
+                "state:chain:STATE-CN-create-existing-same",
+                "state:chain:STATE-CN-create-overwrite",
+                "state:chain:STATE-CN-delete",
+                "state:chain:STATE-CN-delete-again",
+                "state:chain:STATE-CN-differentbytes",
+                "state:chain:STATE-CN-fresh-auto",
+                "state:chain:STATE-CN-repeat-delete",
+                "state:chain:STATE-CN-restore-auto",
+                "state:chain:STATE-CN-same-amended",
+                "state:chain:STATE-CN-same-overwrite",
+                "state:chain:STATE-CN-samebytes",
+                "state:chain:STATE-CN-update-same",
+                "state:chain:STATE-HK-create-deleted",
+                "state:chain:STATE-HK-create-existing-different",
+                "state:chain:STATE-HK-create-existing-same",
+                "state:chain:STATE-HK-create-overwrite",
+                "state:chain:STATE-HK-delete",
+                "state:chain:STATE-HK-delete-again",
+                "state:chain:STATE-HK-differentbytes",
+                "state:chain:STATE-HK-fresh-auto",
+                "state:chain:STATE-HK-repeat-delete",
+                "state:chain:STATE-HK-restore-auto",
+                "state:chain:STATE-HK-same-amended",
+                "state:chain:STATE-HK-same-overwrite",
+                "state:chain:STATE-HK-samebytes",
+                "state:chain:STATE-HK-update-same",
+                "state:chain:STATE-US-create-deleted",
+                "state:chain:STATE-US-create-existing-different",
+                "state:chain:STATE-US-create-existing-same",
+                "state:chain:STATE-US-create-overwrite",
+                "state:chain:STATE-US-delete",
+                "state:chain:STATE-US-delete-again",
+                "state:chain:STATE-US-differentbytes",
+                "state:chain:STATE-US-fresh-auto",
+                "state:chain:STATE-US-repeat-delete",
+                "state:chain:STATE-US-restore-auto",
+                "state:chain:STATE-US-same-amended",
+                "state:chain:STATE-US-same-overwrite",
+                "state:chain:STATE-US-samebytes",
+                "state:chain:STATE-US-update-same",
+                "state:deleted",
+                "state:explicit-repair",
+                "state:explicit-unsafe",
+                "state:fresh",
+                "state:fresh-pair",
+                "state:generated-script",
+                "state:independent-fresh",
+                "state:missing",
+                "state:other-company-active",
+                "state:post-signal",
+                "state:processed-A-preserved",
+                "state:role-changed",
+                "state:uploaded-chain",
+                "state:uploaded-processed"
+              ],
+              "not_applicable": null
+            },
+            "interactive_branch_option_ids": {
+              "mandatory": 0,
+              "covered": 0,
+              "gaps": 0,
+              "obligation_ids": [],
+              "not_applicable": "direct CLI has no interactive branches"
+            },
+            "input_class_ids": {
+              "mandatory": 166,
+              "covered": 166,
+              "gaps": 0,
+              "obligation_ids": [
+                "input:PTY-cancel-descendant-tree",
+                "input:PTY-external-kill-descendant-tree",
+                "input:Unicode-codepoints",
+                "input:absent",
+                "input:absent-files",
+                "input:activexautoxmultixplainxplain",
+                "input:activexcreatexonexplainxplain",
+                "input:activexdeletexmultixamendedxplain",
+                "input:activexupdatexonexplainxoverwrite",
+                "input:actual-help",
+                "input:actual-script-execution",
+                "input:actual-signal",
+                "input:alias-count-boundary",
+                "input:append-chain",
+                "input:backslash-name",
+                "input:blank-company",
+                "input:casefold",
+                "input:casefold-derived-reverse",
+                "input:casefold-original-derived",
+                "input:casefold-reverse",
+                "input:company-seed",
+                "input:concurrent-differentbytes",
+                "input:concurrent-differentidentity",
+                "input:concurrent-differentticker",
+                "input:concurrent-samebytes",
+                "input:conflicting-alias",
+                "input:content-boundary",
+                "input:control-meta",
+                "input:controlled-XBRL-instance",
+                "input:count-boundary",
+                "input:create-deleted",
+                "input:create-existing-different",
+                "input:create-existing-same",
+                "input:create-overwrite",
+                "input:csv-bad",
+                "input:csv-zero",
+                "input:current-run-json-primary-reverse",
+                "input:default-cwd",
+                "input:default-info",
+                "input:delete",
+                "input:delete-again",
+                "input:delete-forbidden-input",
+                "input:deletedxautoxonexamendedxoverwrite",
+                "input:deletedxcreatexmultixplainxplain",
+                "input:deletedxdeletexonexplainxplain",
+                "input:deletedxupdatexonexplainxplain",
+                "input:differentbytes",
+                "input:direct-stream",
+                "input:docx-bad",
+                "input:docx-zero",
+                "input:duplicate-basename",
+                "input:duplicate-path",
+                "input:empty",
+                "input:empty-file-value",
+                "input:exact-primary",
+                "input:failed-B",
+                "input:fresh-auto",
+                "input:freshxautoxonexplainxplain",
+                "input:freshxcreatexmultixamendedxoverwrite",
+                "input:freshxdeletexonexplainxoverwrite",
+                "input:freshxupdatexmultixamendedxplain",
+                "input:help",
+                "input:htm-bad",
+                "input:htm-zero",
+                "input:html-bad",
+                "input:html-zero",
+                "input:identity-control",
+                "input:isolated-usage",
+                "input:isolated-valid-other-inputs",
+                "input:json-bad",
+                "input:json-zero",
+                "input:long-derivative-name",
+                "input:long-near-filesystem",
+                "input:md-bad",
+                "input:md-zero",
+                "input:meta-uppercase",
+                "input:native-PDF",
+                "input:native-complete-public-financial-PDF",
+                "input:newline-name",
+                "input:nfc-name-collision",
+                "input:no-company-name",
+                "input:omitted-name",
+                "input:ordered-two-selectors",
+                "input:original-derived-forward",
+                "input:original-derived-reverse",
+                "input:owned-corruption",
+                "input:pdf-bad",
+                "input:pdf-zero",
+                "input:period-domain",
+                "input:piped-stdin",
+                "input:pptx-bad",
+                "input:pptx-zero",
+                "input:primary-invalid-first",
+                "input:primary-invalid-last",
+                "input:primary-repeated-two-distinct",
+                "input:public-analyzer",
+                "input:public-id-assertion",
+                "input:real-two-source-plan",
+                "input:repeat-booleans",
+                "input:repeat-delete",
+                "input:repeat-list-action",
+                "input:repeat-scalar-last",
+                "input:restore-auto",
+                "input:retry",
+                "input:root-leaf-ordered-selector-conflict",
+                "input:root-leaf-quiet-stream-conflict",
+                "input:root-selector-location",
+                "input:root-workspace-alias",
+                "input:same-amended",
+                "input:same-input-public-Service-consumption",
+                "input:same-overwrite",
+                "input:same-stem-forward",
+                "input:same-stem-reverse",
+                "input:samebytes",
+                "input:samebytes-role",
+                "input:seed",
+                "input:seed-delete",
+                "input:selector-stream-conflict",
+                "input:separate-exact-ID-process",
+                "input:separate-process",
+                "input:shared-owner-filing",
+                "input:signal-on-B",
+                "input:strict-calendar",
+                "input:supported-csv",
+                "input:supported-docx",
+                "input:supported-htm",
+                "input:supported-html",
+                "input:supported-json",
+                "input:supported-md",
+                "input:supported-pdf",
+                "input:supported-pptx",
+                "input:supported-txt",
+                "input:supported-xbrl",
+                "input:supported-xhtml",
+                "input:supported-xlsx",
+                "input:supported-xml",
+                "input:target-state",
+                "input:ticker-csv",
+                "input:trim-filename",
+                "input:txt-bad",
+                "input:txt-zero",
+                "input:unicode-normalization",
+                "input:unicode-reverse",
+                "input:update-deleted",
+                "input:update-same",
+                "input:valid-form",
+                "input:valid-native-derived-txt",
+                "input:valid-seed",
+                "input:whitespace",
+                "input:workspace-alias",
+                "input:workspace-file",
+                "input:workspace-relative",
+                "input:workspace-symlink",
+                "input:workspace-unicode",
+                "input:xbrl-bad",
+                "input:xbrl-zero",
+                "input:xhtml-bad",
+                "input:xhtml-zero",
+                "input:xlsx-bad",
+                "input:xlsx-zero",
+                "input:xml-bad",
+                "input:xml-zero",
+                "input:year-domain",
+                "input:year-period",
+                "input:year-period-dates",
+                "input:year-whitespace-period"
+              ],
+              "not_applicable": null
+            },
+            "combination_high_risk_ids": {
+              "mandatory": 217,
+              "covered": 217,
+              "gaps": 0,
+              "obligation_ids": [
+                "--action",
+                "--base",
+                "--company-name",
+                "--document-id",
+                "--files",
+                "--filing-date",
+                "--fiscal-period",
+                "--fiscal-year",
+                "--forms",
+                "--log-file",
+                "--material-name",
+                "--report-date",
+                "--ticker",
+                "--workspace",
+                "-b",
+                "A-RETAINED",
+                "ACTION-FILES-ADMISSION",
+                "ALIAS-CONFLICT",
+                "ALL-SUFFIX-NEGATIVE-CONTENT",
+                "APPEND-EXACT-PREFIX",
+                "CANCEL-A-RETAINED",
+                "CHILD-PYTHON-OWN-VENV",
+                "CONCURRENT-REAL-OVERLAP",
+                "CONDITIONAL-COMPANY-NAME",
+                "DATE-INDEPENDENT-STRICT",
+                "DEBUG-STREAM-DEFAULT",
+                "DEBUG-STREAM-ORTHOGONAL",
+                "DEFAULT-CWD-WORKSPACE",
+                "DELETE-BEFORE-PATH-ACCESS",
+                "DIRECT-HOST-ABSENCE",
+                "DIRECT-NO-SSE",
+                "DIRECT-NONINTERACTIVE",
+                "DOCID-ASSERTION",
+                "EXTERNAL-KILL-DESCENDANT-PROCESS-PROOF",
+                "FAILURE-PARTIAL-COMPANY-DOCUMENT",
+                "FILE-COUNT-OWNER-LIMIT",
+                "FIVE-FIELD-PUBLIC-OWNER",
+                "FIVE-FIELD-TYPED-FAILURE",
+                "FORM-SHARED-NORMALIZATION",
+                "FORMAT-13-ACTUAL-DOCLING",
+                "FULL-ASSET-NAME-PLAN",
+                "FULL-PDF-ACTUAL-CONVERSION",
+                "FY-INDEPENDENT-OPTIONAL-DOMAIN",
+                "GENERATED-SCRIPT-CONSUMPTION",
+                "GLOBAL-ASSET-PLAN-ORDER-INDEPENDENT",
+                "INDEPENDENT-OPERATION-NOT-CLI",
+                "INTEGRITY-ALL-ACTIONS",
+                "INTEGRITY-PRECONDITION",
+                "LEXICAL-ARGV",
+                "LOG-256-ORDERED-CONFLICTS",
+                "LOG-32-PRIMARY",
+                "LOG-E00",
+                "LOG-E01",
+                "LOG-E02",
+                "LOG-E03",
+                "LOG-E04",
+                "LOG-E05",
+                "LOG-E06",
+                "LOG-E07",
+                "LOG-E08",
+                "LOG-E09",
+                "LOG-E10",
+                "LOG-E11",
+                "LOG-E12",
+                "LOG-E13",
+                "LOG-E14",
+                "LOG-E15",
+                "MARKET-SHARED-OWNER",
+                "MATERIAL-NAME-FORM-GENERATED",
+                "MISSING-NO-UPSERT",
+                "NAME-240-NO-NFC-NO-TRUNCATION",
+                "NATIVE-FINANCIAL-SOURCE",
+                "OPTION-INDEPENDENCE-AND-REPETITION",
+                "ORDER-NOT-PRIMARY",
+                "OWNED-BOUNDARY-FIXTURE",
+                "PAIRWISE-PRECONDITION",
+                "PAIRWISE-STATE-OPTION-INPUT",
+                "PARSER-ABBREVIATION-AND-REMOVED-INPUT",
+                "PARSER-HELP",
+                "PER-DOCUMENT-REGISTRATION",
+                "PERIOD-ALL-INDEPENDENT-OPTIONAL",
+                "PRIMARY-CROSS-CONSUMPTION",
+                "PRIMARY-FULL-CONTRACT",
+                "PRIMARY-INPUT-ORDER",
+                "PRINT-VS-LOG",
+                "PROCESS-INDEPENDENT-COMMAND",
+                "PUBLIC-REPOSITORY-ID-CONSUMPTION",
+                "PW-0-active--1-auto",
+                "PW-0-active--1-create",
+                "PW-0-active--1-delete",
+                "PW-0-active--1-update",
+                "PW-0-active--2-multi",
+                "PW-0-active--2-one",
+                "PW-0-active--3-amended",
+                "PW-0-active--3-plain",
+                "PW-0-active--4-overwrite",
+                "PW-0-active--4-plain",
+                "PW-0-deleted--1-auto",
+                "PW-0-deleted--1-create",
+                "PW-0-deleted--1-delete",
+                "PW-0-deleted--1-update",
+                "PW-0-deleted--2-multi",
+                "PW-0-deleted--2-one",
+                "PW-0-deleted--3-amended",
+                "PW-0-deleted--3-plain",
+                "PW-0-deleted--4-overwrite",
+                "PW-0-deleted--4-plain",
+                "PW-0-fresh--1-auto",
+                "PW-0-fresh--1-create",
+                "PW-0-fresh--1-delete",
+                "PW-0-fresh--1-update",
+                "PW-0-fresh--2-multi",
+                "PW-0-fresh--2-one",
+                "PW-0-fresh--3-amended",
+                "PW-0-fresh--3-plain",
+                "PW-0-fresh--4-overwrite",
+                "PW-0-fresh--4-plain",
+                "PW-1-auto--2-multi",
+                "PW-1-auto--2-one",
+                "PW-1-auto--3-amended",
+                "PW-1-auto--3-plain",
+                "PW-1-auto--4-overwrite",
+                "PW-1-auto--4-plain",
+                "PW-1-create--2-multi",
+                "PW-1-create--2-one",
+                "PW-1-create--3-amended",
+                "PW-1-create--3-plain",
+                "PW-1-create--4-overwrite",
+                "PW-1-create--4-plain",
+                "PW-1-delete--2-multi",
+                "PW-1-delete--2-one",
+                "PW-1-delete--3-amended",
+                "PW-1-delete--3-plain",
+                "PW-1-delete--4-overwrite",
+                "PW-1-delete--4-plain",
+                "PW-1-update--2-multi",
+                "PW-1-update--2-one",
+                "PW-1-update--3-amended",
+                "PW-1-update--3-plain",
+                "PW-1-update--4-overwrite",
+                "PW-1-update--4-plain",
+                "PW-2-multi--3-amended",
+                "PW-2-multi--3-plain",
+                "PW-2-multi--4-overwrite",
+                "PW-2-multi--4-plain",
+                "PW-2-one--3-amended",
+                "PW-2-one--3-plain",
+                "PW-2-one--4-overwrite",
+                "PW-2-one--4-plain",
+                "PW-3-amended--4-overwrite",
+                "PW-3-amended--4-plain",
+                "PW-3-plain--4-overwrite",
+                "PW-3-plain--4-plain",
+                "QUIET-STREAM-TWO-ORDERS",
+                "RAW-DOCLING-JSON-PRIMARY",
+                "REPEAT-ACTION",
+                "REPEATED-SCALAR-LAST",
+                "REQUIRED-ALL-ACTIONS",
+                "ROLE-FINGERPRINT",
+                "ROOT-LEAF-MERGE-CONFLICT",
+                "ROOT-LOG-E00",
+                "ROOT-LOG-E01",
+                "ROOT-LOG-E02",
+                "ROOT-LOG-E03",
+                "ROOT-LOG-E04",
+                "ROOT-LOG-E05",
+                "ROOT-LOG-E06",
+                "ROOT-LOG-E07",
+                "ROOT-LOG-E08",
+                "ROOT-LOG-E09",
+                "ROOT-LOG-E10",
+                "ROOT-LOG-E11",
+                "ROOT-LOG-E12",
+                "ROOT-LOG-E13",
+                "ROOT-LOG-E14",
+                "ROOT-LOG-E15",
+                "ROOT-PARSER-OPTION",
+                "ROOT-PRIMARY-REAL",
+                "ROOT-QUIET-STREAM-TWO-ORDERS",
+                "SHARED-BATCH-WIRING",
+                "SHARED-WIRING-REGRESSION",
+                "SIGINT-GRACEFUL",
+                "SIGKILL-EXTERNAL",
+                "SIGNAL-DESCENDANT-PROCESS-PROOF",
+                "SIGNAL-RETRY",
+                "SOURCE-PROCESSED-CORRELATION",
+                "SOURCE-STORAGE-ZERO",
+                "STATE-FULL-ACTION",
+                "TICKER-ALIAS-OWNER-LIMIT",
+                "TICKER-CSV-IDENTITY",
+                "TYPED-FAILURE-PUBLIC-STORAGE",
+                "USAGE-ACTION-CHOICE",
+                "USAGE-FILES-DIRECTORY",
+                "USAGE-FILES-MISSING",
+                "USAGE-FILES-NO-VALUE",
+                "USAGE-FILES-UNSUPPORTED",
+                "USAGE-FORM-MULTIPLE",
+                "USAGE-LOG-INVALID",
+                "USAGE-LOGFILE-DIRECTORY",
+                "USAGE-LOGFILE-EMPTY",
+                "USAGE-MISSING-TICKER",
+                "USAGE-MISSING-TICKER-VALUE",
+                "USAGE-OLD-FILE-OPTION",
+                "USAGE-REMOVED-INTERNAL-EMPTY",
+                "USAGE-REMOVED-INTERNAL-NONEMPTY",
+                "USAGE-UNKNOWN-OPTION",
+                "WORKSPACE-PATH-OWNER",
+                "differentbytes",
+                "differentidentity",
+                "differentticker",
+                "focused:NATIVE-DEFAULT-04",
+                "focused:NATIVE-ERROR-04",
+                "focused:NATIVE-LOG-04",
+                "focused:NATIVE-QUIET-04",
+                "focused:NATIVE-SIGINT-04",
+                "focused:XBRL-REAL-NATIVE-04",
+                "samebytes"
+              ],
+              "not_applicable": null
+            },
+            "cross_command_assertion_ids": {
+              "mandatory": 50,
+              "covered": 50,
+              "gaps": 0,
+              "obligation_ids": [
+                "wiring:BATCH-HELP",
+                "wiring:BATCH2-GENERATE",
+                "wiring:BATCH2-SCRIPT-CONSUME",
+                "wiring:BATCH3-PROCESS_FILING",
+                "wiring:BATCH3-PROCESS_MATERIAL",
+                "wiring:FILING-WIRING-0",
+                "wiring:FILING-WIRING-1",
+                "wiring:FILING-WIRING-2",
+                "wiring:HELP-FILING",
+                "wiring:HELP-PROCESS",
+                "wiring:OWNER2-CONTENT-00",
+                "wiring:OWNER2-CONTENT-01",
+                "wiring:OWNER2-CONTENT-02",
+                "wiring:OWNER2-CONTENT-03",
+                "wiring:OWNER2-CONTENT-04",
+                "wiring:OWNER2-CONTENT-05",
+                "wiring:OWNER2-CONTENT-06",
+                "wiring:OWNER2-CONTENT-07",
+                "wiring:OWNER2-CONTENT-08",
+                "wiring:OWNER2-SUP-CONTENT-csv-bad",
+                "wiring:OWNER2-SUP-CONTENT-csv-zero",
+                "wiring:OWNER2-SUP-CONTENT-docx-bad",
+                "wiring:OWNER2-SUP-CONTENT-docx-zero",
+                "wiring:OWNER2-SUP-CONTENT-htm-bad",
+                "wiring:OWNER2-SUP-CONTENT-htm-zero",
+                "wiring:OWNER2-SUP-CONTENT-html-bad",
+                "wiring:OWNER2-SUP-CONTENT-html-zero",
+                "wiring:OWNER2-SUP-CONTENT-json-bad",
+                "wiring:OWNER2-SUP-CONTENT-json-zero",
+                "wiring:OWNER2-SUP-CONTENT-md-bad",
+                "wiring:OWNER2-SUP-CONTENT-md-zero",
+                "wiring:OWNER2-SUP-CONTENT-pdf-bad",
+                "wiring:OWNER2-SUP-CONTENT-pdf-zero",
+                "wiring:OWNER2-SUP-CONTENT-pptx-bad",
+                "wiring:OWNER2-SUP-CONTENT-pptx-zero",
+                "wiring:OWNER2-SUP-CONTENT-txt-bad",
+                "wiring:OWNER2-SUP-CONTENT-txt-zero",
+                "wiring:OWNER2-SUP-CONTENT-xbrl-bad",
+                "wiring:OWNER2-SUP-CONTENT-xbrl-zero",
+                "wiring:OWNER2-SUP-CONTENT-xhtml-bad",
+                "wiring:OWNER2-SUP-CONTENT-xhtml-zero",
+                "wiring:OWNER2-SUP-CONTENT-xlsx-bad",
+                "wiring:OWNER2-SUP-CONTENT-xlsx-zero",
+                "wiring:OWNER2-SUP-CONTENT-xml-bad",
+                "wiring:OWNER2-SUP-CONTENT-xml-zero",
+                "wiring:PROCESS-CN",
+                "wiring:PROCESS-HK",
+                "wiring:PROCESS-US",
+                "wiring:ROLE-PROCESS",
+                "wiring:TRACE-ABSENCE"
+              ],
+              "not_applicable": null
+            }
+          },
+          "pairwise": {
+            "mandatory": 66,
+            "covered": 66,
+            "gaps": 0,
+            "obligation_ids": [
+              "PW-0-active--1-auto",
+              "PW-0-active--1-create",
+              "PW-0-active--1-delete",
+              "PW-0-active--1-update",
+              "PW-0-active--2-multi",
+              "PW-0-active--2-one",
+              "PW-0-active--3-amended",
+              "PW-0-active--3-plain",
+              "PW-0-active--4-overwrite",
+              "PW-0-active--4-plain",
+              "PW-0-deleted--1-auto",
+              "PW-0-deleted--1-create",
+              "PW-0-deleted--1-delete",
+              "PW-0-deleted--1-update",
+              "PW-0-deleted--2-multi",
+              "PW-0-deleted--2-one",
+              "PW-0-deleted--3-amended",
+              "PW-0-deleted--3-plain",
+              "PW-0-deleted--4-overwrite",
+              "PW-0-deleted--4-plain",
+              "PW-0-fresh--1-auto",
+              "PW-0-fresh--1-create",
+              "PW-0-fresh--1-delete",
+              "PW-0-fresh--1-update",
+              "PW-0-fresh--2-multi",
+              "PW-0-fresh--2-one",
+              "PW-0-fresh--3-amended",
+              "PW-0-fresh--3-plain",
+              "PW-0-fresh--4-overwrite",
+              "PW-0-fresh--4-plain",
+              "PW-1-auto--2-multi",
+              "PW-1-auto--2-one",
+              "PW-1-auto--3-amended",
+              "PW-1-auto--3-plain",
+              "PW-1-auto--4-overwrite",
+              "PW-1-auto--4-plain",
+              "PW-1-create--2-multi",
+              "PW-1-create--2-one",
+              "PW-1-create--3-amended",
+              "PW-1-create--3-plain",
+              "PW-1-create--4-overwrite",
+              "PW-1-create--4-plain",
+              "PW-1-delete--2-multi",
+              "PW-1-delete--2-one",
+              "PW-1-delete--3-amended",
+              "PW-1-delete--3-plain",
+              "PW-1-delete--4-overwrite",
+              "PW-1-delete--4-plain",
+              "PW-1-update--2-multi",
+              "PW-1-update--2-one",
+              "PW-1-update--3-amended",
+              "PW-1-update--3-plain",
+              "PW-1-update--4-overwrite",
+              "PW-1-update--4-plain",
+              "PW-2-multi--3-amended",
+              "PW-2-multi--3-plain",
+              "PW-2-multi--4-overwrite",
+              "PW-2-multi--4-plain",
+              "PW-2-one--3-amended",
+              "PW-2-one--3-plain",
+              "PW-2-one--4-overwrite",
+              "PW-2-one--4-plain",
+              "PW-3-amended--4-overwrite",
+              "PW-3-amended--4-plain",
+              "PW-3-plain--4-overwrite",
+              "PW-3-plain--4-plain"
+            ]
+          },
+          "inventory": {
+            "parser": {
+              "source_id": "cli802",
+              "relative_path": "parser-inventory-canonical-v2.json",
+              "bytes": 18705,
+              "sha256": "66c4444b0be4855ba17ec7f89316766bdf299cbc6a26d9c949ac3ae45a33cd16"
+            },
+            "interactive": {
+              "source_id": "cli802",
+              "relative_path": "interactive-inventory.json",
+              "bytes": 481,
+              "sha256": "2f211215e1a503e0a9e3793beb67d8342a5fd0f9560d0c9d432d2d4a9c3289ea"
+            },
+            "pairwise": {
+              "source_id": "cli802",
+              "relative_path": "pairwise-method.json",
+              "bytes": 6603,
+              "sha256": "6b9b842b78f3068d8b2e483c6dd62d32ac583ee81e6598d412294b6e0eec0205"
+            },
+            "matrices": [
+              {
+                "name": "matrix.json",
+                "matrix": {
+                  "source_id": "cli802",
+                  "relative_path": "matrix.json",
+                  "bytes": 674817,
+                  "sha256": "8578aa5125e49bbb962a10bdcbd4edf6733444ac7059942bf516ccf6b018ce1b"
+                },
+                "execution_index": {
+                  "source_id": "cli802",
+                  "relative_path": "execution-index.json",
+                  "bytes": 766649,
+                  "sha256": "35b7f9cc61e593df154d128675a2cb32b26ff893b768e857b228735760d1cb49"
+                }
+              },
+              {
+                "name": "matrix-supplement.json",
+                "matrix": {
+                  "source_id": "cli802",
+                  "relative_path": "matrix-supplement.json",
+                  "bytes": 130986,
+                  "sha256": "29c352416dda5da3c0f3b1c0f447e21bb156f9eb68730c902ea9da928739b612"
+                },
+                "execution_index": {
+                  "source_id": "cli802",
+                  "relative_path": "execution-index-supplement.json",
+                  "bytes": 144230,
+                  "sha256": "28f6bc0c3b60d5c7388c92024d5eb6f58f650fcd34636deabdcdf51c7f60220d"
+                }
+              },
+              {
+                "name": "failure-owner-matrix-v2.json",
+                "matrix": {
+                  "source_id": "cli802",
+                  "relative_path": "failure-owner-matrix-v2.json",
+                  "bytes": 26161,
+                  "sha256": "dc95dc531d80e083ba2ec4c6db9df2c6dba39884d34fa2d6139dab4d888e48ce"
+                },
+                "execution_index": {
+                  "source_id": "cli802",
+                  "relative_path": "execution-index-owner-v2.json",
+                  "bytes": 42939,
+                  "sha256": "ad2fea11bd6673c10587890657e769346e8d54171429e28dd90c798fd5d3d78d"
+                }
+              },
+              {
+                "name": "batch-wiring-matrix.json",
+                "matrix": {
+                  "source_id": "cli802",
+                  "relative_path": "batch-wiring-matrix.json",
+                  "bytes": 3716,
+                  "sha256": "b1901e42470272d7f7e7180c81332b7ce411c9a3cbba6d4f46707549690c7249"
+                },
+                "execution_index": {
+                  "source_id": "cli802",
+                  "relative_path": "execution-index-batch.json",
+                  "bytes": 6043,
+                  "sha256": "4df222ad34475e3bdcae3ca29bda843b1f78f79797be1f783754b0a522137a89"
+                }
+              },
+              {
+                "name": "batch-wiring-matrix-v2.json",
+                "matrix": {
+                  "source_id": "cli802",
+                  "relative_path": "batch-wiring-matrix-v2.json",
+                  "bytes": 3195,
+                  "sha256": "3633736436d52c8e66871ce2dd000d58a28760583d4a6783419adb79ddbdd98b"
+                },
+                "execution_index": {
+                  "source_id": "cli802",
+                  "relative_path": "execution-index-batch-v2.json",
+                  "bytes": 4879,
+                  "sha256": "5baeebc76a454f2cfd64df1e6d98ee911093998b1d755903a6680745c7096715"
+                }
+              },
+              {
+                "name": "batch-consumption-matrix.json",
+                "matrix": {
+                  "source_id": "cli802",
+                  "relative_path": "batch-consumption-matrix.json",
+                  "bytes": 1607,
+                  "sha256": "655f5c697bf369771e0e76703b60cb685dc70a3809819b6630c1d4a557ef6fac"
+                },
+                "execution_index": {
+                  "source_id": "cli802",
+                  "relative_path": "execution-index-batch-consumption.json",
+                  "bytes": 2447,
+                  "sha256": "4081796e6ee7dab2dd37cdd482647ff7566cda52c60682bbcc19b027973be295"
+                }
+              },
+              {
+                "name": "tree-retakes-matrix.json",
+                "matrix": {
+                  "source_id": "cli802",
+                  "relative_path": "tree-retakes-matrix.json",
+                  "bytes": 1920,
+                  "sha256": "5a4f8a7a660fc5b0c9bf2723f94082363f753ee3f2cb8ead51e4be95837e3f28"
+                },
+                "execution_index": {
+                  "source_id": "cli802",
+                  "relative_path": "execution-index-tree.json",
+                  "bytes": 2341,
+                  "sha256": "aa2b54acfc94da38aa72e4cd60d818b6fceecc36507228aba5b86ae236dd2ca3"
+                }
+              },
+              {
+                "name": "native-pdf-matrix.json",
+                "matrix": {
+                  "source_id": "cli802",
+                  "relative_path": "native-pdf-matrix.json",
+                  "bytes": 1159,
+                  "sha256": "a6cc22438be7a93b87e3bb430cb1daf2b325182f853d6d7e1e24b91eba0251ba"
+                },
+                "execution_index": {
+                  "source_id": "cli802",
+                  "relative_path": "execution-index-native-pdf.json",
+                  "bytes": 1226,
+                  "sha256": "62537ca887aea464c1c02008d93a4ebc5e54411bf26ee44e9e0154065ee7b0aa"
+                }
+              },
+              {
+                "name": "parser-edges-matrix.json",
+                "matrix": {
+                  "source_id": "cli802",
+                  "relative_path": "parser-edges-matrix.json",
+                  "bytes": 4098,
+                  "sha256": "c701b381ce4f964b6173e050a0e3c53e8272052956ce9b16b55ab69541213251"
+                },
+                "execution_index": {
+                  "source_id": "cli802",
+                  "relative_path": "execution-index-parser-edges.json",
+                  "bytes": 4896,
+                  "sha256": "c7565f23c28e331e09741273ed3bb4fd690e6553b1c2efda16419e8095fcd20c"
+                }
+              }
+            ]
+          },
+          "product_finding_refs": [
+            "UM-CI-N01-F01 historical violation; independently closed; original observation retained"
+          ],
+          "checks": {
+            "historical_records": "unchanged",
+            "dangling": 0,
+            "duplicate": 0,
+            "uncovered": 0,
+            "pending": 0,
+            "gaps": 0
+          },
+          "evidence_sources": [
+            {
+              "source_id": "cli802",
+              "run_id": "upload-material-cli-20261003-79977b3a-01",
+              "target": "79977b3a52f8566672e3b462f786f1004dfd3f89",
+              "report": {
+                "source_id": "cli802",
+                "relative_path": "observed-behavior.md",
+                "bytes": 20705313,
+                "sha256": "f35d33f5ff62b1e45d6f6ecf7ae1bcf7db4139f33c5b2af714e59ea0680ef53c"
+              },
+              "scan": {
+                "source_id": "cli802",
+                "relative_path": "secret-scan.json",
+                "bytes": 3613197,
+                "sha256": "0d3809860ac41e6140b8bd52e7c1e07e85f8d312082447fc9fb929a442c4ff58"
+              }
+            },
+            {
+              "source_id": "diagnostics-focused04",
+              "run_id": "upload-material-diagnostics-focused04-22eca6c3-01",
+              "registration_target": "22eca6c313005e3c5185340f2d6b535ab2583056",
+              "measured_parent": "8009ba4e100081fd1b56f64ddf5bc0c42a06e808",
+              "measured_source": [
+                {
+                  "relative_path": "dayu/runtime/process_diagnostics.py",
+                  "bytes": 21774,
+                  "sha256": "47ed4b45a44aed212fe440347488f8bd7eded30088c81a9f2f68e5ad61c12f3d"
+                },
+                {
+                  "relative_path": "dayu/runtime/log.py",
+                  "bytes": 20268,
+                  "sha256": "52ba9519fd7cc1f78fc9aad91160cc3230651e1ccbd10af800771b041b46ecef"
+                },
+                {
+                  "relative_path": "dayu/fins/pipelines/docling_process_converter.py",
+                  "bytes": 46098,
+                  "sha256": "d8847701fc17c3f825afedb3c3138dabfa03e8050961545ee227819b22075864"
+                },
+                {
+                  "relative_path": "dayu/runtime/interruptible_process.py",
+                  "bytes": 34083,
+                  "sha256": "1a1ae877d60f4a483df75dac8158d0c69821e3d28b18d45c5a63448845961e91"
+                },
+                {
+                  "relative_path": "dayu/runtime/macos_sandbox.py",
+                  "bytes": 6986,
+                  "sha256": "0794d0390706941f76d9250a02c7503aaeaaf35a08420fe27dccf5f890dd3a54"
+                }
+              ],
+              "report": {
+                "source_id": "diagnostics-focused04",
+                "relative_path": "observed-behavior.md",
+                "bytes": 39030,
+                "sha256": "17a4c08a381fb7ae18d3a6b83ae8cc582cc9b01d55ce4e2e7d59005c47cc94dc"
+              },
+              "scan": {
+                "source_id": "diagnostics-focused04",
+                "relative_path": "secret-scan.json",
+                "bytes": 6826,
+                "sha256": "d2ded979d369fb54c56ee28beb0edabfb5745607f05416d083ea49df2b47607e"
+              }
+            }
+          ],
+          "authority_digest": "fb9e676a941b583fad2651b2ef2d715fba10c9c64bf790913c653458213567ac",
+          "assignment_digest": "0802c73b5e74557e3ab20571677358adc78ac90bdb3d9cd2dc286058025037c3",
+          "focused_source_digest": "ae02f0c21bc2a6f324ea0518f9e3c7dddc4cf85027b42eb91cc51e85b259ad29"
+        }
+      },
+      "validation_result": "pass",
+      "registry_status": "ready",
+      "commands": [
+        "init",
+        "prompt",
+        "interactive",
+        "download",
+        "upload_filing",
+        "upload_material"
+      ],
+      "historical_ready_proofs": [
+        {
+          "proof_version": 5,
+          "generated_at": "2026-08-18T00:00:00Z",
+          "target_commit": "256786b255021ee429a20f22aad726b1ad33916c",
+          "registry_scope": [
+            "init",
+            "prompt",
+            "interactive",
+            "download",
+            "upload_filing"
+          ],
+          "validation_result": "ready",
+          "counting_basis": "每条 current non-superseded formal scenario 是一个 mandatory obligation；共享 CLI owner 的等价矩阵只在 owner scope 全量计数，各 direct command 以真实 wiring smoke 证明接线。",
+          "root_parser_inventory": {
+            "inventory_id": "dayu.cli.arg_parsing.build_parser:root",
+            "inventory_version": 4,
+            "source_commit": "256786b255021ee429a20f22aad726b1ad33916c",
+            "parameter_count": 13,
+            "sha256": "e50fcf8bb05f42ab4bdd2273e6a86b304ae6812520edc6e3c7657e852cd1c5d0"
+          },
+          "removed_option_absence": {
+            "root_config_absent": true,
+            "prompt_config_absent": true,
+            "interactive_config_absent": true,
+            "interactive_ticker_absent": true,
+            "download_source_absent": true,
+            "upload_filing_source_absent": true,
+            "upload_filing_config_absent": true,
+            "upload_filing_document_id_absent": true,
+            "upload_filing_infer_absent": true,
+            "upload_filing_ci_absent": true
+          },
+          "commands": {
+            "init": {
+              "validation_result": "ready",
+              "parser_inventory": {
+                "inventory_id": "dayu.cli.arg_parsing.build_parser:init",
+                "inventory_version": 4,
+                "source_commit": "256786b255021ee429a20f22aad726b1ad33916c",
+                "parameter_count": 15,
+                "sha256": "0390a3b21dabdc860266218845037de4aa6b87b407dbce066d9c279bb9d890db"
+              },
+              "mandatory_scenario_obligation_count": 59,
+              "covered_scenario_obligation_count": 59,
+              "accepted_scenario_count": 59,
+              "superseded_scenario_count": 0,
+              "unadjudicated_scenario_count": 0,
+              "gap_count": 0,
+              "distinct_coverage_id_counts": {
+                "command_parameter_ids": 9,
+                "precondition_state_ids": 33,
+                "interactive_branch_option_ids": 46,
+                "input_class_ids": 19,
+                "combination_high_risk_ids": 7,
+                "cross_command_assertion_ids": 6
+              },
+              "coverage_inventory_sha256": "9f87265a8a1d14efc9eb009e1962f46eb3d0ea1bc4d6a3a772394eb5f313b786",
+              "frozen_report_digest_entry_count": 1,
+              "frozen_report_digest_set_sha256": "20b2684028dd540db97efa06d6d0e52c417eea25405f9227b7b7d059370d768d",
+              "user_adjudication_identity_count": 1,
+              "user_adjudication_identity_set_sha256": "2fcb772249b0b656c85560fead497b899ddbd7afe762f60fa5aedeea65185dca",
+              "accepted_oracle_refs": [
+                "cli.init.workspace-initialization@1"
+              ]
+            },
+            "prompt": {
+              "validation_result": "ready",
+              "parser_inventory": {
+                "inventory_id": "dayu.cli.arg_parsing.build_parser:prompt",
+                "inventory_version": 4,
+                "source_commit": "256786b255021ee429a20f22aad726b1ad33916c",
+                "parameter_count": 27,
+                "sha256": "98eef9cea2fde103cd416ca1027eeccfdfffead6fc3972964e3177b477b58040"
+              },
+              "mandatory_scenario_obligation_count": 388,
+              "covered_scenario_obligation_count": 388,
+              "accepted_scenario_count": 388,
+              "superseded_scenario_count": 0,
+              "unadjudicated_scenario_count": 0,
+              "gap_count": 0,
+              "distinct_coverage_id_counts": {
+                "command_parameter_ids": 60,
+                "precondition_state_ids": 14,
+                "interactive_branch_option_ids": 24,
+                "input_class_ids": 12,
+                "combination_high_risk_ids": 64,
+                "cross_command_assertion_ids": 9
+              },
+              "coverage_inventory_sha256": "d2f32ec7ade7cd92f6b27d2097b251a2d4aa4d37b0c04a76d1713e444aef3c92",
+              "frozen_report_digest_entry_count": 6,
+              "frozen_report_digest_set_sha256": "874a1ac46e1c324771a555ce53a02c8bf3e0a3e5afa253517ad12c670f605048",
+              "user_adjudication_identity_count": 2,
+              "user_adjudication_identity_set_sha256": "afd03ac3ad18a03675c52b7570023227cbcecf9302c5edfe6f4ba1e3a835e8de",
+              "accepted_oracle_refs": [
+                "cli.prompt.core-execution@1"
+              ]
+            },
+            "interactive": {
+              "validation_result": "ready",
+              "parser_inventory": {
+                "inventory_id": "dayu.cli.arg_parsing.build_parser:interactive",
+                "inventory_version": 4,
+                "source_commit": "256786b255021ee429a20f22aad726b1ad33916c",
+                "parameter_count": 25,
+                "sha256": "c5b147f06455a57cd7dc88ee44b940404f4811609f0ef14a7197b61f60cf1b1d"
+              },
+              "mandatory_scenario_obligation_count": 609,
+              "covered_scenario_obligation_count": 609,
+              "accepted_scenario_count": 609,
+              "superseded_scenario_count": 3,
+              "unadjudicated_scenario_count": 0,
+              "gap_count": 0,
+              "distinct_coverage_id_counts": {
+                "command_parameter_ids": 63,
+                "precondition_state_ids": 44,
+                "interactive_branch_option_ids": 132,
+                "input_class_ids": 14,
+                "combination_high_risk_ids": 320,
+                "cross_command_assertion_ids": 57
+              },
+              "coverage_inventory_sha256": "23eb7e95103d5e8b8be3e6d79daa4dcced9e1272ad5becea172f5f6c1c6ffd54",
+              "frozen_report_digest_entry_count": 8,
+              "frozen_report_digest_set_sha256": "28a4b1861919b85f34595cbfbd8a9b6760e75e12299daf9ca150bde227688558",
+              "user_adjudication_identity_count": 6,
+              "user_adjudication_identity_set_sha256": "0ecfb2df0bfc328e3776c1948d7a3c8db3db19e91083229b29c8daf542d7c3ae",
+              "accepted_oracle_refs": [
+                "cli.interactive.core-execution@2"
+              ],
+              "latest_user_adjudication_identities": [
+                "cli.interactive.core-execution@2:user-adjudication:2026-08-09",
+                "interactive.interactive.g06.summary-null@1:user-adjudication:2026-08-09"
+              ]
+            },
+            "download": {
+              "validation_result": "ready",
+              "parser_inventory": {
+                "inventory_id": "dayu.cli.arg_parsing.build_parser:download",
+                "inventory_version": 4,
+                "source_commit": "256786b255021ee429a20f22aad726b1ad33916c",
+                "parameter_count": 19,
+                "sha256": "cd8b6dff45ba3904524652ddc7e4b6aa0e1d7ab0a1f3f57a0a42ec51413afff8"
+              },
+              "mandatory_scenario_obligation_count": 101,
+              "covered_scenario_obligation_count": 101,
+              "accepted_scenario_count": 101,
+              "superseded_scenario_count": 0,
+              "unadjudicated_scenario_count": 0,
+              "gap_count": 0,
+              "distinct_coverage_id_counts": {
+                "command_parameter_ids": 15,
+                "precondition_state_ids": 33,
+                "interactive_branch_option_ids": 0,
+                "input_class_ids": 1,
+                "combination_high_risk_ids": 44,
+                "cross_command_assertion_ids": 6
+              },
+              "coverage_inventory_sha256": "c5c1ccece8f4984d5f25d393493546af69b6d36eacaaebc3a21441f923cbaf79",
+              "frozen_report_digest_entry_count": 5,
+              "frozen_report_digest_set_sha256": "6996b1cbd7ed8da11cd779a870b622f26299b76888268b68a761fbd8bfbd19d7",
+              "user_adjudication_identity_count": 1,
+              "user_adjudication_identity_set_sha256": "64d700430152caf5ccbb9298c8291733f04f7785e26e0a9a70fe2b34f0f98508",
+              "accepted_oracle_refs": [
+                "cli.download.document-acquisition@1"
+              ],
+              "latest_user_adjudication_identities": [
+                "cli.download.document-acquisition@1:user-adjudication:2026-08-10"
+              ],
+              "conditional_nonblocking_paths": [
+                "download.DL-X01-partial-provider-failure-if-natural",
+                "download.DL-X02-publication-window-interrupt-if-reachable",
+                "download.DL-X03-docling-fallback-if-natural"
+              ],
+              "shared_cli_owner_equivalence": {
+                "status": "accepted-and-reused",
+                "owner": "dayu.cli.arg_parsing common parent and dayu.runtime.log",
+                "covered_by_command_scopes": [
+                  "prompt",
+                  "interactive"
+                ],
+                "download_wiring_smokes": [
+                  "download.DL-D03-quiet-business-output",
+                  "download.DL-D04-debug-stream-no-model-stream",
+                  "download.DL-D05-debug-log-file"
+                ],
+                "reason": "16 个日志入口、ordered selector conflicts、debug-stream/quiet 与 append 的公共 owner 已在 prompt/interactive 正式 scenarios 全量覆盖；download 不复制数百条等价外部网络 operation。"
+              },
+              "frozen_report_digests": [
+                {
+                  "run_id": "download-20260809Tjbv3bg",
+                  "sha256": "994827953d9694b191611038d29c038b63738f23c670df417bd2e07d81f8d25e"
+                },
+                {
+                  "run_id": "download-postfix-20260810T041254Z",
+                  "sha256": "be0c3c4cbc6a7b27877bd156cd7528ef33bd87f9e8fe097f8fdc09299886f6a6"
+                },
+                {
+                  "run_id": "download-cn-bare-calibration-0uNsYI",
+                  "sha256": "d25446fd9d5c3d9e5e2e317c5f6743067978d5239f800de6524d4a1128dc6069"
+                },
+                {
+                  "run_id": "wu-cli-download-02-postfix-20260810-A9vLZQ",
+                  "sha256": "7ca07d76a6d0d5ed37a5c4b54917f08262bd8a5203bf2d31cc7781da4fa2e666"
+                },
+                {
+                  "run_id": "wu-cli-download-03-dl-f15-postfix-20260810-yCJM88",
+                  "sha256": "c4387f279cdca7466aec36cbe1166e2c3529e29c8ed5203c491eb897be0278a1"
+                }
+              ]
+            },
+            "upload_filing": {
+              "validation_result": "ready",
+              "calibration_status": "oracle-scenarios-and-second-round-conformance-accepted",
+              "implementation_conformance_status": "second-round-conformance-pass",
+              "parser_inventory": {
+                "inventory_id": "dayu.cli.arg_parsing.build_parser:upload_filing",
+                "inventory_version": 4,
+                "source_commit": "256786b255021ee429a20f22aad726b1ad33916c",
+                "parameter_count": 23,
+                "sha256": "2de7aee34a96f397849d3a05e7016199384a6dc07a2521b4d2bc66cc26ad561d"
+              },
+              "mandatory_scenario_obligation_count": 137,
+              "covered_scenario_obligation_count": 137,
+              "accepted_scenario_count": 137,
+              "superseded_scenario_count": 31,
+              "unadjudicated_scenario_count": 0,
+              "gap_count": 0,
+              "distinct_coverage_id_counts": {
+                "command_parameter_ids": 25,
+                "precondition_state_ids": 137,
+                "interactive_branch_option_ids": 0,
+                "input_class_ids": 11,
+                "combination_high_risk_ids": 137,
+                "cross_command_assertion_ids": 1
+              },
+              "coverage_inventory_sha256": "012f40e635ee5d8b70e6a2074cefa6671dce1638516e7dc94c706f5f1cf9eacc",
+              "frozen_report_digest_entry_count": 4,
+              "frozen_report_digest_set_sha256": "43ed846df3790767748934b5398e4aba869c3817b9683feb1955bb0991978289",
+              "user_adjudication_identity_count": 2,
+              "user_adjudication_identity_set_sha256": "4b0fd8ed3a935cc2dd801fde9459af83277bca4721cced310a3db03f0ab54ea5",
+              "accepted_oracle_refs": [
+                "cli.upload_filing.document-publication@1"
+              ],
+              "latest_user_adjudication_identities": [
+                "cli.upload_filing.document-publication@1:user-adjudication:2026-08-12",
+                "cli.upload_filing.document-publication@1:user-adjudication:2026-08-18"
+              ],
+              "shared_cli_owner_equivalence": {
+                "status": "accepted-and-reused",
+                "owners": [
+                  "dayu.cli.arg_parsing common parent",
+                  "dayu.runtime.log"
+                ],
+                "upload_filing_wiring_smokes": [
+                  "upload_filing.UF-W06-quiet-success",
+                  "upload_filing.UF-W07-debug-stream-direct",
+                  "upload_filing.UF-W08-debug-log-file",
+                  "upload_filing.UF-W09-quiet-debug-stream-conflict"
+                ]
+              },
+              "implementation_findings": [
+                {
+                  "finding_id": "UF-FIX01",
+                  "slug": "validation-atomic-boundary",
+                  "status": "fix-complete-post-fix-accepted",
+                  "closeout_commit": "114430ce",
+                  "closeout_artifact": "docs/gateflow/uf-fix01-validation-atomic-boundary-final-closeout-20260813.md",
+                  "oracle_predicate_refs": [
+                    "upload_filing.validation-side-effects",
+                    "upload_filing.error-classification"
+                  ],
+                  "accepted_requirement": "把全部可预判 usage validation 前移到 workspace mutation 前；company meta 与 source publication 同一原子业务边界。",
+                  "implementation_authorization": "completed-by-user-authorized-gateflow-work-unit",
+                  "residual_id": "UF-FIX01-R1",
+                  "residual_status": "resolved-and-accepted",
+                  "residual_requirement": "由 upload/download 可复用的 fiscal-period 单一 owner 在 operation/workspace mutation 前执行 strip、uppercase 与 FY/H1/Q1/Q2/Q3/Q4 闭集校验；US/CN/HK 的非法值统一投影为可行动的 usage failure（exit 2），不得进入 runtime unexpected failure。",
+                  "residual_evidence": {
+                    "run_id": "upload-filing-postfix-all-20260817-p26wBp",
+                    "report_sha256": "c5212306d27af50ac78a8b559c9c4b7348f154a1ec149f105712fabe652d4ddb",
+                    "case_ref": "cases/UF-A21-us-invalid-period",
+                    "observed_exit_code": 1,
+                    "observed_failure_kind": "runtime",
+                    "observed_failure_code": "unexpected_runtime"
+                  },
+                  "residual_closeout_commit": "47e78b2366ff6eedcaa4275a8a10bdfc1522b347",
+                  "residual_closeout_artifact": "docs/gateflow/uf-fix01-fiscal-period-prevalidation-residual-final-closeout-20260818.md",
+                  "residual_resolution_evidence": {
+                    "run_id": "upload-filing-final-calibration-20260818-y6gLgs",
+                    "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+                    "case_refs": [
+                      "cases/UF-A21-us-invalid-period",
+                      "cases/PF01-US-invalid-banana",
+                      "cases/PF01-CN-invalid-banana",
+                      "cases/PF01-HK-invalid-banana"
+                    ],
+                    "user_adjudication": "accepted-2026-08-18"
+                  }
+                },
+                {
+                  "finding_id": "UF-FIX02",
+                  "slug": "action-and-update-identity",
+                  "status": "fix-complete-local-closeout",
+                  "closeout_commit": "31817dc5",
+                  "closeout_artifact": "docs/gateflow/uf-fix02-action-and-update-identity-final-closeout-20260813.md",
+                  "oracle_predicate_refs": [
+                    "upload_filing.action-core",
+                    "upload_filing.renamed-update",
+                    "upload_filing.auto-after-delete"
+                  ],
+                  "accepted_requirement": "按 filing identity 实现 update；update missing 即使 overwrite 也失败；auto 对 deleted source 恢复；existing 冲突在转换前判断。",
+                  "implementation_authorization": "completed-by-user-authorized-gateflow-work-unit"
+                },
+                {
+                  "finding_id": "UF-FIX03",
+                  "slug": "summary-and-bounded-errors",
+                  "status": "fix-complete-local-closeout",
+                  "closeout_commit": "9edd0a46",
+                  "closeout_artifact": "docs/gateflow/uf-fix03-final-closeout-20260814.md",
+                  "oracle_predicate_refs": [
+                    "upload_filing.irrelevant-and-repeated-options",
+                    "upload_filing.direct-boundary-and-summary",
+                    "upload_filing.malformed-and-empty-input"
+                  ],
+                  "accepted_requirement": "区分 requested/stored files，投影有界 typed reason，普通 stderr 不输出第三方 traceback。",
+                  "implementation_authorization": "completed-by-user-authorized-gateflow-work-unit"
+                },
+                {
+                  "finding_id": "UF-FIX04",
+                  "slug": "shared-calendar-year-validation",
+                  "status": "fix-complete-local-closeout",
+                  "closeout_commit": "4a825b75",
+                  "closeout_artifact": "docs/reviews/wu-upload-filing-calendar-year-validation-final-closeout-controller.md",
+                  "oracle_predicate_refs": [
+                    "upload_filing.date-and-year-domain"
+                  ],
+                  "accepted_requirement": "upload 与 download 在相同 calendar/year 语义上复用一个公共校验 owner；保留 download 独有的部分日期边界展开。",
+                  "implementation_authorization": "completed-by-user-authorized-gateflow-work-unit"
+                },
+                {
+                  "finding_id": "UF-FIX05",
+                  "slug": "alias-contract-alignment",
+                  "status": "fix-complete-local-closeout",
+                  "closeout_commit": "a3d584fc",
+                  "closeout_artifact": "docs/reviews/wu-upload-filing-ticker-alias-contract-final-closeout-controller.md",
+                  "oracle_predicate_refs": [
+                    "upload_filing.ticker-and-alias"
+                  ],
+                  "accepted_requirement": "Company Identity/CompanyMeta 统一 alias grammar、归一化、持久化和 list_documents 路由；保留用户声明信任边界，不增加现实公司归属核验。",
+                  "implementation_authorization": "completed-by-user-authorized-gateflow-work-unit"
+                },
+                {
+                  "finding_id": "UF-FIX06",
+                  "slug": "converter-capability-owner",
+                  "status": "fix-complete-local-closeout",
+                  "closeout_commit": "b7725096",
+                  "closeout_artifact": "docs/gateflow/uf-fix06-final-closeout-20260815.md",
+                  "oracle_predicate_refs": [
+                    "upload_filing.format-owner"
+                  ],
+                  "accepted_requirement": "由真实 converter capability 单一 contract 驱动 help/CLI/Service；附件与必转换 primary 分离。",
+                  "implementation_authorization": "completed-by-user-authorized-gateflow-work-unit"
+                },
+                {
+                  "finding_id": "UF-FIX07",
+                  "slug": "multi-file-primary-and-collision",
+                  "status": "fix-complete-local-closeout",
+                  "closeout_commit": "5859856e",
+                  "closeout_artifact": "docs/gateflow/uf-fix07-final-closeout-20260815.md",
+                  "oracle_predicate_refs": [
+                    "upload_filing.multi-file-and-primary"
+                  ],
+                  "accepted_requirement": "前置拒绝重复路径，消除 basename/stem 输出碰撞并冻结显式 primary 规则。",
+                  "implementation_authorization": "completed-by-user-authorized-gateflow-work-unit"
+                },
+                {
+                  "finding_id": "UF-FIX08",
+                  "slug": "existing-source-auto-repair",
+                  "status": "fix-complete-local-closeout",
+                  "closeout_commit": "656b926c",
+                  "closeout_artifact": "docs/gateflow/uf-fix08-existing-source-auto-repair-final-closeout-20260816.md",
+                  "oracle_predicate_refs": [
+                    "upload_filing.existing-source-integrity"
+                  ],
+                  "accepted_requirement": "保持完整性 fail-closed；在完整本地输入可用时由 auto 原子重建可修复 source。",
+                  "implementation_authorization": "completed-by-user-authorized-gateflow-work-unit"
+                },
+                {
+                  "finding_id": "UF-FIX09",
+                  "slug": "shared-interruptible-docling-converter",
+                  "status": "fix-complete-local-closeout",
+                  "closeout_commit": "b3cb1f1b",
+                  "closeout_artifact": "docs/gateflow/uf-fix09-final-closeout-20260813.md",
+                  "oracle_predicate_refs": [
+                    "upload_filing.sigint-cancellation"
+                  ],
+                  "accepted_requirement": "把可中断 Docling converter 收敛为一个公共运行时能力，并让 download、upload 和后续调用方共享协作 terminate/kill/cleanup 语义。",
+                  "implementation_authorization": "completed-by-user-authorized-gateflow-work-unit"
+                },
+                {
+                  "finding_id": "UF-FIX10",
+                  "slug": "same-request-concurrency",
+                  "status": "fix-complete-local-closeout",
+                  "closeout_commit": "94182a0c",
+                  "closeout_artifact": "docs/gateflow/uf-fix10-final-closeout-20260817.md",
+                  "oracle_predicate_refs": [
+                    "upload_filing.concurrency"
+                  ],
+                  "accepted_requirement": "同一 auto 请求在 publication lock 内重读，竞争方收敛为 success/skip 而非 generic failure。",
+                  "implementation_authorization": "completed-by-user-authorized-gateflow-work-unit"
+                },
+                {
+                  "finding_id": "UF-FIX11",
+                  "slug": "fresh-company-meta-warning",
+                  "status": "fix-complete-local-closeout",
+                  "closeout_commit": "6e838a63",
+                  "closeout_artifact": "docs/gateflow/uf-fix11-final-closeout-20260817.md",
+                  "oracle_predicate_refs": [
+                    "upload_filing.company-meta-refresh"
+                  ],
+                  "accepted_requirement": "fresh canonical identity 忽略单次上传提供的新名称或 alias 时输出明确 warning。",
+                  "implementation_authorization": "completed-by-user-authorized-gateflow-work-unit"
+                }
+              ],
+              "required_post_fix_reruns": [
+                {
+                  "rerun_id": "UF-PF01",
+                  "status": "accepted-post-fix-observation",
+                  "blocked_by_finding_ids": [],
+                  "required_observation": "修复 UF-FIX01-R1 后补跑 fiscal-period invalid slice，覆盖 US/CN/HK 共用闭集校验 owner，断言 exit 2、具体 reason、operation 未开始且 workspace 零业务 mutation。",
+                  "evidence_policy": "real-cli-frozen-report-no-mock-no-fake",
+                  "adjudication": "accepted-2026-08-18",
+                  "observed_evidence": {
+                    "run_id": "upload-filing-final-calibration-20260818-y6gLgs",
+                    "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+                    "case_refs": [
+                      "cases/UF-024-cn-invalid-period",
+                      "cases/UF-A21-us-invalid-period",
+                      "cases/PF01-US-invalid-banana",
+                      "cases/PF01-CN-invalid-banana",
+                      "cases/PF01-HK-invalid-banana",
+                      "cases/PF01-US-normalized-q1",
+                      "cases/PF01-CN-normalized-q1",
+                      "cases/PF01-HK-normalized-q1"
+                    ]
+                  }
+                },
+                {
+                  "rerun_id": "UF-PF02",
+                  "status": "accepted-post-fix-observation",
+                  "blocked_by_finding_ids": [
+                    "UF-FIX02"
+                  ],
+                  "required_observation": "同名/改名 update、update missing±overwrite、deleted 后 auto、existing pre-conversion conflict。",
+                  "evidence_policy": "real-cli-frozen-report-no-mock-no-fake",
+                  "adjudication": "accepted-2026-08-17",
+                  "observed_evidence": {
+                    "run_id": "upload-filing-postfix-all-20260817-p26wBp",
+                    "report_sha256": "c5212306d27af50ac78a8b559c9c4b7348f154a1ec149f105712fabe652d4ddb",
+                    "case_refs": [
+                      "cases/R-PF02-01-auto-fresh",
+                      "cases/R-PF02-02-update-same-name",
+                      "cases/R-PF02-03-update-renamed",
+                      "cases/R-PF02-04-update-missing",
+                      "cases/R-PF02-05-update-missing-overwrite",
+                      "cases/R-PF02-06-create-existing-corrupt-preconversion",
+                      "cases/R-PF02-07-delete-existing",
+                      "cases/R-PF02-08-delete-repeated",
+                      "cases/R-PF02-09-auto-after-delete"
+                    ]
+                  }
+                },
+                {
+                  "rerun_id": "UF-PF03",
+                  "status": "accepted-post-fix-observation",
+                  "blocked_by_finding_ids": [
+                    "UF-FIX03"
+                  ],
+                  "required_observation": "delete+files、损坏 PDF/DOCX、混合批次与 generic failure 场景，核对 requested/stored 和 bounded stderr/log。",
+                  "evidence_policy": "real-cli-frozen-report-no-mock-no-fake",
+                  "adjudication": "accepted-2026-08-17",
+                  "observed_evidence": {
+                    "run_id": "upload-filing-postfix-all-20260817-p26wBp",
+                    "report_sha256": "c5212306d27af50ac78a8b559c9c4b7348f154a1ec149f105712fabe652d4ddb",
+                    "case_refs": [
+                      "cases/R-PF03-mixed-corrupt-primary",
+                      "cases/UF-I11-corrupt-pdf",
+                      "cases/UF-I13-corrupt-docx"
+                    ],
+                    "prior_focused_report_sha256": "1645834dff04c863d7a5d5414bffc95cadbc14995fd86720070e9667eba31cdb"
+                  }
+                },
+                {
+                  "rerun_id": "UF-PF04",
+                  "status": "accepted-post-fix-observation",
+                  "blocked_by_finding_ids": [
+                    "UF-FIX04"
+                  ],
+                  "required_observation": "非法/有效 filing-date、report-date、0/负数/超四位/四位 fiscal year，并回归 download 共享校验与部分日期展开。",
+                  "evidence_policy": "real-cli-frozen-report-no-mock-no-fake",
+                  "adjudication": "accepted-2026-08-17",
+                  "observed_evidence": {
+                    "run_id": "upload-filing-postfix-all-20260817-p26wBp",
+                    "report_sha256": "c5212306d27af50ac78a8b559c9c4b7348f154a1ec149f105712fabe652d4ddb",
+                    "case_refs": [
+                      "cases/R-PF04-valid-min",
+                      "cases/R-PF04-valid-max",
+                      "cases/R-PF04-valid-leap",
+                      "cases/R-PF04-download-year",
+                      "cases/R-PF04-download-month",
+                      "cases/R-PF04-download-day",
+                      "cases/R-PF04-download-invalid-calendar"
+                    ],
+                    "prior_focused_report_sha256": "46c8213032b43ee9b5b50118802216c0697c04313e1c2560d370907f66e9bd61"
+                  }
+                },
+                {
+                  "rerun_id": "UF-PF05",
+                  "status": "accepted-post-fix-observation",
+                  "blocked_by_finding_ids": [
+                    "UF-FIX05"
+                  ],
+                  "required_observation": "canonical 与用户声明 alias 调用 list_documents 返回同一 corpus；DELTA,MSFT 按用户声明接受；语法变体、跨市场 alias、resolver 生成的 V.BA 类 alias 端到端可消费。",
+                  "evidence_policy": "real-cli-frozen-report-no-mock-no-fake",
+                  "adjudication": "accepted-2026-08-17",
+                  "observed_evidence": {
+                    "run_id": "upload-filing-postfix-all-20260817-p26wBp",
+                    "report_sha256": "c5212306d27af50ac78a8b559c9c4b7348f154a1ec149f105712fabe652d4ddb",
+                    "case_refs": [
+                      "cases/R-PF05-list-cross-market-alias",
+                      "cases/R2-PF05-list-v-ba"
+                    ]
+                  }
+                },
+                {
+                  "rerun_id": "UF-PF06",
+                  "status": "accepted-post-fix-observation",
+                  "blocked_by_finding_ids": [
+                    "UF-FIX06"
+                  ],
+                  "required_observation": "真实格式 capability 全矩阵及 XBRL primary+companion，逐项核对 help/CLI/Service/converter 同源。",
+                  "evidence_policy": "real-cli-frozen-report-no-mock-no-fake",
+                  "adjudication": "accepted-2026-08-17",
+                  "observed_evidence": {
+                    "run_id": "upload-filing-postfix-all-20260817-p26wBp",
+                    "report_sha256": "c5212306d27af50ac78a8b559c9c4b7348f154a1ec149f105712fabe652d4ddb",
+                    "case_refs": [
+                      "cases/PF06-xbrl-primary-companion",
+                      "cases/R-PF06-real-msft-multi-primary",
+                      "cases/R-PF06-real-msft-multi-process"
+                    ]
+                  }
+                },
+                {
+                  "rerun_id": "UF-PF07",
+                  "status": "accepted-post-fix-observation",
+                  "blocked_by_finding_ids": [
+                    "UF-FIX07"
+                  ],
+                  "required_observation": "不同 stem、重复路径、重复 basename、同 stem 不同后缀、100 文件边界与显式 primary downstream 消费。",
+                  "evidence_policy": "real-cli-frozen-report-no-mock-no-fake",
+                  "adjudication": "accepted-2026-08-17",
+                  "observed_evidence": {
+                    "run_id": "upload-filing-postfix-all-20260817-p26wBp",
+                    "report_sha256": "c5212306d27af50ac78a8b559c9c4b7348f154a1ec149f105712fabe652d4ddb",
+                    "case_refs": [
+                      "cases/R-PF07-distinct-stems",
+                      "cases/R-PF07-same-stem",
+                      "cases/R-PF07-duplicate-basename",
+                      "cases/PF07-one-hundred-explicit-primary"
+                    ]
+                  }
+                },
+                {
+                  "rerun_id": "UF-PF08",
+                  "status": "accepted-post-fix-observation",
+                  "blocked_by_finding_ids": [
+                    "UF-FIX08"
+                  ],
+                  "required_observation": "original/Docling/meta/manifest 四类损坏，以完整本地输入执行 auto 原子恢复并由 public repository 重读。",
+                  "evidence_policy": "real-cli-frozen-report-no-mock-no-fake",
+                  "adjudication": "accepted-2026-08-17",
+                  "observed_evidence": {
+                    "run_id": "upload-filing-postfix-all-20260817-p26wBp",
+                    "report_sha256": "c5212306d27af50ac78a8b559c9c4b7348f154a1ec149f105712fabe652d4ddb",
+                    "case_refs": [
+                      "cases/UF-I02-auto-with-original-missing",
+                      "cases/UF-I04-auto-with-original-digest-changed",
+                      "cases/UF-I06-auto-with-docling-missing",
+                      "cases/UF-I08-auto-with-meta-size-digest-mismatch",
+                      "cases/UF-I10-auto-with-manifest-missing"
+                    ]
+                  }
+                },
+                {
+                  "rerun_id": "UF-PF09",
+                  "status": "accepted-post-fix-observation",
+                  "blocked_by_finding_ids": [
+                    "UF-FIX09"
+                  ],
+                  "required_observation": "HK PDF 与 US DOCX Docling 中途 SIGINT，验证快速 exit 130、无 completed、无子孙进程/半发布、原样重试；同时回归 download Docling cancel。",
+                  "evidence_policy": "real-cli-frozen-report-no-mock-no-fake",
+                  "adjudication": "accepted-2026-08-17",
+                  "observed_evidence": {
+                    "run_id": "upload-filing-postfix-all-20260817-p26wBp",
+                    "report_sha256": "c5212306d27af50ac78a8b559c9c4b7348f154a1ec149f105712fabe652d4ddb",
+                    "case_refs": [
+                      "cases/UF-L01-very-early-sigint",
+                      "cases/UF-L02-cn-docling-sigint",
+                      "cases/UF-L03-cn-retry-after-sigint",
+                      "cases/UF-L04-us-docling-sigint",
+                      "cases/UF-L05-us-retry-after-sigint"
+                    ],
+                    "prior_shared_converter_report_sha256": "4af8f01e94d99ca936fa25b4a63c24dd9df5ca8766f4abc5dabe8b5403aabe16"
+                  }
+                },
+                {
+                  "rerun_id": "UF-PF10",
+                  "status": "accepted-post-fix-observation",
+                  "blocked_by_finding_ids": [
+                    "UF-FIX10"
+                  ],
+                  "required_observation": "同一 auto、同 ticker 不同 filing、不同 ticker 三组真实并发，核对终态与 publication 完整性。",
+                  "evidence_policy": "real-cli-frozen-report-no-mock-no-fake",
+                  "adjudication": "accepted-2026-08-17",
+                  "observed_evidence": {
+                    "run_id": "upload-filing-postfix-all-20260817-p26wBp",
+                    "report_sha256": "c5212306d27af50ac78a8b559c9c4b7348f154a1ec149f105712fabe652d4ddb",
+                    "case_refs": [
+                      "cases/UF-L08-concurrent-same-document",
+                      "cases/UF-L09-concurrent-different-documents-same-ticker",
+                      "cases/UF-L11-concurrent-valid-different-tickers"
+                    ]
+                  }
+                },
+                {
+                  "rerun_id": "UF-PF11",
+                  "status": "accepted-post-fix-observation",
+                  "blocked_by_finding_ids": [
+                    "UF-FIX11"
+                  ],
+                  "required_observation": "stale refresh、stale missing name、fresh name ignored warning、fresh alias stable-union 接受与 company meta/source 原子性。",
+                  "evidence_policy": "real-cli-frozen-report-no-mock-no-fake",
+                  "adjudication": "accepted-2026-08-17",
+                  "observed_evidence": {
+                    "run_id": "upload-filing-postfix-all-20260817-p26wBp",
+                    "report_sha256": "c5212306d27af50ac78a8b559c9c4b7348f154a1ec149f105712fabe652d4ddb",
+                    "case_refs": [
+                      "cases/R-PF11-stale-explicit-refresh",
+                      "cases/R-PF11-stale-missing-name",
+                      "cases/PF11-fresh-name-alias-change"
+                    ]
+                  }
+                },
+                {
+                  "rerun_id": "UF-PF12",
+                  "status": "accepted-second-round-conformance",
+                  "blocked_by_finding_ids": [],
+                  "required_observation": "修复汇总后重新执行 upload_filing 137 条 full-real mandatory matrix并重算 conformance；第一轮 evidence 不重写。",
+                  "evidence_policy": "real-cli-frozen-report-no-mock-no-fake",
+                  "adjudication": "accepted-2026-08-18",
+                  "observed_evidence": {
+                    "run_id": "upload-filing-final-calibration-20260818-y6gLgs",
+                    "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+                    "executed_scenario_count": 137,
+                    "accepted_scenario_obligation_count": 137,
+                    "total_case_directories": 196,
+                    "blocking_residuals": []
+                  }
+                }
+              ],
+              "accepted_scenario_refreshes": [
+                {
+                  "refresh_id": "UF-SR01",
+                  "status": "materialized-2026-08-18",
+                  "scope": "action-precondition-chain",
+                  "requirement": "UF-A08 的 update missing + overwrite 必须保持 usage failure 且不得创建 BETA；UF-A09 delete existing 与 UF-A10 repeated delete 必须各自建立独立、可复现的 existing/deleted 前置，不再依赖 UF-A08 的旧副作用。",
+                  "observed_case_refs": [
+                    "cases/UF-A08-update-missing-overwrite-creates",
+                    "cases/R-PF02-07-delete-existing",
+                    "cases/R-PF02-08-delete-repeated"
+                  ],
+                  "successor_scenario_refs": [
+                    "upload_filing.UF-A08-update-missing-overwrite-rejected@1",
+                    "upload_filing.UF-A09-delete-existing@2",
+                    "upload_filing.UF-A10-delete-already-deleted@2",
+                    "upload_filing.UF-A12-auto-restores-deleted@2"
+                  ]
+                },
+                {
+                  "refresh_id": "UF-SR02",
+                  "status": "materialized-2026-08-18",
+                  "scope": "multi-file-primary",
+                  "requirement": "所有多文件正向场景显式传入属于 --files 的 --primary；重复解析路径继续作为前置 usage failure；显式 primary 下覆盖不同 stem、同 stem、重复 basename、真实多附件与 100 文件边界。",
+                  "observed_case_refs": [
+                    "cases/R-PF06-real-msft-multi-primary",
+                    "cases/PF06-xbrl-primary-companion",
+                    "cases/R-PF07-distinct-stems",
+                    "cases/R-PF07-same-stem",
+                    "cases/R-PF07-duplicate-basename",
+                    "cases/PF07-one-hundred-explicit-primary",
+                    "cases/R-PF03-mixed-corrupt-primary"
+                  ],
+                  "successor_scenario_refs": [
+                    "upload_filing.UF-F11-multi-file@2",
+                    "upload_filing.UF-F13-duplicate-basename@2",
+                    "upload_filing.UF-C05-real-msft-multi-file@2",
+                    "upload_filing.UF-C06-real-xbrl-html-xsd@2",
+                    "upload_filing.UF-C07-real-xbrl-html-instance@2",
+                    "upload_filing.UF-C05-real-msft-multi-file-process@2",
+                    "upload_filing.UF-I12-valid-plus-corrupt-atomic@2",
+                    "upload_filing.UF-D04-multi-distinct-stems@2",
+                    "upload_filing.UF-D05-multi-same-stem@2",
+                    "upload_filing.UFS-006-files-count-100@2"
+                  ]
+                },
+                {
+                  "refresh_id": "UF-SR03",
+                  "status": "materialized-2026-08-18",
+                  "scope": "converter-capability-case-names",
+                  "requirement": "刷新 UF-030～UF-038 与 UF-F06 中携带旧 owner-drift 判断的场景名称，使名称只描述当前 capability/输入类别与期望边界；通过 supersedes/superseded_by 保留原 source scenario lineage，不改写第一轮冻结 evidence。",
+                  "observed_case_refs": [
+                    "cases/UF-030-owner-allows-cli-rejects-doc",
+                    "cases/UF-031-owner-allows-cli-rejects-ppt",
+                    "cases/UF-032-owner-allows-cli-rejects-pptx",
+                    "cases/UF-033-cli-allows-owner-rejects-csv",
+                    "cases/UF-034-cli-allows-owner-rejects-json",
+                    "cases/UF-035-cli-allows-owner-rejects-xbrl",
+                    "cases/UF-036-cli-allows-owner-rejects-xhtml",
+                    "cases/UF-037-cli-allows-owner-rejects-xml",
+                    "cases/UF-038-cli-allows-owner-rejects-zip",
+                    "cases/UF-F06-xls-ooxml-bytes"
+                  ],
+                  "successor_scenario_refs": [
+                    "upload_filing.UF-030-unsupported-doc-prevalidation@1",
+                    "upload_filing.UF-031-unsupported-ppt-prevalidation@1",
+                    "upload_filing.UF-032-supported-pptx@1",
+                    "upload_filing.UF-033-supported-csv@1",
+                    "upload_filing.UF-034-json-content-failure@1",
+                    "upload_filing.UF-035-xbrl-content-failure@1",
+                    "upload_filing.UF-036-supported-xhtml@1",
+                    "upload_filing.UF-037-xml-content-failure@1",
+                    "upload_filing.UF-038-unsupported-zip-prevalidation@1",
+                    "upload_filing.UF-F06-unsupported-xls-prevalidation@1"
+                  ]
+                },
+                {
+                  "refresh_id": "UF-SR04",
+                  "status": "materialized-2026-08-18",
+                  "scope": "evidence-lineage",
+                  "requirement": "本轮 replacement/focused case 登记为新的 observed evidence；第一轮 calibration/supplement report 与既有 scenario evidence 保持冻结，不覆盖、不重写。",
+                  "registry_materialization": "31 个 accepted successor 已从本轮精确 evidence 物化；第一轮条目仅改为 superseded，冻结 evidence 未重写。"
+                },
+                {
+                  "refresh_id": "UF-SR05",
+                  "status": "materialized-2026-08-18",
+                  "scope": "operator-log-and-company-stale-preconditions",
+                  "requirement": "operator log case 预创建父目录；company stale case 由 resolver_version owner 构造 stale，不再使用 wall-clock age。",
+                  "successor_scenario_refs": [
+                    "upload_filing.UF-W08-debug-log-file@2",
+                    "upload_filing.UF-I15-stale-company-refresh@2",
+                    "upload_filing.UF-I16-stale-company-missing-name@2",
+                    "upload_filing.UF-D01-create-baseline@2",
+                    "upload_filing.UF-D02-auto-changed-same-name@2",
+                    "upload_filing.UF-D03-auto-changed-different-name@2",
+                    "upload_filing.UF-D06-multi-same-path@2"
+                  ],
+                  "observed_case_refs": [
+                    "cases/R2-UF-W08-debug-log-file",
+                    "cases/R2-UF-D01-create-baseline",
+                    "cases/R2-UF-D02-auto-changed-same-name",
+                    "cases/R2-UF-D03-auto-changed-different-name",
+                    "cases/R2-UF-D06-multi-same-path",
+                    "cases/R-PF11-stale-explicit-refresh",
+                    "cases/R-PF11-stale-missing-name"
+                  ]
+                }
+              ],
+              "frozen_report_digests": [
+                {
+                  "run_id": "upload-filing-calibration-20260811-tF6OnN",
+                  "sha256": "e2d3b58954576a2aa1cec3cbc3809134ad34c81d5147df778cef82e7173232c3"
+                },
+                {
+                  "run_id": "upload-filing-supplement-20260811-GHEcbh",
+                  "sha256": "3d37640009753d72955f44e62fd772ff37ff984b386fe65bb1ca708476a23276"
+                },
+                {
+                  "run_id": "upload-filing-postfix-all-20260817-p26wBp",
+                  "sha256": "c5212306d27af50ac78a8b559c9c4b7348f154a1ec149f105712fabe652d4ddb"
+                },
+                {
+                  "run_id": "upload-filing-final-calibration-20260818-y6gLgs",
+                  "sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6"
+                }
+              ],
+              "adjudication_artifact_digests": [
+                {
+                  "artifact": "oracle-adjudication.md",
+                  "sha256": "5d92197814db0e202c77f7e5eb87b1d568ca7fc96532c0b006107d9bc63ba671"
+                },
+                {
+                  "artifact": "oracle-candidates.json",
+                  "sha256": "cbc4ca42635194c3519c0bb2a1a5ba7c1d9cdfde045a746eeb999c5ef52277c2"
+                },
+                {
+                  "artifact": "secret-scan.json",
+                  "sha256": "e6a1d67d3d8c98b1e2609d1c8d9b1e06bc1f6cf91e3f96d67cef87870f01d086"
+                },
+                {
+                  "artifact": "upload-filing-postfix-all-20260817-p26wBp/observed-behavior.json",
+                  "sha256": "3312a30bc722d8c610f824cc54804f098c098cde944bc03b4f1af5382d53aeb1"
+                },
+                {
+                  "artifact": "upload-filing-postfix-all-20260817-p26wBp/secret-scan.json",
+                  "sha256": "8a3083a2b54ed7d164278350a0af3c8120213db840a923f1c10bee346d252d42"
+                },
+                {
+                  "artifact": "upload-filing-postfix-all-20260817-p26wBp/manifest-sha256.json",
+                  "sha256": "3696696b145b84152fdec3bb97a55a84e7f6bb3ffcceff1c4aeaa478dcba5b6e"
+                },
+                {
+                  "artifact": "upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.json",
+                  "sha256": "29ec185fa94d219d463149e243ef4eef08efd67880d98c0b87abe8f993342f4c"
+                },
+                {
+                  "artifact": "upload-filing-final-calibration-20260818-y6gLgs/secret-scan.json",
+                  "sha256": "58c68623832a99c554fa30373d0559471e18ae35cb2988026a2773bfc69789a5"
+                },
+                {
+                  "artifact": "upload-filing-final-calibration-20260818-y6gLgs/manifest-sha256.json",
+                  "sha256": "58b448bf7881055eb45d5dc1b774dd71e2dc12f8a0133828f3ef2c3548436b56"
+                }
+              ],
+              "post_fix_conformance_commit": "47e78b2366ff6eedcaa4275a8a10bdfc1522b347",
+              "second_round_evidence": {
+                "run_id": "upload-filing-final-calibration-20260818-y6gLgs",
+                "report_id": "/Users/leo/workspace/.dayu-cli-ci/upload-filing-final-calibration-20260818-y6gLgs/observed-behavior.md",
+                "report_sha256": "20577adbdde1cf6532d7170e6c8af6a8cff5a1688048edab0d77045a70f41ca6",
+                "executed_registry_scenarios": 137,
+                "total_case_directories": 196,
+                "blocking_residuals": [],
+                "user_adjudication": "accepted-2026-08-18"
+              }
+            }
+          },
+          "reference_validation": {
+            "missing_exact_oracle_refs": 0,
+            "unresolved_current_oracles": 0,
+            "unresolved_predicates": 0,
+            "unresolved_evidence_gaps": 0,
+            "unresolved_user_adjudications": 0,
+            "uncovered_correctness_surfaces": 0,
+            "dangling_local_report_refs": 0,
+            "local_report_digest_mismatches": 0
+          },
+          "post_fix_conformance_refresh": {
+            "status": "complete",
+            "accepted_post_fix_observations": [
+              "UF-PF01",
+              "UF-PF02",
+              "UF-PF03",
+              "UF-PF04",
+              "UF-PF05",
+              "UF-PF06",
+              "UF-PF07",
+              "UF-PF08",
+              "UF-PF09",
+              "UF-PF10",
+              "UF-PF11",
+              "UF-PF12"
+            ],
+            "remaining_required_refreshes": [],
+            "blocking_residual_refs": [],
+            "last_user_adjudication_date": "2026-08-18",
+            "boundary": "UF-PF01～UF-PF12 均已按真实 CLI evidence 接受；UF-FIX01-R1 已关闭，31 个 successor scenario 已版本化物化，upload_filing 第二轮 conformance pass。"
+          },
+          "global": {
+            "validation_result": "ready",
+            "ready_command_scopes": [
+              "init",
+              "prompt",
+              "interactive",
+              "download",
+              "upload_filing"
+            ],
+            "out_of_scope_command_scopes": [
+              "upload_material",
+              "upload_filings_from",
+              "process",
+              "process_filing",
+              "process_material",
+              "session",
+              "tool_trace"
+            ],
+            "reason": "五个命令的第一轮真实运行、逐项用户裁决与 accepted Oracle/scenarios 已闭合；upload_filing 的 UF-FIX01～UF-FIX11 均完成，UF-PF01～UF-PF12 真实补跑已接受，31 个受影响场景已以 successor 版本物化并保留历史 lineage，第二轮 conformance pass。"
+          },
+          "registry_digest_basis": "9de64adb659ee0027b52d803e011dbce473dbfee3a8ee3d4441862b464ae94b1",
+          "accepted_oracle_registry_digest_basis": "b99a73399013f4b6bf99bdc17678ac69b4be6101fc45b220b10b8ab7767422c0"
+        }
+      ]
+    }
+  }
+}

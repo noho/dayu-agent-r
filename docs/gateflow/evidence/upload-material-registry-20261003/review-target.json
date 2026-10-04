@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "gate": "code review",
+  "registration_target": "22eca6c313005e3c5185340f2d6b535ab2583056",
+  "registry_candidates": {
+    "oracles": {
+      "path": "docs/cli_ci_oracles.json",
+      "sha256": "07523ad680e591c8c78a28378286ed718228798376e3366409ab811d592df64b",
+      "registry_digest_basis": "5fc1925a1c258647b159c017ec5ed6da0b863623a2793001a64065f72dba1575"
+    },
+    "scenarios": {
+      "path": "docs/cli_ci_scenarios.json",
+      "sha256": "46e1e989c49758bf9cab252250ea8e63d29029791703d0fd62143780bfa96c7e",
+      "registry_digest_basis": "195c66192a3b2c99bbb2c0e15c058f74b3ffdd10aefadb082923208c1bc71744"
+    }
+  },
+  "evidence_sources": [
+    {
+      "source_id": "cli802",
+      "run_id": "upload-material-cli-20261003-79977b3a-01",
+      "report": {
+        "relative_path": "observed-behavior.md",
+        "sha256": "f35d33f5ff62b1e45d6f6ecf7ae1bcf7db4139f33c5b2af714e59ea0680ef53c"
+      },
+      "scan": {
+        "relative_path": "secret-scan.json",
+        "sha256": "0d3809860ac41e6140b8bd52e7c1e07e85f8d312082447fc9fb929a442c4ff58"
+      }
+    },
+    {
+      "source_id": "diagnostics-focused04",
+      "run_id": "upload-material-diagnostics-focused04-22eca6c3-01",
+      "report": {
+        "relative_path": "observed-behavior.md",
+        "sha256": "17a4c08a381fb7ae18d3a6b83ae8cc582cc9b01d55ce4e2e7d59005c47cc94dc"
+      },
+      "scan": {
+        "relative_path": "secret-scan.json",
+        "sha256": "d2ded979d369fb54c56ee28beb0edabfb5745607f05416d083ea49df2b47607e"
+      }
+    }
+  ],
+  "authority_index": {
+    "path": "docs/gateflow/evidence/upload-material-registry-20261003/authority-index.json",
+    "sha256": "382a35bc7fe77206f00b49415e1fdc97dffbe29167c4366a3e2adbd28e4df45f"
+  },
+  "assignment": {
+    "path": "docs/gateflow/evidence/upload-material-registry-20261003/mandatory-assignment.json",
+    "sha256": "27c710e86cbca486e89fdbb3559894b6ef3ce17e9c19d358ea11956d218c0a57"
+  },
+  "focused_source": {
+    "path": "docs/gateflow/evidence/upload-material-registry-20261003/focused-source.json",
+    "sha256": "df57b9608886f8b1af3259f3cabbee7f7e40aa3f4228c278e97c661e1ee29c13"
+  }
+}

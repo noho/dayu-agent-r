@@ -23,3 +23,37 @@ Goal confirmation沿既有明确用户授权；诊断依赖finalcloseout22eca已
 ## 2026-10-04 计划同版双复审通过
 
 冻结candidate89676282/65562bytes，MiMo32518 actual0/38tools、DS34390 actual0/33tools；root完整轨迹/指令/CANARY/实际source和旧values复核、双保。R01–R04已修复，Q1单元素history数组锁定，无新blocking。详见plan-review-acceptance与boundedplan-review-proof。Current gate=accepted plan commit；next=唯一S1 implementation，由gpt-6-sol一次集中完成newfocused纯观察export/802assignment/19predicate/records/唯一validator/tests/docs/proofs，后双code review。产品/旧registry尚未实施，原802不再跑，fixedregistrationtarget22eca与actualparent8009dirty不同。
+
+## S1 implementation terminal / code review 在途
+
+gpt-6-sol managed73177实际exit0/turn.completed；root审计与private双归档见workspace/tmp/upload-material-registry-20261003/root-implementation-sol-01-audit.json。候选14files；原6oracle/1328scenarios/历史proof全值保；新799scenario/19predicates，focused40file双一致。总控同冻结版本117tests/fullpyright0。MiMo4027、ds-flash8047并行只读code review。REG-C01/C02已先登记accepted未修复，不得接受S1/commit；待两路终态后一次集中fix。当前gate/next entry=code review，后续fix/re-review/accepted slice commit按固定顺序。
+
+## code review complete / next fix
+
+MiMo4027和DS8047均实际exit0，root逐tool/identity/CANARY/相关独立反例裁决；三审汇总四项REG-C01/C02/C03/C04 accepted未修复（先登记code-adjudication）。当前gate/next entry=fix，gpt-6-sol一次集中处理，不新增slice；之后同版双路re-review。机器strict旧0不能代验unique owner漏洞。四项不改现成用户裁决、产品或冻结Raw。
+
+## fix01 rejected / fix02在途
+
+14623 actual0但blocked无代码，不接受fix，14候选仍samebytes。后台metadata不可见允许unknown；不存在已证实model mismatch，root解决执行误解并按skill一次同provider task recovery。请求profile当前model=gpt-6.1-sol，这次显式-m gpt-6-sol，不改全局。78819新runY3LCgi/freshlabel02在途，独占code-fix-sol-02；C01–C04都未修，currentgate=fix，next需其actualterminal/四项验证后同版双re-review。失败原件双归档/审计root-code-fix-sol-01-audit.json已保。
+
+## 集中fix02终态 / 同版双re-review在途
+
+78819 actual0/turn.completed；四项candidate已修，166tests/fullpyright0/strict0最后同版实际日志已核、旧6/1328/十九规则/四public源不变，完整审计与双保见root-code-fix-sol-02-audit/retention。current gate=code re-review：MiMo43261/JjmqLb与ds-flash29298/2GTsjE同时只读冻结manifest1239e6137f32996b9d5dfcfff71e69e275ffc0251a61145c01619ef29ff88e01；四项仍待复审最终裁决，不宣S1pass。next核双终态→accepted slice commit→aggregate gate。
+
+## 同版双复审齐全 / 集中补充fix03在途
+
+MiMo43261与DS29298均actual0/structured success，完整57/47tools及CANARY/全指令/root关键源核完双保。C01/C02已修；C03/C04初反例修复但三个同contract遗漏R01/R02/R03 accepted未修已先登记，整体部分修。root狭义裁决不新scope/用户问题：SIGKILL反向标签、predicate与Service/源必填错误locator。当前gate=fix，gpt-6-sol managed9512/AcChkC显式-m gpt-6-sol一次集中fix，正常reviewfinding后续不是provider retry；next同版只审必要新差异双re-review→accepted S1commit→aggregate→PR197既定收尾。
+
+## 集中fix03 actual0 / 仅补充差异双复审在途
+
+9512 actual0/turn.completed，119events45commands全actual0。R01/R02/R03 candidate已修；180tests/type0，actor-c runpy strict0并root原批准-m CLI实际0/sameproof196d933a恢复验收，两个argv区别如实保，不冒同argv。只helper/tests changed，其它十二候选SHA全同、40源两副本/五产品不变。currentgate=code re-review，MiMo33742/c6JzVw与ds-flash1387/caFlgH同时review必要diff/firstconsumption/callchain，freeze02SHA7ad3dfdf77900163110dd84d430f25a160ae64fa6a3f7e8dadbbc61ec4f1db21；rootqueue冻结旧SHA保持不改以免reviewidentity漂移。完整审计/双保root-code-fix-sol-03-audit/retention。next双terminal核三项→accepted slicecommit→aggregate gate，不普通gate停机。
+
+## 2026-10-04T14:31:41.181868+08:00 补充差异ds-flash终态
+
+1387 actual0/structured success，54tools全配对；两实际探索ls失败已恢复，三指令全文逐行精确核、CANARYmatch、14候选SHA保持，报告142329无新finding/三补充已修。完整审计及双保root-code-rereview-ds-flash-02-audit/retention。MiMo33742仍在途，root queue保持冻结；current gate=code re-review，不因单路pass接受S1。handoff已更正9512旧在途描述。
+
+## 唯一S1 code review loop终裁通过
+
+MiMo33742/DS1387 actual0，root双核/双保/无新finding，7项accepted最终已修。最新code-review-acceptance与boundedcode-review-proof记录180/type0/strict0，旧166历史原件保。current gate=accepted slice commit；next=aggregate deepreview，不能普通gate停机。
+
+Checkpoint首尝试root路径解析strip错误actual1，allowlist在stage前拒绝，无Git/文件丢失。改用porcelain -z保前导状态字节，精确范围重新核；setup recovery记录保于scratch。

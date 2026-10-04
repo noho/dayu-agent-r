@@ -343,6 +343,8 @@ pytest tests/engine/test_smoke_async_agent_providers.py -q
 
 ### `tests/cli/`
 
+`test_cli_ci_upload_material_registry.py` 定位 upload_material 只读登记 validator 的旧全值保护、稳定owner、authority/assignment/ref、双副本、focused来源及strict --check负例；不执行产品campaign。
+
 CLI UI adapter 测试当前覆盖 pyproject 只发布真实 `dayu-cli`、wheel metadata / entrypoints / archive 不包含已删除的 placeholder scripts、packages、Web extra 或 Streamlit requirement；也覆盖 `dayu.cli` 的 parser factory、scoped command help、未纳入旧命令的 unknown command
 用法错误、尚未实现命令的 not-implemented 退出、`KeyboardInterrupt` 到 130 的映射、全局参数位置、`init` 拒绝
 `--config`、Agent surfaces 使用 `--model/-m` 且拒绝旧 `--model-name`，以及 `init`

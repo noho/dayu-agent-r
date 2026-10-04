@@ -1,83 +1,51 @@
-> 最新入口（2026-10-02）：统一修复一个WU/三个完整行为slices，计划同版双审和总控已通过。唯一分支约束及当前gate见 `docs/gateflow/upload-material-unified-repair-control-20261002.md`，accepted计划为 `docs/gateflow/upload-material-unified-repair-plan-20261002.md`；原findings最终裁决见 `docs/gateflow/upload-material-unified-plan-rereview-root-adjudication-20261002.md`。不要恢复旧多WU排程；S3必须携带UP-RR-T01。完整upload_material CLI CI/正式oracles/scenarios在本修复WU后独立执行。
+# upload_material 交接 prompt 3
 
-# upload_material 修复交接 prompt 3
+> 最新状态：2026-10-04。此前“G1–G6/17项尚未实施”“修PR findings后停”的排程已经过时。统一产品修复、真实upload_material CLI CI和新增第三方诊断修复均已闭环。当前只有**独立正式oracle/scenario登记WU**仍在推进；不得重做已完成修复或重新裁决用户决定。本文尚不是登记WU final closeout pass。
 
-本文件是下一位总控的执行入口。全程中文。先核实现场，再按用户已经批准的修复目标推进；不要求用户重述裁决或授权。
+全程中文。接手先实时核Git、controller、artifact及托管runner状态，按既有授权从下一个未完成gate继续，不等待用户重复批准。
 
-## 最新执行入口（2026-10-02 用户改排程）
+## 1. 现场状态与当前入口
 
-当前入口以 `docs/gateflow/upload-material-unified-repair-control-20261002.md` 为准：所有剩余修复合为一个 WU，gpt-6-sol plan/implement/fix，MiMo/ds-flash 并行双审，全部 slices 与 aggregate 完成后才 PR review。修复 WU 完成后另行做 upload_material 完整 CLI CI 和 oracle/scenario 登记；不把它们并入本 WU。以下六个候选 WU、findings 后交接停机和旧审查路由为历史准备，不能覆盖这条最新指令。
+- 唯一workspace：`/Users/leo/workspace/dayu-agent-r`；唯一开发分支：`codex/upload-material-oracle`；remote：`github`；既有draft PR：`https://github.com/noho/dayu-agent-r/pull/197`。
+- 当前本地HEAD `d054c0fece08d3fb5b3ed71207b3dbb8ec7f5d8c` 是登记accepted plan checkpoint；远端/PR最后核实HEAD `22eca6c313005e3c5185340f2d6b535ab2583056` 是已完成诊断WU closeout。本地ahead属于正在进行的门禁checkpoint，不能据此reset或覆盖成果。接手必须fresh核，不能把这些旧快照当当前事实。
+- main本地/tracking最后核为 `fac32ecbff9bfe792b63ee9667c8697826b631f4`，本轮未动。不得改main、新branch/worktree/clone/detached，所有计划/实现/fix/docs/tests/commit/push都只能此主工作树此分支；review同树只读，用普通文件快照/manifest固定版本。
+- 登记真源：`docs/gateflow/upload-material-registry-control-20261004.md`、`docs/gateflow/upload-material-registry-plan-20261003.md`（accepted SHA `896762824e3de6ba7538fc710fc13fb8a5f33838788dd84335b7efea7f3ddad0`）、`docs/gateflow/upload-material-registry-plan-review-acceptance-20261004.md`。
+- 当前gate：**accepted slice commit**。集中fix03及补充差异双复审均actual0；root核38/54tools、CANARY、输入SHA、owner与十四新增负例。七项REG-C01–C04/REG-R01–R03最终全为已修复、无新实质finding。真源 `docs/gateflow/upload-material-registry-code-review-acceptance-20261004.md`、`docs/gateflow/evidence/upload-material-registry-20261003/code-review-proof.json`，当前同版180tests/type0/原-m strict0，旧166是历史快照。
+- 唯一S1新增1oracle/19predicates/799formal；现7oracles/2127scenarios，旧6/1328与自有proof全值保。14候选final SHA身份详见boundedproof。MiMo33742/DS1387均已终态及双保，**目前无active runner**，不得重poll。
+- 下一入口：accepted S1 commit→aggregate deepreview→checkpoint→push并核既有draftPR197→正式PR review→checkpoint/final push→draft-PR-pass→final closeout。仍未宣WU完成；普通gate通过继续，不重做已闭环产品/原802或重裁用户决定。
 
-## 0. 当前状态和下一入口
+## 2. 已完成工作及来源
 
-- PR197 review findings已闭环：F1 rejected；F2/F3/F4/F5/F6/F7已修且完成各自finalcloseout。F5单完整S1 `0d8de8cb`，aggregate/source `3d0d390206739a8bb255dee517b5b61bfc4497b6`，正式PRreview `4a370a4fd8ca82de8f01fa8ea58aa83ddd92b192` 已普通push/readback。最后将本prompt/closeout与候选准备保全的提交为docs-only；接手必须实时核最终本地/tracking/live/PR同head，不能把source审查OID当最终Githead。main本地/tracking/远端为`fac32ecbff9bfe792b63ee9667c8697826b631f4`，保持未动。
-- 最终本地验证1747受影响回归passed/3既有warnings/fullpyright0/23改动生产coverage≥80；MiMo/MiMo-flash双审及root独裁通过；不是最终真实CLI/oracle/scenarios/全PR846逐行验收，GHchecks当时无记录。
-- **接手执行入口：G1身份/参数统一正式计划**，见下文6个候选WU与已裁17标签。无需再fix本轮已闭环findings；所有成立新增修复即时登记artifact。当前无活动runner/产品writer，后续工作未实施。
-- 最终真源 `docs/gateflow/pr-197-review-findings-final-closeout-20261002.md`。停点是本轮findings闭环后的交接；下一位依据这里现成授权继续后续队列，不等待用户重复裁决。
+| 工作 | 最新真源 | 状态 |
+|---|---|---|
+| #198 | `docs/gateflow/issue-198-final-closeout-20260929.md` | 已闭环；授权closeout comment已发布，不重复 |
+| 旧PR197 F2–F7含F5 | `docs/gateflow/pr-197-review-findings-final-closeout-20261002.md` | 已闭环；F1 rejected |
+| 全部原17修复＋O20F02 | `docs/gateflow/upload-material-unified-repair-final-closeout-20261003.md` | 一个WU三个完整行为slices已闭环 |
+| upload_material真实CLI CI | `docs/reviews/upload-material-cli-postrepair-root-adjudication-20261003.md`、旧public bundle | 802次实际selected执行已完成及总控裁决；不是pytest替代 |
+| 第三方转换器诊断通道 | `docs/gateflow/upload-material-converter-diagnostics-final-closeout-20261004.md` | 单S1独立WU已闭环；22eca closeout |
+| 正式oracle/scenario登记 | 当前registry controller/plan/implementation/code adjudication | 唯一S1 code review循环已通过，待checkpoint/aggregate/PR/closeout，不宣WU闭环 |
 
-本轮按用户最新指令，在闭环 PR review findings 后停下交接。下一位先执行剩余上传修复队列，不重新裁决或重做已闭环 findings。`docs/upload_material_oracle_celibration_handoff_prompt_2.md` 是早期逐项裁决交接，不能替代本文件。
+真实CI和登记始终在产品修复WU完成后独立开展，不能追溯并入同WU。原六候选WU只是历史准备，不恢复该排程；22个独立residual不是自动新增scope。
 
-## 1. 唯一工作树、分支及权限
+## 3. runner路由与执行约束
 
-- 只能在 `/Users/leo/workspace/dayu-agent-r` 的 `codex/upload-material-oracle` 上做计划、实现、修复、文档、验证、暂存、提交、推送。Git remote=`github`；PR=`https://github.com/noho/dayu-agent-r/pull/197`。
-- 不改main，不新建branch/worktree/clone/detached。审查在同一主树只读进行，用普通文件快照/manifest核版本，不创建隔离Git工作树。只保留既有archive分支，不把其旧版本当开发入口。
-- 普通commit/push和更新已有draftPR已授权；用户手工merge。不得merge、approve、mark-ready、request-review；#198授权closeout评论已经发布，不重复。
-- 写入前读取AGENTS.md、gateflow/sub-agents技能、`git status --short --branch`/当前分支/log，核本地/远端同名branch/PR head及main。盘点任何dirty成果，保全后继续；发现错误分支或无法证明所属范围时先停止写入，不能reset/强推覆盖。
-- 接手必须实时读回，不能沿用旧MERGEABLE/测试/head；最终产品源码未变化的docs-only提交可以明确证明后复用对应审查/验证，不能把旧真实CLIrun偷偷改成新head。
+必须使用 `$sub-agents` **通过runner子进程派发Agent**；总控自己负责裁决；**gpt-6-sol负责plan / implement / fix，MiMo (`mimo`) / ds-flash (`ds-flash`)两路同时独立并行review**。不用内置spawn或tmux替代，不自行换实现provider。
 
-## 2. 子Agent路由（用户明确要求）
+每调用显式 `--cwd /Users/leo/workspace/dayu-agent-r`，全新label/Claude instance、preflight/no-persist、独立output/stderr，Codex另独立last-message。Codex总控每runner一次独立exec_command require_escalated，不复合后台&或bypassPermissions。Claude用stream-json完整逐tool轨迹（preflight默认JSON格式可显式改，但需记录）。实际模型以event metadata可见值为准，不从CANARY/profile/请求provider猜backend。
 
-使用 `$sub-agents`，通过 `codex-agent-run` / `claude-agent-run` runner子进程派发，不用内置spawn或tmux替代。总控自己负责裁决；gpt-6-sol负责plan / implement / fix；MiMo / MiMo-flash两路同时独立并行review，Kimi已被用户替换。历史Kimi/DS证据原样保留，不代表当前默认路由。
+每shell固定绝对workspace，测试/反例输出只独占 `workspace/tmp/`；临时变量先赋值再消费，不能把inline env assignment与同命令参数扩展混用造成根目录fixture。写作用域不重叠才并发；实现与其review串行。
 
-所有调用显式传入 `--cwd /Users/leo/workspace/dayu-agent-r`，全新独立output / stderr（Codex另last-message），全新label/Claude instance、no-persist、每轮preflight及当前校验文件。Codex总控每runner一次独立exec_command require_escalated；不复合后台&、不bypassPermissions。先核skill及runnerhelp/catalog，profile只能记录请求配置；实际runtime/provider/model以本次event证据为准，事件不暴露model则记unknown，不能从当前配置或进程补造。
+总控必须核真实managed外层exit/结构化终态、全部toolresults、非零/failed/error/compound遮蔽/truncation及恢复、stderr、CANARY逐字、实际来源/源码SHA/验证，而后自行裁决；自报和两票不能代验。JSONL以 `bytes.split(b'\n')`，不能用Unicode splitlines。未terminal不验收；已terminal不重poll；不ps/pgrep/kill-0，不因为慢或输出暂静杀进程/重派。有限重试按skill及用户授权。
 
-Claude审查使用stream-json全新.jsonl独立output（允许覆盖preflight默认JSON格式，需登记）；本轮实际runner支持原生 --effort medium，下次先核help后使用，不更改全局profile或把它当速度保证。
+## 4. Gateflow slice规则与修复登记
 
-主控取得managed外层exit和完整结构化终态后，检查全部toolresults、每个非零/failed/error及恢复、stderr、当前校验文件实际读取、fullreport、实际源码/输入SHA和验证结果，自行采纳/部分采纳/驳回；不能以作者自报或两个reviewer一致代验。JSONL仅用LF分隔，Unicode分隔符可在合法JSON字符串内。未terminal不能验收，已terminal不重poll；不能仅因慢/0bytes杀进程或重派，不用ps/pgrep/kill-0判活。遵循skill有限重试和用户既有角色限制，不无限重试或自行换实现路由。
+严格 `$gateflow`：以可验证**行为增量**切slice，数量尽量少，每slice值得一次implementation+review成本；不按模块/文件/owner/技术层机械切分。默认避免超过3个，超过在plan说明为何不能合并；上游/用户明确阈值优先。planreview须挑战过多切分、能否合并、gate成本及future-slice越界。
 
-并发只允许不冲突写入范围；同一产品writer与依赖它的review串行，两review同步只读同版。artifact当前状态必须与真实managed结果一致。
+当前登记只有一个完整S1，C01/C02和双审新增成立finding在**一次集中fix**处理，不为字段/文件/文案nit再开slice或小fix循环。成立修复立即写durable artifact/controller再fix，防压缩丢失。scope外只分类residual，不顺带实施。
 
-## 3. Gateflow slice 原则（必须遵守）
+不能跳过、合并或重排gate：goal→plan→planreview/fix/re-review→acceptedplancommit→implementation→code review/fix/re-review→accepted slicecommit→aggregate deepreview/fix/re-review→accepted deepreviewcommit→ready-to-open-draft-PR→push→核既有draftPR197→PR review/fix/re-review→accepted PRreviewcommit→push→draft-PR-pass→finalcloseout。用户要求所有slices完成后才PRreview。每acceptedfinding都须已修/同版复审，未修/部分修/证据失效不得pass；延期需既有授权、owner/destination/非阻塞理由，不发明新目标。
 
-- 以可验证行为增量切slice，不按模块、文件、owner或技术层机械拆分；数量尽量少，每slice值得一次implementation+review门禁成本。
-- 默认避免一个WU超过3个implementation slices；超过须在plan说明为何不能合并/减少。用户、design_doc或上游handoff明示不同阈值时优先，不把3机械当硬上限。
-- planreview必须审过多/机械切分/能否合并/gate成本是否超过风险/是否诱发提前做future-slice工作。
-- 每slice写id/objective/outcome、allowedfiles、依赖、exactchanges、函数/调用链/数据流/状态/异常/不变量、非目标、验证断言、completion/stop。只能当前approvedslice，除非acceptedplan明确一次可做多个。
-- scope外项登记residual/deferred，不顺带实施；所有成立修复立刻登记artifact及主队列/controller，防上下文压缩丢失。集中实施同一完整行为的必要修复，不为单个字段、finding、文案nit另切slice或独立fixloop。
-- 减少slice不能跳过/合并/重排技能的完整GateOrder：已有goal confirmation有效→plan→planreview/fix/re-review→acceptedplancommit→implementation→code deepreview/fix/re-review→accepted slicecommit→aggregate deepreview/fix/re-review→accepted deepreviewcommit→ready-to-open-draft-PR→push→核已有draftPR197（既有create draft PR状态复用，不另建PR）→PR deepreview/fix/re-review→accepted PRreviewcommit→push→draft-PR-pass→finalcloseout。每个acceptedfinding必须已修并经复审验证，无blocking问题且风险已分类才pass。
-
-## 4. 当前成果和历史证据
-
-- 本组review findings最终closeout：`docs/gateflow/pr-197-review-findings-final-closeout-20261002.md`。
-- F2/F3/F4/F6/F7历史最终closeout：`docs/gateflow/pr-197-findings-except-f5-final-closeout-20261001.md`（accepted PRreviewc305067f）。
-- F5 acceptedplan：`docs/gateflow/pr-197-r1-f5-plan-v2-20261001.md`；code最终裁决：`docs/gateflow/pr-197-r1-f5-s1-code-review-final-adjudication-20261002.md`；aggregate：`docs/gateflow/pr-197-r1-f5-aggregate-review-final-adjudication-20261002.md`；正式PR review：`docs/reviews/pr-197-review-20261002-root-adjudication.md`。
-- 同版验证原件：`docs/gateflow/evidence/pr197-f5-aggregate-fix-20261002/`；正式PR冻证：`docs/gateflow/evidence/pr197-f5-prreview-20261002/`；final推送读回/旧prompt逐字档案/七preparedSHA：`docs/gateflow/evidence/pr197-final-handoff-20261002/`。
-- 当前prompt是完整替换，不仅追加状态；旧prompt全字节与SHA可从该目录`handoff-prompt3-before-replacement.json`逆解，旧内容不再是执行入口。
-
-#198真源 `docs/gateflow/issue-198-final-closeout-20260929.md`：整项已完成，既有评论 `https://github.com/noho/dayu-agent-r/issues/198#issuecomment-5893424991` 已授权发布并读回；PR保留唯一Closes #198，用户merge后预计关闭。旧分叉已处理，不重新整合/创建工作树。分支/裁决保全审计 `docs/gateflow/upload-material-local-branch-integration-audit-20260930.md`、`docs/gateflow/upload-material-local-evidence-preservation-20260930.json`。
-
-早期候选、capacity失败、inprogress及旧controller活动块都是历史，已保存，不可拿它们覆盖最终accepted源码。完整历史队列见 `docs/gateflow/upload-material-issue-198-repair-sequence-20260928.md`，本轮PR裁决controller见 `docs/gateflow/pr-197-review-repair-adjudication-20260930.md`。精确用户裁决/独立artifact优先，旧oracle观察不是当前行为。
-
-## 5. 仍待实施的队列与依赖
-
-当前剩17个原upload修复标签：
-
-`O05F01 O06F01 O07F01 O07F02 O09F01 O10F01 O12F01 O13F01 O14F01 O15F01 O16F01 O17F01 O18F01 O21F01 O22F01 O25F01 O33F01`。另`O20F02`受控XBRL。已有O03、安全点号元数据、O11、O20F01、O04/O23资产规划及#198不重复实施。22个独立residual候选不是自动新增scope。
-
-建议按6个完整行为WU组织，下面都是准备proposal，尚无acceptedplan/implementation；必须绑定最终代码正式planreview，不能把17label逐个切17slice：
-
-| 候选WU | 修复标签/目标 | 依赖 | 准备artifact |
-| --- | --- | --- | --- |
-| G1身份/参数统一 | O05/O06/O07×2/O09/O10/O16/O17，共8标签 | 起点 | upload-material-g1-consolidated-plan-preparation-20261001.md |
-| G2 primary与角色指纹 | O25；多文件exact唯一primary、单文件默认、全材料Docling；filename→Docling共享owner函数 | G1接口固定后接续，具体硬依赖以正式plan核准 | upload-material-g2-primary-plan-preparation-20261001.md |
-| G3 文件状态和覆盖 | O12/O13/O14/O15/O18，共5标签 | G2 | upload-material-g3-state-plan-preparation-20261001.md |
-| G4 内容拒绝及真实文件标签 | O21/O22 | 与company独立事实一致，可按无冲突范围并行 | upload-material-g4-content-plan-preparation-20261001.md |
-| G5 真实并发幂等 | O33 | G1–G3 | upload-material-g5-concurrency-plan-preparation-20261001.md |
-| G6受控XBRL | O20F02，跨平台依赖/taxonomy/有效instance | 正式P0依赖与计划核准 | upload-material-xbrl-p0-plan-preparation-20261001.md |
-
-表中artifact均位于docs/gateflow。旧prepare源码/静态locator可过时，不能直接当当前accepted计划。首入口G1（既有goal授权有效，不重新逐项裁决）：读取主队列对8标签的正式裁决与准备，gpt-6-sol在最终head给最少完整行为slice正式计划，MiMo/MiMo-flash并行planreview，主控裁决后实施。后续分组/并发必须由实际owner/依赖/写入范围决定，不为节省门禁跨未批准WU顺带做。
-
-## 6. 不得漂移的既有用户裁决
+## 5. 不得漂移的既有用户裁决
 
 - material各action的form/material_name均按已裁必须指定，去首尾空白后material_name最多240个Unicode码点，上传启动前统一拒超限，不能截断或新增Unicode归一化规则。form类别处理用同一owner函数，各入口调用。material year可选且域1800–2100；filing域不同，不机械同步。period六枚举、tool显式空值与缺省差异及year/period组合按正式artifact，不补猜默认。
 - public internal_document_id输入移除仅针对已裁公开入口，不能删durable字段；document_id如果提供只能owner一致断言，不可改owner生成规则。action/files/ID预检、deleted的无文件规则与首错顺序按已裁artifact同步各入口，不在一个CLI局部补丁。
@@ -90,30 +58,20 @@ Claude审查使用stream-json全新.jsonl独立output（允许覆盖preflight默
 - CNInfo新下载filing_date用中国本地披露日；历史日期迁移另议。process单独运行；directCLI无FinsAgent产物正确；UI Print/log分开；SIGINT协作优雅退出，保持真实终态。
 - F5可信同公司年度证据可以推断则推断；仍失败继续A、单列B不确定不猜。当前窗口为query_window ∩ union(period_windows)，local可信年度不受窄remote窗误滤；同sourceID核心事实冲突保原ValueError。fresh schema不兼容旧库；unknown>0整体FAILURE/jobFAILED/CLI1，取消优先130；已发布A保留。不得复刻已拒绝的consumer fallback/typed KeyError补偿或52周/过渡财年/超窗新网络推断。
 
-仍有一个已登记、非产品语义finding的完整PR卫生项：`tests/fins/fixtures/sec_earnings_repair_v1/workpapers/final-pyright.log:4` 原始stdout末尾空行使 `git diff --check main...HEAD` exit2。本轮scoped/cached检查0不能代表完整PR检查0。destination仍为最终PR/CI收口，owner是验证证据资产；处理时保留原字节及SHA，例如可逆证据封装和所有有效引用一致更新，不能trim原证据伪造旧输出。本轮不为这个旧nit新切slice/重开已通过业务gate。
+## 6. 证据与登记边界
 
-## 7. 受控XBRL的下一步
+- 原802source target `79977b3a52f8566672e3b462f786f1004dfd3f89`，public双副本：`workspace/evidence/upload-material-cli-20261003-79977b3a-01/public`、`output/evidence-backup/upload-material-cli-20261003-79977b3a-01/public`；20518文件完整双SHA保全已完成。nine matrix 631/118/35/5/4/2/2/1/4，765 CLI/35 Service/2 shell；Service实际32failure/3success。原观察永久保持，不能改pass/fail。
+- 新focused source六测量：5次真实PDF CLI（default/quiet/log/error/SIGINT）＋1次独立真实受控XBRL CLI，native11仅支持；PDF actualparent8009dirty、registrationtarget22eca、旧802target799分别保。新public双副本 `workspace/evidence/upload-material-diagnostics-focused04-22eca6c3-01/public` 与 `output/evidence-backup/upload-material-diagnostics-focused04-22eca6c3-01/public`，40文件（sole scan catalog39）；一次最终secret/canary内存probe扫描后冻结，不再导出/改扫/重写。
+- 五live measured产品源码SHA严格复用，11份reviewed_source是固定历史anchor元数据，不live guard授权的tests/README。登记schema1保持、新proofv6只去顶层registry_status/readiness_proof；旧proof各自single-own-element array opaque全值保，历史refs保，不兼容旧schema读取。
+- 当前正式候选808assignment=802+6；9有意除外→799formal。六维最终当前proof35/61/0/166/217/50，不用此前调整前45；PAIR66。coverage/ref/oldvalue机器检查与19条自由文本规则/纯观察人工审查均必需；不能把helper绿色、聚合exit或log样本数量/hash当业务oracle。
+- 沿用31份逐项用户裁决及明确补充作为authority；review共识不产生authority。`docs/gateflow/evidence/upload-material-registry-20261003/`是bounded登记证据，不将原Raw巨量入Git或污染纯观察report；private归档只核receipt、不给public coverage信用。
+- 原202608 evidence目录用户确认删除：历史缺口保持，不造旧Raw/hash/输入，不重复索要备份。后续新来源supersede lineage保在新run。
+- 子Agent完整stream/scratch/原件双private保全在 `workspace/evidence/upload-material-post-ci-gate-runners-20261003/private` 及 `output/evidence-backup/upload-material-post-ci-gate-runners-20261003/private`，0600/0700；receipt与root审计在各自scratch，不能丢未提交裁决/失败原件。
 
-当前准备记录Docling2.127/core2.96、arelle-release未安装、upstream4437仍OPEN的证据只是当时快照；接手实时核准。目标补受控依赖/taxonomy配置，验证真实有效XBRL instance走完整CLI→Docling→manifest；macOS arm64/Linux x64/Windows x64 fresh标准安装、locks/pipcheck及真实资源可用性须正式验证，不用静态配置冒P0pass。未安装Arelle/未验证runner资源/样本失败不是XBRL已完成。
+## 7. 剩余范围与最终汇报
 
-preparation指出Model load状态应在同进程unload前取，finally卸载后不能再读；taxonomy coverage用实际结构化load attempt/ZIP入口，不把URI集合或文本log冒称逐element覆盖。既有有效样本是candidate，必须真实验证。确认上游缺陷则保留失败证据并按既有授权向上游提issue，不重复现有4437。技术设计须正式planreview，不自动采用prepare所有建议。
+本次原产品修复与真实CLI CI已完成；**当前登记唯一S1已经code review循环通过，剩accepted S1 commit、aggregate、PR197及final closeout gates**。Linux/Windows XBRL真实部署验证已获用户明确延期，macOS先验收；历史CNInfo日期迁移/原22residual assigned to later work unit；Docling抽取准确性归上游existing #4437，不本地修抽取算法。不宣跨平台通过，不自动启动后续scope。
 
-## 8. 全部修复后真实CLI CI / oracle / scenarios
+所有成果进入同一PR197，普通commit/push已授权，用户手工merge。不得merge/approve/markready/requestreviewers/newPR/外部issue/comment/删branch；#198授权评论已发布：`https://github.com/noho/dayu-agent-r/issues/198#issuecomment-5893424991`，不重复。最终fresh核local/tracking/live branch/PR head/main与tests/checks，不能沿用旧MERGEABLE。产品同bytes的治理commit可明确复用对应测试/审查，但不能重标旧CIrun为新HEAD。
 
-权威 `docs/gateflow/upload-material-repair-scope-and-ci-closeout-20261001.md`；准备 `docs/gateflow/upload-material-final-ci-refreshed-preparation-20261001.md`。后者仅49 pinned/36补源/36label/92 AST surface静态核准的准备，没有真实CLIrun，没有改registry。
-
-旧 `/Users/leo/workspace/.dayu-cli-ci/upload-material-calibration-20260818-mNeTId` 用户确认删除，保历史Raw/input/lineage gap；不能伪造原hash、原Raw或把新来源说成旧资料，也不再重复索要已确认删除的备份。保留31份正式逐项裁决；新公开来源/recipes/hash按既有授权受控选择，保新run与supersede lineage。不得读取未授权私有样本。
-
-全部修复后：
-
-1. 最终local/remote/PR同head，重新枚举actual parser的14leaf/full mandatory矩阵与输入corpus/policy。旧160不是上限；prepared locator不能替代当前parser。
-2. 运行真实CLI：独立stdout/stderr、PTYscreen、FS/log/process、publicstorage及适用Host/SQLite有界证据；保源、输入、command、env、真实exit、same-run Docling JSON、publication manifest及lineage。pytest不代CLI。
-3. 对UM-O01–36逐项按已accepted裁决验实际行为；异常抽取准确性归上游；直接CLI不虚构FinsAgent产物；进程/交互/日志语义按真实观察。
-4. 正式material oracle/scenarios、双向coverage proof和readiness。当前registries的Fins只有download/upload_filing，material无正式项；全局已有init/prompt/interactive不表示material覆盖。读取scenario.command顶层，不错查scope.command。
-5. 不原地改accepted registry版本；产品/parser/corpus/policy/oracle改变必须证明旧证据同字节有效，否则最终head新run。docs-only提交明确证明产品不变，不重标旧run。GH MERGEABLE/pytest全绿/字面ready都不代上述验收。
-
-仓库目前无一键完整campaign validator；utils/cli_ci_run_observation仅观察工具。需要最小typed辅助工具时遵循用户目标/正式门禁，不由root绕gpt-6-sol直接补实现。
-
-## 9. 完成报告和保全
-
-每gate记录artifact、裁决、验证、finding最终状态、residual分类及下个未完成gate；gate通过自动继续，不为已完成普通gate重新要许可。用户新stop或真实blocking问题优先。阶段汇报简要实际进展，不以在途/selfreport报完成。所有开发成果和裁决进入同一PR197，最终普通push后实时核local/tracking/live remote/PR head/main；root不merge。全部剩余修复和最终CLI/registry验收完成后才报告总目标完成，剩余范围/风险明确列出。
+最终closeout必须真实写变化/验证/文档/findings最终状态/风险owner/PR及issue关联/下个入口；登记finalpass后更新本文到闭环状态，再向用户报告全部授权任务完成。旧prompt原字节已保 `workspace/tmp/upload-material-registry-20261003/handoff-prompt3-before-20261004.json`，Git历史亦保；不把旧17项排程或旧停机约束当当前入口。
