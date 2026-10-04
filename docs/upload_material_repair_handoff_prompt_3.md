@@ -7,12 +7,11 @@
 ## 1. 现场状态与当前入口
 
 - 唯一workspace：`/Users/leo/workspace/dayu-agent-r`；唯一开发分支：`codex/upload-material-oracle`；remote：`github`；既有draft PR：`https://github.com/noho/dayu-agent-r/pull/197`。
-- 当前本地HEAD `d054c0fece08d3fb5b3ed71207b3dbb8ec7f5d8c` 是登记accepted plan checkpoint；远端/PR最后核实HEAD `22eca6c313005e3c5185340f2d6b535ab2583056` 是已完成诊断WU closeout。本地ahead属于正在进行的门禁checkpoint，不能据此reset或覆盖成果。接手必须fresh核，不能把这些旧快照当当前事实。
+- 当前本地HEAD `238b28980dcbdebc4b44005d75003f00a4a719da` 是登记accepted S1 checkpoint（计划checkpoint d054c0fe仍保留）；远端/PR最后核实HEAD `22eca6c313005e3c5185340f2d6b535ab2583056` 是已完成诊断WU closeout。本地ahead属于正在进行的门禁checkpoint，不能据此reset或覆盖成果。接手必须fresh核，不能把这些旧快照当当前事实。
 - main本地/tracking最后核为 `fac32ecbff9bfe792b63ee9667c8697826b631f4`，本轮未动。不得改main、新branch/worktree/clone/detached，所有计划/实现/fix/docs/tests/commit/push都只能此主工作树此分支；review同树只读，用普通文件快照/manifest固定版本。
 - 登记真源：`docs/gateflow/upload-material-registry-control-20261004.md`、`docs/gateflow/upload-material-registry-plan-20261003.md`（accepted SHA `896762824e3de6ba7538fc710fc13fb8a5f33838788dd84335b7efea7f3ddad0`）、`docs/gateflow/upload-material-registry-plan-review-acceptance-20261004.md`。
-- 当前gate：**accepted slice commit**。集中fix03及补充差异双复审均actual0；root核38/54tools、CANARY、输入SHA、owner与十四新增负例。七项REG-C01–C04/REG-R01–R03最终全为已修复、无新实质finding。真源 `docs/gateflow/upload-material-registry-code-review-acceptance-20261004.md`、`docs/gateflow/evidence/upload-material-registry-20261003/code-review-proof.json`，当前同版180tests/type0/原-m strict0，旧166是历史快照。
-- 唯一S1新增1oracle/19predicates/799formal；现7oracles/2127scenarios，旧6/1328与自有proof全值保。14候选final SHA身份详见boundedproof。MiMo33742/DS1387均已终态及双保，**目前无active runner**，不得重poll。
-- 下一入口：accepted S1 commit→aggregate deepreview→checkpoint→push并核既有draftPR197→正式PR review→checkpoint/final push→draft-PR-pass→final closeout。仍未宣WU完成；普通gate通过继续，不重做已闭环产品/原802或重裁用户决定。
+- 当前gate：**accepted deepreview commit**。MiMo58181/DS95625两必要差异复审 actual0，root核全部证据并双保。REG-AG01 与原 C04/R01 同 crash 合同的 focused 漏调用已修复，全部8项 accepted 最终已修，无新 finding。源 helper23cb69c2/tests1fc88191；186 tests/full pyright0/批准 -m strict0，合法 whole proof 字节不变。
+- 总裁决与真源：`docs/gateflow/upload-material-registry-aggregate-review-acceptance-20261004.md`、`docs/gateflow/evidence/upload-material-registry-20261003/aggregate-review-proof.json`。当前没有在途 runner，不得重poll已退出句柄。下一入口：accepted deepreview checkpoint→push并核既有draft PR197→精确OID正式双路PR review→checkpoint/final push→draft-PR-pass→final closeout。无新slice或新业务目标，尚不宣WU闭环。
 
 ## 2. 已完成工作及来源
 
@@ -23,7 +22,7 @@
 | 全部原17修复＋O20F02 | `docs/gateflow/upload-material-unified-repair-final-closeout-20261003.md` | 一个WU三个完整行为slices已闭环 |
 | upload_material真实CLI CI | `docs/reviews/upload-material-cli-postrepair-root-adjudication-20261003.md`、旧public bundle | 802次实际selected执行已完成及总控裁决；不是pytest替代 |
 | 第三方转换器诊断通道 | `docs/gateflow/upload-material-converter-diagnostics-final-closeout-20261004.md` | 单S1独立WU已闭环；22eca closeout |
-| 正式oracle/scenario登记 | 当前registry controller/plan/implementation/code adjudication | 唯一S1 code review循环已通过，待checkpoint/aggregate/PR/closeout，不宣WU闭环 |
+| 正式oracle/scenario登记 | 当前registry controller/plan/implementation/code adjudication | 唯一S1及aggregate循环已通过，待aggregate checkpoint/PR/closeout，不宣WU闭环 |
 
 真实CI和登记始终在产品修复WU完成后独立开展，不能追溯并入同WU。原六候选WU只是历史准备，不恢复该排程；22个独立residual不是自动新增scope。
 
@@ -70,7 +69,7 @@
 
 ## 7. 剩余范围与最终汇报
 
-本次原产品修复与真实CLI CI已完成；**当前登记唯一S1已经code review循环通过，剩accepted S1 commit、aggregate、PR197及final closeout gates**。Linux/Windows XBRL真实部署验证已获用户明确延期，macOS先验收；历史CNInfo日期迁移/原22residual assigned to later work unit；Docling抽取准确性归上游existing #4437，不本地修抽取算法。不宣跨平台通过，不自动启动后续scope。
+本次原产品修复与真实CLI CI已完成；**当前登记唯一S1与aggregate循环已通过，全部8项已修复；剩aggregate checkpoint、PR197正式审查及final closeout gates**。Linux/Windows XBRL真实部署验证已获用户明确延期，macOS先验收；历史CNInfo日期迁移/原22residual assigned to later work unit；Docling抽取准确性归上游existing #4437，不本地修抽取算法。不宣跨平台通过，不自动启动后续scope。
 
 所有成果进入同一PR197，普通commit/push已授权，用户手工merge。不得merge/approve/markready/requestreviewers/newPR/外部issue/comment/删branch；#198授权评论已发布：`https://github.com/noho/dayu-agent-r/issues/198#issuecomment-5893424991`，不重复。最终fresh核local/tracking/live branch/PR head/main与tests/checks，不能沿用旧MERGEABLE。产品同bytes的治理commit可明确复用对应测试/审查，但不能重标旧CIrun为新HEAD。
 

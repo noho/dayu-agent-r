@@ -57,3 +57,23 @@ MiMo43261与DS29298均actual0/structured success，完整57/47tools及CANARY/全
 MiMo33742/DS1387 actual0，root双核/双保/无新finding，7项accepted最终已修。最新code-review-acceptance与boundedcode-review-proof记录180/type0/strict0，旧166历史原件保。current gate=accepted slice commit；next=aggregate deepreview，不能普通gate停机。
 
 Checkpoint首尝试root路径解析strip错误actual1，allowlist在stage前拒绝，无Git/文件丢失。改用porcelain -z保前导状态字节，精确范围重新核；setup recovery记录保于scratch。
+
+## S1 checkpoint实际成功 / aggregate在准备
+
+accepted S1 commit 238b28980dcbdebc4b44005d75003f00a4a719da，29文件精确stage/cachedcheck0/commit0，main不动。currentgate=aggregate deepreview，next核两独立报告及root裁决→accepted deepreview commit。代码/registry字节与最终180/type0/strict0完全一致，不新实施slice、不重跑原802。
+
+## aggregate双审结束 / 集中fix
+
+2978/91004 actual0，root完整核/双保；新REG-AG01 focused无真实强杀facts仍可标crash的API反例独立复现成立，已先durable登记aggregate-adjudication。C04/R01整体部分修，其余5项保持已修；currentgate=aggregate fix，gpt-6-sol集中一个owner缺口及六focused负例，后必要差异双复审。原产品/数据不变，不新slice、不重裁用户规则。
+
+## aggregatefix候选终态 / 差异复审准备
+
+66642actual0/turn.completed，root核141events59commands、CANARY、两个finalsourceSHA、六负例和当前186/type0/strict0。测试路径首actual4纠正并保，全部必要验证当前字节绑定；只有helper/tests变化，原14候选其它12sameSHA。currentgate=aggregate re-review；AG01及C04/R01仍待终裁。next差异双复审→accepted deepreviewcommit→PR197。
+
+## aggregate差异ds-flash终态核收
+
+95625 actual0/structured success，40901events54tools配对齐全，三指令actual全文逐行精确核、CANARYmatch、冻结14SHA/两delta/rootqueue/fix证据完整。六独立API负例及合法wholeproof exact；新finding无，AG01/C04/R01建议已修。root纠正peer继承报告全文claim、inner cd/ls compoundmask/非原子Write偏差，必要整体证据无缺口，审计/双保已保。MiMo58181仍在途；currentgate=aggregate re-review，不能单路放行。rootqueue保持冻结不改。
+
+## aggregate deepreview loop 总控通过
+
+双复审58181/95625实际0，root完整审计与双保、8项最终已修，aggregate-review-acceptance及bounded aggregate-review-proof已写。186/type0/批准-m strict0最终源保持；当前gate=accepted deepreview commit，下一入口ready-to-open-draft-PR→push→核既有draft197→正式PR review→accepted checkpoint/finalpush→draft-PR-pass→final closeout。普通gate通过继续，main/业务裁决/产品不变。

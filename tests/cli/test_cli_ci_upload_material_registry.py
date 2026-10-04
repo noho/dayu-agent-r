@@ -633,6 +633,28 @@ def test_current_frozen_sources_pass_owner_contract_without_product_rerun() -> N
         'new_predicates':19,'source_cli802':802,'source_focused':6}
 
 
+@pytest.mark.parametrize('case',registry.FOCUSED_CASES)
+def test_focused_formal_crash_requires_actual_sigkill_facts(case: str) -> None:
+    """合同：六个真实focused终态均不能凭scenario标签获得crash信用。参数：case；返回：无；异常：断言失败。"""
+    repo=Path(__file__).resolve().parents[2]
+    evidence=repo/'docs/gateflow/evidence/upload-material-registry-20261003'
+    before=repo/'workspace/tmp/upload-material-unified-repair-20261002/post-wu-preparation'
+    scenarios=registry.load_registry(repo/'docs/cli_ci_scenarios.json')
+    scenario_id='upload_material.diagnostics-focused04.'+case
+    matching=[_map(value) for value in _list(_map(scenarios)['scenarios'])
+              if _map(value)['scenario_id']==scenario_id]
+    assert len(matching)==1 and matching[0]['path_kind']!='crash'
+    matching[0]['path_kind']='crash'
+    report=registry.validate_upload_material_registration(
+        registry.load_registry(repo/'docs/cli_ci_oracles.json'),scenarios,
+        registry.load_registry(evidence/'mandatory-assignment.json'),registry.load_registry(evidence/'authority-index.json'),
+        repo/registry.PUBLIC_ROOTS[0],repo/registry.PUBLIC_ROOTS[1],repo/registry.PUBLIC_ROOTS[2],repo/registry.PUBLIC_ROOTS[3],
+        registry.load_registry(evidence/'focused-source.json'),repo,registry.REGISTRATION_TARGET,
+        registry.load_registry(before/'cli_ci_oracles.json.before'),registry.load_registry(before/'cli_ci_scenarios.json.before'))
+    assert report.errors==('assignment.diagnostics-focused04.'+case+'.path_kind: crash requires SIGKILL facts',)
+    assert report.proof is None
+
+
 def test_source_bundle_identity_cannot_be_relabelled_with_scenarios() -> None:
     """合同：即使六scenario同步伪造bundle，source运行身份仍锁原件。参数：无；返回：无；异常：断言失败。"""
     repo=Path(__file__).resolve().parents[2]

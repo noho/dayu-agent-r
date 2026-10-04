@@ -636,9 +636,9 @@ def _focused_claims(case: str, argv: tuple[str,...], parser: dict[str,JsonValue]
     }
 
 
-def _crash_path_kind(process: Mapping[str,JsonValue], path_kind: JsonValue, location: str) -> None:
-    """按实际外部强杀终态约束分类。参数：process、path_kind、location；返回：无；异常：分类与原件不符。"""
-    killed=process.get('signal')==signal.SIGKILL and process.get('harness_deadline_kill') is False and process.get('actual_wait_returncode')==-signal.SIGKILL
+def _crash_path_kind(process: Mapping[str,JsonValue] | None, path_kind: JsonValue, location: str) -> None:
+    """按实际外部强杀终态约束分类。参数：process为原件事实或无此事实、path_kind、location；返回：无；异常：分类与原件不符。"""
+    killed=process is not None and process.get('signal')==signal.SIGKILL and process.get('harness_deadline_kill') is False and process.get('actual_wait_returncode')==-signal.SIGKILL
     if killed:
         _equal(path_kind,'crash',location+'.path_kind')
     elif path_kind=='crash':
@@ -861,6 +861,7 @@ def _assignment_guard(assignment: dict[str, JsonValue], scenarios: JsonValue, au
                 _crash_path_kind(process,scenario['path_kind'],location)
             else:
                 _equal(row['actual_wait'],True,location+'.actual_wait')
+                _crash_path_kind(None,scenario['path_kind'],location)
         else:
             if 'upload_material.'+identity in scenario_map:
                 raise RegistryValidationError(location+': no-credit row present in formal registry: '+reason)
