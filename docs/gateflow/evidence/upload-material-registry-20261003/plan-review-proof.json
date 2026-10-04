@@ -1,0 +1,211 @@
+{
+  "gate": "plan re-review",
+  "root_decision": "pass; acceptedplancommit then sole S1 implementation",
+  "head": "22eca6c313005e3c5185340f2d6b535ab2583056",
+  "plan": {
+    "path": "docs/gateflow/upload-material-registry-plan-20261003.md",
+    "bytes": 65562,
+    "sha256": "896762824e3de6ba7538fc710fc13fb8a5f33838788dd84335b7efea7f3ddad0"
+  },
+  "goal_sha256": "3b19f1e9a5832635acb5d4cb72f22e33db036e64b93f31f1fe81f6b3bb61b4d8",
+  "findings": [
+    {
+      "id": "REG-PLAN-R01",
+      "decision": "accepted",
+      "status": "已修复",
+      "same_version_reverified": true
+    },
+    {
+      "id": "REG-PLAN-R02",
+      "decision": "accepted",
+      "status": "已修复",
+      "same_version_reverified": true
+    },
+    {
+      "id": "REG-PLAN-R03",
+      "decision": "accepted",
+      "status": "已修复",
+      "same_version_reverified": true
+    },
+    {
+      "id": "REG-PLAN-R04",
+      "decision": "accepted",
+      "status": "已修复",
+      "same_version_reverified": true
+    }
+  ],
+  "reports": [
+    {
+      "route": "mimo",
+      "report": {
+        "path": "docs/reviews/plan-review-20261004-102841.md",
+        "sha256": "0f65c43d4e13175407d143cf71f2b1c698b47f27b5635efe121b9619d198bae4",
+        "bytes": 5545
+      },
+      "outer_exit": 0,
+      "agent_status": "completed",
+      "tool_trace": "complete",
+      "required_evidence": "complete",
+      "result_status": "accepted",
+      "canary_status": "match",
+      "tools": 38,
+      "retention": {
+        "bytes": 505164,
+        "sha256": "146f81a6e703aae6b3037ea1215cc0c92416dc85ec588b89913add71a2f24347",
+        "primary": "workspace/evidence/upload-material-post-ci-gate-runners-20261003/private/registry-plan-rereview-mimo-03.tar.gz",
+        "backup": "output/evidence-backup/upload-material-post-ci-gate-runners-20261003/private/registry-plan-rereview-mimo-03.tar.gz",
+        "equal": true
+      }
+    },
+    {
+      "route": "ds-flash",
+      "report": {
+        "path": "docs/reviews/plan-review-20261004-102025.md",
+        "sha256": "f39f044a41a0a77bb656bfa77ab63800a127b28bb7d43317de250bf571882cb6",
+        "bytes": 6227,
+        "created": "O_EXCL exclusive create with local system clock timestamp"
+      },
+      "outer_exit": 0,
+      "agent_status": "completed",
+      "tool_trace": "complete",
+      "required_evidence": "complete",
+      "result_status": "accepted",
+      "canary_status": "match",
+      "tools": 33,
+      "retention": {
+        "bytes": 1866570,
+        "sha256": "0432647b93f42b5e73d6bb9e9a378403bc6df61369ad918635617b3486bfb0c3",
+        "primary": "workspace/evidence/upload-material-post-ci-gate-runners-20261003/private/registry-plan-rereview-ds-flash-03.tar.gz",
+        "backup": "output/evidence-backup/upload-material-post-ci-gate-runners-20261003/private/registry-plan-rereview-ds-flash-03.tar.gz",
+        "equal": true
+      }
+    }
+  ],
+  "root_schema_clarification": {
+    "historical_ready_proofs": "single-element JSON array [original own registry proof exact value]",
+    "reason": "routine nonblocking envelope lock; same own-proof fullvalue contract, no new goal or compatibility"
+  },
+  "root_verification": {
+    "source_identities": [
+      {
+        "path": "workspace/tmp/upload-material-unified-repair-20261002/post-wu-preparation/oracle-authority-index.json",
+        "bytes": 4915,
+        "sha256": "8610ff1259a04f35a0dd21a474a52f63a3b8113752d35bebb63b2bfccc1b4521"
+      },
+      {
+        "path": "workspace/tmp/upload-material-converter-diagnostics-20261003/code-review-freeze-03/manifest.json",
+        "bytes": 2721,
+        "sha256": "f4ed84914c5a91a11753742ecd3136617188f695f56fb099b2d7cf761841b73c"
+      },
+      {
+        "path": "docs/gateflow/evidence/upload-material-converter-diagnostics-20261003/code-review-proof.json",
+        "bytes": 9735,
+        "sha256": "a736639f30bcb6c0624c6f7a81c2cd3b83c6bc5fc0892e32f632bd424c94f3a9"
+      },
+      {
+        "path": "workspace/tmp/upload-material-converter-diagnostics-20261003/root-code-fix-sol-01-retention.json",
+        "bytes": 559,
+        "sha256": "785f683849143b82cb6b07f916a36a3fad27f886f8e392711185040ecde61eb0"
+      },
+      {
+        "path": "docs/gateflow/upload-material-registry-plan-adjudication-20261004.md",
+        "bytes": 5752,
+        "sha256": "2f2e04b1bb26fa97a1655fa4ea1d761547fe5d2837ded226f5aab1205747b982"
+      },
+      {
+        "path": "workspace/tmp/upload-material-registry-20261003/root-plan-fix-queue-02.json",
+        "bytes": 436,
+        "sha256": "9e9eb9996c1a94511086792c13f83a0f773ac71414878aae84f4239f1099e90d"
+      },
+      {
+        "path": "workspace/tmp/upload-material-registry-20261003/goal-confirmation.md",
+        "bytes": 3397,
+        "sha256": "3b19f1e9a5832635acb5d4cb72f22e33db036e64b93f31f1fe81f6b3bb61b4d8"
+      },
+      {
+        "path": "docs/reviews/plan-review-20261004-092824.md",
+        "bytes": 8892,
+        "sha256": "b2f33f9ae7c94bf7b6bf49c9b17f0076ebc6b766bb7282c6b5dfd71e1cbb5f63"
+      },
+      {
+        "path": "docs/reviews/plan-review-20261004-093805.md",
+        "bytes": 11253,
+        "sha256": "04efe7c929e53f13c102d2ae488de9f49e8b1343697c579a7430fc0088581d10"
+      },
+      {
+        "path": "dayu/runtime/process_diagnostics.py",
+        "bytes": 21774,
+        "sha256": "47ed4b45a44aed212fe440347488f8bd7eded30088c81a9f2f68e5ad61c12f3d"
+      },
+      {
+        "path": "dayu/runtime/log.py",
+        "bytes": 20268,
+        "sha256": "52ba9519fd7cc1f78fc9aad91160cc3230651e1ccbd10af800771b041b46ecef"
+      },
+      {
+        "path": "dayu/fins/pipelines/docling_process_converter.py",
+        "bytes": 46098,
+        "sha256": "d8847701fc17c3f825afedb3c3138dabfa03e8050961545ee227819b22075864"
+      },
+      {
+        "path": "dayu/runtime/interruptible_process.py",
+        "bytes": 34083,
+        "sha256": "1a1ae877d60f4a483df75dac8158d0c69821e3d28b18d45c5a63448845961e91"
+      },
+      {
+        "path": "dayu/runtime/macos_sandbox.py",
+        "bytes": 6986,
+        "sha256": "0794d0390706941f76d9250a02c7503aaeaaf35a08420fe27dccf5f890dd3a54"
+      }
+    ],
+    "old_registries": {
+      "oracles": {
+        "path": "docs/cli_ci_oracles.json",
+        "sha256": "8b3c21a4f177c79148fa7f9cf37f15e3c3b4492f407c57b3836df0e739209662",
+        "bytes": 198824,
+        "records": 6,
+        "proof_version": 5
+      },
+      "scenarios": {
+        "path": "docs/cli_ci_scenarios.json",
+        "sha256": "b50c4fff5fb8881ca61b58f22f9f402387809572c3fa264d84f81fe1176c8c90",
+        "bytes": 5224040,
+        "records": 1328,
+        "proof_version": 5
+      }
+    },
+    "both_old_json_full_values_match_before": true,
+    "all_agent_tools_audited": true,
+    "instruction_and_canary_actual": true,
+    "new_material_findings": [],
+    "blocking_open_questions": []
+  },
+  "boundary": {
+    "slices": 1,
+    "new_predicates": 19,
+    "old_oracles": 6,
+    "old_scenarios": 1328,
+    "old_current_predicates": 105,
+    "registration_not_implemented": true,
+    "old802_target": "79977b3a52f8566672e3b462f786f1004dfd3f89",
+    "focused_parent_dirty": "8009ba4e100081fd1b56f64ddf5bc0c42a06e808",
+    "registration_target": "22eca6c313005e3c5185340f2d6b535ab2583056"
+  },
+  "residuals": [
+    {
+      "classification": "covered by later approved slice",
+      "owner": "sole registry S1",
+      "destination": "implementation/export/helper/tests/proofs/manual semantics code review"
+    },
+    {
+      "classification": "assigned to later work unit",
+      "owner": "original followup owners",
+      "destination": "Win/Linux XBRL/history-date/22 residual/historical unavailable lineage"
+    },
+    {
+      "classification": "tracked by existing issue",
+      "owner": "Docling upstream",
+      "destination": "#4437 extraction quality"
+    }
+  ]
+}
