@@ -1,0 +1,143 @@
+{
+  "gate": "draft-PR-pass",
+  "created": "2026-10-04T16:04:18.851614+08:00",
+  "decision": "pass",
+  "PR": {
+    "baseRefName": "main",
+    "baseRefOid": "fac32ecbff9bfe792b63ee9667c8697826b631f4",
+    "headRefName": "codex/upload-material-oracle",
+    "headRefOid": "640d868fb8ac5c834be551ad2040193b53a72615",
+    "isDraft": true,
+    "mergeStateStatus": "CLEAN",
+    "mergeable": "MERGEABLE",
+    "state": "OPEN",
+    "statusCheckRollup": [],
+    "url": "https://github.com/noho/dayu-agent-r/pull/197"
+  },
+  "accepted_PR_review_commit": "640d868fb8ac5c834be551ad2040193b53a72615",
+  "accepted_deepreview_commit": "3f44c82a6a0e6aafde28cf7d919c51c884212979",
+  "formal_review_head": "3f44c82a6a0e6aafde28cf7d919c51c884212979",
+  "source_bytes_same_as_reviewed": true,
+  "final_push": {
+    "managed": 70208,
+    "actual_exit": 0,
+    "remote": "github",
+    "force": false
+  },
+  "local_tracking_live_remote_PR_exact_head": true,
+  "main_unchanged_local_and_live_remote": true,
+  "actual_checks": [],
+  "checks_meaning": "empty does not mean GitHubCIgreen",
+  "executions": [
+    {
+      "name": "post-push-head",
+      "argv": [
+        "git",
+        "rev-parse",
+        "HEAD"
+      ],
+      "cwd": "/Users/leo/workspace/dayu-agent-r",
+      "actual_wait": true,
+      "actual_exit": 0,
+      "stdout_sha256": "ed044a22e825c251780b58b4775c184eb50bb9916a784f6cfdc9b501dee5720b",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "post-push-tracking",
+      "argv": [
+        "git",
+        "rev-parse",
+        "github/codex/upload-material-oracle"
+      ],
+      "cwd": "/Users/leo/workspace/dayu-agent-r",
+      "actual_wait": true,
+      "actual_exit": 0,
+      "stdout_sha256": "ed044a22e825c251780b58b4775c184eb50bb9916a784f6cfdc9b501dee5720b",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "post-push-live-remote",
+      "argv": [
+        "git",
+        "ls-remote",
+        "github",
+        "refs/heads/main",
+        "refs/heads/codex/upload-material-oracle"
+      ],
+      "cwd": "/Users/leo/workspace/dayu-agent-r",
+      "actual_wait": true,
+      "actual_exit": 0,
+      "stdout_sha256": "9a23e2bb11f3742bcb9c8ccd9934d702a0769cd4c2e8e5a4f1f462e7298d2028",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "post-push-main",
+      "argv": [
+        "git",
+        "rev-parse",
+        "main"
+      ],
+      "cwd": "/Users/leo/workspace/dayu-agent-r",
+      "actual_wait": true,
+      "actual_exit": 0,
+      "stdout_sha256": "80c0c60e2e84393673bc5a7ac8adf55f2160c9678c1f62ba3a2691eb7999fbde",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "post-push-status",
+      "argv": [
+        "git",
+        "status",
+        "--porcelain",
+        "-z"
+      ],
+      "cwd": "/Users/leo/workspace/dayu-agent-r",
+      "actual_wait": true,
+      "actual_exit": 0,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "post-push-source-diff",
+      "argv": [
+        "git",
+        "diff",
+        "--name-only",
+        "3f44c82a6a0e6aafde28cf7d919c51c884212979",
+        "HEAD",
+        "--",
+        "dayu",
+        "tests",
+        "utils",
+        "constraints",
+        "docs/cli_ci.md",
+        "docs/cli_ci_oracles.json",
+        "docs/cli_ci_scenarios.json"
+      ],
+      "cwd": "/Users/leo/workspace/dayu-agent-r",
+      "actual_wait": true,
+      "actual_exit": 0,
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "post-push-PR197",
+      "argv": [
+        "gh",
+        "pr",
+        "view",
+        "197",
+        "--repo",
+        "noho/dayu-agent-r",
+        "--json",
+        "headRefOid,baseRefOid,headRefName,baseRefName,state,isDraft,mergeable,mergeStateStatus,statusCheckRollup,url,body"
+      ],
+      "cwd": "/Users/leo/workspace/dayu-agent-r",
+      "actual_wait": true,
+      "actual_exit": 0,
+      "stdout_sha256": "d84c7b1a5901c8314c7555da31e40fbba64ab04b52d6bd52022ad8a53b56f1bc",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "next_entry": "final closeout"
+}
