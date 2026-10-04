@@ -1,0 +1,13 @@
+# Converter diagnostics aggregate deepreview：总控最终裁决
+
+2026-10-04T00:25:02.124232+00:00
+
+**aggregate deepreview pass，下一 accepted deepreview commit。** 一个S1已在785bf8d5fa28bfe0fdc4fd036bb609883a46baff提交；整个WU相对79977b3a共有39文件，freeze manifest92dacddda9276c64aaf4cddcb60624775c8bcc678db66a9a240f1d22620f0dcd；11产品/测试/README精确字节同最终code审，明确继承而非全量重读。
+
+DS2301实际0/37126events61tools、MiMo72903实际0/5800events72tools，完整轨迹/canary/39Gitblob/11source与必要真实调用已root复核。报告080734 SHA f32e2b5c46112c24cd88ed5faf259f65bff0a1d57d89173e2b19c1840a066a9b 与081443 SHA770fe7e3e202dae97b47a734ce01429c22a91fe864a39941225eb88c919d0adf；两路均无materialfinding/OQ。实际工具错误保，MiMoexit127措辞实际两工具均1；已恢复必要来源。
+
+完整指令审查由root补齐：子审当前只有MiMo显式AGENTS前50行、DS无显式完整读迹，skills新读亦不可证明；不冒子Agent完成这部分、不依据actorpass自放行。root实际完整读取128行AGENTS与本轮用户完整约束、gateflow/deepreview/subagents，并核AGENTS base/HEAD/worktree同字节，新增签名/docstring、owner依赖、storage/LLM边界、README和测试/type/coverage条件成立。对子审任务结论因此仅采纳源代码/调用链事实；整体完整门禁由root补充审查后独裁通过。详情root-aggregate-instruction-read-correction-01及root-aggregate-independent-observations-01私有原件，不能把旧DS audit的accepted全文结论原封泛化。
+
+CLI→Service→Fins upload共用转换器；download/upload_filing两个真实converter调用点未变协议。worker双fd到退出私有、scope只恢复logger；parent close之后验证descriptor，再按现有日志owner投递诊断并原生命周期清理，普通诊断坏不新增成功gate；rawunknown INFO不猜等级；XBRL原work/deny-default权限不扩。普通日志emit/目的地不改，README职责准确。材料成功仍Docling+manifest，四acceptedcodefinding已修复双复审，没有新fix/re-review需求。
+
+196当前affected/type0、其它六文件与三wholecov≥80/318raw0incomplete/真实fresh04 PDF/XBRL/SIGINT均依S1 source-bound proof复用，不宣current889/890全跑；802旧799campaign冻结，focused04独立新lineage，不恢复已删旧Raw。无新代码变化，不重复昂贵测试。跨平台用户延期/上游质量/其它更强诊断保证原owner分类不变；registry单独后续WU，候选plan排除。root保持main/唯一开发branch/既有draft197。
