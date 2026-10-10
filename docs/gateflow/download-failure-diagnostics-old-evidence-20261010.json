@@ -1,0 +1,65 @@
+{
+  "scope": "existing published source metadata via Dayu repository only; no discovery/download/recovery",
+  "create_directories": false,
+  "source_count": 45,
+  "canonical_metadata_sha256": "d2010a1e5d30be536dd4f24b1cc53490ddeec68a875ad2e03d611e712b502b50",
+  "failed_documents": [
+    {
+      "document_id": "fil_cn_76fad62cd9ba3141f4cab67e8e2a0c220a93a27d",
+      "published_meta": "missing",
+      "published_locator": null,
+      "original_reason": null,
+      "original_dates": null
+    },
+    {
+      "document_id": "fil_cn_04fb4018812cf15ca633495dbd9fcac3cb033378",
+      "published_meta": "missing",
+      "published_locator": null,
+      "original_reason": null,
+      "original_dates": null
+    },
+    {
+      "document_id": "fil_cn_307f1a281919204de1d3c3cb5f95322463819734",
+      "published_meta": "missing",
+      "published_locator": null,
+      "original_reason": null,
+      "original_dates": null
+    },
+    {
+      "document_id": "fil_cn_2a0ebbf2c2935ee14a39fec8744d626853a68424",
+      "published_meta": "missing",
+      "published_locator": null,
+      "original_reason": null,
+      "original_dates": null
+    },
+    {
+      "document_id": "fil_cn_d56f9cdc70daa5174522111629889cc74795448b",
+      "published_meta": "missing",
+      "published_locator": null,
+      "original_reason": null,
+      "original_dates": null
+    },
+    {
+      "document_id": "fil_cn_535e021474217e2750d6063d7046a72ead52f7b5",
+      "published_meta": "missing",
+      "published_locator": null,
+      "original_reason": null,
+      "original_dates": null
+    },
+    {
+      "document_id": "fil_cn_a44583fc024459f5a22ee4eed537dea35e8882ac",
+      "published_meta": "missing",
+      "published_locator": null,
+      "original_reason": null,
+      "original_dates": null
+    },
+    {
+      "document_id": "fil_cn_4043a094cd9d2292c378e6b6c8f1856868291372",
+      "published_meta": "missing",
+      "published_locator": null,
+      "original_reason": null,
+      "original_dates": null
+    }
+  ],
+  "record_sha256": "6d42a496a0fd4bbfce4a320025e77fa92758098c380ba51513a689527f15fce7"
+}
