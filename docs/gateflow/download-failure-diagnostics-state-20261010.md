@@ -4,7 +4,7 @@
 - Branch：fix/download-failure-diagnostics-20261010
 - Base：c65c2aa28fae9c47ad947783d63f7559db7768c4
 - Goal confirmation：pass，用户委托巡检线于本会话明确确认；职责收窄已写入 goal artifact。
-- Current gate / next entry point：accepted slice commit
+- Current gate / next entry point：accepted deepreview commit
 - Issue：N/A，未指定 GitHub issue，不创建或评论 issue。
 - 权限边界：只修 Dayu 完整下载失败诊断；新观测及实际下载缺陷扩范围需巡检线确认；merge 等未授权。
 
@@ -193,3 +193,11 @@ session7945真实exit0/turn.completed/canary match，唯一新增文档行、38�
 ## S1 review loop最终pass
 
 两路最终R2复审真实exit0/canary match，C1/C2/R1/R2均已修；DS一次closed stdin原样保留及部分轨迹采纳条件见slice-adjudication。Root独立证据完整、风险已分类、无blocking question；下一accepted slice commit，之后aggregate。不声明work unit完成。
+
+## Accepted S1 checkpoint
+
+真实commit命令exit0；12df3862f979a1fcf7b28300573f45322d21361b，仅48个本unit文件。首次cached whitespace失败已记录并恢复。下一aggregate base c65完整分支，57文件冻结SHA9754e45c9a27255bbd3358d5f3455675425d6c9ab8555a77ca1b56989ed3b99e；不声明draft或完成。
+
+## Aggregate loop结案
+
+双路真实exit0/turn.completed/canary match，完整57文件同版本。DS DF-01 rejected-with-reason（历史实施时点而非最终身份）；所有warnings恢复/报告计数更正见aggregate-adjudication。fix及re-review明确no-op pass；无accepted未修。下一accepted deepreview commit。
