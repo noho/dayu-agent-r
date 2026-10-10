@@ -8,6 +8,7 @@ import pytest
 
 from dayu.contracts.json_value import JsonValue
 from dayu.fins import ingestion_runtime as runtime
+from dayu.fins.direct_events import FinsDownloadPublicSummary
 from dayu.fins.direct_events import FinsResultStatus
 from dayu.fins.download_contract import (
     FinsDownloadDocumentDisposition, FinsDownloadDocumentResult, FinsDownloadEffectiveFilters,
@@ -43,10 +44,15 @@ def _summary(*, known: int = 1, unknown: int = 1, id_chars: int = 8) -> FinsDown
 
 @pytest.mark.parametrize(("known", "unknown", "id_chars"), ((0, 0, 8), (0, 1, 8), (11, 11, 8), (12, 12, 240)))
 def test_public_and_durable_share_unknown_budget_and_conserve_counts(known: int, unknown: int, id_chars: int) -> None:
-    """参数为极值结果；返回无；真实 ID、双 omission、4096 或终态不守恒时断言失败。"""
+    """公共与持久摘要共用未知报告预算并保持计数守恒。
+
+    参数：known 为已确认候选数；unknown 为未知报告数或元数据未知标志；id_chars 为候选身份码点长度。
+    返回：无（None）。
+    异常：AssertionError，既定断言或测试前提不满足时抛出。
+    """
     summary = _summary(known=known, unknown=unknown, id_chars=id_chars)
     durable = summary.to_json_summary(max_json_chars=_BUDGET)
-    public = runtime._public_download_summary(summary)
+    public = FinsDownloadPublicSummary.from_result_summary(summary)
     validate_download_json_summary(durable)
     assert len(json.dumps(durable, ensure_ascii=False, sort_keys=True)) <= _BUDGET
     assert durable["uncertain_reports"] == [r.to_json_value() for r in public.uncertain_reports]

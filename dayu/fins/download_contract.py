@@ -45,6 +45,9 @@ FINS_DOWNLOAD_PUBLIC_MAX_DOCUMENT_ROWS: Final[int] = 10
 FINS_DOWNLOAD_PUBLIC_MAX_TEXT_CHARS: Final[int] = 240
 """下载 public contract 中单个用户可读文本字段的字符上限。"""
 
+FINS_DOWNLOAD_SUMMARY_MAX_JSON_CHARS: Final[int] = 4096
+"""下载 durable 摘要与 public 未知报告共用的 JSON 字符预算。"""
+
 _YEAR_PATTERN: Final[re.Pattern[str]] = re.compile(r"^\d{4}$")
 _YEAR_MONTH_PATTERN: Final[re.Pattern[str]] = re.compile(r"^\d{4}-\d{1,2}$")
 _FULL_DATE_PATTERN: Final[re.Pattern[str]] = re.compile(r"^\d{4}-\d{1,2}-\d{1,2}$")
@@ -1115,6 +1118,7 @@ __all__: tuple[str, ...] = (
     "FINS_DOWNLOAD_MAX_TICKER_CHARS",
     "FINS_DOWNLOAD_PUBLIC_MAX_DOCUMENT_ROWS",
     "FINS_DOWNLOAD_PUBLIC_MAX_TEXT_CHARS",
+    "FINS_DOWNLOAD_SUMMARY_MAX_JSON_CHARS",
     "FinsDownloadDateRange",
     "FinsDownloadDocumentDisposition",
     "FinsDownloadDocumentResult",

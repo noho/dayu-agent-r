@@ -96,6 +96,7 @@ from dayu.fins.direct_event_text import (
     wait_failed_hint,
 )
 from dayu.fins.download_contract import (
+    FinsDownloadRequest,
     FinsDownloadDocumentDisposition,
     FinsDownloadDocumentResult,
     FinsDownloadEffectiveFilters,
@@ -3506,8 +3507,8 @@ def test_public_download_json_preserves_cn_coverage_and_sec_empty_array() -> Non
      uncertain_reports=())
     sec_summary = _typed_download_summary(canonical_ticker="AAPL", skipped_ids=("fil-sec",))
 
-    cn_json = ingestion_runtime._public_download_summary(cn_summary).to_json_value()
-    sec_json = ingestion_runtime._public_download_summary(sec_summary).to_json_value()
+    cn_json = FinsDownloadPublicSummary.from_result_summary(cn_summary).to_json_value()
+    sec_json = FinsDownloadPublicSummary.from_result_summary(sec_summary).to_json_value()
     cn_round_trip = json.loads(json.dumps(cn_json, ensure_ascii=False))
     sec_round_trip = json.loads(json.dumps(sec_json, ensure_ascii=False))
 
@@ -5989,6 +5990,10 @@ async def test_direct_download_projects_typed_provider_failure_without_raw_cause
     assert result.download.omitted_count == 0
     assert result.download.terminal_disposition is FinsDownloadTerminalDisposition.FAILED
     assert result.failure is not None
+    assert result.download_result is not None
+    _assert_empty_request_download(result.download_result, build_fins_download_request(ticker="AAPL"))
+    assert result.to_download_diagnostics_json_value()["failed_documents"] == []
+    assert result.exit_code == 1
     assert result.failure.transport_category is FinsDownloadTransportCategory.CONNECTION
     assert result.failure.reason_code is None
     assert result.failure.to_json_value()["reason_code"] is None
@@ -6262,7 +6267,7 @@ def test_failed_operation_accepts_only_valid_processed_document_dispositions() -
         retry_hint="请检查并修复工作区来源状态后重试。",
         reason_code=FinsDownloadFailureReason.UNSAFE_PUBLICATION,
     )
-    zero = FinsDownloadPublicSummary(
+    zero = FinsDownloadResultSummary(
         source=FinsDownloadSource.SEC,
         canonical_ticker="AAPL",
         effective_filters=FinsDownloadEffectiveFilters(
@@ -6276,17 +6281,17 @@ def test_failed_operation_accepts_only_valid_processed_document_dispositions() -
         failed_count=0,
         document_rows=(),
         missing_periods=(),
-        omitted_count=0,
+
         terminal_disposition=FinsDownloadTerminalDisposition.FAILED,
-     uncertain_reports=(), uncertain_count=0, omitted_uncertain_count=0)
-    downloaded = FinsDownloadPublicDocument(
+     uncertain_reports=(), uncertain_count=0, )
+    downloaded = FinsDownloadDocumentResult(
         document_id="fil-confirmed", form_or_period="10-K", filing_date=None,
         report_date=None, covered_fiscal_periods=(),
         disposition=FinsDownloadDocumentDisposition.DOWNLOADED,
         reason_category=None, reason_message=None,
-        artifact_locator="portfolio/AAPL/filings/fil-confirmed",
+        artifact_locator=PurePosixPath("portfolio/AAPL/filings/fil-confirmed"),
     )
-    failed = FinsDownloadPublicDocument(
+    failed = FinsDownloadDocumentResult(
         document_id="fil-failed", form_or_period="10-K", filing_date=None,
         report_date=None, covered_fiscal_periods=(),
         disposition=FinsDownloadDocumentDisposition.FAILED,
@@ -6313,16 +6318,16 @@ def test_failed_operation_accepts_only_valid_processed_document_dispositions() -
             details=(),
             error_kind=FinsErrorKind.STORAGE,
             error_message=failure.safe_message,
-            download=download,
+            download_result=download,
             failure=failure,
         )
-        assert result.download is download
+        assert result.download_result is download
         with pytest.raises(ValueError, match="requires public failure"):
             replace(result, failure=None)
         with pytest.raises(ValueError, match="only valid for FAILURE"):
             replace(result, status=FinsResultStatus.SUCCESS, exit_code=FINS_RESULT_EXIT_SUCCESS)
         with pytest.raises(ValueError, match="cannot contain cancelled disposition"):
-            replace(result, download=replace(zero, terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED))
+            replace(result, download_result=replace(zero, terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED))
 
 
 def test_initial_typed_download_job_saves_structured_zero_summary_and_safe_message(tmp_path: Path) -> None:
@@ -6785,7 +6790,7 @@ async def test_direct_upload_stream_copies_typed_warnings_exactly(
 
 
 def test_direct_result_builder_callsites_are_exact_and_never_rewrite_warnings() -> None:
-    """direct builder 必须只有 upload/generic 两个显式 warning producer。
+    """direct builder 只由 upload 和 generic 受理 owner 显式提供 warning。
 
     Args:
         无。
@@ -6808,7 +6813,7 @@ def test_direct_result_builder_callsites_are_exact_and_never_rewrite_warnings() 
         and isinstance(node.func, ast.Name)
         and node.func.id == "_direct_result_event"
     ]
-    assert len(calls) == 2
+    assert len(calls) == 4
     warning_expressions: list[str] = []
     for call in calls:
         warning_keyword = next(
@@ -6818,6 +6823,26 @@ def test_direct_result_builder_callsites_are_exact_and_never_rewrite_warnings() 
         assert warning_keyword is not None
         warning_expressions.append(ast.unparse(warning_keyword.value))
     assert set(warning_expressions) == {"summary.warnings", "()"}
+    # 受理 owner 预构造请求、公共拒绝失败和取消三态；warning 仍只来自两个原 owner。
+    owner_warning_expressions: dict[str, list[str]] = {}
+    for function in ast.walk(syntax_tree):
+        if not isinstance(function, ast.FunctionDef):
+            continue
+        owned_calls = [
+            node for node in ast.walk(function)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "_direct_result_event"
+        ]
+        if owned_calls:
+            owner_warning_expressions[function.name] = [
+                ast.unparse(keyword.value)
+                for call in owned_calls for keyword in call.keywords
+                if keyword.arg == "warnings"
+            ]
+    assert owner_warning_expressions == {
+        "_emit_direct_result": ["()", "()", "()"],
+        "_direct_upload_terminal_events": ["summary.warnings"],
+    }
 
     builders = [
         node
@@ -10414,32 +10439,92 @@ def test_cancel_and_activate_share_observation_lock_without_timing_sleep(
     assert executor.operations == []
 
 
-def test_activation_submit_failure_terminalizes_prepared_observation(
-    tmp_path: Path,
-) -> None:
-    """activation submit failure 必须把 prepared observation 转为 FAILED。"""
+@pytest.mark.parametrize("original_error", (OSError("submit unavailable"), ValueError("unexpected activation error")))
+def test_activation_submit_failure_terminalizes_prepared_observation(tmp_path: Path, original_error: Exception) -> None:
+    """验证提交失败保留原异常身份，并安全收口已准备的下载 observation。
 
-    workspace_root = tmp_path / "fins-workspace"
-    runtime = _build_ingestion_runtime(
-        workspace_root,
-        executor=_FailingSubmitExecutor(OSError("submit unavailable")),
-    )
-    handle = runtime.prepare_observed_download(
-        build_fins_download_request(ticker="AAPL"),
-        cancellation_token=_NeverCancelledToken(),
-    )
+    参数：tmp_path 为隔离运行时工作区根；original_error 为执行器提交时注入的
+        OSError 或 ValueError 实例。
+    返回：无（None）。
+    异常：AssertionError，异常对象身份、空下载事实或安全终态不满足断言时抛出；
+        未抛出 original_error 对应类型时 pytest.raises 使测试失败。
+        注入的 OSError 或 ValueError 由 pytest.raises 捕获，不是成功测试向外传播的异常。
+    """
 
-    with pytest.raises(OSError):
+    runtime = _build_ingestion_runtime(tmp_path / "fins-workspace", executor=_FailingSubmitExecutor(original_error))
+    request = build_fins_download_request(ticker="0700", form_types=("FY", "H1"), start="2018-01-01", end="2026-10-10", rebuild_local_artifacts=True)
+    handle = runtime.prepare_observed_download(request, cancellation_token=_NeverCancelledToken())
+    with pytest.raises(type(original_error)) as raised:
         runtime.activate_observation(handle)
+    assert raised.value is original_error
     snapshot = asyncio.run(runtime.poll_observation(handle))
-
     assert snapshot.status is FinsObservationStatus.FAILED
+    result = snapshot.result
+    assert result is not None and result.status is FinsResultStatus.FAILURE and result.exit_code == 1
+    assert result.error_kind is FinsErrorKind.EXECUTION
+    full = result.download_result
+    assert full is not None and full.terminal_disposition is FinsDownloadTerminalDisposition.FAILED
+    _assert_empty_request_download(full, request)
+    assert result.to_download_diagnostics_json_value()["failed_documents"] == []
+    assert result.failure is not None
+    assert result.failure.to_json_value() == {
+        "classification": "execution", "source": request.source.value, "transport_category": None,
+        "message": "下载执行未产生完整终态结果", "retry_hint": "请重新发起下载；若持续失败，请检查运行环境。", "reason_code": None,
+    }
+    assert str(original_error) not in str(result.to_download_diagnostics_json_value())
+
+
+def _assert_empty_request_download(summary: FinsDownloadResultSummary, request: FinsDownloadRequest) -> None:
+    """核对空下载结果仍保留原请求且不虚构候选。
+
+    参数：summary 为typed 空下载结果；request 为原始下载请求。
+    返回：无（None）。
+    异常：AssertionError，既定断言或测试前提不满足时抛出。
+    """
+
+    assert summary.source is request.source and summary.canonical_ticker == request.normalized_ticker.canonical
+    assert summary.effective_filters == FinsDownloadEffectiveFilters(request.form_types, None if request.date_range.start_bound is None else request.date_range.start_bound.isoformat(), None if request.date_range.end_bound is None else request.date_range.end_bound.isoformat(), request.overwrite_existing, request.rebuild_local_artifacts)
+    assert (summary.discovered_count, summary.downloaded_count, summary.skipped_count, summary.rejected_count, summary.failed_count, summary.uncertain_count) == (0, 0, 0, 0, 0, 0)
+    assert summary.document_rows == () and summary.uncertain_reports == ()
+
+
+def test_cancel_prepared_download_preserves_request_and_never_submits(tmp_path: Path) -> None:
+    """准备阶段取消应保留请求并禁止提交执行。
+
+    参数：tmp_path 为隔离测试工作区。
+    返回：无（None）。
+    异常：AssertionError，既定断言或测试前提不满足时抛出。
+    """
+
+    executor = _HoldingExecutor()
+    runtime = _build_ingestion_runtime(tmp_path / "fins-workspace", executor=executor)
+    request = build_fins_download_request(ticker="0700", form_types=("FY", "H1"), start="2018-01-01", end="2026-10-10", overwrite_existing=True)
+    handle = runtime.prepare_observed_download(request, cancellation_token=_NeverCancelledToken())
+    cancelled = asyncio.run(runtime.cancel_observation(handle))
+    runtime.activate_observation(handle)
+    polled = asyncio.run(runtime.poll_observation(handle))
+    assert executor.operations == []
+    for snapshot in (cancelled, polled):
+        assert snapshot.status is FinsObservationStatus.CANCELLED
+        result = snapshot.result
+        assert result is not None and result.status is FinsResultStatus.CANCELLED and result.exit_code == 130
+        assert result.download_result is not None
+        assert result.download_result.terminal_disposition is FinsDownloadTerminalDisposition.CANCELLED
+        _assert_empty_request_download(result.download_result, request)
+        assert result.failure is None
+        assert result.to_download_diagnostics_json_value()["failed_documents"] == []
+
 
 
 def test_unexpected_activation_exception_terminalizes_prepared_observation(
     tmp_path: Path,
 ) -> None:
-    """prepared observation 存在后 activation 非预期异常不得遗留 PENDING。"""
+    """prepared observation 存在后 activation 非预期异常不得遗留 PENDING。
+
+    参数：tmp_path 为隔离测试工作区。
+    返回：无（None）。
+    异常：AssertionError，既定断言或测试前提不满足时抛出。
+    """
 
     workspace_root = tmp_path / "fins-workspace"
     runtime = _build_ingestion_runtime(
@@ -10461,9 +10546,18 @@ def test_unexpected_activation_exception_terminalizes_prepared_observation(
         error_kind=FinsErrorKind.EXECUTION,
         fallback_message=None,
     )
+    assert snapshot.result.download_result is None and snapshot.result.download is None
+    assert snapshot.result.failure is None
+    with pytest.raises(ValueError, match="download_result"):
+        snapshot.result.to_download_diagnostics_json_value()
     activation_error_message = snapshot.result.error_message
     assert activation_error_message is not None
     assert "Observation" not in activation_error_message
+
+    assert snapshot.result.download_result is None and snapshot.result.download is None
+    assert snapshot.result.failure is None
+    with pytest.raises(ValueError, match="requires download_result"):
+        snapshot.result.to_download_diagnostics_json_value()
 
 
 def test_observed_producer_without_result_uses_helper_failure_message(
@@ -12898,6 +12992,19 @@ def test_sec_integrity_failure_public_and_job_conservation(tmp_path: Path, scena
             assert result.download.rejected_count == result.download.failed_count == (0 if scenario == "postrepair" else 1)
             assert result.download.document_rows[0].document_id == _INTEGRITY_FIRST
             assert result.download.omitted_count == 0
+            assert result.download_result is not None
+            failed = result.to_download_diagnostics_json_value()["failed_documents"]
+            assert isinstance(failed, list)
+            rows = [row for row in result.download_result.document_rows if row.disposition is FinsDownloadDocumentDisposition.FAILED]
+            assert len(failed) == len(rows) == result.download_result.failed_count
+            for projected, row in zip(failed, rows, strict=True):
+                assert isinstance(projected, dict)
+                assert projected == {
+                    "document_id": row.document_id, "form_or_period": row.form_or_period,
+                    "filing_date": row.filing_date, "report_date": row.report_date,
+                    "covered_fiscal_periods": list(row.covered_fiscal_periods), "disposition": row.disposition.value,
+                    "reason_category": row.reason_category, "reason_message": row.reason_message, "artifact_locator": None,
+                }
             public = result.failure.to_json_value()
             print(json.dumps({"scenario": scenario, "mode": mode, "failure": public, "download": result.download.to_json_value()}, ensure_ascii=False))
         else:
@@ -12993,3 +13100,100 @@ def test_upload_generic_exception_shares_typed_failure_and_active_only(tmp_path:
     assert record.result_summary['published_amended'] is None and record.request_summary['requested_amended'] is True
     runtime._save_upload_failure_if_active(start.job_id,request,OSError('later different failure'))
     assert runtime.read_job(start.job_id) == record
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ("workflow_cancelled", "before_claim", "after_claim"))
+async def test_download_cancel_preserves_downloaded_failed_prefix_and_claim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+    """验证取消结果与终态竞争保存完整已确认前缀。
+
+    参数：tmp_path 为隔离运行时根；monkeypatch 为真实 claim 的竞争观察替换夹具；
+        mode 为 workflow_cancelled、before_claim 或 after_claim，指定取消竞争时点。
+    返回：无（None）。
+    异常：AssertionError，守恒、唯一终态或竞争 barrier 不满足断言时抛出；
+        TimeoutError，asyncio.wait_for 等待事件收集超过三秒时抛出。
+    """
+
+    original = _typed_download_summary(downloaded_ids=("confirmed",), failed_ids=tuple(f"failed-{index}" for index in range(12)))
+    supplied = replace(original, terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED) if mode == "workflow_cancelled" else original
+    adapter = _PersistedSummaryDownloadAdapter(supplied)
+    runtime = _build_ingestion_runtime(tmp_path, executor=_HoldingExecutor(), download_adapters={("sec", "US"): adapter})
+    states = _record_direct_cancellation_states(monkeypatch)
+    boundary, release = Event(), Event()
+    original_claim = ingestion_runtime._DirectStreamCancellationState.claim_terminal
+    if mode != "workflow_cancelled":
+        # 必须闭包绑定本次 barrier，暂停真实 owner 原子裁决前后而不替换裁决算法。
+        def controlled_claim(state: ingestion_runtime._DirectStreamCancellationState, status: FinsResultStatus) -> FinsResultStatus | None:
+            """在真实终态锁裁决前后控制取消竞争。
+
+            参数：state 为真实取消状态 owner；status 为被测终态。
+            返回：原 owner 裁决的终态或 None。
+            异常：AssertionError，既定断言或测试前提不满足时抛出。
+            """
+
+            if mode == "before_claim":
+                boundary.set()
+                assert release.wait(timeout=2)
+                return original_claim(state, status)
+            claimed = original_claim(state, status)
+            boundary.set()
+            assert release.wait(timeout=2)
+            return claimed
+
+        monkeypatch.setattr(ingestion_runtime._DirectStreamCancellationState, "claim_terminal", controlled_claim)
+    collection = asyncio.create_task(_collect_direct_events(runtime.download(build_fins_download_request(ticker="AAPL"))))
+    if mode != "workflow_cancelled":
+        try:
+            assert await asyncio.to_thread(boundary.wait, 2)
+            assert len(states) == 1
+            assert states[0].request_cancel() is (mode == "before_claim")
+        finally:
+            release.set()
+    events = await asyncio.wait_for(collection, timeout=3)
+    results = [event.result for event in events if event.result is not None]
+    assert len(results) == 1
+    result = results[0]
+    cancelled = mode != "after_claim"
+    assert result.status is (FinsResultStatus.CANCELLED if cancelled else FinsResultStatus.SUCCESS)
+    assert result.exit_code == (130 if cancelled else 0) and result.failure is None
+    assert result.download_result is not None
+    full = result.download_result
+    assert full.document_rows is supplied.document_rows
+    assert (full.discovered_count, full.downloaded_count, full.failed_count) == (13, 1, 12)
+    assert full.terminal_disposition is (FinsDownloadTerminalDisposition.CANCELLED if cancelled else FinsDownloadTerminalDisposition.PARTIAL_FAILURE)
+    if not cancelled:
+        assert full is supplied
+    diagnostics = result.to_download_diagnostics_json_value()
+    failed = diagnostics["failed_documents"]
+    assert isinstance(failed, list) and len(failed) == 12
+    assert diagnostics["failure"] is None
+    assert [row["document_id"] for row in failed if isinstance(row, dict)] == [row.document_id for row in supplied.document_rows[1:]]
+    assert [row["reason_message"] for row in failed if isinstance(row, dict)] == [row.reason_message for row in supplied.document_rows[1:]]
+
+
+@pytest.mark.parametrize("case", ("empty", "partial", "all_failed"))
+def test_download_runtime_full_result_and_durable_budget_same_source(tmp_path: Path, case: str) -> None:
+    """direct 完整结果与持久摘要必须来自同一下载真源。
+
+    参数：tmp_path 为隔离测试工作区；case 为空结果、部分失败或全失败场景。
+    返回：无（None）。
+    异常：AssertionError，既定断言或测试前提不满足时抛出。
+    """
+
+    summary = _typed_download_summary(downloaded_ids=("confirmed",) if case == "partial" else (), skipped_ids=tuple(f"skip-{index}" for index in range(11)) if case == "partial" else (), failed_ids=tuple(f"failed-{index}" for index in range(12)) if case != "empty" else ())
+    executor = _HoldingExecutor()
+    runtime = _build_ingestion_runtime(tmp_path, executor=executor, download_adapters={("sec", "US"): _PersistedSummaryDownloadAdapter(summary)})
+    request = build_fins_download_request(ticker="AAPL")
+    result = asyncio.run(_collect_direct_events(runtime.download(request)))[-1].result
+    assert result is not None and result.download_result is summary
+    assert result.status is (FinsResultStatus.FAILURE if case == "all_failed" else FinsResultStatus.SUCCESS)
+    assert result.exit_code == (1 if case == "all_failed" else 0)
+    failed = result.to_download_diagnostics_json_value()["failed_documents"]
+    assert isinstance(failed, list) and len(failed) == summary.failed_count
+    start = runtime.start_download(request)
+    executor.run_all()
+    record = runtime.read_job(start.job_id)
+    bounded = summary.to_json_summary(max_json_chars=download_contract.FINS_DOWNLOAD_SUMMARY_MAX_JSON_CHARS)
+    assert record.result_summary == bounded
+    assert len(json.dumps(bounded, ensure_ascii=False)) <= download_contract.FINS_DOWNLOAD_SUMMARY_MAX_JSON_CHARS
+    assert "failed_documents" not in bounded and "download_result" not in bounded

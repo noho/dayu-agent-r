@@ -8,10 +8,11 @@ from typing import NoReturn
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
+from dayu.contracts.json_value import JsonValue
 from dayu.contracts.cancellation import CancellationToken
 from dayu.contracts.tool_await import ToolAwaitKind
 from dayu.contracts.tool_await import ToolAwaitSpec
@@ -53,8 +54,6 @@ from dayu.fins.direct_events import (
     FINS_RESULT_EXIT_CANCELLED,
     FINS_RESULT_EXIT_SUCCESS,
     FinsErrorKind,
-    FinsDownloadPublicDocument,
-    FinsDownloadPublicSummary,
     FinsDownloadFailureReason,
     FinsEventDetail,
     FinsOperationKind,
@@ -75,18 +74,21 @@ from dayu.fins.ingestion import (
 from dayu.fins.download_contract import (
     FinsDownloadDocumentDisposition,
     FinsDownloadEffectiveFilters,
+    FinsDownloadDocumentResult,
+    FinsDownloadResultSummary,
     FinsDownloadRequest,
     FinsDownloadSource,
     FinsDownloadTerminalDisposition,
     build_fins_download_request,
 )
-from tests.fins.test_fins_ingestion_runtime import _build_real_sec_integrity_runtime, _NeverCancelledToken
+from tests.fins.test_fins_ingestion_runtime import _build_real_sec_integrity_runtime, _NeverCancelledToken, _build_ingestion_runtime, _HoldingExecutor, _PersistedSummaryDownloadAdapter
 from dayu.fins.ingestion_runtime import (
     FinsPreprocessRequest,
     FinsRuntimeUploadRequest,
     FsFinsIngestionJobStore,
 )
 from dayu.fins.ingestion.awaiting_resolution import AwaitingResolutionMode
+from tests.fins.test_download_failure_diagnostics import _download_summary
 from dayu.fins.tools.download_tools import DOWNLOAD_TOOL_NAME
 from dayu.fins.tools.preprocess_tools import PREPROCESS_TOOL_NAME
 from dayu.fins.tools.upload_tools import UPLOAD_TOOL_NAME
@@ -338,15 +340,13 @@ def test_fins_wait_adapter_projects_completed_warning_exactly() -> None:
 def test_fins_wait_adapter_projects_same_typed_download_object() -> None:
     """wait adapter 应直接序列化 runtime typed summary，不从 details 或 storage 反推。
 
-    Returns:
-        无。
-
-    Raises:
-        AssertionError: nested download 与 typed object 不一致时抛出。
+    参数：无。
+    返回：无（None）。
+    异常：AssertionError，既定断言或测试前提不满足时抛出。
     """
 
     handle = _observation_handle_with_id("abababababababab")
-    download = FinsDownloadPublicSummary(
+    download = FinsDownloadResultSummary(
         source=FinsDownloadSource.SEC,
         canonical_ticker="AAPL",
         effective_filters=FinsDownloadEffectiveFilters(
@@ -362,7 +362,7 @@ def test_fins_wait_adapter_projects_same_typed_download_object() -> None:
         rejected_count=0,
         failed_count=0,
         document_rows=(
-            FinsDownloadPublicDocument(
+            FinsDownloadDocumentResult(
                 document_id="fil-downloaded",
                 form_or_period="10-K",
                 filing_date="2024-08-01",
@@ -371,13 +371,12 @@ def test_fins_wait_adapter_projects_same_typed_download_object() -> None:
                 disposition=FinsDownloadDocumentDisposition.DOWNLOADED,
                 reason_category=None,
                 reason_message=None,
-                artifact_locator="source/AAPL/fil-downloaded",
+                artifact_locator=PurePosixPath("source/AAPL/fil-downloaded"),
             ),
         ),
         missing_periods=(),
-        omitted_count=0,
         terminal_disposition=FinsDownloadTerminalDisposition.SUCCEEDED,
-     uncertain_reports=(), uncertain_count=0, omitted_uncertain_count=0)
+     uncertain_reports=(), uncertain_count=0,)
     result = FinsResultSummary(
         status=FinsResultStatus.SUCCESS,
         exit_code=FINS_RESULT_EXIT_SUCCESS,
@@ -385,7 +384,7 @@ def test_fins_wait_adapter_projects_same_typed_download_object() -> None:
         details=(FinsEventDetail(label="ignored", value="must-not-project"),),
         error_kind=None,
         error_message=None,
-        download=download,
+        download_result=download,
     )
     runtime = _FakeObservationRuntime(
         snapshots={
@@ -406,7 +405,8 @@ def test_fins_wait_adapter_projects_same_typed_download_object() -> None:
     assert isinstance(poll.outcome, ResolveWaitCompletedOutcome)
     value = poll.outcome.result.value
     assert isinstance(value, Mapping)
-    assert value["download"] == download.to_json_value()
+    assert result.download is not None
+    assert value["download"] == result.download.to_json_value()
     download_value = value["download"]
     assert isinstance(download_value, Mapping)
     documents_value = download_value["documents"]
@@ -426,15 +426,13 @@ def test_fins_wait_adapter_projects_same_typed_download_object() -> None:
 def test_fins_wait_adapter_failure_contains_same_typed_download_and_failure() -> None:
     """失败 wait result 应序列化完整 download/failure，而非仅输出泛化错误。
 
-    Returns:
-        无。
-
-    Raises:
-        AssertionError: failure message 缺字段或泄漏内部内容时抛出。
+    参数：无。
+    返回：无（None）。
+    异常：AssertionError，既定断言或测试前提不满足时抛出。
     """
 
     handle = _observation_handle_with_id("acacacacacacacac")
-    download = FinsDownloadPublicSummary(
+    download = FinsDownloadResultSummary(
         source=FinsDownloadSource.SEC,
         canonical_ticker="AAPL",
         effective_filters=FinsDownloadEffectiveFilters(
@@ -450,7 +448,7 @@ def test_fins_wait_adapter_failure_contains_same_typed_download_and_failure() ->
         rejected_count=0,
         failed_count=0,
         document_rows=(
-            FinsDownloadPublicDocument(
+            FinsDownloadDocumentResult(
                 document_id="fil-confirmed",
                 form_or_period="10-K",
                 filing_date=None,
@@ -459,13 +457,12 @@ def test_fins_wait_adapter_failure_contains_same_typed_download_and_failure() ->
                 disposition=FinsDownloadDocumentDisposition.DOWNLOADED,
                 reason_category=None,
                 reason_message=None,
-                artifact_locator="portfolio/AAPL/filings/fil-confirmed",
+                artifact_locator=PurePosixPath("portfolio/AAPL/filings/fil-confirmed"),
             ),
         ),
         missing_periods=(),
-        omitted_count=0,
         terminal_disposition=FinsDownloadTerminalDisposition.SUCCEEDED,
-     uncertain_reports=(), uncertain_count=0, omitted_uncertain_count=0)
+     uncertain_reports=(), uncertain_count=0,)
     failure = FinsPublicFailure(
         kind=FinsPublicFailureKind.STORAGE,
         source=FinsDownloadSource.SEC,
@@ -481,7 +478,7 @@ def test_fins_wait_adapter_failure_contains_same_typed_download_and_failure() ->
         details=(),
         error_kind=FinsErrorKind.STORAGE,
         error_message=failure.safe_message,
-        download=download,
+        download_result=download,
         failure=failure,
     )
     runtime = _FakeObservationRuntime(
@@ -504,7 +501,8 @@ def test_fins_wait_adapter_failure_contains_same_typed_download_and_failure() ->
     message_value = json.loads(poll.outcome.result.message)
     assert isinstance(message_value, Mapping)
     assert message_value["status"] == "failure"
-    assert message_value["download"] == download.to_json_value()
+    assert result.download is not None
+    assert message_value["download"] == result.download.to_json_value()
     assert message_value["failure"] == failure.to_json_value()
     assert message_value["scope_note"] == "文档计数统计已确认处理，未知报告单列；整体状态不撤销已发布文档。"
     download_value = message_value["download"]
@@ -521,7 +519,7 @@ def test_fins_wait_adapter_failure_contains_same_typed_download_and_failure() ->
     assert "/Users/" not in serialized
 
     # 跨操作结果允许无 download；下载 wait 投影仍必须拒绝缺摘要的失败帧。
-    without_download = replace(result, download=None)
+    without_download = replace(result, download_result=None)
     with pytest.raises(ValueError, match="typed download failure must contain download summary"):
         _failure_message(without_download)
     revision_failure = replace(
@@ -1132,3 +1130,50 @@ def test_wait_download_integrity_failure_matches_process_observation(
     assert message["download"]["omitted_count"] == 0
     assert poll.outcome.result.hint == result.failure.retry_hint
     print(json.dumps({"scenario": scenario, "wait": message}, ensure_ascii=False))
+
+
+@pytest.mark.parametrize("status", tuple(FinsResultStatus))
+def test_real_download_observation_wait_three_terminals_stay_bounded(tmp_path: Path, status: FinsResultStatus) -> None:
+    """验证超过十个失败的真实 observation→wait 投影保持原预算。
+
+    参数：tmp_path 为隔离运行时根；status 为成功、失败或取消的 direct 下载终态。
+    返回：无（None）。
+    异常：AssertionError，wait 扩容、终态改变、结果身份或同源 omission 不满足断言时抛出。
+    """
+
+    full = _download_summary(source=FinsDownloadSource.SEC, failed=12, skipped=11, downloaded=1 if status is not FinsResultStatus.FAILURE else 0)
+    if status is FinsResultStatus.CANCELLED:
+        full = replace(full, terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED)
+    executor = _HoldingExecutor()
+    runtime = _build_ingestion_runtime(tmp_path, executor=executor, download_adapters={("sec", "US"): _PersistedSummaryDownloadAdapter(full)})
+    handle = runtime.prepare_observed_download(build_fins_download_request(ticker="AAPL", form_types=("10-K",), start="2018-01-01", end="2026-10-10"), cancellation_token=_NeverCancelledToken())
+    runtime.activate_observation(handle)
+    executor.run_all()
+    observed = asyncio.run(runtime.poll_observation(handle))
+    result = observed.result
+    assert result is not None and result.status is status and result.download is not None
+    assert result.download_result is not None and result.download_result.document_rows is full.document_rows
+    poll = FinsIngestionWaitPollAdapter(runtime=runtime).poll_wait(_wait_snapshot(handle.handle_id, DOWNLOAD_TOOL_NAME))
+    assert isinstance(poll, WaitPollReady)
+    expected = {FinsResultStatus.SUCCESS: ResolveWaitCompletedOutcome, FinsResultStatus.FAILURE: ResolveWaitFailedOutcome, FinsResultStatus.CANCELLED: ResolveWaitCancelledOutcome}[status]
+    assert isinstance(poll.outcome, expected)
+    if isinstance(poll.outcome, ResolveWaitCompletedOutcome):
+        payload = poll.outcome.result.value
+    else:
+        assert isinstance(poll.outcome, (ResolveWaitFailedOutcome, ResolveWaitCancelledOutcome))
+        payload: JsonValue = json.loads(poll.outcome.result.message)
+    assert isinstance(payload, dict)
+    download = payload["download"]
+    assert download == result.download.to_json_value() and isinstance(download, dict)
+    documents = download["documents"]
+    assert isinstance(documents, list) and len(documents) == 10
+    assert download["omitted_count"] == len(full.document_rows) - 10
+    counts = download["counts"]
+    assert isinstance(counts, dict) and counts["failed"] == 12
+    assert download["omitted_uncertain_count"] == 0
+    assert download["uncertain_reports"] == []
+    serialized = json.dumps(payload)
+    assert not any(field in serialized for field in ("failed_documents", "download_result", "diagnostics"))
+    assert "summary" not in payload
+    failed = result.to_download_diagnostics_json_value()["failed_documents"]
+    assert isinstance(failed, list) and len(failed) == 12

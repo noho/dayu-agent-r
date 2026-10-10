@@ -39,8 +39,6 @@ from dayu.fins.direct_events import (
     FINS_RESULT_EXIT_CANCELLED,
     FINS_RESULT_EXIT_FAILURE,
     FINS_RESULT_EXIT_SUCCESS,
-    FinsDownloadPublicDocument,
-    FinsDownloadPublicSummary,
     FinsDownloadFailureReason,
     FinsErrorKind,
     FinsEvent,
@@ -57,7 +55,7 @@ from dayu.fins.direct_events import (
 )
 from dayu.fins.direct_events import ValidatedFinsEventStream
 from dayu.fins.download_contract import (
-    FINS_DOWNLOAD_PUBLIC_MAX_DOCUMENT_ROWS,
+    FINS_DOWNLOAD_SUMMARY_MAX_JSON_CHARS,
     FinsDownloadDateRange,
     FinsDownloadDocumentDisposition,
     FinsDownloadDocumentResult,
@@ -4009,7 +4007,6 @@ class FinsIngestionRuntime:
                     _mark_observation_failed(
                         failed_record,
                         "Observation activation failed.",
-                        FinsErrorKind.EXECUTION,
                     )
             raise
 
@@ -4322,7 +4319,7 @@ class FinsIngestionRuntime:
             download_summary = (
                 None
                 if context.download_request is None
-                else _public_download_summary(
+                else (
                     typed_summary
                     if typed_summary is not None
                     else _empty_download_summary_from_request(
@@ -4353,7 +4350,7 @@ class FinsIngestionRuntime:
                     if public_failure is not None
                     else _safe_direct_error_message(exc, error_kind=error_kind)
                 ),
-                download=download_summary,
+                download_result=download_summary,
                 failure=public_failure,
             )
             if public_failure is not None and public_failure.kind is FinsPublicFailureKind.EXECUTION:
@@ -4419,7 +4416,7 @@ class FinsIngestionRuntime:
                 details=(),
                 error_kind=FinsErrorKind.EXECUTION,
                 error_message=failure.safe_message,
-                download=_public_download_summary(summary),
+                download_result=summary,
                 failure=failure,
             )
             return
@@ -4429,7 +4426,7 @@ class FinsIngestionRuntime:
             details=(),
             error_kind=None,
             error_message=None,
-            download=_public_download_summary(summary),
+            download_result=summary,
             failure=None,
         )
 
@@ -4975,11 +4972,11 @@ class FinsIngestionRuntime:
                 self._save_failed(
                     latest,
                     message=(direct_download_uncertain_period_message() if summary.uncertain_count else direct_download_no_source_documents_message()),
-                    result_summary=summary.to_json_summary(max_json_chars=_MAX_SUMMARY_JSON_CHARS),
+                    result_summary=summary.to_json_summary(max_json_chars=FINS_DOWNLOAD_SUMMARY_MAX_JSON_CHARS),
                     cancelled_result_summary=_cancelled_download_json_summary(summary),
                 )
                 return
-            self._save_succeeded(latest, summary.to_json_summary(max_json_chars=_MAX_SUMMARY_JSON_CHARS), cancelled_result_summary=_cancelled_download_json_summary(summary))
+            self._save_succeeded(latest, summary.to_json_summary(max_json_chars=FINS_DOWNLOAD_SUMMARY_MAX_JSON_CHARS), cancelled_result_summary=_cancelled_download_json_summary(summary))
         except _UnsupportedDownloadSourceError as exc:
             self._save_download_unsupported(job_id, request=request, message=str(exc))
         except (FinsSourceDownloadAdapterFailure, SourceIntegrityPreflightError, SourceIntegrityRevisionConflictError, SourceIntegrityRepairRequiredError) as exc:
@@ -4987,7 +4984,7 @@ class FinsIngestionRuntime:
         except Exception as exc:
             self._save_failed_from_exception(
                 job_id, exc,
-                result_summary=None if summary is None else summary.to_json_summary(max_json_chars=_MAX_SUMMARY_JSON_CHARS),
+                result_summary=None if summary is None else summary.to_json_summary(max_json_chars=FINS_DOWNLOAD_SUMMARY_MAX_JSON_CHARS),
                 cancelled_result_summary=None if summary is None else _cancelled_download_json_summary(summary),
             )
 
@@ -5025,7 +5022,7 @@ class FinsIngestionRuntime:
             record = self.job_store.read_job(job_id)
             if record.status in _TERMINAL_STATUSES:
                 return
-            self._save_failed(record, message=failure.safe_message, result_summary=summary.to_json_summary(max_json_chars=_MAX_SUMMARY_JSON_CHARS), cancelled_result_summary=_cancelled_download_json_summary(summary))
+            self._save_failed(record, message=failure.safe_message, result_summary=summary.to_json_summary(max_json_chars=FINS_DOWNLOAD_SUMMARY_MAX_JSON_CHARS), cancelled_result_summary=_cancelled_download_json_summary(summary))
         except Exception:
             _LOGGER.warning("fins.download.typed_failed_record_save_failed")
 
@@ -6057,7 +6054,7 @@ class FinsIngestionRuntime:
                 result_summary=_empty_download_summary_from_request(
                     request,
                     terminal_disposition=FinsDownloadTerminalDisposition.FAILED,
-                ).to_json_summary(max_json_chars=_MAX_SUMMARY_JSON_CHARS),
+                ).to_json_summary(max_json_chars=FINS_DOWNLOAD_SUMMARY_MAX_JSON_CHARS),
                 cancelled_result_summary=_cancelled_download_json_summary(_empty_download_summary_from_request(request, terminal_disposition=FinsDownloadTerminalDisposition.FAILED)),
             )
         except Exception as terminal_exc:
@@ -6266,7 +6263,7 @@ class FinsIngestionRuntime:
         details: tuple[FinsEventDetail, ...],
         error_kind: FinsErrorKind | None,
         error_message: str | None,
-        download: FinsDownloadPublicSummary | None = None,
+        download_result: _FinsDownloadResultSummary | None = None,
         failure: FinsPublicFailure | None = None,
     ) -> None:
         """向 direct stream 投递唯一终态 RESULT。
@@ -6277,77 +6274,62 @@ class FinsIngestionRuntime:
             details: 有界业务摘要详情。
             error_kind: 可选失败分类。
             error_message: 可选失败说明。
-            download: download 操作的 bounded public summary。
+            download_result: download 操作的完整 typed 结果。
             failure: download 失败的 closed public failure。
 
         Returns:
             无。
 
         Raises:
-            无。legacy job context 不投递 direct RESULT。
+            TypeError: 非下载事件字段类型违反公共契约时抛出。
+            ValueError: 非下载事件字段违反公共契约时抛出。
         """
 
         if context.direct_queue is None:
             return
+        emitted_at = datetime.now(timezone.utc)
+        try:
+            event = _direct_result_event(
+                context=context, status=status, details=details,
+                error_kind=error_kind, error_message=error_message,
+                download_result=download_result, failure=failure,
+                warnings=(), emitted_at=emitted_at,
+            )
+        except (TypeError, ValueError) as exc:
+            if context.download_request is None:
+                raise
+            # 公共受理拒绝尚未成为已确认事实的下载结果；整体执行失败不能伪造成候选失败。
+            failure = _download_public_failure_from_exception(exc, request=context.download_request)
+            status = FinsResultStatus.FAILURE
+            download_result = _empty_download_summary_from_request(
+                context.download_request, terminal_disposition=FinsDownloadTerminalDisposition.FAILED,
+            )
+            event = _direct_result_event(
+                context=context, status=status, details=(),
+                error_kind=_DOWNLOAD_PUBLIC_ERROR_KINDS[failure.kind], error_message=failure.safe_message,
+                download_result=download_result, failure=failure,
+                warnings=(), emitted_at=emitted_at,
+            )
+            _LOGGER.error(
+                "fins.download.unexpected_failure %s",
+                safe_exception_trace(exc, source_root=Path(__file__).parent.parent),
+            )
         cancellation_state = context.cancellation_state
+        # 取消可以在 claim 锁内获胜；其完整公共事件也必须提前校验，claim 后只选择并入队。
+        cancelled_event = event
+        if cancellation_state is not None and status is not FinsResultStatus.CANCELLED:
+            cancelled_event = _direct_result_event(
+                context=context, status=FinsResultStatus.CANCELLED, details=(),
+                error_kind=FinsErrorKind.CANCELLED, error_message=None,
+                download_result=download_result, failure=None,
+                warnings=(), emitted_at=emitted_at,
+            )
         if cancellation_state is not None:
             context.cancellation_checker()
         resolved_status = status if cancellation_state is None else cancellation_state.claim_terminal(status)
         if resolved_status is None:
             return
-        self._emit_claimed_direct_result(
-            context,
-            status=resolved_status,
-            details=details,
-            error_kind=error_kind,
-            error_message=error_message,
-            download=download,
-            failure=failure,
-        )
-
-    def _emit_claimed_direct_result(
-        self,
-        context: _FinsIngestionExecutionContext,
-        *,
-        status: FinsResultStatus,
-        details: tuple[FinsEventDetail, ...],
-        error_kind: FinsErrorKind | None,
-        error_message: str | None,
-        download: FinsDownloadPublicSummary | None = None,
-        failure: FinsPublicFailure | None = None,
-    ) -> None:
-        """投递已经由 direct state 原子 claim 的 RESULT。
-
-        Args:
-            context: direct stream 执行上下文。
-            status: 已 claim 的 canonical 终态。
-            details: 有界业务摘要详情。
-            error_kind: 可选失败分类。
-            error_message: 可选失败说明。
-            download: download 操作的 bounded public summary。
-            failure: download 失败的 closed public failure。
-
-        Returns:
-            无。
-
-        Raises:
-            无。legacy job context 不投递 direct RESULT。
-        """
-
-        if context.direct_queue is None:
-            return
-        event = _direct_result_event(
-            context=context,
-            status=status,
-            details=details,
-            error_kind=error_kind,
-            error_message=error_message,
-            download=download,
-            failure=failure,
-            warnings=(),
-            emitted_at=datetime.now(timezone.utc),
-        )
-        _put_direct_queue(context, event)
+        _put_direct_queue(context, cancelled_event if resolved_status is FinsResultStatus.CANCELLED else event)
 
     def _emit_direct_cancelled_result(self, context: _FinsIngestionExecutionContext, *, download_summary: _FinsDownloadResultSummary | None) -> None:
         """向 direct stream 投递取消 RESULT。
@@ -6372,10 +6354,10 @@ class FinsIngestionRuntime:
                 error_kind=FinsErrorKind.CANCELLED,
                 fallback_message=None,
             ),
-            download=(
+            download_result=(
                 None
                 if context.download_request is None
-                else _public_download_summary(
+                else (
                     replace(download_summary, terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED)
                     if download_summary is not None else _empty_download_summary_from_request(
                         context.download_request, terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED,
@@ -6548,7 +6530,7 @@ def _direct_result_event(
     details: tuple[FinsEventDetail, ...],
     error_kind: FinsErrorKind | None,
     error_message: str | None,
-    download: FinsDownloadPublicSummary | None,
+    download_result: _FinsDownloadResultSummary | None,
     failure: FinsPublicFailure | None,
     warnings: tuple[CompanyMetadataWarning, ...],
     emitted_at: datetime,
@@ -6561,7 +6543,7 @@ def _direct_result_event(
         details: 有界业务摘要详情。
         error_kind: 可选失败分类。
         error_message: 可选失败说明。
-        download: download 操作的 bounded public summary。
+        download_result: download 操作的完整 typed 结果。
         failure: download 失败的 closed public failure。
         warnings: 当前 direct producer 显式给出的 typed 公司元数据警告。
         emitted_at: 调用方提供的带时区事件构造时间。
@@ -6581,14 +6563,12 @@ def _direct_result_event(
             error_kind=FinsErrorKind.CANCELLED,
             fallback_message=None,
         )
-        download = replace(download, terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED) if download is not None else (
+        download_result = replace(download_result, terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED) if download_result is not None else (
             None
             if context.download_request is None
-            else _public_download_summary(
-                _empty_download_summary_from_request(
-                    context.download_request,
-                    terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED,
-                )
+            else _empty_download_summary_from_request(
+                context.download_request,
+                terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED,
             )
         )
         failure = None
@@ -6613,7 +6593,7 @@ def _direct_result_event(
             details=details,
             error_kind=error_kind,
             error_message=error_message,
-            download=download,
+            download_result=download_result,
             failure=failure,
             warnings=warnings,
         ),
@@ -6667,7 +6647,7 @@ def _direct_upload_terminal_events(
             if disposition is FinsUploadTerminalDisposition.FAILED and summary.failure_reason is not None
             else None
         ),
-        download=None,
+        download_result=None,
         failure=None,
         warnings=summary.warnings,
         emitted_at=emitted_at,
@@ -6822,56 +6802,6 @@ def _direct_exit_code(status: FinsResultStatus) -> int:
     if status is FinsResultStatus.CANCELLED:
         return FINS_RESULT_EXIT_CANCELLED
     assert_never(status)
-
-
-def _public_download_summary(
-    summary: _FinsDownloadResultSummary,
-) -> FinsDownloadPublicSummary:
-    """从 operation-local typed rows 构造唯一 bounded public summary。
-
-    Args:
-        summary: source adapter 返回的完整 typed summary。
-
-    Returns:
-        CLI 与 wait adapter 共享的 bounded public object。
-
-    Raises:
-        ValueError: public summary 不变量失败时由 contract 抛出。
-    """
-
-    public_rows = tuple(
-        FinsDownloadPublicDocument(
-            document_id=row.document_id,
-            form_or_period=row.form_or_period,
-            filing_date=row.filing_date,
-            report_date=row.report_date,
-            covered_fiscal_periods=row.covered_fiscal_periods,
-            disposition=row.disposition,
-            reason_category=row.reason_category,
-            reason_message=row.reason_message,
-            artifact_locator=(None if row.artifact_locator is None else row.artifact_locator.as_posix()),
-        )
-        for row in summary.document_rows[:FINS_DOWNLOAD_PUBLIC_MAX_DOCUMENT_ROWS]
-    )
-    omitted_count = len(summary.document_rows) - len(public_rows)
-    uncertain_reports = summary.public_uncertain_reports(max_json_chars=_MAX_SUMMARY_JSON_CHARS)
-    return FinsDownloadPublicSummary(
-        source=summary.source,
-        canonical_ticker=summary.canonical_ticker,
-        effective_filters=summary.effective_filters,
-        discovered_count=summary.discovered_count,
-        downloaded_count=summary.downloaded_count,
-        skipped_count=summary.skipped_count,
-        rejected_count=summary.rejected_count,
-        failed_count=summary.failed_count,
-        uncertain_count=summary.uncertain_count,
-        uncertain_reports=uncertain_reports,
-        omitted_uncertain_count=summary.uncertain_count - len(uncertain_reports),
-        document_rows=public_rows,
-        missing_periods=summary.missing_periods,
-        omitted_count=omitted_count,
-        terminal_disposition=summary.terminal_disposition,
-    )
 
 
 def _empty_download_summary_from_request(
@@ -7414,14 +7344,12 @@ def _observation_failure_result(
             error_kind=FinsErrorKind.EXECUTION,
             fallback_message=None,
         ),
-        download=(
+        download_result=(
             None
             if download_request is None
-            else _public_download_summary(
-                _empty_download_summary_from_request(
-                    download_request,
-                    terminal_disposition=FinsDownloadTerminalDisposition.FAILED,
-                )
+            else _empty_download_summary_from_request(
+                download_request,
+                terminal_disposition=FinsDownloadTerminalDisposition.FAILED,
             )
         ),
         failure=(
@@ -7469,14 +7397,12 @@ def _observation_cancelled_result(
             error_kind=FinsErrorKind.CANCELLED,
             fallback_message=None,
         ),
-        download=(
+        download_result=(
             None
             if download_request is None
-            else _public_download_summary(
-                _empty_download_summary_from_request(
-                    download_request,
-                    terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED,
-                )
+            else _empty_download_summary_from_request(
+                download_request,
+                terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED,
             )
         ),
         failure=None,
@@ -7486,14 +7412,12 @@ def _observation_cancelled_result(
 def _mark_observation_failed(
     record: _FinsObservedOperationRecord,
     message: str,
-    error_kind: FinsErrorKind,
 ) -> None:
     """把 observation record 原地收口为 FAILED。
 
     Args:
         record: 已在 observation lock 内找到的记录。
         message: 有界失败说明。
-        error_kind: 失败分类。
 
     Returns:
         无。
@@ -7505,19 +7429,9 @@ def _mark_observation_failed(
     safe_message = _safe_observation_message(message)
     record.status = FinsObservationStatus.FAILED
     record.message = safe_message
-    record.result = FinsResultSummary(
-        status=FinsResultStatus.FAILURE,
-        exit_code=FINS_RESULT_EXIT_FAILURE,
-        title=direct_result_title(
-            operation_kind=record.handle.operation_kind,
-            status=FinsResultStatus.FAILURE,
-        ),
-        details=(),
-        error_kind=error_kind,
-        error_message=direct_failure_message(
-            error_kind=error_kind,
-            fallback_message=None,
-        ),
+    record.result = _observation_failure_result(
+        operation_kind=record.handle.operation_kind,
+        download_request=record.context.download_request,
     )
 
 
@@ -8865,7 +8779,7 @@ def _cancelled_download_json_summary(summary: _FinsDownloadResultSummary) -> dic
     返回：只覆盖终态的有界新 schema JSON。
     异常：typed 不变量或预算不足抛 ValueError。
     """
-    return replace(summary, terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED).to_json_summary(max_json_chars=_MAX_SUMMARY_JSON_CHARS)
+    return replace(summary, terminal_disposition=FinsDownloadTerminalDisposition.CANCELLED).to_json_summary(max_json_chars=FINS_DOWNLOAD_SUMMARY_MAX_JSON_CHARS)
 
 
 def _record_to_json(record: FinsIngestionJobRecord) -> dict[str, JsonValue]:

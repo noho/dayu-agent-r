@@ -1,0 +1,185 @@
+{
+  "gate": "S1 re-review",
+  "runtime": "codex",
+  "provider": "mimo-flash",
+  "label": "dfdiag-code-rereview-mimoflash-20261010-01",
+  "authorization": "用户临时使用一次mimo-flash，仅本轮；本次已消耗，后续未替代原mimo路由",
+  "session_id": 41652,
+  "run_dir": "/private/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/sub-agents.6MpSNs",
+  "process_exit_source": "write_stdin session41652",
+  "process_exit": 0,
+  "events": 48,
+  "commands": 20,
+  "turn_completed": true,
+  "output_sha256": "4e7079558f46503115c7ee52bfce35529e1bf1a8c24ab6a09338a8365c7aeb65",
+  "stderr": "",
+  "final": "The request was rejected because it was considered high risk",
+  "setup_status": "ok",
+  "agent_status": "completed",
+  "tool_evidence": "yes",
+  "tool_trace": "complete",
+  "required_evidence": "partial",
+  "canary_status": "unknown",
+  "result_status": "rejected",
+  "retry_class": "unknown",
+  "canary_read_bytes_match": true,
+  "canary_report_missing": true,
+  "warnings": [],
+  "evidence_gaps": [
+    "复审artifact及CANARY报告缺失",
+    "C1/C2复审结论缺失",
+    "reviewer关键29文件身份验证未成功恢复",
+    "完整真实代码主链及adversarial review未完成"
+  ],
+  "tool_errors": [
+    {
+      "id": "item_17",
+      "outer_exit": 0,
+      "error": "zsh read变量path覆盖系统PATH；sha256sum/awk无法调用，全部MISMATCH空值",
+      "recovery": "未成功恢复",
+      "impact": "不能作冻结文件校验通过"
+    },
+    {
+      "id": "item_23",
+      "outer_exit": 0,
+      "error": "再次使用path系统变量；shasum无法调用，全部MISMATCH空值",
+      "recovery": "未成功恢复",
+      "impact": "关键reviewer输入验证缺失，不以外层0掩盖"
+    }
+  ],
+  "controller_independent_input_check": {
+    "head": "a1df000835c61d1acfa383532488746e1487ed7b",
+    "manifest_sha256": "659353f68e31286995ce2b1981c3c5d6b0645d46511084e2a55af133813d4c38",
+    "file_checks": [
+      {
+        "path": "README.md",
+        "match": true
+      },
+      {
+        "path": "dayu/cli/output.py",
+        "match": true
+      },
+      {
+        "path": "dayu/fins/README.md",
+        "match": true
+      },
+      {
+        "path": "dayu/fins/direct_events.py",
+        "match": true
+      },
+      {
+        "path": "dayu/fins/download_contract.py",
+        "match": true
+      },
+      {
+        "path": "dayu/fins/ingestion_runtime.py",
+        "match": true
+      },
+      {
+        "path": "dayu/fins/pipelines/cn_pipeline.py",
+        "match": true
+      },
+      {
+        "path": "docs/gateflow/download-failure-diagnostics-baseline-validation-20261010.json",
+        "match": true
+      },
+      {
+        "path": "docs/gateflow/download-failure-diagnostics-code-adjudication-20261010.md",
+        "match": true
+      },
+      {
+        "path": "docs/gateflow/download-failure-diagnostics-code-fix-20261010.md",
+        "match": true
+      },
+      {
+        "path": "docs/gateflow/download-failure-diagnostics-code-fix-adjudication-20261010.md",
+        "match": true
+      },
+      {
+        "path": "docs/gateflow/download-failure-diagnostics-implementation-20261010.md",
+        "match": true
+      },
+      {
+        "path": "docs/gateflow/download-failure-diagnostics-implementation-adjudication-20261010.md",
+        "match": true
+      },
+      {
+        "path": "docs/gateflow/download-failure-diagnostics-implementation-continuation-20261010.md",
+        "match": true
+      },
+      {
+        "path": "docs/gateflow/download-failure-diagnostics-implementation-initial-20261010.md",
+        "match": true
+      },
+      {
+        "path": "docs/gateflow/download-failure-diagnostics-test-scope-adjudication-20261010.md",
+        "match": true
+      },
+      {
+        "path": "docs/reviews/code-review-20261010-134929.md",
+        "match": true
+      },
+      {
+        "path": "docs/reviews/code-review-20261010-135805.md",
+        "match": true
+      },
+      {
+        "path": "tests/README.md",
+        "match": true
+      },
+      {
+        "path": "tests/cli/test_fins_commands.py",
+        "match": true
+      },
+      {
+        "path": "tests/cli/test_output.py",
+        "match": true
+      },
+      {
+        "path": "tests/fins/test_cn_download_runtime.py",
+        "match": true
+      },
+      {
+        "path": "tests/fins/test_download_failure_diagnostics.py",
+        "match": true
+      },
+      {
+        "path": "tests/fins/test_f5_result_contract.py",
+        "match": true
+      },
+      {
+        "path": "tests/fins/test_f5_workflow_rebuild.py",
+        "match": true
+      },
+      {
+        "path": "tests/fins/test_fins_direct_stream.py",
+        "match": true
+      },
+      {
+        "path": "tests/fins/test_fins_ingestion_runtime.py",
+        "match": true
+      },
+      {
+        "path": "tests/service/test_fins_direct.py",
+        "match": true
+      },
+      {
+        "path": "tests/service/test_fins_wait_adapter.py",
+        "match": true
+      }
+    ],
+    "all_match": true,
+    "scope": "仅root确认源版本未漂移，不替代未完成独立review"
+  },
+  "decision": "不采纳，不重试本次一次性授权；gateflow所需第二路artifact无法由当前授权路径产生，入口裁决待巡检线",
+  "residual_risk": {
+    "classification": "requiring new issue or explicit user decision",
+    "owner": "巡检线/Dayu总控",
+    "destination": "本S1及后续必需reviewer路由裁决"
+  },
+  "artifacts": {
+    "stdout": "/private/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/sub-agents.6MpSNs/dfdiag-code-rereview-mimoflash-20261010-01.jsonl",
+    "stderr": "/private/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/sub-agents.6MpSNs/dfdiag-code-rereview-mimoflash-20261010-01.stderr",
+    "last_message": "/private/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/sub-agents.6MpSNs/dfdiag-code-rereview-mimoflash-20261010-01.last.md"
+  }
+}

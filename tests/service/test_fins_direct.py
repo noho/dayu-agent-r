@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from tests.fins.test_download_failure_diagnostics import _download_summary, _terminal
+
 from dayu.fins.storage import FsMaterialUploadStateRepository
+
+from dataclasses import replace
 
 import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator
@@ -268,13 +272,10 @@ def _result_event(
         filing_kind=None,
         document_label=None,
         progress=None,
-        result=FinsResultSummary(
-            status=status,
-            exit_code=exit_code,
-            title="Download finished",
+        result=replace(_terminal(_download_summary(), status), title="Download finished", details=(FinsEventDetail(label="ticker", value="AAPL"),)) if operation_kind is FinsOperationKind.DOWNLOAD else FinsResultSummary(
+            status=status, exit_code=exit_code, title="Download finished",
             details=(FinsEventDetail(label="ticker", value="AAPL"),),
-            error_kind=error_kind,
-            error_message=error_message,
+            error_kind=error_kind, error_message=error_message,
         ),
     )
 
@@ -1050,3 +1051,29 @@ def test_fins_event_leakage_guard_rejects_internal_or_sensitive_text(
             progress=FinsProgress(stage="download", completed_units=None, total_units=None),
             result=None,
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", tuple(FinsResultStatus))
+async def test_service_passes_same_stream_terminal_full_result(status: FinsResultStatus) -> None:
+    """验证 Service 保留验证流、完整结果和终态的同对象身份。
+
+    参数：status 为成功、失败或取消的合法下载终态。
+    返回：无（None）。
+    异常：AssertionError，Service 重建、截断或替换下载事实，或流身份不满足断言时抛出。
+    """
+
+    summary = _download_summary(source=FinsDownloadSource.SEC, failed=12, skipped=11, downloaded=1 if status is not FinsResultStatus.FAILURE else 0)
+    terminal = _terminal(summary, status)
+    event = replace(_result_event(status=status), result=terminal)
+    runtime = _FakeIngestionRuntime((event,))
+    service = FinsDirectCommandService(runtime)
+    stream = service.download(build_fins_download_request(ticker="AAPL"))
+    assert stream is runtime.returned_streams[-1]
+    events = await _collect_events(stream)
+    assert events == [event] and events[0] is event and events[0].result is terminal
+    assert stream.terminal_result is terminal
+    assert terminal.download_result is not None
+    assert terminal.download_result.document_rows is summary.document_rows
+    failed = terminal.to_download_diagnostics_json_value()["failed_documents"]
+    assert isinstance(failed, list) and len(failed) == 12

@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import AsyncGenerator, AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import PurePosixPath
@@ -21,6 +21,9 @@ from dayu.contracts.json_value import JsonValue
 from dayu.fins.company_metadata_warning import CompanyMetadataWarning
 from dayu.fins.download_contract import (
     FinsDownloadDocumentDisposition,
+    FinsDownloadDocumentResult,
+    FinsDownloadResultSummary,
+    FINS_DOWNLOAD_SUMMARY_MAX_JSON_CHARS,
     FinsDownloadEffectiveFilters,
     FinsDownloadSource,
     FinsDownloadTerminalDisposition,
@@ -36,6 +39,10 @@ from dayu.fins.domain.filing_semantics import FISCAL_PERIODS
 FINS_RESULT_EXIT_SUCCESS: Final[int] = 0
 FINS_RESULT_EXIT_FAILURE: Final[int] = 1
 FINS_RESULT_EXIT_CANCELLED: Final[int] = 130
+
+_DOWNLOAD_DIAGNOSTICS_SCOPE_NOTE: Final[str] = (
+    "诊断覆盖本次调用已返回结果的候选；取消或整体中止时，尚未返回结果的候选不作成功、跳过或失败判断。"
+)
 
 _MAX_MESSAGE_CHARS: Final[int] = 240
 _MAX_DETAIL_CHARS: Final[int] = 240
@@ -501,6 +508,44 @@ class FinsDownloadPublicSummary:
                 allow_empty=False,
             )
 
+    @classmethod
+    def from_result_summary(cls, summary: FinsDownloadResultSummary) -> FinsDownloadPublicSummary:
+        """从完整下载结果派生唯一有界公共摘要。
+
+        Args:
+            summary: 来源适配器返回的完整 typed 下载结果。
+
+        Returns:
+            原序前十行及同源计数、筛选条件和未知报告预算投影。
+
+        Raises:
+            ValueError: 公共摘要不符合计数或安全字段契约时抛出。
+        """
+
+        public_rows = tuple(
+            _download_public_document(row)
+            for row in summary.document_rows[:FINS_DOWNLOAD_PUBLIC_MAX_DOCUMENT_ROWS]
+        )
+        omitted_count = len(summary.document_rows) - len(public_rows)
+        uncertain_reports = summary.public_uncertain_reports(max_json_chars=FINS_DOWNLOAD_SUMMARY_MAX_JSON_CHARS)
+        return cls(
+            source=summary.source,
+            canonical_ticker=summary.canonical_ticker,
+            effective_filters=summary.effective_filters,
+            discovered_count=summary.discovered_count,
+            downloaded_count=summary.downloaded_count,
+            skipped_count=summary.skipped_count,
+            rejected_count=summary.rejected_count,
+            failed_count=summary.failed_count,
+            uncertain_count=summary.uncertain_count,
+            uncertain_reports=uncertain_reports,
+            omitted_uncertain_count=summary.uncertain_count - len(uncertain_reports),
+            document_rows=public_rows,
+            missing_periods=summary.missing_periods,
+            omitted_count=omitted_count,
+            terminal_disposition=summary.terminal_disposition,
+        )
+
     def to_json_value(self) -> dict[str, JsonValue]:
         """转换为 CLI/wait 共用的自解释 JSON-compatible 对象。
 
@@ -536,6 +581,32 @@ class FinsDownloadPublicSummary:
             "omitted_count": self.omitted_count,
             "terminal_disposition": self.terminal_disposition.value,
         }
+
+
+def _download_public_document(row: FinsDownloadDocumentResult) -> FinsDownloadPublicDocument:
+    """机械投影一条来源下载结果，供有界摘要和完整失败诊断共用。
+
+    Args:
+        row: 来源 owner 校验过的完整文档结果。
+
+    Returns:
+        保留全部业务字段、将相对定位符转换成文本的公共行。
+
+    Raises:
+        ValueError: 公共字段违反安全文本契约时抛出。
+    """
+
+    return FinsDownloadPublicDocument(
+        document_id=row.document_id,
+        form_or_period=row.form_or_period,
+        filing_date=row.filing_date,
+        report_date=row.report_date,
+        covered_fiscal_periods=row.covered_fiscal_periods,
+        disposition=row.disposition,
+        reason_category=row.reason_category,
+        reason_message=row.reason_message,
+        artifact_locator=None if row.artifact_locator is None else row.artifact_locator.as_posix(),
+    )
 
 
 class _ValidatedStreamState(str, Enum):
@@ -640,7 +711,8 @@ class FinsResultSummary:
         details: 有界、业务可读详情列表。
         error_kind: 失败分类；成功时通常为 ``None``。
         error_message: 用户可读失败说明；成功时通常为 ``None``。
-        download: download 操作的 bounded public 业务对象。
+        download_result: download 操作的完整 typed 结果，唯一下载真源。
+        download: 从完整结果派生的 bounded public 业务对象。
         failure: download 失败的 closed public failure。
         warnings: publication-final typed 公司元数据警告，当前最多一个。
     """
@@ -651,9 +723,11 @@ class FinsResultSummary:
     details: tuple[FinsEventDetail, ...]
     error_kind: FinsErrorKind | None
     error_message: str | None
-    download: FinsDownloadPublicSummary | None = None
+    download_result: FinsDownloadResultSummary | None = None
     failure: FinsPublicFailure | None = None
     warnings: tuple[CompanyMetadataWarning, ...] = ()
+    _download_summary: FinsDownloadPublicSummary | None = field(init=False, repr=False, compare=False)
+    _failed_download_documents: tuple[FinsDownloadPublicDocument, ...] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         """校验终态摘要字段。
@@ -665,8 +739,8 @@ class FinsResultSummary:
             无。
 
         Raises:
-            TypeError: warning 元素不是精确 typed contract 时抛出。
-            ValueError: exit code、标题、详情或 warning 组合不符合契约时抛出。
+            TypeError: download_result 或 warning 元素不符合 typed contract 时抛出。
+            ValueError: 摘要组合、有界摘要或任一完整失败行违反公共契约时抛出。
         """
 
         _validate_result_exit_code(self.status, self.exit_code)
@@ -691,11 +765,19 @@ class FinsResultSummary:
                 max_chars=_MAX_MESSAGE_CHARS,
                 allow_empty=False,
             )
-        if self.download is not None and not isinstance(
-            self.download,
-            FinsDownloadPublicSummary,
+        if self.download_result is not None and not isinstance(
+            self.download_result,
+            FinsDownloadResultSummary,
         ):
-            raise TypeError("download must be FinsDownloadPublicSummary")
+            raise TypeError("download_result must be FinsDownloadResultSummary")
+        # 公共受理一次完成全部安全校验；消费者只读取冻结投影，不在终态提交后才拒绝失败行。
+        object.__setattr__(self, "_download_summary", None if self.download_result is None else
+            FinsDownloadPublicSummary.from_result_summary(self.download_result))
+        object.__setattr__(self, "_failed_download_documents", () if self.download_result is None else tuple(
+            _download_public_document(row)
+            for row in self.download_result.document_rows
+            if row.disposition is FinsDownloadDocumentDisposition.FAILED
+        ))
         if self.failure is not None:
             if not isinstance(self.failure, FinsPublicFailure):
                 raise TypeError("failure must be FinsPublicFailure")
@@ -715,6 +797,50 @@ class FinsResultSummary:
                 FinsDownloadTerminalDisposition.CANCELLED,
             }:
                 raise ValueError("successful download result has incompatible disposition")
+
+    @property
+    def download(self) -> FinsDownloadPublicSummary | None:
+        """读取构造时从唯一完整结果派生并校验的有界下载摘要。
+
+        Args:
+            无。
+
+        Returns:
+            下载结果的有界公共投影；非下载结果为 None。
+
+        Raises:
+            无。
+        """
+
+        return self._download_summary
+
+    def to_download_diagnostics_json_value(self) -> dict[str, JsonValue]:
+        """交付本次下载已返回候选的完整失败诊断。
+
+        Args:
+            无。
+
+        Returns:
+            同源有界摘要、无截断失败行和整体失败说明的 JSON 对象。
+
+        Raises:
+            ValueError: 当前终态没有下载结果时抛出。
+        """
+
+        summary = self.download
+        if self.download_result is None or summary is None:
+            raise ValueError("download diagnostics requires download_result")
+        return {
+            "operation": FinsOperationKind.DOWNLOAD.value,
+            "status": self.status.value,
+            "exit_code": self.exit_code,
+            "summary": summary.to_json_value(),
+            "failed_documents": [
+                row.to_json_value() for row in self._failed_download_documents
+            ],
+            "failure": None if self.failure is None else self.failure.to_json_value(),
+            "scope_note": _DOWNLOAD_DIAGNOSTICS_SCOPE_NOTE,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -778,6 +904,11 @@ class FinsEvent:
         elif self.event_type is FinsEventType.RESULT:
             if self.result is None or self.progress is not None:
                 raise ValueError("RESULT event must have result and no progress")
+            if self.operation_kind is FinsOperationKind.DOWNLOAD:
+                if self.result.download_result is None:
+                    raise ValueError("DOWNLOAD RESULT requires download_result")
+            elif self.result.download_result is not None:
+                raise ValueError("non-DOWNLOAD RESULT cannot carry download_result")
         else:
             raise ValueError(f"unsupported Fins event type: {self.event_type.value}")
 

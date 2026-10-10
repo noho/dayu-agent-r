@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from tests.fins.test_download_failure_diagnostics import _download_summary
 from dayu.fins.download_contract import build_fins_download_request
 from dayu.fins.direct_events import FinsDownloadFailureReason
 from tests.fins.test_fins_ingestion_runtime import _build_real_sec_integrity_runtime
@@ -160,6 +161,7 @@ def _result_summary() -> FinsResultSummary:
         details=(),
         error_kind=None,
         error_message=None,
+        download_result=_download_summary(),
     )
 
 

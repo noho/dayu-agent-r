@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from tests.fins.test_download_failure_diagnostics import _download_summary, _terminal
+from tests.fins.test_fins_ingestion_runtime import (
+    _build_ingestion_runtime, _HoldingExecutor, _PersistedSummaryDownloadAdapter,
+)
+
 from dayu.fins.storage import FsMaterialUploadStateRepository
 
 from dayu.fins.pipelines.docling_upload_service import build_material_ids
@@ -21,7 +26,7 @@ import json
 import subprocess
 import sys
 from collections.abc import AsyncGenerator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from functools import partial
 from pathlib import Path
@@ -36,6 +41,7 @@ import dayu.cli.main as cli_main
 import dayu.cli.output as cli_output
 import dayu.fins.download_contract as download_contract
 import dayu.fins.ingestion_runtime as ingestion_runtime
+import dayu.fins.direct_events as direct_events
 from dayu.cli.agent_entrypoint import CliSigintMonitor
 from dayu.cli.arg_parsing import parse_cli_args
 from dayu.cli.exit_codes import (
@@ -216,7 +222,7 @@ class _FakeFinsDirectService:
     process_material_requests: list[_ProcessSpecificCall]
     upload_filing_requests: list[_UploadFilingCall]
     upload_material_requests: list[_UploadMaterialCall]
-    events: tuple[FinsEvent, ...]
+    events: tuple[FinsEvent, ...] | None
     stream_error: Exception | None
     close_error: BaseException | None
     stream_calls: list[FinsOperationKind]
@@ -251,7 +257,7 @@ class _FakeFinsDirectService:
         self.process_material_requests = []
         self.upload_filing_requests = []
         self.upload_material_requests = []
-        self.events = (_progress_event(FinsOperationKind.DOWNLOAD), _result_event()) if events is None else events
+        self.events = events
         self.stream_error = stream_error
         self.close_error = close_error
         self.stream_calls = []
@@ -490,22 +496,24 @@ class _FakeFinsDirectService:
         self.stream_calls.append(command_operation_kind)
         self.cancellation_tokens.append(cancellation_token)
         stream = ValidatedFinsEventStream(
-            self._raw_stream(),
+            self._raw_stream(validator_operation_kind),
             operation_kind=validator_operation_kind,
         )
         self.opened_streams.append(stream)
         return stream
 
-    async def _raw_stream(self) -> AsyncGenerator[FinsEvent, None]:
+    async def _raw_stream(self, operation_kind: FinsOperationKind) -> AsyncGenerator[FinsEvent, None]:
         """产出 fake raw events 并保留关闭观测。
 
+        :param operation_kind: 默认事件的真实操作类型。
         :returns: 未校验的 Fins raw event async generator。
         :raises BaseException: stream_error 原样抛出；关闭失败保留为取消 cause 或原样抛出。
         """
 
         cancellation_observed = False
         try:
-            for index, event in enumerate(self.events):
+            events = (_progress_event(operation_kind), _result_event(operation_kind=operation_kind)) if self.events is None else self.events
+            for index, event in enumerate(events):
                 yield event
                 if index == 0:
                     self.first_event_yielded.set()
@@ -1002,7 +1010,12 @@ def test_live_fins_commands_render_progress_and_terminal_summary(
     fake_service: _FakeFinsDirectService,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """六个 Fins direct commands 都必须消费 direct event stream 并输出摘要。"""
+    """六个 Fins direct commands 都必须消费 direct event stream 并输出摘要。
+
+    参数：command_name 为被测 direct 命令名；tmp_path 为隔离测试工作区；fake_service 为记录事件与请求的 Service 替身；capsys 为标准输出与错误输出捕获夹具。
+    返回：无（None）。
+    异常：AssertionError，既定断言或测试前提不满足时抛出。
+    """
 
     exit_code = cli_main.main(_live_command_argv(command_name, tmp_path))
 
@@ -1012,7 +1025,12 @@ def test_live_fins_commands_render_progress_and_terminal_summary(
     assert "Fins progress" in captured.out
     assert 'message="download live progress"' in captured.out
     assert "Fins succeeded" in captured.out
-    assert 'processed_count="1"' in captured.out
+    if command_name == "download":
+        assert "downloaded=0 skipped=0 rejected=0 failed=0" in captured.out
+        assert captured.out.count("Fins download diagnostics: ") == 1
+    else:
+        assert 'processed_count="1"' in captured.out
+        assert "Fins download diagnostics: " not in captured.out
     assert "Fins direct event received" not in captured.out
     assert "Fins direct event detail" not in captured.out
     assert captured.err == ""
@@ -1264,8 +1282,9 @@ def test_fins_direct_debug_log_outputs_event_details(
 def test_fins_direct_debug_diagnostic_details_are_bounded() -> None:
     """DEBUG 诊断 details 必须限制条目数，避免日志体量失控。
 
-    :returns: ``None``。
-    :raises AssertionError: detail 条目未被限制时抛出。
+    参数：无。
+    返回：无（None）。
+    异常：AssertionError，既定断言或测试前提不满足时抛出。
     """
 
     event = FinsEvent(
@@ -1290,6 +1309,7 @@ def test_fins_direct_debug_diagnostic_details_are_bounded() -> None:
             ),
             error_kind=None,
             error_message=None,
+            download_result=_download_summary(source=download_contract.FinsDownloadSource.SEC),
         ),
     )
 
@@ -4923,10 +4943,12 @@ def _empty_progress_event() -> FinsEvent:
 def _result_event(
     *,
     status: FinsResultStatus = FinsResultStatus.SUCCESS,
+    operation_kind: FinsOperationKind = FinsOperationKind.DOWNLOAD,
 ) -> FinsEvent:
-    """构造 fake result event。
+    """构造真实操作类型对应的合法测试终态事件。
 
     :param status: result status。
+    :param operation_kind: 真实操作类型。
     :returns: fake result event。
     :raises ValueError: 事件违反 direct contract 时抛出。
     """
@@ -4945,20 +4967,19 @@ def _result_event(
         error_message = "failed"
     return FinsEvent(
         event_type=FinsEventType.RESULT,
-        operation_kind=FinsOperationKind.DOWNLOAD,
+        operation_kind=operation_kind,
         message="download finished",
         emitted_at=_NOW,
         ticker="AAPL",
         filing_kind="10-K",
         document_label="AAPL 10-K FY2024",
         progress=None,
-        result=FinsResultSummary(
-            status=status,
-            exit_code=exit_code,
-            title="Download finished",
-            details=(FinsEventDetail(label="processed_count", value="1"),),
-            error_kind=error_kind,
-            error_message=error_message,
+        result=(
+            replace(_terminal(_download_summary(source=download_contract.FinsDownloadSource.SEC), status), title="Download finished", details=(FinsEventDetail(label="processed_count", value="1"),))
+            if operation_kind is FinsOperationKind.DOWNLOAD
+            else FinsResultSummary(status=status, exit_code=exit_code, title="Operation finished",
+                details=(FinsEventDetail(label="processed_count", value="1"),),
+                error_kind=error_kind, error_message=error_message)
         ),
     )
 
@@ -5135,3 +5156,177 @@ def test_upload_material_converter_diagnostics_cli_owner(tmp_path: Path, monkeyp
         assert 'source_level=unknown' in text and '转换诊断捕获异常' in text
     else: assert 'installed late-created warning' not in text and 'native stdout WARNING' not in text
     if selector == 'info': assert text.startswith('append-prefix\n')
+
+
+def test_fixed_cli_download_diagnostics_on_empty_rebuild(tmp_path: Path) -> None:
+    """通过固定绝对 CLI 与仓库外 cwd 验证空来源离线 rebuild 新协议。
+
+    Args:
+        tmp_path: 本轮独占临时根，隔离来源工作区与进程 cwd。
+
+    Returns:
+        无。
+
+    Raises:
+        AssertionError: 实际退出码、唯一诊断行或新协议字段不满足预期时抛出。
+        subprocess.TimeoutExpired: 固定入口未在六十秒内退出时抛出。
+    """
+
+    binary = Path(__file__).resolve().parents[2] / ".venv/bin/dayu-cli"
+    outside_cwd = tmp_path / "outside-cwd"
+    outside_cwd.mkdir()
+    fixture_root = tmp_path / "empty-workspace"
+    completed = subprocess.run(
+        [str(binary), "download", "--base", str(fixture_root), "--ticker", "0700", "--start", "2018-01-01", "--end", "2026-10-10", "--rebuild"],
+        cwd=outside_cwd, capture_output=True, text=True, timeout=60, check=False,
+    )
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+    prefix = "Fins download diagnostics: "
+    lines = [line for line in completed.stdout.splitlines() if line.startswith(prefix)]
+    assert len(lines) == 1
+    assert not [line for line in completed.stderr.splitlines() if line.startswith(prefix)]
+    diagnostics = json.loads(lines[0][len(prefix):])
+    assert diagnostics["status"] == "success" and diagnostics["exit_code"] == 0
+    assert diagnostics["summary"]["ticker"] == "0700"
+    assert diagnostics["summary"]["filters"] == {"forms": ["FY", "H1"], "start_date": "2018-01-01", "end_date": "2026-10-10", "overwrite": False, "rebuild": True}
+    assert set(diagnostics["summary"]["counts"].values()) == {0}
+    assert diagnostics["summary"]["terminal_disposition"] == "succeeded"
+    assert diagnostics["failed_documents"] == [] and diagnostics["failure"] is None
+
+
+@pytest.mark.parametrize("quiet", (False, True))
+@pytest.mark.parametrize("status", tuple(FinsResultStatus))
+def test_cli_main_default_temporary_log_delivers_twelve_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], quiet: bool, status: FinsResultStatus) -> None:
+    """验证主入口默认临时日志及 quiet 都交付同一 owner 完整诊断。
+
+    参数：tmp_path 为隔离来源根；monkeypatch 为 Service 装配替换夹具；
+        capsys 为标准输出与错误输出捕获夹具；quiet 控制是否使用静默日志选项；
+        status 为成功、失败或取消的下载终态。
+    返回：无（None）。
+    异常：AssertionError，完整性、原通道、退出码或流生命周期不满足断言时抛出。
+    """
+
+    summary = _download_summary(source=download_contract.FinsDownloadSource.SEC, failed=12, skipped=11, downloaded=1 if status is not FinsResultStatus.FAILURE else 0)
+    terminal = _terminal(summary, status)
+    event = FinsEvent(event_type=FinsEventType.RESULT, operation_kind=FinsOperationKind.DOWNLOAD,
+        message="下载终态", emitted_at=_NOW, ticker="AAPL", filing_kind=None, document_label=None,
+        progress=None, result=terminal)
+    service = _FakeFinsDirectService(events=(_progress_event(FinsOperationKind.DOWNLOAD), event))
+    factory = Mock(return_value=service)
+    monkeypatch.setattr(fins_command, "FINS_DIRECT_SERVICE_FACTORY", factory)
+    args = ["download", "--base", str(tmp_path / "fresh"), "--ticker", "AAPL"]
+    if quiet:
+        args.append("--quiet")
+    exit_code = cli_main.main(args)
+    captured = capsys.readouterr()
+    assert exit_code == terminal.exit_code
+    expected_stream = captured.out if status is FinsResultStatus.SUCCESS else captured.err
+    other_stream = captured.err if status is FinsResultStatus.SUCCESS else captured.out
+    prefix = "Fins download diagnostics: "
+    lines = [line.removeprefix(prefix) for line in expected_stream.splitlines() if line.startswith(prefix)]
+    assert len(lines) == 1 and prefix not in other_stream
+    diagnostics = json.loads(lines[0])
+    assert diagnostics == terminal.to_download_diagnostics_json_value()
+    assert len(diagnostics["failed_documents"]) == 12
+    assert diagnostics["summary"]["counts"]["failed"] == 12
+    assert len(diagnostics["summary"]["documents"]) == 10
+    assert terminal.download_result is not None
+    assert f'terminal_disposition="{terminal.download_result.terminal_disposition.value}"' in expected_stream
+    assert service.opened_streams[-1].terminal_result is terminal
+    assert service.closed_streams == 1 and factory.call_count == 1
+
+
+@pytest.mark.parametrize("index", (0, 10))
+@pytest.mark.parametrize("typed_abort", (False, True))
+@pytest.mark.parametrize("race", ("none", "before_claim", "after_claim"))
+def test_real_runtime_public_rejection_delivers_unique_safe_cli_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    index: int, typed_abort: bool, race: str,
+) -> None:
+    """真实 runtime 公共拒绝必须经唯一 RESULT 交付默认 CLI 安全诊断。
+
+    参数：tmp_path 为隔离根；monkeypatch 替外部 adapter、装配和 claim 观察；
+        capsys 观察标准流；index 为第一或第十一条 FAILED；typed_abort 控制快照中止；
+        race 为取消竞争时点。
+    返回：无。
+    异常：终态丢失、错误通道、泄漏、非法事实或 claim 后投影时抛出 AssertionError。
+    """
+
+    summary = _download_summary(source=download_contract.FinsDownloadSource.SEC, failed=11)
+    rows = list(summary.document_rows)
+    rows[index] = replace(rows[index], document_id="note /Users/private/file")
+    supplied = replace(summary, document_rows=tuple(rows))
+    assert supplied.failed_count == 11
+    adapter = _PersistedSummaryDownloadAdapter(supplied)
+    if typed_abort:
+        monkeypatch.setattr(adapter, "download", Mock(side_effect=ingestion_runtime.FinsSourceDownloadAdapterFailure(
+            ingestion_runtime.SourceIntegrityRepairRequiredError(), supplied,
+        )))
+    runtime = _build_ingestion_runtime(tmp_path, executor=_HoldingExecutor(), download_adapters={("sec", "US"): adapter})
+    service = FinsDirectCommandService(runtime)
+    monkeypatch.setattr(fins_command, "FINS_DIRECT_SERVICE_FACTORY", Mock(return_value=service))
+    put = Mock(wraps=ingestion_runtime._put_direct_queue)
+    monkeypatch.setattr(ingestion_runtime, "_put_direct_queue", put)
+    claims: list[FinsResultStatus | None] = []
+    original_claim = ingestion_runtime._DirectStreamCancellationState.claim_terminal
+    late_projection = Mock(side_effect=AssertionError("claim 后不得构造下载公共行"))
+
+    # 闭包仅绑定本次竞争观察，仍调用真实 owner 的锁与原子裁决。
+    def controlled_claim(state: ingestion_runtime._DirectStreamCancellationState, status: FinsResultStatus) -> FinsResultStatus | None:
+        """观察真实 claim 前后竞争，不替换终态算法。
+
+        参数：state 为真实取消 owner；status 为受理终态。
+        返回：原 owner 的终态或 None。
+        异常：取消时点或请求终态错误时抛出 AssertionError。
+        """
+
+        assert status is FinsResultStatus.FAILURE
+        if race == "before_claim":
+            assert state.request_cancel()
+        resolved = original_claim(state, status)
+        claims.append(resolved)
+        if race == "after_claim":
+            assert not state.request_cancel()
+            monkeypatch.setattr(direct_events, "_download_public_document", late_projection)
+        return resolved
+
+    monkeypatch.setattr(ingestion_runtime._DirectStreamCancellationState, "claim_terminal", controlled_claim)
+    exit_code = cli_main.main(("download", "--base", str(tmp_path), "--ticker", "AAPL"))
+    captured = capsys.readouterr()
+    expected_status = FinsResultStatus.CANCELLED if race == "before_claim" else FinsResultStatus.FAILURE
+    assert exit_code == (130 if race == "before_claim" else 1)
+    assert claims == [expected_status]
+    results = [call.args[1] for call in put.call_args_list if isinstance(call.args[1], FinsEvent) and call.args[1].event_type is FinsEventType.RESULT]
+    assert len(results) == 1
+    event = results[0]
+    assert isinstance(event, FinsEvent) and event.result is not None
+    terminal = event.result
+    assert terminal.status is expected_status and terminal.download_result is not None
+    assert terminal.download_result is not supplied
+    assert terminal.download_result.document_rows == ()
+    assert terminal.download_result.terminal_disposition is (
+        download_contract.FinsDownloadTerminalDisposition.CANCELLED if race == "before_claim"
+        else download_contract.FinsDownloadTerminalDisposition.FAILED
+    )
+    prefix = "Fins download diagnostics: "
+    lines = [line.removeprefix(prefix) for line in captured.err.splitlines() if line.startswith(prefix)]
+    assert len(lines) == 1 and prefix not in captured.out
+    diagnostics = json.loads(lines[0])
+    assert diagnostics == terminal.to_download_diagnostics_json_value()
+    assert diagnostics["failed_documents"] == [] and diagnostics["summary"]["documents"] == []
+    assert set(diagnostics["summary"]["counts"].values()) == {0}
+    assert diagnostics["summary"]["ticker"] == "AAPL"
+    assert diagnostics["summary"]["filters"] == {"forms": [], "start_date": None, "end_date": None, "overwrite": False, "rebuild": False}
+    if race == "before_claim":
+        assert diagnostics["failure"] is None and terminal.failure is None
+    else:
+        assert terminal.failure is not None
+        assert terminal.failure.kind is direct_events.FinsPublicFailureKind.EXECUTION
+        assert terminal.error_kind is FinsErrorKind.EXECUTION
+        assert diagnostics["failure"] == {"classification": "execution", "source": "sec", "transport_category": None,
+            "message": "下载执行失败", "retry_hint": "请保存脱敏诊断并排查失败原因后重试。", "reason_code": None}
+    assert "MISSING_RESULT" not in captured.out + captured.err
+    assert "ended without RESULT" not in captured.out + captured.err
+    assert "命令执行失败" not in captured.out + captured.err
+    assert "/Users/private/file" not in captured.out + captured.err
+    late_projection.assert_not_called()

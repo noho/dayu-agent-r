@@ -31,10 +31,13 @@ from dayu.fins.direct_events import (
     FinsEventType,
     FinsPublicFailureKind,
     FinsResultStatus,
+    FinsResultSummary,
 )
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.download_contract import (
     FinsDownloadDateRange,
+    FinsDownloadRequest,
+    FinsDownloadDocumentDisposition,
     FinsDownloadTerminalDisposition,
     FinsDownloadProviderError,
     FinsDownloadSource,
@@ -42,6 +45,7 @@ from dayu.fins.download_contract import (
     build_fins_download_request,
 )
 from dayu.fins.ingestion_runtime import (
+    FinsDownloadProgressSink,
     FinsIngestionExecutor,
     FinsIngestionJobStatus,
     FinsIngestionRuntime,
@@ -870,7 +874,7 @@ def test_cn_integrity_snapshot_has_separate_strict_projection_entry(tmp_path: Pa
         AssertionError: status 或 row 校验被绕过时抛出。
     """
 
-    result = _cn_projection_result([{
+    result = _cn_projection_result([{"reason_message": '本地来源完整性预检失败',
         "document_id": "fil-failed",
         "status": "failed",
         "reason_code": "source_integrity_preflight",
@@ -1014,7 +1018,7 @@ def test_cn_terminal_projection_rejects_missing_and_nontext_status(
         ("missing_periods", [""]),
         ("filings", ["invalid"]),
         ("filings", [{"document_id": "fil-bad", "status": "downloaded"}]),
-        ("filings", [{
+        ("filings", [{"reason_message": '本地 source 完整，跳过远端传输',
             "document_id": "fil-bad", "status": "skipped", "form_type": "FY",
             "reason_code": "already_downloaded_complete", "filing_date": "2025-04-01",
             "report_date": None, "covered_fiscal_periods": [],
@@ -1215,7 +1219,7 @@ def test_cn_adapter_summary_counts_are_derived_from_typed_rows(tmp_path: Path) -
     summary = cn_pipeline_module._summary_from_pipeline_result(
         _cn_projection_result(
             [
-                {
+                {"reason_message": '本地 source 完整，跳过远端传输',
                     "document_id": "fil-existing",
                     "status": "skipped",
                     "reason_code": "already_downloaded_complete",
@@ -1266,7 +1270,7 @@ def test_cn_adapter_rejects_invalid_required_coverage(
         AssertionError: 非法 workflow coverage 被接纳时抛出。
     """
 
-    row: dict[str, JsonValue] = {
+    row: dict[str, JsonValue] = {"reason_message": '本地 source 完整，跳过远端传输',
         "document_id": "fil-invalid-coverage",
         "status": "skipped",
         "reason_code": "already_downloaded_complete",
@@ -1315,11 +1319,16 @@ def test_cn_hk_adapter_local_rebuild_does_not_mutate_processed_documents(
     ticker: str,
     exchange: Exchange,
 ) -> None:
-    """CN/HK local rebuild 应只改 source，不得标记 processed 重处理。"""
+    """CN/HK local rebuild 应只改 source，不得标记 processed 重处理。
+
+    参数：tmp_path 为隔离测试工作区；source 为下载来源；market 为来源市场；ticker 为规范化公司代码；exchange 为交易所。
+    返回：无（None）。
+    异常：AssertionError，既定断言或测试前提不满足时抛出。
+    """
 
     pipeline = _RecordingPipeline(workspace_root=tmp_path)
     document_id = "fil_cn_rebuild"
-    filing_payload: dict[str, JsonValue] = {
+    filing_payload: dict[str, JsonValue] = {"reason_message": '本地 source 完整，跳过远端传输',
         "document_id": document_id,
         "status": "skipped",
         "reason_code": "already_downloaded_complete",
@@ -2502,6 +2511,16 @@ def test_cn_real_churn_preserves_success_prefix_and_stops_tail(tmp_path: Path, m
         assert result.download is not None and result.download.terminal_disposition is FinsDownloadTerminalDisposition.PARTIAL_FAILURE
         assert (result.download.discovered_count, result.download.downloaded_count, result.download.failed_count) == (2, 1, 1)
         assert [row.document_id for row in result.download.document_rows] == [first_id, second_id]
+        assert result.download_result is not None
+        assert result.download_result is observer.failures[0].persisted_summary
+        failed = result.to_download_diagnostics_json_value()["failed_documents"]
+        assert isinstance(failed, list) and len(failed) == 1
+        row = result.download_result.document_rows[1]
+        assert isinstance(failed[0], dict)
+        assert failed[0]["document_id"] == second_id
+        assert failed[0]["reason_category"] == row.reason_category
+        assert failed[0]["reason_message"] == row.reason_message
+        assert tail_id not in [item.document_id for item in result.download_result.document_rows]
         print(json.dumps({"failure": result.failure.to_json_value(), "download": result.download.to_json_value()}, ensure_ascii=False))
     else:
         start = runtime.start_download(request)
@@ -2573,3 +2592,304 @@ def _assert_cn_original_integrity_chain(observer: _CnIntegrityAdapterObservation
     assert isinstance(abort, CnDownloadIntegrityAbort)
     assert abort.cause is adapter_failure.cause and abort.__cause__ is abort.cause
     assert isinstance(abort.cause, SourceIntegrityRepairRequiredError if repair_required else SourceIntegrityRevisionConflictError)
+
+
+class _DiagnosticsWorkflowObserver:
+    """只观察真实 workflow collect 返回值，原封不动交回真实 adapter。"""
+
+    def __init__(self) -> None:
+        """参数无；返回无；异常无。"""
+
+        self.delegate = cn_pipeline_module.collect_cn_download_result_from_events
+        self.results: list[CnPipelineDownloadResult] = []
+
+    async def __call__(self, events: AsyncIterator[DownloadEvent], *, progress_sink: FinsDownloadProgressSink | None = None) -> CnPipelineDownloadResult:
+        """观察真实事件收集结果，并返回同一 workflow 结果对象。
+
+        参数：events 为真实 CN/HK 下载事件异步流；progress_sink 为可选的下载进度回调。
+        返回：委托收集函数返回的完整 workflow 结果对象。
+        异常：RuntimeError，缺少完成事件或完成事件没有结果时由收集函数抛出；
+            CnDownloadIntegrityAbort，工作流完整性中止时透传同一对象；
+            ValueError，进度字段或回调拒绝投影时透传；
+            BaseException，事件流或 progress_sink 的其它异常及取消保持原类型和对象透传。
+        """
+
+        result = await self.delegate(events, progress_sink=progress_sink)
+        self.results.append(result)
+        return result
+
+
+class _DiagnosticsPdfFailure:
+    """外部 PDF transport 故障输入，不替代 workflow 或 adapter。"""
+
+    def __init__(self, failure: Exception) -> None:
+        """保存用于注入 PDF transport 故障的异常。
+
+        参数：failure 为调用时原样抛出的 Exception 实例。
+        返回：无（None）。
+        异常：无；只保存异常并初始化候选记录。
+        """
+
+        self.failure = failure
+        self.candidates: list[CnReportCandidate] = []
+
+    def __call__(self, candidate: CnReportCandidate) -> DownloadedReportAsset:
+        """记录真实候选并注入指定的 PDF transport 故障。
+
+        参数：candidate 为真实 discovery 返回的报告候选。
+        返回：不返回，始终抛出构造时传入的 failure。
+        异常：Exception，原样抛出保存的 failure，保留其实际类型和对象；
+            本组用例分别传入 FinsDownloadProviderError、OSError 或 RuntimeError。
+        """
+
+        self.candidates.append(candidate)
+        raise self.failure
+
+
+class _DiagnosticsCandidateMetadata:
+    """在 discovery 边界提供来源明确给出的报告日与覆盖，不在下游推断。"""
+
+    def __init__(self, discovery: _RuntimeFakeDiscoveryClient) -> None:
+        """保存待委托的离线 discovery 方法。
+
+        参数：discovery 为提供固定候选的 _RuntimeFakeDiscoveryClient 实例。
+        返回：无（None）。
+        异常：无；只保存该实例的候选查询方法。
+        """
+
+        self.delegate = discovery.list_report_candidates
+
+    def __call__(self, query: CnReportQuery, profile: CnCompanyProfile, *, local_annual_ends: tuple[date, ...], cancellation_checkpoint: Callable[[], None] | None = None) -> CnReportDiscoveryResult:
+        """在 discovery 边界补入来源明确提供的报告日和覆盖期间。
+
+        参数：query 为包含市场、表单和日期窗口的报告查询；profile 为公司元数据；
+            local_annual_ends 为传给原 discovery 的本地年度截止日期序列，固定候选替身不使用它；
+            cancellation_checkpoint 为可选无参取消检查回调，由原 discovery 调用。
+        返回：保留原 discovery 其它字段、替换候选报告日和期间投影的结果。
+        异常：CnDownloadCancelledError，取消检查命中时保持同一对象透传；
+            BaseException，cancellation_checkpoint 的其它异常保持实际类型和对象透传；
+            TypeError / ValueError，期间投影构造违反类型或覆盖期间契约时抛出。
+        """
+
+        original = self.delegate(query, profile, local_annual_ends=local_annual_ends, cancellation_checkpoint=cancellation_checkpoint)
+        return replace(original, candidates=tuple(replace(candidate,
+            report_date="2024-12-31" if candidate.provider == "hkexnews" else "2025-12-31",
+            period_projection=CnReportPeriodProjection(identity_period="FY", covered_periods=("FY", "Q4") if candidate.provider == "hkexnews" else ("FY",)))
+            for candidate in original.candidates))
+
+
+class _DiagnosticsChangedHkCoverage:
+    """在外部 discovery 输入处改变已知覆盖，验证真实 workflow 的不一致拒绝。"""
+
+    def __init__(self, discovery: _RuntimeFakeDiscoveryClient) -> None:
+        """保存用于覆盖变化用例的离线 discovery 方法。
+
+        参数：discovery 为提供固定候选的 _RuntimeFakeDiscoveryClient 实例。
+        返回：无（None）。
+        异常：无；只保存该实例的候选查询方法。
+        """
+
+        self.delegate = discovery.list_report_candidates
+
+    def __call__(self, query: CnReportQuery, profile: CnCompanyProfile, *, local_annual_ends: tuple[date, ...], cancellation_checkpoint: Callable[[], None] | None = None) -> CnReportDiscoveryResult:
+        """在 discovery 边界改变 HK 已知覆盖，保留原候选身份。
+
+        参数：query 为包含市场、表单和日期窗口的报告查询；profile 为公司元数据；
+            local_annual_ends 为传给原 discovery 的本地年度截止日期序列，固定候选替身不使用它；
+            cancellation_checkpoint 为可选无参取消检查回调，由原 discovery 调用。
+        返回：候选身份不变、覆盖期间改为 FY 和 Q4 的 discovery 结果。
+        异常：CnDownloadCancelledError，取消检查命中时保持同一对象透传；
+            BaseException，cancellation_checkpoint 的其它异常保持实际类型和对象透传；
+            TypeError / ValueError，期间投影构造违反类型或覆盖期间契约时抛出。
+        """
+
+        original = self.delegate(query, profile, local_annual_ends=local_annual_ends, cancellation_checkpoint=cancellation_checkpoint)
+        return replace(original, candidates=tuple(replace(candidate, period_projection=CnReportPeriodProjection(identity_period="FY", covered_periods=("FY", "Q4"))) for candidate in original.candidates))
+
+
+def test_hk_period_metadata_mismatch_is_real_failed_diagnostic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """真实 HK 期间不一致应作为完整失败诊断保留。
+
+    参数：tmp_path 为隔离测试工作区；monkeypatch 为隔离输入与执行边界替换夹具。
+    返回：无（None）。
+    异常：AssertionError，既定断言或测试前提不满足时抛出。
+    """
+
+    runtime, _cn, hk, converter = _build_runtime_with_cn_hk_adapters(tmp_path)
+    request = build_fins_download_request(ticker="0700", form_types=("FY",), start="2024-01-01", end="2026-10-10")
+    first = asyncio.run(_collect_diagnostics_runtime(runtime, request))[-1].result
+    assert first is not None and first.download_result is not None and first.download_result.downloaded_count == 1
+    observer = _DiagnosticsWorkflowObserver()
+    monkeypatch.setattr(cn_pipeline_module, "collect_cn_download_result_from_events", observer)
+    monkeypatch.setattr(hk, "list_report_candidates", _DiagnosticsChangedHkCoverage(hk))
+    result = asyncio.run(_collect_diagnostics_runtime(runtime, request))[-1].result
+    assert result is not None and result.status is FinsResultStatus.FAILURE and result.exit_code == 1
+    _assert_workflow_row_diagnostics(result, observer.results[0])
+    assert result.download_result is not None
+    row = result.download_result.document_rows[0]
+    assert row.disposition is FinsDownloadDocumentDisposition.FAILED
+    assert row.reason_category == "period_metadata_mismatch"
+    assert row.reason_message == "本地财期与来源识别不一致，请使用 download --rebuild 纠正本地财期"
+    assert row.covered_fiscal_periods == ("FY", "Q4")
+    failed = result.to_download_diagnostics_json_value()["failed_documents"]
+    assert isinstance(failed, list) and len(failed) == 1
+    assert hk.download_calls == converter.calls == 1
+
+
+def _assert_workflow_row_diagnostics(result: FinsResultSummary, workflow: CnPipelineDownloadResult) -> None:
+    """逐字段核对 workflow、typed 结果与完整公共诊断同源。
+
+    参数：result 为真实 direct 结果；workflow 为上游 workflow 的完整结果。
+    返回：无（None）。
+    异常：AssertionError，既定断言或测试前提不满足时抛出。
+        ValueError，strict zip 的三个序列长度不一致时抛出。
+    """
+
+    full, public = result.download_result, result.download
+    assert full is not None and public is not None
+    filings = workflow["filings"]
+    assert isinstance(filings, list) and len(filings) == len(full.document_rows)
+    failed_json = result.to_download_diagnostics_json_value()["failed_documents"]
+    assert isinstance(failed_json, list)
+    expected_failed: list[dict[str, JsonValue]] = []
+    for item, row, public_row in zip(filings, full.document_rows, public.document_rows, strict=True):
+        assert isinstance(item, dict)
+        assert row.document_id == item["document_id"]
+        assert row.form_or_period == item["form_type"]
+        assert row.filing_date == item["filing_date"]
+        assert row.report_date == item["report_date"]
+        assert list(row.covered_fiscal_periods) == item["covered_fiscal_periods"]
+        assert row.disposition.value == item["status"]
+        assert row.reason_category == item["reason_code"]
+        assert row.reason_message == item["reason_message"]
+        assert public_row.reason_category == row.reason_category and public_row.reason_message == row.reason_message
+        assert public_row.document_id == row.document_id
+        if row.disposition is FinsDownloadDocumentDisposition.FAILED:
+            expected_failed.append({
+                "document_id": item["document_id"], "form_or_period": item["form_type"],
+                "filing_date": item["filing_date"], "report_date": item["report_date"],
+                "covered_fiscal_periods": item["covered_fiscal_periods"], "disposition": "failed",
+                "reason_category": item["reason_code"], "reason_message": item["reason_message"], "artifact_locator": None,
+            })
+    assert failed_json == expected_failed
+    assert len(failed_json) == full.failed_count == public.failed_count
+
+
+@pytest.mark.parametrize("source", (FinsDownloadSource.CNINFO, FinsDownloadSource.HKEXNEWS))
+@pytest.mark.parametrize(("category", "expected_reason", "message"), (
+    (FinsDownloadTransportCategory.TIMEOUT, "provider_timeout", "来源请求超时，稍后重试"),
+    (FinsDownloadTransportCategory.HTTP_STATUS, "provider_http_status", "来源返回异常 HTTP 状态"),
+    (FinsDownloadTransportCategory.PROTOCOL, "provider_protocol", "来源响应协议不合法"),
+    (None, "storage_failed", "下载产物读写失败"),
+    (None, "filing_execution_failed", "财报文档执行失败"),
+))
+def test_cn_hk_real_workflow_failure_reasons_reach_complete_diagnostics(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: FinsDownloadSource, category: FinsDownloadTransportCategory | None, expected_reason: str, message: str) -> None:
+    """真实 CN/HK workflow 失败原因必须进入完整公共诊断。
+
+    参数：tmp_path 为隔离测试工作区；monkeypatch 为隔离输入与执行边界替换夹具；source 为下载来源；category 为来源 transport 分类；expected_reason 为预期同源原因代码；message 为来源安全原因说明。
+    返回：无（None）。
+    异常：AssertionError，既定断言或测试前提不满足时抛出。
+    """
+
+    runtime, cn, hk, converter = _build_runtime_with_cn_hk_adapters(tmp_path)
+    observer = _DiagnosticsWorkflowObserver()
+    monkeypatch.setattr(cn_pipeline_module, "collect_cn_download_result_from_events", observer)
+    failure = FinsDownloadProviderError(source=source, transport_category=category, retryable=True, safe_message=message) if category is not None else OSError("/Users/private/raw.pdf") if expected_reason == "storage_failed" else RuntimeError("raw https://private.invalid/contact")
+    transport = _DiagnosticsPdfFailure(failure)
+    discovery = cn if source is FinsDownloadSource.CNINFO else hk
+    monkeypatch.setattr(discovery, "list_report_candidates", _DiagnosticsCandidateMetadata(discovery))
+    monkeypatch.setattr(discovery, "download_report_pdf", transport)
+    request = build_fins_download_request(ticker="600519" if source is FinsDownloadSource.CNINFO else "0700", form_types=("FY",), start="2024-01-01", end="2026-10-10")
+    events = asyncio.run(_collect_diagnostics_runtime(runtime, request))
+    result = events[-1].result
+    assert result is not None and result.status is FinsResultStatus.FAILURE and result.exit_code == 1
+    assert len(observer.results) == len(transport.candidates) == 1 and converter.calls == 0
+    _assert_workflow_row_diagnostics(result, observer.results[0])
+    assert result.download_result is not None
+    row = result.download_result.document_rows[0]
+    candidate = transport.candidates[0]
+    assert row.filing_date == candidate.filing_date
+    assert row.report_date == candidate.report_date
+    assert row.covered_fiscal_periods == candidate.period_projection.covered_periods
+    assert row.reason_category == expected_reason and row.reason_message == message
+    assert "private.invalid" not in str(result.to_download_diagnostics_json_value())
+    assert "/Users/private" not in str(result.to_download_diagnostics_json_value())
+
+
+async def _collect_diagnostics_runtime(runtime: FinsIngestionRuntime, request: FinsDownloadRequest) -> list[FinsEvent]:
+    """完整收集真实 runtime 的已验证下载事件。
+
+    参数：runtime 为已装配的真实下载运行时；request 为静态下载请求。
+    返回：按流顺序收集的全部 FinsEvent，包括已验证的唯一终态。
+    异常：ValueError，请求或公共字段非法时由 runtime 透传；
+        OSError，仓储读写失败时由 runtime 透传；
+        FinsDirectStreamProtocolError，缺少、重复终态或终态之后还有事件时抛出；
+        BaseException，原始流的其它异常或取消保持实际类型和对象透传。
+        正常流耗尽的 StopAsyncIteration 由异步迭代消费，不向外传播。
+    """
+
+    return [event async for event in runtime.download(request)]
+
+
+@pytest.mark.parametrize("source", (FinsDownloadSource.CNINFO, FinsDownloadSource.HKEXNEWS))
+def test_cn_hk_real_skip_and_hk_rebuild_keep_workflow_reason(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: FinsDownloadSource) -> None:
+    """真实跳过与 HK rebuild 必须保留 workflow 原因。
+
+    参数：tmp_path 为隔离测试工作区；monkeypatch 为隔离输入与执行边界替换夹具；source 为下载来源。
+    返回：无（None）。
+    异常：AssertionError，既定断言或测试前提不满足时抛出。
+    """
+
+    runtime, _cn, _hk, _converter = _build_runtime_with_cn_hk_adapters(tmp_path)
+    request = build_fins_download_request(ticker="600519" if source is FinsDownloadSource.CNINFO else "0700", form_types=("FY",), start="2024-01-01", end="2026-10-10")
+    asyncio.run(_collect_diagnostics_runtime(runtime, request))
+    observer = _DiagnosticsWorkflowObserver()
+    monkeypatch.setattr(cn_pipeline_module, "collect_cn_download_result_from_events", observer)
+    result = asyncio.run(_collect_diagnostics_runtime(runtime, request))[-1].result
+    assert result is not None
+    _assert_workflow_row_diagnostics(result, observer.results[-1])
+    assert result.download_result is not None
+    row = result.download_result.document_rows[0]
+    assert row.disposition is FinsDownloadDocumentDisposition.SKIPPED
+    assert row.reason_category == "integrity_complete" and row.reason_message == "本地 source 完整，跳过远端传输"
+    if source is FinsDownloadSource.HKEXNEWS:
+        rebuild = replace(request, rebuild_local_artifacts=True)
+        asyncio.run(_collect_diagnostics_runtime(runtime, rebuild))
+        current = asyncio.run(_collect_diagnostics_runtime(runtime, rebuild))[-1].result
+        assert current is not None
+        _assert_workflow_row_diagnostics(current, observer.results[-1])
+        assert current.download_result is not None
+        row = current.download_result.document_rows[0]
+        assert row.reason_category == "period_metadata_current" and row.reason_message == "财期元数据已一致，无需更新"
+
+
+@pytest.mark.parametrize("entry", ("normal", "rebuild", "integrity"))
+@pytest.mark.parametrize("status", ("failed", "skipped"))
+@pytest.mark.parametrize(("field", "value"), (("reason_code", None), ("reason_message", None), ("reason_code", ""), ("reason_message", ""), ("reason_message", "https://private.invalid/report")))
+def test_cn_reason_owner_strictly_rejects_missing_empty_unsafe(tmp_path: Path, entry: str, status: str, field: str, value: str | None) -> None:
+    """原因 owner 严格拒绝缺失、空值及不安全字段。
+
+    参数：tmp_path 为隔离测试工作区；entry 为被测投影入口；status 为被测终态；field 为待破坏的原因字段；value 为待拒绝的字段值。
+    返回：无（None）。
+    异常：AssertionError，既定断言或测试前提不满足时抛出。
+    """
+
+    row: dict[str, JsonValue] = {"document_id": "strict-row", "status": status, "form_type": "FY", "filing_date": "2025-04-01", "report_date": None, "covered_fiscal_periods": ["FY"], "reason_code": "provider_timeout", "reason_message": "来源请求超时", "skip_reason": "cannot-be-fallback"}
+    if value is None:
+        del row[field]
+    else:
+        row[field] = value
+    result = _cn_projection_result([row])
+    request = _cn_projection_request()
+    if entry == "rebuild":
+        request = replace(request, rebuild_local_artifacts=True)
+        filters = result["filters"]
+        assert isinstance(filters, dict)
+        filters["rebuild"] = True
+    repository = FsSourceDocumentRepository(tmp_path)
+    with pytest.raises(ValueError):
+        if entry == "integrity":
+            result["status"] = "integrity_failed"
+            cn_pipeline_module._summary_from_integrity_abort(result, request=request, source_repository=repository, uncertain_reports=())
+        else:
+            cn_pipeline_module._summary_from_pipeline_result(result, request=request, source_repository=repository)

@@ -231,6 +231,34 @@ earnings-call 上限等于过滤后的 filing 数量；financial statements 不�
 CLI 只能机械消费 typed plan，把 filing/material entry 投影为当前 direct upload grammar，并把 skipped facts投影为人类可读
 摘要；文件名规则、caps 和 skip reason 不得在 CLI renderer 或测试 fixture 中重算。
 
+### 下载完整结果与有界投影
+
+下载终态的唯一真源是 `FinsResultSummary.download_result`，持有完整
+`FinsDownloadResultSummary`。只读 `download` property 通过
+`FinsDownloadPublicSummary.from_result_summary` 在结果构造时派生前十条文档与原独立未知报告预算；
+`omitted_count` 仅描述有界文档摘要。`to_download_diagnostics_json_value()` 提供完整
+`failed_documents`、同源有界 `summary` 和独立整体 `failure`，失败列表不按条数截断。
+两个投影共享同一文档字段规则；来源未提供日期或期间时保留 null 或空覆盖数组。
+DOWNLOAD RESULT 必须携带完整结果，其它 operation 的 RESULT 禁止携带下载结果；
+非下载结果调用完整诊断方法会拒绝。
+
+完整失败行与有界摘要在公共结果受理时一并完成安全校验，后续消费者读取已校验投影。
+Direct 下载在终态原子提交前准备可交付的结果；公共校验拒绝返回请求级空 FAILED 和
+安全整体失败，不把拒绝的行交给 CLI，也不虚构候选失败。取消与请求终态仍由同一原子裁决
+决定，提交后不再构造下载公共投影。
+
+候选身份、日期、覆盖和安全原因属于来源 workflow。CN/HK adapter 严格消费失败与跳过的
+原因对，不猜默认分类、不替换为通用说明；HK 财期不一致仍是 FAILED。
+SEC 完整结果机械保留 adapter 既有安全字段，本接口不改变 SEC 原因治理。
+启动前或 activation 失败由持有请求的 runtime 生成请求级 typed 空 FAILED，整体错误单列；
+取消生成 CANCELLED 结果，已确认文档及原因保留，尚未处理候选不造结果。
+
+完整诊断用于 direct client / operator。Service wait、LLM tool 和 durable job 继续使用
+原有有界下载投影与摘要；durable 摘要与 public 未知报告共用 4096 字符预算，
+不序列化完整失败数组。
+operation-local 结果随既有 observation 生命周期保存，不承诺流提前关闭、崩溃或未捕获
+终态后的历史查询。
+
 ### Ingestion runtime 与 awaiting observation
 
 `dayu.fins.ingestion_runtime.FinsIngestionRuntime` 是下载、预处理与上传的 typed runtime foundation。当前稳定入口分为 direct stream、awaiting observation 和 legacy durable job helpers：
