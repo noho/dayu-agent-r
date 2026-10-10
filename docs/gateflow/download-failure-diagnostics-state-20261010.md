@@ -4,7 +4,7 @@
 - Branch：fix/download-failure-diagnostics-20261010
 - Base：c65c2aa28fae9c47ad947783d63f7559db7768c4
 - Goal confirmation：pass，用户委托巡检线于本会话明确确认；职责收窄已写入 goal artifact。
-- Current gate / next entry point：accepted deepreview commit
+- Current gate / next entry point：push
 - Issue：N/A，未指定 GitHub issue，不创建或评论 issue。
 - 权限边界：只修 Dayu 完整下载失败诊断；新观测及实际下载缺陷扩范围需巡检线确认；merge 等未授权。
 
@@ -201,3 +201,7 @@ session7945真实exit0/turn.completed/canary match，唯一新增文档行、38�
 ## Aggregate loop结案
 
 双路真实exit0/turn.completed/canary match，完整57文件同版本。DS DF-01 rejected-with-reason（历史实施时点而非最终身份）；所有warnings恢复/报告计数更正见aggregate-adjudication。fix及re-review明确no-op pass；无accepted未修。下一accepted deepreview commit。
+
+## Ready-to-open-draft-PR pass
+
+accepted deepreview commit 23c1046fe1f4b8ac5e66fab02b855d85d1cb632d真实exit0；readiness artifact核分支/三checkpoint/sourceclean/验证/风险/issue N/A与body。为持久化readiness新增本unit控制checkpoint后自动push/create draft PR；PR review仍必做。
