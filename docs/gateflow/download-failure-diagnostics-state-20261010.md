@@ -4,7 +4,7 @@
 - Branch：fix/download-failure-diagnostics-20261010
 - Base：c65c2aa28fae9c47ad947783d63f7559db7768c4
 - Goal confirmation：pass，用户委托巡检线于本会话明确确认；职责收窄已写入 goal artifact。
-- Current gate / next entry point：push
+- Current gate / next entry point：accepted PR review commit
 - Issue：N/A，未指定 GitHub issue，不创建或评论 issue。
 - 权限边界：只修 Dayu 完整下载失败诊断；新观测及实际下载缺陷扩范围需巡检线确认；merge 等未授权。
 
@@ -205,3 +205,15 @@ session7945真实exit0/turn.completed/canary match，唯一新增文档行、38�
 ## Ready-to-open-draft-PR pass
 
 accepted deepreview commit 23c1046fe1f4b8ac5e66fab02b855d85d1cb632d真实exit0；readiness artifact核分支/三checkpoint/sourceclean/验证/风险/issue N/A与body。为持久化readiness新增本unit控制checkpoint后自动push/create draft PR；PR review仍必做。
+
+## Draft PR创建真实终态
+
+readiness控制checkpoint e7be21828b0c364306427b6e38de2414b7eb8c92；push session40532真实exit0，draft create session23982真实exit0。PR https://github.com/noho/dayu-agent-r/pull/199，OPEN/isDraft=true；初review精确base c65c2aa2/head e7be2182，API compare62文件、前后metadata稳定、本地HEAD匹配及sourceclean。下一PR review，不draft-PR-pass。
+
+## PR199双路review在途
+
+两路preflight ok、独立require_escalated/no-persist/显式cwd，精确APIcompare base c65c2aa28fae9c47ad947783d63f7559db7768c4/head e7be21828b0c364306427b6e38de2414b7eb8c92、62文件；identity SHA160da326e960eeebc2e751a17e932fde663f6cf9a5cb9634a562446973b59e1b。gpt-6-astra dfdiag-pr199-astra-20261010-01 run_dir sub-agents.pg7YYv session24607；ds-flash dfdiag-pr199-dsflash-20261010-01 run_dir sub-agents.o1oQ9t session17113；共同父目录/private/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T。只各自新PR报告、不读本轮另一报告；未取得真实终态，不验收。root外cwd实际五import hash与aggregate最终身份相同；PR check rollup空不当CI绿。
+
+## PR review loop pass
+
+双路真实exit0/turn.completed/报告token逐字match，未发现实质性问题，no-op fix/re-review pass。MCP403、查询失败恢复、DS parser/CI说明及required完整独立核验见pr-adjudication；CI无检查/聚合pending未当pass。下一accepted PR review commit，再push/draft-PR-pass/final closeout。
