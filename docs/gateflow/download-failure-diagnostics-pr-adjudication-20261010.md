@@ -41,7 +41,7 @@ Review精确base c65c2aa28fae9c47ad947783d63f7559db7768c4 / head e7be21828b0c364
 
 两路write_stdin取得真实exit0，完整JSONL有效且turn.completed，全部stderr原样保留。共同setup_status=ok、agent_status=completed、tool_evidence=yes、tool_trace=partial、required_evidence=complete、canary_status=match、result_status=accepted、evidence_gaps=[]、retry_class=none。Partial因stderr各有一次MCP transport 403 challenge且没有对应请求轨迹，不能声称该基础设施调用成功或精确推原因；没有任务必要MCP依赖，必要来源代码/hash/PR/CI取证由实际command执行完整并被root独立核验，故不受该失败影响。不是auto-review拒绝，不放宽权限。
 
-Warnings逐项：Astra item_4 gh checks exit1表示无checks，并非测试fail；item_11 rg错service/fins.py exit2，item_15真实service/fins_direct.py恢复；item_37 hk_period_rebuild.py不存在exit2，item_38/39沿import读取实际hk_download_rebuild.py恢复。DS item_62/63分隔串被shell执行exit1，item_64重新读取filing分支、item_66和早先owner读取覆盖HK装配；item_86猜旧CLI文件/函数无匹配exit1，item_87/后续commands/fins.py读取恢复。DS item_115以echo保留内层gh checks EXIT=1（不凭外层0认成功），item_118 status响应被head截短不能证明聚合state，root实际API完整查询恢复：state=pending,total_count=0,statuses=[]；check-runs total_count=0。DS报告header CANARY使用bullet使root helper初次严格行首parser报false；唯一token实际字节与expected及item_1 cat输出精确相同，root人工逐字核验并记录parser差异，非token mismatch，不改原报告。两路模型自报不作物理后端证明。无未恢复的required evidence。
+Warnings逐项：Astra item_4 gh checks exit1表示无checks，并非测试fail；item_11 rg错service/fins.py exit2，item_12真实service/fins_direct.py恢复；item_37 hk_period_rebuild.py不存在exit2，item_38/39沿import读取实际hk_download_rebuild.py恢复。DS item_62/63分隔串被shell执行exit1，item_64重新读取filing分支、item_63第一段已读HK工厂声明，root后续再独立读2050—2110及service_runtime装配核验；item_86猜旧CLI文件/函数无匹配exit1，item_89/90读取commands/fins.py恢复（item_87读取的是Service）。DS item_115以echo保留内层gh checks EXIT=1（不凭外层0认成功），item_118 status响应被head截短不能证明聚合state，root实际API完整查询恢复：state=pending,total_count=0,statuses=[]；check-runs total_count=0。DS报告header CANARY使用bullet使root helper初次严格行首parser报false；唯一token实际字节与expected及item_1 cat输出精确相同，root人工逐字核验并记录parser差异，非token mismatch，不改原报告。两路模型自报不作物理后端证明。无未恢复的required evidence。
 
 ## Findings / loop / CI裁决
 
@@ -58,3 +58,5 @@ Warnings逐项：Astra item_4 gh checks exit1表示无checks，并非测试fail�
 Residual五类：fixed in current slice=诊断丢失及C1/C2/R1/R2；assigned to later work unit=67基线（CLI/Service owner）、14资源平台（集成owner）、SEC原因（来源owner）、规模性能（性能owner）、CI配置和实际检查（仓库CI owner）；requiring new issue or explicit user decision=旧8未来观测/生产范围（巡检线）、历史崩溃/双原因治理（公共契约owner）、merge等（用户）；covered by later approved slice / tracked by existing issue=N/A。DS假设“非法cancelled快照且token未观察”在真实CN/HK链无可达证据，不裁新finding；未来自定义adapter同类治理归公共契约owner另定范围。无未分类风险，issue N/A不新建/评论。
 
 本轮只提交review/control evidence；accepted PR review checkpoint以后仅同unit控制docs，不改生产/test/README。必须final push、draft-PR-pass、final closeout，不能创建PR即停止。
+
+总控closeout证据索引更正：此前三个恢复item号与步骤对应写错，现据实际JSONL更正Astra12、DS89/90及HK装配复核位置；证据本身/报告/生产hash不变，不用错误item号作验收依据。

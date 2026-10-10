@@ -4,7 +4,7 @@
 - Branch：fix/download-failure-diagnostics-20261010
 - Base：c65c2aa28fae9c47ad947783d63f7559db7768c4
 - Goal confirmation：pass，用户委托巡检线于本会话明确确认；职责收窄已写入 goal artifact。
-- Current gate / next entry point：accepted PR review commit
+- Current gate / next entry point：用户另行授权 merge 等；巡检线核实后决定生产观测范围及业务恢复
 - Issue：N/A，未指定 GitHub issue，不创建或评论 issue。
 - 权限边界：只修 Dayu 完整下载失败诊断；新观测及实际下载缺陷扩范围需巡检线确认；merge 等未授权。
 
@@ -217,3 +217,7 @@ readiness控制checkpoint e7be21828b0c364306427b6e38de2414b7eb8c92；push sessio
 ## PR review loop pass
 
 双路真实exit0/turn.completed/报告token逐字match，未发现实质性问题，no-op fix/re-review pass。MCP403、查询失败恢复、DS parser/CI说明及required完整独立核验见pr-adjudication；CI无检查/聚合pending未当pass。下一accepted PR review commit，再push/draft-PR-pass/final closeout。
+
+## Draft-PR-pass 与 final closeout pass
+
+accepted PR review f7162206076a0757e19e15e36feb7533792c05ec；final push session97579真实exit0，GitHub head相同/draft open/base稳定。仅控制docs增量，生产/tests/README与reviewed S1相同。进入draft-PR-pass后创建final-closeout artifact，所有findings/validation/docs/residual/入口/继续模板/issue N/A完整。Work unit completed；本closeout与控制索引更正再发布docs-only checkpoint，未merge/approve/ready或业务代批。
