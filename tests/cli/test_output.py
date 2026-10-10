@@ -5,7 +5,7 @@ from __future__ import annotations
 import io
 import asyncio
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from dataclasses import replace
 from datetime import datetime, timezone
 
@@ -29,8 +29,6 @@ from dayu.fins.direct_events import (
     FINS_RESULT_EXIT_CANCELLED,
     FINS_RESULT_EXIT_FAILURE,
     FINS_RESULT_EXIT_SUCCESS,
-    FinsDownloadPublicDocument,
-    FinsDownloadPublicSummary,
     FinsDownloadFailureReason,
     FinsEvent,
     FinsEventDetail,
@@ -46,6 +44,8 @@ from dayu.fins.direct_events import (
 from dayu.fins.download_contract import (
     FinsDownloadDocumentDisposition,
     FinsDownloadEffectiveFilters,
+    FinsDownloadDocumentResult,
+    FinsDownloadResultSummary,
     FinsDownloadSource,
     FinsDownloadTerminalDisposition,
     FinsDownloadUncertainReport,
@@ -78,6 +78,7 @@ def test_download_reference_literals_preserve_identity_and_terminal_rows(
     :param has_existing_document: 未知报告是否具有同字符的既有文档 ID。
     :returns: 无。
     :raises AssertionError: 原引用、计数、通道、退出码或行结构发生改变时抛出。
+    :raises StopIteration: 缺少文档行或未知报告行、next 无匹配项时抛出。
     """
 
     existing_id = reference if has_existing_document else None
@@ -87,13 +88,13 @@ def test_download_reference_literals_preserve_identity_and_terminal_rows(
         source_id=reference, filing_date="2025-11-13", report_date="2025-08-31",
         existing_document_id=existing_id, reason_category="uncertain_hk_period",
     )
-    document = FinsDownloadPublicDocument(
+    document = FinsDownloadDocumentResult(
         document_id=document_reference, form_or_period="Q3", filing_date="2025-11-13",
         report_date="2025-09-30", covered_fiscal_periods=("Q3",),
         disposition=FinsDownloadDocumentDisposition.DOWNLOADED,
-        reason_category=None, reason_message=None, artifact_locator="portfolio/0700/filings/A",
+        reason_category=None, reason_message=None, artifact_locator=PurePosixPath("portfolio/0700/filings/A"),
     )
-    summary = FinsDownloadPublicSummary(
+    summary = FinsDownloadResultSummary(
         source=FinsDownloadSource.HKEXNEWS, canonical_ticker="0700",
         effective_filters=FinsDownloadEffectiveFilters(
             form_types=("Q3",), start_date=None, end_date=None,
@@ -101,8 +102,8 @@ def test_download_reference_literals_preserve_identity_and_terminal_rows(
         ),
         discovered_count=2, downloaded_count=1, skipped_count=0,
         rejected_count=0, failed_count=0, document_rows=(document,),
-        missing_periods=(), omitted_count=0, uncertain_reports=(report,),
-        uncertain_count=1, omitted_uncertain_count=0,
+        missing_periods=(), uncertain_reports=(report,),
+        uncertain_count=1,
         terminal_disposition=(FinsDownloadTerminalDisposition.CANCELLED if cancelled
                               else FinsDownloadTerminalDisposition.PARTIAL_FAILURE),
     )
@@ -116,14 +117,15 @@ def test_download_reference_literals_preserve_identity_and_terminal_rows(
         title="已取消" if cancelled else "财期未确认", details=(),
         error_kind=None if cancelled else FinsErrorKind.EXECUTION,
         error_message=None if cancelled else failure.safe_message,
-        download=summary, failure=None if cancelled else failure,
+        download_result=summary, failure=None if cancelled else failure,
     )
     event = FinsEvent(
         event_type=FinsEventType.RESULT, operation_kind=FinsOperationKind.DOWNLOAD,
         message=result.title, emitted_at=datetime.now(timezone.utc), ticker="0700",
         filing_kind=None, document_label=None, progress=None, result=result,
     )
-    original = summary.to_json_value()
+    assert result.download is not None
+    original = result.download.to_json_value()
     out, err = io.StringIO(), io.StringIO()
     render_fins_direct_event(event, stdout=out, stderr=err)
     text = err.getvalue()
@@ -131,8 +133,9 @@ def test_download_reference_literals_preserve_identity_and_terminal_rows(
     assert result.status is (FinsResultStatus.CANCELLED if cancelled else FinsResultStatus.FAILURE)
     assert result.exit_code == (EXIT_KEYBOARD_INTERRUPT if cancelled else EXIT_FAILURE)
     assert text.startswith("Fins cancelled:" if cancelled else "Fins failure:")
-    assert len(text.splitlines()) == (4 if cancelled else 6)
-    assert text.count("\n") == (4 if cancelled else 6)
+    diagnostic_lines = [line for line in text.splitlines() if line.startswith("Fins download diagnostics: ")]
+    assert len(diagnostic_lines) == 1
+    assert json.loads(diagnostic_lines[0].removeprefix("Fins download diagnostics: ")) == result.to_download_diagnostics_json_value()
     assert sum(line.startswith("Fins summary:") for line in text.splitlines()) == 1
     assert "discovered=2 downloaded=1 skipped=0 rejected=0 failed=0 uncertain=1 omitted_uncertain=0 omitted=0" in text
     assert not any(character in text for character in ("\r", "\x1b", "\u0085", "\u2028", "\u2029"))
@@ -150,7 +153,7 @@ def test_download_reference_literals_preserve_identity_and_terminal_rows(
         assert json.loads(existing_literal) == existing_id
     else:
         assert existing_literal == "-"
-    assert summary.to_json_value() == original
+    assert result.download.to_json_value() == original
     assert document.document_id == document_reference and report.source_id == reference
     assert report.existing_document_id == existing_id
     if reference == _BOUNDARY_REFERENCE:
@@ -230,14 +233,12 @@ def test_interactive_terminal_result_hides_every_internal_cancel_reason(
 def test_fins_download_cli_mechanically_projects_typed_public_summary() -> None:
     """CLI 应只展示 runtime 给出的 typed summary，不扫描文件或推断 raw 字段。
 
-    Returns:
-        无。
-
-    Raises:
-        AssertionError: CLI 投影遗漏 typed 字段或泄漏禁止内容时抛出。
+    参数：无。
+    返回：无（None）。
+    异常：AssertionError，既定断言或测试前提不满足时抛出。
     """
 
-    summary = FinsDownloadPublicSummary(
+    summary = FinsDownloadResultSummary(
         source=FinsDownloadSource.SEC,
         canonical_ticker="AAPL",
         effective_filters=FinsDownloadEffectiveFilters(
@@ -253,7 +254,7 @@ def test_fins_download_cli_mechanically_projects_typed_public_summary() -> None:
         rejected_count=0,
         failed_count=0,
         document_rows=(
-            FinsDownloadPublicDocument(
+            FinsDownloadDocumentResult(
                 document_id="fil-downloaded",
                 form_or_period="10-K",
                 filing_date="2024-08-01",
@@ -262,13 +263,19 @@ def test_fins_download_cli_mechanically_projects_typed_public_summary() -> None:
                 disposition=FinsDownloadDocumentDisposition.DOWNLOADED,
                 reason_category=None,
                 reason_message=None,
-                artifact_locator="source/AAPL/fil-downloaded",
+                artifact_locator=PurePosixPath("source/AAPL/fil-downloaded"),
+            ),
+            FinsDownloadDocumentResult(
+                document_id="fil-skipped", form_or_period="10-K", filing_date=None,
+                report_date=None, covered_fiscal_periods=(),
+                disposition=FinsDownloadDocumentDisposition.SKIPPED,
+                reason_category="integrity_complete", reason_message="本地来源完整，跳过下载",
+                artifact_locator=None,
             ),
         ),
         missing_periods=(),
-        omitted_count=1,
         terminal_disposition=FinsDownloadTerminalDisposition.SUCCEEDED,
-     uncertain_reports=(), uncertain_count=0, omitted_uncertain_count=0)
+     uncertain_reports=(), uncertain_count=0,)
     event = FinsEvent(
         event_type=FinsEventType.RESULT,
         operation_kind=FinsOperationKind.DOWNLOAD,
@@ -285,7 +292,7 @@ def test_fins_download_cli_mechanically_projects_typed_public_summary() -> None:
             details=(),
             error_kind=None,
             error_message=None,
-            download=summary,
+            download_result=summary,
         ),
     )
     stdout = io.StringIO()
@@ -294,7 +301,7 @@ def test_fins_download_cli_mechanically_projects_typed_public_summary() -> None:
     render_fins_direct_event(event, stdout=stdout, stderr=stderr)
 
     output = stdout.getvalue()
-    assert "discovered=2 downloaded=1 skipped=1 rejected=0 failed=0 uncertain=0 omitted_uncertain=0 omitted=1" in output
+    assert "discovered=2 downloaded=1 skipped=1 rejected=0 failed=0 uncertain=0 omitted_uncertain=0 omitted=0" in output
     assert 'artifact_locator="source/AAPL/fil-downloaded"' in output
     assert "covered_fiscal_periods=[]" in output
     assert "https://" not in output
@@ -315,7 +322,7 @@ def test_fins_download_failure_projects_typed_rows_missing_periods_and_recovery(
         AssertionError: failure public object 被省略或进入错误输出通道时抛出。
     """
 
-    download = FinsDownloadPublicSummary(
+    download = FinsDownloadResultSummary(
         source=FinsDownloadSource.SEC,
         canonical_ticker="AAPL",
         effective_filters=FinsDownloadEffectiveFilters(
@@ -331,7 +338,7 @@ def test_fins_download_failure_projects_typed_rows_missing_periods_and_recovery(
         rejected_count=0,
         failed_count=1,
         document_rows=(
-            FinsDownloadPublicDocument(
+            FinsDownloadDocumentResult(
                 document_id="fil-failed",
                 form_or_period="10-K",
                 filing_date=None,
@@ -344,9 +351,8 @@ def test_fins_download_failure_projects_typed_rows_missing_periods_and_recovery(
             ),
         ),
         missing_periods=("FY2024",),
-        omitted_count=0,
         terminal_disposition=FinsDownloadTerminalDisposition.FAILED,
-     uncertain_reports=(), uncertain_count=0, omitted_uncertain_count=0)
+     uncertain_reports=(), uncertain_count=0,)
     failure = FinsPublicFailure(
         kind=FinsPublicFailureKind.STORAGE,
         source=FinsDownloadSource.SEC,
@@ -371,7 +377,7 @@ def test_fins_download_failure_projects_typed_rows_missing_periods_and_recovery(
             details=(),
             error_kind=FinsErrorKind.STORAGE,
             error_message=failure.safe_message,
-            download=download,
+            download_result=download,
             failure=failure,
         ),
     )
@@ -444,6 +450,7 @@ def test_fins_download_failure_preserves_cli_text_bound_and_public_json(
     :param expected_hint: 按既有显示合同独立构造的带引号期望文本。
     :returns: ``None``。
     :raises AssertionError: 有界显示、空单元格、渠道或公共 JSON 发生漂移时抛出。
+    :raises StopIteration: 缺少失败详情行、next 无匹配项时抛出。
     """
 
     failure = FinsPublicFailure(
@@ -478,7 +485,7 @@ def test_fins_download_failure_preserves_cli_text_bound_and_public_json(
             details=(),
             error_kind=FinsErrorKind.EXECUTION,
             error_message=failure.safe_message,
-            download=FinsDownloadPublicSummary(
+            download_result=FinsDownloadResultSummary(
                 source=FinsDownloadSource.SEC,
                 canonical_ticker="AAPL",
                 effective_filters=FinsDownloadEffectiveFilters(
@@ -493,11 +500,14 @@ def test_fins_download_failure_preserves_cli_text_bound_and_public_json(
                 skipped_count=0,
                 rejected_count=0,
                 failed_count=1,
-                document_rows=(),
+                document_rows=(FinsDownloadDocumentResult(
+                    document_id="failed", form_or_period=None, filing_date=None, report_date=None,
+                    covered_fiscal_periods=(), disposition=FinsDownloadDocumentDisposition.FAILED,
+                    reason_category="execution", reason_message="下载执行失败", artifact_locator=None,
+                ),),
                 missing_periods=(),
-                omitted_count=1,
                 terminal_disposition=FinsDownloadTerminalDisposition.FAILED,
-             uncertain_reports=(), uncertain_count=0, omitted_uncertain_count=0),
+             uncertain_reports=(), uncertain_count=0,),
             failure=failure,
         ),
     )
@@ -630,11 +640,9 @@ def test_fins_success_warning_preserves_stdout_and_writes_each_message_to_stderr
 def test_fins_renderer_covers_progress_failure_cancel_and_error_helpers() -> None:
     """Fins renderer 的 progress、failure、cancel 与显式错误 helper 保持分流。
 
-    Returns:
-        无。
-
-    Raises:
-        AssertionError: 输出通道、fallback 或详情投影漂移时抛出。
+    参数：无。
+    返回：无（None）。
+    异常：AssertionError，既定断言或测试前提不满足时抛出。
     """
 
     progress_event = FinsEvent(
@@ -660,6 +668,7 @@ def test_fins_renderer_covers_progress_failure_cancel_and_error_helpers() -> Non
         progress_event,
         event_type=FinsEventType.RESULT,
         message="failed",
+        operation_kind=FinsOperationKind.PREPROCESS,
         progress=None,
         result=failed_summary,
     )
@@ -697,8 +706,8 @@ def test_fins_cancel_without_download_keeps_original_prompt_and_channel() -> Non
     """无下载摘要的取消保持原展示，不输出普通 details。
 
     参数：无。
-    返回：无。
-    异常：取消提示、stderr 通道或空下载展示发生变化时断言失败。
+    返回：无（None）。
+    异常：AssertionError，取消提示、stderr 通道或空下载展示不满足断言时抛出。
     """
     result = FinsResultSummary(
         status=FinsResultStatus.CANCELLED, exit_code=FINS_RESULT_EXIT_CANCELLED,
@@ -706,7 +715,7 @@ def test_fins_cancel_without_download_keeps_original_prompt_and_channel() -> Non
         error_kind=FinsErrorKind.CANCELLED, error_message=None,
     )
     event = FinsEvent(
-        event_type=FinsEventType.RESULT, operation_kind=FinsOperationKind.DOWNLOAD,
+        event_type=FinsEventType.RESULT, operation_kind=FinsOperationKind.PREPROCESS,
         message="cancelled", emitted_at=datetime.now(timezone.utc), ticker="0700",
         filing_kind=None, document_label=None, progress=None, result=result,
     )

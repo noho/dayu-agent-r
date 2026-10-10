@@ -1564,7 +1564,6 @@ def _project_cn_document_row(
             artifact_locator=locator,
         )
     if status == _CN_STATUS_SKIPPED:
-        category = reason_code or _required_cn_text(item, "skip_reason")
         return FinsDownloadDocumentResult(
             document_id=document_id,
             form_or_period=form_or_period,
@@ -1572,8 +1571,8 @@ def _project_cn_document_row(
             report_date=report_date,
             covered_fiscal_periods=covered_fiscal_periods,
             disposition=FinsDownloadDocumentDisposition.SKIPPED,
-            reason_category=category,
-            reason_message="该文档按下载策略跳过",
+            reason_category=_required_cn_text(item, "reason_code"),
+            reason_message=_required_cn_text(item, "reason_message"),
             artifact_locator=None,
         )
     if status == _CN_STATUS_FAILED:
@@ -1584,8 +1583,8 @@ def _project_cn_document_row(
             report_date=report_date,
             covered_fiscal_periods=covered_fiscal_periods,
             disposition=FinsDownloadDocumentDisposition.FAILED,
-            reason_category=reason_code or "cn_document_failed",
-            reason_message="财报来源未能完成该文档",
+            reason_category=_required_cn_text(item, "reason_code"),
+            reason_message=_required_cn_text(item, "reason_message"),
             artifact_locator=None,
         )
     raise ValueError(f"CN/HK 下载结果 status 未封闭: {status}")

@@ -1,0 +1,16 @@
+{
+  "label": "dfdiag-code-rereview-mimo-20261010-02",
+  "run_dir": "/private/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/sub-agents.DX1NmT",
+  "managed_session": 42045,
+  "actual_exit": 0,
+  "events": 26,
+  "turn_completed": true,
+  "output_sha256": "d00c98399ac1e7e487a7266eb0786a9caa2dfbd2e97d50e04fbc5e10ae6b9312",
+  "final_response": "The request was rejected because it was considered high risk",
+  "stderr": "",
+  "tool_canary_read": "mimo-214003a5",
+  "report_canary_status": "missing",
+  "required_evidence": "missing review artifact and explicit C1/C2 statuses",
+  "result_status": "failed",
+  "retry_class": "route decision pending inspection line; no further blind retry or replacement"
+}

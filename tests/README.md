@@ -53,6 +53,29 @@ HK 身份与同窗元数据回归使用真实 Fs/tmp 仓储：`python -m pytest 
 
 下载终态测试还核对四种来源完整性预检原因全覆盖映射为 storage 分类、同源封闭公共原因及非盲目重试建议，并核对 JSON、CLI 与 Service wait 的固定失败原因显示；CN/HK 真实仓储用例分别覆盖首候选前 company pre-swap 零候选、单文档 Phase B 与 commit-time typed 中止、post-repair 已处理快照，以及 direct RESULT 与 job 持久摘要。
 来源完整性 sibling 回归使用真实隔离 Fs、独立 publication writer 与离线合成资产：CN/SEC identity 三轮预算、成功前缀后中止、SEC 6-K 拒绝前缀、Phase B unsafe rollback、postrepair 同长度 digest 损坏与四原因复查均验证原 cause/确认行守恒。SEC 三个循环尾取消点及 repair clean 后取消保留 cancelled 和原已提交事实。公共回归穷尽 SEC/CNINFO/HKEXNEWS 三来源，并通过真实 adapter/runtime、CLI 主入口和 prepare/activate/poll observation wait 核对安全 failure JSON；wait 配置拒绝 job 读取的 guard。运行对应 `test_cn_download_workflow.py`、`test_cn_download_runtime.py`、`test_sec_pipeline_download.py`、`test_sec_pipeline_download_stream.py`、`test_fins_ingestion_runtime.py`、`test_fins_direct_stream.py`、Service wait 与 CLI output/commands 测试即可覆盖这些行为，不调用真实网络、Docling 或 PDF 解析。
+下载失败诊断回归由 `test_download_failure_diagnostics.py` 锁定完整 typed 真源、
+公用有界投影、0/1/10/11/12 失败、失败位于前十条之后、未知日期和特殊字符身份，
+并拒绝下载终态缺真源及非下载终态携带下载结果。CN/HK runtime 用真实隔离 Fs 与 workflow/adapter
+验证 provider timeout/http/protocol、storage/execution 安全原因、跳过、rebuild 与
+`period_metadata_mismatch=FAILED`；仅替外部 discovery/transport/converter。
+runtime 与 Service 测试核对 activation 原异常身份、取消前缀和 claim 竞争、同对象完整结果、
+observation→wait 三终态有界投影及真实 job store 原摘要预算。
+公共拒绝回归覆盖第一与第十一条 FAILED 行的严格安全校验，以及真实 runtime→唯一 RESULT→
+CLI 默认诊断链；正常返回与 typed 中止快照均保持安全整体失败、原通道和请求信息。
+取消在 claim 前后竞争仍走真实 owner 裁决，已受理终态的消费者不再构造公共行。
+
+CLI output/commands 测试按 `Fins download diagnostics: ` 前缀检查唯一物理行及同源 JSON，
+保留原计数、stdout/stderr 与退出码断言；主入口验证默认临时日志和 quiet 下十二个失败仍完整。
+固定入口离线 smoke 可单独运行：
+
+```bash
+source .venv/bin/activate
+python -m pytest tests/cli/test_fins_commands.py -k fixed_cli_download_diagnostics_on_empty_rebuild -q
+```
+
+该用例在 fresh tmp 来源根、仓库外 cwd 用绝对 `.venv/bin/dayu-cli` 执行空来源 `--rebuild`，
+验证实际 binary 加载诊断协议。它不观测远端、不触达生产来源，也不能证明旧失败原因或真实下载恢复。
+
 共享模型终态测试锁定 `ok/cancelled/integrity_failed` 三值，并覆盖普通与完整性入口互拒、未知与非法值拒绝、去空白行为及 CN/HK 本地 rebuild 终态保全。
 安全诊断测试覆盖未知 download 的 RESULT 与日志先后顺序、脱敏类型指纹、有界包内帧、helper 内部故障降级、CLI 显式日志文件，以及 typed storage 和非异常文档失败不产生未知异常诊断。
 SEC 业绩补源回归：`pytest -q tests/fins/test_sec_earnings_repair.py tests/fins/test_sec_downloader.py tests/fins/test_sec_pipeline_download.py`。

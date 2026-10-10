@@ -1,0 +1,41 @@
+{
+  "cwd": "/private/tmp",
+  "sys_executable": "/Users/leo/workspace/dayu-agent-r/.venv/bin/python",
+  "python": "3.11.15 (main, Mar  3 2026, 00:52:57) [Clang 17.0.0 (clang-1700.6.3.2)]",
+  "version": "0.1.4",
+  "editable": {
+    "dir_info": {
+      "editable": true
+    },
+    "url": "file:///Users/leo/workspace/dayu-agent-r"
+  },
+  "binary": "/Users/leo/workspace/dayu-agent-r/.venv/bin/dayu-cli",
+  "binary_sha256": "42b7131da40fa45cbbdd6f9be4004b6a947f34b92a13e3571c0b1aed21b88af1",
+  "modules": [
+    {
+      "module": "dayu.cli.output",
+      "path": "/Users/leo/workspace/dayu-agent-r/dayu/cli/output.py",
+      "sha256": "9aa54696e8e67c5daaa721d5311052e5003c2c6c14c3520f5c8ff4c2bcdc97cd"
+    },
+    {
+      "module": "dayu.fins.direct_events",
+      "path": "/Users/leo/workspace/dayu-agent-r/dayu/fins/direct_events.py",
+      "sha256": "490b45a03167facd825a6dc6cf586d0480db2119d588d998a99d82b471a4cf30"
+    },
+    {
+      "module": "dayu.fins.download_contract",
+      "path": "/Users/leo/workspace/dayu-agent-r/dayu/fins/download_contract.py",
+      "sha256": "9c66c790a49095307391380c7ddd807b7655d0e3a5bf69aefd58e31185788dd3"
+    },
+    {
+      "module": "dayu.fins.ingestion_runtime",
+      "path": "/Users/leo/workspace/dayu-agent-r/dayu/fins/ingestion_runtime.py",
+      "sha256": "94b19d4f1daa2e715bde2c000ff53ff49301fb7d68f6ce68b83633726f5bbad9"
+    },
+    {
+      "module": "dayu.fins.pipelines.cn_pipeline",
+      "path": "/Users/leo/workspace/dayu-agent-r/dayu/fins/pipelines/cn_pipeline.py",
+      "sha256": "470f4fcaef4d264ae7a08f660e134dda4b9d7382810759b9cd36b91897124e2d"
+    }
+  ]
+}

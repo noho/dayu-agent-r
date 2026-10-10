@@ -60,6 +60,7 @@ _MISSING_FINAL_ANSWER_MESSAGE: str = "Host run succeeded without final answer."
 _FINS_CANCEL_REQUESTED_MESSAGE: str = "Fins operation cancel requested."
 _FINS_FAILED_FALLBACK_MESSAGE: str = "Fins operation failed."
 _FINS_EVENT_PROGRESS_PREFIX: Final[str] = "Fins progress"
+_FINS_DOWNLOAD_DIAGNOSTICS_PREFIX: Final[str] = "Fins download diagnostics: "
 _FINS_EVENT_SUMMARY_PREFIX: Final[str] = "Fins summary"
 _FINS_EVENT_FAILURE_PREFIX: Final[str] = "Fins failure"
 _FINS_EVENT_CANCELLED_PREFIX: Final[str] = "Fins cancelled"
@@ -411,6 +412,11 @@ def _print_terminal_business_summary(result: FinsResultSummary, stream: TextIO) 
     _print_download_summary(result.download, stream)
     if result.failure is not None:
         _print_download_failure(result.failure, stream)
+    print(
+        _FINS_DOWNLOAD_DIAGNOSTICS_PREFIX
+        + json.dumps(result.to_download_diagnostics_json_value(), ensure_ascii=True, sort_keys=True),
+        file=stream,
+    )
 
 
 def _print_download_summary(summary: FinsDownloadPublicSummary, stream: TextIO) -> None:
@@ -441,7 +447,8 @@ def _print_download_summary(summary: FinsDownloadPublicSummary, stream: TextIO) 
             f"failed={summary.failed_count} "
             f"uncertain={summary.uncertain_count} "
             f"omitted_uncertain={summary.omitted_uncertain_count} "
-            f"omitted={summary.omitted_count}"
+            f"omitted={summary.omitted_count} "
+            f"terminal_disposition={json.dumps(summary.terminal_disposition.value)}"
         ),
         file=stream,
     )

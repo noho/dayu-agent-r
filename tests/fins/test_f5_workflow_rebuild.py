@@ -231,6 +231,7 @@ def test_actual_adapter_observation_wait_and_cli_keep_a_and_unknown(
     :param unknown_source_id: B 的原始普通或含特殊字符的来源引用。
     :returns: 无。
     :raises AssertionError: 原引用、A/B 计数、终态或行结构漂移、wait 读 job 时抛出。
+    :raises StopIteration: 未知报告固定前缀行缺失时，next 直接抛出。
     """
     raw = (
         _hk_raw(document_id="A", title="截至2025年9月30日止第三季度業績", category_text="季度業績", filing_date="2025-11-13"),
@@ -280,7 +281,10 @@ def test_actual_adapter_observation_wait_and_cli_keep_a_and_unknown(
     assert json.loads(source_literal) == unknown_source_id
     assert "existing_document_id=-" in unknown_line
     assert sum(line.startswith("Fins summary:") for line in text.splitlines()) == 1
-    assert len(text.splitlines()) == text.count("\n") == (4 if cancel_after_a else 6)
+    diagnostics = [line.removeprefix("Fins download diagnostics: ") for line in text.splitlines() if line.startswith("Fins download diagnostics: ")]
+    assert len(diagnostics) == 1
+    assert json.loads(diagnostics[0]) == result.to_download_diagnostics_json_value()
+    assert len(text.splitlines()) == text.count("\n") == (5 if cancel_after_a else 7)
     assert result.exit_code == (130 if cancel_after_a else 1)
 
 

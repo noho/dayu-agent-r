@@ -1,0 +1,16 @@
+{
+  "label": "dfdiag-code-rereview-mimo-20261010-01",
+  "run_dir": "/private/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/sub-agents.nEyF9G",
+  "managed_session": 5670,
+  "actual_exit": 0,
+  "events": 30,
+  "turn_completed": true,
+  "output_sha256": "08a4d0bb80c112c9471cef96124e451c3200a465483f195ba8d716bfed7e3845",
+  "final_response": "The request was rejected because it was considered high risk",
+  "stderr": "2026-10-10T06:21:29.395942Z ERROR codex_core::tools::router: error=Goal tools require a persistent thread.\n",
+  "tool_canary_read": "mimo-e11d17ec",
+  "report_canary_status": "missing",
+  "required_evidence": "missing review artifact and explicit C1/C2 statuses",
+  "result_status": "failed",
+  "retry_class": "hard retry fresh context, same provider, unchanged frozen source; read-only review with explicit respect for system/developer constraints"
+}
