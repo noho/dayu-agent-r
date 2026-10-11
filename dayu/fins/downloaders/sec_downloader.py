@@ -30,6 +30,8 @@ import posixpath
 import re
 import sys
 import time
+import unicodedata
+from decimal import Decimal, InvalidOperation
 from dataclasses import dataclass
 from enum import StrEnum
 from html.parser import HTMLParser
@@ -51,7 +53,7 @@ from typing import (
     cast,
     overload,
 )
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse, urlsplit
 from xml.etree import ElementTree as ET
 
 import httpx
@@ -69,6 +71,11 @@ from dayu.fins.download_contract import (
     SecUserAgentConfigurationError,
 )
 from dayu.fins.ticker_normalization import normalize_ticker
+from dayu.fins.processors.source_text import FinsSourceDecodeError, decode_source_bytes
+from dayu.fins.storage.asset_filename_contract import (
+    is_document_source_control_name,
+    source_asset_name_collision_key,
+)
 
 DownloadFileResultValue: TypeAlias = JsonValue | FileObjectMeta
 """下载器聚合结果值。
@@ -146,6 +153,18 @@ _ETAG_WEAK_PREFIX: Final[str] = "W/"
 _ETAG_GZIP_SUFFIX: Final[str] = "-gzip"
 _SEC_REQUEST_RESERVED_LOG_EVENT: Final[str] = "SEC request reserved"
 _SEC_RESPONSE_RECEIVED_LOG_EVENT: Final[str] = "SEC response received"
+_HTML_ASCII_WHITESPACE: Final[str] = " \t\n\f\r"
+_SRCSET_DENSITY_PATTERN: Final[str] = r"(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
+_INVALID_PERCENT_PATTERN: Final[str] = r"%(?![0-9a-fA-F]{2})"
+_PERCENT_TRIPLET_PATTERN: Final[str] = r"%[0-9a-fA-F]{2}"
+_ENCODED_SEPARATOR_PATTERN: Final[str] = r"%(?:2f|5c)"
+_HTML_IMAGE_SRCSET_MESSAGE: Final[str] = "图片候选列表（srcset）格式不合法或分界不明确，未发布本次来源。"
+_HTML_IMAGE_REFERENCE_MESSAGE: Final[str] = "图片引用地址或文件名不安全，未发布本次来源。"
+_HTML_IMAGE_EXISTING_NAME_LABEL: Final[str] = "基础文件"
+_HTML_IMAGE_BASE_MESSAGE: Final[str] = "文档 base 地址不在本申报安全边界，无法解析相对图片；未发布本次来源。"
+_HTML_IMAGE_SUBDIRECTORY_MESSAGE: Final[str] = "本申报图片引用位于子目录，当前来源资产仅支持单文件名；未发布本次来源，已有来源保持不变。"
+_SEC_HTTPS_PORT: Final[int] = 443
+_IMAGE_ADDRESS_CONTROL_CATEGORIES: Final[frozenset[str]] = frozenset({"Cc", "Cs"})
 _AwaitedValueT = TypeVar("_AwaitedValueT")
 _HttpResultT = TypeVar("_HttpResultT")
 
@@ -162,6 +181,316 @@ class RemoteFileDescriptor:
     http_status: Optional[int] = None
     sec_document_type: Optional[str] = None
     sec_description: Optional[str] = None
+
+
+class SecHtmlImageDependencyError(Exception):
+    """已接受 HTML 的必要图片依赖无法被安全、完整地发现。"""
+
+    def __init__(
+        self,
+        html_name: str,
+        reason_code: Literal["html_image_decode_failed", "html_image_reference_invalid", "html_image_asset_collision"],
+        safe_message: str,
+    ) -> None:
+        """保存不含正文、原始地址或凭证的发现失败事实。
+
+        Args:
+            html_name: 所属 HTML 的仓储文件名。
+            reason_code: 封闭的发现失败类别。
+            safe_message: 安全业务说明。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.html_name = html_name
+        self.reason_code = reason_code
+        self.safe_message = f"HTML {json.dumps(html_name, ensure_ascii=True)}：{safe_message}"
+        super().__init__(self.safe_message)
+
+
+class _HtmlImageExtractor(HTMLParser):
+    """只收集直接图片输入与全文首个带 href 的 base，不进行浏览器选图。"""
+
+    def __init__(self) -> None:
+        """初始化有限图片收集器。
+
+        Args:
+            无。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        super().__init__(convert_charrefs=True)
+        self.sources: list[str] = []
+        self.srcsets: list[str] = []
+        self.base_href: str | None = None
+        self._picture_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        """收集标签输入，首个带 href 的 base 包括空值。
+
+        Args:
+            tag: 标准库已转小写的标签。
+            attrs: 已解码 entity 的属性。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        # HTML 同名属性只采用首值；None/空串同样占位，后值不能补救或覆盖。
+        attributes: dict[str, str | None] = {}
+        for name, value in attrs:
+            attributes.setdefault(name, value)
+        if tag == "base" and self.base_href is None and "href" in attributes:
+            self.base_href = attributes["href"] or ""
+        if tag == "picture":
+            self._picture_depth += 1
+        if tag == "img":
+            self.sources.append(attributes.get("src") or "")
+        if tag == "img" or (tag == "source" and self._picture_depth > 0):
+            self.srcsets.append(attributes.get("srcset") or "")
+
+    def handle_endtag(self, tag: str) -> None:
+        """退出 picture 上下文。
+
+        Args:
+            tag: 结束标签。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        if tag == "picture" and self._picture_depth > 0:
+            self._picture_depth -= 1
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        """用相同规则处理自闭合标签。
+
+        Args:
+            tag: 标签。
+            attrs: 属性。
+
+        Returns:
+            无。
+
+        Raises:
+            无。
+        """
+
+        self.handle_starttag(tag, attrs)
+        self.handle_endtag(tag)
+
+
+def _srcset_descriptor_value(descriptor: str) -> tuple[str, Decimal]:
+    """校验单候选的有限 descriptor，缺席表示隐含 1x。
+
+    Args:
+        descriptor: 单个 descriptor 或空串。
+
+    Returns:
+        w/x 组与精确十进制值。
+
+    Raises:
+        ValueError: descriptor 非法时抛出。
+    """
+
+    if not descriptor:
+        return "x", Decimal(1)
+    suffix = descriptor[-1]
+    value_text = descriptor[:-1]
+    pattern = r"[0-9]+" if suffix == "w" else _SRCSET_DENSITY_PATTERN
+    if suffix not in {"w", "x"} or re.fullmatch(pattern, value_text) is None:
+        raise ValueError(_HTML_IMAGE_SRCSET_MESSAGE)
+    try:
+        value = Decimal(value_text)
+    except InvalidOperation as exc:
+        raise ValueError(_HTML_IMAGE_SRCSET_MESSAGE) from exc
+    if not value.is_finite() or value <= 0:
+        raise ValueError(_HTML_IMAGE_SRCSET_MESSAGE)
+    return suffix, value
+
+
+def _parse_image_srcset(srcset: str) -> list[str]:
+    """按位置解析有限 srcset，全列表合法后才返回候选。
+
+    Args:
+        srcset: 已由 HTMLParser 解码 entity 的属性。
+
+    Returns:
+        包含内嵌 data 的原始 URL 候选，descriptor 不参与选图。
+
+    Raises:
+        ValueError: 列表、分界或 descriptor 不合法时抛出。
+    """
+
+    candidates: list[str] = []
+    position = 0
+    group: str | None = None
+    values: set[Decimal] = set()
+    while position < len(srcset):
+        while position < len(srcset) and srcset[position] in _HTML_ASCII_WHITESPACE:
+            position += 1
+        if position == len(srcset):
+            break
+        start = position
+        while position < len(srcset) and srcset[position] not in _HTML_ASCII_WHITESPACE:
+            position += 1
+        token = srcset[start:position]
+        is_data = token.lower().startswith("data:")
+        token_delimited = token.endswith(",") and not is_data
+        if token_delimited:
+            token = token[:-1]
+        # 普通 URL 的路径编码由共享 URL owner 校验；data 的完整 token 保留有限语法契约。
+        if not token or (is_data and re.search(_INVALID_PERCENT_PATTERN, token)):
+            raise ValueError(_HTML_IMAGE_SRCSET_MESSAGE)
+        if (is_data and (token.count(",") != 1 or token.endswith(","))) or (not is_data and "," in token):
+            raise ValueError(_HTML_IMAGE_SRCSET_MESSAGE)
+        descriptor = ""
+        if not token_delimited:
+            start = position
+            while position < len(srcset) and srcset[position] != ",":
+                position += 1
+            descriptor = srcset[start:position].strip(_HTML_ASCII_WHITESPACE)
+        kind, value = _srcset_descriptor_value(descriptor)
+        if (group is not None and group != kind) or value in values:
+            raise ValueError(_HTML_IMAGE_SRCSET_MESSAGE)
+        group = kind
+        values.add(value)
+        candidates.append(token)
+        if not token_delimited and position < len(srcset):
+            # data 必须用 descriptor 明确划定与后续候选的分界。
+            if is_data and not descriptor:
+                raise ValueError(_HTML_IMAGE_SRCSET_MESSAGE)
+            position += 1
+    return candidates
+
+
+def _validate_image_address_text(value: str, *, allow_dot_segments: bool) -> None:
+    """先保留原始字符安全检查，再校验 URL path 的单次编码语法。
+
+    Args:
+        value: 已去首尾 ASCII 空白的地址。
+        allow_dot_segments: base 允许标准 URL 点段归一化，图片候选不允许遍历。
+
+    Returns:
+        无。
+
+    Raises:
+        ValueError: 编码、控制字符或路径不安全时抛出。
+    """
+
+    if "\\" in value or any(unicodedata.category(char) in _IMAGE_ADDRESS_CONTROL_CATEGORIES for char in value):
+        raise ValueError(_HTML_IMAGE_REFERENCE_MESSAGE)
+    if re.match(r"^[a-zA-Z]:", value):
+        raise ValueError(_HTML_IMAGE_REFERENCE_MESSAGE)
+    path = urlsplit(value).path
+    # query/fragment 参与标准 URL 解析，最终不构成文件身份；百分号语法只约束 path。
+    if re.search(_INVALID_PERCENT_PATTERN, path) or re.search(_ENCODED_SEPARATOR_PATTERN, path, re.IGNORECASE):
+        raise ValueError(_HTML_IMAGE_REFERENCE_MESSAGE)
+    decoded = unquote(path, encoding="utf-8", errors="strict")
+    if re.search(_PERCENT_TRIPLET_PATTERN, decoded) or any(unicodedata.category(char) in _IMAGE_ADDRESS_CONTROL_CATEGORIES for char in decoded):
+        raise ValueError(_HTML_IMAGE_REFERENCE_MESSAGE)
+    for raw, plain in zip(path.split("/"), decoded.split("/"), strict=True):
+        if plain in {".", ".."} and raw != plain:
+            raise ValueError(_HTML_IMAGE_REFERENCE_MESSAGE)
+        if plain == ".." and not allow_dot_segments:
+            raise ValueError(_HTML_IMAGE_REFERENCE_MESSAGE)
+
+
+def _is_same_image_archive(url: str, archive_base: str) -> bool:
+    """按 origin 与路径组件判断完整申报边界。
+
+    Args:
+        url: 待判断的已解析地址。
+        archive_base: 生产 archive 根地址。
+
+    Returns:
+        地址是否属于同申报。
+
+    Raises:
+        ValueError: URL authority 非法时抛出。
+    """
+
+    parsed = urlsplit(url)
+    root = urlsplit(archive_base)
+    return (
+        parsed.scheme.lower() == root.scheme
+        and parsed.hostname == root.hostname
+        and parsed.port in {None, _SEC_HTTPS_PORT}
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.path.split("/")[:len(root.path.split("/")) - 1] == root.path.split("/")[:-1]
+    )
+
+
+def _canonical_image_reference(
+    reference: str, *, base_href: str | None, document_url: str, archive_base: str,
+) -> tuple[str, str] | None:
+    """三种直接输入复用的同申报 URL 与单组件资产身份 owner。
+
+    Args:
+        reference: 原始候选。
+        base_href: 全文首个带 href 的 base；缺席为 None。
+        document_url: 当前 HTML 的正式地址。
+        archive_base: 允许的申报根。
+
+    Returns:
+        原样文件名与 canonical URL；内嵌、本页 fragment 或范围外候选为 None。
+
+    Raises:
+        ValueError: 必要引用无法安全解析或属于子目录时抛出。
+    """
+
+    candidate = reference.strip(_HTML_ASCII_WHITESPACE)
+    if not candidate or candidate.lower().startswith("data:"):
+        return None
+    _validate_image_address_text(candidate, allow_dot_segments=False)
+    parsed = urlsplit(candidate)
+    independent = bool(parsed.scheme or parsed.netloc or candidate.startswith("//"))
+    base_url = document_url
+    if not independent and base_href is not None:
+        try:
+            href = base_href.strip(_HTML_ASCII_WHITESPACE)
+            _validate_image_address_text(href, allow_dot_segments=True)
+            base_url = urljoin(document_url, href)
+            # urljoin 对显式绝对地址保留点段；base 的授权边界必须检查归一化后的路径。
+            base_parts = urlsplit(base_url)
+            base_path = posixpath.normpath(base_parts.path)
+            if base_parts.path.endswith(("/", "/.", "/..")) and not base_path.endswith("/"):
+                base_path += "/"
+            base_url = base_parts._replace(path=base_path).geturl()
+            if not _is_same_image_archive(base_url, archive_base):
+                raise ValueError(_HTML_IMAGE_BASE_MESSAGE)
+        except (ValueError, UnicodeError) as exc:
+            raise ValueError(_HTML_IMAGE_BASE_MESSAGE) from exc
+    resolved = urljoin(document_url if independent else base_url, candidate)
+    if not _is_same_image_archive(resolved, archive_base):
+        return None
+    # 分号属于完整 path；仅在候选解析完成后丢弃最终 query/fragment。
+    path = unquote(urlsplit(resolved).path, encoding="utf-8", errors="strict")
+    root_path = urlsplit(archive_base).path
+    name = path[len(root_path):]
+    if "/" in name:
+        raise ValueError(_HTML_IMAGE_SUBDIRECTORY_MESSAGE)
+    source_asset_name_collision_key(name)
+    canonical = archive_base + quote(name, safe="")
+    if candidate.startswith("#") and canonical == document_url:
+        return None
+    return name, canonical
 
 
 @dataclass(frozen=True)
@@ -1423,7 +1752,7 @@ class SecDownloader:
         include_http_metadata: bool = True,
         cancellation_checker: Optional[Callable[[], bool]] = None,
     ) -> list[RemoteFileDescriptor]:
-        """列出 filing 相关的远端文件。
+        """列出 filing 选择的基础远端文件；接受 HTML 的图片依赖另从待发布字节发现。
 
         Args:
             cik: CIK（无前导零）。
@@ -1527,6 +1856,121 @@ class SecDownloader:
                     sec_description=normalize_optional_text(metadata.get("description")),
                 )
             )
+        return descriptors
+
+    async def list_filing_image_files(
+        self,
+        *,
+        cik: str,
+        accession_no_dash: str,
+        html_payloads: Mapping[str, bytes],
+        existing_files: Sequence[RemoteFileDescriptor],
+        include_http_metadata: bool,
+        cancellation_checker: Callable[[], bool] | None = None,
+    ) -> list[RemoteFileDescriptor]:
+        """从同一次待发布 HTML 字节发现全部直接图片依赖。
+
+        Args:
+            cik: CIK。
+            accession_no_dash: 无连字符 accession。
+            html_payloads: 已接受基础 HTML 文件名到实际预取字节的映射。
+            existing_files: 本轮基础描述符，用于所属文件校验与共享资产碰撞判断。
+            include_http_metadata: 是否沿现有策略尝试图片 HEAD。
+            cancellation_checker: 可选协作取消检查器。
+
+        Returns:
+            按原样文件名排序、去重且不与基础文件重复的新增图片描述符。
+
+        Raises:
+            SecHtmlImageDependencyError: 解码、列表、地址或资产身份无法完整确定时抛出。
+            SecDownloadCancelledError: 观察到取消时抛出。
+            OSError: 共享限流状态读写失败时抛出。
+        """
+
+        _raise_if_download_cancelled(cancellation_checker)
+        archive_base = ARCHIVES_BASE.format(cik=str(int(cik)), accession_no_dash=accession_no_dash)
+        existing_names = {descriptor.name for descriptor in existing_files}
+        identities: dict[str, tuple[str, str]] = {}
+        for descriptor in existing_files:
+            try:
+                key = source_asset_name_collision_key(descriptor.name)
+            except ValueError as exc:
+                # 非法基础名可能含原始路径/地址，诊断只投影封闭标签和原因。
+                raise SecHtmlImageDependencyError(
+                    _HTML_IMAGE_EXISTING_NAME_LABEL, "html_image_reference_invalid", _HTML_IMAGE_REFERENCE_MESSAGE,
+                ) from exc
+            identity = (
+                descriptor.name, archive_base + quote(descriptor.name, safe=""),
+            )
+            if is_document_source_control_name(descriptor.name) or (key in identities and identities[key] != identity):
+                raise SecHtmlImageDependencyError(
+                    descriptor.name, "html_image_asset_collision", "基础资产文件名存在冲突，无法完整登记图片；未发布本次来源。",
+                )
+            identities[key] = identity
+        images: dict[str, str] = {}
+        for html_name, payload in html_payloads.items():
+            _raise_if_download_cancelled(cancellation_checker)
+            if html_name not in existing_names:
+                raise SecHtmlImageDependencyError(html_name, "html_image_reference_invalid", _HTML_IMAGE_REFERENCE_MESSAGE)
+            try:
+                text = decode_source_bytes(payload)
+            except FinsSourceDecodeError as exc:
+                raise SecHtmlImageDependencyError(
+                    html_name, "html_image_decode_failed", "HTML 不是有效 UTF-8，无法完整发现图片；未发布本次来源。",
+                ) from exc
+            extractor = _HtmlImageExtractor()
+            extractor.feed(text)
+            extractor.close()
+            candidates = list(extractor.sources)
+            try:
+                for srcset in extractor.srcsets:
+                    _raise_if_download_cancelled(cancellation_checker)
+                    candidates.extend(_parse_image_srcset(srcset))
+            except ValueError as exc:
+                raise SecHtmlImageDependencyError(
+                    html_name, "html_image_reference_invalid", _HTML_IMAGE_SRCSET_MESSAGE,
+                ) from exc
+            for candidate in candidates:
+                _raise_if_download_cancelled(cancellation_checker)
+                try:
+                    identity = _canonical_image_reference(
+                        candidate, base_href=extractor.base_href,
+                        document_url=archive_base + quote(html_name, safe=""), archive_base=archive_base,
+                    )
+                except (ValueError, UnicodeError) as exc:
+                    # 只投影 owner 的封闭说明，URL parser 的异常文本不得泄漏原始地址。
+                    message = str(exc)
+                    safe_message = message if message in {
+                        _HTML_IMAGE_BASE_MESSAGE, _HTML_IMAGE_SUBDIRECTORY_MESSAGE,
+                    } else _HTML_IMAGE_REFERENCE_MESSAGE
+                    raise SecHtmlImageDependencyError(html_name, "html_image_reference_invalid", safe_message) from exc
+                if identity is None:
+                    continue
+                name, source_url = identity
+                key = source_asset_name_collision_key(name)
+                if is_document_source_control_name(name) or (key in identities and identities[key] != identity):
+                    raise SecHtmlImageDependencyError(
+                        html_name, "html_image_asset_collision", "图片资产与已有文件名或来源控制文件冲突，未发布本次来源。",
+                    )
+                identities[key] = identity
+                if name not in existing_names:
+                    images[name] = source_url
+        descriptors: list[RemoteFileDescriptor] = []
+        # 全部文档完成发现后才开始 HEAD，错误时不会返回已发现的部分集合。
+        for name, source_url in sorted(images.items()):
+            _raise_if_download_cancelled(cancellation_checker)
+            head_response = (
+                await self._http_head(source_url, allow_redirects=True, cancellation_checker=cancellation_checker)
+                if include_http_metadata else None
+            )
+            descriptors.append(RemoteFileDescriptor(
+                name=name, source_url=source_url,
+                http_etag=_safe_header(head_response, "ETag"),
+                http_last_modified=_safe_header(head_response, "Last-Modified"),
+                remote_size=optional_int(_safe_header(head_response, "Content-Length")),
+                http_status=head_response.status_code if head_response else None,
+            ))
+        _raise_if_download_cancelled(cancellation_checker)
         return descriptors
 
     async def prefetch_files_stream(
@@ -1709,6 +2153,11 @@ class SecDownloader:
                 reason_message=event.reason_message,
             )
         if isinstance(event, _PrefetchFailed):
+            Log.warn(
+                f"SEC 文件下载失败: name={json.dumps(descriptor.name, ensure_ascii=True)} "
+                f"reason_code={event.reason_code} reason_message={event.reason_message}",
+                module=self.MODULE,
+            )
             return DownloaderEvent(
                 event_type="file_failed",
                 name=descriptor.name,

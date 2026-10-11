@@ -12,7 +12,7 @@ import logging
 import datetime as dt
 from collections.abc import AsyncIterator, Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from threading import Event
@@ -731,6 +731,36 @@ def test_sec_pipeline_rejection_helpers_consume_typed_registry() -> None:
 class StubDownloader:
     """用于测试的下载器桩。"""
 
+    MODULE = SecDownloader.MODULE
+
+    async def list_filing_image_files(
+        self, *, cik: str, accession_no_dash: str, html_payloads: Mapping[str, bytes],
+        existing_files: list[RemoteFileDescriptor], include_http_metadata: bool,
+        cancellation_checker: Callable[[], bool] | None = None,
+    ) -> list[RemoteFileDescriptor]:
+        """复用真实发现 owner 校验桩提供的待发布字节。
+
+        Args:
+            cik: 测试 CIK。
+            accession_no_dash: 测试 accession。
+            html_payloads: 桩预取的 HTML。
+            existing_files: 基础描述符。
+            include_http_metadata: 元数据策略。
+            cancellation_checker: 取消检查器。
+
+        Returns:
+            真实 owner 产生的新增依赖。
+
+        Raises:
+            SecHtmlImageDependencyError: 桩正文存在非法依赖时抛出。
+        """
+
+        return await SecDownloader.list_filing_image_files(
+            cast(SecDownloader, self), cik=cik, accession_no_dash=accession_no_dash,
+            html_payloads=html_payloads, existing_files=existing_files,
+            include_http_metadata=include_http_metadata, cancellation_checker=cancellation_checker,
+        )
+
     def __init__(
         self,
         submissions: dict[str, JsonValue],
@@ -938,7 +968,7 @@ class StubDownloader:
             无。
         """
 
-        del allow_not_modified, existing_files, primary_document, cancellation_checker
+        del existing_files, primary_document, cancellation_checker
         self.download_files_called = True
         descriptors = {item.name: item for item in remote_files}
         for item in self._download_results:
@@ -956,7 +986,7 @@ class StubDownloader:
                 )
             yield _PrefetchStarted(descriptor=descriptor)
             status = item.get("status")
-            if status == "downloaded":
+            if status == "downloaded" or (status == "skipped" and not allow_not_modified):
                 payload = self._content_by_name.get(name, f"dummy:{name}".encode())
                 yield _PrefetchedFile(
                     descriptor=descriptor,
@@ -2385,7 +2415,7 @@ def test_sec_pipeline_rebuild_local_meta_manifest_without_redownload(tmp_path: P
     assert rebuilt_meta["document_version"] == "v7"
     assert isinstance(rebuilt_meta["source_fingerprint"], str)
     assert rebuilt_meta["source_fingerprint"]
-    assert rebuilt_meta["download_version"] == SEC_PIPELINE_DOWNLOAD_VERSION
+    assert rebuilt_meta["download_version"] == "legacy_download_version"
     rebuilt_processed_meta = processed_repository.get_processed_meta(ticker, document_id)
     assert rebuilt_processed_meta["reprocess_required"] is False
     assert blob_repository.read_file_bytes(source_handle, "sample-10k.htm") == source_bytes_before
@@ -2447,7 +2477,6 @@ def test_sec_rebuild_rolls_back_once_and_reraises_cancellation_identity(
             document_id="fil_0000000000-25-000001",
             previous_meta=_sec_rebuild_previous_meta(),
             company_meta=None,
-            pipeline_download_version=SEC_PIPELINE_DOWNLOAD_VERSION,
         )
 
     assert exc_info.value is cancellation
@@ -2498,7 +2527,6 @@ def test_sec_rebuild_operation_and_rollback_failure_preserve_primary_exception(
             document_id="fil_0000000000-25-000001",
             previous_meta=_sec_rebuild_previous_meta(),
             company_meta=None,
-            pipeline_download_version=SEC_PIPELINE_DOWNLOAD_VERSION,
         )
 
     assert exc_info.value is operation_error
@@ -2550,7 +2578,6 @@ def test_sec_rebuild_ordinary_failure_with_successful_rollback_returns_failed_re
         document_id="fil_0000000000-25-000001",
         previous_meta=_sec_rebuild_previous_meta(),
         company_meta=None,
-        pipeline_download_version=SEC_PIPELINE_DOWNLOAD_VERSION,
     )
 
     assert result["status"] == "failed"
@@ -3150,18 +3177,18 @@ def test_sec_pipeline_skip_with_etag_gzip_variant_without_re_download(tmp_path: 
 @pytest.mark.parametrize(
     ("existing_download_version", "expected_status", "expected_skip_reason"),
     [
-        (SEC_PIPELINE_DOWNLOAD_VERSION, "skipped", "integrity_complete"),
-        ("legacy-download-version", "skipped", "integrity_complete"),
-        (None, "skipped", "integrity_complete"),
+        (SEC_PIPELINE_DOWNLOAD_VERSION, "downloaded", None),
+        ("legacy-download-version", "downloaded", None),
+        (None, "downloaded", None),
     ],
 )
-def test_sec_pipeline_all_files_not_modified_respects_download_version(
+def test_sec_pipeline_unconditional_prefetch_respects_download_version(
     tmp_path: Path,
     existing_download_version: str | None,
     expected_status: str,
     expected_skip_reason: str | None,
 ) -> None:
-    """全文件未修改只能在 current download version 下形成 terminal skip。
+    """无快跳资格且完整远端集合不等价时，必须取得 unconditional replacement。
 
     Args:
         tmp_path: pytest 临时目录。
@@ -3205,17 +3232,9 @@ def test_sec_pipeline_all_files_not_modified_respects_download_version(
     result = pipeline.download(ticker="AAPL", overwrite=False, start_is_explicit=False)
     after_text = meta_path.read_text(encoding="utf-8")
 
-    assert downloader.download_files_called is False
+    assert downloader.download_files_called is True
     assert result["filings"][0]["status"] == expected_status
     assert result["filings"][0].get("skip_reason") == expected_skip_reason
-    if expected_skip_reason == "integrity_complete":
-        assert result["summary"]["skipped"] == 1
-        assert result["summary"]["downloaded"] == 0
-        assert before_text == after_text
-        assert result["filings"][0]["reason_code"] == "integrity_complete"
-        assert "完整" in str(result["filings"][0]["reason_message"])
-        return
-
     assert result["summary"]["skipped"] == 0
     assert result["summary"]["downloaded"] == 1
     assert before_text != after_text
@@ -5069,7 +5088,7 @@ def test_sc13_no_retry_when_found_in_initial_window(tmp_path: Path) -> None:
             "files": [],
         }
     }
-    remote_files = [_make_descriptor("etag-sc13")]
+    remote_files = [replace(_make_descriptor("etag-sc13"), name="sc13g.htm", source_url="https://example.com/sc13g.htm")]
     downloader = StubDownloader(
         submissions=submissions,
         remote_files=remote_files,
@@ -5127,7 +5146,7 @@ def test_sc13_retry_expands_window_and_finds_filing(tmp_path: Path) -> None:
     remote_files = [_make_descriptor("etag-v1")]
     downloader = StubDownloader(
         submissions=submissions,
-        remote_files=remote_files,
+        remote_files=[replace(descriptor, name="sc13g-old.htm", source_url="https://example.com/sc13g-old.htm") for descriptor in remote_files],
         download_results=[
             {
                 "name": "sc13g-old.htm",

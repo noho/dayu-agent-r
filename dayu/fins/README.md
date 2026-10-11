@@ -617,13 +617,27 @@ production download overwrite 只替换本轮实际写入的目标文档。SEC �
 
 SEC downloader 统一持有远端文件选择：6-K 保留同 filing HTML 补链；8-K 从目录、文档类型索引及
 封面相对链接选择 EX-99 HTML，类型索引可识别不含 EX99 字样的附件名。8-K 不扩展为全部附件或
-图片抓取，候选只接受同目录未编码 HTML 文件名，稳定去重后进入现有下载事务。完整缓存仍先行
-增量跳过；显式 overwrite 才重新发现附件并重试历史拒绝。内容 hash 由 blob 字节计算，SEC source
+目录图片抓取，HTML 候选只接受同目录未编码 HTML 文件名。已接受 HTML 的待发布字节另提供
+img/src、img/srcset 与 picture/source/srcset 的全部直接图片候选，复用同一个同申报 URL、
+单组件资产名、去重及碰撞 owner；picture 外 source 不抓媒体。srcset 只接受可明确划分的有限
+URL/descriptor 列表，不按 media、尺寸或业务用途选图；首个带 href 的 base（包括空 href）
+决定全文相对地址，同名属性只保留首值（含空值和无值属性）。图片与 base 的完整 URL path
+保留字面分号，单次解码的字面百分号合法；解码后仍形成百分号 triplet 的二次解释明确失败。
+普通 URL 的百分号编码语法只校验 path；query/fragment 先参与标准地址解析，再从最终文件身份
+去除，其中的字面百分号不导致路径失败。srcset 的 data 候选仍校验完整 token 的百分号语法，
+所有原始地址仍拒绝控制字符和反斜杠。不安全 base 下的相对候选与同申报子目录资产明确失败，
+不取 basename 补偿；非法基础资产名在发现 owner 投影为安全 typed 失败。
+HTML 与图片通过同一 transport 在 batch 外预取，再作为完整集合原子发布；必要发现/下载失败
+保留既有 publication。COMPLETE 还须具备当前下载契约版本与非空指纹才可快跳，旧版本普通
+增量重建完整依赖集合；当前版本空指纹的等价晚期跳过，先完成基础 GET、图片发现与开启时的
+HEAD 尝试，必要失败优先于 skip。显式 overwrite 仍可强制重新检查。内容 hash 由 blob 字节计算，SEC source
 fingerprint 由本轮远端描述符按原契约计算，文件集合变化会触发现有 processed 重处理标记。
 6-K 当前业绩强信号接受“Reports + 明确季度/年份 + Unaudited Financial Results”及 Q4/FY 联合标题；
 它与预告判断复用同一标题规则，避免被公告内的经营亮点先行拒绝。扫描上限、预告和经营更新排除规则不变。
 
 `rebuild_local_artifacts=true` 是 download 自身的 local-only 模式：SEC、CNInfo 与 HKEXNews workflow 只枚举已下载的 source document，并从本地 source meta、文件描述符和内容重建下载 meta/manifest；该分支不配置或调用 provider，也不新增、删除或替换 source 内容。它与 preprocess 的 `rebuild_processed` 是两个独立 owner，不通过 persisted summary 互相映射。
+SEC 本地 rebuild 保留最近一次正式下载的 download_version 或其缺席状态；只有完整正式下载
+能够认证新的依赖集合，本地重建不能授予当前下载版本的快跳资格。
 
 HK 财期语义由 report selection owner 同时供 discovery 与本地 rebuild 使用。三个月只表示长度；
 明确季度和累计期间须相互一致，日期推季度需同公司邻近年度截止日支持，财年采用结束年份。

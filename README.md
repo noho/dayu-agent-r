@@ -307,17 +307,24 @@ dayu-cli download --base /path/to/workspace --ticker 000333 --forms Q1 --start 2
 完成后去掉 `--overwrite` 再运行应跳过。`--rebuild` 不会下载缺失的完整报告。
 下载成功表示文件已获取，分析所需财务原表是否齐全仍需核对报告内容。
 
-SEC 的 8-K 下载包含同一披露下识别到的 EX-99 HTML 附件。已有完整封面缓存不会在普通
-增量下载时重新检查附件；升级后需对受影响的公司、表单和披露日执行一次 `--overwrite`，例如：
+SEC 下载包含已选 HTML 直接引用的图片（img 的 src、srcset 和 picture 内 source 的 srcset），
+以及 8-K 同一披露下识别到的 EX-99 HTML 附件。升级后，对受影响的公司、表单和正式披露日
+执行普通下载即可补齐旧缓存，例如：
 
 ```bash
-dayu-cli download --base /path/to/workspace --ticker MSFT --forms 8-K --start 2025-07-30 --end 2025-07-30 --overwrite
+dayu-cli download --base /path/to/workspace --ticker TSM --forms 6-K --start 2019-04-18 --end 2019-04-18
+dayu-cli download --base /path/to/workspace --ticker TSM --forms 6-K --start 2025-07-17 --end 2025-07-17
 ```
 
-该命令会重新获取所选披露的文件并更新登记，随后去掉 `--overwrite` 再运行应显示增量跳过。
-修正分类规则后，历史被拒的 6-K 也用这一方式重新下载并接受分类检查；`--rebuild` 不能补远端
-附件，也不能将被拒文件变成正式来源。当前下载筛选粒度是公司、表单和披露日，没有按文档 ID
-筛选的下载参数；同日存在多份匹配披露时会一起处理。
+补齐成功后再次普通下载应显示增量跳过；当前版本的完整缓存仍会跳过远端检查，需要强制
+重新检查时加 `--overwrite`。旧版本的历史拒绝记录也会重新接受分类检查。`--rebuild` 只重建
+本地登记，不能补远端附件或图片，也不能将被拒文件变成正式来源。
+图片按文档的首个 base 地址解析，只下载同一披露的直接文件；不递归抓取 CSS、JS 或外站。
+必要图片失败时，本次披露不会发布新完整来源，已有来源保留；查看 `Fins download diagnostics: `
+后的失败诊断及 `--log-file` 指定的日志定位文件原因。若诊断为子目录图片引用，当前平铺文件
+存储不支持该形态，请将安全失败说明交给维护者。
+当前下载筛选粒度是公司、表单和披露日，没有按文档 ID 筛选的下载参数；同日存在多份匹配
+披露时会一起处理。
 
 港股已有季度识别错误时，使用本地重建重新核定财期，例如：
 

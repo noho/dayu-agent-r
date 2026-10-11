@@ -16,8 +16,11 @@ from dayu.fins.downloaders.sec_downloader import (
     RemoteFileDescriptor,
     SecDownloadCancelledError,
     SecDownloader,
+    SecHtmlImageDependencyError,
     StoreDownloadedFile,
     _PrefetchEvent,
+    _PrefetchFailed,
+    _PrefetchedFile,
     accession_to_no_dash,
     build_source_fingerprint,
 )
@@ -244,7 +247,7 @@ async def run_download_single_filing_stream(
 
     fast_skip_reason: str | None = None
     if phase_a_integrity.status is SourceIntegrityStatus.COMPLETE and not overwrite:
-        fast_skip_reason = host._can_skip_fast(previous_meta, overwrite) or "integrity_complete"
+        fast_skip_reason = host._can_skip_fast(previous_meta, overwrite)
     if fast_skip_reason is not None:
         Log.debug(
             f"快速预检跳过: ticker={ticker} document_id={document_id}",
@@ -331,44 +334,6 @@ async def run_download_single_filing_stream(
         )
         return
     source_fingerprint = build_source_fingerprint(remote_files)
-    skip_reason = (
-        host._can_skip(
-            previous_meta,
-            source_fingerprint,
-            overwrite,
-            remote_files=remote_files,
-        )
-        if phase_a_integrity.status is SourceIntegrityStatus.COMPLETE
-        else None
-    )
-    if skip_reason is not None:
-        Log.debug(
-            f"命中已下载跳过: ticker={ticker} document_id={document_id}",
-            module=host.MODULE,
-        )
-        reason_messages = {
-            "source_fingerprint_matched": "远端 source_fingerprint 与本地一致，跳过重新下载",
-            "remote_files_equivalent": "远端文件集合与本地等价，跳过重新下载",
-        }
-        filing_result = {
-            "document_id": document_id,
-            "internal_document_id": internal_document_id,
-            "status": "skipped",
-            "form_type": filing.form_type,
-            "filing_date": filing.filing_date,
-            "report_date": filing.report_date,
-            "skip_reason": skip_reason,
-            "reason_code": skip_reason,
-            "reason_message": reason_messages.get(skip_reason, "命中已下载跳过"),
-        }
-        yield DownloadEvent(
-            event_type=DownloadEventType.FILING_COMPLETED,
-            ticker=ticker,
-            document_id=document_id,
-            payload=build_download_filing_event_payload(filing_result),
-        )
-        return
-
     preferred_primary = ""
     if filing.form_type == "6-K":
         keep, category, selected_name = await host._precheck_6k_filter(
@@ -493,6 +458,78 @@ async def run_download_single_filing_stream(
     if cancel_checker is not None and cancel_checker():
         return
 
+    if not any(isinstance(event, _PrefetchFailed) for event in prefetched_events):
+        # 依赖真源必须是本轮即将发布的字节，而不是预筛选或历史 publication。
+        html_payloads = {
+            event.descriptor.name: event.content
+            for event in prefetched_events
+            if isinstance(event, _PrefetchedFile) and event.descriptor.name.lower().endswith((".htm", ".html"))
+        }
+        try:
+            image_files = await host._downloader.list_filing_image_files(
+                cik=cik,
+                accession_no_dash=accession_no_dash,
+                html_payloads=html_payloads,
+                existing_files=remote_files,
+                include_http_metadata=(previous_meta is not None and not overwrite),
+                cancellation_checker=cancel_checker,
+            )
+        except SecDownloadCancelledError:
+            return
+        except SecHtmlImageDependencyError as exc:
+            filing_result = {
+                "document_id": document_id,
+                "internal_document_id": internal_document_id,
+                "status": "failed",
+                "form_type": filing.form_type,
+                "filing_date": filing.filing_date,
+                "report_date": filing.report_date,
+                "reason_code": exc.reason_code,
+                "reason_message": exc.safe_message,
+            }
+            yield DownloadEvent(
+                event_type=DownloadEventType.FILING_FAILED,
+                ticker=ticker,
+                document_id=document_id,
+                payload=build_download_filing_event_payload(filing_result),
+            )
+            return
+        remote_files = sorted([*remote_files, *image_files], key=lambda descriptor: descriptor.name)
+        source_fingerprint = build_source_fingerprint(remote_files)
+        skip_reason = (
+            host._can_skip(previous_meta, source_fingerprint, overwrite, remote_files=remote_files)
+            if phase_a_integrity.status is SourceIntegrityStatus.COMPLETE else None
+        )
+        if skip_reason is not None:
+            filing_result = {
+                "document_id": document_id,
+                "internal_document_id": internal_document_id,
+                "status": "skipped",
+                "form_type": filing.form_type,
+                "filing_date": filing.filing_date,
+                "report_date": filing.report_date,
+                "skip_reason": skip_reason,
+                "reason_code": skip_reason,
+                "reason_message": "远端完整文件集合与本地等价，跳过重新下载",
+            }
+            yield DownloadEvent(
+                event_type=DownloadEventType.FILING_COMPLETED,
+                ticker=ticker,
+                document_id=document_id,
+                payload=build_download_filing_event_payload(filing_result),
+            )
+            return
+        if image_files:
+            async for prefetched_event in host._downloader.prefetch_files_stream(
+                image_files,
+                allow_not_modified=False,
+                existing_files=existing_files,
+                cancellation_checker=cancel_checker,
+            ):
+                prefetched_events.append(prefetched_event)
+        if cancel_checker is not None and cancel_checker():
+            return
+
     token: BatchToken | None = host._batching_repository.begin_batch(ticker)
     try:
         phase_b_integrity = host._source_repository.classify_staged_source_integrity(
@@ -532,7 +569,11 @@ async def run_download_single_filing_stream(
             ):
                 yield retry_event
             return
-        if phase_b_integrity.status is SourceIntegrityStatus.COMPLETE and not overwrite:
+        phase_b_skip_reason = (
+            host._can_skip_fast(previous_meta, overwrite)
+            if phase_b_integrity.status is SourceIntegrityStatus.COMPLETE and not overwrite else None
+        )
+        if phase_b_skip_reason is not None:
             host._batching_repository.rollback_batch(token)
             token = None
             filing_result = {
@@ -542,8 +583,8 @@ async def run_download_single_filing_stream(
                 "form_type": filing.form_type,
                 "filing_date": filing.filing_date,
                 "report_date": filing.report_date,
-                "skip_reason": "integrity_complete",
-                "reason_code": "integrity_complete",
+                "skip_reason": phase_b_skip_reason,
+                "reason_code": phase_b_skip_reason,
                 "reason_message": "最新 publication 已完整，跳过陈旧预取结果",
             }
             yield DownloadEvent(

@@ -35,6 +35,14 @@ from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
 from dayu.fins.storage.local_file_store import LocalFileStore
 
 _FIXTURES = Path(__file__).parent / "fixtures/sec_earnings_repair_v1"
+# 确定性 SYNTHETIC 测试图片，非 SEC 原图；真实 HTML 与 provenance manifest 不变。
+_SYNTHETIC_IMAGE_BYTES = b"SYNTHETIC JPEG test payload; not official SEC image"
+_SYNTHETIC_IMAGES = {
+    "meta-20240201.htm": "meta-20240201_g1.jpg",
+    "meta-20250129.htm": "meta-20250129_g1.jpg",
+    "meta-20260128.htm": "meta-20260128_g1.jpg",
+}
+
 
 
 @dataclass(frozen=True)
@@ -107,6 +115,8 @@ def _raw(name: str) -> bytes:
 
 def _payload(filing: _Filing, name: str) -> bytes:
     """参数为披露与文件名；返回真实回源 Raw；非法选择断言失败，读取异常透传。"""
+    if name == _SYNTHETIC_IMAGES.get(filing.cover):
+        return _SYNTHETIC_IMAGE_BYTES
     assert name in {filing.cover, filing.exhibit}
     return _raw(name)
 
@@ -173,12 +183,12 @@ class _SecNetwork:
                     200,
                     text=f"<DOCUMENT>\n<TYPE>EX-99.1\n<FILENAME>{filing.exhibit}\n<DESCRIPTION>Earnings release\n</DOCUMENT>",
                 )
-            assert name in {filing.cover, filing.exhibit}, url
-            if name == self.fail_exhibit:
+            assert name in _expected_names(filing, {filing.cover, filing.exhibit}), url
+            if name == self.fail_exhibit and request.method == "GET":
                 return httpx.Response(404, text="Missing test attachment")
             payload = _payload(filing, name)
             return httpx.Response(
-                200, content=payload, headers={"Content-Type": "text/html", "ETag": hashlib.sha256(payload).hexdigest()}
+                200, content=payload, headers={"Content-Type": "image/jpeg" if name.endswith(".jpg") else "text/html", "ETag": hashlib.sha256(payload).hexdigest(), "Content-Length": str(len(payload))}
             )
         raise AssertionError(f"Unexpected network request: {url}")
 
@@ -270,6 +280,12 @@ def _seed_processed(root: Path, filing: _Filing) -> FsProcessedDocumentRepositor
     return processed
 
 
+def _expected_names(filing: _Filing, html_names: set[str]) -> set[str]:
+    """参数为披露与已选 HTML；返回显式 mock 契约定义的完整集合；无异常。"""
+    image = _SYNTHETIC_IMAGES.get(filing.cover)
+    return html_names | ({image} if image is not None and filing.cover in html_names else set())
+
+
 def _assert_registered(root: Path, filing: _Filing, names: set[str]) -> dict[str, JsonValue]:
     """参数为目录、披露与预期文件；校验完整性、真实 hash、清单和索引；返回 meta，断言失败透传。"""
     source = FsSourceDocumentRepository(root)
@@ -283,6 +299,15 @@ def _assert_registered(root: Path, filing: _Filing, names: set[str]) -> dict[str
     files = meta["files"]
     assert isinstance(files, list)
     assert {entry["name"] for entry in files if isinstance(entry, dict)} == names
+    with source.read_source_snapshot(filing.ticker, filing.document_id, SourceKind.FILING, materialize_files=True) as snapshot:
+        assert {descriptor.name for descriptor in snapshot.files} == names
+        assert dict(snapshot.source_meta) == meta
+        for descriptor in snapshot.files:
+            with snapshot.get_source(descriptor.name).open() as stream:
+                payload = stream.read()
+            assert payload == _payload(filing, descriptor.name)
+            assert descriptor.size == len(payload)
+            assert descriptor.sha256 == hashlib.sha256(payload).hexdigest()
     for entry in files:
         assert isinstance(entry, dict)
         name = entry["name"]
@@ -305,14 +330,14 @@ def test_cli_repairs_complete_cover_and_then_skips(
         old.setattr(sec_downloader, "pick_exhibit_files", _no_exhibits)
         for cached in _EIGHT_K:
             assert _cli(tmp_path, cached) == 0
-    before = _assert_registered(tmp_path, filing, {filing.cover})
+    before = _assert_registered(tmp_path, filing, _expected_names(filing, {filing.cover}))
     processed = _seed_processed(tmp_path, filing)
-    untouched = {f.document_id: _assert_registered(tmp_path, f, {f.cover}) for f in _EIGHT_K if f != filing}
+    untouched = {f.document_id: _assert_registered(tmp_path, f, _expected_names(f, {f.cover})) for f in _EIGHT_K if f != filing}
     network.requests.clear()
     assert _cli(tmp_path, filing) == 0
     assert not any("/Archives/" in url for url in network.requests)
     assert _cli(tmp_path, filing, overwrite=True) == 0
-    after = _assert_registered(tmp_path, filing, {filing.cover, filing.exhibit})
+    after = _assert_registered(tmp_path, filing, _expected_names(filing, {filing.cover, filing.exhibit}))
     assert after["document_id"] == before["document_id"]
     assert after["source_fingerprint"] != before["source_fingerprint"]
     assert processed.get_processed_meta(filing.ticker, filing.document_id)["reprocess_required"] is True
@@ -321,12 +346,12 @@ def test_cli_repairs_complete_cover_and_then_skips(
             RemoteFileDescriptor(
                 name=name, source_url=filing.archive + name, http_etag=None, http_last_modified=None, remote_size=None
             )
-            for name in (filing.cover, filing.exhibit)
+            for name in _expected_names(filing, {filing.cover, filing.exhibit})
         ]
     )
     for f in _EIGHT_K:
         if f != filing:
-            assert _assert_registered(tmp_path, f, {f.cover}) == untouched[f.document_id]
+            assert _assert_registered(tmp_path, f, _expected_names(f, {f.cover})) == untouched[f.document_id]
     snapshot = _snapshot(tmp_path)
     network.requests.clear()
     assert _cli(tmp_path, filing) == 0
@@ -348,7 +373,7 @@ def test_cli_retries_rejection_and_registers_actual_release(
     assert _cli(tmp_path, filing) == 0
     assert not any("/Archives/" in url for url in network.requests)
     assert _cli(tmp_path, filing, overwrite=True) == 0
-    meta = _assert_registered(tmp_path, filing, {filing.cover, filing.exhibit})
+    meta = _assert_registered(tmp_path, filing, _expected_names(filing, {filing.cover, filing.exhibit}))
     assert meta["primary_document"] == filing.exhibit
     snapshot = _snapshot(tmp_path)
     network.requests.clear()
@@ -365,13 +390,13 @@ def test_cli_failed_attachment_does_not_replace_complete_cover(
     with monkeypatch.context() as old:
         old.setattr(sec_downloader, "pick_exhibit_files", _no_exhibits)
         assert _cli(tmp_path, filing) == 0
-    before = _assert_registered(tmp_path, filing, {filing.cover})
+    before = _assert_registered(tmp_path, filing, _expected_names(filing, {filing.cover}))
     network.fail_exhibit = filing.exhibit
     assert _cli(tmp_path, filing, overwrite=True) != 0
-    assert _assert_registered(tmp_path, filing, {filing.cover}) == before
+    assert _assert_registered(tmp_path, filing, _expected_names(filing, {filing.cover})) == before
     network.fail_exhibit = None
     assert _cli(tmp_path, filing, overwrite=True) == 0
-    _assert_registered(tmp_path, filing, {filing.cover, filing.exhibit})
+    _assert_registered(tmp_path, filing, _expected_names(filing, {filing.cover, filing.exhibit}))
 
 
 def test_raw_manifest_and_actual_atat_classifier() -> None:
@@ -516,3 +541,24 @@ def test_eight_k_discovery_cancellation(tmp_path: Path, cancel_after: str) -> No
     with pytest.raises(SecDownloadCancelledError):
         asyncio.run(_list_files(tmp_path, network, "8-K", True))
     assert network.requested[-1] == cancel_after
+
+
+def test_cli_failed_necessary_meta_image_preserves_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, network: _SecNetwork
+) -> None:
+    """参数为隔离 root 与 mock；返回无；META 必要图片失败覆盖旧 publication 时失败。"""
+    filing = _EIGHT_K[1]
+    with monkeypatch.context() as old:
+        old.setattr(sec_downloader, "pick_exhibit_files", _no_exhibits)
+        assert _cli(tmp_path, filing) == 0
+    before = _assert_registered(tmp_path, filing, _expected_names(filing, {filing.cover}))
+    processed = _seed_processed(tmp_path, filing)
+    snapshot = _snapshot(tmp_path)
+    network.fail_exhibit = _SYNTHETIC_IMAGES[filing.cover]
+    assert _cli(tmp_path, filing, overwrite=True) != 0
+    assert _assert_registered(tmp_path, filing, _expected_names(filing, {filing.cover})) == before
+    assert processed.get_processed_meta(filing.ticker, filing.document_id)["reprocess_required"] is False
+    assert _snapshot(tmp_path) == snapshot
+    network.fail_exhibit = None
+    assert _cli(tmp_path, filing, overwrite=True) == 0
+    _assert_registered(tmp_path, filing, _expected_names(filing, {filing.cover, filing.exhibit}))

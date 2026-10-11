@@ -102,7 +102,6 @@ def rebuild_download_artifacts(
     start_date: Optional[str],
     end_date: Optional[str],
     overwrite: bool,
-    pipeline_download_version: str,
     expand_form_aliases: Callable[[list[str]], list[str]],
     split_form_input: Callable[[str], list[str]],
     parse_date: Callable[[str, bool], dt.date],
@@ -117,7 +116,6 @@ def rebuild_download_artifacts(
         start_date: 可选起始 filing date。
         end_date: 可选结束 filing date。
         overwrite: 是否覆盖既有 meta。
-        pipeline_download_version: 当前 SEC 下载版本。
         expand_form_aliases: SEC form 筛选别名展开函数。
         split_form_input: form 输入拆分函数。
         parse_date: 日期解析函数。
@@ -173,7 +171,6 @@ def rebuild_download_artifacts(
             document_id=document_id,
             previous_meta=previous_meta,
             company_meta=company_meta,
-            pipeline_download_version=pipeline_download_version,
         )
         filing_results.append(filing_result)
         host._log_filing_download_result(ticker=ticker, filing_result=filing_result)
@@ -291,7 +288,6 @@ def rebuild_single_local_filing(
     document_id: str,
     previous_meta: dict[str, JsonValue],
     company_meta: Optional[CompanyMeta],
-    pipeline_download_version: str,
 ) -> dict[str, JsonValue]:
     """重建单个本地 filing 的 meta/manifest。
 
@@ -302,7 +298,6 @@ def rebuild_single_local_filing(
         document_id: 文档 ID。
         previous_meta: 当前完成态 source meta。
         company_meta: 可选公司元数据。
-        pipeline_download_version: 当前下载版本。
 
     Returns:
         单文档重建结果。
@@ -397,7 +392,6 @@ def rebuild_single_local_filing(
         "document_version": document_version,
         "source_fingerprint": source_fingerprint,
         "amended": amended,
-        "download_version": pipeline_download_version,
         "created_at": created_at,
         "updated_at": now_iso8601(),
     }

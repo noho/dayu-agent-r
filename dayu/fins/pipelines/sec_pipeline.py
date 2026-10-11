@@ -169,7 +169,7 @@ from dayu.fins.storage import (
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
 
-SEC_PIPELINE_DOWNLOAD_VERSION: Final[str] = "sec_pipeline_download_v1.2.0"
+SEC_PIPELINE_DOWNLOAD_VERSION: Final[str] = "sec_pipeline_download_v1.3.0"
 SEC_DOWNLOAD_SOURCE: Final[str] = "sec"
 _SEC_FORMS_ADAPTER_JOINER: Final[str] = ","
 _SEC_STATUS_DOWNLOADED: Final[str] = "downloaded"
@@ -951,7 +951,6 @@ class SecPipeline:
             start_date=start_date,
             end_date=end_date,
             overwrite=overwrite,
-            pipeline_download_version=SEC_PIPELINE_DOWNLOAD_VERSION,
             expand_form_aliases=expand_form_aliases,
             split_form_input=split_form_input,
             parse_date=parse_date,

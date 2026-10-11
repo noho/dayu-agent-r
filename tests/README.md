@@ -84,6 +84,34 @@ HTTP transport 被隔离替换，公开 CLI、分类、文件发现和仓储真�
 6-K 历史拒绝重试、hash/fingerprint/清单一致性、同公司跨日期与跨公司隔离、失败回滚、取消及再次增量跳过。
 测试不会读取投资项目 workspace，也不从夹具提取财务数字。
 
+SEC HTML 图片 owner 回归位于 `test_sec_html_image_assets.py`，使用真实 downloader、
+MockTransport 与 Fs publication，覆盖三类直接候选、有限 srcset、首 base、同申报地址、
+重复属性首值（含空/无值）、完整分号路径、path 百分号与二次编码边界、最终丢弃的 query/fragment
+不改变文件身份、base 的标准地址解析及 data 候选独立语法、基础描述符 typed 失败、
+单组件资产碰撞、完整集合的指纹/hash/寻址、旧下载版本普通补齐、必要失败原子保留及 rebuild
+认证边界。当前版本空指纹用明确播种的边缘来源验证基础 GET/发现/HEAD 先于等价 skip，
+发现失败优先于跳过。META 真实封面的 logo 在 earnings 测试中由显式 SYNTHETIC 确定性图片
+mock 供数并登记完整集合；真实 Raw HTML 与历史 manifest 不变，mock 图片不是 SEC 原图。
+
+`test_sec_html_image_assets_real_cli.py` 默认明确 skip；实际网络验收必须显式启用：
+
+```bash
+source .venv/bin/activate
+SEC_IMAGE_RUN_ROOT=$(mktemp -d "$PWD/workspace/tmp/sec-html-image-assets-XXXXXX")
+mkdir -p "$SEC_IMAGE_RUN_ROOT/baseline-code" "$SEC_IMAGE_RUN_ROOT/evidence"
+git archive --format=tar --output="$SEC_IMAGE_RUN_ROOT/baseline.tar" 297bfbbc67b7d7468e3dfb6669a3385c4dd10d18
+tar -xf "$SEC_IMAGE_RUN_ROOT/baseline.tar" -C "$SEC_IMAGE_RUN_ROOT/baseline-code"
+DAYU_SEC_IMAGE_REAL_VALIDATION=1 DAYU_SEC_IMAGE_RUN_ROOT="$SEC_IMAGE_RUN_ROOT" DAYU_SEC_IMAGE_BASELINE_ROOT="$SEC_IMAGE_RUN_ROOT/baseline-code" DAYU_SEC_IMAGE_CLI="$PWD/.venv/bin/dayu-cli" pytest -q tests/fins/test_sec_html_image_assets_real_cli.py
+```
+
+启用后配置或网络失败是 fail；身份仅在内存复用既有 zshrc literal，证据只记录配置布尔值。
+真实验证使用原 commit 的生产 CLI 播种旧来源，再用指定 editable CLI 普通升级；保存实际 argv、
+两通道、退出码、descriptor 观测及仓储逐图 hash/URI；目标 HTML 与完整 filing 的图片数分栏，
+逐一核验所有实际已选 HTML 的引用，额外图片只作为必要依赖登记。临时 hook 只观察真实 transport/指纹，或对
+exact 图片 GET 注入 404，用以验证 fresh 不发布、upgrade 保留旧 publication、解除故障后 retry
+以及重复的零目标请求与幂等。两例 TSM 平铺 img/src 不证明 base/srcset 能力，这些由合成 owner
+矩阵验证；上述测试均不证明 OCR、财务数值提取或真实 processed 转换结果。
+
 运行当前契约、CLI、Documents、Fins、Tools、Host、Runtime、Service 与 Engine 测试：
 
 ```bash
