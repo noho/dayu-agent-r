@@ -3,8 +3,8 @@
 - Work unit：sec-html-image-assets。
 - Branch：fix/sec-html-image-assets；base：297bfbbc67b7d7468e3dfb6669a3385c4dd10d18。
 - Binding scope：docs/plans/sec-html-image-assets-goal.md，用户已确认全部目标/非目标/边界/五项成功信号。
-- Status：active。
-- Current gate / next entry point：accepted PR review commit。
+- Status：completed。
+- Current gate / next entry point：final closeout pass；用户另行授权 merge 后可进入主线采纳，部署及原业务补齐按各自授权执行。
 - Active slice：S1。
 - 本任务无外部 issue 编号，按 bug fix work unit 执行；不创建 issue 或对外 comment。
 - 原业务 workspace/证据目录只读；正式真实验证只写独立临时 base。
@@ -262,3 +262,16 @@ DS35903实际exit0/completed/needs_review（Qh8kOjTY），artifact021003 PASS；
 ## PR review最终PASS
 
 mimo44537 exit0/completed/needs_review，021002 PASS；DS35903 PASS。rootfinal `docs/reviews/pr-200-review-20261012-023603.md`，全部accepted已修复/原finding回写，无blocking/unclassifiedrisk。root11sourcehash再匹配；两路均已退出，无source写冲突。下一入口accepted PR review commit，尚未finalpush/draft-PR-pass/closeout。
+
+accepted PR review commit `daf6c00b61af937068d7143e9c94abb95223af9f` 已创建（仅审核/控制docs，源/test对reviewed head0b931完全不变）。下一入口final push，然后核对draft-PR-pass entry criteria。
+
+## draft-PR-pass
+
+accepted PR review daf6c00b61af937068d7143e9c94abb95223af9f实际finalpush exit0、GitHub head同值，draft OPEN；双路review artifacts/所有finding裁决和回写齐备，required fixes/re-review PASS；远端reviewed0b→daf6只6治理docs、11source/test对reviewed验证逐项同值。draft-PR-pass entry criteria全满足，PASS；下一未完成gate final closeout（不得把此gate当work unit完成）。证据workspace/tmp/sec-html-image-assets-draft-pr-pass.json。
+
+
+## final closeout pass
+
+2026-10-12：final closeout summary `docs/plans/sec-html-image-assets-final-closeout.md` 已创建。what changed / verified / docs / finding status / residual owners / draft PR / issue 不适用 / live CLI 与普通补齐方式 / next entry 完整。全部 required artifacts/checkpoints 齐备；最终 mimo+ds-flash 双路 PASS、总控裁决与 finding 回写完成，accepted PR review daf6c00b 实际推送，远端 draft OPEN/head 同值，draft-PR-pass PASS。无 blocking question、未修复 accepted finding 或未分类 risk，work unit completed / final closeout PASS。
+
+本关口仅提交 summary/control 治理文档；源码与 reviewed 0b931beb 的 11 项源码/测试 hash 保持同值。原业务 workspace 只读，未执行补齐或覆盖。TCOM 用户撤回任务保留独立 worktree/branch/证据、从未派 worker，不恢复。merge/部署/ready/approve/reviewer/外部 comment/issue 未执行；后续需用户另行授权。本关口 checkpoint 推送后再核对 GitHub draft OPEN/head 和 docs-only delta，实际 commit 可由包含此 summary 的 Git 历史定位。
