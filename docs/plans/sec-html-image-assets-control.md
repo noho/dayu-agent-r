@@ -4,7 +4,7 @@
 - Branch：fix/sec-html-image-assets；base：297bfbbc67b7d7468e3dfb6669a3385c4dd10d18。
 - Binding scope：docs/plans/sec-html-image-assets-goal.md，用户已确认全部目标/非目标/边界/五项成功信号。
 - Status：active。
-- Current gate / next entry point：fix（PR200-N1）。
+- Current gate / next entry point：accepted PR review commit。
 - Active slice：S1。
 - 本任务无外部 issue 编号，按 bug fix work unit 执行；不创建 issue 或对外 comment。
 - 原业务 workspace/证据目录只读；正式真实验证只写独立临时 base。
@@ -252,3 +252,13 @@ gpt-6-sol65125实际exit0/completed/needs_review（SMWqYjdr），仅已恢复初
 新权威pr-percent-path-fix JSON SHA c87e6655774a7e964773870ee7644ad4c3525b79b7b1d9290e4d437ccef5b6c8，1,768,409 bytes；4169 collect/4160 pass/9skip、852owner=694image+158pipeline、全仓pyright0；7cleancoverage95.05/84.16/89.54/85.82/82.71/90.70/88.64，excluded0；2real0skip24CLI=20exit0+4expectedexit1、target27/full28、112readbacks、168producer身份。
 
 root11源/testhash、207库存size/SHA、5历史JSONsize/SHA、12finalcommands exit0/identity/beforeafter/logSHA和fixMD SHA全匹配；6下游producer对旧finalhash逐项未变；diffcheck0，credential精确值scan通过/不存headers-env。新code仍待双路PR re-review，N1未提前关闭。为deepreview精确PR输入准备中间fixcheckpoint/push，不将其计作accepted PR review commit或Gate Order后续final push通过；本轮修复阶段仍未通过。保持draft/无merge部署。
+
+N1修复checkpoint 0b931bebc72be3a250a518db2a48b8c530805c3a已提交并中间push；PRbody更新真实新counts与证据。新GitHub exactbase297/head0b931… compare57files/141501add172del/7992450bytes SHAcef9ecd37b81a171074ef14d427bf61863eb1048cd9f8d9cc3fffcb74bdd315a，facts前后OID一致、完整计数匹配。current gate re-review，不是accepted PR review/final push/draft-PR-pass。
+
+N1双路re-review实际派发成功：mimo44537/artifact20261012-021002；ds-flash35903/artifact20261012-021003。同一精确base297/head0b931…与新JSON；彼此新报告隔离，只自身scratch可写，原发现路可append自己005858最终finding回写。两路均在途，启动不记PASS。
+
+DS35903实际exit0/completed/needs_review（Qh8kOjTY），artifact021003 PASS；独立54矩阵/原反例、224聚焦/852owner/type0、207inventory/11hash/12finalcommands/24CLI168producer及精确PR57files收尾同源。root已追加原反例“两失败+filename正对照”叙述校正、4辅助异常及OQ1不可达边界裁决；未提前关闭N1，mimo44537仍在途。
+
+## PR review最终PASS
+
+mimo44537 exit0/completed/needs_review，021002 PASS；DS35903 PASS。rootfinal `docs/reviews/pr-200-review-20261012-023603.md`，全部accepted已修复/原finding回写，无blocking/unclassifiedrisk。root11sourcehash再匹配；两路均已退出，无source写冲突。下一入口accepted PR review commit，尚未finalpush/draft-PR-pass/closeout。
