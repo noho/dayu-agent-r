@@ -1,0 +1,78 @@
+{
+  "head": "297bfbbc67b7d7468e3dfb6669a3385c4dd10d18",
+  "samples": [
+    {
+      "accession": "0001193125-19-110066",
+      "html": "d733154d6k.htm",
+      "local_html_sha256": "92f003a3c05821f2e31e6731c9361924b62c5263e524a2338aca7af8e7ea0968",
+      "catalog_hash_matches": true,
+      "image_reference_count": 17,
+      "unique_image_count": 15,
+      "missing_local_count": 15,
+      "registered_image_count": 0,
+      "remote": [
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1046179/000119312519110066/d733154d6k.htm",
+          "status": 200,
+          "content_type": "text/html",
+          "bytes": 36961,
+          "sha256": "92f003a3c05821f2e31e6731c9361924b62c5263e524a2338aca7af8e7ea0968"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1046179/000119312519110066/g733154txs8g1.jpg",
+          "status": 200,
+          "content_type": "image/jpeg",
+          "bytes": 273880,
+          "sha256": "d36673f630aa4b1ee96f81f7385b497c91d62f46c2f9c518e370c820eeefeec9"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1046179/000119312519110066/g733154txs13g1.jpg",
+          "status": 200,
+          "content_type": "image/jpeg",
+          "bytes": 289164,
+          "sha256": "1e7ddf5656bf5e9865495bbf1e9f68d7bfb9069a3f5ed659de2202de8b2f9442"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1046179/000119312519110066/g733154txs14g1.jpg",
+          "status": 200,
+          "content_type": "image/jpeg",
+          "bytes": 172741,
+          "sha256": "b54b411d6482b00f0d9281ec553340d0ad54cef17480cb81e93a522f78d99a1e"
+        }
+      ]
+    },
+    {
+      "accession": "0001046179-25-000082",
+      "html": "a2q25presentatione_6kxwm.htm",
+      "local_html_sha256": "91a50bd818a6c7568f5c3474dc30cdf3af83ce6b261c19c9ca20c61d9319f279",
+      "catalog_hash_matches": true,
+      "image_reference_count": 12,
+      "unique_image_count": 12,
+      "missing_local_count": 12,
+      "registered_image_count": 0,
+      "remote": [
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1046179/000104617925000082/a2q25presentatione_6kxwm.htm",
+          "status": 200,
+          "content_type": "text/html",
+          "bytes": 4105,
+          "sha256": "91a50bd818a6c7568f5c3474dc30cdf3af83ce6b261c19c9ca20c61d9319f279"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1046179/000104617925000082/a2q25presentatione_6kxwm001.jpg",
+          "status": 200,
+          "content_type": "image/jpeg",
+          "bytes": 58565,
+          "sha256": "d41cc6de204d6963af5b0b7ea9099c7a94ae1f892b6f1445eab2b3d3fad2236c"
+        },
+        {
+          "url": "https://www.sec.gov/Archives/edgar/data/1046179/000104617925000082/a2q25presentatione_6kxwm012.jpg",
+          "status": 200,
+          "content_type": "image/jpeg",
+          "bytes": 47509,
+          "sha256": "98098d8dc81fd7c8258d2753f6a42ffdabc0964e39eabaa304873c5214798347"
+        }
+      ]
+    }
+  ]
+}
