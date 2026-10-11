@@ -4,7 +4,7 @@
 - Branch：fix/sec-html-image-assets；base：297bfbbc67b7d7468e3dfb6669a3385c4dd10d18。
 - Binding scope：docs/plans/sec-html-image-assets-goal.md，用户已确认全部目标/非目标/边界/五项成功信号。
 - Status：active。
-- Current gate / next entry point：accepted deepreview commit。
+- Current gate / next entry point：fix（PR200-N1）。
 - Active slice：S1。
 - 本任务无外部 issue 编号，按 bug fix work unit 执行；不创建 issue 或对外 comment。
 - 原业务 workspace/证据目录只读；正式真实验证只写独立临时 base。
@@ -224,3 +224,31 @@ Plan runner日志：`/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/agent-run.
 ## Aggregate 最终通过
 
 mimo74699实际exit0/completed/needs_review，003152 PASS；所有辅助异常恢复证据完整。root最终decision `docs/reviews/code-review-20261012-005716.md`，AGG001/002与全部accepted findings已修复、原finding回写，aggregate PASS。两runner已退出，11源/testhash再核一致、diffcheck0；下一入口accepted deepreview commit，无新fix需求。
+
+## Ready-to-open-draft-PR PASS
+
+accepted deepreview db0d0e68557a42ca2b6f33500cd9ffe87033c1e7；branch仅本unit三intended commits，S1/aggregate全部通过；工作树clean，远端main仍297，无已有head PR。docs/validation/residual owners齐备，无issue号。ready-to-open-draft-PR PASS，下一入口push。
+
+初次push实际exit0，github/fix/sec-html-image-assets=db0d0e68557a42ca2b6f33500cd9ffe87033c1e7；下一入口create draft PR。
+
+draft PR创建成功：https://github.com/noho/dayu-agent-r/pull/200。保持draft；current gate PR review，尚未draft-PR-pass或完成。
+
+## PR review实际派发
+
+PR200精确base297bfbbc67b7d7468e3dfb6669a3385c4dd10d18/head db0d0e68557a42ca2b6f33500cd9ffe87033c1e7，GitHub compare52files、109060add/172del，完整snapshotSHA19dc6540eda09b6ad3c2eb6ab87b1b154c6fda1b8ab38c95adefbc2e6d5f51ae。metadata前后OID不变，完整性计数匹配，原snapshot在workspace/tmp/sec-html-image-assets-pr-snapshot。mimo18636/artifact005858与DS98474/artifact005859实际启动，均未通过gate；互不读取并行报告，root只持control。
+
+DS PRreview98474实际exit0/completed/needs_review，artifact005859 PASS。rawprobe42=39pass+3observed/failures0，root已追加计数、OBS1边界与FIFO操作偏差回写；207库存与11source/testhash复核仍全匹配，不假称过程未偏离写范围。mimo18636仍在途，PR review loop未提前放行。
+
+## PR review第一轮合并
+
+mimo18636实际exit0/completed/needs_review，005858 FAIL，新N1；DS98474 PASS。rootdecision `docs/reviews/pr-200-review-20261012-013721.md`，N1 accepted/未修复/中，URL owner同源gap，当前PR gate FAIL。两runner均退出，下一入口gpt-6-sol fix；不扩大scope。
+
+PR200-N1 fix实际派发成功，gpt-6-sol session65125，task workspace/tmp/sec-html-image-assets-pr-percent-path-fix-task.md；源owner仅该runner，root不并行改源码。最新5份历史JSON冻结；新final验证独立base，root后续为PR re-review准备精确新head，不把中间修复push当accepted PR review/final push gate通过。
+
+## PR200-N1 fix收取与冻结
+
+gpt-6-sol65125实际exit0/completed/needs_review（SMWqYjdr），仅已恢复初始脚本语法/检索/参数位置错误、fixture不正确期望和首实现前导空组件回归、中断自身tests。原所有尝试/runner130及未捕获child状态保留，不当pass；旧代码red-proof fixture不纯，不用替代mimo同源直接反例。新正式Fs正例完整发布/失败保留/retry/repeat成立。
+
+新权威pr-percent-path-fix JSON SHA c87e6655774a7e964773870ee7644ad4c3525b79b7b1d9290e4d437ccef5b6c8，1,768,409 bytes；4169 collect/4160 pass/9skip、852owner=694image+158pipeline、全仓pyright0；7cleancoverage95.05/84.16/89.54/85.82/82.71/90.70/88.64，excluded0；2real0skip24CLI=20exit0+4expectedexit1、target27/full28、112readbacks、168producer身份。
+
+root11源/testhash、207库存size/SHA、5历史JSONsize/SHA、12finalcommands exit0/identity/beforeafter/logSHA和fixMD SHA全匹配；6下游producer对旧finalhash逐项未变；diffcheck0，credential精确值scan通过/不存headers-env。新code仍待双路PR re-review，N1未提前关闭。为deepreview精确PR输入准备中间fixcheckpoint/push，不将其计作accepted PR review commit或Gate Order后续final push通过；本轮修复阶段仍未通过。保持draft/无merge部署。

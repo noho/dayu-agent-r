@@ -86,7 +86,11 @@ HTTP transport 被隔离替换，公开 CLI、分类、文件发现和仓储真�
 
 SEC HTML 图片 owner 回归位于 `test_sec_html_image_assets.py`，使用真实 downloader、
 MockTransport 与 Fs publication，覆盖三类直接候选、有限 srcset、首 base、同申报地址、
-重复属性首值（含空/无值）、完整分号路径、path 百分号与二次编码边界、最终丢弃的 query/fragment
+重复属性首值（含空/无值）、完整分号路径、path 百分号与二次编码边界；完整 URL、protocol-relative、
+root-relative 与首 base 的 Archives/edgar/data/CIK/accession 合法 unreserved 编码与字面表示
+共用资产身份。三入口的正式 Fs workflow 从本轮 HTML 字节验证 canonical exact GET、完整
+descriptor/fingerprint/meta.files/blob/manifest/URI/hash、普通旧版补齐、404 原子保留、retry 与 repeat 快跳。
+最终丢弃的 query/fragment
 不改变文件身份、base 的标准地址解析及 data 候选独立语法、基础描述符 typed 失败、
 单组件资产碰撞、完整集合的指纹/hash/寻址、旧下载版本普通补齐、必要失败原子保留及 rebuild
 认证边界。指纹读取 owner 单元契约覆盖所有 JSON 类型、缺席、空白与规范化非空字符串；

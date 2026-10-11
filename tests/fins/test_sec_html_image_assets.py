@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
 from threading import Event
-from typing import BinaryIO
+from typing import BinaryIO, cast
 from urllib.parse import quote
 
 import httpx
@@ -29,12 +30,15 @@ from dayu.fins.downloaders.sec_downloader import (
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.pipelines.sec_filing_collection import FilingRecord
 from dayu.fins.pipelines.sec_pipeline import SEC_PIPELINE_DOWNLOAD_VERSION, SecPipeline
+from dayu.fins.pipelines import sec_download_filing_workflow
 from dayu.fins.processors.registry import build_fins_processor_registry
 from dayu.fins.storage import (
     FsBatchingRepository, FsDocumentBlobRepository, FsMaterialUploadStateRepository,
     FsProcessedDocumentRepository, FsSourceDocumentRepository, SourceIntegrityStatus,
 )
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
+from dayu.fins.storage.local_file_store import LocalFileStore
+from dayu.fins.storage.source_manifest_contract import project_filing_manifest_item
 
 _ARCHIVE = "https://www.sec.gov/Archives/edgar/data/42/000000000000000042/"
 _ACCESSION = "0000000000-00-000042"
@@ -50,6 +54,14 @@ _IMAGE_ENTRY_TEMPLATES = (
     '<picture><source srcset="{reference} 1x"></picture>',
 )
 _IMAGE_AND_BASE_TEMPLATES = (*_IMAGE_ENTRY_TEMPLATES, '<base href="{reference}"><img src="#part">')
+_ENCODED_ARCHIVE_PATHS = (
+    "/%41rchives/edgar/data/42/000000000000000042/",
+    "/Archives/%65dgar/data/42/000000000000000042/",
+    "/Archives/edgar/%64ata/42/000000000000000042/",
+    "/Archives/edgar/data/%34%32/000000000000000042/",
+    "/Archives/edgar/data/42/" + "%30" * 16 + "%34%32/",
+    "/%41rchives/%65dgar/%64ata/%34%32/" + "%30" * 16 + "%34%32/",
+)
 
 
 def _descriptor(name: str, *, metadata: bool = False) -> RemoteFileDescriptor:
@@ -1104,3 +1116,232 @@ def test_query_image_exact_transport_publication_and_rollback(tmp_path: Path, te
     network.requests.clear()
     assert asyncio.run(_run(tmp_path, network))[-1].payload["status"] == "skipped"
     assert not network.requests and _publication(tmp_path) == (meta, revision, payloads)
+
+
+@pytest.mark.parametrize("template", _IMAGE_ENTRY_TEMPLATES)
+@pytest.mark.parametrize("prefix", ["https://www.sec.gov", "//www.sec.gov:443", ""])
+@pytest.mark.parametrize("path", _ENCODED_ARCHIVE_PATHS)
+def test_percent_full_path_single_asset_owner(tmp_path: Path, template: str, prefix: str, path: str) -> None:
+    """参数为根、三入口与编码路径；返回无；完整路径与字面身份未去重或 HEAD 非 canonical 时失败。"""
+    name = "plot;1%.jpg"
+    reference = prefix + path + "%70lot%3B1%25.jpg?label=100%#%GG"
+    html = (template.format(reference=reference) + '<img src="plot;1%25.jpg">').encode()
+    descriptors = asyncio.run(_discover(tmp_path, {"report.htm": html}, metadata=True))
+    assert [(item.name, item.source_url, item.http_etag) for item in descriptors] == [
+        (name, _ARCHIVE + quote(name, safe=""), '"test"'),
+    ]
+    assert build_source_fingerprint(descriptors) == build_source_fingerprint([_descriptor(name, metadata=True)])
+
+
+@pytest.mark.parametrize("template", _IMAGE_ENTRY_TEMPLATES)
+@pytest.mark.parametrize("path", _ENCODED_ARCHIVE_PATHS)
+@pytest.mark.parametrize("tail,reference,name", [
+    (".", "%70lot%3B1%25.jpg", "plot;1%.jpg"),
+    ("sub/../", "%70lot%3B1%25.jpg", "plot;1%.jpg"),
+    ("anchor%3B1%25.jpg?seed=%GG#100%", "?v=100%#%GG", "anchor;1%.jpg"),
+    ("anchor%3B1%25.jpg?seed=%GG#100%", "#100%", "anchor;1%.jpg"),
+])
+def test_percent_full_base_single_path_owner(
+    tmp_path: Path, template: str, path: str, tail: str, reference: str, name: str,
+) -> None:
+    """参数为根、入口、编码首 base 与候选；返回无；一次解码、点段归一或 file base 身份不符时失败。"""
+    html = (template.format(reference=reference) + f'<base href="https://www.sec.gov{path}{tail}">'
+            + '<base href="https://outside.invalid/">').encode()
+    descriptors = asyncio.run(_discover(tmp_path, {"report.htm": html}, metadata=True))
+    assert [(item.name, item.source_url, item.http_etag) for item in descriptors] == [
+        (name, _ARCHIVE + quote(name, safe=""), '"test"'),
+    ]
+    assert build_source_fingerprint(descriptors) == build_source_fingerprint([_descriptor(name, metadata=True)])
+
+
+@pytest.mark.parametrize("template", _IMAGE_ENTRY_TEMPLATES)
+@pytest.mark.parametrize("path", [
+    "/%41rchives/edgar/data/%34%33/000000000000000042/",
+    "/%41rchives/edgar/data/%34%32/000000000000000043/",
+    "/%41rchives/edgar/data/%34%32/000000000000000042x/",
+    "/%41rchives/edgar/data/42x/000000000000000042/",
+])
+def test_percent_cross_filing_is_ignored(tmp_path: Path, template: str, path: str) -> None:
+    """参数为根、入口与跨申报/前缀路径；返回无；误认同申报或发生 HEAD 时失败。"""
+    html = template.format(reference="https://www.sec.gov" + path + "plot.jpg").encode()
+    assert asyncio.run(_discover(tmp_path, {"report.htm": html}, metadata=True)) == []
+
+
+@pytest.mark.parametrize("template", _IMAGE_AND_BASE_TEMPLATES)
+@pytest.mark.parametrize("path", [
+    "/%2541rchives/edgar/data/42/000000000000000042/plot.jpg",
+    "/%GGrchives/edgar/data/42/000000000000000042/plot.jpg",
+    "/%FFrchives/edgar/data/42/000000000000000042/plot.jpg",
+    "/%41rchives%2Fedgar/data/42/000000000000000042/plot.jpg",
+    "/%41rchives%5Cedgar/data/42/000000000000000042/plot.jpg",
+    "/%41rchives/edgar/data/42/000000000000000042/%2e/plot.jpg",
+    "/%41rchives/edgar/data/42/000000000000000042/%2e%2e/plot.jpg",
+])
+def test_percent_full_path_unsafe_remains_typed(tmp_path: Path, template: str, path: str) -> None:
+    """参数为根、入口与非法编码路径；返回无；危险路径未在发现 owner 关闭时失败。"""
+    html = template.format(reference="https://www.sec.gov" + path).encode()
+    with pytest.raises(SecHtmlImageDependencyError) as caught:
+        asyncio.run(_discover(tmp_path, {"report.htm": html}, metadata=True))
+    assert caught.value.reason_code == "html_image_reference_invalid"
+
+
+@pytest.mark.parametrize("template", _IMAGE_ENTRY_TEMPLATES)
+@pytest.mark.parametrize("base", [
+    "https://www.sec.gov/%41rchives/edgar/data/%34%33/000000000000000042/",
+    "https://www.sec.gov/%41rchives/edgar/data/42/000000000000000042x/",
+    "https://user@www.sec.gov/%41rchives/edgar/data/42/000000000000000042/",
+    "http://www.sec.gov/%41rchives/edgar/data/42/000000000000000042/",
+    "https://www.sec.gov:444/%41rchives/edgar/data/42/000000000000000042/",
+])
+def test_percent_unsafe_base_relative_failure(tmp_path: Path, template: str, base: str) -> None:
+    """参数为根、入口与越界首 base；返回无；后续合法 base 补救或宽化 origin 时失败。"""
+    html = (f'<base href="{base}"><base href="{_ARCHIVE}">' + template.format(reference="plot.jpg")).encode()
+    with pytest.raises(SecHtmlImageDependencyError, match="base"):
+        asyncio.run(_discover(tmp_path, {"report.htm": html}, metadata=True))
+
+
+@dataclass
+class _FingerprintObservation:
+    """只观察 workflow 传给原指纹 owner 的完整描述符，不改变计算。"""
+
+    calls: list[list[RemoteFileDescriptor]] = field(default_factory=list)
+
+    def calculate(self, descriptors: list[RemoteFileDescriptor]) -> str:
+        """参数为本轮描述符；返回原指纹；原函数异常透传。"""
+        self.calls.append(list(descriptors))
+        return build_source_fingerprint(descriptors)
+
+
+def _percent_publication_bytes(root: Path) -> tuple[bytes, bytes]:
+    """参数为正式发布根；通过仓储存取返回原始 meta/manifest 字节；读取异常透传。"""
+    core = build_fs_repository_set(workspace_root=root).core
+    paths = (
+        core._source_meta_path_for_read("TEST", _DOCUMENT, SourceKind.FILING),
+        core._filing_manifest_path_for_read("TEST"),
+    )
+    store = LocalFileStore(root)
+    with store.get_object(str(paths[0].relative_to(root))) as stream:
+        meta = stream.read()
+    with store.get_object(str(paths[1].relative_to(root))) as stream:
+        manifest = stream.read()
+    return meta, manifest
+
+
+def _assert_percent_publication_contract(root: Path, html: bytes, name: str, *, metadata: bool) -> None:
+    """参数为发布根、本轮 HTML、图名与 HEAD 开关；返回无；meta/blob/manifest/URI/hash/全集不符时失败。"""
+    source = FsSourceDocumentRepository(root)
+    blobs = FsDocumentBlobRepository(root)
+    handle = SourceHandle("TEST", _DOCUMENT, SourceKind.FILING.value)
+    expected = {"report.htm": html, name: _IMAGE_BYTES}
+    with source.read_source_snapshot("TEST", _DOCUMENT, SourceKind.FILING, materialize_files=True) as snapshot:
+        assert {item.name for item in snapshot.files} == set(expected)
+        meta = dict(snapshot.source_meta)
+        rows = meta["files"]
+        assert isinstance(rows, list)
+        entries: dict[str, dict[str, JsonValue]] = {}
+        for row in rows:
+            assert isinstance(row, dict) and isinstance(row["name"], str)
+            entries[row["name"]] = row
+        assert set(entries) == set(expected)
+        blob_files = {item.uri: item for item in blobs.list_files(handle)}
+        for descriptor in snapshot.files:
+            entry = entries[descriptor.name]
+            payload = expected[descriptor.name]
+            published = source.get_source("TEST", _DOCUMENT, SourceKind.FILING, descriptor.name)
+            with published.open() as stream:
+                assert stream.read() == payload
+            with snapshot.get_source(descriptor.name).open() as stream:
+                assert stream.read() == payload
+            assert blobs.read_file_bytes(handle, descriptor.name) == payload
+            assert published.uri == entry["uri"]
+            blob = blob_files[published.uri]
+            assert blob.sha256 == entry["sha256"] == descriptor.sha256 == hashlib.sha256(payload).hexdigest()
+            assert blob.size == entry["size"] == descriptor.size == len(payload)
+            assert entry["source_url"] == _ARCHIVE + quote(descriptor.name, safe="")
+        assert meta["source_fingerprint"] == build_source_fingerprint([
+            _descriptor(filename, metadata=metadata) for filename in sorted(expected)
+        ])
+        core = build_fs_repository_set(workspace_root=root).core
+        manifest_path = core._filing_manifest_path_for_read("TEST")
+        with LocalFileStore(root).get_object(str(manifest_path.relative_to(root))) as stream:
+            manifest = cast(JsonValue, json.loads(stream.read()))
+        assert isinstance(manifest, dict) and isinstance(manifest["documents"], list)
+        assert manifest["documents"] == [project_filing_manifest_item(meta).to_dict()]
+
+
+@pytest.mark.parametrize("template", _IMAGE_ENTRY_TEMPLATES)
+@pytest.mark.parametrize("kind", ["full", "protocol", "root", "relative"])
+@pytest.mark.parametrize("upgrade", [False, True])
+def test_percent_path_workflow_complete_identity_and_atomic_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, template: str, kind: str, upgrade: bool,
+) -> None:
+    """参数为根、指纹观测、入口、地址形态与旧状态；返回无；必要 404、原子保留/补齐/快跳或身份不同源时失败。"""
+    path = _ENCODED_ARCHIVE_PATHS[-1]
+    name = "plot;1%.jpg"
+    filename = "%70lot%3B1%25.jpg?label=100%#%GG"
+    prefixes = {"full": "https://www.sec.gov", "protocol": "//www.sec.gov:443", "root": ""}
+    reference = filename if kind == "relative" else prefixes[kind] + path + filename
+    duplicate = "plot;1%25.jpg" if kind == "relative" else prefixes[kind] + path + "plot;1%25.jpg"
+    base = f'<base href="https://www.sec.gov{path}sub/../anchor%25.jpg?seed=%GG#100%">'
+    html = (template.format(reference=reference) + base + '<base href="https://outside.invalid/">'
+            + template.format(reference=duplicate)).encode()
+    before = None
+    before_bytes = None
+    processed = None
+    processed_before = None
+    if upgrade:
+        _seed(tmp_path, {"report.htm": b"old selected HTML without images"}, _OLD_VERSION)
+        processed = _seed_processed(tmp_path)
+        processed_before = dict(processed.get_processed_meta("TEST", _DOCUMENT))
+        before = _publication(tmp_path)
+        before_bytes = _percent_publication_bytes(tmp_path)
+    observer = _FingerprintObservation()
+    monkeypatch.setattr(sec_download_filing_workflow, "build_source_fingerprint", observer.calculate)
+    network = _Network(html, failure="404", failure_name=name)
+    canonical = _ARCHIVE + quote(name, safe="")
+    expected_descriptors = [_descriptor(filename, metadata=upgrade) for filename in sorted(("report.htm", name))]
+    failed = asyncio.run(_run(tmp_path, network))
+    assert failed[-1].event_type is DownloadEventType.FILING_FAILED
+    assert failed[-1].payload["reason_code"] == "file_download_failed"
+    assert [(item.name, item.source_url) for item in observer.calls[-1]] == [
+        (item.name, item.source_url) for item in expected_descriptors
+    ]
+    assert build_source_fingerprint(observer.calls[-1]) == build_source_fingerprint(expected_descriptors)
+    image_failures = [event for event in failed if event.event_type is DownloadEventType.FILE_FAILED]
+    assert len(image_failures) == 1 and image_failures[0].payload["source_url"] == canonical
+    expected_requests = ([("HEAD", canonical)] if upgrade else []) + [("GET", canonical)]
+    assert [(method, url) for method, url in network.requests if url == canonical] == expected_requests
+    if before is None:
+        assert FsSourceDocumentRepository(tmp_path).classify_source_integrity(
+            "TEST", _DOCUMENT, SourceKind.FILING,
+        ).status is SourceIntegrityStatus.MISSING
+    else:
+        assert _publication(tmp_path) == before
+        assert _percent_publication_bytes(tmp_path) == before_bytes
+        assert processed is not None and dict(processed.get_processed_meta("TEST", _DOCUMENT)) == processed_before
+    network.failure = None
+    network.requests.clear()
+    assert asyncio.run(_run(tmp_path, network))[-1].payload["status"] == "downloaded"
+    assert [(item.name, item.source_url) for item in observer.calls[-1]] == [
+        (item.name, item.source_url) for item in expected_descriptors
+    ]
+    assert build_source_fingerprint(observer.calls[-1]) == build_source_fingerprint(expected_descriptors)
+    assert [(method, url) for method, url in network.requests if method == "GET"] == [
+        ("GET", _ARCHIVE + "index.json"),
+        ("GET", _ARCHIVE + "report.htm"), ("GET", canonical),
+    ]
+    assert [(method, url) for method, url in network.requests if url == canonical] == expected_requests
+    _assert_percent_publication_contract(tmp_path, html, name, metadata=upgrade)
+    after = _publication(tmp_path)
+    after_bytes = _percent_publication_bytes(tmp_path)
+    assert after[0]["download_version"] == SEC_PIPELINE_DOWNLOAD_VERSION
+    assert after[0]["document_version"] == ("v2" if upgrade else "v1")
+    if before is not None:
+        assert after[0]["first_ingested_at"] == before[0]["first_ingested_at"]
+        assert after[0]["created_at"] == before[0]["created_at"]
+        assert processed is not None and processed.get_processed_meta("TEST", _DOCUMENT)["reprocess_required"] is True
+    network.requests.clear()
+    call_count = len(observer.calls)
+    assert asyncio.run(_run(tmp_path, network))[-1].payload["reason_code"] == "already_downloaded_complete"
+    assert not network.requests and len(observer.calls) == call_count and _publication(tmp_path) == after
+    assert _percent_publication_bytes(tmp_path) == after_bytes

@@ -53,7 +53,7 @@ from typing import (
     cast,
     overload,
 )
-from urllib.parse import quote, unquote, urljoin, urlparse, urlsplit
+from urllib.parse import SplitResult, quote, unquote, urljoin, urlparse, urlsplit
 from xml.etree import ElementTree as ET
 
 import httpx
@@ -379,15 +379,15 @@ def _parse_image_srcset(srcset: str) -> list[str]:
     return candidates
 
 
-def _validate_image_address_text(value: str, *, allow_dot_segments: bool) -> None:
-    """先保留原始字符安全检查，再校验 URL path 的单次编码语法。
+def _parse_image_address(value: str, *, allow_dot_segments: bool) -> SplitResult:
+    """保留原始安全证据，产生一次严格解码的图片地址路径真源。
 
     Args:
         value: 已去首尾 ASCII 空白的地址。
         allow_dot_segments: base 允许标准 URL 点段归一化，图片候选不允许遍历。
 
     Returns:
-        无。
+        已解析地址；path 为一次 UTF-8 解码的路径，后续解析不得再次解码。
 
     Raises:
         ValueError: 编码、控制字符或路径不安全时抛出。
@@ -397,7 +397,8 @@ def _validate_image_address_text(value: str, *, allow_dot_segments: bool) -> Non
         raise ValueError(_HTML_IMAGE_REFERENCE_MESSAGE)
     if re.match(r"^[a-zA-Z]:", value):
         raise ValueError(_HTML_IMAGE_REFERENCE_MESSAGE)
-    path = urlsplit(value).path
+    parsed = urlsplit(value)
+    path = parsed.path
     # query/fragment 参与标准 URL 解析，最终不构成文件身份；百分号语法只约束 path。
     if re.search(_INVALID_PERCENT_PATTERN, path) or re.search(_ENCODED_SEPARATOR_PATTERN, path, re.IGNORECASE):
         raise ValueError(_HTML_IMAGE_REFERENCE_MESSAGE)
@@ -409,14 +410,52 @@ def _validate_image_address_text(value: str, *, allow_dot_segments: bool) -> Non
             raise ValueError(_HTML_IMAGE_REFERENCE_MESSAGE)
         if plain == ".." and not allow_dot_segments:
             raise ValueError(_HTML_IMAGE_REFERENCE_MESSAGE)
+    return parsed._replace(path=decoded)
 
 
-def _is_same_image_archive(url: str, archive_base: str) -> bool:
-    """按 origin 与路径组件判断完整申报边界。
+def _resolve_image_address(base: SplitResult, reference: SplitResult) -> SplitResult:
+    """在已解码路径上执行图片相对地址解析，保留路径中的百分号、分号及保留字符。
 
     Args:
-        url: 待判断的已解析地址。
-        archive_base: 生产 archive 根地址。
+        base: 已由图片地址 owner 解析的基准地址。
+        reference: 已由同一 owner 解析的候选或首 base。
+
+    Returns:
+        标准地址解析结果；路径仍使用输入的单次解码事实。
+
+    Raises:
+        ValueError: 标准地址解析遇到非法 authority 时抛出。
+    """
+
+    # origin/query/fragment 交给标准库；decoded path 不重新序列化，避免 ?/#/% 被再解释。
+    resolved = urlsplit(urljoin(base._replace(path="").geturl(), reference._replace(path="").geturl()))
+    if reference.netloc or (reference.scheme and reference.scheme != base.scheme):
+        return resolved._replace(path=reference.path)
+    if not reference.path:
+        return resolved._replace(path=base.path)
+    # 只处理本 owner 所需的 path 点段；与标准 URL join 一致，绝对路径不折叠空组件。
+    segments = reference.path.split("/")
+    if not reference.path.startswith("/"):
+        segments = base.path.split("/")[:-1] + segments
+        segments[1:-1] = [segment for segment in segments[1:-1] if segment]
+    joined: list[str] = []
+    for segment in segments:
+        if segment == "..":
+            if joined:
+                joined.pop()
+        elif segment != ".":
+            joined.append(segment)
+    if segments[-1] in {".", ".."}:
+        joined.append("")
+    return resolved._replace(path="/".join(joined) or "/")
+
+
+def _is_same_image_archive(parsed: SplitResult, root: SplitResult) -> bool:
+    """按 origin 与同源 decoded 路径组件判断完整申报边界。
+
+    Args:
+        parsed: 图片地址 owner 已解析、单次解码的地址。
+        root: 同一 owner 解析的生产 archive 根地址。
 
     Returns:
         地址是否属于同申报。
@@ -425,8 +464,6 @@ def _is_same_image_archive(url: str, archive_base: str) -> bool:
         ValueError: URL authority 非法时抛出。
     """
 
-    parsed = urlsplit(url)
-    root = urlsplit(archive_base)
     return (
         parsed.scheme.lower() == root.scheme
         and parsed.hostname == root.hostname
@@ -458,32 +495,29 @@ def _canonical_image_reference(
     candidate = reference.strip(_HTML_ASCII_WHITESPACE)
     if not candidate or candidate.lower().startswith("data:"):
         return None
-    _validate_image_address_text(candidate, allow_dot_segments=False)
-    parsed = urlsplit(candidate)
+    parsed = _parse_image_address(candidate, allow_dot_segments=False)
+    root = _parse_image_address(archive_base, allow_dot_segments=False)
+    document = _parse_image_address(document_url, allow_dot_segments=False)
     independent = bool(parsed.scheme or parsed.netloc or candidate.startswith("//"))
-    base_url = document_url
+    base = document
     if not independent and base_href is not None:
         try:
             href = base_href.strip(_HTML_ASCII_WHITESPACE)
-            _validate_image_address_text(href, allow_dot_segments=True)
-            base_url = urljoin(document_url, href)
+            base = _resolve_image_address(document, _parse_image_address(href, allow_dot_segments=True))
             # urljoin 对显式绝对地址保留点段；base 的授权边界必须检查归一化后的路径。
-            base_parts = urlsplit(base_url)
-            base_path = posixpath.normpath(base_parts.path)
-            if base_parts.path.endswith(("/", "/.", "/..")) and not base_path.endswith("/"):
+            base_path = posixpath.normpath(base.path)
+            if base.path.endswith(("/", "/.", "/..")) and not base_path.endswith("/"):
                 base_path += "/"
-            base_url = base_parts._replace(path=base_path).geturl()
-            if not _is_same_image_archive(base_url, archive_base):
+            base = base._replace(path=base_path)
+            if not _is_same_image_archive(base, root):
                 raise ValueError(_HTML_IMAGE_BASE_MESSAGE)
         except (ValueError, UnicodeError) as exc:
             raise ValueError(_HTML_IMAGE_BASE_MESSAGE) from exc
-    resolved = urljoin(document_url if independent else base_url, candidate)
-    if not _is_same_image_archive(resolved, archive_base):
+    resolved = _resolve_image_address(document if independent else base, parsed)
+    if not _is_same_image_archive(resolved, root):
         return None
     # 分号属于完整 path；仅在候选解析完成后丢弃最终 query/fragment。
-    path = unquote(urlsplit(resolved).path, encoding="utf-8", errors="strict")
-    root_path = urlsplit(archive_base).path
-    name = path[len(root_path):]
+    name = resolved.path[len(root.path):]
     if "/" in name:
         raise ValueError(_HTML_IMAGE_SUBDIRECTORY_MESSAGE)
     source_asset_name_collision_key(name)

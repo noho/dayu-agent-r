@@ -622,7 +622,10 @@ img/src、img/srcset 与 picture/source/srcset 的全部直接图片候选，复
 单组件资产名、去重及碰撞 owner；picture 外 source 不抓媒体。srcset 只接受可明确划分的有限
 URL/descriptor 列表，不按 media、尺寸或业务用途选图；首个带 href 的 base（包括空 href）
 决定全文相对地址，同名属性只保留首值（含空值和无值属性）。图片与 base 的完整 URL path
-保留字面分号，单次解码的字面百分号合法；解码后仍形成百分号 triplet 的二次解释明确失败。
+先保留原始安全检查，再严格 UTF-8 解码一次；同申报组件判断、首 base 路径归一与资产名提取
+共用该路径真源。完整路径中 unreserved 字符的合法编码与字面表示具有同一资产身份及
+canonical 请求 URL，包含 Archives、edgar、data、CIK 和 accession 组件。路径保留字面分号，
+单次解码的字面百分号合法；解码后仍形成百分号 triplet 的二次解释明确失败。
 普通 URL 的百分号编码语法只校验 path；query/fragment 先参与标准地址解析，再从最终文件身份
 去除，其中的字面百分号不导致路径失败。srcset 的 data 候选仍校验完整 token 的百分号语法，
 所有原始地址仍拒绝控制字符和反斜杠。不安全 base 下的相对候选与同申报子目录资产明确失败，

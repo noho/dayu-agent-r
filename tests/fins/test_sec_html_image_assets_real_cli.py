@@ -95,6 +95,10 @@ async def observed_transport(self: httpx.AsyncHTTPTransport, request: httpx.Requ
 httpx.AsyncHTTPTransport.handle_async_request = observed_transport
 import dayu
 from dayu.fins.pipelines import sec_pipeline
+from dayu.fins.pipelines import (
+    sec_download_filing_workflow, sec_rebuild_workflow, sec_download_state,
+    sec_safe_meta_access, sec_download_source_upsert,
+)
 producer_paths = (
     "dayu/fins/downloaders/sec_downloader.py",
     "dayu/fins/pipelines/sec_download_filing_workflow.py",
@@ -105,7 +109,20 @@ producer_paths = (
     "dayu/fins/pipelines/sec_download_source_upsert.py",
 )
 code_root = Path(dayu.__file__).resolve().parent.parent
+producer_files = (
+    sec_downloader.__file__, sec_download_filing_workflow.__file__, sec_pipeline.__file__,
+    sec_rebuild_workflow.__file__, sec_download_state.__file__, sec_safe_meta_access.__file__,
+    sec_download_source_upsert.__file__,
+)
+actual_producers: dict[str, JsonValue] = {}
+for name, filename in zip(producer_paths, producer_files, strict=True):
+    assert filename is not None
+    actual_path = Path(filename).resolve()
+    assert actual_path == code_root / name
+    actual_producers[name] = {"file": str(actual_path), "code_root": str(code_root),
+                             "sha256": hashlib.sha256(actual_path.read_bytes()).hexdigest()}
 record({"kind": "origin", "dayu": dayu.__file__, "sec_pipeline": sec_pipeline.__file__,
+        "code_root": str(code_root), "producer_origins": actual_producers,
         "sec_downloader_sha256": hashlib.sha256(Path(sec_downloader.__file__).read_bytes()).hexdigest(),
         "producer_hashes": {name: hashlib.sha256((code_root / name).read_bytes()).hexdigest() for name in producer_paths},
         "package_version": importlib.metadata.version("dayu-agent"),
@@ -326,6 +343,13 @@ def _run_cli(context: _Context, year: str, accession: str, mode: str, base: Path
     assert origin["download_version"] == (_OLD_VERSION if baseline else SEC_PIPELINE_DOWNLOAD_VERSION)
     assert origin["package_version"] == "0.1.4"
     expected_root = context.baseline if baseline else _REPO
+    assert origin["code_root"] == str(expected_root)
+    producer_origins = _mapping(origin["producer_origins"])
+    assert set(producer_origins) == set(_PRODUCER_PATHS)
+    for name in _PRODUCER_PATHS:
+        producer = _mapping(producer_origins[name])
+        assert producer["file"] == str(expected_root / name) and producer["code_root"] == str(expected_root)
+        assert producer["sha256"] == hashlib.sha256((expected_root / name).read_bytes()).hexdigest()
     for name in ("dayu", "sec_pipeline"):
         value = origin[name]
         assert isinstance(value, str) and Path(value).is_relative_to(expected_root)
