@@ -20,7 +20,6 @@ from dayu.fins.domain.document_models import (
 from dayu.fins.downloaders.sec_downloader import (
     BrowseEdgarFiling,
     RemoteFileDescriptor,
-    build_source_fingerprint,
 )
 from dayu.fins.storage import FilingMaintenanceRepositoryProtocol
 
@@ -426,53 +425,6 @@ def _normalize_rebuild_file_entries(previous_meta: dict[str, JsonValue]) -> list
             }
         )
     return normalized
-
-
-def _resolve_rebuild_source_fingerprint(
-    *,
-    previous_meta: dict[str, JsonValue],
-    file_entries: list[dict[str, JsonValue]],
-) -> str:
-    """计算重建模式下的 source_fingerprint。
-
-    Args:
-        previous_meta: 旧 meta 字典。
-        file_entries: 规范化后的文件条目列表。
-
-    Returns:
-        指纹字符串；无法构建时返回空字符串。
-
-    Raises:
-        无。
-    """
-
-    previous_fingerprint = str(previous_meta.get("source_fingerprint", "")).strip()
-    if previous_fingerprint:
-        return previous_fingerprint
-
-    descriptors: list[RemoteFileDescriptor] = []
-    for item in file_entries:
-        name = str(item.get("name", "")).strip()
-        if not name:
-            continue
-        raw_size = item.get("size")
-        normalized_size = raw_size if isinstance(raw_size, int) and raw_size >= 0 else None
-        descriptors.append(
-            RemoteFileDescriptor(
-                name=name,
-                source_url=str(item.get("source_url", "")).strip(),
-                http_etag=str(item.get("http_etag") or item.get("etag") or "").strip() or None,
-                http_last_modified=str(
-                    item.get("http_last_modified") or item.get("last_modified") or ""
-                ).strip()
-                or None,
-                remote_size=normalized_size,
-                http_status=None,
-            )
-        )
-    if not descriptors:
-        return ""
-    return build_source_fingerprint(descriptors)
 
 
 def _has_same_file_name_set(

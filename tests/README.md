@@ -89,8 +89,14 @@ MockTransport 与 Fs publication，覆盖三类直接候选、有限 srcset、�
 重复属性首值（含空/无值）、完整分号路径、path 百分号与二次编码边界、最终丢弃的 query/fragment
 不改变文件身份、base 的标准地址解析及 data 候选独立语法、基础描述符 typed 失败、
 单组件资产碰撞、完整集合的指纹/hash/寻址、旧下载版本普通补齐、必要失败原子保留及 rebuild
-认证边界。当前版本空指纹用明确播种的边缘来源验证基础 GET/发现/HEAD 先于等价 skip，
-发现失败优先于跳过。META 真实封面的 logo 在 earnings 测试中由显式 SYNTHETIC 确定性图片
+认证边界。指纹读取 owner 单元契约覆盖所有 JSON 类型、缺席、空白与规范化非空字符串；
+通过正式 Fs 事务播种当前/旧下载版本的未知指纹来源（含 null、数值、布尔、数组、对象、
+空字符串及创建请求缺席），验证 rebuild
+保留认证、原文件描述符/hash/内容版本及来源身份；随后普通下载必须 GET HTML、发现并下载缺图，
+必要图片失败原样保留旧 publication，解除故障后可重试并重复快跳。非空指纹、旧/缺下载版本和
+重建 staging 写入后失败的原子保留均有回归。未知指纹正式补齐保留旧 v7 与 processed 状态，
+已知变化指纹则按原规则 v7→v8 并标记重处理。当前版本未知指纹的完整来源另验证基础 GET/发现/HEAD
+先于等价 skip、发现失败优先于跳过。META 真实封面的 logo 在 earnings 测试中由显式 SYNTHETIC 确定性图片
 mock 供数并登记完整集合；真实 Raw HTML 与历史 manifest 不变，mock 图片不是 SEC 原图。
 
 `test_sec_html_image_assets_real_cli.py` 默认明确 skip；实际网络验收必须显式启用：
@@ -106,7 +112,8 @@ DAYU_SEC_IMAGE_REAL_VALIDATION=1 DAYU_SEC_IMAGE_RUN_ROOT="$SEC_IMAGE_RUN_ROOT" D
 
 启用后配置或网络失败是 fail；身份仅在内存复用既有 zshrc literal，证据只记录配置布尔值。
 真实验证使用原 commit 的生产 CLI 播种旧来源，再用指定 editable CLI 普通升级；保存实际 argv、
-两通道、退出码、descriptor 观测及仓储逐图 hash/URI；目标 HTML 与完整 filing 的图片数分栏，
+两通道、退出码、descriptor 观测及仓储逐图 hash/URI，并核对七个生产 owner 的同期源码身份；
+目标 HTML 与完整 filing 的图片数分栏，
 逐一核验所有实际已选 HTML 的引用，额外图片只作为必要依赖登记。临时 hook 只观察真实 transport/指纹，或对
 exact 图片 GET 注入 404，用以验证 fresh 不发布、upgrade 保留旧 publication、解除故障后 retry
 以及重复的零目标请求与幂等。两例 TSM 平铺 img/src 不证明 base/srcset 能力，这些由合成 owner

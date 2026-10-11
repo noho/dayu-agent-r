@@ -18,7 +18,7 @@ import pytest
 
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.document_models import (
-    BatchToken, FileObjectMeta, ProcessedCreateRequest, ProcessedHandle,
+    BatchToken, DocumentHandle, FileObjectMeta, ProcessedCreateRequest, ProcessedHandle,
     SourceDocumentUpsertRequest, SourceFileEntry, SourceHandle,
 )
 from dayu.fins.domain.enums import SourceKind
@@ -43,6 +43,7 @@ _OLD_VERSION = "sec_pipeline_download_v1.2.0"
 _IMAGE_BYTES = b"SYNTHETIC image bytes: deterministic test asset, not an SEC original"
 _TEST_BARRIER_TIMEOUT_SECONDS = 10
 _ORIGINAL_STORE_FILE = FsDocumentBlobRepository.store_file
+_ORIGINAL_UPDATE_SOURCE_DOCUMENT = FsSourceDocumentRepository.update_source_document
 _IMAGE_ENTRY_TEMPLATES = (
     '<img src="{reference}">',
     '<img srcset="{reference} 1x">',
@@ -215,8 +216,20 @@ def test_decode_collision_and_cross_html_owner(tmp_path: Path) -> None:
     assert [descriptor.name for descriptor in descriptors] == ["plot.jpg", "wide.jpg"]
 
 
-def _seed(root: Path, payloads: dict[str, bytes], version: str | None, *, empty_fp: bool = False) -> None:
-    """参数为根、明确文件事实与旧下载版本；经正式仓储播种边缘 publication；存储异常透传。"""
+_HTML_FINGERPRINT = build_source_fingerprint([_descriptor("report.htm", metadata=True)])
+_UNKNOWN_FINGERPRINTS: tuple[JsonValue, ...] = (
+    None, 0, False, [], {}, True, 42, 1.25, ["known"], {"fingerprint": "known"}, "", " \t\r\n",
+)
+_UNKNOWN_FINGERPRINT_IDS = (
+    "null", "zero", "false", "empty-array", "empty-mapping", "true", "integer", "float",
+    "array", "mapping", "empty-string", "whitespace",
+)
+
+
+def _seed(root: Path, payloads: dict[str, bytes], version: str | None, *,
+          source_fingerprint: JsonValue = _HTML_FINGERPRINT, omit_fp: bool = False,
+          document_version: str = "v1") -> None:
+    """参数为根、文件、下载/内容版本和原始指纹；经正式仓储事务发布来源；存储异常透传。"""
     repositories = build_fs_repository_set(workspace_root=root)
     batching = FsBatchingRepository(root, repository_set=repositories)
     blobs = FsDocumentBlobRepository(root, repository_set=repositories)
@@ -230,17 +243,19 @@ def _seed(root: Path, payloads: dict[str, bytes], version: str | None, *, empty_
             entries.append(SourceFileEntry(
                 name=name, uri=meta.uri, etag=meta.etag, last_modified=meta.last_modified,
                 size=meta.size, content_type=meta.content_type, sha256=meta.sha256,
-                source_url=_ARCHIVE + name, http_etag='"test"',
+                source_url=_ARCHIVE + name, http_etag='"test"', ingested_at=meta.last_modified,
             ).to_dict())
         metadata: dict[str, JsonValue] = {
             "ingest_method": "download", "source_provider": "sec_edgar", "company_id": "42",
             "accession_number": _ACCESSION, "filing_date": "2025-02-01", "report_date": "2024-12-31",
-            "source_fingerprint": "" if empty_fp else build_source_fingerprint([_descriptor(name, metadata=True) for name in payloads]),
-            "document_version": "v1", "first_ingested_at": "2025-02-01T00:00:00+00:00",
+            "source_fingerprint": source_fingerprint,
+            "document_version": document_version, "first_ingested_at": "2025-02-01T00:00:00+00:00",
             "created_at": "2025-02-01T00:00:00+00:00", "amended": False,
         }
         if version is not None:
             metadata["download_version"] = version
+        if omit_fp:
+            metadata.pop("source_fingerprint")
         source.create_source_document(SourceDocumentUpsertRequest(
             ticker="TEST", document_id=_DOCUMENT, internal_document_id=_ACCESSION, form_type="10-K",
             primary_document="report.htm", meta=metadata, file_entries=entries,
@@ -264,6 +279,25 @@ def _publication(root: Path) -> tuple[dict[str, JsonValue], str, dict[str, bytes
             assert descriptor.sha256 == hashlib.sha256(payloads[descriptor.name]).hexdigest()
             assert descriptor.size == len(payloads[descriptor.name])
         return dict(snapshot.source_meta), str(snapshot.revision), payloads
+
+
+def _seed_processed(root: Path) -> FsProcessedDocumentRepository:
+    """参数为来源根；通过正式事务发布未标重处理的 processed 并返回仓储；存储异常透传。"""
+    repositories = build_fs_repository_set(workspace_root=root)
+    batching = FsBatchingRepository(root, repository_set=repositories)
+    processed = FsProcessedDocumentRepository(root, repository_set=repositories)
+    batch = batching.begin_batch("TEST")
+    try:
+        processed.create_processed(ProcessedCreateRequest(
+            ticker="TEST", document_id=_DOCUMENT, internal_document_id=_ACCESSION,
+            source_kind=SourceKind.FILING.value, form_type="10-K", meta={"reprocess_required": False},
+            sections=[], tables=[],
+        ), batch=batch)
+    except BaseException:
+        batching.rollback_batch(batch)
+        raise
+    batching.commit_batch(batch)
+    return processed
 
 
 async def _run(root: Path, network: _Network, *, overwrite: bool = False, form: str = "10-K",
@@ -350,10 +384,15 @@ def test_necessary_image_failure_is_atomic(tmp_path: Path, failure: str, markup:
     (b'<img srcset="plot.jpg 1x, bad.jpg 1.0x">', "html_image_reference_invalid"),
     (b'<base href="https://outside.invalid/"><img src="plot.jpg">', "html_image_reference_invalid"),
 ])
-def test_empty_fingerprint_preconditions_before_skip(tmp_path: Path, html: bytes, expected: str) -> None:
-    """参数为根与空指纹边缘输入；返回无；必要发现/HEAD 前置或失败优先不符时失败。"""
-    _seed(tmp_path, {"report.htm": b'<img src="plot.jpg">', "plot.jpg": _IMAGE_BYTES}, SEC_PIPELINE_DOWNLOAD_VERSION, empty_fp=True)
+@pytest.mark.parametrize("fingerprint", _UNKNOWN_FINGERPRINTS, ids=_UNKNOWN_FINGERPRINT_IDS)
+def test_unknown_fingerprint_preconditions_before_skip(tmp_path: Path, html: bytes, expected: str,
+                                                      fingerprint: JsonValue, monkeypatch: pytest.MonkeyPatch) -> None:
+    """参数为根、未知指纹和远端输入；返回无；GET/发现前置、失败优先或晚跳产生认证时断言失败。"""
+    _seed(tmp_path, {"report.htm": b'<img src="plot.jpg">', "plot.jpg": _IMAGE_BYTES},
+          SEC_PIPELINE_DOWNLOAD_VERSION, source_fingerprint=fingerprint, document_version="v7")
     before = _publication(tmp_path)
+    if expected != "downloaded":
+        monkeypatch.setattr(FsBatchingRepository, "begin_batch", _forbid_begin)
     network = _Network(html)
     events = asyncio.run(_run(tmp_path, network))
     terminal = events[-1].payload
@@ -388,11 +427,16 @@ def test_cancel_image_transport_preserves_old(tmp_path: Path, stage: str) -> Non
 
 
 @pytest.mark.parametrize("version", [_OLD_VERSION, SEC_PIPELINE_DOWNLOAD_VERSION, None])
-def test_rebuild_preserves_download_certification(tmp_path: Path, version: str | None) -> None:
-    """参数为根与下载资格；返回无；本地 rebuild 授予资格或后续旧来源无法补齐时失败。"""
+@pytest.mark.parametrize("fingerprint", ["published", "empty", "omitted"])
+def test_rebuild_preserves_download_certification(tmp_path: Path, version: str | None, fingerprint: str) -> None:
+    """参数为根、版本及指纹输入状态；返回无；重建改变认证或阻断普通补齐时断言失败。"""
     html = b'<img src="plot.jpg">'
-    _seed(tmp_path, {"report.htm": html}, version)
+    _seed(tmp_path, {"report.htm": html}, version,
+          source_fingerprint=_HTML_FINGERPRINT if fingerprint == "published" else "", omit_fp=fingerprint == "omitted")
     before = _publication(tmp_path)
+    # 正式仓储把创建请求缺席的字段规范为空值；不手改 published meta 伪造旧状态。
+    if fingerprint != "published":
+        assert before[0]["source_fingerprint"] == ""
     pipeline = SecPipeline(workspace_root=tmp_path, processor_registry=build_fins_processor_registry(),
                            material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path))
     assert pipeline.download(ticker="TEST", rebuild=True, start_is_explicit=False)["summary"]["downloaded"] == 1
@@ -400,16 +444,205 @@ def test_rebuild_preserves_download_certification(tmp_path: Path, version: str |
     assert after[0].get("download_version") == version
     assert after[0]["document_version"] == before[0]["document_version"]
     assert after[0]["source_fingerprint"] == before[0]["source_fingerprint"]
+    for key in ("files", "source_provider", "internal_document_id", "accession_number",
+                "primary_document", "first_ingested_at", "created_at"):
+        assert after[0][key] == before[0][key]
     assert after[2] == before[2]
-    if version != SEC_PIPELINE_DOWNLOAD_VERSION:
-        assert asyncio.run(_run(tmp_path, _Network(html)))[-1].payload["status"] == "downloaded"
-        assert _publication(tmp_path)[0]["download_version"] == SEC_PIPELINE_DOWNLOAD_VERSION
+    network = _Network(html)
+    terminal = asyncio.run(_run(tmp_path, network))[-1].payload
+    if version == SEC_PIPELINE_DOWNLOAD_VERSION and fingerprint == "published":
+        assert terminal["reason_code"] == "already_downloaded_complete"
+        assert network.requests == []
+        assert _publication(tmp_path) == after
+    else:
+        assert terminal["status"] == "downloaded"
+        assert ("GET", _ARCHIVE + "report.htm") in network.requests
+        assert ("GET", _ARCHIVE + "plot.jpg") in network.requests
+        complete = _publication(tmp_path)
+        assert complete[2] == {"report.htm": html, "plot.jpg": _IMAGE_BYTES}
+        assert complete[0]["download_version"] == SEC_PIPELINE_DOWNLOAD_VERSION
+        assert complete[0]["source_fingerprint"] == build_source_fingerprint([_descriptor(name, metadata=True) for name in complete[2]])
+        assert complete[0]["document_version"] == ("v2" if fingerprint == "published" else "v1")
+        network.requests.clear()
+        assert asyncio.run(_run(tmp_path, network))[-1].payload["reason_code"] == "already_downloaded_complete"
+        assert network.requests == []
+        assert _publication(tmp_path) == complete
 
 
-def test_base_get_failure_precedes_empty_fingerprint_skip(tmp_path: Path) -> None:
-    """参数为根；返回无；空指纹完整来源在必要基础 GET 失败时错误跳过则失败。"""
+@pytest.mark.parametrize("omit_fp", [False, True])
+@pytest.mark.parametrize("failure", ["404", "timeout", "empty"])
+def test_rebuild_uncertified_image_failure_retry(tmp_path: Path, omit_fp: bool, failure: str) -> None:
+    """参数为根、指纹缺席选项和必要图片故障；返回无；旧发布保留或重试幂等不符时失败。"""
     html = b'<img src="plot.jpg">'
-    _seed(tmp_path, {"report.htm": html, "plot.jpg": _IMAGE_BYTES}, SEC_PIPELINE_DOWNLOAD_VERSION, empty_fp=True)
+    _seed(tmp_path, {"report.htm": html}, SEC_PIPELINE_DOWNLOAD_VERSION, source_fingerprint="", omit_fp=omit_fp)
+    pipeline = SecPipeline(workspace_root=tmp_path, processor_registry=build_fins_processor_registry(),
+                           material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path))
+    assert pipeline.download(ticker="TEST", rebuild=True, start_is_explicit=False)["summary"]["downloaded"] == 1
+    before = _publication(tmp_path)
+    network = _Network(html, failure=failure)
+    terminal = asyncio.run(_run(tmp_path, network))[-1]
+    assert terminal.event_type is DownloadEventType.FILING_FAILED
+    assert terminal.payload["reason_code"] == "file_download_failed"
+    assert ("GET", _ARCHIVE + "report.htm") in network.requests
+    assert ("GET", _ARCHIVE + "plot.jpg") in network.requests
+    assert _publication(tmp_path) == before
+    network.failure = None
+    network.requests.clear()
+    assert asyncio.run(_run(tmp_path, network))[-1].payload["status"] == "downloaded"
+    complete = _publication(tmp_path)
+    assert complete[2] == {"report.htm": html, "plot.jpg": _IMAGE_BYTES}
+    assert complete[0]["source_fingerprint"] == build_source_fingerprint([_descriptor(name, metadata=True) for name in complete[2]])
+    assert complete[0]["document_version"] == "v1"
+    network.requests.clear()
+    assert asyncio.run(_run(tmp_path, network))[-1].payload["reason_code"] == "already_downloaded_complete"
+    assert network.requests == []
+    assert _publication(tmp_path) == complete
+
+
+@pytest.mark.parametrize("fingerprint,omit_fp", [
+    *[pytest.param(value, False, id=name) for value, name in zip(_UNKNOWN_FINGERPRINTS, _UNKNOWN_FINGERPRINT_IDS)],
+    pytest.param(None, True, id="missing"),
+])
+@pytest.mark.parametrize("version", [_OLD_VERSION, SEC_PIPELINE_DOWNLOAD_VERSION])
+@pytest.mark.parametrize("rebuild", [False, True])
+def test_unknown_fingerprint_complete_publication(tmp_path: Path, fingerprint: JsonValue, omit_fp: bool,
+                                                version: str, rebuild: bool) -> None:
+    """参数为正式发布的未知指纹、版本和重建开关；返回无；错误认证、升位或重处理时断言失败。"""
+    html = b'<img src="plot.jpg">'
+    _seed(tmp_path, {"report.htm": html}, version, source_fingerprint=fingerprint,
+          omit_fp=omit_fp, document_version="v7")
+    processed = _seed_processed(tmp_path)
+    before = _publication(tmp_path)
+    processed_before = dict(processed.get_processed_meta("TEST", _DOCUMENT))
+    assert before[0]["source_fingerprint"] == ("" if omit_fp else fingerprint)
+    if rebuild:
+        pipeline = SecPipeline(workspace_root=tmp_path, processor_registry=build_fins_processor_registry(),
+                               material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path))
+        assert pipeline.download(ticker="TEST", rebuild=True, start_is_explicit=False)["summary"]["downloaded"] == 1
+        rebuilt = _publication(tmp_path)
+        assert rebuilt[0]["source_fingerprint"] == before[0]["source_fingerprint"]
+        assert rebuilt[0]["download_version"] == version
+        assert rebuilt[0]["document_version"] == "v7"
+        assert rebuilt[0]["files"] == before[0]["files"] and rebuilt[2] == before[2]
+        assert dict(processed.get_processed_meta("TEST", _DOCUMENT)) == processed_before
+    network = _Network(html)
+    events = asyncio.run(_run(tmp_path, network))
+    assert events[-1].payload["status"] == "downloaded"
+    assert ("GET", _ARCHIVE + "report.htm") in network.requests
+    assert network.requests.index(("GET", _ARCHIVE + "report.htm")) < network.requests.index(("HEAD", _ARCHIVE + "plot.jpg"))
+    assert network.requests.index(("HEAD", _ARCHIVE + "plot.jpg")) < network.requests.index(("GET", _ARCHIVE + "plot.jpg"))
+    complete = _publication(tmp_path)
+    assert complete[2] == {"report.htm": html, "plot.jpg": _IMAGE_BYTES}
+    assert complete[0]["source_fingerprint"] == build_source_fingerprint([_descriptor(name, metadata=True) for name in complete[2]])
+    assert complete[0]["download_version"] == SEC_PIPELINE_DOWNLOAD_VERSION
+    assert complete[0]["document_version"] == "v7"
+    for key in ("first_ingested_at", "created_at"):
+        assert complete[0][key] == before[0][key]
+    assert dict(processed.get_processed_meta("TEST", _DOCUMENT)) == processed_before
+    network.requests.clear()
+    assert asyncio.run(_run(tmp_path, network))[-1].payload["reason_code"] == "already_downloaded_complete"
+    assert not network.requests and _publication(tmp_path) == complete
+    assert dict(processed.get_processed_meta("TEST", _DOCUMENT)) == processed_before
+
+
+@pytest.mark.parametrize("fingerprint", _UNKNOWN_FINGERPRINTS, ids=_UNKNOWN_FINGERPRINT_IDS)
+@pytest.mark.parametrize("version", [_OLD_VERSION, SEC_PIPELINE_DOWNLOAD_VERSION])
+def test_unknown_fingerprint_necessary_get_failure_retry(tmp_path: Path, fingerprint: JsonValue, version: str) -> None:
+    """参数为根、未知指纹及下载版本；返回无；必要 GET 失败改变旧发布或重试幂等失效时断言失败。"""
+    html = b'<img src="plot.jpg">'
+    _seed(tmp_path, {"report.htm": html}, version, source_fingerprint=fingerprint, document_version="v7")
+    processed = _seed_processed(tmp_path)
+    before = _publication(tmp_path)
+    processed_before = dict(processed.get_processed_meta("TEST", _DOCUMENT))
+    network = _Network(html, failure="404")
+    terminal = asyncio.run(_run(tmp_path, network))[-1]
+    assert terminal.event_type is DownloadEventType.FILING_FAILED
+    assert terminal.payload["reason_code"] == "file_download_failed"
+    assert ("GET", _ARCHIVE + "report.htm") in network.requests and ("GET", _ARCHIVE + "plot.jpg") in network.requests
+    assert _publication(tmp_path) == before
+    assert dict(processed.get_processed_meta("TEST", _DOCUMENT)) == processed_before
+    network.failure = None
+    network.requests.clear()
+    assert asyncio.run(_run(tmp_path, network))[-1].payload["status"] == "downloaded"
+    complete = _publication(tmp_path)
+    assert complete[2] == {"report.htm": html, "plot.jpg": _IMAGE_BYTES}
+    assert complete[0]["document_version"] == "v7"
+    assert complete[0]["source_fingerprint"] == build_source_fingerprint([_descriptor(name, metadata=True) for name in complete[2]])
+    assert dict(processed.get_processed_meta("TEST", _DOCUMENT)) == processed_before
+    network.requests.clear()
+    assert asyncio.run(_run(tmp_path, network))[-1].payload["reason_code"] == "already_downloaded_complete"
+    assert not network.requests and _publication(tmp_path) == complete
+
+
+@pytest.mark.parametrize("fingerprint", ["published-fingerprint", " \tpublished-fingerprint\n"])
+@pytest.mark.parametrize("version", [_OLD_VERSION, SEC_PIPELINE_DOWNLOAD_VERSION])
+def test_known_fingerprint_skip_version_and_processed(tmp_path: Path, fingerprint: str, version: str) -> None:
+    """参数为已知字符串和下载版本；返回无；快跳或 v7→v8/processed 既有变化规则回退时断言失败。"""
+    html = b'<img src="plot.jpg">'
+    _seed(tmp_path, {"report.htm": html}, version, source_fingerprint=fingerprint, document_version="v7")
+    processed = _seed_processed(tmp_path)
+    before = _publication(tmp_path)
+    network = _Network(html)
+    terminal = asyncio.run(_run(tmp_path, network))[-1].payload
+    if version == SEC_PIPELINE_DOWNLOAD_VERSION:
+        assert terminal["reason_code"] == "already_downloaded_complete"
+        assert not network.requests and _publication(tmp_path) == before
+        assert processed.get_processed_meta("TEST", _DOCUMENT)["reprocess_required"] is False
+    else:
+        assert terminal["status"] == "downloaded"
+        assert _publication(tmp_path)[0]["document_version"] == "v8"
+        assert _publication(tmp_path)[2] == {"report.htm": html, "plot.jpg": _IMAGE_BYTES}
+        assert processed.get_processed_meta("TEST", _DOCUMENT)["reprocess_required"] is True
+
+
+@pytest.mark.parametrize("whitespace", [False, True])
+def test_known_unchanged_fingerprint_preserves_version_and_processed(tmp_path: Path, whitespace: bool) -> None:
+    """参数为根和字符串空白开关；返回无；旧下载版本升级被误判为内容变化时断言失败。"""
+    html = b'<img src="plot.jpg">'
+    fingerprint = build_source_fingerprint([_descriptor(name, metadata=True) for name in ("report.htm", "plot.jpg")])
+    _seed(tmp_path, {"report.htm": html, "plot.jpg": _IMAGE_BYTES}, _OLD_VERSION,
+          source_fingerprint=f" \t{fingerprint}\n" if whitespace else fingerprint, document_version="v7")
+    processed = _seed_processed(tmp_path)
+    before = dict(processed.get_processed_meta("TEST", _DOCUMENT))
+    network = _Network(html)
+    assert asyncio.run(_run(tmp_path, network))[-1].payload["status"] == "downloaded"
+    assert _publication(tmp_path)[0]["document_version"] == "v7"
+    assert _publication(tmp_path)[0]["download_version"] == SEC_PIPELINE_DOWNLOAD_VERSION
+    assert _publication(tmp_path)[0]["source_fingerprint"] == fingerprint
+    assert dict(processed.get_processed_meta("TEST", _DOCUMENT)) == before
+    assert ("GET", _ARCHIVE + "plot.jpg") in network.requests
+
+
+def _fail_rebuild_update(self: FsSourceDocumentRepository, req: SourceDocumentUpsertRequest,
+                         source_kind: SourceKind, *, batch: BatchToken) -> DocumentHandle:
+    """参数为正式仓储和更新请求/事务；写入真实 staging 后抛错；总是抛出 OSError。"""
+    assert "source_fingerprint" not in req.meta
+    assert "download_version" not in req.meta
+    _ORIGINAL_UPDATE_SOURCE_DOCUMENT(self, req, source_kind, batch=batch)
+    raise OSError("isolated rebuild failure after staging update")
+
+
+@pytest.mark.parametrize("fingerprint", ["published", "empty", "omitted"])
+def test_rebuild_failure_preserves_certification_publication(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                            fingerprint: str) -> None:
+    """参数为根、更新故障注入和指纹状态；返回无；重建失败改变旧发布或认证时断言失败。"""
+    _seed(tmp_path, {"report.htm": b'<img src="plot.jpg">'}, SEC_PIPELINE_DOWNLOAD_VERSION,
+          source_fingerprint=_HTML_FINGERPRINT if fingerprint == "published" else "", omit_fp=fingerprint == "omitted")
+    before = _publication(tmp_path)
+    monkeypatch.setattr(FsSourceDocumentRepository, "update_source_document", _fail_rebuild_update)
+    pipeline = SecPipeline(workspace_root=tmp_path, processor_registry=build_fins_processor_registry(),
+                           material_upload_state_repository=FsMaterialUploadStateRepository(tmp_path))
+    result = pipeline.download(ticker="TEST", rebuild=True, start_is_explicit=False)
+    assert result["summary"]["failed"] == 1
+    assert _publication(tmp_path) == before
+
+
+@pytest.mark.parametrize("fingerprint", _UNKNOWN_FINGERPRINTS, ids=_UNKNOWN_FINGERPRINT_IDS)
+def test_base_get_failure_precedes_unknown_fingerprint_skip(tmp_path: Path, fingerprint: JsonValue) -> None:
+    """参数为根和未知指纹；返回无；必要基础 GET 失败被晚跳覆盖时断言失败。"""
+    html = b'<img src="plot.jpg">'
+    _seed(tmp_path, {"report.htm": html, "plot.jpg": _IMAGE_BYTES}, SEC_PIPELINE_DOWNLOAD_VERSION,
+          source_fingerprint=fingerprint)
     before = _publication(tmp_path)
     network = _Network(html, failure="base404")
     terminal = asyncio.run(_run(tmp_path, network))[-1]
@@ -488,7 +721,8 @@ def test_phase_b_competing_version_qualification(tmp_path: Path, winner_version:
     with ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(asyncio.run, _run(tmp_path, network))
         assert network.ready.wait(_TEST_BARRIER_TIMEOUT_SECONDS)
-        _seed(tmp_path, {"report.htm": winner_html, "plot.jpg": _IMAGE_BYTES}, winner_version)
+        _seed(tmp_path, {"report.htm": winner_html, "plot.jpg": _IMAGE_BYTES}, winner_version,
+              source_fingerprint=build_source_fingerprint([_descriptor(name, metadata=True) for name in ("report.htm", "plot.jpg")]))
         winner = _publication(tmp_path)
         network.winner_committed.set()
         events = future.result(timeout=_TEST_BARRIER_TIMEOUT_SECONDS)
@@ -501,6 +735,41 @@ def test_phase_b_competing_version_qualification(tmp_path: Path, winner_version:
         assert _publication(tmp_path)[2] == {"report.htm": html, "plot.jpg": _IMAGE_BYTES}
         assert _publication(tmp_path)[0]["document_version"] == winner[0]["document_version"]
         assert sum(method == "GET" and url == _ARCHIVE + "report.htm" for method, url in network.requests) == 2
+
+
+@pytest.mark.parametrize("fingerprint", [None, False, ["known"]], ids=["null", "false", "array"])
+def test_phase_b_unknown_fingerprint_winner_requires_new_round(tmp_path: Path, fingerprint: JsonValue) -> None:
+    """参数为根和竞争发布的未知指纹；返回无；当前版本 winner 被伪认证或混合两轮事实时断言失败。"""
+    html = b'<img src="plot.jpg">attempt-A'
+    winner_html = b'<img src="plot.jpg">winner-B'
+    network = _BarrierNetwork(html)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(asyncio.run, _run(tmp_path, network))
+        assert network.ready.wait(_TEST_BARRIER_TIMEOUT_SECONDS)
+        _seed(tmp_path, {"report.htm": winner_html}, SEC_PIPELINE_DOWNLOAD_VERSION,
+              source_fingerprint=fingerprint, document_version="v7")
+        winner = _publication(tmp_path)
+        network.winner_committed.set()
+        events = future.result(timeout=_TEST_BARRIER_TIMEOUT_SECONDS)
+    assert events[-1].payload["status"] == "downloaded"
+    complete = _publication(tmp_path)
+    assert complete[2] == {"report.htm": html, "plot.jpg": _IMAGE_BYTES}
+    assert complete[0]["document_version"] == "v7" and complete[1] != winner[1]
+    assert sum(method == "GET" and url == _ARCHIVE + "report.htm" for method, url in network.requests) == 2
+
+
+@pytest.mark.parametrize("stage", ["HEAD", "GET"])
+def test_current_unknown_fingerprint_cancel_preserves_publication(tmp_path: Path, stage: str) -> None:
+    """参数为根和取消阶段；返回无；未知认证未解除快跳或取消错误发布时断言失败。"""
+    html = b'<img src="plot.jpg">'
+    _seed(tmp_path, {"report.htm": html}, SEC_PIPELINE_DOWNLOAD_VERSION,
+          source_fingerprint={"fingerprint": "known"}, document_version="v7")
+    before = _publication(tmp_path)
+    network = _Network(html, cancel_method=stage)
+    events = asyncio.run(_run(tmp_path, network, cancel_checker=network.is_cancelled))
+    assert (stage, _ARCHIVE + "plot.jpg") in network.requests
+    assert not any(event.event_type is DownloadEventType.FILING_COMPLETED for event in events)
+    assert _publication(tmp_path) == before
 
 
 def _forbid_begin(self: FsBatchingRepository, ticker: str) -> BatchToken:

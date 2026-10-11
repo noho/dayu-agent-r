@@ -22,7 +22,7 @@ from dayu.fins.storage import (
     SourceDocumentRepositoryProtocol,
 )
 
-from .sec_download_state import _normalize_rebuild_file_entries, _resolve_rebuild_source_fingerprint
+from .sec_download_state import _normalize_rebuild_file_entries
 from .sec_fiscal_fields import (
     _coerce_optional_int,
     _normalize_optional_period,
@@ -343,10 +343,6 @@ def rebuild_single_local_filing(
             "rebuild": True,
         }
 
-    source_fingerprint = _resolve_rebuild_source_fingerprint(
-        previous_meta=previous_meta,
-        file_entries=file_entries,
-    )
     primary_document = str(previous_meta.get("primary_document", "")).strip() or str(file_entries[0]["name"])
     source_handle = SourceHandle(
         ticker=ticker,
@@ -390,11 +386,11 @@ def rebuild_single_local_filing(
         "is_deleted": bool(previous_meta.get("is_deleted", False)),
         "deleted_at": previous_meta.get("deleted_at"),
         "document_version": document_version,
-        "source_fingerprint": source_fingerprint,
         "amended": amended,
         "created_at": created_at,
         "updated_at": now_iso8601(),
     }
+    # 下载认证只由正式远端全集下载产生；仓储 merge 保留已有指纹与下载版本。
     try:
         has_xbrl = source_repository.has_filing_xbrl_instance(
             ticker=ticker,

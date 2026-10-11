@@ -4,7 +4,7 @@
 - Branch：fix/sec-html-image-assets；base：297bfbbc67b7d7468e3dfb6669a3385c4dd10d18。
 - Binding scope：docs/plans/sec-html-image-assets-goal.md，用户已确认全部目标/非目标/边界/五项成功信号。
 - Status：active。
-- Current gate / next entry point：accepted slice commit。
+- Current gate / next entry point：accepted deepreview commit。
 - Active slice：S1。
 - 本任务无外部 issue 编号，按 bug fix work unit 执行；不创建 issue 或对外 comment。
 - 原业务 workspace/证据目录只读；正式真实验证只写独立临时 base。
@@ -166,3 +166,61 @@ Plan runner日志：`/var/folders/2t/vbqfkdyj40v8f4jc4x180n5c0000gn/T/agent-run.
 
 - 双路actualexit0/PASS及最终原finding回写已核对，总控decision`docs/reviews/code-review-20261011-220915.md`。C1/C3/C4/C5/C6/C7均已修复，C2未采纳；无新实质finding/blocking/unclassifiedrisk。8当前hash保持冻结，root证据复核完成。
 - Current gate/next entry：accepted slice commit，随后aggregate deepreview；本地checkpoint授权已有效，不等待普通gate确认。
+
+## accepted slice commit
+
+- S1修复commit：`da0ebd0d06196f3cff6d44b68af661e2d6679ceb`，gateflow: accept sec-html-image-assets S1。仅stage27份unit文件，cachedcheck单独exit0；checkpoint后干净。临时base/probe/log及TCOM不含本commit。
+- 下一未完成gate：aggregate deepreview，以原297基线审完整unit diff；mimo+ds-flash双路同时独立runner。
+
+- aggregate deepreview实际双路派发成功：mimo40411/artifact221004、ds-flash22538/artifact221005；目标head da0ebd0d06196f3cff6d44b68af661e2d6679ceb、base297bfbbc67b7d7468e3dfb6669a3385c4dd10d18，生产/tests冻结。派发不记review pass，尚未push/PR。
+
+## Aggregate 双路收取与总控裁决
+
+- 两runner已实际退出，mimo221004 FAIL、DS221005 PASS；总控decision `docs/reviews/code-review-20261011-224555.md`。AGG-001 accepted/未修复，aggregate loop不通过；无在途runner要退出。
+- 下一入口fix，仅gpt-6-sol，允许触及认证真源sec_download_state及rebuild（必要第五生产文件），不扩大产品目标；旧JSON不覆写。随后新审核恢复mimo+ds-flash，保留DS两次失败历史及既有sol替补。
+
+- AGG-001 fix实际派发成功，gpt-6-sol托管session63679；任务workspace/tmp/sec-html-image-assets-aggregate-fix-task.md。总控只持有control/裁决/派发，不并发修改生产与测试。
+
+- AGG-001处理中间结果：原helper已移除；首轮15个新增断言失败源于夹具未提供文件入库时间和空fp正式下载的现有v1版本规则，已按owner合同修正，不修改版本规则/筛选。修正受影响测试471pass、pyright0；probe用合成10K隔离认证（原6K解除快跳后进入既有筛选），确认HTML/缺图GET。最终broad/clean5coverage/真实矩阵仍待收取，不能判通过。
+
+## AGG-001 fix 收取与冻结核对
+
+- gpt-6-sol63679实际exit0/completed，agent-run.BhoWNAuG；needs_review为已恢复的首轮15个断言、原合成6K筛选拒绝、忘设COVERAGE_FILE后主动中止/新路径重跑、外部control范围核对及辅助搜索/临时patch。所有尝试保留，不以中止结果当pass。
+- 新权威aggregate-fix JSON：3788collect/3779pass/9skip；受影响471pass（图片owner347）；pyright0；5owner cleancoverage95.06/84.16/89.54/85.82/82.71且excluded0；真实2pass/0skip24CLI、target27/full28（4必要失败exit1、20成功exit0）。
+- root九hash、192库存size_bytes/SHA及8关键final命令exit0/frozen/logSHA全部匹配；190文本证据UA值缺席。root首库存核对误用旧JSON size字段KeyError，按新schema size_bytes恢复完整检查，非代码缺陷/业务写入。旧3JSON hash原样。
+- root裁决物理缺席边界：既有Fs update setdefault将missing fp规范为空字符串，不生成非空认证；此为既有仓储owner行为，不要求新增schema兼容或raw字段缺席保持。binding goal和AGG001核心是rebuild不授予下载认证，显式空/非空原值保留及普通补齐继续。正式replace_source_meta/batch探针物理缺席→empty→HTML/imageGET downloaded直接成立；storage不改。不新增goal/验收，原224555修法中“缺席保持”的字面表述以本段typed语义准确说明为准。
+- AGG001已实施验证，状态待独立re-review，不提前判已修复。当前源/tests冻结，root仅持control；新双路mimo+ds-flash，不能读取对方新报告。
+
+- 新复审任务：[{"provider": "mimo", "prompt": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/sec-html-image-assets-aggregate-rereview-mimo-task.md", "artifact": "/Users/leo/workspace/dayu-agent-r/docs/reviews/code-review-20261011-230525.md"}, {"provider": "ds-flash", "prompt": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/sec-html-image-assets-aggregate-rereview-ds-flash-task.md", "artifact": "/Users/leo/workspace/dayu-agent-r/docs/reviews/code-review-20261011-230526.md"}]；派发结果单独收取，不记启动为pass。
+
+- AGG001双路re-review实际派发成功：mimo29892/artifact230525；ds-flash35176/artifact230526。同一冻结源状态，彼此报告隔离；均待实际退出。
+
+## AGG001 re-review 第二路收取 / AGG002 初步裁决
+
+- DS35176实际exit0/completed/validationpassed，agent-run.gOEY25F4；新artifact230526 FAIL。AGG001独立8场景106断言/27+14聚焦测试/type0/9hash192库存匹配；新AGG002正式Fs null/0/false/[]/{}矩阵零请求快跳，null+旧version还错误升文档版本。mimo29892仍在途，不打断、不修改其读取源码。
+- root AGG002 accepted/未修复/中：公开仓储与读取链直接可达，资格消费者str()伪造已知非空指纹，safe_meta_access version与upsert reprocess读取同事实不一致。正式producer写字符串，目前未证TSM真实样例或已有生产publisher写非字符串，不声称该状态是原TSM缺图根因；它是本任务跳过资格/认证边界的同源漏洞。
+- 只修SEC metadata安全读取owner，单一typed指纹解释供快跳/晚跳/version/reprocess复用；非字符串不认证，沿既有unknownfp规则。不得扩全仓DocumentModels/通用storage schema/其它providers/新抓取解析/HEX格式校验/processed规则。mimo实际退出及合并裁决后才进入fix。
+
+## AGG001 双路复审合并完成
+
+- mimo29892实际exit0/completed/needs_review，artifact230525 PASS；DS35176实际exit0/completed/passed，artifact230526 FAIL。rootdecision `docs/reviews/code-review-20261011-233443.md`：AGG001已修复及原finding回写完成；AGG002 accepted/未修复，中等severity，aggregate仍FAIL。双方已退出，只有新fix worker可写源码。
+- 新fix任务workspace/tmp/sec-html-image-assets-fingerprint-fix-task.md；允许7修改producer的最终同源proof（新safe_meta_access/source_upsert只服务共同FP读取语义），不改其它schema/providers。未push/PR，无业务base写入。
+
+- AGG002 fix实际派发成功：gpt-6-sol托管session74031。前双路review均已退出，源码写ownership仅本runner；root只更新control/派发资料，旧4validationJSON历史冻结。
+
+## AGG002 fix收取与同源冻结复核
+
+- gpt-6-sol74031实际exit0/completed/needs_review（agent-run.7KN6cxwt），仅已恢复目录探索、覆盖率模块目标NumPy重复导入37collection errors及两次finalizer入口导入错误；原log/command/源码身份保留。目录覆盖目标以全新rawdata重跑成功，无代码/依赖变更规避。
+- 新权威fingerprint-fix JSON SHA1786bc6a5959e79648f6e68e2f0142d90e85622e510703efe1f6659db8814e82：3964collect/3955pass/9skip，受影响647pass（489图片/158pipeline），pyright0，真实2pass0skip24CLI/full28-target27，7owner cleancoverage95.06/84.16/89.54/85.82/82.71/90.70/88.64，excluded0。
+- root11源/test hash、旧4JSON及207库存size/SHA匹配；17finalcommands exit0/identity_unchanged/before=after/logSHA全匹配；204文本证据UA值缺席。root首次核对误用旧字段sourcehash_unchanged KeyError，按新schema identity_unchanged/before/after恢复全部核对，非代码缺陷；不改验证JSON。
+- AGG002已实施验证待双路re-review，不提前关闭finding/gate；root只持control，源/tests再次冻结。新runner仍mimo+DS；全部历史失败/旧证明原样。
+
+- AGG002复审任务：[{"provider": "mimo", "prompt": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/sec-html-image-assets-fingerprint-rereview-mimo-task.md", "artifact": "/Users/leo/workspace/dayu-agent-r/docs/reviews/code-review-20261012-003152.md"}, {"provider": "ds-flash", "prompt": "/Users/leo/workspace/dayu-agent-r/workspace/tmp/sec-html-image-assets-fingerprint-rereview-ds-flash-task.md", "artifact": "/Users/leo/workspace/dayu-agent-r/docs/reviews/code-review-20261012-003153.md"}]；派发不代表通过。
+
+- AGG002双路复审实际派发成功：mimo74699/artifact20261012-003152；DS74618/artifact20261012-003153。同一11源/test冻结hash与新JSON，报告独立；启动不记通过。
+
+- DS74618实际exit0/completed/needs_review（AB7j6fh3），artifact20261012-003153 PASS，34独立检查errors[]、214聚焦tests/type0，11hash207库存17finalcommands及24CLI七producer同源；原230526 AGG002已追加最终回写。5辅助异常为echo分隔zsh/notfound及jq字段/变量引用问题，后续结构化Python全量核对恢复，必需证据完整。mimo74699仍在途，loop未提前放行。
+
+## Aggregate 最终通过
+
+mimo74699实际exit0/completed/needs_review，003152 PASS；所有辅助异常恢复证据完整。root最终decision `docs/reviews/code-review-20261012-005716.md`，AGG001/002与全部accepted findings已修复、原finding回写，aggregate PASS。两runner已退出，11源/testhash再核一致、diffcheck0；下一入口accepted deepreview commit，无新fix需求。

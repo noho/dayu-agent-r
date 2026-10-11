@@ -16,6 +16,7 @@ from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from threading import Event
+from types import MappingProxyType
 from typing import BinaryIO, Literal, Optional, cast
 
 import pytest
@@ -83,6 +84,8 @@ from dayu.fins.pipelines.sec_pipeline import (
     SEC_PIPELINE_DOWNLOAD_VERSION,
     SecPipeline as _SecPipeline,
 )
+from dayu.fins.pipelines.sec_safe_meta_access import read_published_source_fingerprint, resolve_document_version
+from dayu.fins.pipelines.sec_form_utils import increment_document_version
 from dayu.fins.pipelines.sec_sc13_filtering import SC13_FORMS as _SC13_FORMS, SC13_RETRY_MAX as _SC13_RETRY_MAX
 from dayu.fins.storage import (
     FsBatchingRepository,
@@ -2413,8 +2416,7 @@ def test_sec_pipeline_rebuild_local_meta_manifest_without_redownload(tmp_path: P
 
     rebuilt_meta = json.loads(meta_path.read_text(encoding="utf-8"))
     assert rebuilt_meta["document_version"] == "v7"
-    assert isinstance(rebuilt_meta["source_fingerprint"], str)
-    assert rebuilt_meta["source_fingerprint"]
+    assert rebuilt_meta["source_fingerprint"] == ""
     assert rebuilt_meta["download_version"] == "legacy_download_version"
     rebuilt_processed_meta = processed_repository.get_processed_meta(ticker, document_id)
     assert rebuilt_processed_meta["reprocess_required"] is False
@@ -2646,17 +2648,10 @@ def test_sec_rebuild_filter_contract(
     )
 
 
-def test_sec_rebuild_state_preserves_published_fingerprint() -> None:
-    """rebuild state owner 应保留既有指纹，且缺席 meta 不得命中当前版本。"""
+def test_sec_download_version_rejects_absent_meta() -> None:
+    """无参数；返回无；缺席来源元数据被认证为当前下载版本时断言失败。"""
 
     assert _sec_download_state.has_current_download_version(None, SEC_PIPELINE_DOWNLOAD_VERSION) is False
-    assert (
-        _sec_download_state._resolve_rebuild_source_fingerprint(
-            previous_meta={"source_fingerprint": "published-fingerprint"},
-            file_entries=[],
-        )
-        == "published-fingerprint"
-    )
 
 
 def test_sec_pipeline_download_prefers_dei_fiscal_when_available(
@@ -3095,6 +3090,52 @@ def test_sec_fiscal_payload_and_query_extractors_fail_closed() -> None:
             }
         )
     ) == (2021, None)
+
+
+@pytest.mark.parametrize("meta,expected", [
+    pytest.param(None, None, id="no-publication"),
+    pytest.param({}, None, id="missing"),
+    pytest.param({"source_fingerprint": None}, None, id="null"),
+    pytest.param({"source_fingerprint": False}, None, id="false"),
+    pytest.param({"source_fingerprint": True}, None, id="true"),
+    pytest.param({"source_fingerprint": 0}, None, id="zero"),
+    pytest.param({"source_fingerprint": 42}, None, id="integer"),
+    pytest.param({"source_fingerprint": 0.0}, None, id="float-zero"),
+    pytest.param({"source_fingerprint": 1.25}, None, id="float"),
+    pytest.param({"source_fingerprint": []}, None, id="empty-array"),
+    pytest.param({"source_fingerprint": ["known"]}, None, id="array"),
+    pytest.param({"source_fingerprint": {}}, None, id="empty-mapping"),
+    pytest.param({"source_fingerprint": {"fingerprint": "known"}}, None, id="mapping"),
+    pytest.param({"source_fingerprint": ""}, None, id="empty-string"),
+    pytest.param({"source_fingerprint": " \t\r\n"}, None, id="whitespace"),
+    pytest.param({"source_fingerprint": "known"}, "known", id="known-string"),
+    pytest.param({"source_fingerprint": " \tknown\r\n"}, "known", id="stripped-string"),
+    pytest.param(MappingProxyType({"source_fingerprint": "not-hex"}), "not-hex", id="immutable-mapping"),
+])
+def test_sec_published_fingerprint_owner_contract(meta: Mapping[str, JsonValue] | None, expected: str | None) -> None:
+    """参数为所有 JSON 类型及期望认证；返回无；未知值被转换或已知字符串被改变时断言失败。"""
+    assert read_published_source_fingerprint(meta) == expected
+
+
+@pytest.mark.parametrize("fingerprint,expected", [
+    (None, "v7"), (False, "v7"), (True, "v7"), (0, "v7"), (42, "v7"),
+    (0.0, "v7"), (1.25, "v7"), ([], "v7"), (["known"], "v7"), ({}, "v7"),
+    ({"fingerprint": "known"}, "v7"), ("", "v7"), (" \t\n", "v7"),
+    ("new-fingerprint", "v7"), (" \tnew-fingerprint\n", "v7"), ("old-fingerprint", "v8"),
+])
+def test_sec_document_version_uses_known_published_fingerprint(fingerprint: JsonValue, expected: str) -> None:
+    """参数为旧指纹与期望版本；返回无；未知指纹错误升位或已知变化不升位时断言失败。"""
+    assert resolve_document_version(
+        {"source_fingerprint": fingerprint, "document_version": "v7"}, "new-fingerprint",
+        increment_document_version=increment_document_version,
+    ) == expected
+    assert resolve_document_version(
+        {"document_version": "v7"}, "new-fingerprint",
+        increment_document_version=increment_document_version,
+    ) == "v7"
+    assert resolve_document_version(
+        None, "new-fingerprint", increment_document_version=increment_document_version,
+    ) == "v1"
 
 
 def test_sec_pipeline_skip_when_meta_matches(tmp_path: Path) -> None:

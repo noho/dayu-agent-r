@@ -42,6 +42,9 @@ _PRODUCER_PATHS = (
     "dayu/fins/pipelines/sec_download_filing_workflow.py",
     "dayu/fins/pipelines/sec_pipeline.py",
     "dayu/fins/pipelines/sec_rebuild_workflow.py",
+    "dayu/fins/pipelines/sec_download_state.py",
+    "dayu/fins/pipelines/sec_safe_meta_access.py",
+    "dayu/fins/pipelines/sec_download_source_upsert.py",
 )
 # 只观察 transport 与原指纹函数；fault 仅改变 exact 图片 GET 的远端响应。
 _OBSERVER_SCRIPT = '''"""临时真实验证 transport/descriptor 观测器，不改变生产结果。"""
@@ -92,8 +95,19 @@ async def observed_transport(self: httpx.AsyncHTTPTransport, request: httpx.Requ
 httpx.AsyncHTTPTransport.handle_async_request = observed_transport
 import dayu
 from dayu.fins.pipelines import sec_pipeline
+producer_paths = (
+    "dayu/fins/downloaders/sec_downloader.py",
+    "dayu/fins/pipelines/sec_download_filing_workflow.py",
+    "dayu/fins/pipelines/sec_pipeline.py",
+    "dayu/fins/pipelines/sec_rebuild_workflow.py",
+    "dayu/fins/pipelines/sec_download_state.py",
+    "dayu/fins/pipelines/sec_safe_meta_access.py",
+    "dayu/fins/pipelines/sec_download_source_upsert.py",
+)
+code_root = Path(dayu.__file__).resolve().parent.parent
 record({"kind": "origin", "dayu": dayu.__file__, "sec_pipeline": sec_pipeline.__file__,
         "sec_downloader_sha256": hashlib.sha256(Path(sec_downloader.__file__).read_bytes()).hexdigest(),
+        "producer_hashes": {name: hashlib.sha256((code_root / name).read_bytes()).hexdigest() for name in producer_paths},
         "package_version": importlib.metadata.version("dayu-agent"),
         "download_version": sec_pipeline.SEC_PIPELINE_DOWNLOAD_VERSION})
 '''
@@ -148,7 +162,7 @@ def _load_user_agent() -> str:
 
 
 def _producer_hashes() -> dict[str, JsonValue]:
-    """无参数；返回四个生产 owner 的源码 hash；源码读取异常透传。"""
+    """无参数；返回七个生产 owner 的源码 hash；源码读取异常透传。"""
     return {name: hashlib.sha256((_REPO / name).read_bytes()).hexdigest() for name in _PRODUCER_PATHS}
 
 
@@ -316,6 +330,9 @@ def _run_cli(context: _Context, year: str, accession: str, mode: str, base: Path
         value = origin[name]
         assert isinstance(value, str) and Path(value).is_relative_to(expected_root)
     assert origin["sec_downloader_sha256"] == hashlib.sha256((expected_root / _PRODUCER_PATHS[0]).read_bytes()).hexdigest()
+    assert origin["producer_hashes"] == {
+        name: hashlib.sha256((expected_root / name).read_bytes()).hexdigest() for name in _PRODUCER_PATHS
+    }
     result["origin"] = origin
     result["observations"] = cast(JsonValue, observations)
     _write_json(evidence / "command.json", result)

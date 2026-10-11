@@ -628,16 +628,23 @@ URL/descriptor 列表，不按 media、尺寸或业务用途选图；首个带 h
 所有原始地址仍拒绝控制字符和反斜杠。不安全 base 下的相对候选与同申报子目录资产明确失败，
 不取 basename 补偿；非法基础资产名在发现 owner 投影为安全 typed 失败。
 HTML 与图片通过同一 transport 在 batch 外预取，再作为完整集合原子发布；必要发现/下载失败
-保留既有 publication。COMPLETE 还须具备当前下载契约版本与非空指纹才可快跳，旧版本普通
-增量重建完整依赖集合；当前版本空指纹的等价晚期跳过，先完成基础 GET、图片发现与开启时的
+保留既有 publication。COMPLETE 还须具备当前下载契约版本与已知指纹才可快跳：SEC 元数据
+安全读取真源仅把去除首尾空白后的非空字符串视为已知指纹，字段缺席、空白字符串和其它 JSON
+类型均表示未知认证，不转换为文本或重算。旧版本普通增量重建完整依赖集合；当前版本未知
+指纹的等价晚期跳过，先完成基础 GET、图片发现与开启时的
 HEAD 尝试，必要失败优先于 skip。显式 overwrite 仍可强制重新检查。内容 hash 由 blob 字节计算，SEC source
-fingerprint 由本轮远端描述符按原契约计算，文件集合变化会触发现有 processed 重处理标记。
+fingerprint 由本轮远端描述符按原契约计算。已有来源的内容升位与 processed 重处理比较复用
+同一已知指纹语义；已知指纹发生变化沿原规则升位并标记重处理，未知指纹沿空指纹规则保留
+原内容版本，不据其推定内容变化。
 6-K 当前业绩强信号接受“Reports + 明确季度/年份 + Unaudited Financial Results”及 Q4/FY 联合标题；
 它与预告判断复用同一标题规则，避免被公告内的经营亮点先行拒绝。扫描上限、预告和经营更新排除规则不变。
 
 `rebuild_local_artifacts=true` 是 download 自身的 local-only 模式：SEC、CNInfo 与 HKEXNews workflow 只枚举已下载的 source document，并从本地 source meta、文件描述符和内容重建下载 meta/manifest；该分支不配置或调用 provider，也不新增、删除或替换 source 内容。它与 preprocess 的 `rebuild_processed` 是两个独立 owner，不通过 persisted summary 互相映射。
-SEC 本地 rebuild 保留最近一次正式下载的 download_version 或其缺席状态；只有完整正式下载
-能够认证新的依赖集合，本地重建不能授予当前下载版本的快跳资格。
+SEC 本地 rebuild 不写下载认证字段，通过仓储合并保留最近一次正式下载的 download_version 或
+其缺席状态，以及既有 source_fingerprint 原值；空指纹仍为空，物理缺席指纹由仓储规范为空值。
+不从本地文件重新计算远端指纹。只有完整正式下载能够认证新的依赖集合，本地重建不能授予当前
+下载版本的快跳资格。当前版本未知指纹来源重建后，普通下载仍须先 GET HTML、发现完整图片依赖
+并完成必要下载。
 
 HK 财期语义由 report selection owner 同时供 discovery 与本地 rebuild 使用。三个月只表示长度；
 明确季度和累计期间须相互一致，日期推季度需同公司邻近年度截止日支持，财年采用结束年份。

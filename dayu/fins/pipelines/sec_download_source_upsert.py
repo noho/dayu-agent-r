@@ -16,6 +16,7 @@ from dayu.fins.domain.document_models import (
     now_iso8601,
 )
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.pipelines.sec_safe_meta_access import read_published_source_fingerprint
 from dayu.fins.storage import ProcessedDocumentRepositoryProtocol, SourceDocumentRepositoryProtocol
 
 
@@ -314,5 +315,5 @@ def _should_mark_processed_reprocess_required(
 
     if previous_meta is None:
         return safe_get_processed_meta(ticker, document_id) is not None
-    previous_source_fingerprint = str(previous_meta.get("source_fingerprint") or "").strip()
-    return bool(previous_source_fingerprint) and previous_source_fingerprint != source_fingerprint
+    previous_source_fingerprint = read_published_source_fingerprint(previous_meta)
+    return previous_source_fingerprint is not None and previous_source_fingerprint != source_fingerprint

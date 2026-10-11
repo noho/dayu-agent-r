@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dayu.contracts.json_value import JsonValue
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Optional
 
 from dayu.fins.domain.document_models import CompanyMeta
@@ -14,6 +14,30 @@ from dayu.fins.storage import (
     ProcessedDocumentRepositoryProtocol,
     SourceDocumentRepositoryProtocol,
 )
+
+_SOURCE_FINGERPRINT_KEY = "source_fingerprint"
+
+
+def read_published_source_fingerprint(meta: Mapping[str, JsonValue] | None) -> str | None:
+    """读取已发布来源的已知指纹，不把未知 JSON 值转换成下载认证。
+
+    Args:
+        meta: 已发布来源元数据；来源不存在时为 ``None``。
+
+    Returns:
+        字符串指纹去除首尾空白后的非空值。字段缺席、非字符串或空白字符串
+        返回 ``None``，明确表示指纹未知，不能据此授予下载认证或判断内容变化。
+
+    Raises:
+        无。
+    """
+
+    if meta is None:
+        return None
+    value = meta.get(_SOURCE_FINGERPRINT_KEY)
+    if not isinstance(value, str):
+        return None
+    return value.strip() or None
 
 
 def safe_get_company_meta(
@@ -154,7 +178,7 @@ def resolve_document_version(
     if previous_meta is None:
         return "v1"
     previous_version = str(previous_meta.get("document_version", "v1"))
-    previous_fingerprint = str(previous_meta.get("source_fingerprint", "")).strip()
-    if previous_fingerprint and previous_fingerprint != source_fingerprint:
+    previous_fingerprint = read_published_source_fingerprint(previous_meta)
+    if previous_fingerprint is not None and previous_fingerprint != source_fingerprint:
         return increment_document_version(previous_version)
     return previous_version
