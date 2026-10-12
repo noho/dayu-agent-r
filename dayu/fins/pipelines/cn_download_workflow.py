@@ -8,6 +8,8 @@ overwrite ticker 级清理、单 filing 阶段机调度和 summary 聚合。单�
 from __future__ import annotations
 
 import time
+from datetime import date
+from dataclasses import dataclass
 from collections.abc import AsyncIterator, Callable
 from functools import partial
 from typing import TypeAlias, cast
@@ -30,11 +32,14 @@ from dayu.fins.pipelines.cn_download_models import (
     CN_DOWNLOAD_TERMINAL_OK,
     CnDownloadCancelledError,
     CnDownloadTerminalStatus,
+    CnAnnualReportPdf,
+    CnAnnualReportPublication,
     CnCompanyProfile,
     CnFiscalPeriod,
     CnMarketKind,
     CnReportCandidate,
     CnReportQuery,
+    CnSourceProvider,
 )
 from dayu.fins.pipelines.cn_download_rebuild import rebuild_cn_download_artifacts
 from dayu.fins.pipelines.cn_download_protocols import (
@@ -56,6 +61,10 @@ from dayu.fins.storage import (
     SourceIntegrityRepairRequiredError,
     classify_source_integrity_preflight,
 )
+from dayu.fins.storage import SourceDocumentRepositoryProtocol, SourceIntegrityStatus
+from dayu.fins.storage.source_integrity import validate_source_integrity_inventory
+from dayu.fins.pipelines.cn_annual_report_source import read_cn_annual_report_pdf, CnAnnualReportSourceError
+from dayu.fins.download_contract import FinsDownloadProviderError, FinsDownloadTransportCategory
 from dayu.fins._log import Log
 from dayu.fins.ticker_normalization import ticker_to_company_id, try_normalize_ticker
 
@@ -63,6 +72,14 @@ JsonObject: TypeAlias = dict[str, JsonValue]
 _INTEGRITY_FAILED_REASON = "source_integrity_failed"
 _INTEGRITY_FAILED_MESSAGE = "本地来源完整性状态阻止文档处理"
 _INTEGRITY_PREFLIGHT_MESSAGE = "本地来源完整性预检失败"
+
+
+@dataclass(frozen=True, slots=True)
+class _SelectedRepairIntent:
+    """初始候选身份投影选定的修复意图；待收口状态的唯一真源。"""
+
+    source_key: tuple[CnSourceProvider, str]
+    expected_document_id: str
 
 
 class CnDownloadIntegrityAbort(Exception):
@@ -243,9 +260,15 @@ async def run_cn_download_stream_impl(
     company_info: JsonObject = {}
     missing_periods: tuple[str, ...] = ()
     uncertain_reports: tuple[FinsDownloadUncertainReport, ...] = ()
+    pending_repair: _SelectedRepairIntent | None = None
     try:
         _raise_if_cancelled(module=module, ticker=normalized_ticker, document_id="", cancel_checker=cancel_checker)
         local_ends = ()
+        local_pdfs: tuple[CnAnnualReportPdf, ...] = ()
+        if market == "CN" and "FY" in period_policy.discovery_periods:
+            validate_source_integrity_inventory(host.source_repository.list_source_integrity(normalized_ticker))
+            _raise_if_cancelled(module=module, ticker=normalized_ticker, document_id="", cancel_checker=cancel_checker)
+            local_pdfs = _read_local_cn_annual_pdfs(normalized_ticker, period_windows, host.source_repository, cancellation_checkpoint)
         if market == "HK":
             entries = host.source_repository.read_source_meta_integrity_view(normalized_ticker, SourceKind.FILING, batch=None)
             local_ends = tuple(sorted(set(local_hk_annual_ends(entries).values())))
@@ -268,6 +291,8 @@ async def run_cn_download_stream_impl(
             query,
             profile,
             local_annual_ends=local_ends,
+            local_cn_annual_pdfs=local_pdfs,
+            pdf_download_gate=host.pdf_download_gate,
             cancellation_checkpoint=cancellation_checkpoint,
         )
         _raise_if_cancelled(module=module, ticker=normalized_ticker, document_id="", cancel_checker=cancel_checker)
@@ -284,39 +309,40 @@ async def run_cn_download_stream_impl(
         initial_identity_index = read_cn_download_identity_index(
             normalized_ticker, selected, host.source_repository,
         )
-        accepted_filing_ids = frozenset(
-            _candidate_document_id(normalized_ticker, candidate, initial_identity_index) for candidate in selected
+        initial_candidate_ids = tuple(
+            (candidate, _candidate_document_id(normalized_ticker, candidate, initial_identity_index))
+            for candidate in selected
         )
+        accepted_filing_ids = frozenset(document_id for _, document_id in initial_candidate_ids)
         preflight = classify_source_integrity_preflight(
             host.source_repository.list_source_integrity(normalized_ticker),
             accepted_filing_ids=accepted_filing_ids,
             rejected_filing_ids=frozenset(),
         )
-        repair_document_id: str | None = None
         if isinstance(preflight, SelectedSourceRepairRequired):
-            repair_document_id = preflight.target.document_id
-            selected = tuple(
-                sorted(
-                    selected,
-                    key=lambda item: (
-                        _candidate_document_id(normalized_ticker, item, initial_identity_index) != repair_document_id,
-                    ),
-                )
+            repair_candidates = tuple(
+                candidate for candidate, document_id in initial_candidate_ids
+                if document_id == preflight.target.document_id
             )
+            if len(repair_candidates) != 1:
+                raise SourceIntegrityRevisionConflictError()
+            repair_candidate = repair_candidates[0]
+            pending_repair = _SelectedRepairIntent(
+                (repair_candidate.provider, repair_candidate.source_id), preflight.target.document_id,
+            )
+            selected = (repair_candidate,) + tuple(candidate for candidate in selected if candidate != repair_candidate)
         missing_periods = () if uncertain_reports else _resolve_missing_periods(
             period_policy.missing_eligible_periods,
             selected,
         )
         cancelled = False
-        repair_gate_completed = False
-        if repair_document_id is None:
+        if pending_repair is None:
             _publish_cn_company_after_repair(
                 host=host,
                 profile=profile,
                 normalized_ticker=normalized_ticker,
                 ticker_aliases=ticker_aliases,
             )
-            repair_gate_completed = True
         for candidate in selected:
             if cancel_checker is not None and cancel_checker():
                 notes.append("cancelled")
@@ -326,6 +352,24 @@ async def run_cn_download_stream_impl(
                 normalized_ticker, (candidate,), host.source_repository,
             )
             document_id = _candidate_document_id(normalized_ticker, candidate, start_identity_index)
+            if (pending_repair is not None
+                and (candidate.provider, candidate.source_id) == pending_repair.source_key
+                and document_id != pending_repair.expected_document_id):
+                # 初次 repair intent 不能授权 fresh 重绑定目标；尚未开始任何 filing。
+                conflict = SourceIntegrityRevisionConflictError()
+                raise _integrity_abort(
+                    cause=conflict,
+                    started_at=started_at,
+                    pipeline_name=pipeline_name,
+                    ticker=normalized_ticker,
+                    company_info=company_info,
+                    filters=_download_filters(period_policy, period_windows, window.end_date, overwrite),
+                    warnings=warnings,
+                    notes=notes,
+                    filings=filings,
+                    missing_periods=missing_periods,
+                    uncertain_reports=uncertain_reports,
+                ) from conflict
             yield DownloadEvent(
                 event_type=DownloadEventType.FILING_STARTED,
                 ticker=normalized_ticker,
@@ -352,6 +396,8 @@ async def run_cn_download_stream_impl(
                     ticker=normalized_ticker,
                     profile=profile,
                     candidate=candidate,
+                    prepared_asset=next((a for a in discovery_result.prepared_assets if (a.candidate.provider, a.candidate.source_id) == (candidate.provider, candidate.source_id)), None),
+                    local_annual_publication=next((w for w in discovery_result.local_annual_publications if (w.provider, w.source_id) == (candidate.provider, candidate.source_id)), None),
                     overwrite=overwrite,
                     cancel_checker=cancel_checker,
                     module=module,
@@ -374,7 +420,7 @@ async def run_cn_download_stream_impl(
                 notes.append("cancelled")
                 cancelled = True
                 break
-            except (SourceIntegrityPreflightError, SourceIntegrityRevisionConflictError) as exc:
+            except (SourceIntegrityPreflightError, SourceIntegrityRevisionConflictError, SourceIntegrityRepairRequiredError) as exc:
                 failed_item = _build_candidate_failed_result(
                     document_id=document_id,
                     candidate=candidate,
@@ -422,9 +468,10 @@ async def run_cn_download_stream_impl(
                     document_id=str(failed_item["document_id"]),
                     payload=_filing_event_payload(failed_item),
                 )
-            if document_id == repair_document_id and not repair_gate_completed:
+            if pending_repair is not None and (candidate.provider, candidate.source_id) == pending_repair.source_key:
                 if filing_terminal_status == "failed":
                     # 单 filing owner 已投影失败；repair gate 直接终止，company 保持旧值。
+                    pending_repair = None
                     break
                 try:
                     post_repair = classify_source_integrity_preflight(
@@ -461,7 +508,7 @@ async def run_cn_download_stream_impl(
                         normalized_ticker=normalized_ticker,
                         ticker_aliases=ticker_aliases,
                     )
-                except SourceIntegrityPreflightError as exc:
+                except (SourceIntegrityPreflightError, SourceIntegrityRevisionConflictError, SourceIntegrityRepairRequiredError) as exc:
                     raise _integrity_abort(
                         cause=exc,
                         started_at=started_at,
@@ -475,7 +522,7 @@ async def run_cn_download_stream_impl(
                         missing_periods=missing_periods,
                         uncertain_reports=uncertain_reports,
                     ) from exc
-                repair_gate_completed = True
+                pending_repair = None
     except CnDownloadCancelledError:
         notes.append("cancelled")
         cancelled = True
@@ -484,6 +531,23 @@ async def run_cn_download_stream_impl(
         final_cancelled = cancelled or _is_cancel_requested(cancel_checker)
     except CnDownloadCancelledError:
         final_cancelled = True
+
+    if pending_repair is not None and not final_cancelled:
+        # 正常终态不得保留未收口意图；取消和已投影的单 filing 失败优先保留原原因。
+        incomplete = SourceIntegrityRepairRequiredError()
+        raise _integrity_abort(
+            cause=incomplete,
+            started_at=started_at,
+            pipeline_name=pipeline_name,
+            ticker=normalized_ticker,
+            company_info=company_info,
+            filters=_download_filters(period_policy, period_windows, window.end_date, overwrite),
+            warnings=warnings,
+            notes=notes,
+            filings=filings,
+            missing_periods=missing_periods,
+            uncertain_reports=uncertain_reports,
+        ) from incomplete
 
     elapsed_ms = int((time.perf_counter() - started_at) * 1000)
     summary = _build_summary(filings=filings, elapsed_ms=elapsed_ms)
@@ -1064,3 +1128,58 @@ def _candidate_document_id(
 
 
 __all__ = ["run_cn_download_stream_impl"]
+
+
+def _local_annual_checkpoint(checkpoint: Callable[[], None] | None) -> None:
+    """执行原控制检查。参数：checkpoint。返回：无。异常：原异常透传。"""
+    if checkpoint is not None:
+        checkpoint()
+
+
+def _read_local_cn_annual_pdfs(
+    ticker: str,
+    period_windows: tuple[PeriodDownloadWindow, ...],
+    source_repository: SourceDocumentRepositoryProtocol,
+    cancellation_checkpoint: Callable[[], None] | None,
+) -> tuple[CnAnnualReportPdf, ...]:
+    """仅预读 FY 窗内完整下载来源；不按 metadata 财年推断事实。
+
+    参数：ticker、period_windows 为请求；source_repository 为仓储；cancellation_checkpoint 为控制点。
+    返回：同窗 exact 原件输入。异常：完整性/仓储/取消原样传播；声明不足为 discovery PROTOCOL。
+    """
+    windows = tuple(w for w in period_windows if w.fiscal_period == "FY")
+    if not windows:
+        return ()
+    _local_annual_checkpoint(cancellation_checkpoint)
+    entries = source_repository.read_source_meta_integrity_view(ticker, SourceKind.FILING, batch=None)
+    _local_annual_checkpoint(cancellation_checkpoint)
+    validate_source_integrity_inventory(tuple(e.integrity for e in entries))
+    inputs: list[CnAnnualReportPdf] = []
+    for entry in entries:
+        meta = entry.source_meta
+        if entry.integrity.status is not SourceIntegrityStatus.COMPLETE:
+            continue
+        if (meta.get("source_provider") != "cninfo" or meta.get("ingest_method") != "download"
+            or meta.get("fiscal_period") != "FY" or meta.get("is_deleted") is not False):
+            continue
+        source_id = meta.get("source_id")
+        filing_date = meta.get("filing_date")
+        if type(source_id) is not str or not source_id or type(filing_date) is not str:
+            raise ValueError("年度缓存来源身份或日期非法")
+        if date.fromisoformat(filing_date).isoformat() != filing_date:
+            raise ValueError("年度缓存披露日期非法")
+        if not any(w.start_date <= filing_date <= w.end_date for w in windows):
+            continue
+        revision = entry.integrity.revision
+        if revision is None:
+            raise SourceIntegrityRevisionConflictError()
+        publication = CnAnnualReportPublication("cninfo", source_id, entry.document_id, revision)
+        try:
+            pdf = read_cn_annual_report_pdf(ticker, entry.document_id, publication, meta, source_repository, cancellation_checkpoint)
+        except CnAnnualReportSourceError as exc:
+            raise FinsDownloadProviderError(source=FinsDownloadSource.CNINFO, transport_category=FinsDownloadTransportCategory.PROTOCOL,
+                                            retryable=False, safe_message="巨潮年度报告原文无法确认财年或全文性质") from exc
+        inputs.append(pdf)
+    if len({(pdf.publication.provider, pdf.publication.source_id) for pdf in inputs}) != len(inputs):
+        raise ValueError("本地年度来源重复")
+    return tuple(inputs)

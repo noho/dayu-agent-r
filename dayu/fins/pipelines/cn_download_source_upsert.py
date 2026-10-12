@@ -36,7 +36,6 @@ from dayu.fins.ticker_normalization import normalize_ticker, ticker_to_company_i
 
 JsonObject: TypeAlias = dict[str, JsonValue]
 
-_FISCAL_YEAR_SOURCE = "title_or_category_inferred"
 _REPORT_DATE_SOURCE = "period_inferred"
 
 
@@ -258,7 +257,7 @@ def _build_base_meta(
         "fiscal_year": candidate.fiscal_year,
         "fiscal_period": candidate.period_projection.identity_period,
         "covered_fiscal_periods": list(candidate.period_projection.covered_periods),
-        "fiscal_year_source": _FISCAL_YEAR_SOURCE,
+        "fiscal_year_source": candidate.fiscal_year_source,
         "report_date_source": hk_report_date_source(candidate.report_date) if candidate.provider == "hkexnews" else ("source_title" if candidate.report_date is not None else _REPORT_DATE_SOURCE),
         "report_kind": candidate.period_projection.identity_period,
         "report_date": candidate.report_date,

@@ -27,6 +27,7 @@ from typing import Optional, Protocol
 
 from dayu.fins.pipelines.cn_download_pdf_gate import CnDownloadPdfGateProtocol
 from dayu.fins.pipelines.cn_download_models import (
+    CnAnnualReportPdf,
     CnCompanyProfile,
     CnReportCandidate,
     CnReportDiscoveryResult,
@@ -55,8 +56,8 @@ class CnReportDiscoveryClientProtocol(Protocol):
     实现约束：
 
     - 不写 workspace、不依赖 pipeline、不调 docling、不生成 ``document_id``。
-    - HEAD/GET 失败、PDF magic bytes 校验失败等候选层失败仅影响该 candidate，
-      不能让整个 ticker 流程崩。
+    - selected PDF 的 HTTP/校验失败由单 filing 隔离；HEAD 软降级。
+    - discovery HTTP/JSON 或任意准入 CN FY 原文事实失败终止整次发现，不返回部分候选。
     - HK 季度报告查无视为返回空列表（不抛异常），由 workflow 标 skipped。
     - discovery 请求失败 / JSON 解析失败必须抛 ``RuntimeError``，不能用空
       候选伪装成缺报告。
@@ -85,6 +86,8 @@ class CnReportDiscoveryClientProtocol(Protocol):
         profile: CnCompanyProfile,
         *,
         local_annual_ends: tuple[date, ...],
+        local_cn_annual_pdfs: tuple[CnAnnualReportPdf, ...],
+        pdf_download_gate: CnDownloadPdfGateProtocol,
         cancellation_checkpoint: Callable[[], None] | None = None,
     ) -> CnReportDiscoveryResult:
         """列出符合 ``discovery_periods`` 与窗口约束的候选报告。
@@ -96,6 +99,8 @@ class CnReportDiscoveryClientProtocol(Protocol):
         Args:
             query: 单次 download 的查询参数。
             profile: ``resolve_company`` 返回的公司元数据。
+            local_cn_annual_pdfs: 同窗 CN 年度原件；HK 必须为空。
+            pdf_download_gate: 年度远端原件 acquisition gate。
             local_annual_ends: 同公司可信本地年度截止日；CN 必须为空。
             cancellation_checkpoint: 可选 workflow-owned 无参取消检查点；
                 provider 只在真实 discovery I/O 边界调用并原样传播异常。

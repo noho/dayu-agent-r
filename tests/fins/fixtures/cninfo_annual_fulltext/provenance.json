@@ -1,0 +1,114 @@
+{
+  "pdf_first_pages": [
+    {
+      "source_id": "1225178190",
+      "url": "http://static.cninfo.com.cn/finalpage/2026-04-25/1225178190.PDF",
+      "original_sha256": "63f2a34ff83a7f9e47c654d4f8e27086c3c8b65ccc66789465f722bd329881b2",
+      "page_index": 0,
+      "derived_sha256": "98bd9f882b5a0dafb43a456f6a28c5ad1df6d3c0f7720907f40f6cebe656cdbf",
+      "generator": "pypdf 6.1.3 PdfWriter.add_page"
+    },
+    {
+      "source_id": "1223301988",
+      "url": "http://static.cninfo.com.cn/finalpage/2025-04-26/1223301988.PDF",
+      "original_sha256": "f3422819a11c1962ed4ae74d9a62e47a44635fc9e8b9d4de1e446824bbb91b86",
+      "page_index": 0,
+      "derived_sha256": "4006f817b165b8fc052af6e38d732580700b19266fcfd22f099c65943a6a528a",
+      "generator": "pypdf 6.1.3 PdfWriter.add_page"
+    },
+    {
+      "source_id": "1223301999",
+      "url": "http://static.cninfo.com.cn/finalpage/2025-04-26/1223301999.PDF",
+      "original_sha256": "c6e5e1c9499c601b3cdd17cff87af9464ecf46afd3fa908d5a0e43113efd861f",
+      "page_index": 0,
+      "derived_sha256": "20f3b404c4164e51650ea07e09f527af1d9101a45e5556658c925ac59b747535",
+      "generator": "pypdf 6.1.3 PdfWriter.add_page"
+    },
+    {
+      "source_id": "1219815158",
+      "url": "http://static.cninfo.com.cn/finalpage/2024-04-26/1219815158.PDF",
+      "original_sha256": "080827a40f33e613f876e60606daae838b83b715701c12a4f124712aa8bcbb7e",
+      "page_index": 0,
+      "derived_sha256": "6028299bf13b24afc68f00c7982a38eaed6beb3b777ac0d5e6c04d77f4601ccb",
+      "generator": "pypdf 6.1.3 PdfWriter.add_page"
+    },
+    {
+      "source_id": "1216619553",
+      "url": "http://static.cninfo.com.cn/finalpage/2023-04-27/1216619553.PDF",
+      "original_sha256": "d9cb6304fa0c79ebe6592effa4d8552e5f08c4bf53193ee3917cbcf7511873b4",
+      "page_index": 0,
+      "derived_sha256": "b2d6b5ffb8b2d3bf3f3f7bcaddfa7955953a2809da6ce25d45d2143eae9732b0",
+      "generator": "pypdf 6.1.3 PdfWriter.add_page"
+    },
+    {
+      "source_id": "1213161682",
+      "url": "http://static.cninfo.com.cn/finalpage/2022-04-28/1213161682.PDF",
+      "original_sha256": "a15100380ee1ae7930c612700d685aa18f9b02d794d92c4aa097cfaec8a029aa",
+      "page_index": 0,
+      "derived_sha256": "361cb4e965a0edb6760dcb8ee4085490ea132679313504e69181dd2dde250c2d",
+      "generator": "pypdf 6.1.3 PdfWriter.add_page"
+    },
+    {
+      "source_id": "1213161683",
+      "url": "http://static.cninfo.com.cn/finalpage/2022-04-28/1213161683.PDF",
+      "original_sha256": "41ec9bdf696e9e40a650288d042346ad03d05325a921e88fdc735efd5a7ccdb8",
+      "page_index": 0,
+      "derived_sha256": "456d6eb12c20594ed316d364712faab0e088a8c2ba8aaa8c582b91f29ae2b461",
+      "generator": "pypdf 6.1.3 PdfWriter.add_page"
+    },
+    {
+      "source_id": "1209875598",
+      "url": "http://static.cninfo.com.cn/finalpage/2021-04-30/1209875598.PDF",
+      "original_sha256": "30a183cbaa7fbad1dc064abdf6c461e0c35b1eedf0efcbd6173079e64b6337d5",
+      "page_index": 0,
+      "derived_sha256": "651a7e9c0463e77b12226b70f990226399769e2f226b94a28f64c10c2119e751",
+      "generator": "pypdf 6.1.3 PdfWriter.add_page"
+    },
+    {
+      "source_id": "1209875597",
+      "url": "http://static.cninfo.com.cn/finalpage/2021-04-30/1209875597.PDF",
+      "original_sha256": "5a1ff6572e7210d1d753f1de5cc54e5cdbe1210dfb7fb20247ac5f4a507c9416",
+      "page_index": 0,
+      "derived_sha256": "9b459afd4bb5724743c82db9349577eb8110276af9c3949484304d697edf530b",
+      "generator": "pypdf 6.1.3 PdfWriter.add_page"
+    },
+    {
+      "source_id": "1207678369",
+      "url": "http://static.cninfo.com.cn/finalpage/2020-04-30/1207678369.PDF",
+      "original_sha256": "82d90aebd459dbac52bf6767f46321683baab1aa487a44ad1ae02bf0ccc281d9",
+      "page_index": 0,
+      "derived_sha256": "566a6fb206eac03144541ec08c090edf76a4ab066da7566d4d6409e2a9ffaf91",
+      "generator": "pypdf 6.1.3 PdfWriter.add_page"
+    },
+    {
+      "source_id": "1206005283",
+      "url": "http://static.cninfo.com.cn/finalpage/2019-04-11/1206005283.PDF",
+      "original_sha256": "8327d5200737df45e38a92260afdf6c64bcbe4bbb6fdb6ecbc3295dd44be1d70",
+      "page_index": 0,
+      "derived_sha256": "bbc650fa78356df54006393955d674d845a2dab584fe097fd20e8dd297ef456c",
+      "generator": "pypdf 6.1.3 PdfWriter.add_page"
+    },
+    {
+      "source_id": "1205110621",
+      "url": "http://static.cninfo.com.cn/finalpage/2018-06-30/1205110621.PDF",
+      "original_sha256": "2bca03bd67fa906386166010839287f3fa5372c473cbf154d6b57d92df590250",
+      "page_index": 0,
+      "derived_sha256": "5dc294c788e39d1a85f8e6d8a8997e6f25551f74db86f7184487f1537208f25e",
+      "generator": "pypdf 6.1.3 PdfWriter.add_page"
+    },
+    {
+      "source_id": "1204545056",
+      "url": "http://static.cninfo.com.cn/finalpage/2018-03-30/1204545056.PDF",
+      "original_sha256": "3633b323e69c2fe333967b0db2ad8a7fead9d6f1fcb8c2cb36af5322f4820469",
+      "page_index": 0,
+      "derived_sha256": "3b36a1645b34a6d45715d4e81380684a65835a0fa966ca65dbb9631614de8c76",
+      "generator": "pypdf 6.1.3 PdfWriter.add_page"
+    }
+  ],
+  "annual_raw": {
+    "filename": "annual-raw.response.json",
+    "source_evidence": "workspace/tmp/601225-evidence/current-002.response.bin",
+    "sha256": "8d1e30a693127c4bea34847ed816091be1eb768872a0bf75477d971985366471",
+    "announcement_count": 19
+  }
+}

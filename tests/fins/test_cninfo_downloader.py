@@ -14,6 +14,9 @@
 """
 
 from __future__ import annotations
+from tests.fins.test_cn_annual_report_facts import build_synthetic_annual_pdf
+from dayu.fins.pipelines.cn_download_models import CnAnnualReportPdf
+from dayu.fins.pipelines.cn_download_pdf_gate import CnDownloadPdfGateProtocol, NoopCnDownloadPdfGate
 
 import json
 from typing import Callable, TypeAlias
@@ -374,12 +377,24 @@ def test_list_report_candidates_filters_blocklisted_titles() -> None:
         "hasMore": False,
     }
 
+    pdf_payloads = {
+        'http://static.cninfo.com.cn/finalpage/2025-04-03/full.PDF': build_synthetic_annual_pdf(2024),
+        'http://static.cninfo.com.cn/finalpage/2025-04-03/summary.PDF': build_synthetic_annual_pdf(2024),
+        'http://static.cninfo.com.cn/finalpage/2025-04-03/english.PDF': build_synthetic_annual_pdf(2024),
+        'http://static.cninfo.com.cn/finalpage/2025-04-10/hk.PDF': build_synthetic_annual_pdf(2024),
+        'http://static.cninfo.com.cn/finalpage/2025-06-13/english-brief.PDF': build_synthetic_annual_pdf(2024),
+        'http://static.cninfo.com.cn/finalpage/2025-06-14/english-full.PDF': build_synthetic_annual_pdf(2024),
+        'http://static.cninfo.com.cn/finalpage/2025-06-15/english-annual.PDF': build_synthetic_annual_pdf(2024),
+    }
+
     def handler(request: httpx.Request) -> httpx.Response:
         url_str = str(request.url)
         if url_str == CNINFO_STOCK_JSON_URL:
             return _stock_mapping_response()
         if url_str == CNINFO_QUERY_URL:
             return httpx.Response(200, json=announcement_payload)
+        if request.method == "GET" and str(request.url) in pdf_payloads:
+            return httpx.Response(200, content=pdf_payloads[str(request.url)])
         if request.method == "HEAD":
             return httpx.Response(
                 200,
@@ -410,7 +425,7 @@ def test_list_report_candidates_filters_blocklisted_titles() -> None:
             discovery_periods=("FY",),
         ),
         profile,
-     local_annual_ends=()).candidates
+     local_annual_ends=(), local_cn_annual_pdfs=(), pdf_download_gate=NoopCnDownloadPdfGate(), ).candidates
 
     assert len(candidates) == 1
     only = candidates[0]
@@ -469,7 +484,7 @@ def test_list_report_candidates_filters_english_quarterly_report_title() -> None
         discovery_periods=("Q3",),
     )
     profile = client.resolve_company(query)
-    candidates = client.list_report_candidates(query, profile, local_annual_ends=()).candidates
+    candidates = client.list_report_candidates(query, profile, local_annual_ends=(), local_cn_annual_pdfs=(), pdf_download_gate=NoopCnDownloadPdfGate(), ).candidates
 
     assert [candidate.source_id for candidate in candidates] == ["Q3_CN"]
 
@@ -501,12 +516,20 @@ def test_list_report_candidates_prefers_full_fy_over_later_report_notice() -> No
         "hasMore": False,
     }
 
+    pdf_payloads = {
+        'http://static.cninfo.com.cn/finalpage/2025-04-25/full.PDF': build_synthetic_annual_pdf(2024),
+        'http://static.cninfo.com.cn/finalpage/2025-06-13/brief-notice.PDF': build_synthetic_annual_pdf(2024),
+        'http://static.cninfo.com.cn/finalpage/2025-04-26/notice.PDF': build_synthetic_annual_pdf(2024),
+    }
+
     def handler(request: httpx.Request) -> httpx.Response:
         url_str = str(request.url)
         if url_str == CNINFO_STOCK_JSON_URL:
             return _stock_mapping_response()
         if url_str == CNINFO_QUERY_URL:
             return httpx.Response(200, json=announcement_payload)
+        if request.method == "GET" and str(request.url) in pdf_payloads:
+            return httpx.Response(200, content=pdf_payloads[str(request.url)])
         if request.method == "HEAD":
             return httpx.Response(200, headers={})
         raise AssertionError(f"unexpected request {request.method} {request.url}")
@@ -520,7 +543,7 @@ def test_list_report_candidates_prefers_full_fy_over_later_report_notice() -> No
         discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
-    candidates = client.list_report_candidates(query, profile, local_annual_ends=()).candidates
+    candidates = client.list_report_candidates(query, profile, local_annual_ends=(), local_cn_annual_pdfs=(), pdf_download_gate=NoopCnDownloadPdfGate(), ).candidates
 
     assert [candidate.source_id for candidate in candidates] == ["FULL"]
 
@@ -549,7 +572,7 @@ def test_list_report_candidates_returns_empty_for_cninfo_independent_q2_q4() -> 
 
     client = _build_client(handler)
     profile = client.resolve_company(query)
-    candidates = client.list_report_candidates(query, profile, local_annual_ends=()).candidates
+    candidates = client.list_report_candidates(query, profile, local_annual_ends=(), local_cn_annual_pdfs=(), pdf_download_gate=NoopCnDownloadPdfGate(), ).candidates
 
     assert candidates == ()
     assert query_calls == 0
@@ -591,12 +614,20 @@ def test_list_report_candidates_prefers_a_share_fy_over_later_h_share_notice() -
         "hasMore": False,
     }
 
+    pdf_payloads = {
+        'http://static.cninfo.com.cn/finalpage/2026-04-09/hk.PDF': build_synthetic_annual_pdf(2025),
+        'http://static.cninfo.com.cn/finalpage/2026-03-27/a.PDF': build_synthetic_annual_pdf(2025),
+        'http://static.cninfo.com.cn/finalpage/2026-03-27/summary.PDF': build_synthetic_annual_pdf(2025),
+    }
+
     def handler(request: httpx.Request) -> httpx.Response:
         url_str = str(request.url)
         if url_str == CNINFO_STOCK_JSON_URL:
             return _stock_mapping_response()
         if url_str == CNINFO_QUERY_URL:
             return httpx.Response(200, json=announcement_payload)
+        if request.method == "GET" and str(request.url) in pdf_payloads:
+            return httpx.Response(200, content=pdf_payloads[str(request.url)])
         if request.method == "HEAD":
             return httpx.Response(200, headers={})
         raise AssertionError(f"unexpected request {request.method} {request.url}")
@@ -610,7 +641,7 @@ def test_list_report_candidates_prefers_a_share_fy_over_later_h_share_notice() -
         discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
-    candidates = client.list_report_candidates(query, profile, local_annual_ends=()).candidates
+    candidates = client.list_report_candidates(query, profile, local_annual_ends=(), local_cn_annual_pdfs=(), pdf_download_gate=NoopCnDownloadPdfGate(), ).candidates
 
     assert [candidate.source_id for candidate in candidates] == ["A1"]
 
@@ -655,7 +686,7 @@ def test_list_report_candidates_raises_on_failed_period_query() -> None:
     profile = client.resolve_company(query)
 
     with pytest.raises(FinsDownloadProviderError) as exc_info:
-        client.list_report_candidates(query, profile, local_annual_ends=()).candidates
+        client.list_report_candidates(query, profile, local_annual_ends=(), local_cn_annual_pdfs=(), pdf_download_gate=NoopCnDownloadPdfGate(), ).candidates
 
     assert exc_info.value.source is FinsDownloadSource.CNINFO
     assert exc_info.value.transport_category is FinsDownloadTransportCategory.HTTP_STATUS
@@ -684,7 +715,7 @@ def test_list_report_candidates_raises_when_period_query_fails() -> None:
     profile = client.resolve_company(query)
 
     with pytest.raises(FinsDownloadProviderError) as exc_info:
-        client.list_report_candidates(query, profile, local_annual_ends=()).candidates
+        client.list_report_candidates(query, profile, local_annual_ends=(), local_cn_annual_pdfs=(), pdf_download_gate=NoopCnDownloadPdfGate(), ).candidates
 
     assert exc_info.value.transport_category is FinsDownloadTransportCategory.HTTP_STATUS
     assert exc_info.value.retryable is True
@@ -723,12 +754,20 @@ def test_list_report_candidates_filters_non_pdf_and_other_sec_code() -> None:
         "hasMore": False,
     }
 
+    pdf_payloads = {
+        'http://static.cninfo.com.cn/finalpage/2025-04-03/full.PDF': build_synthetic_annual_pdf(2024),
+        'http://static.cninfo.com.cn/finalpage/2025-04-05/other.PDF': build_synthetic_annual_pdf(2024),
+        'http://static.cninfo.com.cn/finalpage/2025-04-04/not-pdf.txt': build_synthetic_annual_pdf(2024),
+    }
+
     def handler(request: httpx.Request) -> httpx.Response:
         url_str = str(request.url)
         if url_str == CNINFO_STOCK_JSON_URL:
             return _stock_mapping_response()
         if url_str == CNINFO_QUERY_URL:
             return httpx.Response(200, json=announcement_payload)
+        if request.method == "GET" and str(request.url) in pdf_payloads:
+            return httpx.Response(200, content=pdf_payloads[str(request.url)])
         if request.method == "HEAD":
             return httpx.Response(200, headers={})
         raise AssertionError(f"unexpected request {request.method} {request.url}")
@@ -742,7 +781,7 @@ def test_list_report_candidates_filters_non_pdf_and_other_sec_code() -> None:
         discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
-    candidates = client.list_report_candidates(query, profile, local_annual_ends=()).candidates
+    candidates = client.list_report_candidates(query, profile, local_annual_ends=(), local_cn_annual_pdfs=(), pdf_download_gate=NoopCnDownloadPdfGate(), ).candidates
 
     assert [candidate.source_id for candidate in candidates] == ["A1"]
 
@@ -768,12 +807,19 @@ def test_list_report_candidates_amended_takes_priority() -> None:
         "hasMore": False,
     }
 
+    pdf_payloads = {
+        'http://static.cninfo.com.cn/finalpage/2025-04-01/v1.PDF': build_synthetic_annual_pdf(2024),
+        'http://static.cninfo.com.cn/finalpage/2025-04-15/v2.PDF': build_synthetic_annual_pdf(2024),
+    }
+
     def handler(request: httpx.Request) -> httpx.Response:
         url_str = str(request.url)
         if url_str == CNINFO_STOCK_JSON_URL:
             return _stock_mapping_response()
         if url_str == CNINFO_QUERY_URL:
             return httpx.Response(200, json=announcements_payload)
+        if request.method == "GET" and str(request.url) in pdf_payloads:
+            return httpx.Response(200, content=pdf_payloads[str(request.url)])
         if request.method == "HEAD":
             return httpx.Response(200, headers={"Content-Length": "9999"})
         raise AssertionError(f"unexpected {request}")
@@ -787,7 +833,7 @@ def test_list_report_candidates_amended_takes_priority() -> None:
         discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
-    candidates = client.list_report_candidates(query, profile, local_annual_ends=()).candidates
+    candidates = client.list_report_candidates(query, profile, local_annual_ends=(), local_cn_annual_pdfs=(), pdf_download_gate=NoopCnDownloadPdfGate(), ).candidates
 
     assert len(candidates) == 1
     assert candidates[0].source_id == "A2"
@@ -821,12 +867,20 @@ def test_list_report_candidates_keeps_one_per_year_for_fy() -> None:
         "hasMore": False,
     }
 
+    pdf_payloads = {
+        'http://static.cninfo.com.cn/finalpage/2025-04-01/v1.PDF': build_synthetic_annual_pdf(2024),
+        'http://static.cninfo.com.cn/finalpage/2024-04-01/v1.PDF': build_synthetic_annual_pdf(2023),
+        'http://static.cninfo.com.cn/finalpage/2023-04-01/v1.PDF': build_synthetic_annual_pdf(2022),
+    }
+
     def handler(request: httpx.Request) -> httpx.Response:
         url_str = str(request.url)
         if url_str == CNINFO_STOCK_JSON_URL:
             return _stock_mapping_response()
         if url_str == CNINFO_QUERY_URL:
             return httpx.Response(200, json=announcements_payload)
+        if request.method == "GET" and str(request.url) in pdf_payloads:
+            return httpx.Response(200, content=pdf_payloads[str(request.url)])
         if request.method == "HEAD":
             return httpx.Response(200, headers={})
         raise AssertionError(f"unexpected {request}")
@@ -840,7 +894,7 @@ def test_list_report_candidates_keeps_one_per_year_for_fy() -> None:
         discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
-    candidates = client.list_report_candidates(query, profile, local_annual_ends=()).candidates
+    candidates = client.list_report_candidates(query, profile, local_annual_ends=(), local_cn_annual_pdfs=(), pdf_download_gate=NoopCnDownloadPdfGate(), ).candidates
 
     assert [c.fiscal_year for c in candidates] == [2024, 2023, 2022]
     assert [c.source_id for c in candidates] == ["A1", "A2", "A3"]
@@ -873,12 +927,20 @@ def test_list_report_candidates_picks_amended_per_year_without_dropping_other_ye
         "hasMore": False,
     }
 
+    pdf_payloads = {
+        'http://static.cninfo.com.cn/finalpage/2025-04-01/2024-v1.PDF': build_synthetic_annual_pdf(2024),
+        'http://static.cninfo.com.cn/finalpage/2025-04-10/2024-v2.PDF': build_synthetic_annual_pdf(2024),
+        'http://static.cninfo.com.cn/finalpage/2024-04-01/2023-v1.PDF': build_synthetic_annual_pdf(2023),
+    }
+
     def handler(request: httpx.Request) -> httpx.Response:
         url_str = str(request.url)
         if url_str == CNINFO_STOCK_JSON_URL:
             return _stock_mapping_response()
         if url_str == CNINFO_QUERY_URL:
             return httpx.Response(200, json=announcements_payload)
+        if request.method == "GET" and str(request.url) in pdf_payloads:
+            return httpx.Response(200, content=pdf_payloads[str(request.url)])
         if request.method == "HEAD":
             return httpx.Response(200, headers={})
         raise AssertionError(f"unexpected {request}")
@@ -892,7 +954,7 @@ def test_list_report_candidates_picks_amended_per_year_without_dropping_other_ye
         discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
-    candidates = client.list_report_candidates(query, profile, local_annual_ends=()).candidates
+    candidates = client.list_report_candidates(query, profile, local_annual_ends=(), local_cn_annual_pdfs=(), pdf_download_gate=NoopCnDownloadPdfGate(), ).candidates
 
     assert [(c.fiscal_year, c.source_id, c.amended) for c in candidates] == [
         (2024, "A2", True),
@@ -928,6 +990,11 @@ def test_list_report_candidates_handles_pagination() -> None:
         },
     }
 
+    pdf_payloads = {
+        'http://static.cninfo.com.cn/finalpage/p1/A1.PDF': build_synthetic_annual_pdf(2024),
+        'http://static.cninfo.com.cn/finalpage/p2/A2.PDF': build_synthetic_annual_pdf(2023),
+    }
+
     def handler(request: httpx.Request) -> httpx.Response:
         url_str = str(request.url)
         if url_str == CNINFO_STOCK_JSON_URL:
@@ -936,6 +1003,8 @@ def test_list_report_candidates_handles_pagination() -> None:
             payload_bytes = request.content
             form = dict(item.split("=", 1) for item in payload_bytes.decode().split("&"))
             return httpx.Response(200, json=pages[form["pageNum"]])
+        if request.method == "GET" and str(request.url) in pdf_payloads:
+            return httpx.Response(200, content=pdf_payloads[str(request.url)])
         if request.method == "HEAD":
             return httpx.Response(200, headers={})
         raise AssertionError(f"unexpected {request}")
@@ -949,7 +1018,7 @@ def test_list_report_candidates_handles_pagination() -> None:
         discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
-    candidates = client.list_report_candidates(query, profile, local_annual_ends=()).candidates
+    candidates = client.list_report_candidates(query, profile, local_annual_ends=(), local_cn_annual_pdfs=(), pdf_download_gate=NoopCnDownloadPdfGate(), ).candidates
 
     # 两条 announcement 同 fiscal_period=FY，但属于不同 fiscal_year；
     # 按 (period, fiscal_year) 分组去重 -> 两条都保留，按年份降序排。
@@ -973,12 +1042,18 @@ def test_list_report_candidates_head_failure_softly_degrades() -> None:
         "hasMore": False,
     }
 
+    pdf_payloads = {
+        'http://static.cninfo.com.cn/finalpage/2025-04-01/full.PDF': build_synthetic_annual_pdf(2024),
+    }
+
     def handler(request: httpx.Request) -> httpx.Response:
         url_str = str(request.url)
         if url_str == CNINFO_STOCK_JSON_URL:
             return _stock_mapping_response()
         if url_str == CNINFO_QUERY_URL:
             return httpx.Response(200, json=payload)
+        if request.method == "GET" and str(request.url) in pdf_payloads:
+            return httpx.Response(200, content=pdf_payloads[str(request.url)])
         if request.method == "HEAD":
             return httpx.Response(500)
         raise AssertionError(f"unexpected {request}")
@@ -992,7 +1067,7 @@ def test_list_report_candidates_head_failure_softly_degrades() -> None:
         discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
-    candidates = client.list_report_candidates(query, profile, local_annual_ends=()).candidates
+    candidates = client.list_report_candidates(query, profile, local_annual_ends=(), local_cn_annual_pdfs=(), pdf_download_gate=NoopCnDownloadPdfGate(), ).candidates
 
     assert len(candidates) == 1
     only = candidates[0]
@@ -1021,7 +1096,7 @@ def test_list_report_candidates_empty_when_no_announcements() -> None:
         discovery_periods=("FY", "H1"),
     )
     profile = client.resolve_company(query)
-    candidates = client.list_report_candidates(query, profile, local_annual_ends=()).candidates
+    candidates = client.list_report_candidates(query, profile, local_annual_ends=(), local_cn_annual_pdfs=(), pdf_download_gate=NoopCnDownloadPdfGate(), ).candidates
 
     assert candidates == ()
 
@@ -1049,7 +1124,7 @@ def test_list_report_candidates_treats_null_announcements_as_empty() -> None:
         discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
-    candidates = client.list_report_candidates(query, profile, local_annual_ends=()).candidates
+    candidates = client.list_report_candidates(query, profile, local_annual_ends=(), local_cn_annual_pdfs=(), pdf_download_gate=NoopCnDownloadPdfGate(), ).candidates
 
     assert candidates == ()
 
@@ -1060,6 +1135,11 @@ def test_list_report_candidates_null_empty_period_does_not_block_other_periods()
     事故回归：bare 请求（discovery=FY,H1,Q1,Q3）在 filing 窗口内 H1/Q1/Q3
     无公告时，巨潮返回 ``announcements: null``，曾导致整个下载被协议失败中断。
     """
+
+    pdf_payloads = {
+        'http://static.cninfo.com.cn/finalpage/2025-03-28/fy_summary.PDF': build_synthetic_annual_pdf(2024),
+        'http://static.cninfo.com.cn/finalpage/2025-03-28/fy_body.PDF': build_synthetic_annual_pdf(2024),
+    }
 
     def handler(request: httpx.Request) -> httpx.Response:
         url_str = str(request.url)
@@ -1093,6 +1173,8 @@ def test_list_report_candidates_null_empty_period_does_not_block_other_periods()
                 200,
                 json={"announcements": None, "hasMore": False, "totalRecordNum": 0},
             )
+        if request.method == "GET" and str(request.url) in pdf_payloads:
+            return httpx.Response(200, content=pdf_payloads[str(request.url)])
         if request.method == "HEAD":
             return httpx.Response(200, headers={})
         raise AssertionError(f"unexpected {request}")
@@ -1106,7 +1188,7 @@ def test_list_report_candidates_null_empty_period_does_not_block_other_periods()
         discovery_periods=("FY", "H1", "Q1", "Q3"),
     )
     profile = client.resolve_company(query)
-    candidates = client.list_report_candidates(query, profile, local_annual_ends=()).candidates
+    candidates = client.list_report_candidates(query, profile, local_annual_ends=(), local_cn_annual_pdfs=(), pdf_download_gate=NoopCnDownloadPdfGate(), ).candidates
 
     assert len(candidates) == 1
     only = candidates[0]
@@ -1137,7 +1219,7 @@ def test_list_report_candidates_missing_announcements_key_raises() -> None:
     profile = client.resolve_company(query)
 
     with pytest.raises(FinsDownloadProviderError) as exc_info:
-        client.list_report_candidates(query, profile, local_annual_ends=()).candidates
+        client.list_report_candidates(query, profile, local_annual_ends=(), local_cn_annual_pdfs=(), pdf_download_gate=NoopCnDownloadPdfGate(), ).candidates
 
     assert exc_info.value.source is FinsDownloadSource.CNINFO
     assert exc_info.value.transport_category is FinsDownloadTransportCategory.PROTOCOL
@@ -1180,7 +1262,7 @@ def test_list_report_candidates_non_list_announcements_raises(
     profile = client.resolve_company(query)
 
     with pytest.raises(FinsDownloadProviderError) as exc_info:
-        client.list_report_candidates(query, profile, local_annual_ends=()).candidates
+        client.list_report_candidates(query, profile, local_annual_ends=(), local_cn_annual_pdfs=(), pdf_download_gate=NoopCnDownloadPdfGate(), ).candidates
 
     assert exc_info.value.transport_category is FinsDownloadTransportCategory.PROTOCOL
     assert exc_info.value.safe_message == "巨潮来源返回的公告列表格式不符合预期"
@@ -1209,7 +1291,7 @@ def test_list_report_candidates_invalid_profile_provider_raises() -> None:
                 discovery_periods=("FY",),
             ),
             bogus_profile,
-         local_annual_ends=()).candidates
+         local_annual_ends=(), local_cn_annual_pdfs=(), pdf_download_gate=NoopCnDownloadPdfGate(), ).candidates
 
 
 def test_list_report_candidates_uses_per_period_category() -> None:
@@ -1236,7 +1318,7 @@ def test_list_report_candidates_uses_per_period_category() -> None:
         discovery_periods=("FY", "H1", "Q1", "Q3"),
     )
     profile = client.resolve_company(query)
-    client.list_report_candidates(query, profile, local_annual_ends=()).candidates
+    client.list_report_candidates(query, profile, local_annual_ends=(), local_cn_annual_pdfs=(), pdf_download_gate=NoopCnDownloadPdfGate(), ).candidates
 
     # URL-encoded 分号 -> %3B
     assert sorted(seen_categories) == sorted(
@@ -1285,7 +1367,7 @@ def test_list_report_candidates_calls_same_checkpoint_around_each_period_post() 
         query,
         profile,
         cancellation_checkpoint=checkpoint,
-     local_annual_ends=()).candidates
+     local_annual_ends=(), local_cn_annual_pdfs=(), pdf_download_gate=NoopCnDownloadPdfGate(), ).candidates
 
     assert candidates == ()
     assert events == [
@@ -1295,6 +1377,7 @@ def test_list_report_candidates_calls_same_checkpoint_around_each_period_post() 
         "CP3",
         "POST(category_bndbg_szsh;)",
         "CP4",
+        "CP5",
     ]
 
 
@@ -1327,6 +1410,8 @@ def test_list_report_candidates_calls_checkpoint_around_every_paginated_post() -
                     "hasMore": page_num == "1",
                 },
             )
+        if request.method == "GET" and request.url.host == "static.cninfo.com.cn":
+            return httpx.Response(200, content=build_synthetic_annual_pdf(2024 if request.url.path == "/page-1.PDF" else 2023))
         if request.method == "HEAD":
             return httpx.Response(200, headers={})
         raise AssertionError(f"unexpected {request}")
@@ -1349,9 +1434,11 @@ def test_list_report_candidates_calls_checkpoint_around_every_paginated_post() -
         query,
         profile,
         cancellation_checkpoint=checkpoint,
-     local_annual_ends=()).candidates
+     local_annual_ends=(), local_cn_annual_pdfs=(), pdf_download_gate=NoopCnDownloadPdfGate(), ).candidates
 
-    assert events == ["CP1", "POST(1)", "CP2", "CP3", "POST(2)", "CP4"]
+    assert events[:6] == ["CP1", "POST(1)", "CP2", "CP3", "POST(2)", "CP4"]
+    assert all(event.startswith("CP") for event in events[6:])
+    assert len(events) == 27
 
 
 @pytest.mark.parametrize(
@@ -1423,7 +1510,7 @@ def test_list_report_candidates_preserves_cancel_identity_and_stops_next_period(
             query,
             profile,
             cancellation_checkpoint=checkpoint,
-         local_annual_ends=()).candidates
+         local_annual_ends=(), local_cn_annual_pdfs=(), pdf_download_gate=NoopCnDownloadPdfGate(), ).candidates
 
     assert exc_info.value is expected
     assert events == expected_events
@@ -1466,7 +1553,7 @@ def test_list_report_candidates_preserves_checkpoint_failure_identity() -> None:
             query,
             profile,
             cancellation_checkpoint=checkpoint,
-         local_annual_ends=()).candidates
+         local_annual_ends=(), local_cn_annual_pdfs=(), pdf_download_gate=NoopCnDownloadPdfGate(), ).candidates
 
     assert exc_info.value is expected
     assert exc_info.value.__cause__ is original
@@ -1477,7 +1564,7 @@ def test_list_report_candidates_preserves_checkpoint_failure_identity() -> None:
 
 
 def _make_candidate(*, source_url: str = "https://example.com/test.pdf") -> CnReportCandidate:
-    return CnReportCandidate(
+    return CnReportCandidate(fiscal_year_source="source_document",
         provider="cninfo",
         source_id="A1",
         source_url=source_url,
@@ -1627,7 +1714,7 @@ def test_download_report_pdf_rejects_non_cninfo_provider() -> None:
         return httpx.Response(200, content=_build_pdf_payload())
 
     client = _build_client(handler)
-    bogus = CnReportCandidate(
+    bogus = CnReportCandidate(fiscal_year_source="title_or_category_inferred",
         provider="hkexnews",
         source_id="X",
         source_url="https://example.com/x.pdf",
@@ -1675,6 +1762,8 @@ def test_announcement_time_milliseconds_is_normalized() -> None:
             return _stock_mapping_response()
         if url_str == CNINFO_QUERY_URL:
             return httpx.Response(200, json=payload)
+        if request.method == "GET" and request.url.host == "static.cninfo.com.cn":
+            return httpx.Response(200, content=build_synthetic_annual_pdf(2024))
         if request.method == "HEAD":
             return httpx.Response(200, headers={})
         raise AssertionError(f"unexpected {request}")
@@ -1688,7 +1777,7 @@ def test_announcement_time_milliseconds_is_normalized() -> None:
         discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
-    candidates = client.list_report_candidates(query, profile, local_annual_ends=()).candidates
+    candidates = client.list_report_candidates(query, profile, local_annual_ends=(), local_cn_annual_pdfs=(), pdf_download_gate=NoopCnDownloadPdfGate(), ).candidates
 
     assert candidates[0].filing_date == "2025-04-03"
 
@@ -1840,7 +1929,7 @@ def test_cninfo_preloop_provider_misuse_makes_zero_http_requests() -> None:
         return httpx.Response(200, content=_build_pdf_payload())
 
     candidate = _make_candidate()
-    invalid = CnReportCandidate(
+    invalid = CnReportCandidate(fiscal_year_source="title_or_category_inferred",
         provider="hkexnews",
         source_id=candidate.source_id,
         source_url=candidate.source_url,
@@ -1923,7 +2012,7 @@ def test_serialize_query_payload_structure_assertion() -> None:
         discovery_periods=("FY",),
     )
     profile = client.resolve_company(query)
-    client.list_report_candidates(query, profile, local_annual_ends=()).candidates
+    client.list_report_candidates(query, profile, local_annual_ends=(), local_cn_annual_pdfs=(), pdf_download_gate=NoopCnDownloadPdfGate(), ).candidates
 
     assert seen_payload["stock"] == "002594,gssz0002594"
     assert seen_payload["column"] == "szse"
@@ -1967,3 +2056,65 @@ def test_form_payload_serialization_round_trip_via_json() -> None:
     payload = json.loads(sample)
     by_code = {item["code"]: item for item in payload["stockList"]}
     assert by_code["002594"]["orgId"] == "gssz0002594"
+
+
+from pathlib import Path
+from tests.fins.test_cn_annual_report_facts import FIXTURES
+from dayu.fins.pipelines.cn_download_models import CnAnnualReportPdf,CnAnnualReportPublication
+from dayu.fins.domain.document_models import SourceDocumentRevision
+
+
+def _official_discovery_client(rows: list[JsonValue],gets: list[str],bad_id: str | None=None) -> CninfoDiscoveryClient:
+    """官方冻结raw/PDF的HTTP owner测试输入，不作为真实网络验收。
+
+    参数：rows为原raw，gets为GET观察，bad_id为原件故障注入。返回：真实downloader。异常：未知请求拒绝。
+    """
+    payloads={str(row['adjunctUrl']):str(row['announcementId']) for row in rows if isinstance(row,dict)}
+    def handler(request: httpx.Request) -> httpx.Response:
+        """参数：真实httpx请求。返回：冻结fixture。异常：未知边界断言失败。"""
+        if str(request.url)==CNINFO_STOCK_JSON_URL:return httpx.Response(200,json={'stockList':[{'code':'601225','orgId':'9900023204','zwjc':'陕西煤业'}]})
+        if str(request.url)==CNINFO_QUERY_URL:
+            category=_read_form(request)['category']
+            return httpx.Response(200,json={'announcements':rows if category=='category_ndbg_szsh;' else [],'hasMore':False})
+        if request.method=='HEAD':return httpx.Response(200,headers={})
+        if request.method=='GET':
+            sid=payloads[request.url.path.lstrip('/')];gets.append(sid)
+            return httpx.Response(200,content=b'%PDF-'+b'0'*2048 if sid==bad_id else (FIXTURES/f'{sid}.pdf').read_bytes())
+        raise AssertionError('unexpected boundary')
+    return _build_client(handler)
+
+
+def _official_rows() -> list[JsonValue]:
+    """参数：无。返回：原19raw。异常：文件/JSON原错误。"""
+    return json.loads((FIXTURES/'annual-raw.response.json').read_bytes())['announcements']
+
+
+def test_official_prepared_assets_selected_only() -> None:
+    """参数：无。返回：无。异常：重复GET、摘要payload泄漏或事实错配断言失败。"""
+    gets:list[str]=[];client=_official_discovery_client(_official_rows(),gets);query=CnReportQuery('CN','601225','2018-01-01','2026-10-12',('FY',))
+    result=client.list_report_candidates(query,client.resolve_company(query),local_annual_ends=(),local_cn_annual_pdfs=(),pdf_download_gate=NoopCnDownloadPdfGate())
+    assert len(gets)==13 and len(set(gets))==13 and len(result.candidates)==len(result.prepared_assets)==9
+    assert result.local_annual_publications==() and result.uncertain_reports==()
+    for asset in result.prepared_assets:
+        assert asset.pdf_bytes==(FIXTURES/f'{asset.candidate.source_id}.pdf').read_bytes()
+        assert asset.content_length==len(asset.pdf_bytes)
+
+
+@pytest.mark.parametrize('case',('duplicate','bad_unselected','local_locator'))
+def test_official_discovery_boundaries(case: str) -> None:
+    """参数：raw重复、落选坏原件或同source不同locator。返回：无。异常：边界失效断言失败。"""
+    rows=_official_rows();gets:list[str]=[]
+    if case=='duplicate':rows.append(rows[0])
+    client=_official_discovery_client(rows,gets,'1204545056' if case=='bad_unselected' else None)
+    query=CnReportQuery('CN','601225','2018-01-01','2026-10-12',('FY',));profile=client.resolve_company(query)
+    local: tuple[CnAnnualReportPdf, ...]=() if case!='local_locator' else (CnAnnualReportPdf(CnAnnualReportPublication('cninfo','1213161683','doc',SourceDocumentRevision('r')),'opaque old locator',(FIXTURES/'1213161683.pdf').read_bytes()),)
+    if case=='local_locator':
+        result=client.list_report_candidates(query,profile,local_annual_ends=(),local_cn_annual_pdfs=local,pdf_download_gate=NoopCnDownloadPdfGate())
+        assert '1213161683' not in gets
+        assert len(result.local_annual_publications)==1
+        assert result.local_annual_publications[0].source_id=='1213161683'
+        assert len(result.prepared_assets)==8
+    else:
+        with pytest.raises(FinsDownloadProviderError) as raised:client.list_report_candidates(query,profile,local_annual_ends=(),local_cn_annual_pdfs=local,pdf_download_gate=NoopCnDownloadPdfGate())
+        assert raised.value.transport_category is FinsDownloadTransportCategory.PROTOCOL and raised.value.retryable is False
+        if case=='duplicate':assert gets==[]

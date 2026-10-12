@@ -3,7 +3,7 @@
 - 基线：7637bb0b4fbca212a4db0f4cfc09655e66516695。
 - 分支：fix/601225-annual-fulltext；目标 artifact：601225-annual-fulltext-goal-confirmation-20261012.md。
 - goal confirmation：用户已确认，pass；补充财年官方证据、不伪造历史 raw、不扩日期重构约束。
-- current gate / next entry point：accepted plan commit。
+- current gate / next entry point：accepted slice commit。
 - plan：Sol runner 实际退出0，completed；产物 601225-annual-fulltext-plan.md、601225-annual-fulltext-root-cause-evidence.md 已核对，单行为slice S1。计划 SHA256 843b4a880fb6fd36b755f2efa2b33ec169f77f6e95824fed67100a93ffecfd79，待双路review。
 - plan runner：validation_status=needs_review，5条工具异常为探索命令/早期replay错误；已检查最终v2重放及基线验证证据，未见影响当前结论的缺项，不代表计划已接受。
 - 基线验证：激活 .venv 后 pyright 退出 0，0 errors/0 warnings；日志 workspace/tmp/601225-pyright-baseline.log。
@@ -20,3 +20,21 @@
 - completed：false；未 merge；未操作其他任务。
 
 - r3 re-review：两runner实际退出0/completed，163103/163104均pass；全finding最终状态已回写plan-final-adjudication.md。plan gate pass，下一步accepted plan commit→implementation S1；真实验证尚未执行。
+
+- accepted plan commit：7709c015（本地checkpoint）；implementation S1交Sol runner，之后双路deepreview code review。生产基线仍7637bb0，未push/PR/merge。
+
+- implementation S1在途：Sol runner session16390，完整句柄workspace/tmp/601225-runner-handles.json；当前代码/README/fixture已落地，checks artifact为s1-checks.md，最新final-2受影响集731 passed、逐修改文件coverage>=80%、pyright/pipcheck/pypdf6.1.3实际退出0。当前尚无slice commit/正式code review/PR。
+- 真实CLI：独立workspace/tmp/601225-cli-s1，clean-01/seeded-01仍运行，clean-02/seeded-02未完成；不得以局部目标落盘放行。总控实际从仓储读取三目标，clean与seeded均验证官方SHA、FY2021/2023/2024/full、真实Docling有正文；seed两摘要meta/revision/两资产SHA中途比对均不变。独立核验JSON在workspace/tmp/601225-controller-*target*.json及live-summary-preservation.json。正式最终verify/compare/原argvexit/HTTP证据仍须完整复核。
+- 版本边界：首轮CLI在HEAD7709c015的实施工作树运行，不能冒充该HEAD已含代码；总控保留启动后生产hash清单controller-clean-start-code-hashes.json。执行期间后续生产变化须在验收裁决核对，不自称启动冻结版本。
+
+- implementation S1交付：Sol实际退出0/completed，s1-controller-validation.md已完成实际证据复核。四CLI/全部verify/compare通过，731 tests及类型/逐文件覆盖率通过；下一入口code review S1。没有accepted slice commit，completed仍false。
+
+- code review S1：两runner实际退出0/completed；MiMo184158两finding、DS184159无实质finding。总控adjudication已写，两项accepted未修复，转Sol fix r1→双路re-review；无accepted slice commit。
+
+- code fix r1：Sol实际退出0/completed，artifact已完整读取；758测试/类型/coverage、两套35pair replay与两真实repeat通过。原FILING_STARTED未落盘，replay以真实file-start/终态同序为证，不伪造事件。两accepted状态待同版复审；下一入口re-review r1，无slice commit。
+
+- r1 DS Flash复审：实际退出0，artifact194843，两accepted均已修复，无新实质finding。总控已读；额外注记待最终risk分类，不能单路替双路pass。
+- r1原MiMo：实际退出0，但仅回复继续核对，无要求artifact194842/最终finding结论；任务交付不完整，不能按runner机械passed放行。原日志保留，未kill或打断。
+- 2026-10-12用户明确“mimo改为mimo-flash”：后续对应review使用mimo-flash；DS Flash保持。新外部runner76340补本路同版r1复审，artifact210515；输入54文件启动前均hash一致。当前gate仍re-review S1 r1。
+
+- r1复审最终：DS194843/mimo-flash210515实际exit0、完整artifact已读；MiMo01/02 accepted已修复，无新实质finding/open question。risk已统一分类至code-rereview-final-adjudication，53冻结实现/证据文件不变，gate pass。下一入口accepted slice commit→aggregate deepreview；未PR/merge、completed false。

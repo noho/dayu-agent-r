@@ -1,6 +1,9 @@
 """CN/HK download runtime 接入测试。"""
 
 from __future__ import annotations
+from dayu.fins.pipelines.cn_download_models import CnAnnualReportPdf
+from dayu.fins.pipelines.cn_download_pdf_gate import CnDownloadPdfGateProtocol, NoopCnDownloadPdfGate
+from tests.fins.test_cn_annual_report_facts import build_synthetic_annual_pdf
 
 from dayu.fins.storage import FsBatchingRepository, FsCompanyMetaRepository, FsSourceDocumentRepository, FsDocumentBlobRepository, FsFilingMaintenanceRepository, FsFilingUploadStateRepository, FsProcessedDocumentRepository
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
@@ -97,11 +100,10 @@ from dayu.fins.storage import (
     SourceMetaReadView,
     SourceDocumentRepositoryProtocol,
 )
-from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
 from dayu.fins.ticker_normalization import Exchange, NormalizedTicker
 from dayu.fins.pipelines.cn_download_workflow import CnDownloadIntegrityAbort
 
-_PDF_BYTES = b"%PDF-1.7\n" + b"1" * 2048
+_PDF_BYTES = build_synthetic_annual_pdf(2024)
 _DOCLING_BYTES = b'{"document": "runtime-ok"}'
 
 
@@ -267,7 +269,7 @@ class _RuntimeFakeDiscoveryClient:
         query: CnReportQuery,
         profile: CnCompanyProfile,
         *,
-        local_annual_ends: tuple[date, ...],
+        local_annual_ends: tuple[date, ...], local_cn_annual_pdfs: tuple[CnAnnualReportPdf, ...], pdf_download_gate: CnDownloadPdfGateProtocol,
         cancellation_checkpoint: Callable[[], None] | None = None,
     ) -> CnReportDiscoveryResult:
         """返回固定年度报告候选。
@@ -290,8 +292,8 @@ class _RuntimeFakeDiscoveryClient:
             cancellation_checkpoint()
         fiscal_year = 2025 if query.market == "CN" else 2024
         filing_date = "2026-04-01" if query.market == "CN" else "2025-04-08"
-        return CnReportDiscoveryResult(candidates=(
-            CnReportCandidate(
+        return CnReportDiscoveryResult(prepared_assets=(), local_annual_publications=(), candidates=(
+            CnReportCandidate(fiscal_year_source="source_document" if query.market == "CN" else "title_or_category_inferred",
                 provider="hkexnews" if query.market == "HK" else "cninfo",
                 source_id=self.source_id,
                 source_url=f"https://download.test/{self.source_id}.pdf",
@@ -321,11 +323,12 @@ class _RuntimeFakeDiscoveryClient:
         """
 
         self.download_calls += 1
+        payload = build_synthetic_annual_pdf(candidate.fiscal_year)
         return DownloadedReportAsset(
             candidate=candidate,
-            pdf_bytes=_PDF_BYTES,
-            sha256=hashlib.sha256(_PDF_BYTES).hexdigest(),
-            content_length=len(_PDF_BYTES),
+            pdf_bytes=payload,
+            sha256=hashlib.sha256(payload).hexdigest(),
+            content_length=len(payload),
             downloaded_at="2026-05-02T00:00:00+00:00",
         )
 
@@ -1648,7 +1651,7 @@ def test_cn_real_phase_b_abort_keeps_published_document_in_result_and_job(
         query: CnReportQuery,
         profile: CnCompanyProfile,
         *,
-        local_annual_ends: tuple[date, ...],
+        local_annual_ends: tuple[date, ...], local_cn_annual_pdfs: tuple[CnAnnualReportPdf, ...], pdf_download_gate: CnDownloadPdfGateProtocol,
         cancellation_checkpoint: Callable[[], None] | None = None,
     ) -> CnReportDiscoveryResult:
         """返回两个不同文档 ID 的候选。
@@ -1665,8 +1668,8 @@ def test_cn_real_phase_b_abort_keeps_published_document_in_result_and_job(
             无。
         """
 
-        first = original_list(query, profile, cancellation_checkpoint=cancellation_checkpoint, local_annual_ends=local_annual_ends).candidates[0]
-        return CnReportDiscoveryResult(candidates=(first, replace(first, source_id="cn-runtime-b2", fiscal_year=2024, filing_date="2025-04-01")), uncertain_reports=())
+        first = original_list(query, profile, cancellation_checkpoint=cancellation_checkpoint, local_annual_ends=local_annual_ends, local_cn_annual_pdfs=(), pdf_download_gate=NoopCnDownloadPdfGate(), ).candidates[0]
+        return CnReportDiscoveryResult(prepared_assets=(), local_annual_publications=(), candidates=(first, replace(first, source_id="cn-runtime-b2", fiscal_year=2024, filing_date="2025-04-01")), uncertain_reports=())
 
     def download_second_with_stray(candidate: CnReportCandidate) -> DownloadedReportAsset:
         """在第二候选 Phase A 后创建未发布 exact target。
@@ -1770,7 +1773,7 @@ def test_hk_real_commit_preflight_uses_same_partial_failure_route(
         query: CnReportQuery,
         profile: CnCompanyProfile,
         *,
-        local_annual_ends: tuple[date, ...],
+        local_annual_ends: tuple[date, ...], local_cn_annual_pdfs: tuple[CnAnnualReportPdf, ...], pdf_download_gate: CnDownloadPdfGateProtocol,
         cancellation_checkpoint: Callable[[], None] | None = None,
     ) -> CnReportDiscoveryResult:
         """给 HK 来源增加第二个不同年份的候选。
@@ -1787,8 +1790,8 @@ def test_hk_real_commit_preflight_uses_same_partial_failure_route(
             无。
         """
 
-        first = original_list(query, profile, cancellation_checkpoint=cancellation_checkpoint, local_annual_ends=local_annual_ends).candidates[0]
-        return CnReportDiscoveryResult(candidates=(first, replace(first, source_id="hk-runtime-b2", fiscal_year=2023, filing_date="2024-04-08")), uncertain_reports=())
+        first = original_list(query, profile, cancellation_checkpoint=cancellation_checkpoint, local_annual_ends=local_annual_ends, local_cn_annual_pdfs=(), pdf_download_gate=NoopCnDownloadPdfGate(), ).candidates[0]
+        return CnReportDiscoveryResult(prepared_assets=(), local_annual_publications=(), candidates=(first, replace(first, source_id="hk-runtime-b2", fiscal_year=2023, filing_date="2024-04-08")), uncertain_reports=())
 
     def root_stray_after_first(candidate: CnReportCandidate) -> DownloadedReportAsset:
         """在第二次真实 commit 的 whole-tree 校验前创建 root 外来文件。
@@ -1901,7 +1904,7 @@ def test_cn_post_repair_abort_then_same_request_skips_complete_source_and_downlo
         query: CnReportQuery,
         profile: CnCompanyProfile,
         *,
-        local_annual_ends: tuple[date, ...],
+        local_annual_ends: tuple[date, ...], local_cn_annual_pdfs: tuple[CnAnnualReportPdf, ...], pdf_download_gate: CnDownloadPdfGateProtocol,
         cancellation_checkpoint: Callable[[], None] | None = None,
     ) -> CnReportDiscoveryResult:
         """从中止请求起提供原候选及尚未发布的第二候选。
@@ -1918,8 +1921,8 @@ def test_cn_post_repair_abort_then_same_request_skips_complete_source_and_downlo
             无。
         """
 
-        first_candidate = original_candidates(query, profile, cancellation_checkpoint=cancellation_checkpoint, local_annual_ends=local_annual_ends).candidates[0]
-        return CnReportDiscoveryResult(candidates=(
+        first_candidate = original_candidates(query, profile, local_cn_annual_pdfs=local_cn_annual_pdfs, pdf_download_gate=pdf_download_gate, cancellation_checkpoint=cancellation_checkpoint, local_annual_ends=local_annual_ends).candidates[0]
+        return CnReportDiscoveryResult(prepared_assets=(), local_annual_publications=(), candidates=(
             first_candidate,
             replace(first_candidate, source_id="cn-runtime-b2", fiscal_year=2024, filing_date="2025-04-01"),
         ), uncertain_reports=())
@@ -1970,7 +1973,7 @@ def test_cn_post_repair_abort_then_same_request_skips_complete_source_and_downlo
         """
 
         calls.append(1)
-        if len(calls) == 2:
+        if len(calls) == 3:
             (tmp_path / "workspace" / "portfolio" / "600519" / "filings" / "foreign-post-repair.bin").write_bytes(
                 b"foreign"
             )
@@ -2014,7 +2017,7 @@ def test_cn_post_repair_abort_then_same_request_skips_complete_source_and_downlo
         assert record.result_summary["failed_count"] == 0
         assert record.result_summary["written_document_ids"] == [document_id]
         assert record.failure_summary["message"] == "本地来源完整性预检失败"
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert downloaded_sources == ["cn-runtime-a1"]
     assert not second_target.exists()
     assert pdf_path.read_bytes() == original_pdf
@@ -2088,7 +2091,7 @@ def test_cn_post_repair_real_second_source_revision_conflict_preserves_public_su
         query: CnReportQuery,
         profile: CnCompanyProfile,
         *,
-        local_annual_ends: tuple[date, ...],
+        local_annual_ends: tuple[date, ...], local_cn_annual_pdfs: tuple[CnAnnualReportPdf, ...], pdf_download_gate: CnDownloadPdfGateProtocol,
         cancellation_checkpoint: Callable[[], None] | None = None,
     ) -> CnReportDiscoveryResult:
         """返回两份身份财期不同且都会被选中的真实仓储候选。
@@ -2105,8 +2108,8 @@ def test_cn_post_repair_real_second_source_revision_conflict_preserves_public_su
             无。
         """
 
-        first = original_candidates(query, profile, cancellation_checkpoint=cancellation_checkpoint, local_annual_ends=local_annual_ends).candidates[0]
-        return CnReportDiscoveryResult(candidates=(first, replace(first, source_id="cn-runtime-b2", fiscal_year=2024, filing_date="2025-04-01")), uncertain_reports=())
+        first = original_candidates(query, profile, local_cn_annual_pdfs=local_cn_annual_pdfs, pdf_download_gate=pdf_download_gate, cancellation_checkpoint=cancellation_checkpoint, local_annual_ends=local_annual_ends).candidates[0]
+        return CnReportDiscoveryResult(prepared_assets=(), local_annual_publications=(), candidates=(first, replace(first, source_id="cn-runtime-b2", fiscal_year=2024, filing_date="2025-04-01")), uncertain_reports=())
 
     monkeypatch.setattr(discovery, "list_report_candidates", list_two)
     request = build_fins_download_request(
@@ -2153,11 +2156,11 @@ def test_cn_post_repair_real_second_source_revision_conflict_preserves_public_su
         """
 
         calls.append(1)
-        if len(calls) == 2:
+        if len(calls) == 3:
             assert repair_pdf.read_bytes() == original_repair
             second_pdf.write_bytes(original_second + b"-revision-changed")
         inventory = real_list(ticker)
-        if len(calls) == 2:
+        if len(calls) == 3:
             second_statuses.extend(item.status for item in inventory if item.document_id == second_id)
         return inventory
 
@@ -2207,7 +2210,7 @@ def test_cn_post_repair_real_second_source_revision_conflict_preserves_public_su
         assert record.result_summary["omitted_written_document_count"] == 0
         assert record.failure_summary == {"message": "本地来源仍需修复，本次下载已停止"}
     _assert_cn_original_integrity_chain(observer, repair_required=True)
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert second_statuses == [SourceIntegrityStatus.REPAIR_REQUIRED]
     assert repair_pdf.read_bytes() == original_repair
     assert second_pdf.read_bytes() == original_second + b"-revision-changed"
@@ -2299,12 +2302,12 @@ class _RuntimeTwoIdentityCandidates:
 
     def __call__(
         self, query: CnReportQuery, profile: CnCompanyProfile, *,
-        local_annual_ends: tuple[date, ...],
+        local_annual_ends: tuple[date, ...], local_cn_annual_pdfs: tuple[CnAnnualReportPdf, ...], pdf_download_gate: CnDownloadPdfGateProtocol,
         cancellation_checkpoint: Callable[[], None] | None = None,
     ) -> CnReportDiscoveryResult:
         """返回两个候选。参数：query/profile/cancellation_checkpoint 为原输入。返回：两年度候选。异常：原取消异常。"""
-        first = self.original(query, profile, cancellation_checkpoint=cancellation_checkpoint, local_annual_ends=local_annual_ends).candidates[0]
-        return CnReportDiscoveryResult(candidates=(first, replace(first, source_id="next-year", fiscal_year=2023, filing_date="2024-04-08")), uncertain_reports=())
+        first = self.original(query, profile, local_cn_annual_pdfs=local_cn_annual_pdfs, pdf_download_gate=pdf_download_gate, cancellation_checkpoint=cancellation_checkpoint, local_annual_ends=local_annual_ends).candidates[0]
+        return CnReportDiscoveryResult(prepared_assets=(), local_annual_publications=(), candidates=(first, replace(first, source_id="next-year", fiscal_year=2023, filing_date="2024-04-08")), uncertain_reports=())
 
 
 class _RuntimeIdentityWindowCorruption:
@@ -2433,15 +2436,15 @@ class _ThreeCnIntegrityCandidates:
         self.original = discovery.list_report_candidates
 
     def __call__(self, query: CnReportQuery, profile: CnCompanyProfile, *,
-        local_annual_ends: tuple[date, ...],
+        local_annual_ends: tuple[date, ...], local_cn_annual_pdfs: tuple[CnAnnualReportPdf, ...], pdf_download_gate: CnDownloadPdfGateProtocol,
         cancellation_checkpoint: Callable[[], None] | None = None) -> CnReportDiscoveryResult:
         """返回三个年度候选。
 
         参数：query/profile 为真实输入；cancellation_checkpoint 为取消检查。
         返回：2025/2024/2023 候选。异常：原检查异常原样传播。
         """
-        first = self.original(query, profile, cancellation_checkpoint=cancellation_checkpoint, local_annual_ends=local_annual_ends).candidates[0]
-        return CnReportDiscoveryResult(candidates=(first, replace(first, source_id="integrity-second", fiscal_year=2024, filing_date="2025-04-01"),
+        first = self.original(query, profile, local_cn_annual_pdfs=local_cn_annual_pdfs, pdf_download_gate=pdf_download_gate, cancellation_checkpoint=cancellation_checkpoint, local_annual_ends=local_annual_ends).candidates[0]
+        return CnReportDiscoveryResult(prepared_assets=(), local_annual_publications=(), candidates=(first, replace(first, source_id="integrity-second", fiscal_year=2024, filing_date="2025-04-01"),
             replace(first, source_id="integrity-tail", fiscal_year=2023, filing_date="2024-04-01")), uncertain_reports=())
 
 
@@ -2659,7 +2662,7 @@ class _DiagnosticsCandidateMetadata:
 
         self.delegate = discovery.list_report_candidates
 
-    def __call__(self, query: CnReportQuery, profile: CnCompanyProfile, *, local_annual_ends: tuple[date, ...], cancellation_checkpoint: Callable[[], None] | None = None) -> CnReportDiscoveryResult:
+    def __call__(self, query: CnReportQuery, profile: CnCompanyProfile, *, local_annual_ends: tuple[date, ...], local_cn_annual_pdfs: tuple[CnAnnualReportPdf, ...], pdf_download_gate: CnDownloadPdfGateProtocol, cancellation_checkpoint: Callable[[], None] | None = None) -> CnReportDiscoveryResult:
         """在 discovery 边界补入来源明确提供的报告日和覆盖期间。
 
         参数：query 为包含市场、表单和日期窗口的报告查询；profile 为公司元数据；
@@ -2671,7 +2674,7 @@ class _DiagnosticsCandidateMetadata:
             TypeError / ValueError，期间投影构造违反类型或覆盖期间契约时抛出。
         """
 
-        original = self.delegate(query, profile, local_annual_ends=local_annual_ends, cancellation_checkpoint=cancellation_checkpoint)
+        original = self.delegate(query, profile, local_annual_ends=local_annual_ends, cancellation_checkpoint=cancellation_checkpoint, local_cn_annual_pdfs=(), pdf_download_gate=NoopCnDownloadPdfGate(), )
         return replace(original, candidates=tuple(replace(candidate,
             report_date="2024-12-31" if candidate.provider == "hkexnews" else "2025-12-31",
             period_projection=CnReportPeriodProjection(identity_period="FY", covered_periods=("FY", "Q4") if candidate.provider == "hkexnews" else ("FY",)))
@@ -2691,7 +2694,7 @@ class _DiagnosticsChangedHkCoverage:
 
         self.delegate = discovery.list_report_candidates
 
-    def __call__(self, query: CnReportQuery, profile: CnCompanyProfile, *, local_annual_ends: tuple[date, ...], cancellation_checkpoint: Callable[[], None] | None = None) -> CnReportDiscoveryResult:
+    def __call__(self, query: CnReportQuery, profile: CnCompanyProfile, *, local_annual_ends: tuple[date, ...], local_cn_annual_pdfs: tuple[CnAnnualReportPdf, ...], pdf_download_gate: CnDownloadPdfGateProtocol, cancellation_checkpoint: Callable[[], None] | None = None) -> CnReportDiscoveryResult:
         """在 discovery 边界改变 HK 已知覆盖，保留原候选身份。
 
         参数：query 为包含市场、表单和日期窗口的报告查询；profile 为公司元数据；
@@ -2703,7 +2706,7 @@ class _DiagnosticsChangedHkCoverage:
             TypeError / ValueError，期间投影构造违反类型或覆盖期间契约时抛出。
         """
 
-        original = self.delegate(query, profile, local_annual_ends=local_annual_ends, cancellation_checkpoint=cancellation_checkpoint)
+        original = self.delegate(query, profile, local_annual_ends=local_annual_ends, cancellation_checkpoint=cancellation_checkpoint, local_cn_annual_pdfs=(), pdf_download_gate=NoopCnDownloadPdfGate(), )
         return replace(original, candidates=tuple(replace(candidate, period_projection=CnReportPeriodProjection(identity_period="FY", covered_periods=("FY", "Q4"))) for candidate in original.candidates))
 
 
@@ -2893,3 +2896,31 @@ def test_cn_reason_owner_strictly_rejects_missing_empty_unsafe(tmp_path: Path, e
             cn_pipeline_module._summary_from_integrity_abort(result, request=request, source_repository=repository, uncertain_reports=())
         else:
             cn_pipeline_module._summary_from_pipeline_result(result, request=request, source_repository=repository)
+
+
+from tests.fins.test_cninfo_downloader import _official_discovery_client,_official_rows
+
+
+@pytest.mark.parametrize('entry',('direct','job'))
+def test_annual_discovery_failure_public_scope(tmp_path: Path,monkeypatch: pytest.MonkeyPatch,entry: str) -> None:
+    """参数：真实runtime入口。返回：无。异常：发现失败变成空成功/partial或写入断言失败。"""
+    runtime,cn,hk,converter=_build_runtime_with_cn_hk_adapters(tmp_path)
+    gets:list[str]=[];actual=_official_discovery_client(_official_rows(),gets,'1204545056')
+    monkeypatch.setattr(cn,'resolve_company',actual.resolve_company);monkeypatch.setattr(cn,'list_report_candidates',actual.list_report_candidates)
+    request=build_fins_download_request(ticker='601225.SH',start='2018-01-01',end='2026-10-12')
+    if entry=='direct':
+        events=asyncio.run(_collect_diagnostics_runtime(runtime,request));result=events[-1].result
+        assert result is not None and result.status is FinsResultStatus.FAILURE and result.failure is not None
+        failure=result.failure
+    else:
+        job=runtime.start_download(request);record=runtime.read_job(job.job_id)
+        assert record.status is FinsIngestionJobStatus.FAILED
+        assert record.failure_summary=={'message':'巨潮年度报告原文无法确认财年或全文性质'}
+        assert record.result_summary=={} and converter.calls==cn.download_calls==0
+        assert runtime.source_repository.list_source_document_ids('601225',SourceKind.FILING)==[]
+        return
+    assert failure is not None and failure.kind is FinsPublicFailureKind.PROVIDER_TRANSPORT
+    assert failure.source is FinsDownloadSource.CNINFO and failure.transport_category is FinsDownloadTransportCategory.PROTOCOL
+    assert failure.safe_message=='巨潮年度报告原文无法确认财年或全文性质'
+    assert converter.calls==cn.download_calls==0
+    assert runtime.source_repository.list_source_document_ids('601225',SourceKind.FILING)==[]

@@ -28,7 +28,9 @@ from dayu.fins.download_contract import (
     FinsDownloadSource,
     FinsDownloadTransportCategory,
 )
+from dayu.fins.pipelines.cn_download_pdf_gate import CnDownloadPdfGateProtocol
 from dayu.fins.pipelines.cn_download_models import (
+    CnAnnualReportPdf,
     CnCompanyProfile,
     CnFiscalPeriod,
     CnLanguage,
@@ -275,6 +277,8 @@ class HkexnewsDiscoveryClient:
         profile: CnCompanyProfile,
         *,
         local_annual_ends: tuple[date, ...],
+        local_cn_annual_pdfs: tuple[CnAnnualReportPdf, ...],
+        pdf_download_gate: CnDownloadPdfGateProtocol,
         cancellation_checkpoint: Callable[[], None] | None = None,
     ) -> CnReportDiscoveryResult:
         """列出符合窗口和财期的 HK 报告候选。
@@ -282,6 +286,8 @@ class HkexnewsDiscoveryClient:
         Args:
             query: 单次 download 查询参数。
             profile: ``resolve_company`` 返回的公司元数据。
+            local_cn_annual_pdfs: 同窗 CN 年度原件；HK 必须为空。
+            pdf_download_gate: 年度远端原件 acquisition gate。
             local_annual_ends: 同公司可信本地年度截止日，可为空；与当前窗口远端年度证据合并。
             cancellation_checkpoint: 可选 workflow-owned 无参取消检查点；
                 每个 title search 累计 GET 前和成功响应后调用。
@@ -294,6 +300,8 @@ class HkexnewsDiscoveryClient:
             FinsDownloadProviderError: 任一有效财期来源请求或协议失败时抛出。
         """
 
+        if local_cn_annual_pdfs:
+            raise ValueError("HK discovery 不接受 CN 年度原件")
         if query.market != "HK":
             raise ValueError(f"HkexnewsDiscoveryClient 仅支持 HK，收到 market={query.market!r}")
         if profile.provider != "hkexnews":

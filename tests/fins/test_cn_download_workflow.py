@@ -1,11 +1,15 @@
 """CN/HK download workflow 单元测试。"""
 
 from __future__ import annotations
+from tests.fins.test_cn_annual_report_facts import build_synthetic_annual_pdf
+from dayu.fins.pipelines.cn_download_models import CnAnnualReportPdf
+from dayu.fins.pipelines.cn_download_protocols import CnReportDiscoveryClientProtocol
+from dayu.fins.pipelines.cn_download_pdf_gate import CnDownloadPdfGateProtocol, NoopCnDownloadPdfGate
 
 from dayu.fins.storage import FsBatchingRepository, FsCompanyMetaRepository, FsSourceDocumentRepository, FsDocumentBlobRepository, FsFilingMaintenanceRepository, FsFilingUploadStateRepository, FsProcessedDocumentRepository
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
 
-from dayu.fins.storage import FsMaterialUploadStateRepository
+from dayu.fins.storage import FsMaterialUploadStateRepository, SourceDocumentRepositoryProtocol
 
 import asyncio
 import hashlib
@@ -28,6 +32,7 @@ from dayu.fins.domain.company_meta_contract import (
     CompanyMetaCommitOutcome,
 )
 from dayu.fins.domain.document_models import (
+    SourceDocumentRevision,
     BatchToken,
     DocumentHandle,
     DocumentMeta,
@@ -96,7 +101,7 @@ from dayu.fins.storage._fs_repository_factory import _FsRepositorySet, build_fs_
 from dayu.fins.storage._fs_identity import _FILING_IDENTITY_NAMESPACE, _identity_directory_path
 from tests.fins.test_fins_storage_atomicity import _create_complete_source, _identity_descriptor_file
 
-_PDF_BYTES = b"%PDF-1.7\n" + b"0" * 2048
+_PDF_BYTES = build_synthetic_annual_pdf(2024)
 _DOCLING_BYTES = b'{"document": "ok"}'
 
 
@@ -437,7 +442,7 @@ class _FakeDiscoveryClient:
         query: CnReportQuery,
         profile: CnCompanyProfile,
         *,
-        local_annual_ends: tuple[date, ...],
+        local_annual_ends: tuple[date, ...], local_cn_annual_pdfs: tuple[CnAnnualReportPdf, ...], pdf_download_gate: CnDownloadPdfGateProtocol,
         cancellation_checkpoint: Callable[[], None] | None = None,
     ) -> CnReportDiscoveryResult:
         """返回测试候选。
@@ -463,7 +468,7 @@ class _FakeDiscoveryClient:
             except RuntimeError as exc:
                 self.checkpoint_errors.append(exc)
                 raise
-        return CnReportDiscoveryResult(candidates=self.candidates, uncertain_reports=())
+        return CnReportDiscoveryResult(prepared_assets=(), local_annual_publications=(), candidates=self.candidates, uncertain_reports=())
 
     def download_report_pdf(self, candidate: CnReportCandidate) -> DownloadedReportAsset:
         """返回内存 PDF 下载资产。
@@ -479,11 +484,12 @@ class _FakeDiscoveryClient:
         """
 
         self.download_calls += 1
+        payload = build_synthetic_annual_pdf(candidate.fiscal_year) if self.pdf_bytes == _PDF_BYTES else self.pdf_bytes
         return DownloadedReportAsset(
             candidate=candidate,
-            pdf_bytes=self.pdf_bytes,
-            sha256=hashlib.sha256(self.pdf_bytes).hexdigest(),
-            content_length=len(self.pdf_bytes),
+            pdf_bytes=payload,
+            sha256=hashlib.sha256(payload).hexdigest(),
+            content_length=len(payload),
             downloaded_at="2026-05-02T00:00:00+00:00",
         )
 
@@ -873,7 +879,7 @@ def _candidate(
         无。
     """
 
-    return CnReportCandidate(
+    return CnReportCandidate(fiscal_year_source="source_document" if provider == "cninfo" and fiscal_period == "FY" else "title_or_category_inferred",
         provider=provider,
         source_id=source_id,
         source_url=f"https://static.cninfo.test/{source_id}.pdf",
@@ -895,8 +901,8 @@ def _candidate(
 def _build_pipeline(
     *,
     tmp_path: Path,
-    discovery: _FakeDiscoveryClient,
-    hk_discovery: _FakeDiscoveryClient | None = None,
+    discovery: CnReportDiscoveryClientProtocol,
+    hk_discovery: CnReportDiscoveryClientProtocol | None = None,
     converter: DoclingConverter,
     pdf_download_gate: CnDownloadPdfGateProtocol | None = None,
     repository_set: _FsRepositorySet | None = None,
@@ -1136,7 +1142,7 @@ async def _collect_single_filing_events_async(
     """
 
     events: list[DownloadEvent] = []
-    async for event in _cn_download_filing_workflow.run_cn_download_single_filing_stream(
+    async for event in _cn_download_filing_workflow.run_cn_download_single_filing_stream(prepared_asset=None, local_annual_publication=None,
         batching_repository=pipeline.batching_repository,
         source_repository=pipeline.source_repository,
         blob_repository=pipeline.blob_repository,
@@ -1834,7 +1840,7 @@ def test_cn_replacement_separates_company_and_document_transactions(
     assert batching_repository.rollback_calls == rollback_calls + 1
 
 
-def test_cn_complete_phase_a_skips_transport_without_source_mutation(tmp_path: Path) -> None:
+def test_cn_different_complete_source_is_preserved_and_new_source_downloaded(tmp_path: Path) -> None:
     """完整正文缓存面对合成全文候选时保留旧来源和文件，且不打开 source batch。
 
     Args:
@@ -1891,13 +1897,13 @@ def test_cn_complete_phase_a_skips_transport_without_source_mutation(tmp_path: P
     batch_ids = {batch_id for _, batch_id in batching_repository.phases}
     summary = result["summary"]
     assert isinstance(summary, dict)
-    assert summary["skipped"] == 1
-    assert phases == ["begin", "rollback"]
-    assert len(batch_ids) == 1
-    assert batching_repository.begin_calls == begin_calls + 1
-    assert batching_repository.commit_calls == commit_calls
+    assert summary["downloaded"] == 1
+    assert phases.count("begin") == 2 and phases.count("commit") == 1
+    assert len(batch_ids) == 2
+    assert batching_repository.begin_calls == begin_calls + 2
+    assert batching_repository.commit_calls == commit_calls + 1
     assert batching_repository.rollback_calls == rollback_calls + 1
-    assert discovery.download_calls == download_calls
+    assert discovery.download_calls == download_calls + 1
     assert source_repository.get_source_meta("600519", document_id, SourceKind.FILING) == old_meta
     assert blob_repository.read_file_bytes(handle, f"{document_id}.pdf") == old_pdf
 
@@ -2138,7 +2144,7 @@ def test_cn_replacement_success_exposes_source_blobs_and_processed_marker_togeth
     replacement_pdf = _PDF_BYTES + b"replacement"
     discovery.pdf_bytes = replacement_pdf
     new_candidate = replace(
-        _candidate(source_id="A2", etag='"v2"'),
+        _candidate(source_id="A1", etag='"v2"'),
         title="合成测试：2024年年度报告全文",
         content_length=len(replacement_pdf),
     )
@@ -3116,7 +3122,7 @@ def test_cn_post_repair_real_preflight_keeps_confirmed_repair_and_old_company(
         """
 
         calls.append(1)
-        if len(calls) == 2:
+        if len(calls) == 3:
             (tmp_path / "portfolio" / "600519" / "filings" / "foreign-after-repair.bin").write_bytes(b"foreign")
         return real_list(ticker)
 
@@ -3145,7 +3151,7 @@ def test_cn_post_repair_real_preflight_keeps_confirmed_repair_and_old_company(
     with pytest.raises(_cn_download_workflow.CnDownloadIntegrityAbort) as exc_info:
         asyncio.run(consume())
     abort = exc_info.value
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert isinstance(abort.cause, SourceIntegrityPreflightError)
     assert abort.cause.reason is SourceIntegrityPreflightReason.UNSAFE_PUBLICATION
     rows = abort.result["filings"]
@@ -3447,7 +3453,7 @@ def test_cn_post_repair_real_second_selected_source_conflict_preserves_first_row
         """
 
         calls.append(1)
-        if len(calls) == 2:
+        if len(calls) == 3:
             second_pdf.write_bytes(second_pdf.read_bytes() + b"-new-corruption")
         return real_list(ticker)
 
@@ -3455,7 +3461,7 @@ def test_cn_post_repair_real_second_selected_source_conflict_preserves_first_row
     with pytest.raises(_cn_download_workflow.CnDownloadIntegrityAbort) as exc_info:
         _collect_events(pipeline, start_is_explicit=True)
     abort = exc_info.value
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert isinstance(abort.cause, SourceIntegrityRepairRequiredError)
     assert abort.__cause__ is abort.cause
     rows = abort.result["filings"]
@@ -3465,10 +3471,16 @@ def test_cn_post_repair_real_second_selected_source_conflict_preserves_first_row
     assert company_path.read_bytes() == old_company
 
 
+@pytest.mark.parametrize("failure_kind", ("provider", "conversion", "cancel"))
 def test_cn_selected_repair_transport_failure_preserves_old_company_and_source(
     tmp_path: Path,
+    failure_kind: str,
 ) -> None:
-    """selected repair 的 PDF 失败由 filing owner 收口，且 company/source 全保持 old。"""
+    """稳定 repair 的失败和取消保原原因，关闸保旧公司/来源且不启动 tail。
+
+    参数：tmp_path 为隔离仓储；failure_kind 为 provider、转换或取消。
+    返回：无。异常：AssertionError 表示原因被完整性检查遮蔽或后续候选被启动。
+    """
 
     initial_discovery = _FakeDiscoveryClient(temp_dir=tmp_path, candidates=(_candidate(),))
     initial_pipeline = _build_pipeline(
@@ -3496,20 +3508,36 @@ def test_cn_selected_repair_transport_failure_preserves_old_company_and_source(
     old_meta = meta_path.read_bytes()
     pdf_path = source_dir / f"{document_id}.pdf"
     pdf_path.unlink()
+    tail = _candidate(source_id="tail", fiscal_year=2025)
+    discovery = (_FailingDownloadDiscoveryClient if failure_kind == "provider" else _FakeDiscoveryClient)(
+        temp_dir=tmp_path, candidates=(tail, candidate),
+        pdf_bytes=_PDF_BYTES if failure_kind == "provider" else _PDF_BYTES + b"\n%new conversion input",
+    )
+    converter = _FailingConverter(
+        DoclingConversionCancelledError() if failure_kind == "cancel" else RuntimeError("repair conversion failed"),
+    )
     failing_pipeline = _build_pipeline(
         tmp_path=tmp_path,
-        discovery=_FailingDownloadDiscoveryClient(
-            temp_dir=tmp_path,
-            candidates=(candidate,),
-        ),
-        converter=_FakeConverter(),
+        discovery=discovery,
+        converter=converter,
     )
 
-    result = _final_result(_collect_events(failing_pipeline, start_is_explicit=True))
+    events = _collect_events(failing_pipeline, start_is_explicit=True)
+    result = _final_result(events)
 
     summary = result["summary"]
     assert isinstance(summary, dict)
-    assert summary["failed"] == 1
+    assert [event.payload["source_id"] for event in events if event.event_type is DownloadEventType.FILING_STARTED] == [candidate.source_id]
+    assert discovery.download_calls == 1
+    assert converter.calls == (0 if failure_kind == "provider" else 1)
+    assert result["status"] == ("cancelled" if failure_kind == "cancel" else "ok")
+    assert summary["failed"] == (0 if failure_kind == "cancel" else 1)
+    if failure_kind != "cancel":
+        rows = result["filings"]
+        assert isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict)
+        expected_failure = RuntimeError("forced PDF download failure" if failure_kind == "provider" else "repair conversion failed")
+        reason, message = _cn_download_filing_workflow.project_cn_filing_failure(expected_failure)
+        assert rows[0]["reason_code"] == reason and rows[0]["reason_message"] == message
     assert failing_pipeline._company_repository.get_company_meta("600519") == old_company
     assert meta_path.read_bytes() == old_meta
     assert pdf_path.exists() is False
@@ -3937,14 +3965,14 @@ def test_cn_parent_leak_catch_reuses_filing_owner_pair_and_continues(
         discovery=discovery,
         converter=_FakeConverter(),
     )
-    original_get_source_meta = pipeline.source_repository.get_source_meta
+    original_phase_a = _cn_download_filing_workflow._read_cn_annual_phase_a
     source_meta_calls = 0
 
     def fail_first_source_meta(
         ticker: str,
         document_id: str,
-        source_kind: SourceKind,
-    ) -> DocumentMeta:
+        source_repository: SourceDocumentRepositoryProtocol,
+    ) -> tuple[SourceIntegrityClassification, dict[str, JsonValue] | None]:
         """第一次读取抛出预构造异常，之后调用真实仓储。
 
         Args:
@@ -3962,13 +3990,13 @@ def test_cn_parent_leak_catch_reuses_filing_owner_pair_and_continues(
 
         nonlocal source_meta_calls
         source_meta_calls += 1
-        if source_meta_calls == 1:
+        if source_meta_calls == 2:
             raise failure
-        return original_get_source_meta(ticker, document_id, source_kind)
+        return original_phase_a(ticker, document_id, source_repository)
 
     monkeypatch.setattr(
-        pipeline.source_repository,
-        "get_source_meta",
+        _cn_download_filing_workflow,
+        "_read_cn_annual_phase_a",
         fail_first_source_meta,
     )
     projection_spy = _FilingFailureProjectionSpy(delegate=_cn_download_filing_workflow.project_cn_filing_failure)
@@ -4175,7 +4203,7 @@ def test_cn_inner_generator_close_before_conversion_leaves_no_document(tmp_path:
 
         stream = cast(
             AsyncGenerator[DownloadEvent, None],
-            _cn_download_filing_workflow.run_cn_download_single_filing_stream(
+            _cn_download_filing_workflow.run_cn_download_single_filing_stream(prepared_asset=None, local_annual_publication=None,
                 batching_repository=batching_repository,
                 source_repository=source_repository,
                 blob_repository=blob_repository,
@@ -4361,13 +4389,13 @@ def test_cn_workflow_maps_bool_true_inside_single_owned_checkpoint(
     def cancel_checker() -> bool:
         nonlocal raw_calls
         raw_calls += 1
-        return raw_calls == 4
+        return bool(discovery.cancellation_checkpoints)
 
     events = _collect_events(pipeline, start_is_explicit=True, cancel_checker=cancel_checker)
     result = _final_result(events)
 
     assert result["status"] == "cancelled"
-    assert raw_calls == 4
+    assert raw_calls >= 4
     assert len(discovery.cancellation_checkpoints) == 1
     checkpoint = discovery.cancellation_checkpoints[0]
     assert checkpoint is not None
@@ -4400,7 +4428,7 @@ def test_cn_workflow_preserves_caller_cancel_object_through_checkpoint(
     def cancel_checker() -> bool:
         nonlocal raw_calls
         raw_calls += 1
-        if raw_calls == 4:
+        if discovery.cancellation_checkpoints:
             raise expected
         return False
 
@@ -4452,7 +4480,7 @@ def test_cn_workflow_preserves_checkpoint_non_cancel_failure_identity(
     def cancel_checker() -> bool:
         nonlocal raw_calls
         raw_calls += 1
-        if raw_calls == 4:
+        if discovery.cancellation_checkpoints:
             raise expected
         return False
 
@@ -4595,6 +4623,142 @@ def _publish_identity_binding(
         previous_completed_meta=None, source_meta_exists=False, batch=batch,
     )
     writer.batching_repository.commit_batch(batch)
+
+
+class _RepairRebindSourceRepository(FsSourceDocumentRepository):
+    """只模拟合法初始 repair inventory；fresh 重绑定由独立真实 Fs writer 发布。"""
+
+    def __init__(
+        self, root: Path, repositories: _FsRepositorySet, writer: CnPipeline,
+        old_id: str, replacement: CnReportCandidate,
+    ) -> None:
+        """初始化受控观察。
+
+        参数：root/repositories 为真实读仓储；writer 为独立 writer；old_id/replacement 为重绑定输入。
+        返回：无。异常：仓储初始化错误原样传播。
+        """
+        super().__init__(root, repository_set=repositories)
+        self.writer = writer
+        self.old_id = old_id
+        self.replacement: CnReportCandidate | None = replacement
+        self.inventory_calls = 0
+        self.views: list[SourceMetaReadView] = []
+        self.published_state: tuple[str, dict[str, JsonValue], tuple[tuple[str, bytes], ...]] | None = None
+
+    def list_source_integrity(self, ticker: str) -> tuple[SourceIntegrityClassification, ...]:
+        """初始两窗口投影合法 repair 观察；后续委托真实库存。
+
+        参数：ticker 为公司。返回：符合 storage 不变量的观察。
+        异常：真实读取错误原样传播。
+        """
+        self.inventory_calls += 1
+        inventory = super().list_source_integrity(ticker)
+        if self.inventory_calls <= 2:
+            return tuple(replace(item, status=SourceIntegrityStatus.REPAIR_REQUIRED,
+                                 reasons=(SourceIntegrityReason.ORIGINAL_FILE_MISSING,))
+                         if item.document_id == self.old_id else item for item in inventory)
+        return inventory
+
+    def read_source_meta_view(self, ticker: str, source_kind: SourceKind) -> SourceMetaReadView:
+        """final preflight 后、filing-start 前真实发布 D_new，再读取 fresh 观察。
+
+        参数：ticker/source_kind 为观察范围。返回：真实 Fs 读取结果。
+        异常：独立 writer 发布或真实读取错误原样传播。
+        """
+        if self.inventory_calls == 2 and self.replacement is not None:
+            _publish_identity_binding(self.writer, ticker, self.replacement, "D_new", "internal-new", remove_id=self.old_id)
+            self.published_state = _published_source_state(self.writer, "D_new")
+            self.replacement = None
+        view = super().read_source_meta_view(ticker, source_kind)
+        self.views.append(view)
+        return view
+
+
+def _published_source_state(
+    pipeline: CnPipeline, document_id: str,
+) -> tuple[str, dict[str, JsonValue], tuple[tuple[str, bytes], ...]]:
+    """经 snapshot 保存同版 metadata、revision 和全部资产，比较请求前后真实发布态。
+
+    参数：pipeline 为仓储宿主；document_id 为目标。返回：完整发布观察。
+    异常：原仓储读取错误。
+    """
+    with pipeline.source_repository.read_source_snapshot("600519", document_id, SourceKind.FILING, materialize_files=True) as snapshot:
+        assets: list[tuple[str, bytes]] = []
+        for descriptor in snapshot.files:
+            with snapshot.get_source(descriptor.name).open() as stream:
+                assets.append((descriptor.name, stream.read()))
+        return snapshot.revision.token, dict(snapshot.source_meta), tuple(assets)
+
+
+async def _capture_cn_repair_events(pipeline: CnPipeline, events: list[DownloadEvent]) -> None:
+    """保留异常前真实请求事件。
+
+    参数：pipeline 为请求宿主；events 为收集容器。返回：无。
+    异常：请求原错误，包括 typed integrity abort。
+    """
+    async for event in pipeline.download_stream(
+        ticker="600519", form_type="FY", start_date="2024", end_date="2026", overwrite=False, start_is_explicit=True,
+    ):
+        events.append(event)
+
+
+@pytest.mark.parametrize("replacement_valid", (True, False))
+def test_selected_repair_source_rebind_aborts_before_application(
+    tmp_path: Path, replacement_valid: bool,
+) -> None:
+    """同源 D_old→D_new 的可成功/可失败目标均在应用前中止，保并发发布及旧源。
+
+    参数：tmp_path 为隔离仓储；replacement_valid 为 D_new 是否符合当前候选财年。
+    返回：无。异常：AssertionError 表示发生本请求 filing/tail/company 写入或错误未 typed。
+    """
+    candidate = _candidate()
+    replacement = candidate if replacement_valid else replace(candidate, fiscal_year=2023)
+    # 独立控制仓储直接证明 D_new 的两种原业务结果，避免仅凭配置猜测反例。
+    control_root = tmp_path / "control"
+    control = _build_pipeline(tmp_path=control_root, discovery=_FakeDiscoveryClient(control_root, (candidate,)), converter=_FakeConverter())
+    _publish_identity_binding(control, "600519", replacement, "D_new", "internal-new", remove_id=None)
+    control_rows = _final_result(_collect_events(control, start_is_explicit=True))["filings"]
+    assert isinstance(control_rows, list) and len(control_rows) == 1 and isinstance(control_rows[0], dict)
+    assert control_rows[0]["status"] == ("skipped" if replacement_valid else "failed")
+    if not replacement_valid:
+        assert control_rows[0]["reason_code"] == "period_metadata_mismatch"
+
+    root = tmp_path / "request"
+    writer = _build_pipeline(tmp_path=root, discovery=_FakeDiscoveryClient(root, (candidate,)), converter=_FakeConverter())
+    _collect_events(writer, start_is_explicit=True)
+    old_id = writer.source_repository.list_source_document_ids("600519", SourceKind.FILING)[0]
+    unrelated = _candidate(source_id="preserved", fiscal_year=2024, fiscal_period="H1")
+    _publish_identity_binding(writer, "600519", unrelated, "preserved", "internal-preserved", remove_id=None)
+    old_company = writer._company_repository.get_company_meta("600519")
+    preserved = _published_source_state(writer, "preserved")
+    tail = _candidate(source_id="tail", fiscal_year=2025)
+    repositories = build_fs_repository_set(workspace_root=root)
+    source = _RepairRebindSourceRepository(root, repositories, writer, old_id, replacement)
+    batching = _BatchIdentityCnBatchingRepository(root, repositories)
+    discovery = _FakeDiscoveryClient(root, (tail, candidate))
+    converter = _FakeConverter()
+    pipeline = _build_pipeline(tmp_path=root, discovery=discovery, converter=converter, repository_set=repositories,
+                               source_repository=source, batching_repository=batching)
+    events: list[DownloadEvent] = []
+    with pytest.raises(_cn_download_workflow.CnDownloadIntegrityAbort) as raised:
+        asyncio.run(_capture_cn_repair_events(pipeline, events))
+    abort = raised.value
+    assert isinstance(abort.cause, SourceIntegrityRevisionConflictError) and abort.__cause__ is abort.cause
+    assert abort.result["status"] == "integrity_failed" and abort.result["filings"] == []
+    assert source.inventory_calls == 2 and len(source.views) == 2
+    initial = build_cn_download_identity_index(source.views[0])
+    fresh = build_cn_download_identity_index(source.views[1])
+    assert resolve_cn_download_ids("600519", candidate, initial)[0] == old_id
+    assert resolve_cn_download_ids("600519", candidate, fresh) == ("D_new", "internal-new")
+    assert not {DownloadEventType.FILING_STARTED, DownloadEventType.FILING_FAILED, DownloadEventType.PIPELINE_COMPLETED}.intersection(event.event_type for event in events)
+    assert batching.begin_calls == batching.commit_calls == batching.rollback_calls == 0
+    assert discovery.download_calls == converter.calls == 0
+    assert _published_source_state(writer, "preserved") == preserved
+    assert writer._company_repository.get_company_meta("600519") == old_company
+    new_state = _published_source_state(writer, "D_new")
+    assert new_state == source.published_state == _published_source_state(pipeline, "D_new")
+    assert new_state[1]["fiscal_year"] == replacement.fiscal_year
+    assert source.list_source_document_ids("600519", SourceKind.FILING) == ["D_new", "preserved"]
 
 
 async def _collect_hk_identity_events(
@@ -4946,3 +5110,260 @@ def test_hk_direct_cancel_and_checker_error_precede_identity_read(tmp_path: Path
     with pytest.raises(type(error)) as raised:
         _collect_single_filing_events(pipeline=pipeline, candidate=_candidate(provider="hkexnews"), cancel_checker=_IdentityCancelError(error))
     assert raised.value is error and not source.views
+
+
+from collections.abc import Mapping
+from dayu.fins.pipelines.cn_download_models import CnAnnualReportPublication, CnAnnualReportPdf
+from dayu.fins.pipelines.cn_annual_report_facts import resolve_cn_annual_report_facts
+from dayu.fins.pipelines.cn_download_filing_workflow import CnDownloadAnnualPublicationError, _require_matching_cn_annual_publication
+from tests.fins.test_cninfo_downloader import _official_discovery_client, _official_rows
+from tests.fins.test_cn_annual_report_facts import FIXTURES
+from dayu.fins.downloaders.cninfo_downloader import _parse_raw_announcement
+
+
+async def _annual_single(pipeline: CnPipeline,candidate: CnReportCandidate,prepared: DownloadedReportAsset | None,witness: CnAnnualReportPublication | None) -> list[DownloadEvent]:
+    """参数：真实仓储宿主、所选candidate、两种显式handoff。返回：单filing事件。异常：owner原错误。"""
+    return [event async for event in _cn_download_filing_workflow.run_cn_download_single_filing_stream(
+        batching_repository=pipeline.batching_repository,source_repository=pipeline.source_repository,
+        blob_repository=pipeline.blob_repository,processed_repository=pipeline.processed_repository,
+        discovery_client=pipeline.cn_discovery_client,pdf_download_gate=pipeline.pdf_download_gate,
+        docling_conversion_runner=pipeline.docling_conversion_runner,ticker='600519',
+        profile=CnCompanyProfile('cninfo','CNINFO:test','测试公司','600519'),candidate=candidate,
+        prepared_asset=prepared,local_annual_publication=witness,overwrite=False,cancel_checker=None,module='TEST')]
+
+
+def _annual_asset(candidate: CnReportCandidate,payload: bytes) -> DownloadedReportAsset:
+    """参数：所选来源、实际测试原件。返回：严格同次资产。异常：无。"""
+    return DownloadedReportAsset(candidate,payload,hashlib.sha256(payload).hexdigest(),len(payload),'2026-10-12T00:00:00+00:00')
+
+
+def _seed_annual_owner(pipeline: CnPipeline,candidate: CnReportCandidate,payload: bytes, *, ticker: str = '600519') -> str:
+    """经真实仓储播种指定原件，用于历史摘要及错年元数据反例。
+
+    参数：pipeline/candidate/原件bytes。返回：原seed ID。异常：仓储错误原样。
+    """
+    docid,internal=build_cn_filing_ids(ticker=ticker,form_type='FY',fiscal_year=candidate.fiscal_year,fiscal_period='FY',amended=candidate.amended)
+    batch=pipeline.batching_repository.begin_batch(ticker);handle=SourceHandle(ticker,docid,SourceKind.FILING.value)
+    pdf_name,docling_name=docid+'.pdf',docid+'_docling.json'
+    pdf=pipeline.blob_repository.store_file(handle,pdf_name,io.BytesIO(payload),batch=batch,content_type='application/pdf')
+    docling=pipeline.blob_repository.store_file(handle,docling_name,io.BytesIO(_DOCLING_BYTES),batch=batch,content_type='application/json')
+    commit_cn_filing_source_document(source_repository=pipeline.source_repository,processed_repository=pipeline.processed_repository,
+        ticker=ticker,document_id=docid,internal_document_id=internal,primary_document=docling_name,
+        file_entries=[build_cn_file_entry(filename=pdf_name,file_meta=pdf,source_label='original'),build_cn_file_entry(filename=docling_name,file_meta=docling,source_label='docling')],
+        candidate=candidate,profile=CnCompanyProfile('cninfo','CNINFO:test','测试公司',ticker),pdf_sha256=hashlib.sha256(payload).hexdigest(),
+        remote_fingerprint=build_remote_fingerprint(candidate),source_fingerprint=build_content_fingerprint(pdf_bytes=payload,docling_json_bytes=_DOCLING_BYTES),
+        previous_completed_meta=None,source_meta_exists=False,batch=batch)
+    pipeline.batching_repository.commit_batch(batch)
+    return docid
+
+
+@pytest.mark.parametrize('path',('prepared','original'))
+@pytest.mark.parametrize('facts',('full','summary','wrong_year','bad'))
+def test_annual_acquisition_actual_facts(tmp_path: Path,path: str,facts: str) -> None:
+    """参数：acquisition路径与原件事实。返回：无。异常：错事实发布、重复GET或漏失败断言失败。"""
+    candidate=_candidate();payload=build_synthetic_annual_pdf(2023 if facts=='wrong_year' else 2024,summary=facts=='summary') if facts!='bad' else b'%PDF-'+b'0'*2048
+    discovery=_FakeDiscoveryClient(tmp_path,(candidate,),pdf_bytes=payload);converter=_FakeConverter();pipeline=_build_pipeline(tmp_path=tmp_path,discovery=discovery,converter=converter)
+    prepared=_annual_asset(candidate,payload) if path=='prepared' else None
+    events=asyncio.run(_annual_single(pipeline,candidate,prepared,None))
+    terminals=[e for e in events if e.event_type in (DownloadEventType.FILING_FAILED,DownloadEventType.FILING_COMPLETED)]
+    assert len(terminals)==1 and discovery.download_calls==(0 if path=='prepared' else 1)
+    if facts=='full':
+        assert converter.calls==1 and terminals[0].payload['status']=='downloaded'
+        docid=pipeline.source_repository.list_source_document_ids('600519',SourceKind.FILING)[0]
+        meta=pipeline.source_repository.get_source_meta('600519',docid,SourceKind.FILING)
+        assert meta['fiscal_year']==2024 and meta['fiscal_year_source']=='source_document'
+    else:
+        assert converter.calls==0 and terminals[0].payload['status']=='failed'
+        assert pipeline.source_repository.list_source_document_ids('600519',SourceKind.FILING)==[]
+        assert terminals[0].payload['reason_code']==('provider_protocol' if facts=='bad' else 'source_document_facts_mismatch')
+
+
+@pytest.mark.parametrize('facts',('full','summary','wrong_year','bad'))
+@pytest.mark.parametrize('prepared',(False,True))
+def test_complete_without_witness_proves_exact_original(tmp_path: Path,facts: str,prepared: bool) -> None:
+    """参数：当前实际原件与多余prepared。返回：无。异常：meta-only skip、远端补偿或修改旧资产断言失败。"""
+    candidate=_candidate();discovery=_FakeDiscoveryClient(tmp_path,(candidate,));converter=_FakeConverter();pipeline=_build_pipeline(tmp_path=tmp_path,discovery=discovery,converter=converter)
+    payload=build_synthetic_annual_pdf(2023 if facts=='wrong_year' else 2024,summary=facts=='summary') if facts!='bad' else b'%PDF-'+b'0'*2048
+    docid=_seed_annual_owner(pipeline,candidate,payload)
+    before=pipeline.source_repository.get_source_meta('600519',docid,SourceKind.FILING)
+    asset=_annual_asset(candidate,build_synthetic_annual_pdf()) if prepared else None
+    if facts=='full':
+        events=asyncio.run(_annual_single(pipeline,candidate,asset,None))
+        assert events[-1].payload['status']=='skipped' and events[-1].payload['reason_code']=='integrity_complete'
+    else:
+        with pytest.raises(CnDownloadAnnualPublicationError) as raised:asyncio.run(_annual_single(pipeline,candidate,asset,None))
+        assert raised.value.reason=='source_document_facts_mismatch'
+    assert discovery.download_calls==converter.calls==0
+    assert pipeline.source_repository.get_source_meta('600519',docid,SourceKind.FILING)==before
+
+
+@pytest.mark.parametrize('covered',(None,(),[],['FY','FY'],['Q9'],['H1','FY'],['FY','H1'],['H1']))
+def test_annual_canonical_list_owner(covered: JsonValue) -> None:
+    """参数：持久数组反例（tuple仅为直接非法容器测试）。返回：无。异常：loose parsing被接受断言失败。"""
+    meta:dict[str,JsonValue]={'source_provider':'cninfo','source_id':'A1','fiscal_year':2024,'fiscal_period':'FY'}
+    if covered is not None:meta['covered_fiscal_periods']=covered
+    with pytest.raises(CnDownloadAnnualPublicationError) as raised:_require_matching_cn_annual_publication(meta,_candidate())
+    assert raised.value.reason=='period_metadata_mismatch'
+
+
+def test_annual_real_canonical_list_and_locator_skip(tmp_path: Path) -> None:
+    """参数：根。返回：无。异常：合法JSON list不被接受或locator变更导致刷新断言失败。"""
+    candidate=_candidate();discovery=_FakeDiscoveryClient(tmp_path,(candidate,));converter=_FakeConverter();pipeline=_build_pipeline(tmp_path=tmp_path,discovery=discovery,converter=converter)
+    docid=_seed_annual_owner(pipeline,candidate,build_synthetic_annual_pdf());meta=pipeline.source_repository.get_source_meta('600519',docid,SourceKind.FILING)
+    assert type(meta['covered_fiscal_periods']) is list
+    _require_matching_cn_annual_publication(meta,candidate)
+    changed=replace(candidate,source_url='http://changed.test/other-path.pdf')
+    events=asyncio.run(_annual_single(pipeline,changed,None,None))
+    assert events[-1].payload['status']=='skipped' and discovery.download_calls==converter.calls==0
+    assert pipeline.source_repository.get_source_meta('600519',docid,SourceKind.FILING)==meta
+
+
+@pytest.mark.parametrize('condition',('repair','revision','presence','unsafe'))
+def test_local_witness_changed_aborts_not_retry(tmp_path: Path,monkeypatch: pytest.MonkeyPatch,condition: str) -> None:
+    """参数：根与A变化。返回：无。异常：陈旧见证被复用/重GET断言失败。"""
+    candidate=_candidate();discovery=_FakeDiscoveryClient(tmp_path,(candidate,));converter=_FakeConverter();pipeline=_build_pipeline(tmp_path=tmp_path,discovery=discovery,converter=converter)
+    docid=_seed_annual_owner(pipeline,candidate,build_synthetic_annual_pdf());entry=pipeline.source_repository.read_source_meta_integrity_view('600519',SourceKind.FILING,batch=None)[0]
+    assert entry.integrity.revision is not None
+    witness=CnAnnualReportPublication('cninfo','A1',docid,entry.integrity.revision)
+    integrity=entry.integrity
+    if condition=='repair':integrity=replace(integrity,status=SourceIntegrityStatus.REPAIR_REQUIRED,reasons=(SourceIntegrityReason.SIZE_MISMATCH,))
+    elif condition=='revision':integrity=replace(integrity,revision=SourceDocumentRevision('new'))
+    elif condition=='presence':integrity=replace(integrity,status=SourceIntegrityStatus.MISSING,revision=None)
+    else:integrity=replace(integrity,status=SourceIntegrityStatus.UNSAFE,revision=None,reasons=(SourceIntegrityReason.META_UNTRUSTED,))
+    def phase_a(ticker: str,document_id: str,source_repository: SourceDocumentRepositoryProtocol) -> tuple[SourceIntegrityClassification,dict[str,JsonValue] | None]:
+        """参数：目标及仓储。返回：A观察变化。异常：无。"""
+        return integrity,dict(entry.source_meta)
+    monkeypatch.setattr(_cn_download_filing_workflow,'_read_cn_annual_phase_a',phase_a)
+    error_type=SourceIntegrityRepairRequiredError if condition=='repair' else SourceIntegrityPreflightError if condition=='unsafe' else SourceIntegrityRevisionConflictError
+    with pytest.raises(error_type):asyncio.run(_annual_single(pipeline,candidate,None,witness))
+    assert discovery.download_calls==converter.calls==0
+
+
+@pytest.mark.parametrize('reason',('source_identity_conflict','period_metadata_mismatch','source_document_facts_mismatch'))
+@pytest.mark.parametrize('integrity',(False,True))
+def test_annual_failure_scope_keeps_prefix(tmp_path: Path,monkeypatch: pytest.MonkeyPatch,reason: Literal["source_identity_conflict", "period_metadata_mismatch", "source_document_facts_mismatch"],integrity: bool) -> None:
+    """参数：业务原因/完整性类型组合。返回：无。异常：类型作用域、前缀或失败行数量漂移断言失败。"""
+    candidates=(_candidate(source_id='first',fiscal_year=2024),_candidate(source_id='second',fiscal_year=2023),_candidate(source_id='third',fiscal_year=2022,filing_date='2025-04-01'))
+    discovery=_FakeDiscoveryClient(tmp_path,candidates);pipeline=_build_pipeline(tmp_path=tmp_path,discovery=discovery,converter=_FakeConverter());real=_cn_download_filing_workflow._read_cn_annual_phase_a
+    failure=SourceIntegrityRepairRequiredError() if integrity else CnDownloadAnnualPublicationError(reason)
+    calls:list[str]=[]
+    def phase_a(ticker: str,document_id: str,source_repository: SourceDocumentRepositoryProtocol) -> tuple[SourceIntegrityClassification,dict[str,JsonValue] | None]:
+        """参数：target。返回：真实A。异常：第二目标指定异常。"""
+        calls.append(document_id)
+        if len(calls)==2:raise failure
+        return real(ticker,document_id,source_repository)
+    monkeypatch.setattr(_cn_download_filing_workflow,'_read_cn_annual_phase_a',phase_a)
+    if integrity:
+        with pytest.raises(_cn_download_workflow.CnDownloadIntegrityAbort) as raised:_collect_events(pipeline,start_is_explicit=True)
+        assert raised.value.cause is failure
+        rows=raised.value.result['filings'];assert isinstance(rows,list) and len(rows)==2
+        assert len(calls)==2
+    else:
+        result=_final_result(_collect_events(pipeline,start_is_explicit=True));rows=result['filings'];assert isinstance(rows,list) and len(rows)==3
+        assert len(calls)==3
+    statuses=[row['status'] for row in rows if isinstance(row,dict)]
+    assert statuses==(['downloaded','failed'] if integrity else ['downloaded','failed','downloaded'])
+
+
+def test_official_full_workflow_prepared_then_local_repeat(tmp_path: Path) -> None:
+    """参数：真实Fs根。返回：无。异常：三目标缺失、prepared重复GET或repeat完整源刷新断言失败。"""
+    gets:list[str]=[];client=_official_discovery_client(_official_rows(),gets);converter=_FakeConverter();pipeline=_build_pipeline(tmp_path=tmp_path,discovery=client,converter=converter)
+    result=pipeline.download(ticker='601225.SH',form_type='FY',start_date='2018-01-01',end_date='2026-10-12',start_is_explicit=True)
+    summary=result['summary'];assert isinstance(summary,dict)
+    assert summary['downloaded']==9 and len(gets)==13 and converter.calls==9
+    entries=pipeline.source_repository.read_source_meta_integrity_view('601225',SourceKind.FILING,batch=None)
+    before={e.document_id:(dict(e.source_meta),e.integrity.revision) for e in entries}
+    gets.clear()
+    repeat=pipeline.download(ticker='601225.SH',form_type='FY',start_date='2018-01-01',end_date='2026-10-12',start_is_explicit=True)
+    repeat_summary=repeat['summary'];assert isinstance(repeat_summary,dict)
+    assert repeat_summary['skipped']==9 and converter.calls==9
+    assert set(gets)=={'1204545056','1209875597','1213161682','1223301999'}
+    after=pipeline.source_repository.read_source_meta_integrity_view('601225',SourceKind.FILING,batch=None)
+    assert before=={e.document_id:(dict(e.source_meta),e.integrity.revision) for e in after}
+
+
+@pytest.mark.parametrize('original_kind',('full','summary','wrong_year'))
+def test_b_same_revision_complete_rolls_back_and_fresh_a_proves_original(tmp_path: Path,monkeypatch: pytest.MonkeyPatch,original_kind: str) -> None:
+    """参数：真实旧原件性质。返回：无。异常：B直接skip或远端facts替代当前原件断言失败。"""
+    candidate=_candidate();discovery=_FakeDiscoveryClient(tmp_path,(candidate,));converter=_FakeConverter();pipeline=_build_pipeline(tmp_path=tmp_path,discovery=discovery,converter=converter)
+    old_pdf=build_synthetic_annual_pdf(2023 if original_kind=='wrong_year' else 2024,summary=original_kind=='summary')
+    docid=_seed_annual_owner(pipeline,candidate,old_pdf)
+    locator=pipeline.source_repository.get_source_document_locator('600519',docid,SourceKind.FILING)
+    pdf_path=tmp_path/locator/(docid+'.pdf');pdf_path.write_bytes(old_pdf+b'corrupt')
+    phase_a=pipeline.source_repository.classify_source_integrity('600519',docid,SourceKind.FILING)
+    assert phase_a.status is SourceIntegrityStatus.REPAIR_REQUIRED
+    real_converter=converter.convert_to_json_bytes;phases:list[SourceIntegrityStatus]=[];real_a=_cn_download_filing_workflow._read_cn_annual_phase_a
+    def observe_a(ticker: str,document_id: str,source_repository: SourceDocumentRepositoryProtocol) -> tuple[SourceIntegrityClassification,dict[str,JsonValue] | None]:
+        """参数：target。返回：真实同窗A并记录。异常：仓储原错误。"""
+        result=real_a(ticker,document_id,source_repository);phases.append(result[0].status);return result
+    async def restore_original(input_bytes: bytes,stream_name: str,*,config: DoclingConversionConfig,cancellation: CancellationToken | None) -> DoclingConversionResult:
+        """参数：真实转换输入。返回：测试转换结果。异常：原转换/写错误。"""
+        pdf_path.write_bytes(old_pdf)
+        return await real_converter(input_bytes,stream_name,config=config,cancellation=cancellation)
+    monkeypatch.setattr(converter,'convert_to_json_bytes',restore_original);monkeypatch.setattr(_cn_download_filing_workflow,'_read_cn_annual_phase_a',observe_a)
+    if original_kind=='full':
+        events=asyncio.run(_annual_single(pipeline,candidate,_annual_asset(candidate,build_synthetic_annual_pdf()+b"new acquisition"),None))
+        assert events[-1].payload['status']=='skipped'
+    else:
+        with pytest.raises(CnDownloadAnnualPublicationError) as raised:asyncio.run(_annual_single(pipeline,candidate,_annual_asset(candidate,build_synthetic_annual_pdf()+b"new acquisition"),None))
+        assert raised.value.reason=='source_document_facts_mismatch'
+    assert phases==[SourceIntegrityStatus.REPAIR_REQUIRED,SourceIntegrityStatus.COMPLETE]
+    assert pipeline.source_repository.classify_source_integrity('600519',docid,SourceKind.FILING).revision==phase_a.revision
+    assert converter.calls==1 and discovery.download_calls==0
+    assert pdf_path.read_bytes()==old_pdf
+
+
+def test_discovery_bad_unselected_original_preserves_all_held_sources(tmp_path: Path) -> None:
+    """参数：真实Fs根。返回：无。异常：坏落选FY产生部分候选、公司或资产写入断言失败。"""
+    gets:list[str]=[];converter=_FakeConverter();valid=_official_discovery_client(_official_rows(),gets)
+    pipeline=_build_pipeline(tmp_path=tmp_path,discovery=valid,converter=converter)
+    pipeline.download(ticker='601225.SH',form_type='FY',start_date='2018-01-01',end_date='2026-10-12',start_is_explicit=True)
+    before={str(p.relative_to(tmp_path)):p.read_bytes() for p in (tmp_path/'portfolio').rglob('*') if p.is_file()}
+    calls=converter.calls;gets.clear();bad=_official_discovery_client(_official_rows(),gets,'1204545056')
+    pipeline=_build_pipeline(tmp_path=tmp_path,discovery=bad,converter=converter)
+    events:list[DownloadEvent]=[]
+    async def collect() -> None:
+        """参数：无。返回：无。异常：真实发现typed failure。"""
+        async for event in pipeline.download_stream(ticker='601225.SH',form_type=None,start_date='2018-01-01',end_date='2026-10-12',start_is_explicit=True):events.append(event)
+    with pytest.raises(FinsDownloadProviderError) as raised:asyncio.run(collect())
+    assert raised.value.safe_message=='巨潮年度报告原文无法确认财年或全文性质'
+    assert raised.value.transport_category is FinsDownloadTransportCategory.PROTOCOL
+    assert not any(e.event_type is DownloadEventType.FILING_STARTED for e in events)
+    assert converter.calls==calls and gets==['1223301999','1213161682','1209875597','1204545056']
+    after={str(p.relative_to(tmp_path)):p.read_bytes() for p in (tmp_path/'portfolio').rglob('*') if p.is_file()}
+    assert before==after
+
+
+@pytest.mark.parametrize('source_id,repair',(('1213161682',False),('1213161682',True),('1213161683',True)))
+def test_official_summary_preservation_and_selected_repair(tmp_path: Path,source_id: str,repair: bool) -> None:
+    """参数：真实官方来源与损坏状态。返回：无。异常：摘要repair写入、全文重复GET或来源覆盖断言失败。"""
+    rows=_official_rows();raw=next(row for row in rows if isinstance(row,dict) and row.get('announcementId')==source_id)
+    parsed=_parse_raw_announcement(raw);assert parsed is not None
+    original=(FIXTURES/f'{source_id}.pdf').read_bytes();facts=resolve_cn_annual_report_facts(original)
+    candidate=replace(_candidate(source_id=source_id,fiscal_year=facts.fiscal_year,filing_date=parsed.announcement_date),source_url=parsed.source_url,title=parsed.title)
+    gets:list[str]=[];converter=_FakeConverter();client=_official_discovery_client(rows,gets);pipeline=_build_pipeline(tmp_path=tmp_path,discovery=client,converter=converter)
+    docid=_seed_annual_owner(pipeline,candidate,original,ticker='601225')
+    meta=pipeline.source_repository.get_source_meta('601225',docid,SourceKind.FILING)
+    revision=pipeline.source_repository.classify_source_integrity('601225',docid,SourceKind.FILING).revision
+    locator=pipeline.source_repository.get_source_document_locator('601225',docid,SourceKind.FILING);pdf_path=tmp_path/locator/(docid+'.pdf')
+    if repair:pdf_path.write_bytes(original+b'broken')
+    before={str(p.relative_to(tmp_path)):p.read_bytes() for p in (tmp_path/'portfolio').rglob('*') if p.is_file()}
+    if facts.kind=='summary' and repair:
+        with pytest.raises(SourceIntegrityPreflightError) as raised:pipeline.download(ticker='601225.SH',form_type=None,start_date='2018-01-01',end_date='2026-10-12',start_is_explicit=True)
+        assert raised.value.reason is SourceIntegrityPreflightReason.UNSELECTED_REPAIR_REQUIRED
+        assert gets.count(source_id)==1 and converter.calls==0
+        assert before=={str(p.relative_to(tmp_path)):p.read_bytes() for p in (tmp_path/'portfolio').rglob('*') if p.is_file()}
+    else:
+        result=pipeline.download(ticker='601225.SH',form_type='FY',start_date='2018-01-01',end_date='2026-10-12',start_is_explicit=True)
+        summary=result['summary'];assert isinstance(summary,dict) and summary['failed']==0
+        if facts.kind=='summary':
+            assert gets.count(source_id)==0
+            assert pipeline.source_repository.get_source_meta('601225',docid,SourceKind.FILING)==meta
+            assert pipeline.source_repository.classify_source_integrity('601225',docid,SourceKind.FILING).revision==revision
+            assert pdf_path.read_bytes()==original
+            selected=pipeline.source_repository.read_source_meta_integrity_view('601225',SourceKind.FILING,batch=None)
+            full=next(e for e in selected if e.source_meta.get('source_id')=='1213161683')
+            assert full.document_id!=docid and full.integrity.status is SourceIntegrityStatus.COMPLETE
+        else:
+            assert gets.count(source_id)==1 and pdf_path.read_bytes()==original
+            assert pipeline.source_repository.classify_source_integrity('601225',docid,SourceKind.FILING).status is SourceIntegrityStatus.COMPLETE

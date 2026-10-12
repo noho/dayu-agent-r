@@ -705,3 +705,19 @@ OpenAI-compatible Runner 的 provider 协议测试，覆盖从 payload 构建、
 本文件只描述当前 `tests/` 已存在的事实，不写用户手册、Engine 设计文档、完整 review prompt、未落地测试体系或时间敏感记录。
 
 如果之后新增测试层级、测试运行方式或测试维护规则发生变化，应在对应变更中同步更新本文件。
+
+
+CN 年度原文 owner 回归位于 `test_cn_annual_report_facts.py`、`test_cn_annual_report_source.py` 与
+`test_source_integrity_preflight.py`：13 份官方首页派生 PDF 和原 19 条 raw 的 provenance/hash 保存在
+`tests/fins/fixtures/cninfo_annual_fulltext/`，覆盖封闭 grammar、真实 Fs exact 原件读取、角色声明、
+raw JSON 同版关系、实际 locator 保留、取消资源释放及 inventory 与 repair 授权分离。
+身份 owner 回归覆盖年度 seed/fallback 的 external/internal 占用、未知来源 key 的可信内部占用、
+同 key 复用与原错误优先序。workflow 回归用独立真实 Fs writer 在 final preflight 后重绑定来源，
+证明可成功／可失败新目标均在 filing-start 前 typed 中止，并保留并发发布态；稳定 repair 的失败和取消仍关闸。
+共享 discovery 的本地原件/gate 输入、prepared/witness 输出与显式财年来源均为必填；CN/HK fixtures
+按 owner contract 迁移，合成 PDF 明确用于测试，不作为官方原件或真实网络验收。
+workflow/model/downloader/identity 测试分别覆盖 local、prepared、original GET 路径、每次 COMPLETE
+原件证明、摘要与全文独立身份、JSON list、失败类型作用域及 HK 共享 helper 原行为。
+独立真实验收工具 `utils/observe_601225_cli_http.py` 仅记录所 spawn 公开 CLI 的 transport/wire/raw；
+`utils/validate_601225_annual_fulltext.py` 通过仓储检查全部持有源、真实 Docling 模型/origin/内容/hash，
+并比较 clean/seeded 的首次与重复下载，不能以有界摘要或缺少 debug 日志证明全集或零 GET。

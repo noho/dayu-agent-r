@@ -1,5 +1,8 @@
 """CnPipeline download facade 行为测试。"""
 from __future__ import annotations
+from tests.fins.test_cn_annual_report_facts import build_synthetic_annual_pdf
+from dayu.fins.pipelines.cn_download_models import CnAnnualReportPdf
+from dayu.fins.pipelines.cn_download_pdf_gate import CnDownloadPdfGateProtocol, NoopCnDownloadPdfGate
 
 from dayu.fins.storage import FsBatchingRepository, FsCompanyMetaRepository, FsSourceDocumentRepository, FsDocumentBlobRepository, FsFilingMaintenanceRepository, FsFilingUploadStateRepository, FsProcessedDocumentRepository
 from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
@@ -71,7 +74,6 @@ from dayu.fins.storage import (
     FsFilingUploadStateRepository,
     SourceIntegrityStatus,
 )
-from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
 
 from .upload_filing_test_support import (
     TrackingBatchingRepository,
@@ -80,7 +82,7 @@ from .upload_filing_test_support import (
     published_tree_sha256,
 )
 
-_PDF_BYTES = b"%PDF-1.7\n" + b"0" * 2048
+_PDF_BYTES = build_synthetic_annual_pdf(2024)
 _DOCLING_BYTES = b'{"document": "ok"}'
 
 
@@ -359,7 +361,7 @@ class _PipelineDownloadFakeDiscoveryClient:
         query: CnReportQuery,
         profile: CnCompanyProfile,
         *,
-        local_annual_ends: tuple[date, ...],
+        local_annual_ends: tuple[date, ...], local_cn_annual_pdfs: tuple[CnAnnualReportPdf, ...], pdf_download_gate: CnDownloadPdfGateProtocol,
         cancellation_checkpoint: Callable[[], None] | None = None,
     ) -> CnReportDiscoveryResult:
         """返回一份固定 FY 候选。
@@ -381,7 +383,7 @@ class _PipelineDownloadFakeDiscoveryClient:
         if cancellation_checkpoint is not None:
             cancellation_checkpoint()
         default_candidates = (
-            CnReportCandidate(
+            CnReportCandidate(fiscal_year_source="source_document",
                 provider="cninfo",
                 source_id="A1",
                 source_url="https://static.cninfo.test/A1.pdf",
@@ -396,7 +398,7 @@ class _PipelineDownloadFakeDiscoveryClient:
                 last_modified="Wed, 01 Apr 2026 00:00:00 GMT",
             ),
         )
-        return CnReportDiscoveryResult(candidates=self.candidates if self.candidates is not None else default_candidates, uncertain_reports=())
+        return CnReportDiscoveryResult(prepared_assets=(), local_annual_publications=(), candidates=self.candidates if self.candidates is not None else default_candidates, uncertain_reports=())
 
     def download_report_pdf(self, candidate: CnReportCandidate) -> DownloadedReportAsset:
         """返回内存 PDF 资产。
@@ -412,11 +414,12 @@ class _PipelineDownloadFakeDiscoveryClient:
         """
 
         self.download_calls += 1
+        payload = build_synthetic_annual_pdf(candidate.fiscal_year)
         return DownloadedReportAsset(
             candidate=candidate,
-            pdf_bytes=_PDF_BYTES,
-            sha256=hashlib.sha256(_PDF_BYTES).hexdigest(),
-            content_length=len(_PDF_BYTES),
+            pdf_bytes=payload,
+            sha256=hashlib.sha256(payload).hexdigest(),
+            content_length=len(payload),
             downloaded_at="2026-05-02T00:00:00+00:00",
         )
 
@@ -454,7 +457,7 @@ class _PipelineDownloadFakeHkDiscoveryClient:
         query: CnReportQuery,
         profile: CnCompanyProfile,
         *,
-        local_annual_ends: tuple[date, ...],
+        local_annual_ends: tuple[date, ...], local_cn_annual_pdfs: tuple[CnAnnualReportPdf, ...], pdf_download_gate: CnDownloadPdfGateProtocol,
         cancellation_checkpoint: Callable[[], None] | None = None,
     ) -> CnReportDiscoveryResult:
         """返回一份固定 HK FY 候选。
@@ -475,8 +478,8 @@ class _PipelineDownloadFakeHkDiscoveryClient:
         self.cancellation_checkpoints.append(cancellation_checkpoint)
         if cancellation_checkpoint is not None:
             cancellation_checkpoint()
-        return CnReportDiscoveryResult(candidates=(
-            CnReportCandidate(
+        return CnReportDiscoveryResult(prepared_assets=(), local_annual_publications=(), candidates=(
+            CnReportCandidate(fiscal_year_source="title_or_category_inferred",
                 provider="hkexnews",
                 source_id="HK1",
                 source_url="https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0408/hk1.pdf",
@@ -506,11 +509,12 @@ class _PipelineDownloadFakeHkDiscoveryClient:
         """
 
         self.download_calls += 1
+        payload = build_synthetic_annual_pdf(candidate.fiscal_year)
         return DownloadedReportAsset(
             candidate=candidate,
-            pdf_bytes=_PDF_BYTES,
-            sha256=hashlib.sha256(_PDF_BYTES).hexdigest(),
-            content_length=len(_PDF_BYTES),
+            pdf_bytes=payload,
+            sha256=hashlib.sha256(payload).hexdigest(),
+            content_length=len(payload),
             downloaded_at="2026-05-02T00:00:00+00:00",
         )
 
@@ -942,7 +946,7 @@ def test_download_non_explicit_nonempty_start_keeps_default_business_limit(tmp_p
     """
 
     candidates = tuple(
-        CnReportCandidate(
+        CnReportCandidate(fiscal_year_source="source_document",
             provider="cninfo",
             source_id=f"A{fiscal_year}",
             source_url=f"https://static.cninfo.test/A{fiscal_year}.pdf",

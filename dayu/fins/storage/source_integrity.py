@@ -326,11 +326,8 @@ def classify_source_integrity_preflight(
         SourceIntegrityPreflightError: corruption 无法由本次请求唯一、安全修复时抛出。
     """
 
-    if any(item.status is SourceIntegrityStatus.UNSAFE for item in inventory):
-        raise SourceIntegrityPreflightError(SourceIntegrityPreflightReason.UNSAFE_PUBLICATION)
+    validate_source_integrity_inventory(inventory)
     repair_targets = tuple(item for item in inventory if item.status is SourceIntegrityStatus.REPAIR_REQUIRED)
-    if len(repair_targets) > 1:
-        raise SourceIntegrityPreflightError(SourceIntegrityPreflightReason.MULTIPLE_REPAIR_REQUIRED)
     if not repair_targets:
         return NoSourceRepairRequired()
 
@@ -342,3 +339,15 @@ def classify_source_integrity_preflight(
     if target.document_id in rejected_filing_ids:
         raise SourceIntegrityPreflightError(SourceIntegrityPreflightReason.SELECTED_REJECTED_REPAIR_REQUIRED)
     return SelectedSourceRepairRequired(target=target)
+
+
+def validate_source_integrity_inventory(inventory: tuple[SourceIntegrityClassification, ...]) -> None:
+    """纯校验 inventory 安全性，不授予唯一 repair 写权限。
+
+    参数：inventory 为同 guard 完整观察。返回：clean/唯一 repair 时 None。
+    异常：PreflightError 表示 UNSAFE 或多 repair；UNSAFE 优先。
+    """
+    if any(item.status is SourceIntegrityStatus.UNSAFE for item in inventory):
+        raise SourceIntegrityPreflightError(SourceIntegrityPreflightReason.UNSAFE_PUBLICATION)
+    if sum(item.status is SourceIntegrityStatus.REPAIR_REQUIRED for item in inventory) > 1:
+        raise SourceIntegrityPreflightError(SourceIntegrityPreflightReason.MULTIPLE_REPAIR_REQUIRED)

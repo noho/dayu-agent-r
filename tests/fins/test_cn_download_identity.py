@@ -2,7 +2,7 @@
 
 import hashlib
 from collections.abc import Mapping
-from dataclasses import fields, FrozenInstanceError
+from dataclasses import fields, FrozenInstanceError, replace
 from pathlib import Path
 from types import MappingProxyType
 
@@ -30,7 +30,7 @@ def _identity_candidate(provider: CnSourceProvider = "hkexnews", source_id: str 
     参数：provider 为真实来源类别；source_id 为来源引用。
     返回：固定年度报告候选。异常：无。
     """
-    return CnReportCandidate(
+    return CnReportCandidate(fiscal_year_source="source_document" if provider == "cninfo" else "title_or_category_inferred",
         provider=provider, source_id=source_id, source_url="https://example.test/report.pdf",
         title="年度报告", language="zh", filing_date="2025-04-01", fiscal_year=2024,
         period_projection=CnReportPeriodProjection(identity_period="FY", covered_periods=("FY",)),
@@ -68,6 +68,7 @@ def test_identity_types_are_closed_frozen_slots() -> None:
     index = build_cn_download_identity_index(view)
     assert isinstance(index.source_matches, MappingProxyType)
     assert isinstance(index.allocated_periods, MappingProxyType)
+    assert index.allocated_internal_ids == frozenset()
     with pytest.raises(FrozenInstanceError):
         index.__setattr__("ticker", "other")
 
@@ -77,7 +78,7 @@ def _forbidden_identity_read(ticker: str, source_kind: SourceKind) -> SourceMeta
     raise AssertionError("非 HK 不应读仓储")
 
 
-@pytest.mark.parametrize("candidates", [(), (_identity_candidate("cninfo"),)])
+@pytest.mark.parametrize("candidates", [(), (replace(_identity_candidate("cninfo"), period_projection=CnReportPeriodProjection("H1", ("H1",))),)])
 def test_non_hk_and_empty_do_not_touch_storage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, candidates: tuple[CnReportCandidate, ...],
 ) -> None:
@@ -91,9 +92,9 @@ def test_non_hk_and_empty_do_not_touch_storage(
     index = read_cn_download_identity_index("0700", candidates, source)
     for candidate in candidates:
         assert resolve_cn_download_ids("0700", candidate, index) == build_cn_filing_ids(
-            ticker="0700", form_type="FY", fiscal_year=2024, fiscal_period="FY", amended=False,
+            ticker="0700", form_type=candidate.period_projection.identity_period, fiscal_year=2024, fiscal_period=candidate.period_projection.identity_period, amended=False,
         )
-    assert not index.source_matches and not index.allocated_periods
+    assert not index.source_matches and not index.allocated_periods and not index.allocated_internal_ids
 
 
 def test_identity_kind_and_ticker_misuse_are_development_errors() -> None:
@@ -254,3 +255,104 @@ def test_identity_read_helper_multiple_candidates_builds_one_filing_index(
     assert counter.calls == [("0700", SourceKind.FILING)]
     second = read_cn_download_identity_index("0700", candidates, source)
     assert second is not first and counter.calls == [("0700", SourceKind.FILING)] * 2
+
+
+@pytest.mark.parametrize('mode',('empty','same','occupied','fallback_occupied','duplicate','missing_internal','read_error'))
+def test_cn_annual_source_key_and_slot_collision(mode: str) -> None:
+    """参数：CN年度身份状态。返回：无。异常：来源混同、locator绑定或覆盖碰撞断言失败。"""
+    candidate=_identity_candidate('cninfo','full')
+    allocated=build_cn_filing_ids(ticker='0700',form_type='FY',fiscal_year=2024,fiscal_period='FY',amended=False)
+    digest=hashlib.sha1(b'0700|cninfo|full').hexdigest();fallback=('fil_cn_'+digest,'cn_'+digest)
+    same={'source_provider':'cninfo','source_id':'full','internal_document_id':'internal','source_url':'old opaque locator','fiscal_year':2024,'fiscal_period':'FY'}
+    occupied={'source_provider':'cninfo','source_id':'summary','internal_document_id':'seed_internal','fiscal_year':2024,'fiscal_period':'FY'}
+    rows:tuple[tuple[str,Mapping[str,JsonValue]],...]=()
+    error:ValueError | OSError | None=None
+    if mode=='same':rows=(('held',same),)
+    elif mode=='occupied':rows=((allocated[0],occupied),)
+    elif mode=='fallback_occupied':rows=((allocated[0],occupied),(fallback[0],occupied))
+    elif mode=='duplicate':rows=(('a',same),('b',same))
+    elif mode=='missing_internal':rows=(('held',{**same,'internal_document_id':None}),)
+    elif mode=='read_error':error=OSError('original read')
+    index=build_cn_download_identity_index(_view(rows,error))
+    if mode in ('fallback_occupied','duplicate','missing_internal','read_error'):
+        with pytest.raises(OSError if mode=='read_error' else ValueError):resolve_cn_download_ids('0700',candidate,index)
+    else:assert resolve_cn_download_ids('0700',candidate,index)==(fallback if mode=='occupied' else ('held','internal') if mode=='same' else allocated)
+
+
+@pytest.mark.parametrize("seed_slot", ("external", "internal"))
+@pytest.mark.parametrize("fallback_slot", (None, "external", "internal"))
+@pytest.mark.parametrize("known_source", (False, True))
+def test_cn_annual_allocation_checks_both_explicit_id_namespaces(
+    seed_slot: str, fallback_slot: str | None, known_source: bool,
+) -> None:
+    """任一 seed 占用转 fallback，任一 fallback 占用拒绝，未知来源仍占用可信内部 ID。
+
+    参数：seed_slot/fallback_slot 为占用命名空间；known_source 为是否具有可信来源 key。
+    返回：无。异常：AssertionError 表示碰撞被忽略或索引被修改。
+    """
+    candidate = _identity_candidate("cninfo", "full")
+    seed = build_cn_filing_ids(ticker="0700", form_type="FY", fiscal_year=2024, fiscal_period="FY", amended=False)
+    digest = hashlib.sha1(b"0700|cninfo|full").hexdigest()
+    fallback = (f"fil_cn_{digest}", f"cn_{digest}")
+    key: dict[str, JsonValue] = {"source_provider": "cninfo", "source_id": "other"} if known_source else {}
+    rows: list[tuple[str, Mapping[str, JsonValue]]] = [
+        (seed[0] if seed_slot == "external" else "unrelated-seed-owner",
+         {**key, "internal_document_id": seed[1] if seed_slot == "internal" else "seed-owner"}),
+    ]
+    if fallback_slot is not None:
+        rows.append((fallback[0] if fallback_slot == "external" else "unrelated-fallback-owner",
+                     {**key, "internal_document_id": fallback[1] if fallback_slot == "internal" else "fallback-owner"}))
+    view = _view(tuple(rows))
+    index = build_cn_download_identity_index(view)
+    before = (dict(index.source_matches), dict(index.allocated_periods), index.allocated_internal_ids)
+    if fallback_slot is None:
+        assert resolve_cn_download_ids("0700", candidate, index) == fallback
+    else:
+        with pytest.raises(ValueError, match="^年度来源身份已被其它源占用$"):
+            resolve_cn_download_ids("0700", candidate, index)
+    assert (dict(index.source_matches), dict(index.allocated_periods), index.allocated_internal_ids) == before
+    assert index.allocated_internal_ids == frozenset(row[1]["internal_document_id"] for row in rows)
+
+
+@pytest.mark.parametrize("internal", (None, "", 42, False, [], {}, "trusted"))
+def test_internal_occupancy_uses_only_explicit_nonempty_strings(internal: JsonValue) -> None:
+    """内部占用只取非空字符串，不从 external 名字猜内部身份。
+
+    参数：internal 为 owner 声明值。返回：无。异常：AssertionError 表示推测或宽松转换。
+    """
+    candidate = _identity_candidate("cninfo", "full")
+    seed = build_cn_filing_ids(ticker="0700", form_type="FY", fiscal_year=2024, fiscal_period="FY", amended=False)
+    index = build_cn_download_identity_index(_view(((seed[1], {"internal_document_id": internal}),)))
+    assert index.allocated_internal_ids == (frozenset({"trusted"}) if internal == "trusted" else frozenset())
+    assert resolve_cn_download_ids("0700", candidate, index) == seed
+
+
+@pytest.mark.parametrize("mode", ("same", "missing", "duplicate", "read_error"))
+def test_cn_reuse_and_original_errors_precede_colliding_allocation(mode: str) -> None:
+    """同 key 复用及旧错误优先序均先于新分配碰撞检查。
+
+    参数：mode 为复用或原错误场景。返回：无。异常：AssertionError 表示优先序改变。
+    """
+    candidate = _identity_candidate("cninfo", "full")
+    seed = build_cn_filing_ids(ticker="0700", form_type="FY", fiscal_year=2024, fiscal_period="FY", amended=False)
+    digest = hashlib.sha1(b"0700|cninfo|full").hexdigest()
+    meta: dict[str, JsonValue] = {"source_provider": "cninfo", "source_id": "full", "internal_document_id": "held-internal"}
+    rows: list[tuple[str, Mapping[str, JsonValue]]] = [
+        (seed[0], {"internal_document_id": seed[1]}),
+        (f"fil_cn_{digest}", {"internal_document_id": f"cn_{digest}"}),
+        ("held", {**meta, "internal_document_id": None} if mode == "missing" else meta),
+    ]
+    if mode in {"duplicate", "read_error"}:
+        rows.append(("duplicate", meta))
+    error = OSError("original read") if mode in {"missing", "read_error"} else None
+    index = build_cn_download_identity_index(_view(tuple(rows), error))
+    if mode == "same":
+        assert resolve_cn_download_ids("0700", candidate, index) == ("held", "held-internal")
+    elif mode == "read_error":
+        with pytest.raises(OSError) as raised:
+            resolve_cn_download_ids("0700", candidate, index)
+        assert raised.value is error
+    else:
+        message = "既有下载来源缺少内部文档身份" if mode == "missing" else "同一下载来源对应多个文档，无法唯一绑定"
+        with pytest.raises(ValueError, match=f"^{message}$"):
+            resolve_cn_download_ids("0700", candidate, index)

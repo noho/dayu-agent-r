@@ -15,6 +15,7 @@ from typing import Final, Optional, TypeAlias
 from dayu.fins.pipelines.cn_download_models import (
     CN_FISCAL_PERIOD_ORDER,
     CnFiscalPeriod,
+    CnAnnualReportFacts,
     CnReportCandidate,
     CnReportDiscoveryResult,
     CnReportHeadMeta,
@@ -249,6 +250,7 @@ def select_cninfo_report_candidates(
     query: CnReportQuery,
     announcements_by_period: Mapping[CnFiscalPeriod, tuple[CninfoRawAnnouncement, ...]],
     read_head_meta: Callable[[str], CnReportHeadMeta],
+    annual_facts_by_source: Mapping[str, CnAnnualReportFacts],
 ) -> tuple[CnReportCandidate, ...]:
     """从巨潮 raw announcements 选择财报候选。
 
@@ -264,12 +266,28 @@ def select_cninfo_report_candidates(
         无。
     """
 
+    eligible_annual = tuple(item for item in announcements_by_period.get("FY", ())
+                            if "FY" in query.discovery_periods
+                            and query.start_date <= item.announcement_date <= query.end_date
+                            and is_cninfo_report_title_admissible(item.title))
+    if len({item.announcement_id for item in eligible_annual}) != len(eligible_annual):
+        raise ValueError("年度 raw 来源重复")
+    if set(annual_facts_by_source) != {item.announcement_id for item in eligible_annual}:
+        raise ValueError("年度原文事实必须精确覆盖准入来源")
     per_period_year: dict[tuple[CnFiscalPeriod, int], list[CninfoRawAnnouncement]] = {}
     for period in query.discovery_periods:
         for item in announcements_by_period.get(period, ()):
-            if _is_title_blocked(item.title):
+            if not is_cninfo_report_title_admissible(item.title):
                 continue
-            fiscal_year = _infer_cninfo_fiscal_year(item.title, item.announcement_date)
+            if period == "FY":
+                if not query.start_date <= item.announcement_date <= query.end_date:
+                    continue
+                facts = annual_facts_by_source[item.announcement_id]
+                if facts.kind == "summary":
+                    continue
+                fiscal_year = facts.fiscal_year
+            else:
+                fiscal_year = _infer_cninfo_fiscal_year(item.title, item.announcement_date)
             if fiscal_year is None:
                 continue
             per_period_year.setdefault((period, fiscal_year), []).append(item)
@@ -364,17 +382,17 @@ def select_hkexnews_report_candidates(
             )
         )
     candidates.sort(key=lambda item: (-item.fiscal_year, _PERIOD_SORT_KEY[item.period_projection.identity_period]))
-    return CnReportDiscoveryResult(tuple(candidates), tuple(sorted(uncertain, key=lambda r: (r.filing_date or "", r.source_id))))
+    return CnReportDiscoveryResult(tuple(candidates), tuple(sorted(uncertain, key=lambda r: (r.filing_date or "", r.source_id))), (), ())
 
 
-def _is_title_blocked(title: str) -> bool:
+def is_cninfo_report_title_admissible(title: str) -> bool:
     """判断巨潮标题是否命中财报候选排除规则。
 
     Args:
         title: 公告标题。
 
     Returns:
-        命中排除规则返回 `True`。
+        准入返回 `True`。
 
     Raises:
         无。
@@ -382,12 +400,12 @@ def _is_title_blocked(title: str) -> bool:
 
     lowered = title.lower()
     if any(token.lower() in lowered for token in _CNINFO_TITLE_BLOCKLIST):
-        return True
+        return False
     if _has_cninfo_report_language_marker(title):
-        return True
+        return False
     has_report_title = any(token in title for token in _CNINFO_REPORT_TITLE_TOKENS)
     has_notice_title = any(token in title for token in _CNINFO_REPORT_NOTICE_TITLE_TOKENS)
-    return has_report_title and has_notice_title
+    return not (has_report_title and has_notice_title)
 
 
 def _has_cninfo_report_language_marker(title: str) -> bool:
@@ -522,6 +540,7 @@ def _build_cninfo_candidate(
         language="zh",
         filing_date=announcement.announcement_date,
         fiscal_year=fiscal_year,
+        fiscal_year_source="source_document" if period == "FY" else "title_or_category_inferred",
         period_projection=CnReportPeriodProjection(identity_period=period, covered_periods=(period,)),
         amended=_is_cninfo_amended_title(announcement.title),
         content_length=head_meta.content_length,
@@ -939,6 +958,7 @@ def _build_hk_candidate(
         report_date=end.isoformat() if end is not None else None,
         filing_date=announcement.filing_date,
         fiscal_year=fiscal_year,
+        fiscal_year_source="title_or_category_inferred",
         period_projection=period_projection,
         amended=_is_hk_amended_title(announcement.title),
         content_length=head_meta.content_length,

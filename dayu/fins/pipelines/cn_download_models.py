@@ -17,9 +17,11 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import Final, Literal, Optional, TypeAlias
 
+from dayu.fins.domain.document_models import SourceDocumentRevision
 from dayu.fins.domain.filing_semantics import FiscalPeriod
 from dayu.fins.download_contract import FinsDownloadUncertainReport
 
@@ -220,8 +222,8 @@ class CnReportCandidate:
         report_date: 从原始标题识别的截止日；缺少时为 None。
         language: 候选语言；副语言不入主 candidate。
         filing_date: 公告披露日期，``YYYY-MM-DD``。
-        fiscal_year: 推断财年；``fiscal_year_source`` 在 source meta 标记为
-            ``"title_or_category_inferred"``。
+        fiscal_year: 已确认财年。
+        fiscal_year_source: 财年事实来源；CN FY 必须来自原文。
         period_projection: 身份财期与覆盖财期投影。
         amended: 是否修订/更正版本。
         content_length: HEAD 返回的 ``Content-Length``；为 ``None`` 表示
@@ -237,6 +239,7 @@ class CnReportCandidate:
     language: CnLanguage
     filing_date: str
     fiscal_year: int
+    fiscal_year_source: Literal["title_or_category_inferred", "source_document"]
     period_projection: CnReportPeriodProjection
     amended: bool
     content_length: Optional[int]
@@ -337,6 +340,10 @@ class DownloadedReportAsset:
 
 __all__ = [
     "CnReportDiscoveryResult",
+    "CnAnnualReportFacts",
+    "CnAnnualReportPublication",
+    "CnAnnualReportPdf",
+    "require_matching_cn_annual_asset",
     "CN_DOWNLOAD_NORMAL_TERMINAL_STATUSES",
     "CN_DOWNLOAD_TERMINAL_OK",
     "CN_DOWNLOAD_TERMINAL_CANCELLED",
@@ -367,3 +374,98 @@ class CnReportDiscoveryResult:
 
     candidates: tuple[CnReportCandidate, ...]
     uncertain_reports: tuple[FinsDownloadUncertainReport, ...]
+    prepared_assets: tuple[DownloadedReportAsset, ...]
+    local_annual_publications: tuple[CnAnnualReportPublication, ...]
+
+    def __post_init__(self) -> None:
+        """校验所选来源与同次资产、只读见证的唯一绑定。
+
+        参数：无。返回：无。异常：ValueError 表示重复或错配来源。
+        """
+        by_source = {(c.provider, c.source_id): c for c in self.candidates}
+        if len(by_source) != len(self.candidates):
+            raise ValueError("候选来源必须唯一")
+        handed: set[tuple[str, str]] = set()
+        for asset in self.prepared_assets:
+            key = (asset.candidate.provider, asset.candidate.source_id)
+            if key in handed or key not in by_source:
+                raise ValueError("prepared 来源重复或未被选择")
+            require_matching_cn_annual_asset(by_source[key], asset)
+            handed.add(key)
+        for publication in self.local_annual_publications:
+            key = (publication.provider, publication.source_id)
+            if key in handed or key not in by_source:
+                raise ValueError("本地见证来源重复或未被选择")
+            candidate = by_source[key]
+            if candidate.provider != "cninfo" or candidate.period_projection.identity_period != "FY":
+                raise ValueError("本地见证仅允许 CN FY")
+            handed.add(key)
+
+
+@dataclass(frozen=True, slots=True)
+class CnAnnualReportFacts:
+    """官方原文年度事实，不含推断或来源治理状态。"""
+
+    fiscal_year: int
+    kind: Literal["full", "summary"]
+
+    def __post_init__(self) -> None:
+        """校验封闭事实。参数：无。返回：无。异常：TypeError/ValueError 为非法事实。"""
+        if type(self.fiscal_year) is not int or type(self.kind) is not str:
+            raise TypeError("年度事实字段类型非法")
+        if not 1000 <= self.fiscal_year <= 9999 or self.kind not in ("full", "summary"):
+            raise ValueError("年度事实值非法")
+
+
+@dataclass(frozen=True, slots=True)
+class CnAnnualReportPublication:
+    """已确认原件的 exact publication 只读见证，不授予写权限。"""
+
+    provider: Literal["cninfo"]
+    source_id: str
+    document_id: str
+    revision: SourceDocumentRevision
+
+    def __post_init__(self) -> None:
+        """校验来源见证。参数：无。返回：无。异常：TypeError/ValueError 为非法身份。"""
+        if any(type(v) is not str for v in (self.provider, self.source_id, self.document_id)):
+            raise TypeError("来源身份必须为字符串")
+        if not isinstance(self.revision, SourceDocumentRevision):
+            raise TypeError("revision 必须为仓储版本")
+        if self.provider != "cninfo" or not self.source_id or not self.document_id:
+            raise ValueError("来源身份不能为空或跨 provider")
+
+
+@dataclass(frozen=True, slots=True)
+class CnAnnualReportPdf:
+    """同一 snapshot 的原件 bytes、实际 locator 与见证。"""
+
+    publication: CnAnnualReportPublication
+    source_url: str
+    pdf_bytes: bytes
+
+    def __post_init__(self) -> None:
+        """校验原件输入。参数：无。返回：无。异常：TypeError/ValueError 为非法输入。"""
+        if not isinstance(self.publication, CnAnnualReportPublication):
+            raise TypeError("publication 类型非法")
+        if type(self.source_url) is not str or type(self.pdf_bytes) is not bytes:
+            raise TypeError("原件 locator/bytes 类型非法")
+        if self.source_url == "" or not self.pdf_bytes:
+            raise ValueError("原件 locator/bytes 不能为空")
+
+
+def require_matching_cn_annual_asset(candidate: CnReportCandidate, asset: DownloadedReportAsset) -> None:
+    """校验同次年度原件资产。参数：candidate、asset 为所选来源及资产。返回：无。
+
+    异常：ValueError 表示候选、来源、字节长度或摘要不匹配。
+    """
+    if candidate.provider != "cninfo" or candidate.period_projection.identity_period != "FY":
+        raise ValueError("年度资产仅允许 CN FY")
+    if candidate.fiscal_year_source != "source_document" or asset.candidate != candidate:
+        raise ValueError("年度资产候选或事实来源不匹配")
+    if type(asset.pdf_bytes) is not bytes or not asset.pdf_bytes:
+        raise ValueError("年度资产原件不能为空")
+    if type(asset.content_length) is not int or asset.content_length != len(asset.pdf_bytes):
+        raise ValueError("年度资产长度不匹配")
+    if asset.sha256 != hashlib.sha256(asset.pdf_bytes).hexdigest() or not asset.downloaded_at:
+        raise ValueError("年度资产摘要或取得时间不匹配")

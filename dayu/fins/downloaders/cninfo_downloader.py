@@ -39,6 +39,7 @@ import time
 from datetime import date
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from typing import Final, Optional, TypeAlias, cast
 
 import httpx
@@ -47,7 +48,10 @@ from dayu.fins.download_contract import (
     FinsDownloadSource,
     FinsDownloadTransportCategory,
 )
+from dayu.fins.pipelines.cn_download_pdf_gate import CnDownloadPdfGateProtocol
 from dayu.fins.pipelines.cn_download_models import (
+    CnAnnualReportPdf,
+    CnAnnualReportFacts,
     CnCompanyProfile,
     CnFiscalPeriod,
     CnReportHeadMeta,
@@ -57,7 +61,8 @@ from dayu.fins.pipelines.cn_download_models import (
     CninfoRawAnnouncement,
     DownloadedReportAsset,
 )
-from dayu.fins.pipelines.cn_report_selection import select_cninfo_report_candidates
+from dayu.fins.pipelines.cn_report_selection import select_cninfo_report_candidates, is_cninfo_report_title_admissible
+from dayu.fins.pipelines.cn_annual_report_facts import resolve_cn_annual_report_facts
 from dayu.fins._log import Log
 
 _MODULE: Final[str] = "FINS.CNINFO_DOWNLOADER"
@@ -233,6 +238,8 @@ class CninfoDiscoveryClient:
         profile: CnCompanyProfile,
         *,
         local_annual_ends: tuple[date, ...],
+        local_cn_annual_pdfs: tuple[CnAnnualReportPdf, ...],
+        pdf_download_gate: CnDownloadPdfGateProtocol,
         cancellation_checkpoint: Callable[[], None] | None = None,
     ) -> CnReportDiscoveryResult:
         """列出符合 ``query.discovery_periods`` 与窗口约束的候选报告。
@@ -248,6 +255,8 @@ class CninfoDiscoveryClient:
         Args:
             query: 单次 download 查询参数。
             profile: ``resolve_company`` 返回的公司元数据。
+            local_cn_annual_pdfs: 同窗 CN 年度原件；HK 必须为空。
+            pdf_download_gate: 年度远端原件 acquisition gate。
             local_annual_ends: 同公司可信本地年度截止日；CN 必须为空。
             cancellation_checkpoint: 可选 workflow-owned 无参取消检查点；
                 每个受支持财期的每次 POST 前和成功响应后调用。
@@ -296,12 +305,53 @@ class CninfoDiscoveryClient:
                 cancellation_checkpoint=cancellation_checkpoint,
             )
             raw_by_period[period] = tuple(announcements)
+        _cninfo_checkpoint(cancellation_checkpoint)
+        annual_raw = tuple(item for item in raw_by_period.get("FY", ())
+                           if query.start_date <= item.announcement_date <= query.end_date
+                           and is_cninfo_report_title_admissible(item.title))
+        if len({item.announcement_id for item in raw_by_period.get("FY", ())}) != len(raw_by_period.get("FY", ())):
+            raise _cninfo_protocol_error("巨潮年度公告来源身份重复")
+        local = {(pdf.publication.provider, pdf.publication.source_id): pdf for pdf in local_cn_annual_pdfs}
+        if len(local) != len(local_cn_annual_pdfs):
+            raise ValueError("本地年度来源身份重复")
+        facts: dict[str, CnAnnualReportFacts] = {}
+        remote: dict[str, tuple[bytes, str]] = {}
+        for item in annual_raw:
+            _cninfo_checkpoint(cancellation_checkpoint)
+            cached = local.get(("cninfo", item.announcement_id))
+            if cached is not None:
+                payload = cached.pdf_bytes
+                facts[item.announcement_id] = _cninfo_annual_facts(payload, cancellation_checkpoint)
+            else:
+                _cninfo_checkpoint(cancellation_checkpoint)
+                with pdf_download_gate.lease_for_provider("cninfo", cancel_checker=partial(_check_cninfo_gate_cancellation, cancellation_checkpoint)):
+                    _cninfo_checkpoint(cancellation_checkpoint)
+                    Log.debug(f"巨潮年度原文获取: source_id={item.announcement_id}", module=_MODULE)
+                    payload = self._http_download_bytes(item.source_url, cancellation_checkpoint=cancellation_checkpoint)
+                    _cninfo_checkpoint(cancellation_checkpoint)
+                    _validate_cninfo_pdf(payload)
+                    _cninfo_checkpoint(cancellation_checkpoint)
+                    facts[item.announcement_id] = _cninfo_annual_facts(payload, cancellation_checkpoint)
+                    remote[item.announcement_id] = (payload, _utc_now_isoformat())
+                _cninfo_checkpoint(cancellation_checkpoint)
         candidates = select_cninfo_report_candidates(
             query=query,
             announcements_by_period=raw_by_period,
             read_head_meta=self._http_head_meta,
+            annual_facts_by_source=facts,
         )
-        return CnReportDiscoveryResult(candidates=candidates, uncertain_reports=())
+        prepared: list[DownloadedReportAsset] = []
+        publications = []
+        for candidate in candidates:
+            if candidate.period_projection.identity_period != "FY":
+                continue
+            if candidate.source_id in remote:
+                payload, acquired_at = remote[candidate.source_id]
+                prepared.append(DownloadedReportAsset(candidate, payload, _sha256_hex(payload), len(payload), acquired_at))
+            else:
+                publications.append(local[("cninfo", candidate.source_id)].publication)
+        return CnReportDiscoveryResult(candidates=candidates, uncertain_reports=(),
+                                       prepared_assets=tuple(prepared), local_annual_publications=tuple(publications))
 
     def download_report_pdf(self, candidate: CnReportCandidate) -> DownloadedReportAsset:
         """下载单份候选 PDF 并返回强类型资产对象。
@@ -327,10 +377,7 @@ class CninfoDiscoveryClient:
         if candidate.provider != "cninfo":
             raise ValueError(f"CninfoDiscoveryClient 不支持 provider={candidate.provider!r}")
         payload = self._http_download_bytes(candidate.source_url)
-        if len(payload) < _PDF_MIN_BYTES:
-            raise _cninfo_protocol_error("巨潮来源返回的 PDF 内容不符合预期")
-        if not payload.startswith(_PDF_MAGIC_BYTES):
-            raise _cninfo_protocol_error("巨潮来源返回的 PDF 内容不符合预期")
+        _validate_cninfo_pdf(payload)
         sha256 = _sha256_hex(payload)
         downloaded_at = _utc_now_isoformat()
         return DownloadedReportAsset(
@@ -677,7 +724,7 @@ class CninfoDiscoveryClient:
             last_modified=response.headers.get("Last-Modified"),
         )
 
-    def _http_download_bytes(self, url: str) -> bytes:
+    def _http_download_bytes(self, url: str, *, cancellation_checkpoint: Callable[[], None] | None = None) -> bytes:
         """带重试地下载文件字节。
 
         Args:
@@ -691,11 +738,13 @@ class CninfoDiscoveryClient:
         """
 
         for attempt in range(self._max_retries):
+            _cninfo_checkpoint(cancellation_checkpoint)
             try:
                 self._throttle_before_request()
                 try:
                     response = self._client.get(url, follow_redirects=True)
                     response.raise_for_status()
+                    _cninfo_checkpoint(cancellation_checkpoint)
                     return response.content
                 finally:
                     self._mark_request_finished()
@@ -931,3 +980,32 @@ __all__ = [
     "CNINFO_STATIC_BASE_URL",
     "CninfoDiscoveryClient",
 ]
+
+
+def _cninfo_checkpoint(checkpoint: Callable[[], None] | None) -> None:
+    """执行控制检查。参数：checkpoint 为可选检查。返回：无。异常：原控制异常透传。"""
+    if checkpoint is not None:
+        checkpoint()
+
+
+def _check_cninfo_gate_cancellation(checkpoint: Callable[[], None] | None) -> bool:
+    """把控制检查适配既有 gate。参数：checkpoint 为检查。返回：False。异常：原异常透传。"""
+    _cninfo_checkpoint(checkpoint)
+    return False
+
+
+def _validate_cninfo_pdf(payload: bytes) -> None:
+    """统一实体校验。参数：payload 为响应字节。返回：无。异常：typed PROTOCOL 为非 PDF。"""
+    if len(payload) < _PDF_MIN_BYTES or not payload.startswith(_PDF_MAGIC_BYTES):
+        raise _cninfo_protocol_error("巨潮来源返回的 PDF 内容不符合预期")
+
+
+def _cninfo_annual_facts(payload: bytes, checkpoint: Callable[[], None] | None) -> CnAnnualReportFacts:
+    """在独立 parser scope 确认事实。参数：payload/检查点。返回：年度事实。异常：PROTOCOL 或原控制异常。"""
+    _cninfo_checkpoint(checkpoint)
+    try:
+        facts = resolve_cn_annual_report_facts(payload)
+    except ValueError as exc:
+        raise _cninfo_protocol_error("巨潮年度报告原文无法确认财年或全文性质") from exc
+    _cninfo_checkpoint(checkpoint)
+    return facts

@@ -1,6 +1,8 @@
 """CN/HK report selection helper 测试。"""
 
 from __future__ import annotations
+from dayu.fins.pipelines.cn_download_models import CnAnnualReportFacts
+from dayu.fins.pipelines.cn_report_selection import is_cninfo_report_title_admissible
 
 from dataclasses import replace
 
@@ -279,7 +281,13 @@ def test_cninfo_selection_filters_blocklisted_titles_and_builds_candidate() -> N
         AssertionError: 断言失败时抛出。
     """
 
-    candidates = select_cninfo_report_candidates(
+    candidates = select_cninfo_report_candidates(annual_facts_by_source={item.announcement_id: CnAnnualReportFacts(int(item.title.split("年")[0][-4:]), "full") for item in ({
+            "FY": (
+                _cn_raw(announcement_id="FULL", title="比亚迪：2024年年度报告"),
+                _cn_raw(announcement_id="SUMMARY", title="比亚迪：2024年年度报告摘要"),
+                _cn_raw(announcement_id="EN", title="比亚迪：2024年年度报告（英文）"),
+            )
+        }).get("FY", ()) if is_cninfo_report_title_admissible(item.title)},
         query=_cn_query(("FY",)),
         announcements_by_period={
             "FY": (
@@ -312,7 +320,15 @@ def test_cninfo_selection_keeps_years_and_prefers_amended_per_year() -> None:
         AssertionError: 断言失败时抛出。
     """
 
-    candidates = select_cninfo_report_candidates(
+    candidates = select_cninfo_report_candidates(annual_facts_by_source={item.announcement_id: CnAnnualReportFacts(int(item.title.split("年")[0][-4:]), "full") for item in ({
+            "FY": (
+                _cn_raw(announcement_id="A1", title="贵州茅台：2024年年度报告", announcement_date="2025-04-01"),
+                _cn_raw(
+                    announcement_id="A2", title="贵州茅台：2024年年度报告（更正后）", announcement_date="2025-04-15"
+                ),
+                _cn_raw(announcement_id="A3", title="贵州茅台：2023年年度报告", announcement_date="2024-04-01"),
+            )
+        }).get("FY", ()) if is_cninfo_report_title_admissible(item.title)},
         query=_cn_query(("FY",)),
         announcements_by_period={
             "FY": (
@@ -362,7 +378,7 @@ def test_cninfo_same_release_prefers_full_report(
         _cn_raw(announcement_id="Z7", title=f"2024年{report}正文{revision}"),
         full,
     )
-    candidates = select_cninfo_report_candidates(
+    candidates = select_cninfo_report_candidates(annual_facts_by_source={item.announcement_id: CnAnnualReportFacts(int(item.title.split("年")[0][-4:]), "full") for item in ({period: tuple(reversed(rows)) if reverse else rows}).get("FY", ()) if is_cninfo_report_title_admissible(item.title)},
         query=_cn_query((period,)),
         announcements_by_period={period: tuple(reversed(rows)) if reverse else rows},
         read_head_meta=_head_meta,
@@ -394,7 +410,7 @@ def test_cninfo_body_remains_a_valid_only_report(period: CnFiscalPeriod, report:
     """
 
     body = _cn_raw(announcement_id="body", title=f"2024年{report}正文")
-    candidates = select_cninfo_report_candidates(
+    candidates = select_cninfo_report_candidates(annual_facts_by_source={item.announcement_id: CnAnnualReportFacts(int(item.title.split("年")[0][-4:]), "full") for item in ({period: (body,)}).get("FY", ()) if is_cninfo_report_title_admissible(item.title)},
         query=_cn_query((period,)), announcements_by_period={period: (body,)}, read_head_meta=_head_meta
     )
     assert len(candidates) == 1
@@ -431,7 +447,7 @@ def test_cninfo_revision_and_date_take_precedence_over_report_form(
     body = _cn_raw(announcement_id="A1", title=body_title, announcement_date=body_date)
     full = _cn_raw(announcement_id="Z9", title="2024年第一季度报告全文", announcement_date=full_date)
     for rows in ((body, full), (full, body)):
-        candidates = select_cninfo_report_candidates(
+        candidates = select_cninfo_report_candidates(annual_facts_by_source={item.announcement_id: CnAnnualReportFacts(int(item.title.split("年")[0][-4:]), "full") for item in ({"Q1": rows}).get("FY", ()) if is_cninfo_report_title_admissible(item.title)},
             query=_cn_query(("Q1",)), announcements_by_period={"Q1": rows}, read_head_meta=_head_meta
         )
         assert len(candidates) == 1
@@ -456,7 +472,7 @@ def test_cninfo_equal_reports_use_stable_source_identity(same_id: bool) -> None:
     first = _cn_raw(announcement_id="A1", title="2024年第一季度报告全文")
     second = replace(first, source_url=first.source_url + "?version=2") if same_id else replace(first, announcement_id="A2")
     for rows in ((first, second), (second, first)):
-        candidates = select_cninfo_report_candidates(
+        candidates = select_cninfo_report_candidates(annual_facts_by_source={item.announcement_id: CnAnnualReportFacts(int(item.title.split("年")[0][-4:]), "full") for item in ({"Q1": rows}).get("FY", ()) if is_cninfo_report_title_admissible(item.title)},
             query=_cn_query(("Q1",)), announcements_by_period={"Q1": rows}, read_head_meta=_head_meta
         )
         assert len(candidates) == 1
@@ -740,3 +756,32 @@ def test_hkexnews_selection_fails_closed_on_same_source_id_fact_conflict() -> No
             ),
             read_head_meta=_head_meta,
          local_annual_ends=()).candidates
+
+
+import json
+import random
+from typing import cast
+from dayu.fins.downloaders.cninfo_downloader import _parse_raw_announcement,JsonValue as RawJsonValue
+from dayu.fins.pipelines.cn_annual_report_facts import resolve_cn_annual_report_facts
+from tests.fins.test_cn_annual_report_facts import FIXTURES
+
+
+@pytest.mark.parametrize('seed',range(5))
+def test_official_19_rows_use_original_facts(seed: int) -> None:
+    """参数：确定打乱种子。返回：无。异常：跨年竞争或摘要误选断言失败。"""
+    raw=json.loads((FIXTURES/'annual-raw.response.json').read_bytes())['announcements']
+    items=[item for row in raw if (item:=_parse_raw_announcement(cast(RawJsonValue,row))) is not None]
+    random.Random(seed).shuffle(items)
+    facts={item.announcement_id:resolve_cn_annual_report_facts((FIXTURES/f'{item.announcement_id}.pdf').read_bytes()) for item in items if is_cninfo_report_title_admissible(item.title)}
+    candidates=select_cninfo_report_candidates(query=CnReportQuery('CN','601225','2018-01-01','2026-10-12',('FY',)),announcements_by_period={'FY':tuple(items)},annual_facts_by_source=facts,read_head_meta=_head_meta)
+    assert [(c.fiscal_year,c.source_id) for c in candidates]==[(2025,'1225178190'),(2024,'1223301988'),(2023,'1219815158'),(2022,'1216619553'),(2021,'1213161683'),(2020,'1209875598'),(2019,'1207678369'),(2018,'1206005283'),(2017,'1205110621')]
+    assert all(c.fiscal_year_source=='source_document' for c in candidates)
+
+
+@pytest.mark.parametrize('case',('missing','extra','duplicate'))
+def test_facts_map_exact_contract(case: str) -> None:
+    """参数：事实map缺口。返回：无。异常：静默fallback或覆盖map断言失败。"""
+    item=_cn_raw(announcement_id='A',title='无年份年度报告')
+    items=(item,item) if case=='duplicate' else (item,)
+    facts={} if case=='missing' else {'A':CnAnnualReportFacts(2021,'full'),'extra':CnAnnualReportFacts(2020,'full')} if case=='extra' else {'A':CnAnnualReportFacts(2021,'full')}
+    with pytest.raises(ValueError):select_cninfo_report_candidates(query=_cn_query(('FY',)),announcements_by_period={'FY':items},read_head_meta=_head_meta,annual_facts_by_source=facts)

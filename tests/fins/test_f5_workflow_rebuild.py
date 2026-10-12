@@ -1,4 +1,6 @@
 """F5 真实 Fs 下载 A+未知 B、日期共享 writer 和 rebuild 原资产保全；仅合成资产。"""
+from dayu.fins.pipelines.cn_download_models import CnAnnualReportPdf
+from dayu.fins.pipelines.cn_download_pdf_gate import CnDownloadPdfGateProtocol, NoopCnDownloadPdfGate
 
 import asyncio
 import io
@@ -45,7 +47,7 @@ class _RawDiscovery(_FakeDiscoveryClient):
         """参数为隔离目录与合成 raw；返回无；异常无。"""
         super().__init__(temp_dir=temp_dir, candidates=())
         self.raw = raw
-    def list_report_candidates(self, query: CnReportQuery, profile: CnCompanyProfile, *, local_annual_ends: tuple[date, ...], cancellation_checkpoint: Callable[[], None] | None = None) -> CnReportDiscoveryResult:
+    def list_report_candidates(self, query: CnReportQuery, profile: CnCompanyProfile, *, local_annual_ends: tuple[date, ...], local_cn_annual_pdfs: tuple[CnAnnualReportPdf, ...], pdf_download_gate: CnDownloadPdfGateProtocol, cancellation_checkpoint: Callable[[], None] | None = None) -> CnReportDiscoveryResult:
         """参数为 mandatory discovery 输入；返回真实 selection；取消与来源冲突原样抛出。"""
         del profile
         self.queries.append(query)

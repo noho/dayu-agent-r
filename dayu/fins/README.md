@@ -554,10 +554,34 @@ batching repository 是 begin / commit / rollback 的唯一 lifecycle owner。pr
 
 CNInfo / HKEXNews downloader 只负责 HTTP 请求响应、provider JSON 解析、provider raw 字段归一、股票代码匹配、PDF URL 归一、HEAD / GET 与 PDF 字节校验。产品级财报候选语义由 `dayu.fins.pipelines.cn_report_selection` 持有：title blocklist、语言过滤、report kind / fiscal period / fiscal year 推断、同 period/year 去重、amended 优先和 `CnReportCandidate` 构造都在 pipeline helper 内完成。HKEXNews 的 Q1～Q4 共用一次全 results group discovery；selection 先只由 provider category 判定 report/results family，再在该 family 内共同解释 category 与 title 的期间事实。category family 或期间事实不唯一、同一 source ID 的核心事实冲突时失败关闭。
 
-CNInfo 同财年、财期内先按修订标记、公告日期优先选择；两者相同时，非“正文”报告优先。
-完整报告标题不必含“全文”；只有正文时仍返回正文。剩余平手使用公告 ID、来源 URL 的字符串
-顺序稳定裁决，这些身份字段不代表版本新旧或报告质量。该规则只描述候选选择，不承诺 PDF
-财务表完整性；本地完整缓存仍沿用增量跳过契约，更新选中来源使用显式覆盖下载。
+CNInfo FY 的财年和全文／摘要事实由纯 PDF 首页 facts owner 产生；selection 只消费已确认事实，
+明确标题摘要不取原文，隐藏摘要确认后排除。任意准入年度原文的获取或解析失败终止整次 discovery，
+不返回部分财期候选。H1/Q 和 HK 的财期推断保持既有规则。CNInfo 同财年、财期内仍先按修订、
+公告日期、非“正文”优先选择，最终来源 ID/URL 仅作稳定平手裁决，不代表质量或版本新旧。
+
+CNInfo FY 来源身份是 `(provider, source_id)`；URL 是取得实际原件的 locator。同来源复用既有 ID，
+不同摘要／全文或新版公告即使财期相同也分配独立身份，保留旧源。合法 COMPLETE 不因 locator
+变化自动刷新；显式 overwrite 作用于解析到的该来源。新年度身份同时检查显式 external/internal
+占用：财期 seed 任一被占用即使用来源 hash 身份，后者任一被占用则拒绝；来源 key 未知的
+在场元数据仍保留其非空字符串内部身份占用。同来源复用先于新分配。
+
+发现前 inventory 检查只拒绝 UNSAFE 和多处 repair；selection 后的新 inventory 才裁决唯一所选 repair。
+FY 窗内完整下载来源经同窗元数据和 exact revision snapshot 读取唯一显式 original PDF；共享原件 owner
+只验证角色、descriptor、实际 bytes 和同版关系，不猜财年或从 URL 推身份。它与 pure facts owner
+共同产生所选本地 publication witness；所选远端全文则交付本次 prepared bytes。落选 payload 不持久化。
+
+每次非 overwrite 的 CN FY COMPLETE skip 都要求 A 当前 revision 的实际本地 original 是同年全文：
+同版 witness 可复用证明，无 witness 则重新读取 exact target 原件，prepared 不能替代该证明。
+A/B 共用严格 publication metadata 匹配，覆盖财期必须为与 candidate 投影相等的 canonical JSON list。
+B COMPLETE 先 rollback，再 fresh A 证明；publication churn 按既有三轮预算丢弃旧 payload 重取。
+三种完整性异常终止请求并保留真实已提交前缀；年度身份、财期或原文事实错配只产生单 filing 失败。
+取消保持控制类型和资源关闭，均不从 reason 文本决定调度。
+
+唯一可信所选全文 repair 复用 prepared、成功提交并复查 clean 后才开放公司与后续候选。
+修复意图由初始候选身份投影保存来源 key 与预期文档 ID；开始该来源前 fresh 身份漂移按版本
+冲突中止，尚未开始 filing。稳定修复失败关闸并保留原原因，取消保持取消终态；正常终态须收口修复意图。
+落选损坏隐藏摘要只允许必要的只读原文 GET 确认事实，随后由 final preflight 拒绝，零业务写入；
+不修复、覆盖或删除摘要，不用它伪造 selected/rejected。历史错年、未知身份或声明不足不提供自动恢复。
 
 CN/HK candidate 使用 `CnReportPeriodProjection` 区分唯一 `identity_period` 与只读
 `covered_periods`。identity 是 document ID、窗口、form、fiscal period、report kind 与

@@ -9,17 +9,22 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
+from functools import partial
 from io import BytesIO
 from typing import Literal, TypeAlias, cast
 
 from dayu.contracts.cancellation import CancellationToken
 from dayu.fins.domain.document_models import BatchToken, SourceHandle
 from dayu.fins.domain.enums import SourceKind
-from dayu.fins.download_contract import FinsDownloadProviderError
+from dayu.fins.download_contract import FinsDownloadProviderError, FinsDownloadSource, FinsDownloadTransportCategory
+from dayu.fins.pipelines.cn_annual_report_source import read_cn_annual_report_pdf, CnAnnualReportSourceError
+from dayu.fins.pipelines.cn_annual_report_facts import resolve_cn_annual_report_facts
 from dayu.fins.pipelines.cn_download_pdf_gate import CnDownloadPdfGateProtocol
 from dayu.fins.pipelines.cn_download_models import (
     CnDownloadCancelledError,
+    CnAnnualReportPublication,
+    require_matching_cn_annual_asset,
     CnCompanyProfile,
     CnReportCandidate,
     DownloadedReportAsset,
@@ -54,6 +59,7 @@ from dayu.fins.storage import (
     SourceIntegrityPreflightReason,
     SourceIntegrityRevisionConflictError,
     SourceIntegrityStatus,
+    SourceIntegrityRepairRequiredError,
     has_same_source_publication_identity,
 )
 from dayu.fins._log import Log
@@ -83,6 +89,8 @@ def project_cn_filing_failure(error: Exception) -> tuple[str, str]:
         无。
     """
 
+    if isinstance(error, CnDownloadAnnualPublicationError):
+        return error.reason, _ANNUAL_FAILURE_MESSAGES[error.reason]
     if isinstance(error, FinsDownloadProviderError):
         return f"provider_{error.transport_category.value}", error.safe_message
     if isinstance(error, OSError):
@@ -128,6 +136,8 @@ async def run_cn_download_single_filing_stream(
     ticker: str,
     profile: CnCompanyProfile,
     candidate: CnReportCandidate,
+    prepared_asset: DownloadedReportAsset | None,
+    local_annual_publication: CnAnnualReportPublication | None,
     overwrite: bool,
     cancel_checker: Callable[[], bool] | None,
     module: str,
@@ -145,6 +155,8 @@ async def run_cn_download_single_filing_stream(
         docling_conversion_runner: 可取消 PDF -> Docling JSON conversion runner。
         ticker: 已归一化 ticker。
         profile: 公司基础元数据。
+        prepared_asset: 同次所选原件，或 None。
+        local_annual_publication: 已确认同版原件的只读见证，或 None。
         candidate: 远端候选报告。
         overwrite: 是否强制覆盖；为 ``True`` 时禁止复用和 skip。
         cancel_checker: 可选取消检查函数。
@@ -167,28 +179,41 @@ async def run_cn_download_single_filing_stream(
     document_id, internal_document_id = resolve_cn_download_ids(ticker, candidate, identity_index)
     pdf_filename = f"{document_id}.pdf"
     docling_filename = f"{document_id}_docling.json"
-    phase_a_integrity = source_repository.classify_source_integrity(
-        ticker,
-        document_id,
-        SourceKind.FILING,
-    )
+    if prepared_asset is not None and local_annual_publication is not None:
+        raise ValueError("prepared 与本地见证不能并存")
+    annual = candidate.provider == "cninfo" and candidate.period_projection.identity_period == "FY"
+    if annual:
+        phase_a_integrity, previous_meta = _read_cn_annual_phase_a(ticker, document_id, source_repository)
+    else:
+        phase_a_integrity = source_repository.classify_source_integrity(ticker, document_id, SourceKind.FILING)
+        previous_meta = None if phase_a_integrity.status is SourceIntegrityStatus.MISSING else _safe_get_source_meta(
+            source_repository=source_repository, ticker=ticker, document_id=document_id)
     if phase_a_integrity.status is SourceIntegrityStatus.UNSAFE:
         raise SourceIntegrityPreflightError(SourceIntegrityPreflightReason.UNSAFE_PUBLICATION)
-    previous_meta = (
-        None
-        if phase_a_integrity.status is SourceIntegrityStatus.MISSING
-        else _safe_get_source_meta(
-            source_repository=source_repository,
-            ticker=ticker,
-            document_id=document_id,
-        )
-    )
+    if local_annual_publication is not None:
+        if (local_annual_publication.document_id != document_id
+            or local_annual_publication.provider != candidate.provider
+            or local_annual_publication.source_id != candidate.source_id
+            or phase_a_integrity.revision != local_annual_publication.revision
+            or phase_a_integrity.status is SourceIntegrityStatus.MISSING):
+            raise SourceIntegrityRevisionConflictError()
+        if phase_a_integrity.status is SourceIntegrityStatus.REPAIR_REQUIRED:
+            raise SourceIntegrityRepairRequiredError()
+        if phase_a_integrity.status is not SourceIntegrityStatus.COMPLETE:
+            raise SourceIntegrityRevisionConflictError()
+    if annual and previous_meta is not None:
+        _require_matching_cn_annual_publication(previous_meta, candidate)
     previous_completed_meta = _resolve_previous_completed_meta(
         previous_meta=previous_meta,
         overwrite=overwrite,
     )
     remote_fingerprint = build_remote_fingerprint(candidate)
     if phase_a_integrity.status is SourceIntegrityStatus.COMPLETE and not overwrite:
+        if annual:
+            assert previous_meta is not None
+            _require_current_cn_annual_complete_facts(ticker, document_id, phase_a_integrity, previous_meta,
+                candidate, local_annual_publication, source_repository,
+                partial(_raise_if_cancelled, module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker))
         if (
             candidate.provider == "hkexnews"
             and previous_meta is not None
@@ -246,14 +271,27 @@ async def run_cn_download_single_filing_stream(
         },
     )
     try:
-        asset = await asyncio.to_thread(
-            _download_report_pdf_with_gate,
-            discovery_client=discovery_client,
-            pdf_download_gate=pdf_download_gate,
-            candidate=candidate,
-            cancel_checker=cancel_checker,
-        )
+        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
+        if prepared_asset is not None:
+            asset = prepared_asset
+        else:
+            asset = await asyncio.to_thread(
+                _download_report_pdf_with_gate, discovery_client=discovery_client,
+                pdf_download_gate=pdf_download_gate, candidate=candidate, cancel_checker=cancel_checker)
+        _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
+        if annual:
+            require_matching_cn_annual_asset(candidate, asset)
+            try:
+                facts = resolve_cn_annual_report_facts(asset.pdf_bytes)
+            except ValueError as exc:
+                raise FinsDownloadProviderError(source=FinsDownloadSource.CNINFO, transport_category=FinsDownloadTransportCategory.PROTOCOL,
+                    retryable=False, safe_message="巨潮年度报告原文无法确认财年或全文性质") from exc
+            _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
+            if facts.kind != "full" or facts.fiscal_year != candidate.fiscal_year:
+                raise CnDownloadAnnualPublicationError("source_document_facts_mismatch")
     except CnDownloadCancelledError:
+        raise
+    except (SourceIntegrityPreflightError, SourceIntegrityRevisionConflictError, SourceIntegrityRepairRequiredError):
         raise
     except Exception as exc:
         reason_code, reason_message = project_cn_filing_failure(exc)
@@ -341,6 +379,8 @@ async def run_cn_download_single_filing_stream(
             docling_json_bytes = conversion.json_bytes
         except DoclingConversionCancelledError as exc:
             raise CnDownloadCancelledError("操作已被取消") from exc
+        except (SourceIntegrityPreflightError, SourceIntegrityRevisionConflictError, SourceIntegrityRepairRequiredError):
+            raise
         except Exception as exc:
             reason_code, reason_message = project_cn_filing_failure(exc)
             failed = _build_filing_result(
@@ -527,6 +567,8 @@ async def _retry_cn_filing_after_identity_change(
         overwrite=overwrite,
         cancel_checker=cancel_checker,
         module=module,
+        prepared_asset=None,
+        local_annual_publication=None,
         _identity_round=next_round,
     ):
         yield event
@@ -611,10 +653,17 @@ def _commit_cn_filing_assets_batch(
             batching_repository.rollback_batch(token)
             commit_started = True
             return "retry"
+        annual = candidate.provider == "cninfo" and candidate.period_projection.identity_period == "FY"
+        if annual and phase_b_integrity.status is not SourceIntegrityStatus.MISSING:
+            entries = source_repository.read_source_meta_integrity_view(ticker, SourceKind.FILING, batch=token)
+            target = next((entry for entry in entries if entry.document_id == document_id), None)
+            if target is None or target.integrity != phase_b_integrity:
+                raise SourceIntegrityRevisionConflictError()
+            _require_matching_cn_annual_publication(target.source_meta, candidate)
         if phase_b_integrity.status is SourceIntegrityStatus.COMPLETE and not overwrite:
             batching_repository.rollback_batch(token)
             commit_started = True
-            return "skip"
+            return "retry" if annual else "skip"
         _raise_if_cancelled(
             module=module,
             ticker=ticker,
@@ -944,3 +993,79 @@ __all__ = [
     "project_cn_filing_failure",
     "run_cn_download_single_filing_stream",
 ]
+
+
+_AnnualFailureReason: TypeAlias = Literal["source_identity_conflict", "period_metadata_mismatch", "source_document_facts_mismatch"]
+_ANNUAL_FAILURE_MESSAGES: dict[_AnnualFailureReason, str] = {
+    "source_identity_conflict": "本地年度报告来源与所选公告不一致，无法复用",
+    "period_metadata_mismatch": "本地年度报告财年或覆盖期间与原文不一致，需核对已有来源",
+    "source_document_facts_mismatch": "年度报告原文与本次已确认的财年或全文性质不一致，无法应用",
+}
+
+
+class CnDownloadAnnualPublicationError(CnDownloadFilingError):
+    """年度 publication 业务失败；仅影响单 filing，不改变完整性调度。"""
+
+    def __init__(self, reason: _AnnualFailureReason) -> None:
+        """构造业务原因。参数：reason 为封闭原因。返回：无。异常：ValueError 为非法原因。"""
+        if reason not in _ANNUAL_FAILURE_MESSAGES:
+            raise ValueError("年度 publication 原因非法")
+        self.reason: _AnnualFailureReason = reason
+        super().__init__(_ANNUAL_FAILURE_MESSAGES[reason])
+
+
+def _read_cn_annual_phase_a(ticker: str, document_id: str, source_repository: SourceDocumentRepositoryProtocol) -> tuple[SourceIntegrityClassification, JsonObject | None]:
+    """读取同窗 A 分类及元数据。参数：exact target/仓储。返回：分类、同窗 meta。异常：仓储/冲突原样。"""
+    entries = source_repository.read_source_meta_integrity_view(ticker, SourceKind.FILING, batch=None)
+    for entry in entries:
+        if entry.document_id == document_id:
+            return entry.integrity, dict(entry.source_meta)
+    missing = source_repository.classify_source_integrity(ticker, document_id, SourceKind.FILING)
+    if missing.status is not SourceIntegrityStatus.MISSING:
+        raise SourceIntegrityRevisionConflictError()
+    return missing, None
+
+
+def _require_matching_cn_annual_publication(meta: Mapping[str, JsonValue], candidate: CnReportCandidate) -> None:
+    """唯一业务 metadata 匹配 owner。参数：meta/candidate。返回：无。异常：AnnualPublicationError 为错配。"""
+    if meta.get("source_provider") != candidate.provider or meta.get("source_id") != candidate.source_id:
+        raise CnDownloadAnnualPublicationError("source_identity_conflict")
+    covered = meta.get("covered_fiscal_periods")
+    if (type(meta.get("fiscal_year")) is not int or meta.get("fiscal_year") != candidate.fiscal_year
+        or meta.get("fiscal_period") != candidate.period_projection.identity_period
+        or type(covered) is not list or covered != list(candidate.period_projection.covered_periods)):
+        raise CnDownloadAnnualPublicationError("period_metadata_mismatch")
+
+
+def _require_current_cn_annual_complete_facts(
+    ticker: str, document_id: str, classification: SourceIntegrityClassification,
+    meta: Mapping[str, JsonValue], candidate: CnReportCandidate,
+    local_annual_publication: CnAnnualReportPublication | None,
+    source_repository: SourceDocumentRepositoryProtocol, cancellation_checkpoint: Callable[[], None] | None,
+) -> None:
+    """证明本次 A revision 的实际 original 为所选全文。
+
+    参数：exact target、classification/meta、candidate、同版 witness、仓储/检查点。
+    返回：无。异常：原仓储/完整性/取消；声明或事实不足为单 filing 业务失败。
+    """
+    if cancellation_checkpoint is not None:
+        cancellation_checkpoint()
+    if classification.status is not SourceIntegrityStatus.COMPLETE or classification.revision is None:
+        raise SourceIntegrityRevisionConflictError()
+    if local_annual_publication is not None:
+        return
+    publication = CnAnnualReportPublication("cninfo", candidate.source_id, document_id, classification.revision)
+    try:
+        pdf = read_cn_annual_report_pdf(ticker, document_id, publication, meta, source_repository, cancellation_checkpoint)
+    except CnAnnualReportSourceError as exc:
+        raise CnDownloadAnnualPublicationError("source_document_facts_mismatch") from exc
+    if cancellation_checkpoint is not None:
+        cancellation_checkpoint()
+    try:
+        facts = resolve_cn_annual_report_facts(pdf.pdf_bytes)
+    except ValueError as exc:
+        raise CnDownloadAnnualPublicationError("source_document_facts_mismatch") from exc
+    if cancellation_checkpoint is not None:
+        cancellation_checkpoint()
+    if facts.kind != "full" or facts.fiscal_year != candidate.fiscal_year:
+        raise CnDownloadAnnualPublicationError("source_document_facts_mismatch")
