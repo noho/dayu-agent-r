@@ -3,7 +3,7 @@
 - 基线：7637bb0b4fbca212a4db0f4cfc09655e66516695。
 - 分支：fix/601225-annual-fulltext；目标 artifact：601225-annual-fulltext-goal-confirmation-20261012.md。
 - goal confirmation：用户已确认，pass；补充财年官方证据、不伪造历史 raw、不扩日期重构约束。
-- current gate / next entry point：accepted slice commit。
+- current gate / next entry point：accepted deepreview commit。
 - plan：Sol runner 实际退出0，completed；产物 601225-annual-fulltext-plan.md、601225-annual-fulltext-root-cause-evidence.md 已核对，单行为slice S1。计划 SHA256 843b4a880fb6fd36b755f2efa2b33ec169f77f6e95824fed67100a93ffecfd79，待双路review。
 - plan runner：validation_status=needs_review，5条工具异常为探索命令/早期replay错误；已检查最终v2重放及基线验证证据，未见影响当前结论的缺项，不代表计划已接受。
 - 基线验证：激活 .venv 后 pyright 退出 0，0 errors/0 warnings；日志 workspace/tmp/601225-pyright-baseline.log。
@@ -38,3 +38,7 @@
 - 2026-10-12用户明确“mimo改为mimo-flash”：后续对应review使用mimo-flash；DS Flash保持。新外部runner76340补本路同版r1复审，artifact210515；输入54文件启动前均hash一致。当前gate仍re-review S1 r1。
 
 - r1复审最终：DS194843/mimo-flash210515实际exit0、完整artifact已读；MiMo01/02 accepted已修复，无新实质finding/open question。risk已统一分类至code-rereview-final-adjudication，53冻结实现/证据文件不变，gate pass。下一入口accepted slice commit→aggregate deepreview；未PR/merge、completed false。
+
+- accepted slice commit：e5238119c0eaf7957b57ffb972fcea60ddeb4804，57文件，仅本工作单元；git diff --cached --check通过（两review markdown尾空格已清理，无语义变化）。下一入口aggregate deepreview，mimo-flash/DS Flash并行完整分支审核，尚未push/PR/merge。
+
+- aggregate：DS211529/mimo-flash212454实际exit0、完整artifacts已读，root aggregate-adjudication判pass；旧MiMo Flash progress-only首轮拒收并一次补交，不冒充pass。75冻结文件结束仍全等、无新accepted/needs-more-evidence/blocker，风险已分类；新版三skills已重读。下一入口accepted deepreview commit→ready→push/newdraftPR，completed false。
