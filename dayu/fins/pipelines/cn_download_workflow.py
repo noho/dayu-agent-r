@@ -64,6 +64,7 @@ from dayu.fins.storage import (
 from dayu.fins.storage import SourceDocumentRepositoryProtocol, SourceIntegrityStatus
 from dayu.fins.storage.source_integrity import validate_source_integrity_inventory
 from dayu.fins.pipelines.cn_annual_report_source import read_cn_annual_report_pdf, CnAnnualReportSourceError
+from dayu.fins.pipelines.cn_annual_report_diagnostics import log_cn_annual_report_rejection
 from dayu.fins.download_contract import FinsDownloadProviderError, FinsDownloadTransportCategory
 from dayu.fins._log import Log
 from dayu.fins.ticker_normalization import ticker_to_company_id, try_normalize_ticker
@@ -1177,6 +1178,8 @@ def _read_local_cn_annual_pdfs(
         try:
             pdf = read_cn_annual_report_pdf(ticker, entry.document_id, publication, meta, source_repository, cancellation_checkpoint)
         except CnAnnualReportSourceError as exc:
+            log_cn_annual_report_rejection(source_id=source_id, stage="local_declaration_read",
+                                           reason=exc.reason, document_id=entry.document_id)
             raise FinsDownloadProviderError(source=FinsDownloadSource.CNINFO, transport_category=FinsDownloadTransportCategory.PROTOCOL,
                                             retryable=False, safe_message="巨潮年度报告原文无法确认财年或全文性质") from exc
         inputs.append(pdf)

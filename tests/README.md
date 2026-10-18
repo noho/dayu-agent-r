@@ -708,9 +708,14 @@ OpenAI-compatible Runner 的 provider 协议测试，覆盖从 payload 构建、
 
 
 CN 年度原文 owner 回归位于 `test_cn_annual_report_facts.py`、`test_cn_annual_report_source.py` 与
-`test_source_integrity_preflight.py`：13 份官方首页派生 PDF 和原 19 条 raw 的 provenance/hash 保存在
+`test_source_integrity_preflight.py`：官方首页派生 PDF 和原 19 条 raw 的 provenance/hash 保存在
 `tests/fins/fixtures/cninfo_annual_fulltext/`，覆盖封闭 grammar、真实 Fs exact 原件读取、角色声明、
 raw JSON 同版关系、实际 locator 保留、取消资源释放及 inventory 与 repair 授权分离。
+`test_cninfo_midea_regression.py` 使用 `fixtures/cninfo_midea_20261018/` 的官方分类响应及首页派生件，
+provenance 区分完整原件与派生件并保存来源、采集时间和两类 hash；不依赖临时取证目录。
+回归覆盖明确“全文”语法、复杂摘要拒绝、七个真实候选、prepared/直接下载/COMPLETE 复核、
+真实 Fs 本地见证复用及 revision/全部资产不变，检查各拒绝阶段的来源诊断和私密 cause 不外泄。
+这些离线网络 fixture 和测试转换结果不替代真实 CLI 下载及 Docling 验收。
 身份 owner 回归覆盖年度 seed/fallback 的 external/internal 占用、未知来源 key 的可信内部占用、
 同 key 复用与原错误优先序。workflow 回归用独立真实 Fs writer 在 final preflight 后重绑定来源，
 证明可成功／可失败新目标均在 filing-start 前 typed 中止，并保留并发发布态；稳定 repair 的失败和取消仍关闸。

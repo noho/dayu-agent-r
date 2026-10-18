@@ -62,7 +62,8 @@ from dayu.fins.pipelines.cn_download_models import (
     DownloadedReportAsset,
 )
 from dayu.fins.pipelines.cn_report_selection import select_cninfo_report_candidates, is_cninfo_report_title_admissible
-from dayu.fins.pipelines.cn_annual_report_facts import resolve_cn_annual_report_facts
+from dayu.fins.pipelines.cn_annual_report_facts import resolve_cn_annual_report_facts, CnAnnualReportFactsError
+from dayu.fins.pipelines.cn_annual_report_diagnostics import log_cn_annual_report_rejection, CnAnnualReportRejectionStage
 from dayu.fins._log import Log
 
 _MODULE: Final[str] = "FINS.CNINFO_DOWNLOADER"
@@ -321,7 +322,9 @@ class CninfoDiscoveryClient:
             cached = local.get(("cninfo", item.announcement_id))
             if cached is not None:
                 payload = cached.pdf_bytes
-                facts[item.announcement_id] = _cninfo_annual_facts(payload, cancellation_checkpoint)
+                facts[item.announcement_id] = _cninfo_annual_facts(
+                    payload, cancellation_checkpoint, source_id=item.announcement_id,
+                    stage="local_discovery", document_id=cached.publication.document_id)
             else:
                 _cninfo_checkpoint(cancellation_checkpoint)
                 with pdf_download_gate.lease_for_provider("cninfo", cancel_checker=partial(_check_cninfo_gate_cancellation, cancellation_checkpoint)):
@@ -331,7 +334,8 @@ class CninfoDiscoveryClient:
                     _cninfo_checkpoint(cancellation_checkpoint)
                     _validate_cninfo_pdf(payload)
                     _cninfo_checkpoint(cancellation_checkpoint)
-                    facts[item.announcement_id] = _cninfo_annual_facts(payload, cancellation_checkpoint)
+                    facts[item.announcement_id] = _cninfo_annual_facts(
+                        payload, cancellation_checkpoint, source_id=item.announcement_id, stage="remote_discovery")
                     remote[item.announcement_id] = (payload, _utc_now_isoformat())
                 _cninfo_checkpoint(cancellation_checkpoint)
         candidates = select_cninfo_report_candidates(
@@ -1000,12 +1004,16 @@ def _validate_cninfo_pdf(payload: bytes) -> None:
         raise _cninfo_protocol_error("巨潮来源返回的 PDF 内容不符合预期")
 
 
-def _cninfo_annual_facts(payload: bytes, checkpoint: Callable[[], None] | None) -> CnAnnualReportFacts:
-    """在独立 parser scope 确认事实。参数：payload/检查点。返回：年度事实。异常：PROTOCOL 或原控制异常。"""
+def _cninfo_annual_facts(
+    payload: bytes, checkpoint: Callable[[], None] | None, *, source_id: str,
+    stage: CnAnnualReportRejectionStage, document_id: str | None = None,
+) -> CnAnnualReportFacts:
+    """确认年度事实并诊断拒绝。参数：原件/检查点、来源/阶段/已有文档身份。返回：事实。异常：PROTOCOL 或原控制异常。"""
     _cninfo_checkpoint(checkpoint)
     try:
         facts = resolve_cn_annual_report_facts(payload)
-    except ValueError as exc:
+    except CnAnnualReportFactsError as exc:
+        log_cn_annual_report_rejection(source_id=source_id, stage=stage, reason=exc.reason, document_id=document_id)
         raise _cninfo_protocol_error("巨潮年度报告原文无法确认财年或全文性质") from exc
     _cninfo_checkpoint(checkpoint)
     return facts

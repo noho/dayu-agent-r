@@ -7,7 +7,10 @@ import pytest
 from pypdf import PdfWriter
 from pypdf.generic import DictionaryObject, NameObject, NumberObject, DecodedStreamObject
 
-from dayu.fins.pipelines.cn_annual_report_facts import resolve_cn_annual_report_facts, _resolve_cn_annual_report_text_facts
+from dayu.fins.pipelines.cn_annual_report_facts import (
+    resolve_cn_annual_report_facts, _resolve_cn_annual_report_text_facts,
+    CnAnnualReportFactsError, CnAnnualReportFactsReason,
+)
 from dayu.fins.pipelines.cn_download_models import CnAnnualReportFacts
 
 FIXTURES = Path(__file__).parent / "fixtures" / "cninfo_annual_fulltext"
@@ -59,7 +62,8 @@ def test_summary_suffix(suffix: str) -> None:
     assert _resolve_cn_annual_report_text_facts(f'公司 2024 年 年度报告 {suffix}') == CnAnnualReportFacts(2024, 'summary')
 
 
-@pytest.mark.parametrize('text', ('2024年度报告\n公司2024年年报', '公司\u30002024年\t年度报告'))
+@pytest.mark.parametrize('text', ('2024年度报告\n公司2024年年报', '公司\u30002024年\t年度报告',
+    '公司 2024 年 年度报告 全 文\n2024年年度报告', '2024年年报全文'))
 def test_full_labels(text: str) -> None:
     """参数：重复/空白标签。返回：无。异常：合法事实误拒断言失败。"""
     assert _resolve_cn_annual_report_text_facts(text) == CnAnnualReportFacts(2024, 'full')
@@ -67,7 +71,9 @@ def test_full_labels(text: str) -> None:
 
 @pytest.mark.parametrize('text', ('2024年度报告摘要版','2024年度报告说明','2024年度报告补充','2024年度报告（未知）',
  '2024年度报告（摘要]','2024年度报告：','2024年度报告\n摘要','2024年度报告\n（摘要）',
- '2024年度报告\n2023年报','2024年度报告\n2024年报摘要','2024年报2024年报','12024年度报告','２０２４年度报告','', '无标签'))
+ '2024年度报告\n2023年报','2024年度报告\n2024年报摘要','2024年报2024年报','12024年度报告','２０２４年度报告','', '无标签',
+ '2024年度报告全文摘要', '2024年度报告全文说明', '2024年度报告全文（未知）',
+ '2024年度报告全文\n2023年度报告', '2024年度报告全文\n2024年度报告摘要'))
 def test_unsupported_text(text: str) -> None:
     """参数：明确反例。返回：无。异常：错误接受反例断言失败。"""
     with pytest.raises(ValueError): _resolve_cn_annual_report_text_facts(text)
@@ -85,8 +91,35 @@ def test_pdf_boundary(payload: bytes) -> None:
 def test_empty_encrypted_pdf() -> None:
     """参数：无。返回：无。异常：零页、无标签或加密页面未被拒绝断言失败。"""
     writer = PdfWriter(); stream = BytesIO(); writer.write(stream)
-    with pytest.raises(ValueError): resolve_cn_annual_report_facts(stream.getvalue())
+    with pytest.raises(CnAnnualReportFactsError) as empty:
+        resolve_cn_annual_report_facts(stream.getvalue())
+    assert empty.value.reason is CnAnnualReportFactsReason.EXTRACTION_FAILED
     writer.add_blank_page(width=300,height=300); stream=BytesIO();writer.write(stream)
-    with pytest.raises(ValueError): resolve_cn_annual_report_facts(stream.getvalue())
+    with pytest.raises(CnAnnualReportFactsError) as blank:
+        resolve_cn_annual_report_facts(stream.getvalue())
+    assert blank.value.reason is CnAnnualReportFactsReason.MISSING_OR_CONFLICTING_FACTS
     writer.encrypt('secret'); stream=BytesIO();writer.write(stream)
-    with pytest.raises(ValueError): resolve_cn_annual_report_facts(stream.getvalue())
+    with pytest.raises(CnAnnualReportFactsError) as encrypted:
+        resolve_cn_annual_report_facts(stream.getvalue())
+    assert encrypted.value.reason is CnAnnualReportFactsReason.EXTRACTION_FAILED
+
+
+@pytest.mark.parametrize('text,reason', (
+    ('2024年报2024年报', CnAnnualReportFactsReason.MULTIPLE_LABELS),
+    ('2024年报全文摘要', CnAnnualReportFactsReason.UNSUPPORTED_SUFFIX),
+    ('2024年报全文\n2023年报', CnAnnualReportFactsReason.MISSING_OR_CONFLICTING_FACTS),
+    ('', CnAnnualReportFactsReason.MISSING_OR_CONFLICTING_FACTS),
+))
+def test_rejection_reason_owned_by_facts(text: str, reason: CnAnnualReportFactsReason) -> None:
+    """断言拒绝原因是 owner 合同。参数：文本/封闭原因。返回：无。异常：原因漂移断言失败。"""
+    with pytest.raises(CnAnnualReportFactsError) as raised:
+        _resolve_cn_annual_report_text_facts(text)
+    assert raised.value.reason is reason
+
+
+def test_extraction_reason_preserves_private_cause() -> None:
+    """坏 PDF 有封闭原因和私有 cause。参数：无。返回：无。异常：拒绝合同漂移断言失败。"""
+    with pytest.raises(CnAnnualReportFactsError) as raised:
+        resolve_cn_annual_report_facts(b'broken')
+    assert raised.value.reason is CnAnnualReportFactsReason.EXTRACTION_FAILED
+    assert raised.value.__cause__ is not None

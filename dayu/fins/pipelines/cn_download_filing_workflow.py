@@ -19,7 +19,8 @@ from dayu.fins.domain.document_models import BatchToken, SourceHandle
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.download_contract import FinsDownloadProviderError, FinsDownloadSource, FinsDownloadTransportCategory
 from dayu.fins.pipelines.cn_annual_report_source import read_cn_annual_report_pdf, CnAnnualReportSourceError
-from dayu.fins.pipelines.cn_annual_report_facts import resolve_cn_annual_report_facts
+from dayu.fins.pipelines.cn_annual_report_facts import resolve_cn_annual_report_facts, CnAnnualReportFactsError
+from dayu.fins.pipelines.cn_annual_report_diagnostics import log_cn_annual_report_rejection
 from dayu.fins.pipelines.cn_download_pdf_gate import CnDownloadPdfGateProtocol
 from dayu.fins.pipelines.cn_download_models import (
     CnDownloadCancelledError,
@@ -283,11 +284,15 @@ async def run_cn_download_single_filing_stream(
             require_matching_cn_annual_asset(candidate, asset)
             try:
                 facts = resolve_cn_annual_report_facts(asset.pdf_bytes)
-            except ValueError as exc:
+            except CnAnnualReportFactsError as exc:
+                log_cn_annual_report_rejection(source_id=candidate.source_id, stage="download_review",
+                                               reason=exc.reason, document_id=document_id)
                 raise FinsDownloadProviderError(source=FinsDownloadSource.CNINFO, transport_category=FinsDownloadTransportCategory.PROTOCOL,
                     retryable=False, safe_message="巨潮年度报告原文无法确认财年或全文性质") from exc
             _raise_if_cancelled(module=module, ticker=ticker, document_id=document_id, cancel_checker=cancel_checker)
             if facts.kind != "full" or facts.fiscal_year != candidate.fiscal_year:
+                log_cn_annual_report_rejection(source_id=candidate.source_id, stage="download_review",
+                                               reason="source_document_facts_mismatch", document_id=document_id)
                 raise CnDownloadAnnualPublicationError("source_document_facts_mismatch")
     except CnDownloadCancelledError:
         raise
@@ -1058,14 +1063,20 @@ def _require_current_cn_annual_complete_facts(
     try:
         pdf = read_cn_annual_report_pdf(ticker, document_id, publication, meta, source_repository, cancellation_checkpoint)
     except CnAnnualReportSourceError as exc:
+        log_cn_annual_report_rejection(source_id=candidate.source_id, stage="complete_original_review",
+                                       reason=exc.reason, document_id=document_id)
         raise CnDownloadAnnualPublicationError("source_document_facts_mismatch") from exc
     if cancellation_checkpoint is not None:
         cancellation_checkpoint()
     try:
         facts = resolve_cn_annual_report_facts(pdf.pdf_bytes)
-    except ValueError as exc:
+    except CnAnnualReportFactsError as exc:
+        log_cn_annual_report_rejection(source_id=candidate.source_id, stage="complete_original_review",
+                                       reason=exc.reason, document_id=document_id)
         raise CnDownloadAnnualPublicationError("source_document_facts_mismatch") from exc
     if cancellation_checkpoint is not None:
         cancellation_checkpoint()
     if facts.kind != "full" or facts.fiscal_year != candidate.fiscal_year:
+        log_cn_annual_report_rejection(source_id=candidate.source_id, stage="complete_original_review",
+                                       reason="source_document_facts_mismatch", document_id=document_id)
         raise CnDownloadAnnualPublicationError("source_document_facts_mismatch")

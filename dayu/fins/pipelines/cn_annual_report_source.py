@@ -1,6 +1,7 @@
 """CN 年度当前原件的唯一声明投影与 exact publication 读取 owner。"""
 
 from collections.abc import Callable, Mapping
+from enum import Enum
 import hashlib
 
 from dayu.contracts.json_value import JsonValue
@@ -17,11 +18,18 @@ _PDF_MEDIA = "application/pdf"
 _RANGE_FIELDS = ("ingest_method", "is_deleted", "filing_date", "fiscal_year", "fiscal_period", "covered_fiscal_periods")
 
 
+class CnAnnualReportSourceReason(str, Enum):
+    """原件声明 owner 的安全拒绝原因，不代表 PDF 文字解析结果。"""
+
+    ORIGINAL_UNCONFIRMED = "本地年度报告声明或原件字节无法确认"
+
+
 class CnAnnualReportSourceError(ValueError):
     """本地声明与实际原件关系不能被确认；不是完整性调度错误。"""
 
     def __init__(self) -> None:
         """构造有界安全原因。参数：无。返回：无。异常：无。"""
+        self.reason = CnAnnualReportSourceReason.ORIGINAL_UNCONFIRMED
         super().__init__("本地年度报告缺少可信且唯一声明的 PDF 原件，无法确认原文")
 
 
