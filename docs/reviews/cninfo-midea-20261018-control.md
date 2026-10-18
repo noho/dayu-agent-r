@@ -5,8 +5,8 @@
 - Binding scope：[目标确认](cninfo-midea-20261018-goal-confirmation.md)。
 - 用户已明确回复：已完整核对目标确认文件，并依据 Dayu 上游修复授权确认目标、非目标、边界、成功信号；允许进入 plan，按 gpt-6-sol plan/implement/fix、mimo-flash 与 ds-flash 并发 review 推进至 draft PR 交付。保留实际根因待取证边界，新日志验证真实入口，授权不含 merge。
 - 分支：`fix/cninfo-midea-report-identification-20261018`；base：`1b2166305428d894696974519615cfc4a0ca3b20`。
-- 当前 gate / next entry point：必要提交 / push。
-- Goal confirmation、plan、implementation / validation、code review、ready-to-open-draft-PR：pass。尚未创建 PR 或完成交付核对。
+- Gate 状态：总控交付核对 pass → draft-PR-pass → final closeout pass；work unit completed。
+- Next entry point：本 work unit 无未完成 gate。merge 须用户另行明确授权；业务恢复由调用方依据已验证入口与交付自行执行。main 未合并。
 - 总控负责 gate 裁决及交付；外部 runner 指定模型按任务范围执行。子任务不拥有 merge、额外部署或范围扩张授权。
 
 ## 产物索引
@@ -71,3 +71,36 @@
 - 当前任务来自上游 workpaper，不是已给定 GitHub issue，无 issue closing keyword 或外部 issue comment 要求。
 - PR body 已按最终实现准备于 `workspace/tmp/cninfo-midea-20261018/pr-body.md`，准确注明七份合法 skip、未新执行真实转换和原始来源不可唯一追溯。审核报告及总控记录的事实勘误不改变已审行为版本。
 - Ready gate pass，自动继续必要提交/push，不请求重复授权；后续创建 draft PR 后必须进入“总控交付核对”，不提前标 draft-PR-pass。
+
+## 提交与 Push
+
+- 提交前再次核对修复分支和变更归属；24 个行为/测试/fixture/README 文件 hash 与已验证收据一致。仅追加审核结果/总控记录，不改已审行为代码。
+- 修复 commit：`b97af9e46ff041c37024f6004b4e944c7f7764ec`，相对 base 仅此一个 intended commit，31 个相关文件；commit 实际退出 0，提交后 clean。
+- `git push --set-upstream github fix/cninfo-midea-report-identification-20261018` 实际退出 0；远端 branch OID 读回为同一 commit，未修改 main。当前进入 create draft PR。
+
+## Draft PR 创建
+
+- `gh pr create --repo noho/dayu-agent-r --head fix/cninfo-midea-report-identification-20261018 --base main --draft ... --body-file .../pr-body.md` 实际退出 0。
+- PR：`https://github.com/noho/dayu-agent-r/pull/202`。创建后立即进入总控交付核对；当前不把创建成功当作 draft-PR-pass。
+
+## 总控交付核对 / draft-PR-pass
+
+- 实际 base repository / head repository 均为 `noho/dayu-agent-r`；PR #202 为 open draft，base `main`，head `fix/cninfo-midea-report-identification-20261018`。
+- 代码交付 OID 对：base `1b2166305428d894696974519615cfc4a0ca3b20`，head `b97af9e46ff041c37024f6004b4e944c7f7764ec`。直接从实际 PR API 取得，读取 compare 前后再查询 PR，OID 对保持一致。
+- 完整 diff 请求：`repos/noho/dayu-agent-r/compare/1b2166305428d894696974519615cfc4a0ca3b20...b97af9e46ff041c37024f6004b4e944c7f7764ec`；保存 `workspace/tmp/cninfo-midea-20261018/delivery/initial-pr.diff`，SHA256 `8d78a3a8ce19f2d36155b1f6e624d47ec549cb1175ce80e6770dc949da2772c9`。31 个 diff 文件与实际 compare 文件集合、本地 intended 集合完全相等，每个 GitHub head blob OID 与本地对应对象一致；仅一个 intended 修复 commit。
+- 已审行为与最终提交对应：24 个行为/测试/fixture/README 文件 hash 继续与测试/真实 CLI 收据一致；相对原冻结审核版本仅追加两份审核结果和总控事实/状态记录，无未经审核的实质代码变更。
+- 标题/body 与本地最终描述逐字核对准确；两路审核链接、630 tests、真实七份合法 skip 和未新执行转换均如实表述。PR 无 issue closing keyword（本任务没有 GitHub issue 身份）。
+- 必要 CI：实际 branch protection 的 required contexts/checks 为空，实际 PR statusCheckRollup 为空；未假称 CI green。仓库未配置 workflow，mandatory tests/pyright 已实际通过。
+- 修复 push 后远端 branch OID 与实际 PR head 一致；源版本快照 `delivery/initial-head-snapshot.tar.gz`，SHA256 `0ddadb4e004ef1e6b1a35065409771791ee0c470ff102bbf4c21113dccb7bd9c`；完整身份/diff/版本/裁决事实在 `delivery/initial-delivery-receipt.json`。
+- 上述条件满足，交付核对 pass，draft-PR-pass。随后创建以下实质 closeout。收尾记录发布若产生纯文档附加 commit，保持已审代码不变，仍须核对最终 OID/diff/push/checks；最终核对事实保存于 `workspace/tmp/cninfo-midea-20261018/delivery/final-delivery-receipt.json`，不得仅以本段旧 OID 代替最终核对。
+
+## Final closeout
+
+- **改了什么**：在年度事实唯一 owner 精确识别“全文”后缀；类型化事实/声明拒绝原因，五个实际入口统一附安全来源和阶段诊断。保留未知/冲突/证据不足的失败，未引入个股、发布日期、法规或跨页 fallback；公共 schema、筛选和仓储模型不变。
+- **验证了什么**：同版受影响测试 630 passed、全仓及六文件临时工具 pyright 零错，六个生产文件覆盖率 90.17%–100%；两位独立 reviewer 各自定向重验 74 项并核对同版完整证据。原绝对 CLI 原 base/ticker/date 两次普通增量均退出 0，各为 7 discovered / 7 skipped、0 failed/rejected/uncertain；实际零 PDF GET/转换，31 份来源 revision/资产/meta/manifest 不变，2025/2024 FY 实际原件均 full。入口生效证据来自修复分支工作树实际调用，不来自 PR 创建。
+- **文档**：Fins README 与 tests README 已更新；根 README 与其他层按职责不触发。goal、plan、implementation、live validation、两份独立 review 与本 control 均可追踪。
+- **Finding 状态**：两路均无 material finding；无 accepted 待修、needs-more-evidence 或实际 fix/re-review 遗留。审核报告两处数量笔误已按原始证据勘误，不修改独立判断。raw 提取文本空白告警按证据保真保留，源码/测试/README check pass；不把完整 diff whitespace check 说成 pass。
+- **残余风险 / owner**：真实新 Docling 转换本轮未执行；原始历史失败 source ID 不可唯一追溯；历史 provenance 标签与 provider 日期时区未迁移/核实；未知首页布局继续 fail closed。均 assigned to later work unit，由 Fins 维护者在实际新来源、历史证据或明确迁移目标下处理；本轮未越权创建 issue 或迁移旧来源。详见 live-validation 与 review 的非阻塞依据。
+- **交付**：修复 commit `b97af9e46ff041c37024f6004b4e944c7f7764ec`；draft PR `https://github.com/noho/dayu-agent-r/pull/202`。仅本 closeout/交付记录会进入必要的纯文档附加提交，最终 PR head 与完整 diff 以 final-delivery-receipt 为准。
+- **Issue link / closeout comment**：不适用，输入为上游 workpaper 而非指定 GitHub issue；没有未经授权创建/修改 issue 或对外 comment。
+- **完成与下一步**：final closeout pass，当前 work unit completed；用户如需 merge 另行明确授权。调用方可依据当前修复分支绝对 CLI 可用性证据接续自身业务流程；本任务不操作其 workflow，不设置巡查 timer。
