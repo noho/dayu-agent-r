@@ -75,7 +75,7 @@ Python 如需参与，仅使用简短标准库查询平台、sysconfig 路径、
 3. 从源外 cwd 用目标解释器 `-I` 核验真实安装：通过 sysconfig 的 purelib/platlib 定位目标实际 `.dist-info`，检查 Name/Version、entry point、`direct_url.json` 的 editable/source；版本与源码 pyproject 一致，本线为 0.1.5。不得仅在仓库 cwd 调 `version()`，不得把源码 `.egg-info` 或 PYTHONPATH 影子当安装证明。
 4. 从目标 scripts 路径获得 pip 真正生成的 console script（POSIX `dayu-cli`、Windows `dayu-cli.exe`），先执行它的真实 `--help` 并检查退出。不可用其它安装或 marker 补足。
 5. 准备 profile 的必要 PATH block 和 `$HOME/.local/bin/dayu-cli`。profile 成功之后最后发布默认入口，再做读回与新正常 shell 核验。每一文件的发布不得截断原文件、沿旧符号链接写目标或意外把临时文件移动进链接目标目录；BSD/GNU 工具差异必须在实际使用处验证。无需跨文件事务。
-6. 安装后从源外 cwd 启动所选 shell 的正常交互与登录交互模式（`-ic`、`-lic`），移除继承的 venv/PYTHONPATH/PYTHONHOME，初始 PATH 不含仓库 `.venv` 或刻意注入的 `.local/bin`。zsh 同时断言启动后的有效 ZDOTDIR 仍为 HOME。检查默认入口是外部命令、解析到本次入口，裸 `dayu-cli --help` 真正退出 0。不手动 source/profile、activate、export 目标目录，不用 `-f/--norc` 绕过启动文件。失败返回非零，不能输出“安装完成”。
+6. 安装后从源外 cwd 启动所选 shell 的正常交互与登录交互模式（`-ic`、`-lic`）。直接从安装进程输入选择：SHELL 名称与 `--shell` 一致时使用该 executable，否则从正常 PATH 解析；不查找其它项目环境或配置。移除继承的 VIRTUAL_ENV/PYTHONPATH/PYTHONHOME，PATH 仅移除明确活动及本源码 venv 的命令目录，保留正常工具路径（含合法 `.local/bin`），不刻意注入目标目录。zsh 同时断言启动后的有效 ZDOTDIR 仍为 HOME。检查默认入口是外部命令、解析到本次入口，裸 `dayu-cli --help` 真正退出 0；联合 fresh/legacy 的预期入口字节与实际 metadata 证明本次交付。不手动 source/profile、activate、export 目标目录，不用 `-f/--norc` 绕过启动文件。失败返回非零，不能输出“安装完成”。
 
 安装脚本返回 0 表示本次包/metadata、入口/profile 发布及受支持正常 shell 检查均通过。成功输出只需说明安装目标、默认入口和应重新打开终端；不宣称改变调用者已经运行的父 shell。
 
@@ -156,7 +156,7 @@ python -m pyright
 2. 缺席入口、给定历史形态 symlink、dangling、人工同目标 symlink、相同 launcher、未知普通文件/目录/特殊形态及不安全目录型链接，目的地父目录 symlink 明确失败（Q1）；替换只能改目录项。空格/中文路径、源外 cwd、参数原样转发/退出码至少有真实 Bash 测试。
 3. zsh 启动文件、Bash 非登录/登录启动文件优先级；BP3 隔离覆盖继承非 HOME ZDOTDIR 和 `.zshenv` 设置另一目录（含另一份 `.zshrc` 恰好提供正确 PATH 的反例），在任何安装/发布写入前失败，入口与配置原字节不变；标准 HOME 正常通过，发布后两种正常模式也断言有效值；profile 原文/权限/init block 保持，缺席/已有 PATH、block 重复与损坏、symlink profile、连续运行稳定；顺序 init-after-install 保留 PATH block 及反向保留 init block。不为其新增生产共享 helper。
 4. pip/metadata/source/help 任一失败禁止成功及错误发布；profile 发布失败、profile 成功后入口失败、清理失败及安装后正常 shell 中 alias/function/后续 PATH 覆盖导致失败。故障测试可在外部命令/文件 I/O 边界注入，不用 fake metadata 把非法来源变成成功。
-5. 在本机真实 Bash 与 zsh 子进程里用隔离 HOME、源外 cwd、干净初始 PATH，运行 `-ic`/`-lic`；登录 profile 先移除 `.local/bin`/前置旧目录，仍须由本次配置交付正确解析。不能仅检测启动文件存在。非 TTY 的 job-control stderr 应保留并说明。
+5. 在本机真实 Bash 与 zsh 子进程里用隔离 HOME、源外 cwd、正常工具 PATH，运行 `-ic`/`-lic`；验证 profile 对正常 PATH 工具的依赖、不同位置 shell 的选择及仅移除 venv 污染。登录 profile 先移除 `.local/bin`/前置旧目录，仍须由本次配置交付正确解析。最小系统 PATH 仅作额外对抗输入，不能替代正常输入；联合入口字节/metadata 验证，不能仅检测启动文件存在。非 TTY 的 job-control stderr 应保留并说明。
 
 ### 6.2 用 README 流程真实隔离安装
 
@@ -203,10 +203,14 @@ entry_untracked_inputs=$(git ls-files --others \
 安装之后，从源外 cwd 启动真实 HOME 的新正常未激活 shell。当前本机 zsh 的验收命令轮廓如下；路径/退出/两通道均须落盘。BP3 与写前预检一样保留用户真实启动配置/继承 ZDOTDIR，在 shell 启动完成后查询并断言有效值为 HOME；不强制重设它。这是后续执行要求，不是已经完成的证据：
 
 ```bash
+entry_source_root=$PWD
+source "$entry_source_root/scripts/install-source.sh"
+prepare_shell_path "$entry_source_root"
+entry_normal_shell=$(resolve_shell zsh)
 cd /private/tmp
 env -u VIRTUAL_ENV -u PYTHONPATH -u PYTHONHOME \
-  PATH=/usr/bin:/bin:/usr/sbin:/sbin \
-  /bin/zsh -lic '
+  PATH="$SHELL_PATH" \
+  "$entry_normal_shell" -lic '
     [[ -z "${VIRTUAL_ENV-}" ]] || exit 1
     print -r -- "effective_zdotdir=${ZDOTDIR-$HOME}"
     [[ "${ZDOTDIR-$HOME}" -ef "$HOME" ]] || exit 1
@@ -220,7 +224,7 @@ env -u VIRTUAL_ENV -u PYTHONPATH -u PYTHONHOME \
   '
 ```
 
-还须实际断言 `whence -w` 是外部命令而非 alias/function，解析路径为本次 `$HOME/.local/bin/dayu-cli`；不能只把上述输出记录下来就判 pass。Bash 对应使用 `bash -ic/-lic`、`command -v`、`type -t`（须 `file`）、`type -P`；其它 OS 使用其正常启动 shell 与系统初始 PATH，不硬套 macOS 路径。至少包含正常交互和登录交互检查。
+还须实际断言 `whence -w` 是外部命令而非 alias/function，解析路径为本次 `$HOME/.local/bin/dayu-cli`；不能只把上述输出记录下来就判 pass。示例复用安装 owner 对直接 SHELL/PATH 输入的选择与去 venv 规则，不覆盖为系统最小 PATH。Bash 对应使用所选 executable 的 `-ic/-lic`、`command -v`、`type -t`（须 `file`）、`type -P`；其它 OS 同样保留正常工具路径，不硬套 macOS 路径。至少包含正常交互和登录交互检查。
 
 解析入口是本次生成的 launcher 时，记录其实际字节/哈希及唯一 `exec` 目标，核对目标是本源码 `.venv` 的实际 console script；若保留 symlink 则记录原始与最终目标。记录该 console script 的实际解释器关联（POSIX shebang/必要 shell 引导，Windows 则按实际生成 launcher 核对），不要把 `.venv/bin/python` resolve 后的基础解释器误当成 venv 身份；同时保存目标 Python 的 `sys.executable`、`sys.prefix`、sysconfig scripts/purelib/platlib。
 
@@ -251,3 +255,9 @@ Blocking questions：**无**。用户已确认 Bash 方向、目标、真实 syn
 正式 sync 的限定未跟踪输入命令仅新增精确 `--exclude=.DS_Store`，保留普通和 ignored
 源码/安装脚本拒绝，不删除现有元数据、不使用 `--exclude-standard`。其余计划不变；
 原冻结 v2 与 v1 保存快照不改。实现/验证详见 bash-implementation 回执，正式核销由主控双审裁决。
+
+## C2 实现纠正：正常 shell 与 PATH
+
+依 binding code-adjudication，仅同步 §4.1、§6.1 与 §7 的正常输入语义：直接采用安装进程
+SHELL/PATH，保留正常工具路径，只清理明确活动/本源码 venv 污染。系统最小 PATH 仅为额外
+对抗测试，不代表唯一正常输入；不新增必填参数或调用方配置动作。旧冻结版本不改。

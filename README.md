@@ -43,11 +43,16 @@ bash scripts/install-source.sh --shell bash --python "/c/实际路径/python.exe
 ```
 
 默认解释器为 `python3.11`，可通过 `--python` 指定单个可执行文件路径。
+所选 shell 与安装进程的 `SHELL` 名称一致时使用该可执行文件，否则从正常 `PATH` 选择；
+检查时保留正常工具路径，仅移除活动虚拟环境和本源码 `.venv` 的命令目录。
 脚本自动选择 macOS arm64、Linux x64 或 Windows x64 的现有依赖锁；其它组合会在安装前拒绝。
 Windows 需 Git Bash，不能直接在 PowerShell/cmd 执行；WSL 安装在 Linux 子系统内。
 
 脚本安装到源码根的 `.venv`，发布 `~/.local/bin/dayu-cli`，并在所选 shell 的启动文件
 前置 `~/.local/bin`；这也会提高该目录内其它同名命令的优先级。请保留源码与 `.venv` 的位置。
+Bash 同时处理 `.bashrc` 和首个现有登录文件（`.bash_profile`、`.bash_login`、`.profile`；
+均无则创建 `.bash_profile`）。已有非目录型入口符号链接（含悬空链接）只替换链接本身，保留原目标；
+HOME、启动文件、`.local`、`.local/bin` 或目标 `.venv` 为符号链接时停止。
 已有普通入口、特殊文件或不支持的启动配置冲突会报出路径并停止，请先检查该文件用途；
 不会自动接管未知文件。失败可能留下部分包安装或已发布文件，以报出的失败阶段为准。
 成功后重新打开终端，无需 activate：

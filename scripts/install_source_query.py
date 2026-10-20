@@ -51,14 +51,30 @@ def _project(source: Path) -> tuple[str, str, str]:
     return name, version, target
 
 
-def _venv(source: Path) -> None:
+def _identity() -> str:
+    """查询所有安装阶段共用的解释器平台身份。
+
+    :returns: OS 与架构，以竖线分隔。
+    :raises ValueError: Python 版本、位宽或 ABI 不适用现有锁。
+    """
+    if sys.version_info[:2] != (3, 11):
+        raise ValueError("安装需要 Python 3.11")
+    if struct.calcsize("P") != _SUPPORTED_POINTER_BYTES:
+        raise ValueError("现有依赖锁只支持 64 位 Python")
+    if sysconfig.get_config_var("Py_GIL_DISABLED"):
+        raise ValueError("不支持非标准 Python ABI")
+    return f"{sys.platform}|{platform.machine().lower()}"
+
+
+def _venv(source: Path) -> str:
     """断言解释器确属本源码的 Python 3.11 venv。
 
     :param source: 源码根。
-    :returns: None。
+    :returns: 已验证的解释器平台身份。
     :raises ValueError: 解释器身份不符。
     """
-    if sys.version_info[:2] != (3, 11) or sys.prefix == sys.base_prefix:
+    identity = _identity()
+    if sys.prefix == sys.base_prefix:
         raise ValueError("需要 Python 3.11 独立 venv")
     if Path(sys.prefix).resolve() != (source / ".venv").resolve():
         raise ValueError("venv 不属于本源码目标")
@@ -68,8 +84,7 @@ def _venv(source: Path) -> None:
         raise ValueError("目标 venv 不得借用系统 site-packages")
     if any(not Path(sysconfig.get_path(key)).resolve().is_relative_to(target) for key in ("purelib", "platlib", "scripts")):
         raise ValueError("目标 venv 路径越出本次安装目录")
-    if sysconfig.get_config_var("Py_GIL_DISABLED"):
-        raise ValueError("不支持非标准 Python ABI")
+    return identity
 
 
 def _installed(source: Path) -> None:
@@ -134,14 +149,9 @@ def main(argv: list[str]) -> int:
         mode, source_text = argv
         source = Path(source_text).resolve()
         if mode == "platform":
-            if sys.version_info[:2] != (3, 11):
-                raise ValueError("安装需要 Python 3.11")
-            if struct.calcsize("P") != _SUPPORTED_POINTER_BYTES:
-                raise ValueError("现有依赖锁只支持 64 位 Python")
-            print(f"{sys.platform}|{platform.machine().lower()}")
+            print(_identity())
         elif mode == "venv":
-            _venv(source)
-            print(sysconfig.get_path("scripts"))
+            print(f"{_venv(source)}|{sysconfig.get_path('scripts')}")
         elif mode == "installed":
             _installed(source)
         else:

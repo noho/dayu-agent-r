@@ -6,6 +6,7 @@ set -euo pipefail
 INSTALL_STAGE=预检
 INSTALL_TEMP=
 PATH_MARKER='dayu source install PATH'
+SHELL_PATH=$PATH
 
 # 参数：错误说明；输出到 stderr；始终以非零终止。
 fail() { printf '安装失败 [%s]: %s\n' "$INSTALL_STAGE" "$*" >&2; exit 1; }
@@ -57,9 +58,9 @@ inspect_profile() {
     [[ "$block" == "$(profile_block)" ]] || fail "profile block 被改写: $path"
 }
 
-# 参数：入口路径和目标 console；只接受缺席、安全 symlink 或逐字相同 launcher。
+# 参数：入口路径、目标 console、Python OS；只接受缺席、安全 symlink 或相同 launcher。
 inspect_entry() {
-    local dest=$1 target=$2
+    local dest=$1 target=$2 os=$3
     if [[ -L "$dest" ]]; then
         [[ ! -d "$dest" ]] || fail "入口为目录型 symlink: $dest"
     elif [[ -e "$dest" ]]; then
@@ -68,7 +69,9 @@ inspect_entry() {
         [[ -x "$dest" ]] || fail "已有相同入口不可执行: $dest"
     fi
     # Git Bash 的命令解析还会搜索 .exe；不允许另一个同名入口抢占。
-    [[ ! -e "$dest.exe" && ! -L "$dest.exe" ]] || fail "入口 .exe 碰撞: $dest.exe"
+    if [[ "$os" == win32 ]]; then
+        [[ ! -e "$dest.exe" && ! -L "$dest.exe" ]] || fail "入口 .exe 碰撞: $dest.exe"
+    fi
 }
 
 # 参数：profile 路径；原子替换单文件并保留原字节/权限；I/O 失败非零。
@@ -90,10 +93,10 @@ publish_profile() {
     INSTALL_TEMP=
 }
 
-# 参数：入口及 console；最后替换目录项，绝不沿旧 symlink 写目标；失败非零。
+# 参数：入口、console、Python OS；只替换目录项，绝不沿旧 symlink 写目标；失败非零。
 publish_entry() {
-    local dest=$1 target=$2
-    inspect_entry "$dest" "$target"
+    local dest=$1 target=$2 os=$3
+    inspect_entry "$dest" "$target" "$os"
     if [[ ! -L "$dest" && -f "$dest" ]] && launcher_text "$target" | cmp -s - "$dest"; then
         [[ -x "$dest" ]] || fail "已有相同入口不可执行: $dest"
         return 0
@@ -104,6 +107,38 @@ publish_entry() {
     mv -f -- "$INSTALL_TEMP" "$dest"
     INSTALL_TEMP=
     launcher_text "$target" | cmp -s - "$dest" || fail "入口读回不一致: $dest"
+}
+
+# 参数：规范源码根；构造正常 shell PATH，仅移除明确的活动/本源码 venv scripts。
+# 返回：设置 SHELL_PATH；保留其它目录、空项及其顺序，不改调用方环境。
+prepare_shell_path() {
+    local source=$1 remaining=$PATH part separator= active=${VIRTUAL_ENV-}
+    SHELL_PATH=
+    while :; do
+        part=${remaining%%:*}
+        if [[ "$part" != "$source/.venv/bin" && "$part" != "$source/.venv/Scripts" &&
+              ! "$part" -ef "$source/.venv/bin" && ! "$part" -ef "$source/.venv/Scripts" ]] &&
+           { [[ -z "$active" ]] || [[ "$part" != "$active/bin" && "$part" != "$active/Scripts" &&
+              ! "$part" -ef "$active/bin" && ! "$part" -ef "$active/Scripts" ]]; }; then
+            SHELL_PATH="$SHELL_PATH$separator$part"
+            separator=:
+        fi
+        [[ "$remaining" == *:* ]] || break
+        remaining=${remaining#*:}
+    done
+}
+
+# 参数：--shell 所选名称；stdout 为安装进程 SHELL 或正常 PATH 中的真实可执行路径。
+# 返回：找不到外部可执行文件时失败；不读取其它项目或 shell 配置来猜测。
+resolve_shell() {
+    local name=$1 executable
+    if [[ -n "${SHELL-}" && "${SHELL##*/}" == "$name" ]]; then
+        executable=$SHELL
+    else
+        executable=$(PATH="$SHELL_PATH" type -P "$name") || fail '目标 shell 不可用'
+    fi
+    [[ -f "$executable" && -x "$executable" ]] || fail "目标 shell 不可执行: $executable"
+    printf '%s/%s\n' "$(CDPATH= cd -- "$(dirname "$executable")" && pwd -P)" "${executable##*/}"
 }
 
 # 参数：shell 名/绝对 executable、阶段 preflight|published、入口；真实 -ic/-lic。
@@ -132,7 +167,7 @@ if [[ "$2" == published ]]; then
   exit "$help_status"
 fi'
     for mode in -ic -lic; do
-        (cd /; env -u VIRTUAL_ENV -u PYTHONPATH -u PYTHONHOME PATH="$SHELL_BASE_PATH" \
+        (cd /; env -u VIRTUAL_ENV -u PYTHONPATH -u PYTHONHOME PATH="$SHELL_PATH" \
             "$executable" "$mode" "$code" dayu-install "$name" "$phase" "$dest" "$HOME") || fail "正常 $name $mode 检查失败 ($phase)"
     done
 }
@@ -162,36 +197,38 @@ main() {
     done
     [[ "$shell_name" == bash || "$shell_name" == zsh ]] || fail '必须指定 --shell bash|zsh'
     [[ -n "$python" ]] || fail 'Python executable 不能为空'
-    source=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+    source=$(CDPATH= cd -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
     helper="$source/scripts/install_source_query.py"
     native_source=$source; native_helper=$helper; native_venv="$source/.venv"
     host=$(uname -s)
-    SHELL_BASE_PATH=/usr/bin:/bin:/usr/sbin:/sbin
     case "$host" in
         MINGW*|MSYS*)
             [[ "$shell_name" == bash ]] || fail 'Windows Git Bash 仅支持 Bash'
             command -v cygpath >/dev/null || fail '缺少 Git Bash cygpath'
             native_source=$(cygpath -w "$source"); native_helper=$(cygpath -w "$helper")
-            native_venv=$(cygpath -w "$source/.venv")
-            SHELL_BASE_PATH=/mingw64/bin:/usr/bin:/bin:/c/Windows/System32 ;;
+            native_venv=$(cygpath -w "$source/.venv") ;;
         Darwin|Linux) ;;
         *) fail "不支持的 Bash 平台: $host" ;;
     esac
-    shell_executable=$(PATH="$SHELL_BASE_PATH" command -v "$shell_name") || fail '目标 shell 不可用'
-    platform_info=$("$python" -I "$native_helper" platform "$native_source") || fail 'Python 平台查询失败'
-    IFS='|' read -r os arch <<< "$platform_info"
-    lock=$(select_lock "$host" "$os" "$arch") || fail '无适用平台锁'
-    [[ -f "$source/constraints/$lock" && -f "$source/constraints/lock-common-py311.txt" ]] || fail '适用约束缺失'
+    prepare_shell_path "$source"
+    shell_executable=$(resolve_shell "$shell_name") || fail '目标 shell 解析失败'
     [[ -d "${HOME:?需要 HOME}" && ! -L "$HOME" ]] || fail 'HOME 必须为实际目录'
     check_directory "$HOME"; check_directory "$HOME/.local"; check_directory "$HOME/.local/bin"
     [[ ! -L "$source/.venv" ]] || fail '目标 .venv 不能为 symlink'
-    if [[ "$os" == win32 ]]; then venv_python="$source/.venv/Scripts/python.exe"; console="$source/.venv/Scripts/dayu-cli.exe"
-    else venv_python="$source/.venv/bin/python"; console="$source/.venv/bin/dayu-cli"; fi
+    case "$host" in
+        MINGW*|MSYS*) venv_python="$source/.venv/Scripts/python.exe"; console="$source/.venv/Scripts/dayu-cli.exe" ;;
+        *) venv_python="$source/.venv/bin/python"; console="$source/.venv/bin/dayu-cli" ;;
+    esac
     if [[ -e "$source/.venv" ]]; then
         [[ -d "$source/.venv" && -f "$source/.venv/pyvenv.cfg" && -x "$venv_python" ]] || fail '已有 .venv 类型或身份无效'
-        scripts_path=$("$venv_python" -I "$native_helper" venv "$native_source") || fail '已有 .venv 身份无效'
+        platform_info=$("$venv_python" -I "$native_helper" venv "$native_source") || fail '已有 .venv 身份无效'
+    else
+        platform_info=$("$python" -I "$native_helper" platform "$native_source") || fail 'Python 平台查询失败'
     fi
-    inspect_entry "$HOME/.local/bin/dayu-cli" "$console"
+    IFS='|' read -r os arch scripts_path <<< "$platform_info"
+    lock=$(select_lock "$host" "$os" "$arch") || fail '无适用平台锁'
+    [[ -f "$source/constraints/$lock" && -f "$source/constraints/lock-common-py311.txt" ]] || fail '适用约束缺失'
+    inspect_entry "$HOME/.local/bin/dayu-cli" "$console" "$os"
     if [[ "$shell_name" == zsh ]]; then profiles=("$HOME/.zshrc")
     else
         login="$HOME/.bash_profile"
@@ -204,7 +241,9 @@ main() {
     check_shell "$shell_name" "$shell_executable" preflight "$HOME/.local/bin/dayu-cli"
     INSTALL_STAGE='venv/pip（失败可能留下部分安装）'
     if [[ ! -d "$source/.venv" ]]; then "$python" -I -m venv "$native_venv"; fi
-    scripts_path=$("$venv_python" -I "$native_helper" venv "$native_source") || fail '目标 venv 身份无效'
+    platform_info=$("$venv_python" -I "$native_helper" venv "$native_source") || fail '目标 venv 身份无效'
+    IFS='|' read -r os arch scripts_path <<< "$platform_info"
+    [[ "$(select_lock "$host" "$os" "$arch")" == "$lock" ]] || fail '实际 pip 解释器与预检平台锁不一致'
     if [[ "$os" == win32 ]]; then scripts_path=$(cygpath -u "$scripts_path"); fi
     [[ "$scripts_path" == "$(dirname "$console")" ]] || fail '实际 scripts 路径与目标不符'
     # pip 自行解析项目唯一版本；脚本不维护安装数据库或第二份版本声明。
@@ -218,13 +257,12 @@ main() {
     mkdir -p "$HOME/.local/bin"
     for candidate in "${profiles[@]}"; do publish_profile "$candidate"; done
     INSTALL_STAGE=入口发布
-    publish_entry "$HOME/.local/bin/dayu-cli" "$console"
+    publish_entry "$HOME/.local/bin/dayu-cli" "$console" "$os"
     INSTALL_STAGE=新正常shell核验
     check_shell "$shell_name" "$shell_executable" published "$HOME/.local/bin/dayu-cli"
     printf '安装完成。目标: %s\n默认入口: %s\n请重新打开终端。\n' "$source/.venv" "$HOME/.local/bin/dayu-cli"
 }
 
-SHELL_BASE_PATH=/usr/bin:/bin:/usr/sbin:/sbin
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     trap cleanup EXIT
     main "$@"

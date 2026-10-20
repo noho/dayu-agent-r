@@ -156,7 +156,7 @@ pytest tests/contracts tests/cli tests/documents tests/fins tests/tools tests/ho
 运行类型检查：
 
 ```bash
-python -m pyright dayu/ tests/ utils/
+python -m pyright
 ```
 
 运行 filing 多文件 primary、碰撞隔离与原子发布的 focused 回归：
@@ -764,7 +764,8 @@ workflow/model/downloader/identity 测试分别覆盖 local、prepared、origina
 ### `tests/install/`
 
 源码安装 owner 的隔离行为测试覆盖 Bash launcher、入口和 profile 的安全发布/保全/幂等、
-正常 Bash/zsh 启动、写前 ZDOTDIR 拒绝以及标准库 metadata/source 查询。受控失败边界
+正常 Bash/zsh 的 SHELL/PATH 解析、仅去 venv 污染、CDPATH 隔离、平台化 exe 碰撞、
+已有 venv 实际解释器与锁同源、写前 ZDOTDIR 拒绝以及标准库 metadata/source 查询。受控失败边界
 不替代含依赖的真实 pip 安装；Bash 不计入 Python coverage。安装查询 helper 纳入全量 pyright。
 
 ```bash

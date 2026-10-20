@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -191,13 +193,13 @@ def test_entry_replacement_preserves_old_target(tmp_path: Path, kind: str) -> No
     if kind in ("legacy", "dangling", "current"):
         dest.symlink_to(old if kind == "legacy" else tmp_path / "missing" if kind == "dangling" else target)
     if kind == "same":
-        result = _run(tmp_path, 'source "$1"; publish_entry "$2" "$3"', str(dest), str(target))
+        result = _run(tmp_path, 'source "$1"; publish_entry "$2" "$3" darwin', str(dest), str(target))
         assert result.returncode == 0, result.stderr
-    result = _run(tmp_path, 'source "$1"; publish_entry "$2" "$3"', str(dest), str(target))
+    result = _run(tmp_path, 'source "$1"; publish_entry "$2" "$3" darwin', str(dest), str(target))
     assert result.returncode == 0, result.stderr
     assert dest.is_file() and not dest.is_symlink()
     before = (dest.read_bytes(), dest.stat().st_mtime_ns)
-    repeat = _run(tmp_path, 'source "$1"; publish_entry "$2" "$3"', str(dest), str(target))
+    repeat = _run(tmp_path, 'source "$1"; publish_entry "$2" "$3" darwin', str(dest), str(target))
     assert repeat.returncode == 0
     assert (dest.read_bytes(), dest.stat().st_mtime_ns) == before
     assert (old.read_bytes(), old.stat().st_mode, old.stat().st_mtime_ns) == fingerprint
@@ -247,24 +249,27 @@ def test_atomic_publish_failure_keeps_original(tmp_path: Path, operation: str) -
         dest.symlink_to(old)
     else:
         dest.write_text("preserve", encoding="utf-8")
-    result = _run(tmp_path, 'source "$1"; trap cleanup EXIT; mv() { return 43; }; if [[ "$2" == profile ]]; then publish_profile "$3"; else publish_entry "$3" "$4"; fi', operation, str(dest), str(tmp_path / "console"))
+    result = _run(tmp_path, 'source "$1"; trap cleanup EXIT; mv() { return 43; }; if [[ "$2" == profile ]]; then publish_profile "$3"; else publish_entry "$3" "$4" darwin; fi', operation, str(dest), str(tmp_path / "console"))
     assert result.returncode == 43
     assert dest.read_text(encoding="utf-8") == "preserve"
     assert old.read_text(encoding="utf-8") == "preserve"
     assert not list(tmp_path.glob("*.dayu.*"))
 
 
-def test_windows_exe_collision_is_preflight_conflict(tmp_path: Path) -> None:
+@pytest.mark.parametrize("os_name", ["darwin", "linux", "win32"])
+def test_exe_collision_follows_execution_platform(tmp_path: Path, os_name: str) -> None:
     """Git Bash 同名 exe 碰撞按入口合同拒绝；这不是 Windows 实机测试。
 
     :param tmp_path: 合成路径布局。
     :returns: None。
-    :raises AssertionError: exe 被忽略。
+    :param os_name: 现有 Python OS 真源的受控值。
+    :raises AssertionError: 平台碰撞策略错误或原 exe 被改动。
     """
     (tmp_path / "dayu-cli.exe").write_bytes(b"SYNTHETIC EXE collision")
-    result = _run(tmp_path, 'source "$1"; inspect_entry "$2" "$3"', str(tmp_path / "dayu-cli"), str(tmp_path / "Scripts/dayu-cli.exe"))
-    assert result.returncode != 0
-    assert not (tmp_path / "dayu-cli").exists()
+    result = _run(tmp_path, 'source "$1"; publish_entry "$2" "$3" "$4"', str(tmp_path / "dayu-cli"), str(tmp_path / "Scripts/dayu-cli.exe"), os_name)
+    assert (result.returncode != 0) == (os_name == "win32")
+    assert (tmp_path / "dayu-cli").exists() == (os_name != "win32")
+    assert (tmp_path / "dayu-cli.exe").read_bytes() == b"SYNTHETIC EXE collision"
 
 
 @pytest.mark.parametrize(("host", "os_name", "arch", "lock"), [
@@ -502,14 +507,14 @@ def test_profile_success_then_entry_failure_is_honest(tmp_path: Path) -> None:
     dest.symlink_to(old)
     profile = tmp_path / ".bashrc"
     target = tmp_path / "new console"
-    result = _run(tmp_path, 'source "$1"; trap cleanup EXIT; publish_profile "$2"; mv() { return 43; }; INSTALL_STAGE=入口发布; publish_entry "$3" "$4"', str(profile), str(dest), str(target))
+    result = _run(tmp_path, 'source "$1"; trap cleanup EXIT; publish_profile "$2"; mv() { return 43; }; INSTALL_STAGE=入口发布; publish_entry "$3" "$4" darwin', str(profile), str(dest), str(target))
     assert result.returncode == 43
     assert "入口发布" in result.stderr
     assert "未回滚" in result.stderr
     assert profile.exists() and dest.is_symlink()
     assert old.read_bytes() == b"SYNTHETIC old executable"
     before = profile.read_bytes()
-    retry = _run(tmp_path, 'source "$1"; publish_profile "$2"; publish_entry "$3" "$4"', str(profile), str(dest), str(target))
+    retry = _run(tmp_path, 'source "$1"; publish_profile "$2"; publish_entry "$3" "$4" darwin', str(profile), str(dest), str(target))
     assert retry.returncode == 0
     assert profile.read_bytes() == before
     assert not dest.is_symlink()
@@ -532,3 +537,165 @@ def test_shell_help_failure_is_not_success(tmp_path: Path) -> None:
     assert result.returncode != 0
     assert "SYNTHETIC help failure" in result.stderr
     assert "安装完成。" not in result.stdout
+
+
+def _fingerprint(root: Path) -> dict[str, tuple[int, int, str]]:
+    """记录隔离树的完整写入指纹，含根目录且不跟随链接。
+
+    :param root: 已存在的隔离目录。
+    :returns: 相对路径到权限、mtime 与文件摘要或链接文字的映射。
+    :raises OSError: 无法读取条目。
+    """
+    result: dict[str, tuple[int, int, str]] = {}
+    for path in [root, *sorted(root.rglob("*"))]:
+        stat = path.lstat()
+        content = os.readlink(path) if path.is_symlink() else hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else ""
+        result[str(path.relative_to(root))] = (stat.st_mode, stat.st_mtime_ns, content)
+    return result
+
+
+@pytest.mark.parametrize(("os_name", "arch", "width"), [("linux", "arm64", 8), ("darwin", "x86_64", 8), ("darwin", "arm64", 4), ("darwin", "arm64", 8)])
+def test_existing_venv_identity_rejected_before_writes(tmp_path: Path, os_name: str, arch: str, width: int) -> None:
+    """完整安装只信实际 pip 解释器；受控不适用身份写前失败且保留已有树。
+
+    :param tmp_path: 隔离文件系统。
+    :param os_name: 受控实际 venv OS。
+    :param arch: 受控实际 venv 架构。
+    :param width: 受控指针字节数。
+    :returns: None。
+    :raises AssertionError: 查询 bootstrap、执行 pip 或改写任何已有资产。
+    """
+    source = tmp_path / "source"
+    shutil.copytree(ROOT / "scripts", source / "scripts")
+    shutil.copytree(ROOT / "constraints", source / "constraints")
+    home = tmp_path / "home"
+    (home / ".local/bin").mkdir(parents=True)
+    (home / ".local/bin/dayu-cli").write_bytes(b"unknown entry must stop valid identity")
+    venv = source / ".venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text("include-system-site-packages = false\n", encoding="utf-8")
+    # 仅控制标准库查询身份；任何 pip 调用均不能通过该只读边界。
+    code = '''import sys, platform, struct, sysconfig, runpy
+from functools import partial
+from pathlib import Path
+assert sys.argv[1] == '-I' and sys.argv[3] == 'venv'
+namespace = runpy.run_path(sys.argv[2])
+sysconfig.get_config_vars()
+source = Path(sys.argv[4])
+sys.prefix = str(source / '.venv')
+sys.platform, arch, width = sys.argv[5:8]
+platform.machine = partial(str, arch)
+struct.calcsize = {'P': int(width)}.__getitem__
+sysconfig.get_path = {'scripts': str(source / '.venv/bin'), 'purelib': str(source / '.venv/site'), 'platlib': str(source / '.venv/site')}.__getitem__
+raise SystemExit(namespace['main'](['venv', str(source)]))
+'''
+    # 将受控输入附在真实查询 argv 后，不改变生产 helper。
+    wrapper = venv / "bin/python"
+    wrapper.write_text(f'#!/bin/bash\nexec {shlex.quote(PYTHON)} -I -c {shlex.quote(code)} "$@" {shlex.quote(os_name)} {shlex.quote(arch)} {width}\n', encoding="utf-8")
+    wrapper.chmod(0o700)
+    before_source, before_home = _fingerprint(source), _fingerprint(home)
+    result = _run(home, 'source "$2"; uname() { printf "Darwin\\n"; }; main --shell bash --python /bin/false', str(source / "scripts/install-source.sh"))
+    assert result.returncode != 0
+    assert "预检" in result.stderr
+    assert "Python 平台查询失败" not in result.stderr
+    assert "venv/pip" not in result.stderr
+    assert "Traceback" not in result.stderr
+    if width != 8:
+        assert "只支持 64 位 Python" in result.stderr
+    elif (os_name, arch) == ("darwin", "arm64"):
+        assert "未知普通入口冲突" in result.stderr
+    else:
+        assert "无匹配 Python/OS/架构约束" in result.stderr
+    assert _fingerprint(source) == before_source
+    assert _fingerprint(home) == before_home
+
+
+@pytest.mark.parametrize("selection", ["shell", "path"])
+def test_normal_path_tools_shell_location_and_venv_cleanup(tmp_path: Path, selection: str) -> None:
+    """正常 PATH 的 profile 工具保留；SHELL/PATH 选择非系统位置真实 Bash wrapper。
+
+    :param tmp_path: 隔离 HOME、正常工具及 venv 目录。
+    :param selection: 从 SHELL 或 PATH 选择 wrapper。
+    :returns: None。
+    :raises AssertionError: 丢工具、选错 shell 或残留明确的 venv 污染。
+    """
+    home = tmp_path / "home"
+    local = home / ".local/bin"
+    local.mkdir(parents=True)
+    tools = tmp_path / "normal-tools"
+    tools.mkdir()
+    shell_dir = tmp_path / "custom-shell"
+    shell_dir.mkdir()
+    wrapper = shell_dir / "bash"
+    wrapper.write_text('#!/bin/bash\nprintf "selected_wrapper=%s\\n" "$0"\nexec /bin/bash "$@"\n', encoding="utf-8")
+    wrapper.chmod(0o700)
+    competing = tools / "bash"
+    competing.write_text('#!/bin/bash\nexit 65\n', encoding="utf-8")
+    competing.chmod(0o700)
+    for directory, name in ((local, "local-profile-tool"), (tools, "normal-profile-tool")):
+        tool = directory / name
+        tool.write_text('#!/bin/bash\nexit 0\n', encoding="utf-8")
+        tool.chmod(0o700)
+    source = tmp_path / "source"
+    active = tmp_path / "active"
+    for directory in (source / ".venv/bin", active / "bin"):
+        directory.mkdir(parents=True)
+    for profile in (home / ".bashrc", home / ".bash_profile"):
+        profile.write_text('local-profile-tool || exit 61\nnormal-profile-tool || exit 62\n[[ "$PATH" != *"/.venv/bin"* && "$PATH" != *"/active/bin"* ]] || exit 63\n', encoding="utf-8")
+    code = '''source "$1"
+export PATH="$2/.venv/bin:$3/bin:$4:$5:$HOME/.local/bin:$PATH" VIRTUAL_ENV="$3"
+if [[ "$6" == shell ]]; then
+  export SHELL="$4/bash" PATH="$2/.venv/bin:$3/bin:$5:$HOME/.local/bin:$PATH"
+else export SHELL=/bin/zsh; fi
+prepare_shell_path "$2"
+resolved=$(resolve_shell bash)
+[[ "$resolved" == "$4/bash" ]] || exit 64
+printf 'normal_path=%s\\n' "$SHELL_PATH"
+check_shell bash "$resolved" preflight "$HOME/.local/bin/dayu-cli"
+'''
+    result = _run(home, code, str(source), str(active), str(shell_dir), str(tools), selection)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.count(f"selected_wrapper={wrapper}") == 2
+    assert f"{tools}:{local}" in result.stdout
+
+
+def test_shell_path_preserves_exact_normal_items(tmp_path: Path) -> None:
+    """PATH owner 保留空项、重复项和合法 local 工具，只删除明确目录及其链接别名。
+
+    :param tmp_path: 隔离目录。
+    :returns: None。
+    :raises AssertionError: 正常项改变或 venv 别名未被移除。
+    """
+    source = tmp_path / "source"
+    active = tmp_path / "active"
+    (source / ".venv/bin").mkdir(parents=True)
+    (active / "bin").mkdir(parents=True)
+    alias = tmp_path / "venv-alias"
+    alias.symlink_to(active / "bin", target_is_directory=True)
+    result = _run(tmp_path, 'source "$1"; export VIRTUAL_ENV="$3" PATH=":$HOME/.local/bin:$2/.venv/bin:$4:/usr/bin:/usr/bin:"; prepare_shell_path "$2"; printf "%s" "$SHELL_PATH"', str(source), str(active), str(alias))
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f":{tmp_path}/.local/bin:/usr/bin:/usr/bin:"
+
+
+def test_relative_readme_invocation_ignores_cdpath(tmp_path: Path) -> None:
+    """真实 README 相对调用不受另一个 scripts 目录的 CDPATH 劫持。
+
+    :param tmp_path: 隔离源码、HOME 与诱导目录。
+    :returns: None。
+    :raises AssertionError: 根解析改变、修改 CDPATH 或进入 pip。
+    """
+    source = tmp_path / "source"
+    shutil.copytree(ROOT / "scripts", source / "scripts")
+    shutil.copytree(ROOT / "constraints", source / "constraints")
+    (source / ".venv").write_bytes(b"preserve invalid existing venv")
+    other = tmp_path / "other"
+    (other / "scripts").mkdir(parents=True)
+    home = tmp_path / "home"
+    home.mkdir()
+    before = _fingerprint(source)
+    result = _run(home, 'cd "$2"; export CDPATH="$3"; /bin/bash scripts/install-source.sh --shell bash --python "$4"; result=$?; [[ "$CDPATH" == "$3" ]] || exit 99; exit "$result"', str(source), str(other), PYTHON)
+    assert result.returncode != 0
+    assert "已有 .venv 类型或身份无效" in result.stderr
+    assert "平台查询失败" not in result.stderr
+    assert _fingerprint(source) == before
+    assert not (other / ".venv").exists()

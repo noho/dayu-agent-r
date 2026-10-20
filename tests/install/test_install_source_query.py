@@ -157,13 +157,35 @@ def _pointer32(format_text: str) -> int:
     return 4
 
 
-def test_32bit_python_cannot_select_64bit_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("mode", ["platform", "venv", "installed"])
+def test_32bit_python_cannot_select_64bit_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
     """OS 架构不能替代 Python 指针宽度；写前拒绝 32 位解释器。
 
     :param tmp_path: 独立 cwd。
     :param monkeypatch: 标准库恢复器。
+    :param mode: bootstrap、实际 pip venv 或安装核验查询。
     :returns: None。
     :raises AssertionError: 错误接受 32 位解释器。
     """
+    source, _ = _context(tmp_path, monkeypatch)
     monkeypatch.setattr(query.struct, "calcsize", _pointer32)
-    assert query.main(["platform", str(tmp_path)]) == 1
+    assert query.main([mode, str(source)]) == 1
+
+
+@pytest.mark.parametrize(("os_name", "arch"), [("darwin", "arm64"), ("linux", "x86_64"), ("win32", "amd64")])
+def test_venv_query_projects_its_own_platform(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], os_name: str, arch: str) -> None:
+    """实际 venv 身份查询直接携带平台，不从 bootstrap 或目录后缀推断。
+
+    :param tmp_path: 隔离文件系统。
+    :param monkeypatch: 标准库身份边界恢复器。
+    :param capsys: 输出捕获器。
+    :param os_name: 受控 OS。
+    :param arch: 受控架构。
+    :returns: None。
+    :raises AssertionError: 平台投影与解释器事实不同源。
+    """
+    source, _ = _context(tmp_path, monkeypatch)
+    monkeypatch.setattr(query.sys, "platform", os_name)
+    monkeypatch.setattr(query.platform, "machine", partial(str, arch))
+    assert query.main(["venv", str(source)]) == 0
+    assert capsys.readouterr().out.strip() == f"{os_name}|{arch}|{source / '.venv/bin'}"

@@ -6,7 +6,7 @@
 
 - 最新通讯规则（用户追加）：后续只用 `tmux-agents` 经 tmux 向 title 为 `portfolio-manager` 的项目协作助手汇报；每次发送前重新 discovery 并核对身份。禁用 codex_tui 跨会话发送。中途不向协作助手发进度；仅任务完成、需裁决而停止或其它停止时，汇报实际结果/证据路径/停点/待办。现有开发、draft PR 授权和 merge/live 停点不变，无需另做确认。
 - 用户追加确认继续正常修复，强调不得裁剪吞掉财报内容；按现有成功标准核对无任意长度静默丢弃，显式有界页必须可续读取齐尾部，预览可沿 span 回读，便利视图不冒充完整原件。已加入最终双路审核任务。
-- current gate / next entry point：`code review`（IE-B1实施/验证已完成，待冻结精确版本并执行MiMo/DS完整代码审核）。用户已明确确认目标与授权，见[install-entry goal](public-original-read-r1-r3-20261020-install-entry-goal.md)；版本保持0.1.5、同PR206，工程核收后才真实sync，merge未授权。此前1856cf8d自身安装完成及人工默认链接修正保留为历史，不冒充新流程验证。
+- current gate / next entry point：`受影响面 re-review`（C1–C6 writer修复与验证已完成，待冻结新版本并双路复审）。用户已明确确认目标与授权，见[install-entry goal](public-original-read-r1-r3-20261020-install-entry-goal.md)；版本保持0.1.5、同PR206，工程核收后才真实sync，merge未授权。此前1856cf8d自身安装完成及人工默认链接修正保留为历史，不冒充新流程验证。
 - 目标确认已通过，见 [goal confirmation](public-original-read-r1-r3-20261020-goal-confirmation.md)。用户明确本线唯一承接，并授权持续推进到独立 draft PR 交付；merge 另授权。
 - 分支：`fix/public-original-read-r1-r3-20261020`；base：`8bf8daec8a022fd705e6cfe32c4283605f1fe6ca`（`github/main`）。
 - plan 已实际完成：`codex-agent-run --provider gpt-6-sol --cwd /Users/leo/workspace/dayu-agent-r --prompt-file /Users/leo/workspace/dayu-agent-r/workspace/tmp/public-original-read-r1-r3-20261020/plan-task.md`，托管会话 `97052` 已退出；外层退出码与 `runtime_exit_code` 均为 0，终态 `turn.completed`，实际耗时 751.107963 秒。
@@ -148,3 +148,12 @@ IE-B1 gpt-6-sol实施writer已实际启动，会话47725；输入install-entry-2
 IE-B1 writer47725已实际退出，外层/runtime0/0、turn.completed、1686.269596秒；完整final/实施回执、实际检查及源码快照已读。81tests通过、helper全文件96%（103stmt/4miss）、全量pyright0/0/0、bash-n0；最终delivery fresh/legacy各完整两次安装及四次metadata回读均0，含依赖真pip，无no-deps/借用live site/marker冒充。根README安装/默认入口及wheel同目标检查、testsREADME、必要helper pyrightinclude已按职责更新。版本0.1.5与dayu生产业务代码未改。
 主控独立重算9个writer文件/保存副本全部匹配，496安装输入×当前/快照/fresh/legacy四位置全部匹配；真实0.1.5metadata和旧树前后相等已读。legacy-root-proof另含根.，两轮前后严格相等，其Bash字节与最终同；helper仅补64bit预检不触该owner。BP1a/BP3a plan差异经程序重建核对恰为两个授权局部修正加说明。原pyright三处测试None类型失败、探针zsh只读变量及字节解码失败等保留，主控额外保存controller-first-validation，不伪称一次全绿。独立wheel含依赖安装/show/metadata/help0仅venv验证，不声称user-site或非本机OS通过。
 具体证据workspace/tmp/bash-implementation-20261020-194550/，主控controller-implementation-readback-{initial,final}.json在install-entry-20261020T101200Z。风险已按实施回执分类；BP1a/BP3a正式deferred-with-owner待本轮双路完整代码审核销。current gate转code review，不能据writer通过提前交付/安装。
+
+完整代码双路审核已实际启动：冻结增量base1856cf8d97468423c6a3ece5558a312d31802b20/head5c179fdcb217634c31d66c60a141cf2909987f39，本地冻结commit尚未push；完整22文件diff317031bytes SHA1ea55eae804392dc80f6a1b08daf86caf84d8d907d048424834c41d7e76c6378，版本映射install-entry-20261020T101200Z/bash-code-review-version.json及binary/full-index完整diff可取回。MiMo67035、DS37473，共同任务bash-code-review-task.md，各自bash-code-review-{mimo-flash,ds-flash}.jsonl/.stderr。采用Current Changes全增量模式，远端PR此时仍旧head，不混用可变PRdiff；代码/tests/helper/README/config冻结，主控仅过程记录追加。必须待双路实际退出/完整报告及裁决/必要修复复审后才交付；真实sync与merge均未放行。
+
+安装完整首审已收齐：DS37473实际0/0success1877.652801秒报告204535，MiMo67035实际0/0success2118.829733秒报告204928；完整final/报告已读。BP1a/BP3a正式accepted/已修复，旧wheelDSF1核销。主控接受DS五项+exe平台策略收束C1–C6未修复，见新bash-code-adjudication；当前转fix，不按多数pass直接交付。root最早Homebrew路径探针无效已纠正并不作finding；有效正常PATH同/binBash真实反例独立保存。真实旧UV内部核验要求明确拒绝新增，先工程核收通知再sync与merge另授权不变。
+
+指定gpt-6-sol代码fix已实际启动，会话71339；任务install-entry-20261020T101200Z/bash-code-fix-task.md，独立日志bash-code-fix-writer.jsonl/.stderr，修C1–C6及受影响验证/有限C2计划示例。当前无在途旧review，源码在5c基础上由该writer唯一修改；根README、helper和owner测试随实际契约调整。未安装live/改真实default/profile，未push；完成后冻结新精确commit并双路聚焦复审。
+
+C1–C6 fix writer71339实际外层/runtime0/0、turn.completed、907.062148秒；完整final和bash-code-fix回执已读。92安装tests通过、helper106stmt/4miss96%、全量pyright839文件0/0/0、bash-n/help0；新真实fresh/legacy各安装及完整repeat、metadata/shadow/normal-ic/-lic共20个明确delivery子进程退出0。主控独立核8writer文件/快照零差异，494安装输入×当前/快照/fresh/legacy四位置全符，legacy旧树含根.前后两次严格相等，OS实际metadata0.1.5editable正确。新source仅真实目标venv选锁、正常SHELL/PATH、CDPATH及exe平台语义和直接测试文档；dayu/pyproject/constraints/requirements/pyrightconfig未改。证据workspace/tmp/install-entry-bash-code-fix-20261020-210107/及controller-code-fix-readback.json。
+早期三个C1负例曾因struct注入引起导入TypeError被明确INVALID，最终已具体错误/noTraceback断言重验；早期ambient记录不足仅作历史，最终handoff显式环境白名单完整；均保留不当核收证据。原包/wheel/R1未变部分证据按实际hash适用复用，不机械重跑不变业务。正式C1–C6状态仍待下一步指定双路受影响面复审核销；next entry point转re-review。仍无真实HOME/default/profile/live安装或push/merge。
