@@ -2,6 +2,8 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+import hashlib
+import json
 from pathlib import Path
 from threading import Barrier, Event, Lock
 from typing import Literal, TypedDict
@@ -13,6 +15,7 @@ from dayu.documents.processors.base import DocumentProcessor
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.documents.processors.source import Source
 from dayu.fins.domain.enums import SourceKind
+from dayu.fins.domain.original_read_contract import OriginalNode, OriginalStructureResult, OriginalTextResult
 from dayu.fins.processors.original_content import OriginalContent, OriginalStructure
 from dayu.fins.processors.original_content import _ReferenceTarget
 from dayu.fins.service_runtime import DefaultFinsRuntime
@@ -38,6 +41,142 @@ _TARGET_DOCUMENT = """<html xmlns="http://www.w3.org/1999/xhtml" xmlns:z="http:/
 <z:nonNumeric name="c:Flag" contextRef="C" target="" continuedAt="tail">原值</z:nonNumeric>
 <z:nonNumeric name="c:Symbol" contextRef="C">S</z:nonNumeric>
 <z:continuation id="tail">续文</z:continuation></body></html>"""
+_NOSCRIPT_TEXT_PAGE_CHARS = 37
+_NOSCRIPT_STRUCTURE_PAGE_NODES = 2
+
+
+@pytest.mark.parametrize("head_closing", ["", "</head>"], ids=["omitted-head-end", "explicit-head-end"])
+@pytest.mark.parametrize("head_noscript", [False, True], ids=["body-only", "head-and-body"])
+def test_noscript_keeps_head_and_body_source_relationships(
+    tmp_path: Path, head_closing: str, head_noscript: bool
+) -> None:
+    """参数：真实 Fs 根、head 结束标签和 head 内 noscript 开关。返回：无。异常：父链、完整性、身份或公开续读不保真时断言失败。"""
+    # head 内只放规范允许的 link；body 内独立放 flow 内容，避免把非法 head/p 当作正例。
+    head_content = '<noscript><link rel="stylesheet" href="fallback.css"></noscript>' if head_noscript else ""
+    text = (
+        "<!doctype html><html><head><title>T</title>"
+        + head_content
+        + head_closing
+        + "<body><noscript><p>正文&amp;备用</p></noscript></body></html>"
+    )
+    publish_original(tmp_path, text)
+    with closing(DefaultFinsRuntime.create(workspace_root=tmp_path)) as runtime:
+        reader = runtime.get_read_runtime()
+        listing = reader.list_document_assets(ticker="TEST", document_id="original-doc", source_kind=SourceKind.FILING)
+        asset = next(a["asset"] for a in listing["assets"] if a["asset"]["filename"] == "main.html")
+        payload = b"\xef\xbb\xbf" + text.encode("utf-8")
+        assert asset["sha256"] == hashlib.sha256(payload).hexdigest() and asset["size_bytes"] == len(payload)
+        args: _Selection = {
+            "ticker": "TEST",
+            "document_id": "original-doc",
+            "source_kind": SourceKind.FILING,
+            "filename": asset["filename"],
+            "expected_sha256": asset["sha256"],
+        }
+        result = reader.read_original_structure(**args)
+        assert result["asset"] == asset and result["bom_bytes"] == len(payload) - len(text.encode("utf-8"))
+        assert result["parse_status"] == "complete" and result["diagnostics"] == []
+        assert result["diagnostics_complete"] and not result["truncated"] and result["next_start"] is None
+        elements = {n["qname"]["raw"]: n for n in result["nodes"] if n["qname"]}
+        html, head, body = elements["html"], elements["head"], elements["body"]
+        scripts = [n for n in result["nodes"] if n["qname"] and n["qname"]["raw"] == "noscript"]
+        assert len(scripts) == (2 if head_noscript else 1)
+        relations: list[tuple[OriginalNode, list[OriginalNode]]] = [
+            (head, [html]),
+            (elements["title"], [head, html]),
+            (body, [html]),
+            (scripts[-1], [body, html]),
+            (elements["p"], [scripts[-1], body, html]),
+        ]
+        if head_noscript:
+            relations.extend([(scripts[0], [head, html]), (elements["link"], [scripts[0], head, html])])
+            assert elements["link"]["closure"] == "void"
+        for node, ancestors in relations:
+            assert node["parent_status"] == "resolved" and node["parent"] == ancestors[0]["opening"]
+            assert node["ancestors_complete"] and node["ancestors"] == [a["opening"] for a in ancestors]
+        assert all(n["closure"] == "explicit" for n in scripts)
+        assert head["closure"] == ("explicit" if head_closing else "rule")
+        assert head["content"] is not None
+        if head_closing:
+            assert head["closing"] is not None and text[head["closing"]["start"] : head["closing"]["end"]] == head_closing
+            assert head["content"]["end"] == head["closing"]["start"]
+        else:
+            assert head["closing"] is None and head["content"]["end"] == body["opening"]["start"]
+
+        readbacks: list[OriginalTextResult] = []
+        for node in result["nodes"]:
+            for span in (node["opening"], node["content"], node["closing"]):
+                if span is not None:
+                    back = reader.read_original_text(**args, start=span["start"], end=span["end"])
+                    assert back["asset"] == span["asset"] == asset and back["text"] == text[span["start"] : span["end"]]
+                    assert not back["truncated"] and back["next_start"] is None
+                    readbacks.append(back)
+
+        pages: list[OriginalStructureResult] = []
+        start = 0
+        while True:
+            page = reader.read_original_structure(**args, start=start, max_nodes=_NOSCRIPT_STRUCTURE_PAGE_NODES)
+            pages.append(page)
+            assert page["parse_status"] == "complete" and page["diagnostics"] == [] and page["diagnostics_complete"]
+            following = page["next_start"]
+            assert page["truncated"] == (following is not None)
+            if following is None:
+                break
+            assert following > start
+            start = following
+        assert [n for page in pages for n in page["nodes"]] == result["nodes"]
+
+        text_pages: list[OriginalTextResult] = []
+        start = 0
+        while True:
+            text_page = reader.read_original_text(**args, start=start, max_chars=_NOSCRIPT_TEXT_PAGE_CHARS)
+            text_pages.append(text_page)
+            assert text_page["asset"] == asset and text_page["returned_range"]["start"] == start
+            following = text_page["next_start"]
+            assert text_page["truncated"] == (following is not None)
+            if following is None:
+                assert text_page["returned_range"]["end"] == len(text)
+                break
+            assert following == text_page["returned_range"]["end"] and following > start
+            start = following
+        assert "".join(page["text"] for page in text_pages) == text
+        (tmp_path / "code-fix-2-head-noscript-receipt.json").write_text(
+            json.dumps(
+                {"text": text, "listing": listing, "structure": result, "structure_pages": pages,
+                 "text_pages": text_pages, "span_readbacks": readbacks},
+                ensure_ascii=False, indent=2,
+            ), encoding="utf-8",
+        )
+
+
+def test_unclosed_head_noscript_keeps_partial_unknown(tmp_path: Path) -> None:
+    """参数：真实 Fs 根。返回：无。异常：缺失 noscript 结束被规则闭合冒充完整、或未知父链被伪造时断言失败。"""
+    text = '<html><head><title>T</title><noscript><link rel="stylesheet" href="fallback.css"></head><body></body></html>'
+    publish_original(tmp_path, text)
+    with closing(DefaultFinsRuntime.create(workspace_root=tmp_path)) as runtime:
+        reader = runtime.get_read_runtime()
+        asset = next(
+            a["asset"] for a in reader.list_document_assets(
+                ticker="TEST", document_id="original-doc", source_kind=SourceKind.FILING
+            )["assets"] if a["asset"]["filename"] == "main.html"
+        )
+        result = reader.read_original_structure(
+            ticker="TEST", document_id="original-doc", source_kind=SourceKind.FILING,
+            filename=asset["filename"], expected_sha256=asset["sha256"],
+        )
+        assert result["parse_status"] == "partial" and result["diagnostics_complete"]
+        assert [d["reason"] for d in result["diagnostics"]] == ["mismatched_nesting"]
+        elements = {n["qname"]["raw"]: n for n in result["nodes"] if n["qname"]}
+        script, link = elements["noscript"], elements["link"]
+        assert script["closure"] == "unknown" and script["closing"] is None and script["content"] is None
+        assert link["parent"] is None and link["parent_status"] == "unknown"
+        assert link["ancestors"] == [] and not link["ancestors_complete"]
+        assert elements["body"]["parent"] == elements["html"]["opening"]
+        diagnostic = result["diagnostics"][0]["span"]
+        assert text[diagnostic["start"] : diagnostic["end"]] == text[text.index("<noscript>") : text.index("<body>")]
+        (tmp_path / "code-fix-2-head-noscript-partial-receipt.json").write_text(
+            json.dumps({"text": text, "structure": result}, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
 
 
 @pytest.mark.parametrize(

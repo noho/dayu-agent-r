@@ -2,9 +2,11 @@
 
 ## 当前状态
 
+- **交付/live 授权最新纠正优先**：见 [authorization update](public-original-read-r1-r3-20261020-authorization-update.md)。保留在途复审；工程修复/审核/验证与独立 draft PR 交付后，先经 tmux-agents 重新核实 portfolio-manager 身份并报工程交付，等待其核收通知后才 sync。sync 无需 merge，按当前 README 从源码安装已核收分支/精确 commit，只交自身安装命令/退出/源码 commit/安装位置及 README 要求的公开入口检查（`dayu-cli --help`）；用户已撤回调用方入口来源核验要求，无需了解、查找或核验调用方环境与入口；不加业务回归/原失败用例/live LLM 出站门槛，调用方补验后续安排。merge 仍另授权。本文后面的“merge 后才 sync/live 复验”仅是旧时点历史，已由该最新指令取代，不作当前停点。
+
 - 最新通讯规则（用户追加）：后续只用 `tmux-agents` 经 tmux 向 title 为 `portfolio-manager` 的项目协作助手汇报；每次发送前重新 discovery 并核对身份。禁用 codex_tui 跨会话发送。中途不向协作助手发进度；仅任务完成、需裁决而停止或其它停止时，汇报实际结果/证据路径/停点/待办。现有开发、draft PR 授权和 merge/live 停点不变，无需另做确认。
 - 用户追加确认继续正常修复，强调不得裁剪吞掉财报内容；按现有成功标准核对无任意长度静默丢弃，显式有界页必须可续读取齐尾部，预览可沿 span 回读，便利视图不冒充完整原件。已加入最终双路审核任务。
-- current gate / next entry point：`受影响面 re-review`（fix 已实际交付并核同版验证，冻结后按指定 MiMo/DS 双路复审；未放行 PR）。
+- current gate / next entry point：`受影响面 re-review`（D3 窄修已实际退出并验证冻结，待指定 MiMo/DS 双路核销；11 项前轮已修复，未放行 PR）。
 - 目标确认已通过，见 [goal confirmation](public-original-read-r1-r3-20261020-goal-confirmation.md)。用户明确本线唯一承接，并授权持续推进到独立 draft PR 交付；merge 另授权。
 - 分支：`fix/public-original-read-r1-r3-20261020`；base：`8bf8daec8a022fd705e6cfe32c4283605f1fe6ca`（`github/main`）。
 - plan 已实际完成：`codex-agent-run --provider gpt-6-sol --cwd /Users/leo/workspace/dayu-agent-r --prompt-file /Users/leo/workspace/dayu-agent-r/workspace/tmp/public-original-read-r1-r3-20261020/plan-task.md`，托管会话 `97052` 已退出；外层退出码与 `runtime_exit_code` 均为 0，终态 `turn.completed`，实际耗时 751.107963 秒。
@@ -45,12 +47,14 @@
    - 主控独立核对 `code-fix-files-final.json` 34 个文件、`code-fix-source-final/` 保存字节与当前树相同，API-8 的 182 个 Fins 模块指纹全同版。完整受影响集 1 failed/1452 passed（唯一旧测试的 registry hook 已在 entry 发布后，错误当作发布前），仅迁移该测试到真实 full snapshot 返回前并保留拒绝发布/零构建/清理断言，整个一致性文件 55 passed；其余 1398 项与当前生产源码完全同版，合计 1453 个唯一测试有有效通过证据，不把退出 1 伪称一次全绿。
    - 全量最终 pyright 退出 0、0 errors/0 warnings/0 informations；17 个生产文件完整覆盖率均 >=80%，未新增 exclude/omit。合并一份零测量行 SQLite 子进程文件的 CoverageWarning 原样保留；该文件 integrity=ok、所有测量表为空，未删警告/改写数据，缺失测量不从完整文件分母删除，阈值仍满足。详见回执与 coverage warning inspection/detail。
    - 新真实 API-8：1774 次调用、外层/程序 0，全部原件/隔离副本前后相同；ASML cold/warm 各380页拼齐24,864,734字符，TSM双资产/关系、MSFT三occurrence及53旧调用重放均重验。source/argv/实际时间/错误/返回 SHA 在 `workspace/tmp/public-original-read-r1-r3-20261020/development-api-8-code-fix/` 与 code-fix-api-8 execution。
+7. 受影响面 re-review：实际冻结 HEAD `6da0b8706f92a0e1eb361bebf5a529c97d2f9d40`，selected fix base `cd37d5759b1152eb1571fd410ff6275c30c83e25`；完整 fix diff `workspace/tmp/public-original-read-r1-r3-20261020/code-rereview-full.diff`，SHA `e6fdf89a828916d37cf95ce7a6abb200278cafa72376e9af1aac53be6f849df1`，版本记录同目录 code-rereview-version.json。源码无在途 writer。
+   - MiMo 会话 `15948` 与 DS 会话 `16726` 已按指定并行实际启动；共同输入 `workspace/tmp/public-original-read-r1-r3-20261020/code-rereview-task.md`，各自原始日志 `code-rereview-{mimo,ds}.jsonl/.stderr`。聚焦正式 accepted 清单、实际 fix diff 与受影响交互，不重复无变化全部旧代码；两路独立当前判断，禁止参考另一此次复审结论。收齐真实退出、完整 final/报告并总控逐项核销前，不放行 PR。
 
 ## 验证与风险
 
 - 用户追加 OLD 对照线索后，总控已只读核对 `/Users/leo/workspace/dayu-agent` 的精确 HEAD `76037b242d0b14a77281d7bc610429296123c5cb`（clean）；三类限制在其同路径已有直接代码证据，不能统称重构新增回归。静态结论及未做同输入动态对照的限定见 [OLD 对照](public-original-read-r1-r3-20261020-old-comparison.md)，原文件可取回快照及指纹见 `workspace/tmp/public-original-read-r1-r3-20261020/old-comparison/receipt.json`。未改 OLD、未扩大修复范围。
 
-当前唯一 writer 已退出，最终 release/API-7 验证与源码冻结对应，完整双路代码审核在途。下面的中间记录仅保留迭代历史；当前实现验收以第 4 节及实施回执的最终证据为准，开工基线和早期通过记录不替代最终版本。
+以下为首次实施验收时点的历史记录：当时唯一 writer 已退出，release/API-7 验证与源码冻结对应，完整双路代码审核在途。当前 gate 与最新版本以本文顶部和第 6–7 节之后的实际修复/复审追加记录为准；开工基线和早期通过记录不替代当前版本。
 
 - 早期中间验证曾失败：`implementation-regression-2.stdout` 留有 23 failed / 220 passed，`implementation-pyright.stdout` 留有 2 errors（取消异常旧导入与 ExpandedName 序列进入 JSON 参数边界）。这些历史失败完整保留，不能作为最终验证；旧工具集/角色夹具/输出禁止规则须随 owner/public contract 迁移，不能靠生产兼容代码兜底。
 - 后续进度（非最终 gate）：controller 已读取 `implementation-pyright-2.stdout` 的 0 errors/0 warnings 与 `host-original-2.stdout` 的 1 passed（真实工具/Host 单次补读联合测试）。原文新测试曾报 20 项通过，仍有后续新增/修改，最终需统一同版验收。
@@ -59,6 +63,22 @@
 
 - 源码基线额外核验：在 `8bf8daec` 文件树且无生产代码修改时，实际执行 `source .venv/bin/activate && pyright`（stdout/stderr 分别保存到 `workspace/tmp/public-original-read-r1-r3-20261020/baseline-pyright.stdout/.stderr`），会话 `20505` 实际退出 0，0 errors/0 warnings/0 informations。stderr 仅有 CLI 新版提示，不升级依赖；此证据仅属于开工基线，不能放行未来实现代码。
 
-- R1–R3 缺陷：`fixed in current slice`（实施/验证层，尚待完整代码审核裁决），owner 为本线 Dayu；证据见实施回执。
-- merge / live 安装更新与真实入口复验：`requiring new issue or explicit user decision`，owner 为用户授权与本线执行；merge 尚未授权，不提前同步 live。
+- R1–R3 修复：`fixed in current slice`，owner 为本线 Dayu；实施及首轮修复证据见相应回执。最新双路复审核销 11 项，D3 为部分修复并由本线窄修，仍阻塞代码审核放行。
+- merge：`requiring new issue or explicit user decision`，owner 为用户，尚未授权。源码安装为条件授权后续接续，owner 本线；须工程交付获 portfolio-manager 核收并收到安装通知后，按 README 安装指定精确 commit，报告自身命令/退出/commit/位置及 `dayu-cli --help`；不查调用方环境与入口、不追加业务回归。
+
+> 旧停点历史（已被 authorization-update 覆盖）：merge / live 安装更新与真实入口复验曾统一归为 requiring new issue or explicit user decision，要求不提前同步；原用户通知历史保留，当前将 merge 与条件安装分别处理。
 - README：实施已按职责更新 Fins/config/tests README 与现有 fins-read 指引；根 README/dayu README 的入口与架构未变，不机械扩写，详见实施回执 docs decision。
+
+### 受影响面复审阶段回执
+
+DS 会话 `16726` 实际退出，外层/runtime 均 0、success、693.724303 秒；完整 final 与 [报告](../reviews/code-review-20261020-143203.md) 已读取。独立核对 11 项已修复；D3 部分修复，合法 head `noscript` 不在 `_HEAD_CONTENT` 而被提前闭合，public runtime 复现错误 parent/complete（显式 head 则误报 partial），同输入旧版对照成立。主控直接核对集合与 `_close_optional` 分支，接受同 owner 范围内反例；待 MiMo 收齐后窄修并双路复审，不放行 PR。MiMo `15948` 仍在途，源码继续冻结。
+
+MiMo `15948` 已实际退出，外层/runtime 均0、success、1224.371016秒；完整final已读，但未交durable审核报告，最终停在索取pytest失败输出，不能视为本轮复审通过。主控保留其全部原始日志，派同provider完成同一冻结版本审核产物，明确已有完整日志可读、纠正其调查脚本的错误入口，不注入另一reviewer结论，源码继续冻结。主控另独立真实Fs/public runtime复现D3 noscript：`workspace/tmp/public-original-read-r1-r3-20261020/controller-noscript-probe/{omitted,explicit,receipt}.json`保存完整返回，实际复现命令退出0；先前`python -m runpy <文件>`启动方式错误退出1（未运行脚本），改用`runpy.run_path`后成功，未改源码。
+
+MiMo同版审核产物补齐已实际启动：会话 `86892`，prompt `workspace/tmp/public-original-read-r1-r3-20261020/code-rereview-mimo-completion-task.md`，独立日志 `code-rereview-mimo-completion.jsonl/.stderr`；等待实际退出并读完整final/报告。不得仅凭日志或目录新增放行，当前无writer。
+
+MiMo 补齐会话 `86892` 实际退出，外层/runtime 0、success、2108.34396秒，完整final及 `docs/reviews/code-review-20261020-150149.md` 已读。双路最终收齐：11项已修复、D3部分修复；MiMo XHTML疑点根因为探针URI拼写错误，正式排除。主控逐项裁决及报告笔误限定见 code-adjudication 的“第一轮受影响面复审裁决”。现在进入 D3 窄修，随后指定双路窄复审；无用户新取舍，不放行PR。
+
+D3 窄修已实际启动：指定 gpt-6-sol 唯一writer会话 `92708`，任务 `workspace/tmp/public-original-read-r1-r3-20261020/code-fix-2-task.md`，原始日志 `code-fix-2-gpt6-sol.jsonl/.stderr`。writer不commit/push/安装，主控只写过程记录；待实际退出、同版验证与快照核对后再冻结窄复审。
+
+D3 窄修会话 `92708` 实际退出，外层/runtime 均0、turn.completed、725.936212秒；完整final与 code-fix-2 回执已读。生产只补head内容集合noscript及注释，新增五个真实Fs/public runtime回归实例与tests README条目；99项完整原文/process/Host测试通过、全量pyright0/0/0，本轮唯一修改生产完整文件覆盖率391/402=97.2637%，无exclude/omit。主控逐字节重核902份当前文件/保存快照/manifest全部相符；原始失败、control外部更新导致的初次一致性检查失败、空coverage子库警告均按回执保留限定，后续检查退出0。API8的1774份响应与182模块旧指纹已核：仅original_content改变，八份保存原文无noscript起始候选，故旧证据对未变样本仍适用，新分支由本轮公开runtime/Host断言证明，不声称本轮重跑1774或1453全量。下一步冻结精确commit并双路窄复审，D3正式状态仍部分修复待核销。

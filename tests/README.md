@@ -756,4 +756,4 @@ workflow/model/downloader/identity 测试分别覆盖 local、prepared、origina
 
 `fins/test_read_search_regression.py` 用真实 Markdown processor 验证取消 owner import 迁移后的多模式搜索、证据导航回读及较小显示预算下的 exact 命中保留。原文结构用例另覆盖 XML 声明/CDATA、合法省略的行组边界，以及未闭合 SEC 原始外层必须显式标记未知父链。
 
-`fins/test_original_read_review_regressions.py` 覆盖真实 Fs/public runtime 的 XML/XHTML 媒体与大小写、HTML 省略 head/行组/colgroup/option/ruby 闭合、资产内 exact ID 引用与 target 原声明、跨页引用完整性、字面量文件名、typed not_found、三类懒构建跨 close 的借用资源收口、诊断零构建，以及两个 full snapshot 在发布前同步竞争的败方清理。provider 禁值扫描覆盖全部十三工具的成功/失败/取消嵌套投影；Host 联合测试另覆盖 facts 页内截断取齐后按 next_offset 遍历 occurrence。
+`fins/test_original_read_review_regressions.py` 覆盖真实 Fs/public runtime 的 XML/XHTML 媒体与大小写、HTML 省略 head/行组/colgroup/option/ruby 闭合、head 内 noscript 在显式或省略 head 结束时的父链与 body 归属、body noscript 对照及未闭合时的 partial/unknown、同版 hash/span 回读与文本/结构分页、资产内 exact ID 引用与 target 原声明、跨页引用完整性、字面量文件名、typed not_found、三类懒构建跨 close 的借用资源收口、诊断零构建，以及两个 full snapshot 在发布前同步竞争的败方清理。provider 禁值扫描覆盖全部十三工具的成功/失败/取消嵌套投影；Host 联合测试另覆盖 facts 页内截断取齐后按 next_offset 遍历 occurrence。

@@ -41,7 +41,8 @@ _HTML_VOID = frozenset("area base br col embed hr img input link meta param sour
 _P_BLOCK = frozenset(
     "address article aside blockquote details dialog div dl fieldset figcaption figure footer form h1 h2 h3 h4 h5 h6 header hgroup hr main menu nav ol p pre search section table ul".split()
 )
-_HEAD_CONTENT = frozenset("base basefont bgsound link meta noframes script style template title".split())
+# noscript 可承载 head 内的 link/style/meta；其起点不能触发 head 的省略闭合。
+_HEAD_CONTENT = frozenset("base basefont bgsound link meta noframes noscript script style template title".split())
 _OPTIONAL_PARENT_END = {
     "html": frozenset({""}),
     "head": frozenset({"html"}),
