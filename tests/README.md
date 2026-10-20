@@ -138,7 +138,9 @@ DAYU_SEC_IMAGE_REAL_VALIDATION=1 DAYU_SEC_IMAGE_RUN_ROOT="$SEC_IMAGE_RUN_ROOT" D
 启用后配置或网络失败是 fail；身份仅在内存复用既有 zshrc literal，证据只记录配置布尔值。
 真实验证使用原 commit 的生产 CLI 播种旧来源，再用指定 editable CLI 普通升级；保存实际 argv、
 两通道、退出码、descriptor 观测及仓储逐图 hash/URI，并核对七个生产 owner 的同期源码身份；
-实际查询到的包 metadata 版本必须与对应 baseline/current 源码的 `pyproject.toml` 声明一致，错版即失败。
+observer 保留按运行环境路径解析所得的包 metadata 版本，仅作观测，不证明 baseline 源码版本或安装成功；
+源码身份由 `code_root`、七个生产 owner 的路径/hash 及 `download_version` 断言核定。
+wheel 测试负责核对发行 metadata 与源码声明同源；实际安装包版本留给后续明确授权的 sync 后核对。
 目标 HTML 与完整 filing 的图片数分栏，
 逐一核验所有实际已选 HTML 的引用，额外图片只作为必要依赖登记。临时 hook 只观察真实 transport/指纹，或对
 exact 图片 GET 注入 404，用以验证 fresh 不发布、upgrade 保留旧 publication、解除故障后 retry

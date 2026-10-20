@@ -10,7 +10,6 @@ import os
 import re
 import shlex
 import subprocess
-import tomllib
 from dataclasses import dataclass, field
 from collections.abc import Iterator
 from html.parser import HTMLParser
@@ -48,6 +47,7 @@ _PRODUCER_PATHS = (
     "dayu/fins/pipelines/sec_download_source_upsert.py",
 )
 # 只观察 transport 与原指纹函数；fault 仅改变 exact 图片 GET 的远端响应。
+# package_version 仅记录运行环境按路径解析的 metadata，不证明 baseline 源码版本或安装成功。
 _OBSERVER_SCRIPT = '''"""临时真实验证 transport/descriptor 观测器，不改变生产结果。"""
 from __future__ import annotations
 import importlib.metadata
@@ -311,22 +311,6 @@ def _observations(path: Path) -> list[dict[str, JsonValue]]:
     return [_mapping(cast(JsonValue, json.loads(line))) for line in path.read_text().splitlines()]
 
 
-def _assert_package_version(observed_version: JsonValue, code_root: Path) -> None:
-    """按对应源码声明核对实际查询到的包版本。
-
-    :param observed_version: 子进程通过 distribution metadata 实际查询到的版本。
-    :param code_root: 本次运行应使用的 baseline 或 current 源码根目录。
-    :returns: ``None``。
-    :raises AssertionError: 声明不是字符串或实际版本与声明不符时抛出。
-    :raises OSError: 对应源码的 pyproject 无法读取时抛出。
-    :raises tomllib.TOMLDecodeError: 对应源码的 pyproject 格式非法时抛出。
-    :raises KeyError: 对应源码缺少 project/version 声明时抛出。
-    """
-    expected_version = tomllib.loads((code_root / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
-    assert isinstance(expected_version, str)
-    assert observed_version == expected_version, (observed_version, expected_version, str(code_root))
-
-
 def _run_cli(context: _Context, year: str, accession: str, mode: str, base: Path, *,
              baseline: bool = False, fault: str | None = None) -> dict[str, JsonValue]:
     """参数为 CLI 模式、base 与 exact transport fault；保存 argv/两通道/log/exit/观测；入口失败透传。"""
@@ -359,7 +343,6 @@ def _run_cli(context: _Context, year: str, accession: str, mode: str, base: Path
     origin = origins[0]
     assert origin["download_version"] == (_OLD_VERSION if baseline else SEC_PIPELINE_DOWNLOAD_VERSION)
     expected_root = context.baseline if baseline else _REPO
-    _assert_package_version(origin["package_version"], expected_root)
     assert origin["code_root"] == str(expected_root)
     producer_origins = _mapping(origin["producer_origins"])
     assert set(producer_origins) == set(_PRODUCER_PATHS)
