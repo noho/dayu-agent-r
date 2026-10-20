@@ -6,7 +6,7 @@
 
 - 最新通讯规则（用户追加）：后续只用 `tmux-agents` 经 tmux 向 title 为 `portfolio-manager` 的项目协作助手汇报；每次发送前重新 discovery 并核对身份。禁用 codex_tui 跨会话发送。中途不向协作助手发进度；仅任务完成、需裁决而停止或其它停止时，汇报实际结果/证据路径/停点/待办。现有开发、draft PR 授权和 merge/live 停点不变，无需另做确认。
 - 用户追加确认继续正常修复，强调不得裁剪吞掉财报内容；按现有成功标准核对无任意长度静默丢弃，显式有界页必须可续读取齐尾部，预览可沿 span 回读，便利视图不冒充完整原件。已加入最终双路审核任务。
-- current gate / next entry point：`受影响面 re-review`（D3 窄修已实际退出并验证冻结，待指定 MiMo/DS 双路核销；11 项前轮已修复，未放行 PR）。
+- current gate / next entry point：`必要提交 / push`（完整代码审核与必要双路复审通过，ready-to-open-draft-PR 已核对；尚未创建 PR）。
 - 目标确认已通过，见 [goal confirmation](public-original-read-r1-r3-20261020-goal-confirmation.md)。用户明确本线唯一承接，并授权持续推进到独立 draft PR 交付；merge 另授权。
 - 分支：`fix/public-original-read-r1-r3-20261020`；base：`8bf8daec8a022fd705e6cfe32c4283605f1fe6ca`（`github/main`）。
 - plan 已实际完成：`codex-agent-run --provider gpt-6-sol --cwd /Users/leo/workspace/dayu-agent-r --prompt-file /Users/leo/workspace/dayu-agent-r/workspace/tmp/public-original-read-r1-r3-20261020/plan-task.md`，托管会话 `97052` 已退出；外层退出码与 `runtime_exit_code` 均为 0，终态 `turn.completed`，实际耗时 751.107963 秒。
@@ -82,3 +82,11 @@ MiMo 补齐会话 `86892` 实际退出，外层/runtime 0、success、2108.34396
 D3 窄修已实际启动：指定 gpt-6-sol 唯一writer会话 `92708`，任务 `workspace/tmp/public-original-read-r1-r3-20261020/code-fix-2-task.md`，原始日志 `code-fix-2-gpt6-sol.jsonl/.stderr`。writer不commit/push/安装，主控只写过程记录；待实际退出、同版验证与快照核对后再冻结窄复审。
 
 D3 窄修会话 `92708` 实际退出，外层/runtime 均0、turn.completed、725.936212秒；完整final与 code-fix-2 回执已读。生产只补head内容集合noscript及注释，新增五个真实Fs/public runtime回归实例与tests README条目；99项完整原文/process/Host测试通过、全量pyright0/0/0，本轮唯一修改生产完整文件覆盖率391/402=97.2637%，无exclude/omit。主控逐字节重核902份当前文件/保存快照/manifest全部相符；原始失败、control外部更新导致的初次一致性检查失败、空coverage子库警告均按回执保留限定，后续检查退出0。API8的1774份响应与182模块旧指纹已核：仅original_content改变，八份保存原文无noscript起始候选，故旧证据对未变样本仍适用，新分支由本轮公开runtime/Host断言证明，不声称本轮重跑1774或1453全量。下一步冻结精确commit并双路窄复审，D3正式状态仍部分修复待核销。
+
+第二轮D3窄复审已实际启动：冻结HEAD `f7eee0c5a85d8810d63e32976f17c36922640f90`、base `6da0b8706f92a0e1eb361bebf5a529c97d2f9d40`；完整diff `workspace/tmp/public-original-read-r1-r3-20261020/code-rereview-2-full.diff` SHA256 `2c76bb9400d4f01faceb67a6564b331f23efe548f2d7c00d7e31e0a0f7868a7e`，版本映射同目录code-rereview-2-version.json。MiMo会话 `28070`、DS会话 `53087`，共同输入code-rereview-2-task.md，各自日志code-rereview-2-{mimo,ds}.jsonl/.stderr。生产/测试/README与writer验证快照相同、无在途writer；主控只追加过程记录。待两路真实退出、完整final/报告和总控裁决，不放行PR。
+
+### 最终代码审核与 ready-to-open-draft-PR
+
+第二轮已收齐：DS `53087` 实际0/0、success、386.740158秒，报告153921；MiMo `28070` 实际0/0、success、1429.184726秒，报告155306。完整final和报告均已读取，主控终裁见code-adjudication最新节；D3正式accepted/已修复，12项全核销，S1维持有owner/destination的非阻塞defer，无needs-more-evidence/blocker。源码审核HEAD f7eee0c5，base6da0b870，完整diff及版本映射可取回；源码/测试/README相对writer验证无字节变化，只有主控过程记录追加。
+
+ready核对通过：分支非protected trunk，8bf8daec起仅本work unit三项实现/修复commit；全部approved slice完成。99 tests及全量pyright实际通过、17修改生产完整文件覆盖率有效达标，旧1453/1774证据按实际输入/源码/依赖复用并保留历史失败，不伪称一次全绿。README按职责更新Fins/config/tests，最新窄修只更新tests README；根README安装入口和层次未变。风险已分类且有owner/destination，未指定GitHubissue（本地handoff，不创建issue/comment）。远端main重新核为8bf8daec8a022fd705e6cfe32c4283605f1fe6ca，开放PR列表为空；无重复修复。允许必要过程记录提交/push及create独立draft PR；随后必须总控核repo/headrepo/精确OID/完整diff/title/body/实际CI/最终push，再draft-PR-pass与final closeout。工程核收并通知前不安装，merge未授权。

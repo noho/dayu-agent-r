@@ -1,6 +1,6 @@
 # R1–R3 完整代码审核裁决
 
-当前 gate 为 `受影响面 re-review`：D3 窄修已实际交付并验证，尚待指定 MiMo/DS 双路核销，**不放行 PR**。D1/D2/D4/C1/C2/C3/C4/M1/T1/T2/L1 前轮已核销，D3 正式状态仍为部分修复。最新安装边界见 authorization-update.md，历史通知保留。
+当前代码审核已通过：12 项 accepted 均为 **已修复**，S1 正式 deferred-with-owner，未发现未决 blocker 或 needs-more-evidence。源码审核版本为 `f7eee0c5a85d8810d63e32976f17c36922640f90`；后续仅过程记录更新。进入独立 draft PR 交付链，安装仍须工程核收及明确通知，merge 另授权。
 
 ## 首轮完整审核裁决历史
 
@@ -14,7 +14,7 @@
 | --- | --- | --- | --- |
 | D1 | DS Finding 1 | accepted / 已修复 | 原文 processor 错把技术 target 当资产内 ID 命名空间。按当前资产 exact ID 与期望元素类型解析 context/continuation，重复 ID 才 ambiguous；保留 fact target_raw/origin。主控另下载实读 FRC 指南，原文明确 resources/continuation/exclude 禁用 target、context/unit 进入所需目标，见 `workspace/tmp/public-original-read-r1-r3-20261020/inline-target-guidance.{pdf,txt}` 第 199–203 行。现有 target fixture 固化错误须迁移，不保兼容分组。已有 resource_target_* 字段可保留为原文声明存在/内容的投影，须说明不构成合法分组，不因语义修复删除已承诺原文。补 target fact + default resources + continuation 的公开入口、重复 ID/未决反例。 |
 | D2 | DS Finding 2 | accepted / 已修复 | 懒 entry 发布后，诊断的 borrow.processor accessor 会构建未读 processor，违反零构建成本 owner 契约。诊断只能读取已完成 processor，未建就跳过；保持 revision 校验与借用资源收口。补枚举 B→A 坏 ref/table_ref 不构建 B 的实际 registry 计数回归。 |
-| D3 | DS Finding 3 | accepted / 部分修复 | 原文 HTML 可省略闭合规则漏 head，合法省略 </head> 的 body 被当 head 子级且 complete。修复 head/本轮支持的可省略标签边界；其它无法确定的关系必须明确 partial/unknown，不能完整旗标下伪造父链；不引入浏览器 DOM 重建或平行 parser。补 head/body、行组及同类合法边界，XML 保大小写行为独立。 |
+| D3 | DS Finding 3 | accepted / 已修复 | 原文 HTML 可省略闭合规则漏 head，合法省略 </head> 的 body 被当 head 子级且 complete。修复 head/本轮支持的可省略标签边界；其它无法确定的关系必须明确 partial/unknown，不能完整旗标下伪造父链；不引入浏览器 DOM 重建或平行 parser。补 head/body、行组及同类合法边界，XML 保大小写行为独立。 |
 | D4 | DS Finding 4 | accepted / 已修复 | 新四 API 的 missing resource 语义在 runtime owner 未收束，落到旧工具 file_not_found/ref 提示。按 accepted plan 返回 typed not_found，恢复动作为重枚举当前 namespace 的 exact 资产；区分参数错、版本错、解码/损坏，不能把这些都降格为 missing。补 Python/API 与实际 process tool 的缺失文档/文件 code/hint。 |
 | C1 | 主控反例 + DS XML question | accepted / 已修复 | 格式能力由 suffix/media 判定，索引模式却只按 .xml。真实 public runtime 的 sample.xhtml/application/xhtml+xml 将 <P>A</p> 标 complete/explicit。原文 processor 的同一个格式 owner 决定能力与 XML/HTML 模式，复用 descriptor 的媒体声明，禁止下游单入口特例。证据见 [主控取证](public-original-read-r1-r3-20261020-controller-review-evidence.md)。 |
 
@@ -43,7 +43,7 @@
 
 目标不变：保留原始声明和可回读定位，不做财报业务判断、不改 primary 或下载选文、不新增平行真源。D1 纠正技术规范解释，不删除已承诺原文声明字段，不扩大至跨资产 document set；不需要重新 goal confirmation。D3/C1/C4 是原文 processor 关系/完整性 owner 的范围内修复；C2/D2 是既有 lazy cache/borrow 合同的必要收束；C3/D4 是既有 exact 选择/错误契约修正。全清单作为一次范围内 fix，随后两路聚焦受影响面复审，不重做无变化部分完整审核。
 
-除 S1 外，当前没有 deferred 的范围内已证缺陷或 needs-more-evidence 未决项；所有 accepted 必须修复并由双路复审核销。accepted 项风险归 fixed in current slice：11 项已核销，D3 仍为部分修复、由 gpt-6-sol writer/主控窄修，不据此提前标 pass。其余非目标/未覆盖风险沿实施回执/审核报告分类，owner/destination 不变；后续 gate 仍须核实际适用性。
+除 S1 外，当前没有 deferred 的范围内已证缺陷或 needs-more-evidence 未决项；所有 accepted 必须修复并由双路复审核销。accepted 项风险归 fixed in current slice：第一轮时 11 项已核销，D3 当时为部分修复、随后由 gpt-6-sol writer/主控窄修，不据此提前标 pass。其余非目标/未覆盖风险沿实施回执/审核报告分类，owner/destination 不变；后续 gate 仍须核实际适用性。
 
 ## 其余边界
 
@@ -62,6 +62,17 @@
 
 本轮无需新增用户目标取舍；继续一次 D3 窄修与指定 MiMo/DS 双路受影响面复审。
 
-### D3 窄修候选（待第二轮双路核销）
+### 历史：D3 窄修候选（当时待第二轮双路核销）
 
 已读 code-fix-2 回执与完整实际diff，writer实际0/0退出。主控重核902份可取回快照/当前文件/manifest相符，99 tests、pyright0、完整文件97.2637%覆盖率及旧API8未受影响样本复用证据有效；生产仅同一owner集合新增noscript和意图注释，无runtime/Host/schema/存储改动。D3仍为accepted / 部分修复，正式改为已修复须收齐接下来指定双路受影响面复审的实际退出、完整final与报告。
+
+## 第二轮双路终裁 / code-review-pass
+
+- 冻结源码 HEAD `f7eee0c5a85d8810d63e32976f17c36922640f90`、base `6da0b8706f92a0e1eb361bebf5a529c97d2f9d40`、完整 diff SHA256 `2c76bb9400d4f01faceb67a6564b331f23efe548f2d7c00d7e31e0a0f7868a7e`。两路均重算相符，源码/测试/README与writer验证快照不变，主控亦独立重核。
+- DS 会话 `53087`：外层/runtime 0、success、386.740158秒，完整final与 [报告](../reviews/code-review-20261020-153921.md) 已读。MiMo 会话 `28070`：外层/runtime 0、success、1429.184726秒，完整final与 [报告](../reviews/code-review-20261020-155306.md) 已读。各自独立当前判断与公开入口探针，未读另一位本轮结论；主控核MiMo工具输入，无读取DS本轮报告的命令。
+- 两路均将D3核销为已修复、无实质finding/Open Question。主控直接核单一集合消费点、两种合法head、body对照、未闭合partial/unknown、XML独立性、版本/span/分页及真实process/Host交互的断言，采纳D3 **accepted / 已修复**。前11项无实质生产变化，按已核同源差分与未触发noscript的真实输入复用；12项全已修复。
+- 验证充分且同版：writer与两路各自99 tests/pyright均实际0退出；本轮唯一修改生产完整文件391/402=97.2637%，无exclude/omit，其余16个完整生产文件沿未变源码复用已>=80%证据。1774份API8完整响应与八份原文/实际版本绑定证据保全，182模块仅original_content变化，不伪称全同或重跑。历史完整集退出1、随后55passed、空coverage子库警告和检查时主控文档更新均保留真实限定。
+- 风险终裁：D3及原11项为 fixed in current slice；S1仍 assigned to later work unit / deferred-with-owner（Provider/Engine owner + 项目协作助手安排调用方后续补验），无已证vendor拒绝，不追加安装门槛。真实head-noscript财报样本缺失、仅独立探针覆盖的省略head+未闭合noscript组合，均 assigned to later work unit（Fins capability/tests owner，在后续边界扩展或调用方自然补验时加入）；当前公开入口与正反输入已证行为正确，低风险不阻塞。
+- DS关于脚本启用时浏览器如何移动noscript的具体比较未在本线核证，不采用该技术断言；保留既定“浏览器DOM/脚本不建模”非目标即可。空coverage子库原因、容量/硬时限、SEC durable original_main、OLD动态对照等继续按既有明确owner/destination assigned to later work unit；merge requiring explicit user decision；工程交付及工程核收后按通知安装为 covered by later approved slice。无未分类风险。
+
+完整组合审核（cd37d575）→实际修复（6da0b870）及双路复审→D3窄修（f7eee0c5）及本轮双路复审的证据链闭合；无新scope/契约/验收取舍，放行 ready-to-open-draft-PR。
