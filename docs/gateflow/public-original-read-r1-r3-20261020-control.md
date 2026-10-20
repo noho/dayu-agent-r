@@ -6,7 +6,7 @@
 
 - 最新通讯规则（用户追加）：后续只用 `tmux-agents` 经 tmux 向 title 为 `portfolio-manager` 的项目协作助手汇报；每次发送前重新 discovery 并核对身份。禁用 codex_tui 跨会话发送。中途不向协作助手发进度；仅任务完成、需裁决而停止或其它停止时，汇报实际结果/证据路径/停点/待办。现有开发、draft PR 授权和 merge/live 停点不变，无需另做确认。
 - 用户追加确认继续正常修复，强调不得裁剪吞掉财报内容；按现有成功标准核对无任意长度静默丢弃，显式有界页必须可续读取齐尾部，预览可沿 span 回读，便利视图不冒充完整原件。已加入最终双路审核任务。
-- current gate / next entry point：`必要提交 / push`（0.1.5 增量，ready 核对通过）。R1–R3 工程 f854a6e6 已核收；本次同 PR206 升级包版本的目标由用户直接明确，最小计划主控核对通过，见 [version increment](public-original-read-r1-r3-20261020-version-increment.md)。安装尚未放行，须增量核收并收到明确通知；merge 未授权。
+- current gate / next entry point：`final closeout pass`（0.1.5 增量工程完成；待增量核收及安装通知）。R1–R3 工程 f854a6e6 已核收；本次同 PR206 升级包版本的目标由用户直接明确，最小计划主控核对通过，见 [version increment](public-original-read-r1-r3-20261020-version-increment.md)。安装尚未放行，须增量核收并收到明确通知；merge 未授权。
 - 目标确认已通过，见 [goal confirmation](public-original-read-r1-r3-20261020-goal-confirmation.md)。用户明确本线唯一承接，并授权持续推进到独立 draft PR 交付；merge 另授权。
 - 分支：`fix/public-original-read-r1-r3-20261020`；base：`8bf8daec8a022fd705e6cfe32c4283605f1fe6ca`（`github/main`）。
 - plan 已实际完成：`codex-agent-run --provider gpt-6-sol --cwd /Users/leo/workspace/dayu-agent-r --prompt-file /Users/leo/workspace/dayu-agent-r/workspace/tmp/public-original-read-r1-r3-20261020/plan-task.md`，托管会话 `97052` 已退出；外层退出码与 `runtime_exit_code` 均为 0，终态 `turn.completed`，实际耗时 751.107963 秒。
@@ -112,3 +112,7 @@ V1 writer26872已实际退出，外层/runtime0/0、turn.completed、470.49825�
 V1双路窄复审已实际启动：HEAD `398afb641849e8673c0398f440838eacb8b2e55e`，base090eb4f5；完整diff version-rereview-full.diff SHA256 `120533f4e5bf86583b434df1b63ab15b9b2cc1169a4bdbc81e8187de624b692d`及版本映射已保存。MiMo会话56884、DS会话83969，各自version-rereview-{mimo,ds}.jsonl/.stderr，输入version-rereview-task.md；禁止安装及重开未变业务，等待实际退出/完整报告/裁决。
 
 版本V1双路窄复审已收齐：DS83969实际0/0 success271.580271秒、报告170445；MiMo56884实际0/0 success984.882153秒、报告171452。完整final/report读毕，主控终裁V1 accepted/已修复，无blocker/needs-more-evidence；历史报告加阅读提示解决非阻塞open question，原正文及090eb4f5版本保留，未改被审源码。所有approved增量完成，4passed/2明确网络skip及全量pyright0/0/0与895快照绑定有效，484wheel条目逐字验证适用复用；R1–R3生产源码不变，原核收证据保留。README职责决策完成，风险有owner/destination，issue为本地handoff不适用。ready核对通过，下一步必要提交/push并更新同draft PR206，随后实际总控交付核对；此时尚未draft-PR-pass、安装或merge。
+
+版本增量及审核记录已提交为d2977b12并push github工作分支，实际push退出0；同PR206 title/body更新命令实际退出0，保持draft/open。此时current gate为总控交付核对，尚不提前标draft-PR-pass。完整精确OID compare、metadata/CI与最终push对应关系接下来实际取证。
+
+0.1.5增量总控交付核对实际通过，pr-delivery-verification-version-initial.json保存repo/headrepo、PR206 draft/open、base8bf8daec/head d2977b12、72文件完整补丁与准确title/body/CI/push核对。源码与398afb64及895快照全符，完整hunk/mode/content相等，仅index与hunk尾标签格式有别；main protected但required checks为空，无远端CI执行。进入draft-PR-pass并完成[version-closeout](public-original-read-r1-r3-20261020-version-closeout.md)实际总结，工程增量completed。该记录提交/push后在pr-delivery-verification-version-final.json对最终精确OID与完整diff再核，不制造源码复审循环。下一接续仅工程增量报告、等待portfolio-manager核收并明确通知安装；当前未安装0.1.5，不核调用方环境，merge未授权。
