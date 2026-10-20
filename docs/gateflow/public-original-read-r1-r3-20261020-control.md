@@ -187,3 +187,9 @@ MiMo仍对同95版有效：主控再次重算8writer文件、494实际安装输�
 风险主控统一分类：非本机OS/架构/真实其他Bash或TTY/wheel-user-site矩阵、未知配置及并发profile写为assigned to later work unit，owner安装/init维护者，destination有具体runner/复现的后续单元；PATH完全未设置的退化输入零写入失败也归此类，不阻断当前正常shell目标。部分失败无跨文件事务、PATH优先级、源码移动失效已在本slice诚实报错/README披露，fixed in current slice，不增加通用回滚机制。真实自身sync与精确源码/metadata/默认入口/help验收为covered by later approved slice，owner本线主控，须工程核收及明确安装通知；不查调用方环境、旧UV真实内部，merge另授权。原S1供应商接受度后续Provider/Engine与项目方接续保持。
 
 review-pass：所有approved slice完成，适用双路完整审核与必要双路复审均实际完成、accepted全修、验证充分且mandatory checks通过；README按用户手册职责更新，testsREADME/pyright helper scope同步，无业务架构README触发。分支只有本任务提交、dirty仅本线过程文档/审核报告；来源是本地handoff，无GitHub issue/issue comment任务。current gate / next entry point进入ready-to-open-draft-PR，随后必要提交/push并更新同draftPR206、总控交付核对。此时尚不提前标draft-PR-pass，真实安装/merge仍未执行。
+
+## 安装入口增量 draft-PR-pass / final closeout
+
+审核记录已提交11e41db41a3087077ae41e9ca5a7f99a7a2b98fc并实际push退出0；PR206 title/body更新退出0，保持draft/open。总控实际交付核对 `workspace/tmp/public-original-read-r1-r3-20261020/pr-delivery-verification-install-entry-initial.json` 通过：repo/headrepo同noho/dayu-agent-r，base8bf8daec/head11e41db4，完整99文件/1308222字节远端diff及全部blob索引、hunk范围/内容/权限与本地一致（仅index缩写与hunk尾标签格式差异）；读取前后OID相同、最终远端head与本地push一致。源码与95复审对象无差异，后续仅五份审核/过程文档；dayu相对已审f7eee0c5无差异。main受保护但required checks为空，无workflow/远端check运行，不声称CI已跑；本地mandatory checks有效。
+
+实际进入draft-PR-pass并创建 install-entry-closeout.md，涵盖变更/验证/docs/finding/分类风险/PR/issue边界/下一入口，工程增量work unit completed。最后提交仅此交付与closeout记录，随后按最终精确OID重新取完整diff与metadata/CI/push核对，保存pr-delivery-verification-install-entry-final.json，不制造自引用提交循环。next entry point：通知portfolio-manager工程核收，等待明确安装通知；不能把工程完成当live可用。尚未真实sync或merge；安装由本线按更新README负责自身default入口，调用方环境与项目关联由项目方独立接续。
