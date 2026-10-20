@@ -9,6 +9,8 @@
 
 from __future__ import annotations
 
+from dayu.fins.cancellation import FinsReadCancelledError, raise_if_fins_cancelled
+
 import re
 from collections.abc import Mapping
 from threading import Lock, RLock
@@ -43,6 +45,14 @@ from dayu.documents.processors.base import (
 )
 from dayu.documents.processors.processor_registry import ProcessorRegistry
 from dayu.fins.processors.source_text import FinsSourceDecodeError, validate_source_utf8_text
+from dayu.fins.processors.original_content import OriginalContent, OriginalStructure, OriginalParseError, original_capabilities
+from dayu.fins.storage.asset_filename_contract import source_asset_name_collision_key
+from dayu.fins.domain.original_read_contract import (
+    CONCEPTS_MAX, TEXT_PAGE_DEFAULT, TEXT_PAGE_MAX, STRUCTURE_PAGE_DEFAULT, STRUCTURE_PAGE_MAX,
+    FACT_PAGE_DEFAULT, FACT_PAGE_MAX, ExpandedName, SourceAssetIdentity, DocumentAssetsResult,
+    OriginalTextResult, OriginalStructureResult, OriginalFactsResult,
+)
+from collections.abc import Sequence
 from .error_contract import ErrorCode
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.domain.tool_models import Citation, SourceType
@@ -99,7 +109,6 @@ from dayu.fins._converters import normalize_optional_text, require_non_empty_tex
 from .read_runtime_helpers import (
     FinsReadArgumentError,
     FinsReadBusinessError,
-    FinsReadCancelledError,
     _collect_parent_titles,
     _normalize_form_type_for_matching,
     _normalize_document_types,
@@ -116,7 +125,6 @@ from .read_runtime_helpers import (
     _build_match_quality,
     _build_search_hint,
     build_search_next_section_fields,
-    raise_if_fins_cancelled,
     resolve_has_financial_data,
     resolve_document_type_for_source,
 )
@@ -192,20 +200,39 @@ class _SourceDocumentMeta(TypedDict):
     ingest_complete: bool
 
 
+def _original_int(value: int, name: str, maximum: int | None = None, *, positive: bool = False) -> None:
+    """参数：数值、字段名、可选上限及正数约束。返回：无。异常：参数不符抛 FinsReadArgumentError。"""
+    if type(value) is not int or value < (1 if positive else 0) or maximum is not None and value > maximum:
+        raise FinsReadArgumentError("original_read", name, value, "请传入预算范围内的整数，不能使用 bool。")
+
+
+def _source_asset(snapshot: SourceSnapshotProtocol, filename: str) -> SourceAssetIdentity:
+    """参数：active full snapshot、exact 文件名。返回：storage 实际字节身份。异常：不存在或未物化。"""
+    identity = snapshot.get_content_identity(filename)
+    return {
+        "ticker": snapshot.ticker,
+        "document_id": snapshot.document_id,
+        "source_kind": "filing" if snapshot.source_kind is SourceKind.FILING else "material",
+        "filename": filename,
+        "sha256": identity.sha256,
+        "size_bytes": identity.size_bytes,
+    }
+
+
 class _CachedProcessor:
     """持有同版 processor、source meta 与 snapshot 资源的私有缓存条目。"""
 
     def __init__(
         self,
         *,
-        processor: DocumentProcessor,
+        processor: DocumentProcessor | None,
         source_meta: _SourceDocumentMeta,
         snapshot: SourceSnapshotProtocol,
     ) -> None:
         """初始化 live 缓存条目。
 
         Args:
-            processor: 从 ``snapshot`` 主文件构建的处理器。
+            processor: 已完成的 primary 处理器；None 表示尚未请求该能力。
             source_meta: 从同一 ``snapshot`` 解析的 read-side meta 投影。
             snapshot: 条目独占的 full storage snapshot 资源。
 
@@ -219,6 +246,9 @@ class _CachedProcessor:
         self.processor = processor
         self.source_meta = source_meta
         self.snapshot = snapshot
+        self.capability_lock = RLock()
+        self.original_texts: dict[str, OriginalContent] = {}
+        self.original_structures: dict[str, OriginalStructure] = {}
         self._active_borrows = 0
         self._retired = False
         self._closed = False
@@ -371,12 +401,13 @@ class _CachedProcessor:
 class _ProcessorBorrow:
     """一次 read 调用对 cached processor/snapshot 的私有 active borrow。"""
 
-    def __init__(self, *, runtime: FinsReadRuntime, entry: _CachedProcessor) -> None:
+    def __init__(self, *, runtime: FinsReadRuntime, entry: _CachedProcessor, cancellation_token: CancellationToken | None = None) -> None:
         """初始化已取得计数的 borrow。
 
         Args:
             runtime: borrow release 与 cleanup 的 owner runtime。
             entry: 已成功增加 active borrow 的缓存条目。
+            cancellation_token: 只属于本次 borrow 的取消观察令牌，不保存到缓存条目。
 
         Returns:
             无。
@@ -388,6 +419,7 @@ class _ProcessorBorrow:
         self._runtime = runtime
         self._entry = entry
         self._released = False
+        self._cancellation_token = cancellation_token
 
     def __enter__(self) -> _ProcessorBorrow:
         """进入 borrow scope 并返回自身。
@@ -446,7 +478,7 @@ class _ProcessorBorrow:
             无。
         """
 
-        return self._entry.processor
+        return self._runtime._get_convenience_processor(self._entry, self._cancellation_token)
 
     @property
     def source_meta(self) -> _SourceDocumentMeta:
@@ -1003,6 +1035,7 @@ class FinsReadRuntime:
                 "document_id": normalized_document_id,
                 "sections": enriched_sections,
                 "citation": citation,
+                "source_asset": _source_asset(borrow.snapshot, borrow.snapshot.primary_filename),
             }
 
     def read_section(
@@ -1176,6 +1209,8 @@ class FinsReadRuntime:
             "page_range": _extract_page_range(section_raw),
             "content_word_count": content_word_count,
             "citation": citation,
+            "source_asset": _source_asset(borrow.snapshot, borrow.snapshot.primary_filename),
+            "content_scope": "section_view",
         }
 
     def search_document(
@@ -2841,7 +2876,7 @@ class FinsReadRuntime:
         """借用仍与 storage lightweight snapshot 一致的诊断候选 processor。
 
         Args:
-            cache_key: 无 source-kind 维度的 processor cache key。
+            cache_key: 含 source-kind 维度的 source cache key。
 
         Returns:
             snapshot 一致的 active borrow；未命中、source 失效或 mismatch
@@ -2892,6 +2927,7 @@ class FinsReadRuntime:
         ticker: str,
         document_id: str,
         cancellation_token: CancellationToken | None = None,
+        source_kind: SourceKind | None = None,
     ) -> _ProcessorBorrow:
         """读取或创建同版 processor cache entry，并返回 active borrow。
 
@@ -2899,6 +2935,7 @@ class FinsReadRuntime:
             ticker: 标准化股票代码。
             document_id: 标准化文档 ID。
             cancellation_token: Host 注入的取消观察令牌。
+            source_kind: 显式 namespace；None 时由 storage 保留便利读取的来源歧义校验。
 
         Returns:
             覆盖 processor/meta/provenance/citation/result 全路径的 active borrow。
@@ -2912,25 +2949,21 @@ class FinsReadRuntime:
 
         self._ensure_open()
         _raise_if_fins_cancelled(cancellation_token)
-        cache_key = ProcessorCacheKey(ticker=ticker, document_id=document_id)
-        lock = self._get_creation_lock(cache_key)
-        cached_before_read = self._processor_cache.peek(cache_key)
         try:
             light_snapshot = self._read_source_snapshot(
                 ticker=ticker,
                 document_id=document_id,
-                source_kind=None,
+                source_kind=source_kind,
                 materialize_files=False,
             )
         except BaseException as read_error:
-            if cached_before_read is not None:
-                self._evict_processor_entry_if_matches(
-                    cache_key,
-                    expected=cached_before_read,
-                    active_error=read_error,
-                )
+            for key in self._processor_cache.keys_snapshot():
+                if key.ticker == ticker and key.document_id == document_id and (source_kind is None or key.source_kind is source_kind):
+                    self._evict_processor_entry(key, active_error=read_error)
             raise
 
+        cache_key = ProcessorCacheKey(ticker=ticker, document_id=document_id, source_kind=light_snapshot.source_kind)
+        lock = self._get_creation_lock(cache_key)
         cached = self._processor_cache.get(cache_key)
         acquired_cached = False
         try:
@@ -2951,7 +2984,7 @@ class FinsReadRuntime:
                 self._release_processor_borrow(cached, active_error=close_error)
             raise
         if acquired_cached and cached is not None:
-            return _ProcessorBorrow(runtime=self, entry=cached)
+            return _ProcessorBorrow(runtime=self, entry=cached, cancellation_token=cancellation_token)
         if cached is not None:
             self._evict_processor_entry_if_matches(
                 cache_key,
@@ -2962,7 +2995,7 @@ class FinsReadRuntime:
         full_snapshot = self._read_source_snapshot(
             ticker=ticker,
             document_id=document_id,
-            source_kind=None,
+            source_kind=cache_key.source_kind,
             materialize_files=True,
         )
         snapshot_transferred = False
@@ -2980,17 +3013,16 @@ class FinsReadRuntime:
                             active_error=close_error,
                         )
                         raise
-                    return _ProcessorBorrow(runtime=self, entry=competing)
+                    return _ProcessorBorrow(runtime=self, entry=competing, cancellation_token=cancellation_token)
                 if competing is not None:
                     self._evict_processor_entry(cache_key)
 
-                processor, source_meta = self._create_processor_from_snapshot(
-                    snapshot=full_snapshot,
-                    cancellation_token=cancellation_token,
-                )
+                source_meta = _parse_source_document_meta(full_snapshot.source_meta, source_kind=full_snapshot.source_kind)
+                if source_meta["is_deleted"] or not source_meta["ingest_complete"]:
+                    raise FileNotFoundError("源文档当前不可读取")
                 _raise_if_fins_cancelled(cancellation_token)
                 created = _CachedProcessor(
-                    processor=processor,
+                    processor=None,
                     source_meta=source_meta,
                     snapshot=full_snapshot,
                 )
@@ -3011,14 +3043,289 @@ class FinsReadRuntime:
                     self._release_processor_borrow(created, active_error=retire_error)
                     raise
             Log.debug(
-                f"processor 已创建并缓存: ticker={ticker} document_id={document_id} type={type(processor).__name__}",
+                f"processor 已创建并缓存: ticker={ticker} document_id={document_id} kind={full_snapshot.source_kind.value}",
                 module=self.MODULE,
             )
-            return _ProcessorBorrow(runtime=self, entry=created)
+            return _ProcessorBorrow(runtime=self, entry=created, cancellation_token=cancellation_token)
         except BaseException as build_error:
             if not snapshot_transferred:
                 self._close_unowned_snapshot(full_snapshot, active_error=build_error)
             raise
+
+    def list_document_assets(
+        self,
+        *,
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+        cancellation_token: CancellationToken | None = None,
+    ) -> DocumentAssetsResult:
+        """枚举完整资产。参数：ticker、exact 文档 ID、显式 kind、本次取消 token。返回：同版实际身份和声明角色。异常：参数/仓储/取消失败。"""
+        ticker, document_id = self._original_selection(ticker, document_id, source_kind, cancellation_token)
+        with self._borrow_processor(
+            ticker=ticker, document_id=document_id, source_kind=source_kind, cancellation_token=cancellation_token
+        ) as borrow:
+            snapshot = borrow.snapshot
+            result: DocumentAssetsResult = {"assets": [], "reading_primary_filename": snapshot.primary_filename}
+            for descriptor in snapshot.files:
+                _raise_if_fins_cancelled(cancellation_token)
+                text, structure, inline = original_capabilities(descriptor.name, descriptor.content_type)
+                result["assets"].append(
+                    {
+                        "asset": _source_asset(snapshot, descriptor.name),
+                        "is_reading_primary": descriptor.name == snapshot.primary_filename,
+                        "role_status": "recorded" if descriptor.source_role is not None else "unrecorded",
+                        "source_role": descriptor.source_role,
+                        "original_filename": descriptor.original_filename,
+                        "derived_from": descriptor.derived_from,
+                        "content_type": descriptor.content_type,
+                        "text_supported": text,
+                        "structure_supported": structure,
+                        "inline_facts_supported": inline,
+                    }
+                )
+            _raise_if_fins_cancelled(cancellation_token)
+            return result
+
+    def read_original_text(
+        self,
+        *,
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+        filename: str,
+        expected_sha256: str,
+        start: int = 0,
+        end: int | None = None,
+        max_chars: int = TEXT_PAGE_DEFAULT,
+        cancellation_token: CancellationToken | None = None,
+    ) -> OriginalTextResult:
+        """读取精确原文页。参数：显式资产/hash、码点范围、页预算和本次 token。返回：请求/实际范围、原文及 next_start。异常：参数、版本、解码、取消或仓储失败。"""
+        _raise_if_fins_cancelled(cancellation_token)
+        _original_int(max_chars, "max_chars", TEXT_PAGE_MAX, positive=True)
+        self._validate_original_window(start, end)
+        ticker, document_id = self._original_selection(ticker, document_id, source_kind, cancellation_token)
+        self._validate_original_asset(filename, expected_sha256)
+        with self._borrow_processor(
+            ticker=ticker, document_id=document_id, source_kind=source_kind, cancellation_token=cancellation_token
+        ) as borrow:
+            asset, content = self._original_content(
+                borrow._entry, filename, expected_sha256, "text", cancellation_token
+            )
+            stop = self._original_end(content, start, end)
+            return content.read_text(asset, start, stop, max_chars, cancellation_token)
+
+    def read_original_structure(
+        self,
+        *,
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+        filename: str,
+        expected_sha256: str,
+        start: int = 0,
+        end: int | None = None,
+        max_nodes: int = STRUCTURE_PAGE_DEFAULT,
+        cancellation_token: CancellationToken | None = None,
+    ) -> OriginalStructureResult:
+        """读取原始节点页。参数：资产/hash、起点选择范围、节点预算和 token。返回：原序节点、父链/属性位置、独立解析状态。异常：参数、版本、格式、解析或取消失败。"""
+        _raise_if_fins_cancelled(cancellation_token)
+        _original_int(max_nodes, "max_nodes", STRUCTURE_PAGE_MAX, positive=True)
+        self._validate_original_window(start, end)
+        ticker, document_id = self._original_selection(ticker, document_id, source_kind, cancellation_token)
+        self._validate_original_asset(filename, expected_sha256)
+        with self._borrow_processor(
+            ticker=ticker, document_id=document_id, source_kind=source_kind, cancellation_token=cancellation_token
+        ) as borrow:
+            asset, content = self._original_content(
+                borrow._entry, filename, expected_sha256, "structure", cancellation_token
+            )
+            stop = self._original_end(content, start, end)
+            structure = self._original_structure(borrow._entry, filename, content, cancellation_token)
+            return structure.read_structure(asset, start, stop, max_nodes, cancellation_token)
+
+    def query_original_facts(
+        self,
+        *,
+        ticker: str,
+        document_id: str,
+        source_kind: SourceKind,
+        filename: str,
+        expected_sha256: str,
+        concepts: Sequence[ExpandedName],
+        offset: int = 0,
+        limit: int = FACT_PAGE_DEFAULT,
+        cancellation_token: CancellationToken | None = None,
+    ) -> OriginalFactsResult:
+        """查询原生非数值 occurrence。参数：资产/hash、原文发现的 expanded concepts、分页和 token。返回：原文/context/可见性证据，无业务真假转换。异常：参数、版本、格式、解析、取消失败。"""
+        _raise_if_fins_cancelled(cancellation_token)
+        _original_int(offset, "offset")
+        _original_int(limit, "limit", FACT_PAGE_MAX, positive=True)
+        if (
+            not isinstance(concepts, Sequence)
+            or isinstance(concepts, (str, bytes))
+            or not concepts
+            or len(concepts) > CONCEPTS_MAX
+            or any(
+                not isinstance(c, Mapping)
+                or set(c) != {"namespace_uri", "local_name"}
+                or not isinstance(c["namespace_uri"], str)
+                or not isinstance(c["local_name"], str)
+                or not c["namespace_uri"]
+                or not re.fullmatch(r"[^\W\d][\w.-]*", c["local_name"])
+                for c in concepts
+            )
+        ):
+            raise FinsReadArgumentError(
+                "query_original_facts",
+                "concepts",
+                "invalid expanded concepts",
+                "需要非空精确 namespace_uri/local_name 列表，最多 100 项；URI 从原文结构取得。",
+            )
+        ticker, document_id = self._original_selection(ticker, document_id, source_kind, cancellation_token)
+        self._validate_original_asset(filename, expected_sha256)
+        with self._borrow_processor(
+            ticker=ticker, document_id=document_id, source_kind=source_kind, cancellation_token=cancellation_token
+        ) as borrow:
+            asset, content = self._original_content(
+                borrow._entry, filename, expected_sha256, "facts", cancellation_token
+            )
+            structure = self._original_structure(borrow._entry, filename, content, cancellation_token)
+            return structure.query_facts(asset, concepts, offset, limit, cancellation_token)
+
+    def _original_selection(
+        self, ticker: str, document_id: str, source_kind: SourceKind, token: CancellationToken | None
+    ) -> tuple[str, str]:
+        """参数：显式 namespace、本次 token。返回：canonical ticker 和未经别名转换的 exact ID。异常：非法参数或取消。"""
+        _raise_if_fins_cancelled(token)
+        if (
+            not isinstance(source_kind, SourceKind)
+            or type(document_id) is not str
+            or not document_id
+            or document_id.strip() != document_id
+            or any(c in document_id for c in ("/", "\\", ":", "*", "?"))
+            or document_id in {".", ".."}
+        ):
+            raise FinsReadArgumentError(
+                "original_read",
+                "document_id/source_kind",
+                document_id,
+                "请从 list_documents 原样复制文档 ID，并显式传 filing/material namespace。",
+            )
+        return (
+            self._resolve_canonical_ticker(ticker=ticker, tool_name="original_read", cancellation_token=token),
+            document_id,
+        )
+
+    def _validate_original_asset(self, filename: str, expected_sha256: str) -> None:
+        """参数：exact 文件名、枚举摘要。返回：无。异常：非法值为参数错误。"""
+        try:
+            if (
+                type(filename) is not str
+                or filename.strip() != filename
+                or any(c in filename for c in ("*", "?", "[", "]"))
+            ):
+                raise ValueError("文件名必须原样")
+            source_asset_name_collision_key(filename)
+            if type(expected_sha256) is not str or re.fullmatch(r"[a-f0-9]{64}", expected_sha256) is None:
+                raise ValueError("摘要必须原样")
+        except (ValueError, TypeError) as exc:
+            raise FinsReadArgumentError(
+                "original_read",
+                "filename/expected_sha256",
+                filename,
+                "请原样传回 list_document_assets 返回的文件名和内容校验标签。",
+            ) from exc
+
+    def _validate_original_window(self, start: int, end: int | None) -> None:
+        """参数：码点范围。返回：无。异常：非法范围为参数错误。"""
+        _original_int(start, "start")
+        if end is not None:
+            _original_int(end, "end")
+            if end < start:
+                raise FinsReadArgumentError("original_read", "end", end, "end 不能小于 start。")
+
+    def _original_end(self, content: OriginalContent, start: int, end: int | None) -> int:
+        """参数：完整原文和预校验范围。返回：具体终点。异常：超过 EOF 为参数错误。"""
+        stop = len(content.text) if end is None else end
+        if start > len(content.text) or stop > len(content.text):
+            raise FinsReadArgumentError("original_read", "start/end", stop, "范围不能超过 total_chars。")
+        return stop
+
+    def _original_content(
+        self,
+        entry: _CachedProcessor,
+        filename: str,
+        expected: str,
+        capability: Literal["text", "structure", "facts"],
+        token: CancellationToken | None,
+    ) -> tuple[SourceAssetIdentity, OriginalContent]:
+        """参数：active entry、资产/预期摘要、能力、token。返回：同版身份与完整解码内容。异常：不存在、版本不符、不支持、解码或取消。"""
+        _raise_if_fins_cancelled(token)
+        asset = _source_asset(entry.snapshot, filename)
+        if expected != asset["sha256"]:
+            raise FinsReadBusinessError(
+                ErrorCode.ASSET_VERSION_MISMATCH,
+                "资产内容已变化，旧定位不可用于当前文件。",
+                hint="请重新枚举资产并使用新的内容校验标签。",
+            )
+        descriptor = next(d for d in entry.snapshot.files if d.name == filename)
+        supported = original_capabilities(filename, descriptor.content_type)
+        if not supported[{"text": 0, "structure": 1, "facts": 2}[capability]]:
+            raise FinsReadBusinessError(
+                ErrorCode.NOT_SUPPORTED,
+                "当前资产格式不支持该原文操作。",
+                hint="请按枚举中的格式能力选择操作；PDF 阅读可使用既有章节/页工具。",
+            )
+        with entry.capability_lock:
+            content = entry.original_texts.get(filename)
+            if content is None:
+                try:
+                    content = OriginalContent(entry.snapshot.get_source(filename), token=token)
+                except FinsSourceDecodeError as exc:
+                    raise FinsReadBusinessError(ErrorCode.SOURCE_DECODE_FAILED, "原文不是有效的 UTF-8 文本。") from exc
+                _raise_if_fins_cancelled(token)
+                with self._lifecycle_lock:
+                    self._ensure_open()
+                    entry.original_texts[filename] = content
+            _raise_if_fins_cancelled(token)
+            return asset, content
+
+    def _original_structure(
+        self, entry: _CachedProcessor, filename: str, content: OriginalContent, token: CancellationToken | None
+    ) -> OriginalStructure:
+        """参数：entry、资产、同版文本和本次 token。返回：完整构建索引。异常：解析/取消失败不发布能力。"""
+        _raise_if_fins_cancelled(token)
+        with entry.capability_lock:
+            structure = entry.original_structures.get(filename)
+            if structure is None:
+                try:
+                    structure = OriginalStructure(content, xml=filename.lower().endswith(".xml"), token=token)
+                except FinsReadCancelledError:
+                    raise
+                except Exception as exc:
+                    raise FinsReadBusinessError(
+                        ErrorCode.ORIGINAL_PARSE_FAILED, "原文结构解析执行失败，可单独读取原文窗口。"
+                    ) from exc
+                _raise_if_fins_cancelled(token)
+                with self._lifecycle_lock:
+                    self._ensure_open()
+                    entry.original_structures[filename] = structure
+            _raise_if_fins_cancelled(token)
+            return structure
+
+    def _get_convenience_processor(self, entry: _CachedProcessor, token: CancellationToken | None) -> DocumentProcessor:
+        """参数：active entry、本次 token。返回：同版完整 processor。异常：构建/取消/关闭失败，不缓存失败能力。"""
+        _raise_if_fins_cancelled(token)
+        with entry.capability_lock:
+            if entry.processor is None:
+                processor, _ = self._create_processor_from_snapshot(snapshot=entry.snapshot, cancellation_token=token)
+                _raise_if_fins_cancelled(token)
+                with self._lifecycle_lock:
+                    self._ensure_open()
+                    entry.processor = processor
+            _raise_if_fins_cancelled(token)
+            return entry.processor
 
     def _create_processor_from_snapshot(
         self,
@@ -3132,7 +3439,7 @@ class FinsReadRuntime:
         """从 LRU 移除一个 processor entry 并交给 lifecycle owner retire。
 
         Args:
-            cache_key: 无 source-kind 维度的 processor cache key。
+            cache_key: 含 source-kind 维度的 source cache key。
             active_error: 当前活动主异常；正常 eviction 为 ``None``。
 
         Returns:

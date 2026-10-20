@@ -1,6 +1,6 @@
 """Fins read tools 的 current 原生定义。
 
-本模块把 ``FinsReadRuntime`` 的九个只读能力暴露为当前
+本模块把 ``FinsReadRuntime`` 的十三个只读能力暴露为当前
 ``ToolDefinition`` / ``ToolCallable``。工具声明、参数校验、取消 outcome
 和异常投影都在本模块完成；财报文件读取仍只通过 read runtime 进入
 ``dayu.fins.storage`` 仓储边界。
@@ -8,8 +8,10 @@
 
 from __future__ import annotations
 
+from dayu.fins.cancellation import FinsReadCancelledError
+
 import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -33,6 +35,8 @@ from dayu.contracts.tool_schema import (
 )
 from dayu.fins._log import Log
 from dayu.fins.domain.filing_semantics import FISCAL_PERIODS
+from dayu.fins.domain.enums import SourceKind
+from dayu.fins.domain.original_read_contract import ExpandedName, TEXT_PAGE_DEFAULT, TEXT_PAGE_MAX, STRUCTURE_PAGE_DEFAULT, STRUCTURE_PAGE_MAX, FACT_PAGE_DEFAULT, FACT_PAGE_MAX, CONCEPTS_MAX
 from dayu.fins.service_runtime import DefaultFinsRuntime
 from dayu.fins.tools.fins_limits import FinsToolLimits
 from dayu.runtime.tool_call_projection import (
@@ -47,7 +51,6 @@ from .read_runtime import FinsReadRuntime
 from .read_runtime_helpers import (
     FinsReadArgumentError,
     FinsReadBusinessError,
-    FinsReadCancelledError,
 )
 from .result_types import (
     financial_statement_result_description,
@@ -66,6 +69,7 @@ GET_TABLE_TOOL_NAME: Final[str] = "get_table"
 GET_PAGE_CONTENT_TOOL_NAME: Final[str] = "get_page_content"
 GET_FINANCIAL_STATEMENT_TOOL_NAME: Final[str] = "get_financial_statement"
 QUERY_XBRL_FACTS_TOOL_NAME: Final[str] = "query_xbrl_facts"
+_ORIGINAL_TOOL_NAMES: Final[tuple[str, ...]] = ("list_document_assets", "read_original_text", "read_original_structure", "query_original_facts")
 
 FINS_READ_TOOL_NAMES: Final[tuple[str, ...]] = (
     LIST_DOCUMENTS_TOOL_NAME,
@@ -77,6 +81,7 @@ FINS_READ_TOOL_NAMES: Final[tuple[str, ...]] = (
     GET_PAGE_CONTENT_TOOL_NAME,
     GET_FINANCIAL_STATEMENT_TOOL_NAME,
     QUERY_XBRL_FACTS_TOOL_NAME,
+    *_ORIGINAL_TOOL_NAMES,
 )
 
 _INVALID_ARGUMENT_HINT: Final[str] = "Fix arguments to match the tool schema and retry."
@@ -118,7 +123,7 @@ def build_fins_read_tool_definitions(
     workspace_root: Path,
     limits: FinsToolLimits,
 ) -> tuple[ToolDefinition, ...]:
-    """构造九个原生 Fins read 工具定义。
+    """构造十三个原生 Fins read 工具定义。
 
     Args:
         read_runtime: 通过 ``DefaultFinsRuntime`` 获取的 read runtime。
@@ -148,6 +153,7 @@ def build_fins_read_tool_definitions(
         _build_get_page_content_definition(read_runtime, limits, provider_lock, process_target_factory),
         _build_get_financial_statement_definition(read_runtime, limits, provider_lock, process_target_factory),
         _build_query_xbrl_facts_definition(read_runtime, limits, provider_lock, process_target_factory),
+        *(_build_original_definition(name, read_runtime, limits, provider_lock, process_target_factory) for name in _ORIGINAL_TOOL_NAMES),
     )
     names = tuple(definition.name for definition in definitions)
     if names != FINS_READ_TOOL_NAMES:
@@ -524,6 +530,148 @@ def _build_get_document_sections_definition(
     return get_document_sections
 
 
+_ORIGINAL_DESCRIPTION: Final[
+    str
+] = """先 list_documents 取得 exact document_id，再 list_document_assets 选文件。
+资产 asset 必含 ticker/document_id/source_kind/filename/sha256/size_bytes；filename 为资产名，sha256 只是后续原样传回的内容校验标签，不是业务事实。
+枚举返回 assets 数组、reading_primary_filename；每项必有 asset、is_reading_primary、role_status(recorded/unrecorded)、source_role/original_filename/derived_from/content_type(字符串或 null)、text_supported/structure_supported/inline_facts_supported(布尔)。阅读 primary 不保证是原始提交主件。
+所有 span 必含 asset/start/end；start/end 为严格 UTF-8 解码且仅去开头 BOM 后的 Unicode 码点，0 基左闭右开，不是字节或渲染坐标。预览必含 span/preview/preview_complete；false 时沿 span 分页 read_original_text 取齐。
+文本返回 asset、encoding(utf-8)、bom_bytes(0/3)、requested_range、returned_range、total_chars、text、truncated、next_start(整数或 null)。truncated 只表示请求范围尚未读完，局部范围完成不代表全文完成。
+结构返回 asset/encoding/bom_bytes/requested_range/total_chars、nodes、total_matches、truncated、next_start、parse_status(complete/partial)、diagnostics(reason/span 数组)、diagnostics_complete。nodes 按原文起点选择；每项必含 kind(element/text/comment/doctype/cdata/processing_instruction)、order、qname(原 raw/namespace_uri/local_name/status 及各自 raw_complete/namespace_uri_complete/local_name_complete 布尔，未取齐时按 opening 回读，或不适用为 null)、opening/content/closing(span 或不适用为 null)、closure(explicit/void/rule/unknown/token)、parent、parent_status(root/resolved/unknown；unknown 的 parent=null 不表示根)、ancestors(span 数组)、ancestors_complete、attributes、attributes_complete、preview、continuation。属性保序，含 name/span/value(原值预览或 null)/quote/duplicate；xmlns 属性可用于发现定义处 URI，局部重绑定须按父链检查，属性未取齐用 opening span 回读。
+facts 返回 asset/facts/total_matches/truncated/next_offset(整数或 null)/parse_status/diagnostics/diagnostics_complete。每项必含 node、name/format(QName 或 null)、raw_value/context_ref/target_raw/xml_lang/xsi_nil/escape/continued_at(原值预览或 null)、target_origin(explicit/implicit_default)、context、visibility。引用 context/continuation 必含 status(resolved/unresolved/ambiguous/absent)、reason(字符串或 null)、target(预览或 null)，context 解析成功时另含 namespace_uri、resource_span、resource_target_raw、resource_target_origin(explicit/implicit_default)，保留资源目标原声明；沿目标 span 可回读结构和下一跳；exclude 仍是独立结构节点。visibility 含 visibility_status(hidden_declaration/unknown)、css_evaluated=false、evidence(预览数组)、evidence_complete。partial 或 unknown 不能用于证明零事实/可见/业务真假；不转换 checkbox/format，不合并同值 occurrence。
+当前读取页与本次显示内容分别续读：若 text/nodes/facts 被本次显示预算截断，先用返回 cursor/scope_token 调用一次 fetch_more，省略 limit 取齐本页全部余量并拼接；cursor 只是本次被截内容的引用，成功使用一次即失效，不返回新 cursor。不得传小 limit 期待后续 cursor。取齐本页后再用 next_start/next_offset 读下一页；不得将 cursor 当资产坐标。
+最小例子：先 read_original_structure(..., start=0) 从节点的原始 xmlns:c 属性发现 URI（例如返回 urn:example），再 query_original_facts(..., concepts=[{"namespace_uri":"urn:example","local_name":"TradingSymbol"}])；实际调用必须使用本文件定义处发现的 URI，不猜年度/前缀。"""
+
+
+def _original_parameters(name: str) -> ToolParametersSchema:
+    """参数：原文工具名。返回：自足显式参数 schema。异常：schema 非法时抛出。"""
+    properties: dict[str, JsonValue] = {
+        "ticker": _ticker_parameter_schema(),
+        "document_id": {"type": "string", "description": "list_documents 返回的 exact ID，不接受 accession 别名。"},
+        "source_kind": {
+            "type": "string",
+            "enum": ["filing", "material"],
+            "description": "显式资产 namespace，取自文档列表。",
+        },
+    }
+    required = ["ticker", "document_id", "source_kind"]
+    if name != "list_document_assets":
+        properties.update(
+            {
+                "filename": {"type": "string", "description": "从枚举原样复制 exact 文件名，不传路径。"},
+                "expected_sha256": {
+                    "type": "string",
+                    "description": "从枚举原样复制 sha256 内容校验标签，内容变更须重新枚举。",
+                },
+            }
+        )
+        required.extend(("filename", "expected_sha256"))
+    if name in {"read_original_text", "read_original_structure"}:
+        properties.update(
+            {
+                "start": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "可选，默认 0；原文码点起点，结构选择节点起点。",
+                },
+                "end": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "可选，省略为 EOF；左闭右开终点，不能超过 total_chars。",
+                },
+            }
+        )
+        field = "max_chars" if name == "read_original_text" else "max_nodes"
+        default, maximum = (
+            (TEXT_PAGE_DEFAULT, TEXT_PAGE_MAX)
+            if name == "read_original_text"
+            else (STRUCTURE_PAGE_DEFAULT, STRUCTURE_PAGE_MAX)
+        )
+        properties[field] = {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": maximum,
+            "description": f"可选，当前读取页预算，默认 {default}，上限 {maximum}，超限拒绝。",
+        }
+    if name == "query_original_facts":
+        properties.update(
+            {
+                "concepts": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": CONCEPTS_MAX,
+                    "description": '必填 expanded concepts。每项是对象，只允许两个必填非空字符串 namespace_uri（定义处 exact URI）和 local_name（不含 prefix 的本地名）。先公开读取结构发现 URI，不猜年度或前缀别名。例：[{"namespace_uri":"urn:example","local_name":"TradingSymbol"}]，实际 URI 必须替换为本文件公开结构返回值。',
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "可选，默认 0；按原文顺序的 occurrence 偏移。",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": FACT_PAGE_MAX,
+                    "description": f"可选，默认 {FACT_PAGE_DEFAULT}，最大 {FACT_PAGE_MAX}。",
+                },
+            }
+        )
+        required.append("concepts")
+    return ToolParametersSchema(
+        type="object", properties=properties, required=tuple(required), additional_properties=False
+    )
+
+
+def _build_original_definition(
+    name: str,
+    read_runtime: FinsReadRuntime,
+    limits: FinsToolLimits,
+    provider_lock: asyncio.Lock,
+    process_target_factory: _FinsReadProcessTargetFactory,
+) -> ToolDefinition:
+    """参数：工具名、runtime、预算、provider 锁和进程工厂。返回：同契约 process-backed 工具。异常：声明失败。"""
+    parameters = _original_parameters(name)
+    truncate = (
+        _text_truncate(limits.original_text_display_chars, "text")
+        if name == "read_original_text"
+        else (
+            _list_truncate(limits.original_structure_display_items, "nodes")
+            if name == "read_original_structure"
+            else (
+                _list_truncate(limits.original_facts_display_items, "facts") if name == "query_original_facts" else None
+            )
+        )
+    )
+
+    # 工具声明需要每个定义各自绑定其 schema 和名称；闭包仅持有装配依赖，不保存请求状态。
+    @tool(
+        name=name,
+        description=_ORIGINAL_DESCRIPTION,
+        parameters=parameters,
+        execution=ProcessBackedToolExecutionCapability(target_factory=process_target_factory),
+        tags=FINS_TOOL_TAGS,
+        display_name=name,
+        truncate=truncate,
+    )
+    async def original_read(call: ToolCallRequest, context: BatchToolExecutionContext) -> ToolExecutionOutcome:
+        """参数：调用及执行上下文。返回：统一 outcome。异常：由统一业务投影处理。"""
+        return await _invoke_fins_read_business(
+            tool_name=name,
+            context=context,
+            provider_lock=provider_lock,
+            started_at=datetime.now(UTC),
+            business_call=lambda token: _execute_fins_read_business_value(
+                tool_name=name,
+                call=call,
+                parameters=parameters,
+                read_runtime=read_runtime,
+                limits=limits,
+                cancellation_token=token,
+            ),
+        )
+
+    return original_read
+
+
 def _build_read_section_definition(
     read_runtime: FinsReadRuntime,
     limits: FinsToolLimits,
@@ -549,7 +697,7 @@ def _build_read_section_definition(
 
     @tool(
         name=READ_SECTION_TOOL_NAME,
-        description="读取章节全文。若正文里出现 [[t_XXXX]]，可用 get_table(t_XXXX) 读取对应表格。",
+        description="读取章节视图，content_scope=section_view；source_asset 标识实际阅读资产。该视图不承诺完整原件；完整原文请先 list_document_assets 再 read_original_text。若正文里出现 [[t_XXXX]]，可用 get_table(t_XXXX) 读取对应表格。",
         parameters=parameters,
         execution=ProcessBackedToolExecutionCapability(
             target_factory=process_target_factory,
@@ -1024,7 +1172,7 @@ async def _invoke_fins_read_business(
 ) -> ToolExecutionOutcome:
     """在 fallback callable 边界执行同步 Fins read 业务并投影 outcome。
 
-    生产默认路径不再经过本函数；九个 Fins read ``ToolDefinition.execution``
+    生产默认路径不再经过本函数；十三个 Fins read ``ToolDefinition.execution``
     均声明为 process-backed，由 Host ToolRuntime 在父进程治理取消与超时。
     本函数只保留给直接调用 ``ToolDefinition.callable`` 的测试和非生产
     fallback，避免把同进程 ``asyncio.to_thread`` 误作为生产取消 closeout
@@ -1224,6 +1372,74 @@ def _route_fins_read_business(
         FinsReadCancelledError: direct callable fallback 观察到 Host 取消时抛出。
     """
 
+    if tool_name in _ORIGINAL_TOOL_NAMES:
+        ticker = _required_string(arguments, "ticker")
+        document_id = _required_string(arguments, "document_id")
+        kind = SourceKind(_required_string(arguments, "source_kind"))
+        if tool_name == "list_document_assets":
+            return cast(
+                JsonValue,
+                read_runtime.list_document_assets(
+                    ticker=ticker, document_id=document_id, source_kind=kind, cancellation_token=cancellation_token
+                ),
+            )
+        filename = _required_string(arguments, "filename")
+        expected = _required_string(arguments, "expected_sha256")
+        start = _optional_int(arguments, "start")
+        end = _optional_int(arguments, "end")
+        if tool_name == "read_original_text":
+            max_chars = _optional_int(arguments, "max_chars")
+            return cast(
+                JsonValue,
+                read_runtime.read_original_text(
+                    ticker=ticker,
+                    document_id=document_id,
+                    source_kind=kind,
+                    filename=filename,
+                    expected_sha256=expected,
+                    start=0 if start is None else start,
+                    end=end,
+                    max_chars=TEXT_PAGE_DEFAULT if max_chars is None else max_chars,
+                    cancellation_token=cancellation_token,
+                ),
+            )
+        if tool_name == "read_original_structure":
+            max_nodes = _optional_int(arguments, "max_nodes")
+            return cast(
+                JsonValue,
+                read_runtime.read_original_structure(
+                    ticker=ticker,
+                    document_id=document_id,
+                    source_kind=kind,
+                    filename=filename,
+                    expected_sha256=expected,
+                    start=0 if start is None else start,
+                    end=end,
+                    max_nodes=STRUCTURE_PAGE_DEFAULT if max_nodes is None else max_nodes,
+                    cancellation_token=cancellation_token,
+                ),
+            )
+        concepts_raw = arguments.get("concepts")
+        if not isinstance(concepts_raw, list):
+            raise ValueError("concepts 必须是 expanded name 数组")
+        # JSON 传输不删改条目；完整 shape 与 QName 校验由 runtime owner 执行。
+        concepts = cast(Sequence[ExpandedName], concepts_raw)
+        offset = _optional_int(arguments, "offset")
+        limit = _optional_int(arguments, "limit")
+        return cast(
+            JsonValue,
+            read_runtime.query_original_facts(
+                ticker=ticker,
+                document_id=document_id,
+                source_kind=kind,
+                filename=filename,
+                expected_sha256=expected,
+                concepts=concepts,
+                offset=0 if offset is None else offset,
+                limit=FACT_PAGE_DEFAULT if limit is None else limit,
+                cancellation_token=cancellation_token,
+            ),
+        )
     if tool_name == LIST_DOCUMENTS_TOOL_NAME:
         return cast(
             JsonValue,
@@ -1334,6 +1550,8 @@ def _parameters_for_tool(tool_name: str) -> ToolParametersSchema:
         ValueError: 工具名未知时抛出。
     """
 
+    if tool_name in _ORIGINAL_TOOL_NAMES:
+        return _original_parameters(tool_name)
     if tool_name == LIST_DOCUMENTS_TOOL_NAME:
         return _list_documents_parameters()
     if tool_name == GET_DOCUMENT_SECTIONS_TOOL_NAME:

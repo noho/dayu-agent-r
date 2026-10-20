@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+from dayu.fins.cancellation import raise_if_fins_cancelled
+
 from collections import Counter
 import re
 from typing import Any, Optional
@@ -54,7 +56,6 @@ from .section_semantic import resolve_section_semantic
 from dayu.fins._converters import normalize_optional_text, require_non_empty_text
 from .read_runtime_helpers import (
     FinsReadArgumentError,
-    raise_if_fins_cancelled,
 )
 
 

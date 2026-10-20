@@ -29,3 +29,5 @@ class ErrorCode(str, Enum):
     SOURCE_CHANGED_DURING_READ = "source_changed_during_read"
     WORKSPACE_IDENTITY_CORRUPTED = "workspace_identity_corrupted"
     STORAGE_UNAVAILABLE = "storage_unavailable"
+    ASSET_VERSION_MISMATCH = "asset_version_mismatch"
+    ORIGINAL_PARSE_FAILED = "original_parse_failed"

@@ -426,3 +426,5 @@ Scene manifest 不表达 workflow step graph、next scene、artifact store、par
 ```
 
 如果只想复用包内记录并改少量字段，应新增一个 id 并用 `extends` 显式继承；不要指望 workspace partial record 与包内同 id 记录 deep merge。
+
+`base/tools.md` 的 `fins-read` 条件块包含资产枚举、原文/结构分页、由 namespace 声明发现 URI 后查询非数值事实的指引。文件名和摘要仅作内容引用；本页显示截断先一次省略 limit 的 fetch_more 取齐，再读下一页。`has_financial_data` 只约束财务取数，不限制四个原文操作。原文分页预算由 Fins 公共契约和 FinsToolLimits 默认值持有，当前 tool_discovery.json 没有新增原文 limit 键。

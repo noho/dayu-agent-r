@@ -7,6 +7,7 @@ from copy import deepcopy
 import pytest
 
 from dayu.contracts.json_value import JsonValue
+from dayu.fins.domain.enums import SourceKind
 from dayu.fins.pipelines.sec_fiscal_fields import _extract_fiscal_from_xbrl_query
 from dayu.fins.tools.cache import ProcessorCacheKey, ProcessorLRUCache
 from dayu.fins.tools.read_runtime_helpers import _normalize_form_type_for_matching, _normalize_xbrl_query_payload
@@ -61,9 +62,9 @@ def test_generic_lru_returns_replaced_evicted_and_cleared_values() -> None:
     """
 
     cache = ProcessorLRUCache[str](max_entries=2)
-    first_key = ProcessorCacheKey(ticker="AAPL", document_id="doc-1")
-    second_key = ProcessorCacheKey(ticker="AAPL", document_id="doc-2")
-    third_key = ProcessorCacheKey(ticker="AAPL", document_id="doc-3")
+    first_key = ProcessorCacheKey(ticker="AAPL", document_id="doc-1", source_kind=SourceKind.FILING)
+    second_key = ProcessorCacheKey(ticker="AAPL", document_id="doc-2", source_kind=SourceKind.FILING)
+    third_key = ProcessorCacheKey(ticker="AAPL", document_id="doc-3", source_kind=SourceKind.FILING)
 
     assert cache.put(first_key, "first") == ()
     assert cache.put(first_key, "replacement") == ("first",)

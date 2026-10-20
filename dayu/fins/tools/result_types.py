@@ -19,6 +19,8 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Final, NotRequired, TypedDict
 
 from dayu.contracts.json_value import JsonValue
+from dayu.fins.domain.original_read_contract import SourceAssetIdentity
+from typing import Literal
 from dayu.documents.processors.base import SectionSummary, TableSummary
 from dayu.fins.domain.financial_result_contract import (
     FinancialPeriod,
@@ -119,6 +121,7 @@ class DocumentSectionsResult(TypedDict):
     document_id: str
     sections: list[dict[str, Any]]
     citation: dict[str, Any]
+    source_asset: SourceAssetIdentity
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +147,8 @@ class SectionContentResult(TypedDict):
     page_range: list[int] | None
     content_word_count: int
     citation: dict[str, Any]
+    source_asset: SourceAssetIdentity
+    content_scope: Literal["section_view"]
 
 
 # ---------------------------------------------------------------------------

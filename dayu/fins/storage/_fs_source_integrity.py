@@ -139,23 +139,6 @@ class _SourceKindPublicationInspection:
 
 
 @dataclass(frozen=True, slots=True)
-class _DeclaredSourceFile:
-    """已通过结构校验的单个 source file 声明。
-
-    Attributes:
-        inspected: snapshot descriptor 与 physical locator。
-        source: 可选 original/docling 来源角色。
-        original_filename: 可选用户输入 basename。
-        derived_from: 可选派生来源 identity。
-    """
-
-    inspected: _InspectedSourceFile
-    source: FilingUploadAssetSource | None
-    original_filename: str | None
-    derived_from: str | None
-
-
-@dataclass(frozen=True, slots=True)
 class _ManifestInspection:
     """一次 source-kind manifest 读取的封闭结构事实。
 
@@ -625,7 +608,7 @@ def _inspect_source_directory(
         business_meta=business_meta,
         provenance=provenance,
         revision=revision,
-        files=tuple(item.inspected for item in declared_files),
+        files=declared_files,
         primary_document=primary_document,
         canonical_manifest_item=(
             canonical_manifest_item
@@ -640,7 +623,7 @@ def _parse_declared_source_files(
     *,
     persisted_meta: Mapping[str, JsonValue],
     source_directory: Path,
-) -> tuple[_DeclaredSourceFile, ...] | None:
+) -> tuple[_InspectedSourceFile, ...] | None:
     """解析并严格校验 source meta 的 files 声明。
 
     Args:
@@ -657,7 +640,7 @@ def _parse_declared_source_files(
     raw_files = persisted_meta.get("files")
     if not isinstance(raw_files, list) or not raw_files:
         return None
-    result: list[_DeclaredSourceFile] = []
+    result: list[_InspectedSourceFile] = []
     names: set[str] = set()
     for raw_file in raw_files:
         if not isinstance(raw_file, Mapping):
@@ -706,21 +689,13 @@ def _parse_declared_source_files(
             return None
         names.add(name)
         result.append(
-            _DeclaredSourceFile(
-                inspected=_InspectedSourceFile(
-                    descriptor=SourceSnapshotFileDescriptor(
-                        name=name,
-                        etag=etag,
-                        last_modified=last_modified,
-                        size=size,
-                        content_type=content_type,
-                        sha256=sha256,
-                    ),
-                    physical_path=source_directory / name,
+            _InspectedSourceFile(
+                descriptor=SourceSnapshotFileDescriptor(
+                    name=name, etag=etag, last_modified=last_modified, size=size,
+                    content_type=content_type, sha256=sha256, source_role=source,
+                    original_filename=original_filename, derived_from=derived_from,
                 ),
-                source=source,
-                original_filename=original_filename,
-                derived_from=derived_from,
+                physical_path=source_directory / name,
             )
         )
     return tuple(result)
@@ -838,7 +813,7 @@ def _optional_non_empty_text(
 def _validate_physical_structure(
     *,
     source_directory: Path,
-    declared_files: tuple[_DeclaredSourceFile, ...],
+    declared_files: tuple[_InspectedSourceFile, ...],
 ) -> SourceIntegrityReason | None:
     """在计算 missing/digest 前验证 actual tree 无歧义。
 
@@ -853,7 +828,7 @@ def _validate_physical_structure(
         OSError: 目录枚举或 containment operational I/O 失败时抛出 path-free 异常。
     """
 
-    declared_names = {item.inspected.descriptor.name for item in declared_files}
+    declared_names = {item.descriptor.name for item in declared_files}
     for child in _list_directory(
         source_directory,
         action="枚举 source integrity document directory",
@@ -880,7 +855,7 @@ def _classify_role_projection(
     source_kind: SourceKind,
     provenance: SourceDocumentProvenance,
     persisted_meta: Mapping[str, JsonValue],
-    declared_files: tuple[_DeclaredSourceFile, ...],
+    declared_files: tuple[_InspectedSourceFile, ...],
 ) -> tuple[SourceIntegrityReason, ...] | None:
     """验证 generic primary 与 user-upload filing 的 original/Docling 关系。
 
@@ -917,59 +892,59 @@ def _classify_role_projection(
     originals = tuple(
         item
         for item in declared_files
-        if item.source == FILING_UPLOAD_ASSET_SOURCE_ORIGINAL
+        if item.descriptor.source_role == FILING_UPLOAD_ASSET_SOURCE_ORIGINAL
     )
     docling_files = tuple(
         item
         for item in declared_files
-        if item.source == FILING_UPLOAD_ASSET_SOURCE_DOCLING
+        if item.descriptor.source_role == FILING_UPLOAD_ASSET_SOURCE_DOCLING
     )
     if len(originals) < 1 or len(docling_files) != 1:
         return None
     if len(originals) + len(docling_files) != len(declared_files):
         return None
     if any(
-        item.original_filename is None or item.derived_from is not None
+        item.descriptor.original_filename is None or item.descriptor.derived_from is not None
         for item in originals
     ):
         return None
-    original_names = [item.inspected.descriptor.name for item in originals]
+    original_names = [item.descriptor.name for item in originals]
     docling_file = docling_files[0]
-    if docling_file.derived_from is None or docling_file.original_filename is None:
+    if docling_file.descriptor.derived_from is None or docling_file.descriptor.original_filename is None:
         return None
     derived_matches = [
         item
         for item in originals
-        if item.inspected.descriptor.name == docling_file.derived_from
+        if item.descriptor.name == docling_file.descriptor.derived_from
     ]
     if len(derived_matches) == 1:
         # storage name 是 authoritative asset identity；basename 只校验该 exact
         # identity 的用户可读投影，不能用来要求不同 authoritative assets 全局唯一。
-        if derived_matches[0].original_filename != docling_file.original_filename:
+        if derived_matches[0].descriptor.original_filename != docling_file.descriptor.original_filename:
             reasons.append(SourceIntegrityReason.DERIVED_PROJECTION_MISMATCH)
     else:
         filename_matches = [
             item
             for item in originals
-            if item.original_filename == docling_file.original_filename
+            if item.descriptor.original_filename == docling_file.descriptor.original_filename
         ]
         # exact derived identity 损坏时，只允许唯一 basename 提供 repairable
         # projection；同 basename 命中多个 assets 仍是无法安全归属的结构歧义。
         if len(filename_matches) != 1:
             return None
         reasons.append(SourceIntegrityReason.DERIVED_PROJECTION_MISMATCH)
-    docling_name = docling_file.inspected.descriptor.name
+    docling_name = docling_file.descriptor.name
     if primary != docling_name:
         reasons.append(SourceIntegrityReason.PRIMARY_PROJECTION_MISMATCH)
-    if docling_file.derived_from not in original_names:
+    if docling_file.descriptor.derived_from not in original_names:
         reasons.append(SourceIntegrityReason.DERIVED_PROJECTION_MISMATCH)
     return _ordered_reasons(reasons)
 
 
 
-def _is_declared_docling_primary(primary: str, declared_files: tuple[_DeclaredSourceFile, ...]) -> bool:
+def _is_declared_docling_primary(primary: str, declared_files: tuple[_InspectedSourceFile, ...]) -> bool:
     """参数：exact 主源名与已解析声明；返回：是否精确命中 DOCLING 角色；异常：无，不读取文件。"""
-    return any(item.inspected.descriptor.name == primary and item.source == FILING_UPLOAD_ASSET_SOURCE_DOCLING
+    return any(item.descriptor.name == primary and item.descriptor.source_role == FILING_UPLOAD_ASSET_SOURCE_DOCLING
                for item in declared_files)
 
 
@@ -986,7 +961,7 @@ def validate_material_source_primary(*, source_meta: Mapping[str, JsonValue], so
 def _trusted_primary_document(
     *,
     persisted_meta: Mapping[str, JsonValue],
-    declared_files: tuple[_DeclaredSourceFile, ...],
+    declared_files: tuple[_InspectedSourceFile, ...],
 ) -> str | None:
     """从已验证声明中投影 exact primary document。
 
@@ -1008,7 +983,7 @@ def _trusted_primary_document(
         primary = _normalize_filename(raw_primary)
     except ValueError:
         return None
-    names = {item.inspected.descriptor.name for item in declared_files}
+    names = {item.descriptor.name for item in declared_files}
     if primary != raw_primary or primary not in names:
         return None
     return primary
@@ -1070,7 +1045,7 @@ def _project_filing_upload_publication_identity(
     status: SourceIntegrityStatus,
     business_meta: Mapping[str, JsonValue],
     provenance: SourceDocumentProvenance,
-    declared_files: tuple[_DeclaredSourceFile, ...],
+    declared_files: tuple[_InspectedSourceFile, ...],
     primary_document: str | None,
 ) -> FilingUploadPublicationIdentity | None:
     """从同一次 trusted inspection 投影 exact user-upload filing identity。
@@ -1133,10 +1108,10 @@ def _project_filing_upload_publication_identity(
         return None
     assets: list[FilingUploadAssetDescriptor] = []
     for declared_file in declared_files:
-        descriptor = declared_file.inspected.descriptor
+        descriptor = declared_file.descriptor
         if (
-            declared_file.source is None
-            or declared_file.original_filename is None
+            declared_file.descriptor.source_role is None
+            or declared_file.descriptor.original_filename is None
             or descriptor.sha256 is None
             or descriptor.size is None
             or descriptor.content_type == ""
@@ -1146,12 +1121,12 @@ def _project_filing_upload_publication_identity(
             assets.append(
                 FilingUploadAssetDescriptor(
                     name=descriptor.name,
-                    original_filename=declared_file.original_filename,
-                    derived_from=declared_file.derived_from,
+                    original_filename=declared_file.descriptor.original_filename,
+                    derived_from=declared_file.descriptor.derived_from,
                     sha256=descriptor.sha256,
                     size=descriptor.size,
                     content_type=descriptor.content_type,
-                    source=declared_file.source,
+                    source=declared_file.descriptor.source_role,
                 )
             )
         except (TypeError, ValueError):
@@ -1198,7 +1173,7 @@ def _project_filing_upload_publication_identity(
 
 
 def _classify_physical_file_facts(
-    declared_files: tuple[_DeclaredSourceFile, ...],
+    declared_files: tuple[_InspectedSourceFile, ...],
 ) -> tuple[SourceIntegrityReason, ...]:
     """在结构与 role 无歧义后分类 physical missing/size/digest。
 
@@ -1215,23 +1190,23 @@ def _classify_physical_file_facts(
     reasons: list[SourceIntegrityReason] = []
     for item in declared_files:
         path_state = _lstat_optional(
-            item.inspected.physical_path,
+            item.physical_path,
             action="检查 source integrity declared file",
         )
         if path_state is None:
-            if item.source == FILING_UPLOAD_ASSET_SOURCE_ORIGINAL:
+            if item.descriptor.source_role == FILING_UPLOAD_ASSET_SOURCE_ORIGINAL:
                 reasons.append(SourceIntegrityReason.ORIGINAL_FILE_MISSING)
-            elif item.source == FILING_UPLOAD_ASSET_SOURCE_DOCLING:
+            elif item.descriptor.source_role == FILING_UPLOAD_ASSET_SOURCE_DOCLING:
                 reasons.append(SourceIntegrityReason.PRIMARY_DOCLING_FILE_MISSING)
             else:
                 reasons.append(SourceIntegrityReason.DECLARED_FILE_MISSING)
             continue
-        descriptor = item.inspected.descriptor
+        descriptor = item.descriptor
         if descriptor.size is not None and path_state.st_size != descriptor.size:
             reasons.append(SourceIntegrityReason.SIZE_MISMATCH)
         if (
             descriptor.sha256 is not None
-            and _hash_regular_file_sha256(item.inspected.physical_path)
+            and _hash_regular_file_sha256(item.physical_path)
             != descriptor.sha256
         ):
             reasons.append(SourceIntegrityReason.DIGEST_MISMATCH)

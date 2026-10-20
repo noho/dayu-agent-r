@@ -1631,9 +1631,13 @@ def test_read_section_projects_minimal_navigation_payload_and_rejects_unknown_re
         "page_range",
         "content_word_count",
         "citation",
+        "source_asset",
+        "content_scope",
     }
     assert result["ticker"] == "AAPL"
     assert result["document_id"] == "doc-1"
+    assert result["content_scope"] == "section_view"
+    assert result["source_asset"]["document_id"] == "doc-1"
     assert result["ref"] == "section-1"
     assert result["title"] == "Item 1. Business"
     assert result["content"] == "Revenue grew while operating costs remained controlled."

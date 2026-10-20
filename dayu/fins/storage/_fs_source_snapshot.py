@@ -46,6 +46,7 @@ from ._fs_storage_utils import (
     _source_dir_name,
 )
 from .repository_protocols import (
+    SourceContentIdentity,
     SourceSnapshotConsistencyError,
     SourceSnapshotFileDescriptor,
     SourceSnapshotProtocol,
@@ -85,6 +86,7 @@ class _OpenSnapshotFile:
     descriptor: SourceSnapshotFileDescriptor
     stream: BinaryIO
     initial_state: _StableFileState
+    content_identity: SourceContentIdentity | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +114,7 @@ class _AcquiredSnapshotAttempt:
     primary_filename: str
     marker: _PublishedSnapshotMarker
     open_files: list[_OpenSnapshotFile]
+    content_identities: dict[str, SourceContentIdentity] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -268,6 +271,7 @@ class _FsSourceSnapshot(SourceSnapshotProtocol):
         files: tuple[SourceSnapshotFileDescriptor, ...],
         primary_filename: str,
         temp_root: Optional[Path],
+        content_identities: Mapping[str, SourceContentIdentity],
     ) -> None:
         """初始化同版 descriptor 与可关闭资源。
 
@@ -281,6 +285,7 @@ class _FsSourceSnapshot(SourceSnapshotProtocol):
             files: 完整有序业务文件描述符。
             primary_filename: 精确命中文件描述符的主文件名。
             temp_root: full snapshot 私有临时根；light snapshot 为 ``None``。
+            content_identities: 同次复制产生的实际字节身份；light snapshot 为空。
 
         Returns:
             无。
@@ -299,6 +304,7 @@ class _FsSourceSnapshot(SourceSnapshotProtocol):
         self._primary_filename = primary_filename
         self._files_by_name = {item.name: item for item in files}
         self._state = _SnapshotResourceState(temp_root=temp_root)
+        self._content_identities = dict(content_identities)
 
     def __enter__(self) -> SourceSnapshotProtocol:
         """进入 snapshot 资源生命周期。
@@ -475,6 +481,13 @@ class _FsSourceSnapshot(SourceSnapshotProtocol):
 
         return self.get_source(self._primary_filename)
 
+    def get_content_identity(self, filename: str) -> SourceContentIdentity:
+        """取得复制身份。参数：exact 文件名。返回：实际完整字节身份。异常：未物化/关闭或文件不存在。"""
+        self._state.require_open_root()
+        if filename not in self._files_by_name:
+            raise FileNotFoundError("source snapshot 不包含该业务文件")
+        return self._content_identities[filename]
+
     def close(self) -> None:
         """幂等关闭 snapshot 并释放私有临时树。
 
@@ -564,6 +577,7 @@ def _read_source_snapshot(
         copy_error: Optional[BaseException] = None
         try:
             _copy_snapshot_files(attempt.open_files, temp_root)
+            attempt.content_identities = {opened.descriptor.name: opened.content_identity for opened in attempt.open_files if opened.content_identity is not None}
         except (OSError, ValueError) as exc:
             copy_error = exc
         except BaseException as unexpected_copy_error:
@@ -648,6 +662,7 @@ def _snapshot_from_attempt(
         files=attempt.files,
         primary_filename=attempt.primary_filename,
         temp_root=temp_root,
+        content_identities=attempt.content_identities,
     )
 
 
@@ -1115,6 +1130,7 @@ def _copy_snapshot_file(
         raise ValueError("source snapshot 文件大小与 source meta 不一致")
     if descriptor.sha256 is not None and digest.hexdigest() != descriptor.sha256:
         raise ValueError("source snapshot 文件内容与 source meta 摘要不一致")
+    opened_file.content_identity = SourceContentIdentity(sha256=digest.hexdigest(), size_bytes=copied_size)
 
 
 def _create_snapshot_temp_root() -> Path:

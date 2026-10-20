@@ -2,7 +2,6 @@
 
 from collections.abc import Callable, Mapping
 from enum import Enum
-import hashlib
 
 from dayu.contracts.json_value import JsonValue
 from dayu.fins.domain.enums import SourceKind
@@ -39,23 +38,12 @@ def project_report_original(snapshot: SourceSnapshotProtocol) -> SourceSnapshotF
     参数：snapshot 为同版仓储快照。返回：exact 原件 descriptor。
     异常：ReportOriginalSourceError 表示角色、媒体类型或声明不一致。
     """
-    files = snapshot.source_meta.get("files")
-    if not isinstance(files, list):
-        raise ReportOriginalSourceError()
-    originals = tuple(entry for entry in files if isinstance(entry, Mapping) and entry.get("source") == "original")
+    originals = tuple(entry for entry in snapshot.files if entry.source_role == "original")
     if len(originals) != 1:
         raise ReportOriginalSourceError()
-    entry = originals[0]
-    name = entry.get("name")
-    if type(name) is not str or name == "" or entry.get("content_type") != _PDF_MEDIA:
+    descriptor = originals[0]
+    if descriptor.content_type != _PDF_MEDIA:
         raise ReportOriginalSourceError()
-    matches = tuple(d for d in snapshot.files if d.name == name)
-    if len(matches) != 1 or matches[0].content_type != _PDF_MEDIA:
-        raise ReportOriginalSourceError()
-    descriptor = matches[0]
-    for field, declared in (("size", descriptor.size), ("sha256", descriptor.sha256)):
-        if entry.get(field) is not None and entry.get(field) != declared:
-            raise ReportOriginalSourceError()
     return descriptor
 
 
@@ -114,9 +102,7 @@ def read_report_pdf(
         with snapshot.get_source(descriptor.name).open() as stream:
             payload = stream.read()
             _checkpoint(cancellation_checkpoint)
-        if not payload or (descriptor.size is not None and descriptor.size != len(payload)) or (
-            descriptor.sha256 is not None and descriptor.sha256 != hashlib.sha256(payload).hexdigest()
-        ):
+        if not payload or snapshot.get_content_identity(descriptor.name).size_bytes != len(payload):
             raise ReportOriginalSourceError()
         result = CnReportPdf(expected_publication, locator, payload)
     _checkpoint(cancellation_checkpoint)

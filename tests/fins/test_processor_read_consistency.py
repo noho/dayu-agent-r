@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dayu.fins.cancellation import FinsReadCancelledError
+
 from docling_core.types.doc.document import DoclingDocument
 from dayu.fins.upload_asset_plan import docling_storage_name
 
@@ -109,7 +111,6 @@ from dayu.fins.tools.read_runtime import FinsReadRuntime
 from dayu.fins.tools.read_runtime_helpers import (
     FinsReadArgumentError,
     FinsReadBusinessError,
-    FinsReadCancelledError,
 )
 from dayu.service.fins_direct import FinsDirectCommandService
 
@@ -2782,7 +2783,8 @@ def test_read_runtime_maps_invalid_utf8_to_source_decode_failure(tmp_path: Path)
     assert error_info.value.code is ErrorCode.SOURCE_DECODE_FAILED
     assert isinstance(error_info.value.__cause__, FinsSourceDecodeError)
     assert registry.create_count == 0
-    assert runtime._processor_cache.size() == 0
+    assert runtime._processor_cache.size() == 1
+    runtime.close()
     assert len(repository.full_snapshot_roots) == 1
     assert all(not root.exists() for root in repository.full_snapshot_roots)
 
@@ -2810,7 +2812,8 @@ def test_processor_build_failure_closes_unpublished_full_snapshot(tmp_path: Path
     assert error_info.value is build_failure
     assert registry.create_count == 1
     assert registry.created == []
-    assert runtime._processor_cache.size() == 0
+    assert runtime._processor_cache.size() == 1
+    runtime.close()
     assert len(repository.full_snapshot_roots) == 1
     assert all(not root.exists() for root in repository.full_snapshot_roots)
 
@@ -2840,7 +2843,8 @@ def test_processor_build_cancellation_closes_unpublished_full_snapshot(tmp_path:
         )
 
     assert registry.create_count == 1
-    assert runtime._processor_cache.size() == 0
+    assert runtime._processor_cache.size() == 1
+    runtime.close()
     assert runtime._retired_entries == set()
     assert runtime._pending_snapshots == []
     assert len(repository.full_snapshot_roots) == 1
@@ -3149,15 +3153,15 @@ def test_concurrent_initial_cache_miss_builds_one_processor_and_closes_losing_sn
         first_future = executor.submit(_read_runtime_processor, runtime, 0)
         assert build_entered.wait(timeout=5.0)
         second_future = executor.submit(_read_runtime_processor, runtime, 1)
-        assert second_full_ready.wait(timeout=5.0)
+        # snapshot entry 已完整发布，第二次调用复用 entry 并等待其能力锁。
         release_build.set()
         processors = [first_future.result(timeout=5.0), second_future.result(timeout=5.0)]
 
     assert processors[0] is processors[1]
     assert registry.create_count == 1
     assert len(creation_lock_ids) == 2
-    assert len(set(creation_lock_ids)) == 1
-    assert len(repository.full_snapshot_roots) == 2
+    # snapshot 发布后不再需要保活 creation lock；能力锁保证 processor 仅构建一次。
+    assert len(repository.full_snapshot_roots) == 1
     assert sum(root.exists() for root in repository.full_snapshot_roots) == 1
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dayu.fins.domain.original_read_contract import TEXT_PAGE_DEFAULT, STRUCTURE_PAGE_DEFAULT, FACT_PAGE_DEFAULT
 
 
 @dataclass(frozen=True)
@@ -20,6 +21,9 @@ class FinsToolLimits:
         get_table_max_items: `get_table` 中列表数据最大条目数。
         get_financial_statement_max_items: `get_financial_statement` 列表数据最大条目数。
         query_xbrl_facts_max_items: `query_xbrl_facts` 列表数据最大条目数。
+        original_text_display_chars: 原文工具的本次显示字符预算，与原文请求页范围分离。
+        original_structure_display_items: 原文结构工具的本次显示节点预算。
+        original_facts_display_items: 非数值事实工具的本次显示 occurrence 预算。
     """
 
     processor_cache_max_entries: int = 128
@@ -32,3 +36,6 @@ class FinsToolLimits:
     get_table_max_items: int = 800
     get_financial_statement_max_items: int = 1200
     query_xbrl_facts_max_items: int = 1200
+    original_text_display_chars: int = TEXT_PAGE_DEFAULT
+    original_structure_display_items: int = STRUCTURE_PAGE_DEFAULT
+    original_facts_display_items: int = FACT_PAGE_DEFAULT

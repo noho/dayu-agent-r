@@ -12,6 +12,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from threading import RLock
 from typing import Generic, Optional, TypeVar
+from dayu.fins.domain.enums import SourceKind
 
 
 ProcessorT = TypeVar("ProcessorT")
@@ -24,10 +25,12 @@ class ProcessorCacheKey:
     Attributes:
         ticker: 股票代码（标准化后）。
         document_id: 文档唯一标识。
+        source_kind: 显式 filing/material namespace，不能跨 namespace 命中。
     """
 
     ticker: str
     document_id: str
+    source_kind: SourceKind
 
 
 class ProcessorLRUCache(Generic[ProcessorT]):

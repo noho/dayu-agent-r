@@ -114,7 +114,7 @@ HK 下载身份 owner 每个观察窗口只建立一次来源与财期索引，�
 
 `SourceDocumentRepositoryProtocol.read_source_snapshot(...)` 是 storage-owned 单文档一致读取边界。snapshot 只接受 storage 已分类为 `COMPLETE` 的 source；`REPAIR_REQUIRED` 或 `UNSAFE` 统一以固定、无路径的异常拒绝，不由 read runtime 重判原因。light snapshot 在同一 publication guard 下返回 exact identity、typed source kind、完整 source meta、provenance、persisted revision、完整有序文件描述符与 primary filename，不暴露 published path 或 local URI；full snapshot 从同一次 inspection 与 guard 内打开的全部 regular file descriptors 复制到 snapshot 私有临时树，并在复制后核对同一 source kind 的 persisted revision、identity descriptor 与 deletion state。真实 publication 变化可由 storage 内部有界重取，持续变化抛出不携带 path/key/revision 的 typed consistency error。snapshot 必须显式关闭且 close 幂等，关闭后其 `Source` 不可再读，full snapshot 的 `materialize()` 只返回临时树路径。
 
-read runtime 的每个 processor cache entry 独占一份 full snapshot，并从中取得 processor、source meta、provenance 与 citation 所需事实。单次 read 在同一 active borrow 内完成 processor 调用、结果与 citation 构造；replacement、LRU eviction、clear 与 runtime close 只 retire entry，若仍有 active borrow 则延迟到最后一次 release 后关闭 snapshot。相同文档的并发 cache miss 在 creation lock 内按 full snapshot 再次核对，只有一个 matching entry 被构建和发布，竞争失败的 snapshot 会立即关闭。storage typed consistency exhaustion 只在 read runtime 映射为既有 `source_changed_during_read` 业务错误。
+read runtime 的每个 source cache entry 独占一份 full snapshot，并从中按需取得 primary processor、各资产原文能力、source meta、provenance 与 citation 所需事实。单次 read 在同一 active borrow 内完成 processor 调用、结果与 citation 构造；replacement、LRU eviction、clear 与 runtime close 只 retire entry，若仍有 active borrow 则延迟到最后一次 release 后关闭 snapshot。相同文档的并发 cache miss 在 creation lock 内按 full snapshot 再次核对，只有一个 matching entry 被构建和发布，竞争失败的 snapshot 会立即关闭。storage typed consistency exhaustion 只在 read runtime 映射为既有 `source_changed_during_read` 业务错误。
 
 storage mutation authority 由显式 `BatchToken(transaction_id, ticker)` 承载。只有 `BatchingRepositoryProtocol` 提供 `begin_batch(...)`、`commit_batch(...)` 与 `rollback_batch(...)` lifecycle；source、blob、processed、company 与 filing maintenance 的所有 mutation 都要求 keyword-only `batch=`，并由 shared repository set 的同一 storage core 校验 token 仍开放且 ticker 匹配。异步 task、线程或 callback 不从上下文推断 authority；需要回调写文件时，每次 invocation 都显式接收并传递同一个 token。
 
@@ -175,12 +175,16 @@ resolver 只提供业务解析能力；调用方负责读取环境变量、配�
 - `get_page_content`
 - `get_financial_statement`
 - `query_xbrl_facts`
+- `list_document_assets`
+- `read_original_text`
+- `read_original_structure`
+- `query_original_facts`
 
 read runtime 持有 `document_id -> storage snapshot -> processor` 路由和 read tool 输出投影。processor 的可选能力边界使用 typed protocol 显式判断：分页、财务报表、XBRL facts 与 XBRL taxonomy 能力都由 protocol 方法承诺，不通过字符串属性名探测。source meta 从当前 snapshot 收窄为本地 typed projection；fiscal year 只接受 producer 持久化的正整数，fiscal period 只接受 domain canonical 值，缺失值保持 `None`，不从 form、report date 或 filing date 补偿。processor cache 有界并拥有 snapshot 资源生命周期，不另设 source meta cache；`list_documents` 只组合 filing/material 两个 typed document list 与对应轻量 meta 投影，不为每个列表项创建 snapshot。
 
 read path 对 source decode、search index 构建、XBRL 查询全失败和读取期间 source 变化使用 typed failure code。非法 UTF-8 不以忽略字符或空文本继续；section/enrichment/BM25F 任一构建失败不返回空搜索成功；这些失败在工具边界投影为稳定业务错误，原始异常只作为内部 cause 保留。协作式取消仍优先传播，不被 degradation mapping 改写。
 
-`dayu.fins.tools.provider.discover_tools(spec)` 是 read tools 的 ToolsDiscovery provider 入口，provider id 为 `financial-read-tools`。启用时必须通过 effective spec 提供绝对 `workspace_root`，并返回九个 read tools；read provider 是否参与发现只由 provider-level `enabled` 控制。
+`dayu.fins.tools.provider.discover_tools(spec)` 是 read tools 的 ToolsDiscovery provider 入口，provider id 为 `financial-read-tools`。启用时必须通过 effective spec 提供绝对 `workspace_root`，并返回十三个 read tools；read provider 是否参与发现只由 provider-level `enabled` 控制。
 
 当前 read tools 名称为：
 
@@ -193,6 +197,43 @@ read path 对 source decode、search index 构建、XBRL 查询全失败和读�
 - `get_page_content`
 - `get_financial_statement`
 - `query_xbrl_facts`
+- `list_document_assets`
+- `read_original_text`
+- `read_original_structure`
+- `query_original_facts`
+
+### 原文资产与位置契约
+
+四个原文方法均以 keyword-only 显式传入 `ticker`、列表返回的 exact `document_id` 与 `source_kind`。
+`list_document_assets` 返回完整有序清单、reading primary、storage 已验证的声明角色及实际完整字节的
+`sha256/size_bytes`；没有角色声明时返回 unrecorded，不猜原始提交主件。其它三方法必须原样传回
+`filename/expected_sha256`，旧摘要遇到新内容返回 `asset_version_mismatch`。
+
+`read_original_text` 的坐标是严格 UTF-8 解码且只移除开头 BOM 后的 Unicode 码点，0 基左闭右开，
+保留实体拼写、CRLF 和原始标记。摘要仍包含 BOM 字节。请求范围、返回范围、全文长度、truncated 与
+next_start 明确分离，默认每页 16,384、最大 65,536 码点；局部范围读完不等于全文读完。
+`read_original_structure` 按节点起点分页（默认 200、上限 1,000），保留原始属性、namespace、父链、
+单元格/块/空 inline 等元素边界及可回读位置。属性、祖先、长字符串预览均有预算与完整性标志；
+可通过 opening/parent/span 回读完整原文，不重序列化 DOM 计算位置。
+未确定的父级返回 parent_status=unknown、parent=null，不能理解成根节点；父链遇到未决关系时
+ancestors_complete=false，保留 partial diagnostics 与原文回读路径。
+
+`query_original_facts` 只查当前资产内指定 expanded namespace URI/local name 的原生非数值 occurrence，
+默认 100、最大 500 条、最多 100 concepts；URI 先由公开结构的原始声明与定义处作用域发现。
+每个 occurrence 保留原 QName、format、原值、context/target 来源、隐藏声明、continuation/exclude 定位，
+不转换 checkbox 真假，不按值去重，不执行 CSS/脚本。结构/引用未决为 partial，不能冒充完整零结果。
+文本/结构不支持的 PDF 等二进制资产仍可枚举核验；既存 PDF/Docling 阅读继续使用原章节/页能力。
+章节/目录返回实际 `source_asset`；章节的 `content_scope=section_view` 不承诺完整原件。
+
+这些方法复用同一 snapshot/cache entry，按资产懒建文本与索引，便利 primary processor 也按需构建。
+缓存键含 canonical ticker、exact document ID 与 source kind，仅保留完整成功的同版能力，
+不保留某次调用的 token、范围或预算。每次暖调用仍确认 storage publication，并观察本次 token；
+旧 active borrow 完成自洽旧版结果，新调用使用新 publication。实际摘要由 storage 复制过程产生，
+light snapshot 不提供实际字节身份。CN/HK 原件读取同样消费该 typed 角色与实际身份。
+
+工具按进程执行。原文页若另被 Host 显示预算截断，先以 cursor/scope_token 调用一次不带 limit 的
+fetch_more 取齐当前页，再用 next_start/next_offset 进入下一页；cursor 成功消费一次即失效，
+不能当资产坐标。`original_parse_failed` 和 `source_decode_failed` 保留原因，不回退为便利文本。
 
 ### Download / preprocess / upload awaiting tools
 
@@ -791,7 +832,7 @@ ToolsDiscovery
   -> tool result accepted by Host ToolRuntime
 ```
 
-Read path 只读取 Fins workspace 中已经存在的财报材料。九个 read tools 的生产执行形态为 `process_backed`：父进程只把 `workspace_root` 字符串、工具名、参数 JSON 副本、limits 和 timeout 标量放入可序列化 target；子进程通过 `DefaultFinsRuntime.create(workspace_root=Path(...))` 重新打开只读仓储并创建 `FinsReadRuntime`，并在成功或失败终态的 `finally` 路径关闭 runtime 与 snapshot cache。read tool process target 不跨进程序列化 `FinsReadRuntime`、仓储对象、processor cache、provider lock、Host cancellation token 或 Host 内部对象。需要截断的 read tools 声明 `ToolTruncateSpec`；实际截断、cursor、`fetch_more` 与工具结果 accept 由 Host ToolRuntime 负责。
+Read path 只读取 Fins workspace 中已经存在的财报材料。十三个 read tools 的生产执行形态为 `process_backed`：父进程只把 `workspace_root` 字符串、工具名、参数 JSON 副本、limits 和 timeout 标量放入可序列化 target；子进程通过 `DefaultFinsRuntime.create(workspace_root=Path(...))` 重新打开只读仓储并创建 `FinsReadRuntime`，并在成功或失败终态的 `finally` 路径关闭 runtime 与 snapshot cache。read tool process target 不跨进程序列化 `FinsReadRuntime`、仓储对象、processor cache、provider lock、Host cancellation token 或 Host 内部对象。需要截断的 read tools 声明 `ToolTruncateSpec`；实际截断、cursor、`fetch_more` 与工具结果 accept 由 Host ToolRuntime 负责。
 
 ### Download / preprocess / upload awaiting tool 路径
 
@@ -986,7 +1027,7 @@ SecProcessor
 
 ### Workspace root 与 provider fail fast
 
-四个 Fins provider 都要求 effective spec 中存在绝对 `workspace_root`。read provider 启用时始终解析 workspace 并注册九个 read tools；upload provider 启用时始终注册 `start_fins_upload`，本地文件在工具调用时校验存在与普通文件，空内容在执行阶段统一拒绝。其它启用路径缺少、空字符串或相对路径都会 fail fast。Service assembly 对 Fins awaiting providers 还会校验 download / preprocess / upload 使用同一个绝对 workspace root，避免一个 Host assembly 把 wait adapter 绑定到不同 Fins workspace。
+四个 Fins provider 都要求 effective spec 中存在绝对 `workspace_root`。read provider 启用时始终解析 workspace 并注册十三个 read tools；upload provider 启用时始终注册 `start_fins_upload`，本地文件在工具调用时校验存在与普通文件，空内容在执行阶段统一拒绝。其它启用路径缺少、空字符串或相对路径都会 fail fast。Service assembly 对 Fins awaiting providers 还会校验 download / preprocess / upload 使用同一个绝对 workspace root，避免一个 Host assembly 把 wait adapter 绑定到不同 Fins workspace。
 
 ### Storage repository boundary
 

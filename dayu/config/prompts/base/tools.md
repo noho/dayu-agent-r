@@ -55,7 +55,11 @@
   2. `query_xbrl_facts`
   3. `get_table`
   4. `read_section`
-- 调用前检查 `has_financial_data`。
+- 仅财务取数前检查 `has_financial_data`；false 不阻止原文资产枚举、文本、结构或非数值查询。
+- 原文流程：`list_documents` → `list_document_assets` 选择 exact filename/sha256 → `read_original_text` / `read_original_structure`。filename 是文件名，sha256 是原样传回的内容校验标签，都不是财报推理依据。
+- 非数值事实先从公开 `read_original_structure` 的原始 xmlns 声明及节点定义处作用域发现 URI，再用 `query_original_facts` 的 namespace_uri/local_name 查询；不猜年度 URI，不把 prefix 当 URI。按返回 span 用原文接口回读 context、原值及 continuation/exclude。
+- 当前读取页若有 `next_start` / `next_offset` 可继续下一页；若本次显示内容被截断，必须先用返回 `cursor/scope_token` 调用一次 `fetch_more`，省略 `limit` 取齐当前页全部余量并拼接，再读下一页。cursor 是当前被截内容的引用，成功使用一次即失效，不返回新 cursor；不得传小 limit 期待后续 cursor。
+- section 是导航视图；完整原件按文本请求范围分页取齐。partial/unknown 不等于完整零结果，不把原文 checkbox/format 直接转成业务真假。
 
 ### 硬约束
 - 同一主题最多 3 次 `search_document` 调用；达到上限后切换精读。

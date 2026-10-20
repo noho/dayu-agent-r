@@ -45,6 +45,10 @@ _DEFAULT_FINS_READ_TOOL_NAMES: Final[frozenset[str]] = frozenset(
         "get_page_content",
         "get_financial_statement",
         "query_xbrl_facts",
+    "list_document_assets",
+    "read_original_text",
+    "read_original_structure",
+    "query_original_facts",
     }
 )
 _DEFAULT_FINS_LONG_TRANSACTION_TOOL_NAMES: Final[frozenset[str]] = frozenset(
@@ -407,6 +411,14 @@ def test_default_non_upload_scenes_do_not_select_upload_tool() -> None:
         assert selected is not None
         assert _START_FINS_UPLOAD_TOOL_NAME not in selected
         assert _DEFAULT_FINS_READ_TOOL_NAMES.issubset(selected)
+        if scene_id != "repair":
+            assert "list_document_assets" in result.system_prompt
+            assert "read_original_structure" in result.system_prompt
+            assert "namespace_uri/local_name" in result.system_prompt
+            assert "省略 `limit`" in result.system_prompt
+            assert "成功使用一次即失效" in result.system_prompt
+            assert "false 不阻止原文" in result.system_prompt
+            assert "<when_tag" not in result.system_prompt
         if scene_id == "wechat":
             assert _DEFAULT_FINS_LONG_TRANSACTION_TOOL_NAMES.issubset(selected)
         elif scene_id == "interactive":

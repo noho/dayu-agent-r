@@ -740,6 +740,9 @@ class SourceSnapshotFileDescriptor:
         size: 可选声明字节数。
         content_type: 可选媒体类型。
         sha256: 可选文件内容摘要。
+        source_role: 已校验的 original/docling 声明；缺失为 None，不代表 primary 角色。
+        original_filename: 可选的原件业务文件名声明。
+        derived_from: 可选派生来源文件名声明。
     """
 
     name: str
@@ -748,6 +751,17 @@ class SourceSnapshotFileDescriptor:
     size: Optional[int]
     content_type: Optional[str]
     sha256: Optional[str]
+    source_role: FilingUploadAssetSource | None = None
+    original_filename: str | None = None
+    derived_from: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SourceContentIdentity:
+    """storage 复制并核验的实际完整文件字节身份，与声明摘要分离。"""
+
+    sha256: str
+    size_bytes: int
 
 
 class SourceSnapshotConsistencyError(RuntimeError):
@@ -888,6 +902,10 @@ class SourceSnapshotProtocol(Protocol):
             OSError: 临时主文件不可读时抛出。
         """
 
+        ...
+
+    def get_content_identity(self, filename: str) -> SourceContentIdentity:
+        """取得实际复制身份。参数：exact 文件名。返回：实际摘要/大小。异常：未物化或关闭为 RuntimeError，不存在为 FileNotFoundError。"""
         ...
 
     def close(self) -> None:
@@ -2072,6 +2090,7 @@ __all__ = [
     "FilingUploadPublicationIdentity",
     "FilingUploadPublishedState",
     "FilingUploadStateRepositoryProtocol",
+    "SourceContentIdentity",
     "SourceSnapshotConsistencyError",
     "SourceSnapshotFileDescriptor",
     "SourceSnapshotProtocol",

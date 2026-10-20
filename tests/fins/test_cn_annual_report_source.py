@@ -3,6 +3,7 @@
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
+import json
 
 import pytest
 
@@ -38,25 +39,43 @@ def test_real_exact_original(tmp_path: Path) -> None:
         with snapshot.get_source(descriptor.name).open() as stream:assert stream.read()==pdf.pdf_bytes
 
 
+def test_two_distinct_originals_do_not_select_the_only_pdf(tmp_path: Path) -> None:
+    """参数：隔离真实 Fs 根。返回：无。异常：多个 original 中下游擅自只选 PDF。"""
+    pipeline = _seed(tmp_path)
+    document = pipeline.source_repository.list_source_document_ids('600519', SourceKind.FILING)[0]
+    path = next((tmp_path / 'portfolio' / '600519' / 'filings').glob('*/meta.json'))
+    meta = json.loads(path.read_text())
+    derived = next(entry for entry in meta['files'] if entry.get('source') == 'docling')
+    derived['source'] = 'original'
+    derived['original_filename'] = derived['name']
+    derived.pop('derived_from', None)
+    path.write_text(json.dumps(meta))
+    with pipeline.source_repository.read_source_snapshot('600519', document, SourceKind.FILING, materialize_files=True) as snapshot:
+        assert len([d for d in snapshot.files if d.source_role == 'original']) == 2
+        with pytest.raises(ReportOriginalSourceError):
+            project_report_original(snapshot)
+
+
 @pytest.mark.parametrize('mode',('no_files','empty','no_role','two','non_pdf','bad_name','size','sha','missing_descriptor'))
-def test_projection_declared_role_only(tmp_path: Path,monkeypatch: pytest.MonkeyPatch,mode: str) -> None:
-    """参数：根、声明反例。返回：无。异常：角色猜测或错配未拒断言失败。"""
-    pipeline=_seed(tmp_path);docid=pipeline.source_repository.list_source_document_ids('600519',SourceKind.FILING)[0]
-    with pipeline.source_repository.read_source_snapshot('600519',docid,SourceKind.FILING,materialize_files=True) as snapshot:
-        meta=dict(snapshot.source_meta);entries=meta['files'];assert isinstance(entries,list)
-        original=next(dict(e) for e in entries if isinstance(e,Mapping) and e.get('source')=='original')
-        if mode=='no_files':meta.pop('files')
-        elif mode=='empty':meta['files']=[]
-        elif mode=='no_role':original.pop('source');meta['files']=[original]
-        elif mode=='two':meta['files']=[original,original]
-        else:
-            field,value={'non_pdf':('content_type','text/plain'),'bad_name':('name',''), 'size':('size',1),'sha':('sha256','bad'),'missing_descriptor':('name','other.pdf')}[mode]
-            original[field]=value;meta['files']=[original]
-        def altered(self: SourceSnapshotProtocol) -> Mapping[str,JsonValue]:
-            """参数：真实 snapshot。返回：测试声明。异常：无。"""
-            return meta
-        monkeypatch.setattr(type(snapshot),'source_meta',property(altered))
-        with pytest.raises(ReportOriginalSourceError):project_report_original(snapshot)
+def test_projection_declared_role_only(tmp_path: Path, mode: str) -> None:
+    """参数：隔离 Fs 根和损坏声明。返回：无。异常：storage 或 typed 原件投影未安全拒绝时断言失败。"""
+    pipeline = _seed(tmp_path)
+    docid = pipeline.source_repository.list_source_document_ids('600519', SourceKind.FILING)[0]
+    # 只破坏本测试创建的 publication；声明一致性必须由 storage 判定，消费者不重读 raw meta。
+    meta_path = next((tmp_path / 'portfolio' / '600519' / 'filings').glob('*/meta.json'))
+    meta = json.loads(meta_path.read_text())
+    original = next(e for e in meta['files'] if e.get('source') == 'original')
+    if mode == 'no_files': meta.pop('files')
+    elif mode == 'empty': meta['files'] = []
+    elif mode == 'no_role': original.pop('source')
+    elif mode == 'two': meta['files'].append(dict(original))
+    else:
+        field, value = {'non_pdf': ('content_type','text/plain'), 'bad_name': ('name',''), 'size': ('size',1), 'sha': ('sha256','bad'), 'missing_descriptor': ('name','other.pdf')}[mode]
+        original[field] = value
+    meta_path.write_text(json.dumps(meta))
+    with pytest.raises(ValueError):
+        with pipeline.source_repository.read_source_snapshot('600519', docid, SourceKind.FILING, materialize_files=True) as snapshot:
+            project_report_original(snapshot)
 
 
 @pytest.mark.parametrize('locator',('',None,42,' ','opaque locator'))

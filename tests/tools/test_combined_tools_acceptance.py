@@ -109,6 +109,10 @@ _FINS_TOOL_NAMES: Final[tuple[str, ...]] = (
     "get_page_content",
     "get_financial_statement",
     "query_xbrl_facts",
+    "list_document_assets",
+    "read_original_text",
+    "read_original_structure",
+    "query_original_facts",
 )
 _FINS_AWAITING_TOOL_NAMES: Final[tuple[str, ...]] = (
     "start_fins_download",
@@ -929,8 +933,8 @@ def _build_fins_workspace(tmp_path: Path) -> Path:
                     "filing_date": "2024-11-01",
                     "report_date": "2024-09-28",
                     "amended": False,
-                    "ingest_method": "upload",
-                    "source_provider": FinsSourceProvider.USER_UPLOAD.to_storage_value(),
+                    "ingest_method": "download",
+                    "source_provider": FinsSourceProvider.SEC_EDGAR.to_storage_value(),
                 },
                 files=[file_meta],
             ),

@@ -1256,10 +1256,6 @@ _TOC_BOUNDARY_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Cover Page 最大保留字符数上限（自适应，当无 TOC 标记时使用）
-_COVER_PAGE_MAX_CHARS = 5000
-
-
 def _trim_cover_page_content(prefix_content: str) -> str:
     """自适应收紧 Cover Page 内容边界。
 
@@ -1267,8 +1263,7 @@ def _trim_cover_page_content(prefix_content: str) -> str:
 
     1. 若前缀文本中存在 "Table of Contents" 标记，截断到该标记位置
        （TOC 之后的内容属于正文章节，不是封面）。
-    2. 若无 TOC 标记，限制最大长度为 ``_COVER_PAGE_MAX_CHARS``
-       以防止 Cover Page 包含过多正文。
+    2. 若无 TOC 标记，保留完整前缀；字数不是章节边界。
 
     Args:
         prefix_content: 原始前缀文本（第一个 marker 之前的内容）。
@@ -1287,10 +1282,6 @@ def _trim_cover_page_content(prefix_content: str) -> str:
     if toc_match is not None:
         # 包含 "Table of Contents" 全文，截断到其末尾
         return prefix_content[: toc_match.end()].strip()
-
-    # 策略 2: 无 TOC 标记时限制最大长度
-    if len(prefix_content) > _COVER_PAGE_MAX_CHARS:
-        return prefix_content[:_COVER_PAGE_MAX_CHARS].strip()
 
     return prefix_content
 

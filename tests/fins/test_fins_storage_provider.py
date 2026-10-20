@@ -108,7 +108,8 @@ from dayu.fins.tools.error_contract import ErrorCode
 from dayu.fins.tools.fins_tools import build_fins_read_tool_definitions
 from dayu.fins.tools.provider import discover_tools
 from dayu.fins.tools.read_runtime import FinsReadRuntime
-from dayu.fins.tools.read_runtime_helpers import FinsReadBusinessError, FinsReadCancelledError
+from dayu.fins.tools.read_runtime_helpers import FinsReadBusinessError
+from dayu.fins.cancellation import FinsReadCancelledError
 from dayu.fins.tools.result_types import (
     financial_statement_result_description,
     xbrl_query_result_description,
@@ -149,6 +150,10 @@ _FINS_READ_TOOL_NAMES = (
     "get_page_content",
     "get_financial_statement",
     "query_xbrl_facts",
+    "list_document_assets",
+    "read_original_text",
+    "read_original_structure",
+    "query_original_facts",
 )
 _FINANCIAL_HTML_DOCUMENT_ID: Final[str] = "aapl-html-2024-10k"
 _FINANCIAL_HTML_PRIMARY_DOCUMENT: Final[str] = "aapl-html-2024-10k.html"
@@ -3206,6 +3211,8 @@ def test_fins_read_tool_schemas_do_not_expose_execution_context(tmp_path: Path) 
         assert properties["ticker"] == ticker_schema
         if definition.name == "list_documents":
             assert "document_id" not in properties
+        elif definition.name in {"list_document_assets", "read_original_text", "read_original_structure", "query_original_facts"}:
+            assert "exact" in str(properties["document_id"])
         else:
             assert properties["document_id"] == document_id_schema
         assert "execution_context" not in properties
@@ -3809,7 +3816,7 @@ def test_read_outputs_never_expose_revision_internal_key_local_uri_or_temp_path(
             )
 
         projected_outputs: list[JsonValue] = []
-        for tool_name in _FINS_READ_TOOL_NAMES:
+        for tool_name in completed_arguments:
             completed = completed_outcomes[tool_name]
             assert isinstance(completed, ToolCompletedOutcome)
             projected_outputs.append(_project_llm_facing_outcome(completed))
@@ -4831,6 +4838,9 @@ def test_fins_provider_explicit_limits_shape_truncate_specs(tmp_path: Path) -> N
     assert _truncate_limit(definitions["query_xbrl_facts"], "max_items") == 1250
     for definition in definitions.values():
         truncate = definition.truncate
+        if definition.name == "list_document_assets":
+            assert truncate is None
+            continue
         assert isinstance(truncate, ToolTruncateSpec)
         assert "processor_cache_max_entries" not in truncate.limits
 

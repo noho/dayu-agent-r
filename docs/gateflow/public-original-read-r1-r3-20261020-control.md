@@ -1,0 +1,54 @@
+# Dayu 公开原始读取 R1–R3 执行记录
+
+## 当前状态
+
+- 最新通讯规则（用户追加）：后续只用 `tmux-agents` 经 tmux 向 title 为 `portfolio-manager` 的项目协作助手汇报；每次发送前重新 discovery 并核对身份。禁用 codex_tui 跨会话发送。中途不向协作助手发进度；仅任务完成、需裁决而停止或其它停止时，汇报实际结果/证据路径/停点/待办。现有开发、draft PR 授权和 merge/live 停点不变，无需另做确认。
+- 用户追加确认继续正常修复，强调不得裁剪吞掉财报内容；按现有成功标准核对无任意长度静默丢弃，显式有界页必须可续读取齐尾部，预览可沿 span 回读，便利视图不冒充完整原件。已加入最终双路审核任务。
+- current gate / next entry point：`code review`（唯一 slice 实施验证已完成；冻结最终组合版本，指定 MiMo/DS 完整双路审核待启动）。
+- 目标确认已通过，见 [goal confirmation](public-original-read-r1-r3-20261020-goal-confirmation.md)。用户明确本线唯一承接，并授权持续推进到独立 draft PR 交付；merge 另授权。
+- 分支：`fix/public-original-read-r1-r3-20261020`；base：`8bf8daec8a022fd705e6cfe32c4283605f1fe6ca`（`github/main`）。
+- plan 已实际完成：`codex-agent-run --provider gpt-6-sol --cwd /Users/leo/workspace/dayu-agent-r --prompt-file /Users/leo/workspace/dayu-agent-r/workspace/tmp/public-original-read-r1-r3-20261020/plan-task.md`，托管会话 `97052` 已退出；外层退出码与 `runtime_exit_code` 均为 0，终态 `turn.completed`，实际耗时 751.107963 秒。
+- 原始 runner 输出：`workspace/tmp/public-original-read-r1-r3-20261020/plan-gpt6-sol.jsonl`；stderr 同目录 `plan-gpt6-sol.stderr`。完整 final 已读取，明确仅交付 plan，未实现或执行验证。中间检索/patch 错误不改变原生退出；最终计划及工作树已重新检查。
+- 已实际通知 portfolio-manager 协调线程 plan 启动与后续审核路由。
+
+## Gate 事实
+
+1. preflight / 去重：通过；范围与证据见 goal confirmation。
+2. goal confirmation：用户实读确认通过。
+3. plan：已交付 [plan](public-original-read-r1-r3-20261020-plan.md)，SHA-256 `e82cc97f92d6d712fbda151207badececb9521c8aa06f53b447920b135e2c845`；原始提交快照 `workspace/tmp/public-original-read-r1-r3-20261020/plan-submitted.md`。
+   - 总控核对：四类公开操作分别覆盖资产选择、原文窗口、物理结构及指定非数值概念；storage 复用复制时实际摘要，runtime 复用同一 snapshot/cache 生命周期，不改下载选文或调用方判断。一个 implementation slice 合理；docs/验证范围明确。当前无总控确认的 scope blocker，重要公共契约仍须独立审核放行。
+   - `planreview` 已按用户指定并行启动：`claude-agent-run --provider mimo-flash` 会话 `92518`，`claude-agent-run --provider ds-flash` 会话 `1374`；共同任务输入 `workspace/tmp/public-original-read-r1-r3-20261020/plan-review-task.md`，各自原始日志为同目录 `plan-review-{mimo,ds}.jsonl` 与 `.stderr`。尚未取得审核终态，不放行 implementation。
+   - DS 已实际退出：外层/runtime 退出码均 0，终态 success，耗时 428.659385 秒；完整 final 与 [报告](../reviews/plan-review-20261020-112403.md) 已读取。结论 `pass-with-risks`，三个 material findings 为 Host 截断/Fins 分页联合测试、typed 角色与既有 `project_report_original` 的 owner 收敛、遗漏 snapshot 消费者测试。MiMo 仍在途，最终裁决与放行待双路收齐。
+   - MiMo 已实际退出：外层/runtime 退出码均 0，终态 success，耗时 1664.834001 秒；完整 final 与 [报告](../reviews/plan-review-20261020-114237.md) 已读取。结论 `pass-with-risks`，material finding 为遗漏 combined tools 精确工具集断言测试；条件性 config_loader 与 namespace/暖 identity 问题已交裁决。
+   - [总控逐项裁决](public-original-read-r1-r3-20261020-plan-adjudication.md)：P1–P4 `accepted / 未修复`；无待用户决定的 scope/owner blocker。由 gpt-6-sol 计划修订，再双路聚焦受影响面复审，未放行前不实施。
+   - gpt-6-sol plan fix 已实际启动：会话 `33874`，任务输入 `workspace/tmp/public-original-read-r1-r3-20261020/plan-fix-task.md`，原始日志同目录 `plan-fix-gpt6-sol.jsonl/.stderr`；仍在途，尚不认定修复完成。已通知协调方双路首轮结果及本次修订启动。
+   - plan fix 已实际退出：外层/runtime 均 0，终态 turn.completed，耗时 467.224575 秒；完整 final、[修订回执](public-original-read-r1-r3-20261020-plan-fix.md) 与新旧差异已读取。当前 plan SHA `583596a6f754d6ff695f5b1ba4afd79c673cc485975a755bbf2229c2715d1bef`，保存副本 `workspace/tmp/public-original-read-r1-r3-20261020/plan-revised.md`，实际差异 `plan-fix.diff`；仅文档变化，无代码/测试/配置变化。
+   - 双路受影响面复审已实际启动：MiMo 会话 `92136`、DS 会话 `50554`；任务输入 `workspace/tmp/public-original-read-r1-r3-20261020/plan-rereview-task.md`，原始 stdout 同目录 `plan-rereview-{mimo,ds}.jsonl`。MiMo stderr 为同目录同前缀 `.stderr`；DS stderr 命令误含重复 workspace 路径，实际为 `workspace/dayu-agent-r/workspace/tmp/public-original-read-r1-r3-20261020/plan-rereview-ds.stderr`，退出后再归整并记录，不停止/重复派发在途审核。正式 finding 状态待复审裁决回写。
+   - 第一轮复审已收齐实际终态：MiMo 外层/runtime 0，success，261.623685 秒，[报告](../reviews/plan-review-20261020-115710.md) pass；DS 外层/runtime 0，success，290.664807 秒，[报告](../reviews/plan-review-20261020-115908.md) fail。完整 finals/报告均已读取。
+   - 总控已基于 Host 实际代码接受 DS 的新增反例，见裁决末节：P1 部分修复，P2–P4 计划层已修复。仅 P1 错误的“小 limit 连续补读”改为一次省略 limit 取齐，不扩 Host。gpt-6-sol 第二次窄修已启动，会话 `83546`，输入 `workspace/tmp/public-original-read-r1-r3-20261020/plan-fix-2-task.md`，日志 `plan-fix-2-gpt6-sol.jsonl/.stderr`；之后 P1 双路复审。
+   - DS stderr 在实际退出后已移动到标准 `workspace/tmp/public-original-read-r1-r3-20261020/plan-rereview-ds.stderr`；原路径→新路径、实际时间、SHA/size 保存于同目录 `stderr-relocation.json`，源内容保全，误建空目录已移除。原生 runner 报告中的旧路径通过该回执定位，未重跑审核。
+   - 第二次窄修实际完成：会话 `83546` 外层/runtime 0，turn.completed，182.728014 秒；完整 final、[fix-2 回执](public-original-read-r1-r3-20261020-plan-fix-2.md) 与五处实际差异已读取。当前 plan v3 SHA `1e10b5595161854a1f456f21c34bb72f68587e76f11375f79cfd8b653dbc70e7`，快照 `workspace/tmp/public-original-read-r1-r3-20261020/plan-revised-2.md`，窄 diff `plan-fix-2.diff`；未变更代码或其它已通过方案。
+   - P1 双路窄复审已实际启动：MiMo 会话 `59154`、DS 会话 `99538`，输入 `workspace/tmp/public-original-read-r1-r3-20261020/plan-rereview-2-task.md`，原始日志 `plan-rereview-2-{mimo,ds}.jsonl/.stderr`。current gate 保持 plan；两路未收齐/裁决前不放行 implementation。
+   - P1 第二次窄复审已实际收齐：DS 外层/runtime 0、success、77.953983 秒，[报告](../reviews/plan-review-20261020-120644.md) pass；MiMo 外层/runtime 0、success、419.863986 秒，[报告](../reviews/plan-review-20261020-120818.md) pass。完整 finals/报告均已读取；v3 SHA 未变，总控直接核现有 Host 契约与五处差异，放行 [plan-pass](public-original-read-r1-r3-20261020-plan-pass.md)。P1–P4 最终均 accepted / 已修复（仅计划层），无待决计划 finding。
+4. implementation / validation：已获 plan-pass 放行，指定 gpt-6-sol 唯一代码 writer 实际启动，会话 `19490`，输入 `workspace/tmp/public-original-read-r1-r3-20261020/implementation-task.md`，原始日志 `implementation-gpt6-sol.jsonl/.stderr`。实施、测试与真实 API 待实际执行/收集，不复用基线 pyright 放行未来改动。
+   - 实际已退出：外层/runtime 0，turn.completed，3991.131688 秒。完整 final 与 [实施回执](public-original-read-r1-r3-20261020-implementation.md) 已读取；中途错误保留，最终以 release-tests/release-pyright/development-api-7 为准。主控重算 `release-files.json` 的 32 个 writer 文件与保存快照及当前树匹配；API-7 的 182 个 Fins 模块指纹全部匹配，无 docstring 例外。
+   - 最终验证：1,399 passed，3 条第三方弃用提示；全量 pyright 0 errors/0 warnings/0 informations；16 个生产 Python 文件完整文件覆盖率均 >=80%（最低 80.1248%）。对应实际 argv/退出、原始 stdout、coverage 父子数据、逐文件分母与未覆盖行保存于实施回执链接。
+   - 公开入口验收 API-7：1,774 次完整调用，外层/程序退出 0，原 53 次调用实际 replay，原件及隔离副本 before/after 不变；七份锚原文加 TSM 附件完整续读，ASML 24,864,734 字符 cold/warm 分页拼齐与原件逐字相等，MSFT 三个 occurrence 保留。TSM SGML 如实 partial/unknown；未改 primary/meta/原件，不做业务判断。详见 `workspace/tmp/public-original-read-r1-r3-20261020/development-api-7/`。
+5. code review：实施验证通过，下一步对最终组合版本执行指定 MiMo/DS 并行独立 Deepreview。尚无代码审核通过结论；不进入 PR gate。
+
+## 验证与风险
+
+- 用户追加 OLD 对照线索后，总控已只读核对 `/Users/leo/workspace/dayu-agent` 的精确 HEAD `76037b242d0b14a77281d7bc610429296123c5cb`（clean）；三类限制在其同路径已有直接代码证据，不能统称重构新增回归。静态结论及未做同输入动态对照的限定见 [OLD 对照](public-original-read-r1-r3-20261020-old-comparison.md)，原文件可取回快照及指纹见 `workspace/tmp/public-original-read-r1-r3-20261020/old-comparison/receipt.json`。未改 OLD、未扩大修复范围。
+
+当前已完成目标/计划放行，唯一 writer 正在修改生产代码并迭代局部测试/类型检查；实施版本尚无最终验收结论。开工基线检查不能替代实施结果。
+
+- 早期中间验证曾失败：`implementation-regression-2.stdout` 留有 23 failed / 220 passed，`implementation-pyright.stdout` 留有 2 errors（取消异常旧导入与 ExpandedName 序列进入 JSON 参数边界）。这些历史失败完整保留，不能作为最终验证；旧工具集/角色夹具/输出禁止规则须随 owner/public contract 迁移，不能靠生产兼容代码兜底。
+- 后续进度（非最终 gate）：controller 已读取 `implementation-pyright-2.stdout` 的 0 errors/0 warnings 与 `host-original-2.stdout` 的 1 passed（真实工具/Host 单次补读联合测试）。原文新测试曾报 20 项通过，仍有后续新增/修改，最终需统一同版验收。
+- controller 已读两轮实际 API receipt：`development-api-1/receipt.json` 为 1,601 calls、exit_code 0；`development-api-2/receipt.json` 为 1,774 calls、exit_code 0，均记录 `source_and_copy_unchanged=true`。回执包含实际 argv/Python/module/依赖/模块指纹、53 个旧调用 replay、新资产全文/namespace 发现等检查与完整逐调用文件；仍需在源码冻结后核对证据适用性，不能直接用历史轮次放行最终版本。
+- 首轮 `coverage/coverage-first.json` 中已改 Fins Python 文件仅 `tools/search_engine.py` 为 58.30%，其余均 >=80%；writer 正补对应 owner 行为测试。最终 coverage/full regression、pyright-final 与 development-api-3 已启动，待收齐真实退出和版本后裁决。
+
+- 源码基线额外核验：在 `8bf8daec` 文件树且无生产代码修改时，实际执行 `source .venv/bin/activate && pyright`（stdout/stderr 分别保存到 `workspace/tmp/public-original-read-r1-r3-20261020/baseline-pyright.stdout/.stderr`），会话 `20505` 实际退出 0，0 errors/0 warnings/0 informations。stderr 仅有 CLI 新版提示，不升级依赖；此证据仅属于开工基线，不能放行未来实现代码。
+
+- R1–R3 缺陷：`covered by later approved slice`，owner 为本线 Dayu，实现 slice 在计划审核后执行。
+- merge / live 安装更新与真实入口复验：`requiring new issue or explicit user decision`，owner 为用户授权与本线执行；merge 尚未授权，不提前同步 live。
+- README：目标确认与执行记录不宣称新增已实现能力；实现完成后按实际变更核对 README 职责，不提前写入未来契约。
