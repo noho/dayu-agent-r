@@ -39,11 +39,27 @@ XML_URI = "http://www.w3.org/XML/1998/namespace"
 XSI_URI = "http://www.w3.org/2001/XMLSchema-instance"
 _HTML_VOID = frozenset("area base br col embed hr img input link meta param source track wbr".split())
 _P_BLOCK = frozenset(
-    "address article aside blockquote div dl fieldset footer form h1 h2 h3 h4 h5 h6 header hr menu nav ol p pre section table ul".split()
+    "address article aside blockquote details dialog div dl fieldset figcaption figure footer form h1 h2 h3 h4 h5 h6 header hgroup hr main menu nav ol p pre search section table ul".split()
 )
-_OPTIONAL_AT_EOF = frozenset(
-    {"html", "head", "body", "p", "li", "dt", "dd", "tr", "td", "th", "tbody", "thead", "tfoot", "colgroup", "option"}
-)
+_HEAD_CONTENT = frozenset("base basefont bgsound link meta noframes script style template title".split())
+_OPTIONAL_PARENT_END = {
+    "html": frozenset({""}),
+    "head": frozenset({"html"}),
+    "body": frozenset({"html", ""}),
+    "li": frozenset({"ul", "ol", "menu"}),
+    "dd": frozenset({"dl"}),
+    "tr": frozenset({"table", "thead", "tbody", "tfoot"}),
+    "td": frozenset({"tr"}),
+    "th": frozenset({"tr"}),
+    "tbody": frozenset({"table"}),
+    "tfoot": frozenset({"table"}),
+    "colgroup": frozenset({"table"}),
+    "option": frozenset({"select", "datalist", "optgroup"}),
+    "optgroup": frozenset({"select"}),
+    "rt": frozenset({"ruby"}),
+    "rp": frozenset({"ruby"}),
+}
+_P_END_FORBIDDEN = frozenset({"a", "audio", "del", "ins", "map", "noscript", "video"})
 _TOKEN = re.compile(
     r'<!--(?:[\s\S]*?-->|[\s\S]*\Z)|<!\[CDATA\[[\s\S]*?(?:\]\]>|\Z)|<![^>]*>|<\?[^>]*\?>|</?[A-Za-z_][^<>\s/]*(?:\s+(?:[^<>"\x27]|"[^"]*"|\x27[^\x27]*\x27)*)?/?>'
 )
@@ -62,20 +78,48 @@ def check_original_cancel(token: CancellationToken | None) -> None:
     raise_if_fins_cancelled(token, message="原文读取已被取消。")
 
 
-def original_capabilities(filename: str, content_type: str | None) -> tuple[bool, bool, bool]:
-    """参数：资产名/媒体类型。返回：文本、结构、inline 能力。异常：无。"""
+@dataclass(frozen=True, slots=True)
+class OriginalFormat:
+    """原文格式能力与索引语法的同一判定结果。"""
+
+    text: bool
+    syntax: Literal["html", "xml"] | None
+    inline_facts: bool
+
+
+def original_format(filename: str, content_type: str | None) -> OriginalFormat:
+    """参数：仓储资产名和媒体声明。返回：统一格式能力及语法，明确媒体优先于后缀。异常：无。"""
     suffix = filename.rsplit(".", 1)[-1].lower()
-    media = (content_type or "").lower().split(";", 1)[0]
-    html = suffix in {"htm", "html", "xhtml"} or media in {"text/html", "application/xhtml+xml"}
-    xml = suffix == "xml" or media in {"application/xml", "text/xml"}
+    media = (content_type or "").lower().split(";", 1)[0].strip()
+    syntax: Literal["html", "xml"] | None
+    if media in {"application/xhtml+xml", "application/xml", "text/xml"}:
+        syntax = "xml"
+    elif media == "text/html":
+        syntax = "html"
+    else:
+        syntax = "xml" if suffix in {"xml", "xhtml"} else "html" if suffix in {"htm", "html"} else None
+    inline = media == "application/xhtml+xml" or suffix == "xhtml" or syntax == "html"
     text = (
-        html
-        or xml
+        syntax is not None
         or suffix in {"txt", "md", "markdown", "json"}
         or media.startswith("text/")
         or media == "application/json"
     )
-    return text, html or xml, html
+    return OriginalFormat(text, syntax, inline)
+
+
+def _omittable_at_parent_end(name: str, parent: str) -> bool:
+    """参数：HTML 元素名和直接父名（空为片段根）。返回：能否在父级结束时省略闭合。异常：无。"""
+    return parent not in _P_END_FORBIDDEN if name == "p" else parent in _OPTIONAL_PARENT_END.get(name, ())
+
+
+@dataclass(frozen=True, slots=True)
+class _ReferenceTarget:
+    """与投影身份无关的资产内引用校验结果；index 保留首跳位置。"""
+
+    status: Literal["resolved", "unresolved", "ambiguous", "absent"]
+    reason: str | None
+    index: int | None
 
 
 @dataclass(slots=True)
@@ -162,8 +206,10 @@ class OriginalStructure:
         self.xml = xml
         self.nodes: list[_Node] = []
         self.reasons: list[tuple[str, int, int]] = []
-        self.ids: dict[tuple[str, str], list[int]] = {}
+        self.ids: dict[str, list[int]] = {}
         self.fact_indices: list[int] = []
+        self.contexts: dict[int, _ReferenceTarget] = {}
+        self.continuations: dict[int, _ReferenceTarget] = {}
         self._scan(token)
         self.starts = [node.start for node in self.nodes]
         for index, node in enumerate(self.nodes):
@@ -186,7 +232,7 @@ class OriginalStructure:
                     expanded_attributes.add((attribute_uri, attribute_local))
             identifier = self.value(node, "id")
             if identifier is not None:
-                self.ids.setdefault((self.target(index, token), identifier), []).append(index)
+                self.ids.setdefault(identifier, []).append(index)
             uri, local = self.expanded(node, node.name)
             if uri in INLINE_URIS and local == "nonNumeric":
                 self.fact_indices.append(index)
@@ -203,13 +249,11 @@ class OriginalStructure:
                 raw_name = self.value(node, name)
                 if raw_name is not None and self.expanded(node, raw_name)[0] is None:
                     self.reasons.append(("unbound_fact_qname", node.start, node.opening_end))
-            context_id = self.value(node, "contextRef")
-            matches = self.ids.get((self.target(index, token), context_id), []) if context_id is not None else []
-            if len(matches) != 1 or self.expanded(self.nodes[matches[0]], self.nodes[matches[0]].name) != (
-                XBRLI_URI,
-                "context",
-            ):
+            reference = self._resolve_reference(self.value(node, "contextRef"), context=True)
+            self.contexts[index] = reference
+            if reference.status != "resolved":
                 self.reasons.append(("unresolved_or_ambiguous_context", node.start, node.opening_end))
+        self._index_continuations(token)
         check_original_cancel(token)
 
     def value(self, node: _Node, name: str) -> str | None:
@@ -224,24 +268,71 @@ class OriginalStructure:
         prefix, separator, local = name.partition(":")
         return (node.namespaces.get(prefix), local) if separator else (node.namespaces.get("", ""), name)
 
-    def target(self, index: int, token: CancellationToken | None) -> str:
-        """参数：节点索引、本次 token。返回：技术 target 分组，缺失为默认空组。异常：取消。"""
-        current: int | None = index
-        depth = 0
-        while current is not None:
-            if depth % SCAN_CHECK_INTERVAL == 0:
+    def _resolve_reference(self, identifier: str | None, *, context: bool) -> _ReferenceTarget:
+        """参数：原文 ID、context/continuation 模式。返回：资产内 exact ID 与元素类型校验。异常：无。"""
+        if identifier is None:
+            return (
+                _ReferenceTarget("unresolved", "missing_context_ref", None)
+                if context
+                else _ReferenceTarget("absent", None, None)
+            )
+        matches = self.ids.get(identifier, [])
+        if len(matches) != 1:
+            return _ReferenceTarget(
+                "ambiguous" if matches else "unresolved", "duplicate_id" if matches else "target_not_found", None
+            )
+        index = matches[0]
+        node = self.nodes[index]
+        uri, local = self.expanded(node, node.name)
+        valid = (
+            (uri == XBRLI_URI and local == "context") if context else (uri in INLINE_URIS and local == "continuation")
+        )
+        if not valid:
+            return _ReferenceTarget("unresolved", "invalid_reference_target", None)
+        return (
+            _ReferenceTarget("unresolved", "unknown_target_boundary", index)
+            if node.end is None
+            else _ReferenceTarget("resolved", None, index)
+        )
+
+    def _index_continuations(self, token: CancellationToken | None) -> None:
+        """参数：本次 token。返回：无；一次构建全资产引用图并缓存链状态。异常：取消。"""
+        edges: dict[int, _ReferenceTarget] = {}
+        for index, node in enumerate(self.nodes):
+            if index % SCAN_CHECK_INTERVAL == 0:
                 check_original_cancel(token)
-            depth += 1
-            node = self.nodes[current]
-            uri, local = self.expanded(node, node.name)
-            if uri in INLINE_URIS and local in {"resources", "nonNumeric", "continuation"}:
-                value = self.value(node, "target")
-                if value is not None:
-                    return value
-                if local == "nonNumeric":
-                    return ""
-            current = node.parent
-        return ""
+            identifier = self.value(node, "continuedAt")
+            if identifier is not None:
+                edges[index] = self._resolve_reference(identifier, context=False)
+        # 每个节点至多进入一条尚未求值的路径；共享长尾和循环均只校验一次。
+        outcomes: dict[int, tuple[Literal["resolved", "unresolved", "ambiguous", "absent"], str | None]] = {}
+        for index in edges:
+            path: set[int] = set()
+            cursor = index
+            outcome: tuple[Literal["resolved", "unresolved", "ambiguous", "absent"], str | None] = ("resolved", None)
+            while cursor in edges:
+                check_original_cancel(token)
+                if cursor in outcomes:
+                    outcome = outcomes[cursor]
+                    break
+                if cursor in path:
+                    outcome = ("unresolved", "continuation_cycle")
+                    break
+                path.add(cursor)
+                edge = edges[cursor]
+                if edge.status != "resolved" or edge.index is None:
+                    outcome = (edge.status, edge.reason)
+                    break
+                cursor = edge.index
+            for member in path:
+                outcomes[member] = outcome
+        for index, edge in edges.items():
+            check_original_cancel(token)
+            status, reason = outcomes[index]
+            self.continuations[index] = _ReferenceTarget(status, reason, edge.index)
+            if status != "resolved":
+                node = self.nodes[index]
+                self.reasons.append((reason or "unresolved_continuation", node.start, node.opening_end))
 
     def _scan(self, token: CancellationToken | None) -> None:
         """参数：本次 token。返回：无。异常：取消；保全不了关系时记录 partial。"""
@@ -280,7 +371,9 @@ class OriginalStructure:
                     else (
                         "cdata"
                         if raw.startswith("<![CDATA[")
-                        else "processing_instruction" if raw.startswith("<?") else "doctype"
+                        else "processing_instruction"
+                        if raw.startswith("<?")
+                        else "doctype"
                     )
                 )
                 self.nodes.append(_Node(kind, start, end, "", parent, scope, content_end=end, end=end, closure="token"))
@@ -308,7 +401,8 @@ class OriginalStructure:
                     continue
                 while len(stack) - 1 > found:
                     unfinished = self.nodes[stack.pop()]
-                    if not self.xml and unfinished.name.lower() in _OPTIONAL_AT_EOF:
+                    parent_name = self.nodes[stack[-1]].name.lower() if stack else ""
+                    if not self.xml and _omittable_at_parent_end(unfinished.name.lower(), parent_name):
                         unfinished.content_end = start
                         unfinished.end = start
                         unfinished.closure = "rule"
@@ -363,7 +457,8 @@ class OriginalStructure:
                 stack.append(len(self.nodes) - 1)
         for index in reversed(stack):
             node = self.nodes[index]
-            if not self.xml and node.name.lower() in _OPTIONAL_AT_EOF:
+            parent_name = self.nodes[node.parent].name.lower() if node.parent is not None else ""
+            if not self.xml and _omittable_at_parent_end(node.name.lower(), parent_name):
                 node.content_end, node.end, node.closure = len(text), len(text), "rule"
             else:
                 self.reasons.append(("unclosed_element", node.start, node.opening_end))
@@ -374,7 +469,15 @@ class OriginalStructure:
             node = self.nodes[stack[-1]]
             current = node.name.lower()
             closes = (
-                current == "p"
+                current == "head"
+                and incoming not in _HEAD_CONTENT
+                or current == "colgroup"
+                and incoming not in {"col", "template"}
+                or current == "optgroup"
+                and incoming == "optgroup"
+                or current in {"rt", "rp"}
+                and incoming in {"rt", "rp"}
+                or current == "p"
                 and incoming in _P_BLOCK
                 or current == "li"
                 and incoming == "li"
@@ -435,80 +538,27 @@ class OriginalStructure:
     def reference(
         self,
         index: int,
-        identifier: str | None,
         *,
         context: bool,
         asset: SourceAssetIdentity,
         token: CancellationToken | None,
     ) -> OriginalReference:
-        """参数：节点、引用、context 模式、身份/token。返回：同目标唯一引用或明确未决。异常：取消。"""
-        if identifier is None:
-            return {
-                "status": "unresolved" if context else "absent",
-                "reason": "missing_context_ref" if context else None,
-                "target": None,
-            }
-        matches = self.ids.get((self.target(index, token), identifier), [])
-        expected = "context" if context else "continuation"
-        accepted = [
-            i
-            for i in matches
-            if self.expanded(self.nodes[i], self.nodes[i].name)[1] == expected
-            and (
-                self.expanded(self.nodes[i], self.nodes[i].name)[0] == XBRLI_URI
-                if context
-                else self.expanded(self.nodes[i], self.nodes[i].name)[0] in INLINE_URIS
-            )
-        ]
-        if len(matches) != 1 or len(accepted) != 1:
-            return {
-                "status": "ambiguous" if len(matches) > 1 else "unresolved",
-                "reason": "duplicate_id" if len(matches) > 1 else "target_not_found",
-                "target": None,
-            }
-        target = self.nodes[accepted[0]]
-        if target.end is None:
-            return {
-                "status": "unresolved",
-                "reason": "unknown_target_boundary",
-                "target": self.content.preview(asset, target.start, target.opening_end),
-            }
-        if not context:
-            seen = {index}
-            cursor = accepted[0]
-            while True:
-                check_original_cancel(token)
-                if cursor in seen:
-                    return {
-                        "status": "unresolved",
-                        "reason": "continuation_cycle",
-                        "target": self.content.preview(asset, target.start, target.end),
-                    }
-                seen.add(cursor)
-                next_id = self.value(self.nodes[cursor], "continuedAt")
-                if next_id is None:
-                    break
-                following = self.ids.get((self.target(cursor, token), next_id), [])
-                if len(following) != 1:
-                    return {
-                        "status": "ambiguous" if len(following) > 1 else "unresolved",
-                        "reason": "continuation_target_unresolved",
-                        "target": self.content.preview(asset, target.start, target.end),
-                    }
-                cursor = following[0]
-                uri, local = self.expanded(self.nodes[cursor], self.nodes[cursor].name)
-                if uri not in INLINE_URIS or local != "continuation":
-                    return {
-                        "status": "unresolved",
-                        "reason": "invalid_continuation_target",
-                        "target": self.content.preview(asset, target.start, target.end),
-                    }
+        """参数：节点、context 模式、身份/token。返回：已校验的资产内引用及原文投影。异常：取消。"""
+        check_original_cancel(token)
+        reference = (
+            self.contexts[index] if context else self.continuations.get(index, _ReferenceTarget("absent", None, None))
+        )
+        target = self.nodes[reference.index] if reference.index is not None else None
         result: OriginalReference = {
-            "status": "resolved",
-            "reason": None,
-            "target": self.content.preview(asset, target.start, target.end),
+            "status": reference.status,
+            "reason": reference.reason,
+            "target": self.content.preview(
+                asset, target.start, target.end if target.end is not None else target.opening_end
+            )
+            if target is not None
+            else None,
         }
-        if context:
+        if context and target is not None and reference.status == "resolved":
             result["namespace_uri"] = self.expanded(target, target.name)[0]
             parent = target.parent
             resources: _Node | None = None
@@ -590,7 +640,9 @@ class OriginalStructure:
             "parent_status": (
                 "root"
                 if node.parent is None
-                else "unknown" if self.nodes[node.parent].closure == "unknown" else "resolved"
+                else "unknown"
+                if self.nodes[node.parent].closure == "unknown"
+                else "resolved"
             ),
             "ancestors": ancestors,
             "ancestors_complete": current is None,
@@ -598,9 +650,7 @@ class OriginalStructure:
             "attributes_complete": len(node.attributes) <= ATTRIBUTE_PAGE_MAX
             and all(len(a.name) <= PREVIEW_CHARS for a in node.attributes),
             "preview": content.preview(asset, node.start, node.end if node.end is not None else node.opening_end),
-            "continuation": self.reference(
-                index, self.value(node, "continuedAt"), context=False, asset=asset, token=token
-            ),
+            "continuation": self.reference(index, context=False, asset=asset, token=token),
         }
 
     def diagnostics(self, asset: SourceAssetIdentity) -> list[OriginalDiagnostic]:
@@ -684,7 +734,7 @@ class OriginalStructure:
             "xsi_nil": self.expanded_attribute_preview(node, XSI_URI, "nil", asset),
             "escape": self.attribute_preview(node, "escape", asset),
             "continued_at": self.attribute_preview(node, "continuedAt", asset),
-            "context": self.reference(index, self.value(node, "contextRef"), context=True, asset=asset, token=token),
+            "context": self.reference(index, context=True, asset=asset, token=token),
             "visibility": {
                 "visibility_status": "hidden_declaration" if hidden else "unknown",
                 "css_evaluated": False,
@@ -712,10 +762,6 @@ class OriginalStructure:
             if name is not None and self.expanded(node, name) in wanted:
                 matches.append(index)
         facts = [self.project_fact(i, asset, token) for i in matches[offset : offset + limit]]
-        reference_partial = any(
-            f["context"]["status"] != "resolved" or f["node"]["continuation"]["status"] in {"unresolved", "ambiguous"}
-            for f in facts
-        )
         check_original_cancel(token)
         return {
             "asset": asset,
@@ -723,7 +769,7 @@ class OriginalStructure:
             "total_matches": len(matches),
             "truncated": offset + limit < len(matches),
             "next_offset": offset + limit if offset + limit < len(matches) else None,
-            "parse_status": "partial" if self.reasons or reference_partial else "complete",
+            "parse_status": "partial" if self.reasons else "complete",
             "diagnostics": self.diagnostics(asset),
             "diagnostics_complete": len(self.reasons) <= _DIAGNOSTICS_MAX,
         }

@@ -102,10 +102,10 @@ def test_partial_never_claims_complete_zero(tmp_path: Path, fragment: str) -> No
 
 
 @pytest.mark.parametrize(
-    "mode", ("cycle", "missing", "duplicate", "invalid", "context_duplicate", "context_missing", "target")
+    "mode", ("cycle", "missing", "duplicate", "invalid", "context_duplicate", "context_missing")
 )
 def test_context_target_and_continuation_uncertainty(tmp_path: Path, mode: str) -> None:
-    """参数：根及引用反例。返回：无。异常：跨 target 补位、循环/缺失或歧义冒充完整。"""
+    """参数：根及引用反例。返回：无。异常：循环/缺失或资产内 ID 歧义冒充完整。"""
     text = HTML
     if mode == "cycle":
         text = text.replace('id="tail"', 'id="tail" continuedAt="tail"')
@@ -119,13 +119,11 @@ def test_context_target_and_continuation_uncertainty(tmp_path: Path, mode: str) 
         text = text.replace("</z:resources>", '<x:context id="C">two</x:context></z:resources>')
     elif mode == "context_missing":
         text = text.replace('contextRef="C"', 'contextRef=""')
-    else:
-        text = text.replace('target=""', 'target="other"')
     _, structure = _parse(tmp_path, text)
     result = structure.query_facts(ASSET, [{"namespace_uri": "urn:concept", "local_name": "Flag"}], 0, 1, None)
     fact = result["facts"][0]
     assert result["parse_status"] == "partial"
-    reference = fact["context"] if mode.startswith("context") or mode == "target" else fact["node"]["continuation"]
+    reference = fact["context"] if mode.startswith("context") else fact["node"]["continuation"]
     assert reference["status"] in {"ambiguous", "unresolved"}
     assert reference["reason"]
 

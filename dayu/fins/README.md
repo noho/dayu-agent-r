@@ -208,6 +208,8 @@ read path 对 source decode、search index 构建、XBRL 查询全失败和读�
 `list_document_assets` 返回完整有序清单、reading primary、storage 已验证的声明角色及实际完整字节的
 `sha256/size_bytes`；没有角色声明时返回 unrecorded，不猜原始提交主件。其它三方法必须原样传回
 `filename/expected_sha256`，旧摘要遇到新内容返回 `asset_version_mismatch`。
+filename 按仓储的合法单组件名原样匹配（包括字面量 `[ ] * ?`），不作 glob 展开。
+缺失文档/资产返回 `not_found` 并要求在当前 namespace 重新枚举；不把版本不符、损坏或解码失败归为缺失。
 
 `read_original_text` 的坐标是严格 UTF-8 解码且只移除开头 BOM 后的 Unicode 码点，0 基左闭右开，
 保留实体拼写、CRLF 和原始标记。摘要仍包含 BOM 字节。请求范围、返回范围、全文长度、truncated 与
@@ -217,11 +219,16 @@ next_start 明确分离，默认每页 16,384、最大 65,536 码点；局部范
 可通过 opening/parent/span 回读完整原文，不重序列化 DOM 计算位置。
 未确定的父级返回 parent_status=unknown、parent=null，不能理解成根节点；父链遇到未决关系时
 ancestors_complete=false，保留 partial diagnostics 与原文回读路径。
+格式能力和解析语法来自同一媒体/后缀判定：明确 HTML/XML/XHTML 媒体优先，未知媒体按后缀判定；
+XHTML/XML 保持大小写，HTML 按合法省略结束边界闭合，无法确定的关系仍为 partial/unknown。
 
 `query_original_facts` 只查当前资产内指定 expanded namespace URI/local name 的原生非数值 occurrence，
 默认 100、最大 500 条、最多 100 concepts；URI 先由公开结构的原始声明与定义处作用域发现。
 每个 occurrence 保留原 QName、format、原值、context/target 来源、隐藏声明、continuation/exclude 定位，
 不转换 checkbox 真假，不按值去重，不执行 CSS/脚本。结构/引用未决为 partial，不能冒充完整零结果。
+context/continuation 在当前资产内按 exact ID 和期望元素类型解析，不按 fact target 分组；重复 ID 不择首项。
+`resource_target_raw/resource_target_origin` 仅投影 resources 上原声明的内容/存在，不承诺该声明构成合法分组。
+parse_status 是整个资产的结构与引用完整性，独立于查询概念和分页；共享 continuation 链由同一索引一次校验。
 文本/结构不支持的 PDF 等二进制资产仍可枚举核验；既存 PDF/Docling 阅读继续使用原章节/页能力。
 章节/目录返回实际 `source_asset`；章节的 `content_scope=section_view` 不承诺完整原件。
 
@@ -229,6 +236,7 @@ ancestors_complete=false，保留 partial diagnostics 与原文回读路径。
 缓存键含 canonical ticker、exact document ID 与 source kind，仅保留完整成功的同版能力，
 不保留某次调用的 token、范围或预算。每次暖调用仍确认 storage publication，并观察本次 token；
 旧 active borrow 完成自洽旧版结果，新调用使用新 publication。实际摘要由 storage 复制过程产生，
+关闭后禁止新借用；已有借用可以完成尚未构建的能力，最后释放时回收 retired snapshot。
 light snapshot 不提供实际字节身份。CN/HK 原件读取同样消费该 typed 角色与实际身份。
 
 工具按进程执行。原文页若另被 Host 显示预算截断，先以 cursor/scope_token 调用一次不带 limit 的

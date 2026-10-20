@@ -3168,7 +3168,7 @@ def test_concurrent_initial_cache_miss_builds_one_processor_and_closes_losing_sn
 def test_runtime_close_before_cache_publication_rejects_build_and_cleans_snapshot(
     tmp_path: Path,
 ) -> None:
-    """close 先线性化时，阻塞中的 build 必须失败且不得事后发布 entry。
+    """close 先于 entry publication 时，已取得的 full snapshot 必须关闭且不得事后发布。
 
     Args:
         tmp_path: pytest 临时目录。
@@ -3177,18 +3177,18 @@ def test_runtime_close_before_cache_publication_rejects_build_and_cleans_snapsho
         无。
 
     Raises:
-        AssertionError: build 未以 close-state 失败或 cache/temp root 残留时抛出。
+        AssertionError: 借用未以 close-state 失败、仍创建 processor 或 cache/temp root 残留时抛出。
     """
 
     runtime, repository, registry = _build_runtime(tmp_path)
     build_entered = Event()
     release_build = Event()
 
-    def _block_before_registry_return() -> None:
-        """在 processor 已构建、cache 尚未发布的窗口阻塞 worker。
+    def _block_before_snapshot_return(count: int) -> None:
+        """在真实 full snapshot 已取得、entry 尚未发布的窗口阻塞 worker。
 
         Args:
-            无。
+            count: 仓储已取得的 full snapshot 数量。
 
         Returns:
             无。
@@ -3197,21 +3197,25 @@ def test_runtime_close_before_cache_publication_rejects_build_and_cleans_snapsho
             AssertionError: 主线程未释放 build 时抛出。
         """
 
+        assert count == 1
         build_entered.set()
         assert release_build.wait(timeout=5.0)
 
-    registry.before_return = _block_before_registry_return
+    repository.on_full_snapshot = _block_before_snapshot_return
     with ThreadPoolExecutor(max_workers=1) as executor:
         build_future = executor.submit(_read_runtime_processor_for_document, runtime, "doc-1")
-        assert build_entered.wait(timeout=5.0)
-        runtime.close()
-        assert runtime._processor_cache.size() == 0
-        release_build.set()
+        try:
+            assert build_entered.wait(timeout=5.0)
+            assert runtime._processor_cache.size() == 0 and registry.create_count == 0
+            runtime.close()
+            assert runtime._processor_cache.size() == 0
+        finally:
+            release_build.set()
         with pytest.raises(RuntimeError, match="Fins read runtime 已关闭"):
             build_future.result(timeout=5.0)
         assert build_future.done()
 
-    assert registry.create_count == 1
+    assert registry.create_count == 0
     assert runtime._processor_cache.size() == 0
     assert runtime._retired_entries == set()
     assert runtime._pending_snapshots == []

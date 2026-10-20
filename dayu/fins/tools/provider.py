@@ -35,7 +35,7 @@ def discover_tools(spec: ToolsDiscoveryProviderSpec) -> ToolsDiscoveryProviderOu
         spec: ToolsDiscovery 传入的 provider 显式配置。
 
     Returns:
-        provider 输出，包含九个 Fins read tool definitions。
+        provider 输出，包含十三个 Fins read tool definitions。
 
     Raises:
         ValueError: provider config 非法时抛出。

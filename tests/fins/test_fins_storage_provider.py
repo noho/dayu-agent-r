@@ -28,6 +28,7 @@ from docling_core.types.doc.labels import DocItemLabel
 import pytest
 
 from tests.fins.company_meta_test_support import stage_company_meta_fixture
+from tests.fins.test_original_read_runtime import publish_original
 
 import dayu.fins.storage._fs_source_snapshot as source_snapshot_module
 from dayu.contracts.cancellation import CancellationToken
@@ -3184,7 +3185,7 @@ def test_fins_read_tools_do_not_import_retired_adapter() -> None:
 
 
 def test_fins_read_tool_schemas_do_not_expose_execution_context(tmp_path: Path) -> None:
-    """九个 Fins read tools 的 LLM-facing schema 不得暴露治理字段。"""
+    """十三个 Fins read tools 的 LLM-facing schema 不得暴露治理字段。"""
 
     workspace_root = _build_fins_workspace(tmp_path)
     definitions = _discover_definitions(workspace_root)
@@ -3219,10 +3220,15 @@ def test_fins_read_tool_schemas_do_not_expose_execution_context(tmp_path: Path) 
         assert "cancellation_token" not in properties
         assert "execution_context" not in required
         assert "cancellation_token" not in required
+        description = definition.schema.function.description
+        if definition.name in {"read_original_structure", "query_original_facts"}:
+            assert all(term in description for term in ("resolved=", "unbound=", "ambiguous=", "quote(", "duplicate(布尔", "整个资产"))
+        elif definition.name == "get_document_sections":
+            assert all(term in description for term in ("source_asset", "filename", "sha256", "内容校验标签"))
 
 
 def test_fins_read_definitions_declare_process_backed_execution(tmp_path: Path) -> None:
-    """九个 Fins read definitions 必须声明 process-backed execution。"""
+    """十三个 Fins read definitions 必须声明 process-backed execution。"""
 
     workspace_root = _build_fins_workspace(tmp_path)
     definitions = _discover_definitions(workspace_root)
@@ -3688,7 +3694,7 @@ def test_default_runtime_public_close_retries_real_snapshot_cleanup(
 def test_read_outputs_never_expose_revision_internal_key_local_uri_or_temp_path(
     tmp_path: Path,
 ) -> None:
-    """九个 read tools 的成功、失败、取消投影均不得泄漏 storage 私有语义。
+    """十三个 read tools 的成功、失败、取消投影均不得泄漏 storage 私有语义。
 
     Args:
         tmp_path: pytest 临时目录。
@@ -3721,6 +3727,10 @@ def test_read_outputs_never_expose_revision_internal_key_local_uri_or_temp_path(
     ).parent.name
     runtime = DefaultFinsRuntime.create(workspace_root=workspace_root)
     read_runtime = runtime.get_read_runtime()
+    publish_original(workspace_root)
+    original_listing = read_runtime.list_document_assets(ticker="TEST", document_id="original-doc", source_kind=SourceKind.FILING)
+    original_asset = original_listing["assets"][0]["asset"]
+    original_select: dict[str, JsonValue] = {"ticker": "TEST", "document_id": "original-doc", "source_kind": "filing", "filename": "main.html", "expected_sha256": original_asset["sha256"]}
     definitions = _definitions_by_name(_definitions_for_read_runtime(read_runtime, workspace_root))
     completed_outcomes: dict[str, ToolExecutionOutcome] = {}
     try:
@@ -3803,6 +3813,13 @@ def test_read_outputs_never_expose_revision_internal_key_local_uri_or_temp_path(
                 "concepts": ["Revenue"],
             },
         }
+        completed_arguments.update({
+            "list_document_assets": {"ticker": "TEST", "document_id": "original-doc", "source_kind": "filing"},
+            "read_original_text": original_select,
+            "read_original_structure": original_select,
+            "query_original_facts": {**original_select, "concepts": [{"namespace_uri": "urn:concept", "local_name": "Flag"}]},
+        })
+        assert set(completed_arguments) == set(_FINS_READ_TOOL_NAMES)
         completed_outcomes["get_document_sections"] = sections_outcome
         completed_outcomes["list_tables"] = tables_outcome
         for tool_name, arguments in completed_arguments.items():
@@ -3816,7 +3833,7 @@ def test_read_outputs_never_expose_revision_internal_key_local_uri_or_temp_path(
             )
 
         projected_outputs: list[JsonValue] = []
-        for tool_name in completed_arguments:
+        for tool_name in _FINS_READ_TOOL_NAMES:
             completed = completed_outcomes[tool_name]
             assert isinstance(completed, ToolCompletedOutcome)
             projected_outputs.append(_project_llm_facing_outcome(completed))
@@ -3841,7 +3858,11 @@ def test_read_outputs_never_expose_revision_internal_key_local_uri_or_temp_path(
             assert isinstance(cancelled, ToolCancelledOutcome)
             projected_outputs.append(_project_llm_facing_outcome(cancelled))
 
+        assert len(projected_outputs) == len(_FINS_READ_TOOL_NAMES) * 3
+        original_revision = _read_snapshot_revision(source_repository, "TEST", "original-doc", SourceKind.FILING)
+        original_key = repository_set.core._source_meta_path_for_read("TEST", "original-doc", SourceKind.FILING).parent.name
         forbidden_values = (
+            original_revision.token, original_key,
             revision.token,
             source_private_key,
             str(workspace_root),

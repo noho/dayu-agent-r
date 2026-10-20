@@ -31,9 +31,10 @@ from tests.fins.test_original_read_contract import HTML
 
 
 def publish_original(
-    root: Path, text: str = HTML, *, replace: bool = False, kind: SourceKind = SourceKind.FILING
+    root: Path, text: str | bytes = HTML, *, replace: bool = False, kind: SourceKind = SourceKind.FILING,
+    filename: str = "main.html", content_type: str = "text/html", document_id: str = "original-doc",
 ) -> None:
-    """参数：隔离根、文本、替换标志及 namespace。返回：无。异常：真实 Fs 发布错误。"""
+    """参数：隔离根、原文或待解码字节、替换标志、namespace、exact 资产名/媒体及文档 ID。返回：无。异常：真实 Fs 发布错误。"""
     repos = build_fs_repository_set(workspace_root=root)
     sources = FsSourceDocumentRepository(workspace_root=root, repository_set=repos)
     blobs = FsDocumentBlobRepository(workspace_root=root, repository_set=repos)
@@ -53,10 +54,10 @@ def publish_original(
             batch=batch,
         )
         if replace:
-            sources.reset_source_document("TEST", "original-doc", kind, batch=batch)
-        handle = SourceHandle("TEST", "original-doc", kind.value)
+            sources.reset_source_document("TEST", document_id, kind, batch=batch)
+        handle = SourceHandle("TEST", document_id, kind.value)
         first = blobs.store_file(
-            handle, "main.html", BytesIO(b"\xef\xbb\xbf" + text.encode()), content_type="text/html", batch=batch
+            handle, filename, BytesIO(b"\xef\xbb\xbf" + (text.encode() if isinstance(text, str) else text)), content_type=content_type, batch=batch
         )
         second = blobs.store_file(
             handle,
@@ -71,8 +72,8 @@ def publish_original(
         sources.create_source_document(
             SourceDocumentUpsertRequest(
                 ticker="TEST",
-                document_id="original-doc",
-                internal_document_id="original-doc",
+                document_id=document_id,
+                internal_document_id=document_id,
                 form_type="6-K" if kind is SourceKind.FILING else None,
                 primary_document="attachment.html",
                 files=[first, second, binary],

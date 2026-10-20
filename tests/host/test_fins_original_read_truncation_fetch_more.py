@@ -11,12 +11,13 @@ from dayu.contracts.tool_call import BatchToolExecutionRequest, ToolCallRequest
 from dayu.contracts.tool_call import BatchToolExecutionContext
 from dayu.host.tool_runtime import ToolRuntimeHandle
 from dayu.contracts.tool_declaration import ToolBundle
-from dayu.contracts.tool_outcome import ToolCompletedOutcome
+from dayu.contracts.tool_outcome import ToolCompletedOutcome, ToolFailedOutcome
 from dayu.fins.domain.enums import SourceKind
 from dayu.fins.service_runtime import DefaultFinsRuntime
 from dayu.fins.tools.fins_limits import FinsToolLimits
 from dayu.fins.tools.fins_tools import build_fins_read_tool_definitions
 from tests.fins.test_original_read_runtime import publish_original
+from tests.fins.test_original_read_contract import HTML
 from tests.tools.test_combined_tools_acceptance import _tool_runtime, _context
 from tests.host.test_toolruntime_truncation_fetch_more import _source_ref
 from typing import cast
@@ -225,5 +226,128 @@ async def test_structure_namespace_then_facts_survive_host_list_truncation(tmp_p
         target = tmp_path / "host-structure-facts-receipt.json"
         target.write_text(json.dumps([assets, structure, remaining, facts, rest], ensure_ascii=False, indent=2))
         print(f"完整结构/facts 联合回执：{target}")
+    finally:
+        runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_facts_fetch_more_then_next_offset_has_no_lost_occurrences(tmp_path: Path) -> None:
+    """参数：真实 Fs 根。返回：无。异常：进程工具页内取齐/跨页拼接的 occurrence 丢失、重复或顺序改变。"""
+    occurrence = '<z:nonNumeric name="c:Flag" contextRef="C" target="alternate" continuedAt="tail">SAME</z:nonNumeric>'
+    text = HTML.replace("</body>", occurrence * 5 + "</body>")
+    publish_original(tmp_path, text)
+    runtime = DefaultFinsRuntime.create(workspace_root=tmp_path)
+    receipt: list[JsonValue] = []
+    try:
+        reader = runtime.get_read_runtime()
+        asset = reader.list_document_assets(ticker="TEST", document_id="original-doc", source_kind=SourceKind.FILING)[
+            "assets"
+        ][0]["asset"]
+        definitions = build_fins_read_tool_definitions(reader, tmp_path, FinsToolLimits(original_facts_display_items=1))
+        handle, _ = _tool_runtime(ToolBundle(definitions=definitions), (_source_ref(),))
+        context = _context()
+        select: dict[str, JsonValue] = {
+            "ticker": "TEST",
+            "document_id": "original-doc",
+            "source_kind": "filing",
+            "filename": "main.html",
+            "expected_sha256": asset["sha256"],
+            "concepts": [{"namespace_uri": "urn:concept", "local_name": "Flag"}],
+        }
+        joined: list[JsonValue] = []
+        offset, ordinal = 0, 0
+        while True:
+            ordinal += 1
+            page = await _execute(
+                handle, context, "query_original_facts", {**select, "offset": offset, "limit": 2}, ordinal
+            )
+            assert isinstance(page, Mapping) and page["asset"] == asset and page["parse_status"] == "complete"
+            receipt.append(page)
+            wrapped = page["facts"]
+            assert isinstance(wrapped, Mapping) and wrapped["truncated"] is True
+            visible, fetch = wrapped["value"], wrapped["fetch_more"]
+            assert isinstance(visible, list) and isinstance(fetch, Mapping)
+            ordinal += 1
+            rest = await _execute(
+                handle, context, "fetch_more", {"cursor": fetch["cursor"], "scope_token": fetch["scope_token"]}, ordinal
+            )
+            assert isinstance(rest, list)
+            receipt.append(rest)
+            full_page = visible + rest
+            assert len(full_page) == 2
+            joined.extend(full_page)
+            if page["next_offset"] is None:
+                assert page["truncated"] is False
+                break
+            assert page["truncated"] is True and page["next_offset"] == offset + len(full_page)
+            offset += len(full_page)
+        expected = reader.query_original_facts(
+            ticker="TEST",
+            document_id="original-doc",
+            source_kind=SourceKind.FILING,
+            filename="main.html",
+            expected_sha256=asset["sha256"],
+            concepts=[{"namespace_uri": "urn:concept", "local_name": "Flag"}],
+        )
+        assert joined == expected["facts"] and len(joined) == expected["total_matches"] == 6
+        starts: list[int] = []
+        for fact in joined:
+            assert isinstance(fact, Mapping) and isinstance(fact["node"], Mapping)
+            opening = fact["node"]["opening"]
+            assert isinstance(opening, Mapping)
+            position = opening["start"]
+            assert isinstance(position, int)
+            starts.append(position)
+        assert len(set(starts)) == 6 and starts == sorted(starts)
+        target = tmp_path / "host-facts-paging-receipt.json"
+        target.write_text(json.dumps(receipt, ensure_ascii=False, indent=2))
+        print(f"完整 facts 分页联合回执：{target}")
+    finally:
+        runtime.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_name,missing",
+    [
+        ("list_document_assets", "document"),
+        ("read_original_text", "document"),
+        ("read_original_structure", "document"),
+        ("query_original_facts", "document"),
+        ("read_original_text", "asset"),
+        ("read_original_structure", "asset"),
+        ("query_original_facts", "asset"),
+    ],
+)
+async def test_process_original_missing_resources_keep_typed_code_and_hint(
+    tmp_path: Path, tool_name: str, missing: str
+) -> None:
+    """参数：真实 Fs 根、工具和缺失维度。返回：无。异常：真实进程/Host 投影丢失 typed not_found 与恢复步骤。"""
+    publish_original(tmp_path)
+    runtime = DefaultFinsRuntime.create(workspace_root=tmp_path)
+    try:
+        definitions = build_fins_read_tool_definitions(runtime.get_read_runtime(), tmp_path, FinsToolLimits())
+        handle, _ = _tool_runtime(ToolBundle(definitions=definitions), (_source_ref(),))
+        arguments: dict[str, JsonValue] = {
+            "ticker": "TEST",
+            "document_id": "absent-doc" if missing == "document" else "original-doc",
+            "source_kind": "filing",
+        }
+        if tool_name != "list_document_assets":
+            arguments.update(filename="absent.html" if missing == "asset" else "main.html", expected_sha256="a" * 64)
+        if tool_name == "query_original_facts":
+            arguments["concepts"] = [{"namespace_uri": "urn:concept", "local_name": "Flag"}]
+        response = await handle.tool_executor.execute(
+            BatchToolExecutionRequest(calls=(_call(tool_name, arguments, 0),), context=_context())
+        )
+        failure = response.records[0].outcome
+        assert isinstance(failure, ToolFailedOutcome)
+        assert failure.result.error == "not_found"
+        assert (
+            failure.result.hint
+            and "list_document_assets" in failure.result.hint
+            and "source_kind" in failure.result.hint
+        )
+        assert "table_ref" not in failure.result.hint
     finally:
         runtime.close()
