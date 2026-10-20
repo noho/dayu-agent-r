@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import sys
 import tomllib
+from email.parser import Parser
 from pathlib import Path
 from typing import cast
 from zipfile import ZipFile
@@ -20,7 +22,6 @@ PLACEHOLDER_PACKAGE_PREFIXES: tuple[str, ...] = tuple(
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PYPROJECT_PATH = REPO_ROOT / "pyproject.toml"
 CONSTRAINTS_ROOT = REPO_ROOT / "constraints"
-PUBLIC_PACKAGE_BUILD_ROOT = REPO_ROOT / "workspace/tmp/r11-public-package-test"
 PYTHON_311_CONSTRAINT_NAMES: tuple[str, ...] = (
     "min-py311.txt",
     "lock-linux-x64-py311.txt",
@@ -79,34 +80,52 @@ def _load_project_dependencies() -> tuple[str, ...]:
     return tuple(cast(list[str], dependencies))
 
 
-def _build_wheel() -> Path:
-    """在 validation 专用目录构建当前 wheel。
+def _build_wheel(build_root: Path) -> Path:
+    """从独立源码副本构建当前 wheel，并保存完整构建证据。
 
+    :param build_root: pytest 提供的独立临时目录。
     :returns: 唯一的 wheel 路径。
     :raises AssertionError: wheel 构建失败或产物数量不是一个时抛出。
+    :raises OSError: 源码复制或构建证据写入失败时抛出。
     """
 
-    shutil.rmtree(PUBLIC_PACKAGE_BUILD_ROOT, ignore_errors=True)
-    PUBLIC_PACKAGE_BUILD_ROOT.mkdir(parents=True)
+    source_root = build_root / "source"
+    wheel_root = build_root / "wheel"
+    source_root.mkdir()
+    wheel_root.mkdir()
+    for filename in ("pyproject.toml", "README.md", "LICENSE"):
+        shutil.copyfile(REPO_ROOT / filename, source_root / filename)
+    shutil.copytree(
+        REPO_ROOT / "dayu",
+        source_root / "dayu",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    argv = (
+        sys.executable,
+        "-m",
+        "pip",
+        "wheel",
+        "--no-deps",
+        "--no-build-isolation",
+        "--wheel-dir",
+        str(wheel_root),
+        ".",
+    )
     completed = subprocess.run(
-        (
-            sys.executable,
-            "-m",
-            "pip",
-            "wheel",
-            "--no-deps",
-            "--no-build-isolation",
-            "--wheel-dir",
-            str(PUBLIC_PACKAGE_BUILD_ROOT),
-            ".",
-        ),
-        cwd=REPO_ROOT,
+        argv,
+        cwd=source_root,
         capture_output=True,
         text=True,
         check=False,
     )
+    (build_root / "build.stdout").write_text(completed.stdout, encoding="utf-8")
+    (build_root / "build.stderr").write_text(completed.stderr, encoding="utf-8")
+    (build_root / "build.command.json").write_text(
+        json.dumps({"argv": argv, "cwd": str(source_root), "exit_code": completed.returncode}, indent=2) + "\n",
+        encoding="utf-8",
+    )
     assert completed.returncode == 0, completed.stderr
-    wheels = tuple(PUBLIC_PACKAGE_BUILD_ROOT.glob("dayu_agent-*.whl"))
+    wheels = tuple(wheel_root.glob("dayu_agent-*.whl"))
     assert len(wheels) == 1, wheels
     return wheels[0]
 
@@ -157,14 +176,15 @@ def test_ocr_engine_strategy_is_rapidocr_across_python_311_constraints() -> None
         assert RETIRED_OCR_ENGINE_MARKER not in constraint_text, constraint_name
 
 
-def test_wheel_excludes_placeholder_scripts_metadata_and_packages() -> None:
-    """wheel 不得发布 placeholder script、extra、依赖或 package。
+def test_wheel_excludes_placeholder_scripts_metadata_and_packages(tmp_path: Path) -> None:
+    """wheel 身份必须与源码声明一致，且不得发布 placeholder 内容。
 
+    :param tmp_path: pytest 提供的独立源码及 wheel 构建目录。
     :returns: ``None``。
     :raises AssertionError: wheel 构建失败或任一 placeholder contract 残留时抛出。
     """
 
-    wheel = _build_wheel()
+    wheel = _build_wheel(tmp_path)
     with ZipFile(wheel) as archive:
         names = tuple(archive.namelist())
         metadata_names = tuple(name for name in names if name.endswith(".dist-info/METADATA"))
@@ -174,6 +194,10 @@ def test_wheel_excludes_placeholder_scripts_metadata_and_packages() -> None:
         metadata = archive.read(metadata_names[0]).decode("utf-8")
         entrypoints = archive.read(entrypoint_names[0]).decode("utf-8")
 
+    project = tomllib.loads(PYPROJECT_PATH.read_text(encoding="utf-8"))["project"]
+    metadata_message = Parser().parsestr(metadata)
+    assert metadata_message["Name"] == project["name"]
+    assert metadata_message["Version"] == project["version"]
     assert "dayu-cli = dayu.cli.__main__:exit_module" in entrypoints
     assert not any(script_name in entrypoints for script_name in PLACEHOLDER_SCRIPT_NAMES)
     assert "Provides-Extra: web" not in metadata

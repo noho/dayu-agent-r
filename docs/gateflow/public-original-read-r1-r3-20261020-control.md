@@ -6,7 +6,7 @@
 
 - 最新通讯规则（用户追加）：后续只用 `tmux-agents` 经 tmux 向 title 为 `portfolio-manager` 的项目协作助手汇报；每次发送前重新 discovery 并核对身份。禁用 codex_tui 跨会话发送。中途不向协作助手发进度；仅任务完成、需裁决而停止或其它停止时，汇报实际结果/证据路径/停点/待办。现有开发、draft PR 授权和 merge/live 停点不变，无需另做确认。
 - 用户追加确认继续正常修复，强调不得裁剪吞掉财报内容；按现有成功标准核对无任意长度静默丢弃，显式有界页必须可续读取齐尾部，预览可沿 span 回读，便利视图不冒充完整原件。已加入最终双路审核任务。
-- current gate / next entry point：`final closeout pass`；工程work unit completed，独立draft PR206已交付；下一接续为经tmux报portfolio-manager、等待工程核收及明确安装通知。merge未授权。
+- current gate / next entry point：`code review`（0.1.5 版本增量）。R1–R3 工程 f854a6e6 已核收；本次同 PR206 升级包版本的目标由用户直接明确，最小计划主控核对通过，见 [version increment](public-original-read-r1-r3-20261020-version-increment.md)。安装尚未放行，须增量核收并收到明确通知；merge 未授权。
 - 目标确认已通过，见 [goal confirmation](public-original-read-r1-r3-20261020-goal-confirmation.md)。用户明确本线唯一承接，并授权持续推进到独立 draft PR 交付；merge 另授权。
 - 分支：`fix/public-original-read-r1-r3-20261020`；base：`8bf8daec8a022fd705e6cfe32c4283605f1fe6ca`（`github/main`）。
 - plan 已实际完成：`codex-agent-run --provider gpt-6-sol --cwd /Users/leo/workspace/dayu-agent-r --prompt-file /Users/leo/workspace/dayu-agent-r/workspace/tmp/public-original-read-r1-r3-20261020/plan-task.md`，托管会话 `97052` 已退出；外层退出码与 `runtime_exit_code` 均为 0，终态 `turn.completed`，实际耗时 751.107963 秒。
@@ -98,3 +98,7 @@ ready核对通过：分支非protected trunk，8bf8daec起仅本work unit三项�
 总控交付核对已实际通过，详细回执 `workspace/tmp/public-original-read-r1-r3-20261020/pr-delivery-verification-initial.json`：repo/headrepo均noho/dayu-agent-r，PR206 draft/open，base8bf8daec/head eb230ad4，完整精确OID compare的60文件补丁SHA74581a8b887cb64cb1ecb91472e1863d2943107b92017b2475c8a81dc0a4ebfa，全部hunk范围/mode/content一致且Git blob索引核符；仅格式标签有别，原差异保留。前后OID及远端push head相同，源码/test/config对复审f7eee0c5无变化，title/body准确。main虽受保护但required checks为空、无workflow/check run/status context，不伪称CI执行。早前校验器两次前提断言失败已由全量diff/保护设置原件核清，非绕过必要CI或变更内容。进入draft-PR-pass并继续创建final-closeout总结，不能止于PR创建。
 
 [final closeout](public-original-read-r1-r3-20261020-final-closeout.md) 已创建，涵盖what changed/verified/docs/finding状态/分类风险owner/draftURL/issue不适用及下一入口，工程work unit completed。本次随后仅提交审计记录，最后head/base/diff/CI/push在pr-delivery-verification-final.json再核，避免自引用提交循环。工程交付先经tmux报告并等待portfolio-manager核收和安装通知，当前没有安装或merge；只按README做自身源码安装及公开入口检查，不查调用方环境入口。
+
+## 0.1.5 增量 implementation / validation
+
+指定 gpt-6-sol writer 会话15126已实际退出：外层/runtime均0，turn.completed，684.978194秒。完整final与version-implementation.md已读取；唯一版本声明0.1.5，版本核对按对应源码声明，wheel隔离构建，production Python未变。受影响测试4passed/2opt-in网络skipped（不作网络验收），全量pyright0/0/0，真实metadata匹配/错版互换拒绝及500快照一致性通过，既有安装与本树egg-info未变，实际仍0.1.4。首次临时probe符号链接重复计数失败及原始日志保留，改临时路径去重后成功，不改变被测源码。writer中途TLS/model-refresh观测未改变实际成功退出，不当作业务失败或批准。主控重新核500份保存快照全匹配。下一步冻结增量并执行既定MiMo/DS独立双路适用审核；安装仍未放行。
