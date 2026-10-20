@@ -1,5 +1,13 @@
 # R1–R3 交付与 live 接续授权更新
 
+## 最新授权：默认命令入口安装增量
+
+用户随后明确选择 Bash 安装脚本统一安装编排。Windows 需 Git Bash 或 WSL；WSL 属于 Linux 子系统，不声称原生 cmd/PowerShell 直接执行 Bash。README 分开说明运行条件、依赖约束平台与实际验证范围；该选择不放行真实 sync，不改变同PR206、0.1.5、先工程核收再安装或 merge 另授权边界。
+
+用户已追加同PR206修复安装流程，版本保持0.1.5。目标、历史与成功信号见[install-entry goal](public-original-read-r1-r3-20261020-install-entry-goal.md)。默认/Users/leo/.local/bin/dayu-cli的发布现在归Dayu安装交付本线负责；此前portfolio-manager从旧uv工具0.1.4手动改为本仓.venv的结果可保留，但不能冒充新安装流程已验证。工程阶段隔离验证旧入口处理与重复执行，必要计划/实现/双路审核完成、提交更新同draft PR；工程核收后再按更新README真实sync，并由portfolio-manager独立验证。禁止删除其他工具环境、修改调用方项目配置、要求调用方补安装动作或查找推断调用方环境。真实未激活新正常shell的默认命令/解释器/实际metadata0.1.5及位置/源码绑定/help命令退出由本线交付，merge另授权。下文早前“项目默认入口由portfolio-manager接续改动”仅为此前边界历史，不再作当前职责划分。
+
+此前0.1.5增量已核收并通知从1856cf8d安装，自身README安装已实际完成，回执workspace/tmp/public-original-read-r1-r3-20261020/installation-20261020T092320Z/；该回执只证明当时自身.venv安装，未证明本次新的默认入口安装目标。
+
 本文件记录用户在双路受影响面复审期间追加并再次纠正的授权。以最后一条用户指令为准；下方旧通知仅保留历史；不改原冻结 goal/plan/审核历史，不中断或重派在途复审。
 
 ## 当前有效要求（工程核收后版本增量）

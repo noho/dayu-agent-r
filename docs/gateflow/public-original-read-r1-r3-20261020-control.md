@@ -6,7 +6,7 @@
 
 - 最新通讯规则（用户追加）：后续只用 `tmux-agents` 经 tmux 向 title 为 `portfolio-manager` 的项目协作助手汇报；每次发送前重新 discovery 并核对身份。禁用 codex_tui 跨会话发送。中途不向协作助手发进度；仅任务完成、需裁决而停止或其它停止时，汇报实际结果/证据路径/停点/待办。现有开发、draft PR 授权和 merge/live 停点不变，无需另做确认。
 - 用户追加确认继续正常修复，强调不得裁剪吞掉财报内容；按现有成功标准核对无任意长度静默丢弃，显式有界页必须可续读取齐尾部，预览可沿 span 回读，便利视图不冒充完整原件。已加入最终双路审核任务。
-- current gate / next entry point：`final closeout pass`（0.1.5 增量工程完成；待增量核收及安装通知）。R1–R3 工程 f854a6e6 已核收；本次同 PR206 升级包版本的目标由用户直接明确，最小计划主控核对通过，见 [version increment](public-original-read-r1-r3-20261020-version-increment.md)。安装尚未放行，须增量核收并收到明确通知；merge 未授权。
+- current gate / next entry point：`code review`（IE-B1实施/验证已完成，待冻结精确版本并执行MiMo/DS完整代码审核）。用户已明确确认目标与授权，见[install-entry goal](public-original-read-r1-r3-20261020-install-entry-goal.md)；版本保持0.1.5、同PR206，工程核收后才真实sync，merge未授权。此前1856cf8d自身安装完成及人工默认链接修正保留为历史，不冒充新流程验证。
 - 目标确认已通过，见 [goal confirmation](public-original-read-r1-r3-20261020-goal-confirmation.md)。用户明确本线唯一承接，并授权持续推进到独立 draft PR 交付；merge 另授权。
 - 分支：`fix/public-original-read-r1-r3-20261020`；base：`8bf8daec8a022fd705e6cfe32c4283605f1fe6ca`（`github/main`）。
 - plan 已实际完成：`codex-agent-run --provider gpt-6-sol --cwd /Users/leo/workspace/dayu-agent-r --prompt-file /Users/leo/workspace/dayu-agent-r/workspace/tmp/public-original-read-r1-r3-20261020/plan-task.md`，托管会话 `97052` 已退出；外层退出码与 `runtime_exit_code` 均为 0，终态 `turn.completed`，实际耗时 751.107963 秒。
@@ -116,3 +116,35 @@ V1双路窄复审已实际启动：HEAD `398afb641849e8673c0398f440838eacb8b2e55
 版本增量及审核记录已提交为d2977b12并push github工作分支，实际push退出0；同PR206 title/body更新命令实际退出0，保持draft/open。此时current gate为总控交付核对，尚不提前标draft-PR-pass。完整精确OID compare、metadata/CI与最终push对应关系接下来实际取证。
 
 0.1.5增量总控交付核对实际通过，pr-delivery-verification-version-initial.json保存repo/headrepo、PR206 draft/open、base8bf8daec/head d2977b12、72文件完整补丁与准确title/body/CI/push核对。源码与398afb64及895快照全符，完整hunk/mode/content相等，仅index与hunk尾标签格式有别；main protected但required checks为空，无远端CI执行。进入draft-PR-pass并完成[version-closeout](public-original-read-r1-r3-20261020-version-closeout.md)实际总结，工程增量completed。该记录提交/push后在pr-delivery-verification-version-final.json对最终精确OID与完整diff再核，不制造源码复审循环。下一接续仅工程增量报告、等待portfolio-manager核收并明确通知安装；当前未安装0.1.5，不核调用方环境，merge未授权。
+
+## 默认命令入口安装增量
+
+用户直接确认新的binding目标（install-entry-goal），同PR206、包版本保持0.1.5。初始分支/HEAD1856cf8d/工作树干净，README只安装venv而未发布默认入口的直接缺口成立；此前自身安装和portfolio-manager人工链接修正保留，不作新流程验证。gpt-6-sol plan writer已实际启动，会话62744，输入workspace/tmp/public-original-read-r1-r3-20261020/install-entry-20261020T101200Z/plan-task.md，独立日志plan-writer.jsonl/.stderr。首次派发误引用另一时间目录，setup退出2且未启动runtime；纠正为实际系统时钟生成的目录后才启动，原失败不冒充有效派发。当前只制定计划，真实安装/默认入口变更待工程核收通知。
+
+默认入口计划writer62744已实际退出：外层/runtime0/0，turn.completed，573.039088秒；完整final及install-entry-plan已读取。方案一个slice，保留venv/pip，新增仅负责默认链接与持久PATH的小脚本，业务层及版本0.1.5不变；工程隔离验证旧链接/缺席/重复，真实正常shell验收在工程核收通知后。主控核对owner/方向与单slice合理；该计划明确改变默认命令和用户持久文件的安装公共承诺，适用独立Planreview，未审核前不放行实施。精确plan/goal快照与SHA、源码HEAD1856cf8d及零实现变化见install-entry-20261020T101200Z/plan-review-version.json。隔离zsh机制probe只证明startup行为，不作安装通过；原命令缺文件/存在性检查退出、model-refresh/MCP连接诊断按raw保留，不改实际成功终态。
+
+默认入口独立双路Planreview已实际启动：MiMo43101、DS14840；共同输入install-entry-20261020T101200Z/plan-review-task.md，各自plan-review-{mimo,ds}.jsonl/.stderr。精确plan SHA e21092e541111d0207094a624fa31fd7d13f6b1d7326e6c33396a8c2491766f2、goal SHA4aa7525ff198870cd51d054352937c40c3d07ac849fc16ac22837a46b129e586及保存副本可取回。实施仍未放行，真实安装/默认入口/profile未变。
+
+用户追问平台无关安装与venv/pip/constraints关系，主控已明确首版过早绑定zsh配置，不放行其实施；见install-entry-plan-direction.md。优先比较标准安装/现成工具机制的更小方案，不改变已确认默认入口目标/0.1.5/同PR/先核收再sync。首版冻结对象不改，正常收取43101/14840；将来修订方案不能借用首版pass。只读pip/uv帮助取证退出0，未执行安装或PATH写入，也未查询调用方环境。
+
+默认入口首版双审实际收齐与最新 Bash 方向见 install-entry-plan-direction.md。旧版不放行实施；DS F1 accepted/未修复，交下一版README契约修正。新计划文件独立保存，不覆盖首版；真实默认入口/profile/安装均未变。
+
+Bash修订计划writer已实际启动：gpt-6-sol会话49413，任务install-entry-20261020T101200Z/bash-plan-task.md，独立日志bash-plan-writer.jsonl/.stderr；只写独立install-entry-bash-plan及隔离取证，不实施、不写真实入口/profile。等待实际退出与新方案审查，旧首版双审不作新方案放行。
+
+Bash修订writer49413实际退出：外层/runtime0/0、turn.completed、527.161712秒；完整final及bash-plan已读。主控核对一个slice和owner/目标/保留旧树/新shell/来源绑定/核收停点合理；新默认入口与跨shell持久文件契约适用新方案Planreview。快照bash-plan-submitted.md、bash-plan-review-version.json保存精确SHA和零实现变化。Bash/zsh startup与旧live模块help仅机制/只读证据，不作新安装通过，Linux/Windows未实测。原始失败和model refresh诊断保留，不改真实退出。下一入口双路新方案计划审核，不实施。
+
+新Bash计划双路Planreview已实际启动：MiMo69913、DS88709；共同输入install-entry-20261020T101200Z/bash-plan-review-task.md，各自bash-plan-review-{mimo-flash,ds-flash}.jsonl/.stderr。冻结plan SHA a6ec1737b2e32a33c2f761d8d31e026d66971f529965510da0f864d98f6dd20a，goal SHA4aa7525ff198870cd51d054352937c40c3d07ac849fc16ac22837a46b129e586。writer两个exit1均为新增文件git diff --no-index --check返回差异状态，diff --check及原实现零差异核对退出0；原始日志保留。等待新双审实际终态与裁决，未实施。
+
+DS新Bash首审88709实际0/0 success549.648876秒，报告185725 fail；完整final/report已读，BP1–3主控accepted/未修复，详见bash-adjudication。MiMo69913继续审冻结旧版，不改其文件。指定gpt-6-sol新建独立bash-plan-v2窄修三个已确认点，不重设计、不实施；收齐MiMo后统一窄复审。
+
+Bash首审MiMo69913实际0/0 success1080.395155秒报告190523收齐，维持BP1–3accepted；gpt-6-sol窄修24875实际0/0 turn.completed620.181773秒完成独立v2，SHA b280bbd5fdd86aadf9e0c302ac170c6e9316203f5d8310e8e10b024e647eadf7。完整final/报告/窄diff与机制回执均读，主控核对及风险映射见bash-adjudication；待新v2双路窄复审，不实施。
+
+Bash v2双路窄复审已实际启动：MiMo7570、DS99536；输入install-entry-20261020T101200Z/bash-plan-rereview-task.md，各自bash-plan-rereview-{mimo-flash,ds-flash}.jsonl/.stderr。版本映射bash-plan-rereview-version.json、快照bash-plan-v2-submitted.md及完整窄diff可取回；current gate仍plan，收齐裁决前不实施。
+
+Bash v2 plan-pass已实际裁决：MiMo7570外层/runtime0/0 success1762.179624秒报告193516、DS99536报告192241双路均通过核心BP1–3；完整final/报告/版本/反例核对及风险分类见bash-adjudication末节。BP1–3计划层accepted/已修复；BP3a/BP1a局部表达式/具名非输入清单按明确授权deferred-with-owner至IE-B1和完整代码审核，非高层plan blocker且不可遗留到sync。current gate转implementation/validation，指定gpt-6-sol实施，未进行真实安装/入口变更。
+
+IE-B1 gpt-6-sol实施writer已实际启动，会话47725；输入install-entry-20261020T101200Z/bash-implementation-task.md，原始日志bash-implementation-writer.jsonl/.stderr。只有该writer修改安装/测试/README及两处已授权plan局部示例；主控只写过程记录。实际实现/验证结果待退出收取，真实live/default/profile未放行。
+
+IE-B1 writer47725已实际退出，外层/runtime0/0、turn.completed、1686.269596秒；完整final/实施回执、实际检查及源码快照已读。81tests通过、helper全文件96%（103stmt/4miss）、全量pyright0/0/0、bash-n0；最终delivery fresh/legacy各完整两次安装及四次metadata回读均0，含依赖真pip，无no-deps/借用live site/marker冒充。根README安装/默认入口及wheel同目标检查、testsREADME、必要helper pyrightinclude已按职责更新。版本0.1.5与dayu生产业务代码未改。
+主控独立重算9个writer文件/保存副本全部匹配，496安装输入×当前/快照/fresh/legacy四位置全部匹配；真实0.1.5metadata和旧树前后相等已读。legacy-root-proof另含根.，两轮前后严格相等，其Bash字节与最终同；helper仅补64bit预检不触该owner。BP1a/BP3a plan差异经程序重建核对恰为两个授权局部修正加说明。原pyright三处测试None类型失败、探针zsh只读变量及字节解码失败等保留，主控额外保存controller-first-validation，不伪称一次全绿。独立wheel含依赖安装/show/metadata/help0仅venv验证，不声称user-site或非本机OS通过。
+具体证据workspace/tmp/bash-implementation-20261020-194550/，主控controller-implementation-readback-{initial,final}.json在install-entry-20261020T101200Z。风险已按实施回执分类；BP1a/BP3a正式deferred-with-owner待本轮双路完整代码审核销。current gate转code review，不能据writer通过提前交付/安装。

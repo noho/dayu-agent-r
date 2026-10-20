@@ -10,7 +10,7 @@
 source .venv/bin/activate
 ```
 
-当前类型检查配置覆盖 `dayu/`、`tests/`、`utils/`，并排除 `workspace/`、缓存目录、隐藏目录与 `.venv/`。
+当前类型检查配置覆盖 `dayu/`、`tests/`、`utils/` 与安装只读查询 `scripts/install_source_query.py`，并排除 `workspace/`、缓存目录、隐藏目录与 `.venv/`。
 
 `tests/conftest.py` 提供全局测试隔离夹具：每个测试结束后恢复 `dayu` namespace logger 的 handler、level、
 propagate 与 disabled 状态，并关闭本测试新增的 logger handler，避免 CLI 入口日志装配把 pytest 捕获流泄漏给后续测试。
@@ -760,3 +760,17 @@ workflow/model/downloader/identity 测试分别覆盖 local、prepared、origina
 `fins/test_read_search_regression.py` 用真实 Markdown processor 验证取消 owner import 迁移后的多模式搜索、证据导航回读及较小显示预算下的 exact 命中保留。原文结构用例另覆盖 XML 声明/CDATA、合法省略的行组边界，以及未闭合 SEC 原始外层必须显式标记未知父链。
 
 `fins/test_original_read_review_regressions.py` 覆盖真实 Fs/public runtime 的 XML/XHTML 媒体与大小写、HTML 省略 head/行组/colgroup/option/ruby 闭合、head 内 noscript 在显式或省略 head 结束时的父链与 body 归属、body noscript 对照及未闭合时的 partial/unknown、同版 hash/span 回读与文本/结构分页、资产内 exact ID 引用与 target 原声明、跨页引用完整性、字面量文件名、typed not_found、三类懒构建跨 close 的借用资源收口、诊断零构建，以及两个 full snapshot 在发布前同步竞争的败方清理。provider 禁值扫描覆盖全部十三工具的成功/失败/取消嵌套投影；Host 联合测试另覆盖 facts 页内截断取齐后按 next_offset 遍历 occurrence。
+
+### `tests/install/`
+
+源码安装 owner 的隔离行为测试覆盖 Bash launcher、入口和 profile 的安全发布/保全/幂等、
+正常 Bash/zsh 启动、写前 ZDOTDIR 拒绝以及标准库 metadata/source 查询。受控失败边界
+不替代含依赖的真实 pip 安装；Bash 不计入 Python coverage。安装查询 helper 纳入全量 pyright。
+
+```bash
+source .venv/bin/activate
+bash -n scripts/install-source.sh
+python -m pytest tests/install tests/cli/test_public_package_entrypoints.py -q
+python -m pytest tests/install/test_install_source_query.py --cov=scripts.install_source_query --cov-report=term-missing -q
+python -m pyright
+```

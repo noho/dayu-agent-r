@@ -5,7 +5,8 @@
   "include": [
     "dayu",
     "tests",
-    "utils"
+    "utils",
+    "scripts/install_source_query.py"
   ],
   "exclude": [
     "workspace",

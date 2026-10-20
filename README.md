@@ -30,36 +30,54 @@
 
 ### 1.1 从源码安装
 
+在源码根目录执行；无需先激活虚拟环境。脚本需要 Bash 3.2+ 和 Python 3.11，
+`--shell` 选择以后正常使用的 shell：
+
 ```bash
-python3.11 -m venv .venv
-source .venv/bin/activate
-python -m pip install -e ".[test,dev,browser]" \
-  -c constraints/lock-macos-arm64-py311.txt
+# macOS 正常 zsh；正常 Bash 时改为 --shell bash
+bash scripts/install-source.sh --shell zsh
+# Linux / WSL 正常 Bash（使用子系统内的 Python）
+bash scripts/install-source.sh --shell bash
+# Windows Git Bash：指定本机 Windows Python 3.11
+bash scripts/install-source.sh --shell bash --python "/c/实际路径/python.exe"
 ```
 
-按平台替换约束文件：
+默认解释器为 `python3.11`，可通过 `--python` 指定单个可执行文件路径。
+脚本自动选择 macOS arm64、Linux x64 或 Windows x64 的现有依赖锁；其它组合会在安装前拒绝。
+Windows 需 Git Bash，不能直接在 PowerShell/cmd 执行；WSL 安装在 Linux 子系统内。
 
-- macOS Apple Silicon：`constraints/lock-macos-arm64-py311.txt`
-- Linux x64：`constraints/lock-linux-x64-py311.txt`
-- Windows x64：`constraints/lock-windows-x64-py311.txt`
-
-如果需要浏览器回退抓取，再安装 Chromium：
+脚本安装到源码根的 `.venv`，发布 `~/.local/bin/dayu-cli`，并在所选 shell 的启动文件
+前置 `~/.local/bin`；这也会提高该目录内其它同名命令的优先级。请保留源码与 `.venv` 的位置。
+已有普通入口、特殊文件或不支持的启动配置冲突会报出路径并停止，请先检查该文件用途；
+不会自动接管未知文件。失败可能留下部分包安装或已发布文件，以报出的失败阶段为准。
+成功后重新打开终端，无需 activate：
 
 ```bash
-playwright install chromium
+command -v dayu-cli
+dayu-cli --help
+```
+
+如果需要浏览器回退抓取，再用本次安装的解释器安装 Chromium：
+
+```bash
+.venv/bin/python -m playwright install chromium
+# Windows Git Bash：.venv/Scripts/python.exe -m playwright install chromium
 ```
 
 ### 1.2 安装 wheel
 
-```bash
-python3.11 -m pip install /path/to/dayu_agent-<version>-py3-none-any.whl
-```
-
-安装后确认公开入口：
+用同一个明确的目标解释器安装和检查（将下方路径替换为实际 Python 3.11 路径）：
 
 ```bash
-dayu-cli --help
+"/目标/Python3.11" -m pip install /path/to/dayu_agent-<version>-py3-none-any.whl
+cd /源码之外的目录
+"/目标/Python3.11" -E -P -m pip show dayu-agent
+"/目标/Python3.11" -E -P -m dayu.cli --help
 ```
+
+`pip show` 显示实际版本与安装位置；`-E -P` 排除 Python 环境变量和当前目录的干扰，
+保留目标解释器正常启用的用户安装目录。wheel 检查使用这个解释器的公开模块入口；
+裸 `dayu-cli` 取决于 PATH，可能仍指向先前的源码安装。
 
 ## 2. 初始化工作区
 
