@@ -17,3 +17,11 @@
 ## 双路收齐后的终裁与修复入口
 
 两路均完成独立版本/构建核验，版本声明与wheel同源无争议。MiMo建议accept，但其residual risk第3项自己明确安装后baseline将解析0.1.5而拒绝0.1.4；不能把本次目标“升级后不误拒正确版本”的已知失败转交后续新增metadata影子机制，且用户没有授权给baseline另建metadata框架。因此不采用MiMo该项非阻塞解释，也不采用其“无ownership drift”的总体结论；保留其真实构建/文件完整性/pyright等有效证据，V1仍accepted/未修复。DS建议的具体metadata扫描框架不是修复必选项；主控选择移除错误的业务测试版本比较，将安装版本核对归还sync owner，保持已授权目标最小方案。该裁决不重开R1–R3，也不要求网络验收。下一gate为fix，完成受影响验证后双路窄复审核销V1。
+
+## V1 双路窄复审终裁：已修复
+
+DS会话83969实际退出0/0、success、271.580271秒，报告[170445](../reviews/code-review-20261020-170445.md)；MiMo会话56884实际退出0/0、success、984.882153秒，报告[171452](../reviews/code-review-20261020-171452.md)。完整final及报告均读，两路独立确认V1已修复、无实质反例，原业务/源码身份断言完整保留，895保存源码与被审398afb64逐字相符；当前4passed/2显式网络skip及全量pyright0/0/0有效，484成员wheel内容证据在构建输入未变的前提下复用，生产Python与R1–R3源码f7eee0c5相同。V1正式 `accepted / 已修复`，无accepted未修复/needs-more-evidence/blocker。
+
+MiMo关于历史初版单独打开会误读的open question由主控直接解决：只加显式历史提示并链接V1纠正回执与裁决，原报告正文完整保留，原字节可从090eb4f5取回；writer/审核中原SHA仍指其当时准确版本，不把提示后的文件冒充旧快照。此为记录澄清，不改被审代码/测试/配置，无须重开源码审核。DS把baseline/current后续实跑归sync slice的措辞不采用：本线安装只做README安装和自身metadata/help检查，业务网络矩阵另由Fins后续unit安排。两路报告所谓全部命令0仅适用于最终有效验证；原生tool错误（初始相对路径cwd/不存在glob/证据路径尝试）及首次临时probe失败均保留，未用于pass，不伪称所有尝试一次成功。
+
+风险分类维持：实际安装验证covered by later approved slice，须增量核收及明确安装通知；网络矩阵/构建清单未来扩展/原S1分别由Fins验收、CLI packaging test、Provider/Engine及portfolio-manager接续。用户明确无需CLI version flag，无merge授权。本增量满足ready-to-open-draft-PR，沿用PR206，不新建PR或外部issue/comment。下一步提交审核与纠正记录、push、更新PR并实际核对精确head/base/完整diff/CI/push。

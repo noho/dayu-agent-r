@@ -1,5 +1,7 @@
 # PR206 版本 0.1.5 增量：实现与验证
 
+> 历史初版：下文“按对应 baseline/current 源码声明核对包 metadata”的方案与正确性推论已被 [V1 修复回执](public-original-read-r1-r3-20261020-version-fix.md)及[最终裁决](public-original-read-r1-r3-20261020-version-adjudication.md)取代；请以其当前结论为准。原文内容保留，未加提示的准确版本可从 commit `090eb4f566fd94a57d9b758f5dd67cf30f814141` 取回。此提示仅纠正阅读入口，不改变下文历史验证发生过的事实。
+
 ## 范围、版本与当前状态
 
 本轮是已核收 R1–R3 head `f854a6e6ff3e3a1cee24745eaae96148843d6401` 上的单个版本增量 slice。工作分支为 `fix/public-original-read-r1-r3-20261020`；依据 [主控已批准的最小计划](public-original-read-r1-r3-20261020-version-increment.md) 和 [授权记录](public-original-read-r1-r3-20261020-authorization-update.md)，仅完成实现与必要验证，交回主控进入本增量的独立代码审核。本报告不宣称 review-pass、draft-PR-pass 或 final closeout pass。
