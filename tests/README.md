@@ -105,6 +105,12 @@ HTTP transport 被隔离替换，公开 CLI、分类、文件发现和仓储真�
 6-K 历史拒绝重试、hash/fingerprint/清单一致性、同公司跨日期与跨公司隔离、失败回滚、取消及再次增量跳过。
 测试不会读取投资项目 workspace，也不从夹具提取财务数字。
 
+SEC 数量诊断回归：`python -m pytest tests/fins/test_sec_download_disposition.py tests/fins/test_sec_pipeline_download.py tests/fins/test_sec_pipeline_download_stream.py -q`。
+分类 owner 测试覆盖四类状态、两种拒绝原因入口和非法字段；skipped 缺因、全 null 和双向原因冲突在 owner、数量诊断与 typed 行同步拒绝，单原因及规范化后双同值保持合法。
+真实隔离 Fs 工作流将相同确认行送入摘要、typed 投影与数量诊断，
+验证拒绝有效零、完整缓存跳过有效一、有效二加拒绝一仍不足。失败、拒绝前缀后取消和完整性中止保持原原因及确认行计数；
+早期取消 builder 的非空行仅验证构造契约，不代表当前早期调用点可达。
+
 SEC HTML 图片 owner 回归位于 `test_sec_html_image_assets.py`，使用真实 downloader、
 MockTransport 与 Fs publication，覆盖三类直接候选、有限 srcset、首 base、同申报地址、
 重复属性首值（含空/无值）、完整分号路径、path 百分号与二次编码边界；完整 URL、protocol-relative、

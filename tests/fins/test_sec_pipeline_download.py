@@ -53,6 +53,7 @@ from dayu.fins.domain.document_models import (
 from dayu.fins.ingestion_runtime import FinsSourceDownloadAdapterRequest
 from dayu.fins.download_contract import (
     FinsDownloadDateRange,
+    FinsDownloadDocumentDisposition,
     FinsDownloadProviderError,
     FinsDownloadSource,
     FinsDownloadTransportCategory,
@@ -92,6 +93,7 @@ from dayu.fins.storage import (
     FsCompanyMetaRepository,
     FsDocumentBlobRepository,
     FsProcessedDocumentRepository,
+    FsFilingMaintenanceRepository,
     FsSourceDocumentRepository,
     SourceIntegrityClassification,
     SourceIntegrityPreflightError,
@@ -1454,6 +1456,175 @@ class RebuildOnlyDownloader:
 
 
 _TestDownloader = StubDownloader | RebuildOnlyDownloader | SecDownloader
+
+
+class _QuantityDownloader(StubDownloader):
+    """只提供合成远端文件与响应，分类和发布使用真实生产 owner。"""
+
+    def __init__(self, accepted_count: int, *, reject: bool, artifact_failure: bool = False) -> None:
+        """配置独立披露，拒绝候选排在正常候选之前。
+
+        参数：accepted_count 为有效披露数，reject 为是否含拒绝候选，artifact_failure 为拒绝原件传输故障。
+        返回：无。异常：无。
+        """
+
+        count = accepted_count + int(reject)
+        recent: dict[str, JsonValue] = {
+            "form": ["6-K" for _ in range(count)],
+            "filingDate": [f"2025-08-{index + 1:02d}" for index in range(count)],
+            "reportDate": ["2025-06-30" for _ in range(count)],
+            "accessionNumber": [f"0000000000-25-{index + 1:06d}" for index in range(count)],
+            "primaryDocument": ["quantity.htm" for _ in range(count)],
+        }
+        super().__init__({"filings": {"recent": recent, "files": []}}, [], [])
+        self.reject = reject
+        self.artifact_failure = artifact_failure
+
+    def list_filing_files(
+        self, cik: str, accession_no_dash: str, primary_document: str, form_type: str,
+        include_xbrl: bool = True, include_exhibits: bool = True, include_http_metadata: bool = True,
+        cancellation_checker: Callable[[], bool] | None = None,
+    ) -> list[RemoteFileDescriptor]:
+        """按当前 accession 提供原件描述和传输响应，不直接返回文档分类。
+
+        参数：全部为正式下载器的文件发现参数。返回：当前披露的文件描述。
+        异常：无。
+        """
+
+        filtered = self.reject and accession_no_dash.endswith("000001")
+        self._content_by_name = {"quantity.htm": (
+            b"<html>Annual general meeting voting results.</html>" if filtered else
+            b"<html>Company Announces Second Quarter 2025 Unaudited Financial Results</html>"
+        )}
+        descriptor = RemoteFileDescriptor(
+            name="quantity.htm", source_url=f"https://example.com/{accession_no_dash}/quantity.htm",
+            http_etag="quantity-etag", http_last_modified="Mon, 01 Jan 2025 00:00:00 GMT",
+            remote_size=len(self._content_by_name["quantity.htm"]), http_status=200,
+        )
+        self._remote_files = [descriptor]
+        self._download_results = [{
+            "name": descriptor.name,
+            "status": "failed" if filtered and self.artifact_failure else "downloaded",
+            "reason_code": "http_404" if filtered and self.artifact_failure else None,
+            "reason_message": "合成传输故障" if filtered and self.artifact_failure else None,
+        }]
+        return super().list_filing_files(
+            cik, accession_no_dash, primary_document, form_type, include_xbrl,
+            include_exhibits, include_http_metadata, cancellation_checker,
+        )
+
+
+def _quantity_pipeline(root: Path, downloader: _QuantityDownloader) -> sec_pipeline.SecPipeline:
+    """装配真实隔离 Fs 下载 pipeline。
+
+    参数：root 为工作区，downloader 为外部传输替身。返回：生产 pipeline。
+    异常：仓储或装配失败传播 OSError/ValueError。
+    """
+
+    return SecPipeline(
+        workspace_root=root, downloader=downloader, processor_registry=build_fins_processor_registry(),
+        material_upload_state_repository=FsMaterialUploadStateRepository(root),
+    )
+
+
+def _quantity_request() -> FinsSourceDownloadAdapterRequest:
+    """构造与真实数量场景一致的 typed 请求。
+
+    参数：无。返回：显式 6-K 窗口请求。异常：输入非法传播 ValueError。
+    """
+
+    return FinsSourceDownloadAdapterRequest(
+        normalized_ticker=normalize_ticker("TCOM"), source=FinsDownloadSource.SEC,
+        form_types=("6-K",), date_range=FinsDownloadDateRange(dt.date(2025, 8, 1), dt.date(2025, 8, 3), True, True),
+        overwrite_existing=False, rebuild_local_artifacts=False, cancellation_checker=_NeverCancelled(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("accepted_count", "reject", "cached"), [(0, True, False), (1, False, True), (2, True, False)],
+)
+def test_sec_quantity_warning_matches_real_fs_and_typed_result(
+    tmp_path: Path, accepted_count: int, reject: bool, cached: bool,
+) -> None:
+    """同一真实确认行联验拒绝零有效、完整缓存有效及有效二加拒绝仍不足。
+
+    参数：tmp_path 为隔离根，accepted_count 为成功数，reject 为拒绝候选，cached 为再次完整跳过。
+    返回：无。异常：计数、warning 或持久化不一致时抛出 AssertionError。
+    """
+
+    pipeline = _quantity_pipeline(tmp_path, _QuantityDownloader(accepted_count, reject=reject))
+    result = pipeline.download(
+        ticker="TCOM", form_type="6-K", start_date="2025-08-01", end_date="2025-08-03", start_is_explicit=True,
+    )
+    if cached:
+        result = pipeline.download(
+            ticker="TCOM", form_type="6-K", start_date="2025-08-01", end_date="2025-08-03", start_is_explicit=True,
+        )
+        assert result["filings"][0]["skip_reason"] == "already_downloaded_complete"
+    typed = sec_pipeline._summary_from_pipeline_result(
+        cast(dict[str, JsonValue], result), request=_quantity_request(), source_repository=pipeline.source_repository,
+    )
+    assert result["summary"]["downloaded"] == typed.downloaded_count == (0 if cached else accepted_count)
+    assert result["summary"]["skipped"] == typed.skipped_count == (accepted_count if cached else 0)
+    assert result["summary"]["rejected"] == typed.rejected_count == int(reject)
+    assert typed.failed_count == result["summary"]["failed"] == 0
+    assert any(f"有效落盘数 {accepted_count} 低于期望 3" in warning for warning in result["warnings"])
+    assert len(pipeline.source_repository.list_source_integrity("TCOM")) == accepted_count
+    maintenance = FsFilingMaintenanceRepository(tmp_path)
+    registry = maintenance.load_download_rejection_registry("TCOM")
+    assert len(registry) == int(reject)
+    if reject:
+        rejected_id = "fil_0000000000-25-000001"
+        rejected_row = next(row for row in typed.document_rows if row.document_id == rejected_id)
+        assert rejected_row.disposition is FinsDownloadDocumentDisposition.REJECTED
+        assert rejected_row.reason_category == registry[rejected_id].reason == "6k_filtered"
+        assert rejected_row.artifact_locator is None
+        artifact = maintenance.get_rejected_filing_artifact("TCOM", rejected_id)
+        assert artifact.rejection_reason == "6k_filtered"
+    print(json.dumps({"case": [accepted_count, reject, cached], "raw": result,
+                      "public": typed.to_json_summary(max_json_chars=4096)}, ensure_ascii=False))
+
+
+def test_sec_rejected_artifact_transport_failure_remains_failed(tmp_path: Path) -> None:
+    """拒绝原件传输失败保留原类别，不能变成有效或已拒绝成功。
+
+    参数：tmp_path 为隔离根。返回：无。异常：分类或持久化错误时抛出 AssertionError。
+    """
+
+    pipeline = _quantity_pipeline(tmp_path, _QuantityDownloader(0, reject=True, artifact_failure=True))
+    result = pipeline.download(
+        ticker="TCOM", form_type="6-K", start_date="2025-08-01", end_date="2025-08-03", start_is_explicit=True,
+    )
+    typed = sec_pipeline._summary_from_pipeline_result(
+        cast(dict[str, JsonValue], result), request=_quantity_request(), source_repository=pipeline.source_repository,
+    )
+    assert typed.failed_count == result["summary"]["failed"] == 1
+    assert typed.rejected_count == result["summary"]["rejected"] == 0
+    assert typed.document_rows[0].reason_category == "rejected_artifact_download_failed"
+    assert any("有效落盘数 0 低于期望 3" in warning for warning in result["warnings"])
+    assert pipeline.source_repository.list_source_integrity("TCOM") == ()
+
+
+@pytest.mark.parametrize("reason_code", [None, "explicit_rejection"])
+def test_sec_explicit_rejected_row_preserves_existing_public_reason(
+    tmp_path: Path, reason_code: str | None,
+) -> None:
+    """显式 rejected 行仍保留既有原因规则，且不查询成功文件 locator。
+
+    参数：tmp_path 为真实仓储根，reason_code 为可选公开类别。返回：无。
+    异常：既有字段投影改变时抛出 AssertionError。
+    """
+
+    pipeline = _quantity_pipeline(tmp_path, _QuantityDownloader(0, reject=False))
+    row: dict[str, JsonValue] = {
+        "document_id": "fil-explicit-rejected", "status": "rejected", "form_type": "6-K",
+        "filing_date": "2025-08-01", "report_date": "2025-06-30", "reason_code": reason_code,
+    }
+    projected = sec_pipeline._project_sec_document_row(row, ticker="TCOM", source_repository=pipeline.source_repository)
+    assert projected.disposition is FinsDownloadDocumentDisposition.REJECTED
+    assert projected.reason_category == ("6k_filtered" if reason_code is None else reason_code)
+    assert projected.reason_message == "该文档未通过来源筛选规则"
+    assert projected.artifact_locator is None
 
 
 def _as_sec_downloader(downloader: _TestDownloader) -> SecDownloader:

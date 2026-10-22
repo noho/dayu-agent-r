@@ -72,6 +72,7 @@ from dayu.fins.pipelines.sec_company_meta import (
     upsert_company_meta as _upsert_company_meta_impl,
 )
 from dayu.fins.pipelines.sec_download_diagnostics import warn_insufficient_filings, warn_xbrl_missing_filings
+from dayu.fins.pipelines.sec_download_disposition import project_sec_filing_disposition
 from dayu.fins.pipelines.sec_download_event_mapping import (
     DownloadFileResult,
     build_download_filing_event_payload,
@@ -173,10 +174,7 @@ from dayu.fins.storage._fs_repository_factory import build_fs_repository_set
 SEC_PIPELINE_DOWNLOAD_VERSION: Final[str] = "sec_pipeline_download_v1.3.0"
 SEC_DOWNLOAD_SOURCE: Final[str] = "sec"
 _SEC_FORMS_ADAPTER_JOINER: Final[str] = ","
-_SEC_STATUS_DOWNLOADED: Final[str] = "downloaded"
-_SEC_STATUS_REJECTED: Final[str] = "rejected"
 _SEC_STATUS_SKIPPED: Final[str] = "skipped"
-_SEC_STATUS_FAILED: Final[str] = "failed"
 _SEC_REASON_6K_FILTERED: Final[str] = "6k_filtered"
 _ADAPTER_PROGRESS_FILING_STARTED: Final[str] = "download.filing_started"
 _ADAPTER_PROGRESS_FILING_COMPLETED: Final[str] = "download.filing_completed"
@@ -1894,9 +1892,10 @@ def _project_sec_document_row(
     """
 
     document_id = _required_sec_text(item, "document_id")
+    disposition = project_sec_filing_disposition(item)
     status = _required_sec_text(item, "status")
     reason_code = _optional_sec_text(item, "reason_code")
-    allow_missing_business_fields = status == _SEC_STATUS_FAILED and reason_code == "missing_form_type"
+    allow_missing_business_fields = disposition is FinsDownloadDocumentDisposition.FAILED and reason_code == "missing_form_type"
     form_or_period = _required_optional_sec_text(
         item,
         "form_type",
@@ -1912,7 +1911,7 @@ def _project_sec_document_row(
         "report_date",
         allow_missing=allow_missing_business_fields,
     )
-    if status == _SEC_STATUS_DOWNLOADED:
+    if disposition is FinsDownloadDocumentDisposition.DOWNLOADED:
         locator = source_repository.get_source_document_locator(
             ticker,
             document_id,
@@ -1924,18 +1923,13 @@ def _project_sec_document_row(
             filing_date=filing_date,
             report_date=report_date,
             covered_fiscal_periods=(),
-            disposition=FinsDownloadDocumentDisposition.DOWNLOADED,
+            disposition=disposition,
             reason_category=None,
             reason_message=None,
             artifact_locator=locator,
         )
     if status == _SEC_STATUS_SKIPPED:
         category = reason_code or _required_sec_text(item, "skip_reason")
-        disposition = (
-            FinsDownloadDocumentDisposition.REJECTED
-            if _is_rejected_filing_result(item)
-            else FinsDownloadDocumentDisposition.SKIPPED
-        )
         return FinsDownloadDocumentResult(
             document_id=document_id,
             form_or_period=form_or_period,
@@ -1947,7 +1941,7 @@ def _project_sec_document_row(
             reason_message=_sec_safe_reason_message(disposition),
             artifact_locator=None,
         )
-    if status == _SEC_STATUS_REJECTED:
+    if disposition is FinsDownloadDocumentDisposition.REJECTED:
         category = reason_code or _SEC_REASON_6K_FILTERED
         return FinsDownloadDocumentResult(
             document_id=document_id,
@@ -1955,12 +1949,12 @@ def _project_sec_document_row(
             filing_date=filing_date,
             report_date=report_date,
             covered_fiscal_periods=(),
-            disposition=FinsDownloadDocumentDisposition.REJECTED,
+            disposition=disposition,
             reason_category=category,
             reason_message=_sec_safe_reason_message(FinsDownloadDocumentDisposition.REJECTED),
             artifact_locator=None,
         )
-    if status == _SEC_STATUS_FAILED:
+    if disposition is FinsDownloadDocumentDisposition.FAILED:
         category = reason_code or "sec_document_failed"
         return FinsDownloadDocumentResult(
             document_id=document_id,
@@ -1968,7 +1962,7 @@ def _project_sec_document_row(
             filing_date=filing_date,
             report_date=report_date,
             covered_fiscal_periods=(),
-            disposition=FinsDownloadDocumentDisposition.FAILED,
+            disposition=disposition,
             reason_category=category,
             reason_message=_sec_safe_reason_message(FinsDownloadDocumentDisposition.FAILED),
             artifact_locator=None,
@@ -2064,29 +2058,6 @@ def _build_sec_typed_summary(
         uncertain_reports=(),
         missing_periods=(),
     )
-
-
-def _is_rejected_filing_result(item: Mapping[str, JsonValue]) -> bool:
-    """判断 SEC filing 结果是否为 rejected artifact。
-
-    Args:
-        item: SEC workflow filing result。
-
-    Returns:
-        明确 rejected 或 6-K filtered skipped 返回 ``True``。
-
-    Raises:
-        ValueError: status 或 reason 字段类型非法时抛出。
-    """
-
-    status = _required_sec_text(item, "status")
-    if status == _SEC_STATUS_REJECTED:
-        return True
-    if status != _SEC_STATUS_SKIPPED:
-        return False
-    skip_reason = _optional_sec_text(item, "skip_reason")
-    reason_code = _optional_sec_text(item, "reason_code")
-    return skip_reason == _SEC_REASON_6K_FILTERED or reason_code == _SEC_REASON_6K_FILTERED
 
 
 def _sec_safe_reason_message(disposition: FinsDownloadDocumentDisposition) -> str:

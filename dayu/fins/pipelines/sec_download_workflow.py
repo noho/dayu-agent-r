@@ -12,7 +12,9 @@ from typing import AsyncIterator, Awaitable, Callable, Final, Literal, Optional,
 
 from dayu.fins.domain.company_meta_contract import CompanyMetaCommitIntent
 from dayu.fins.domain.document_models import BatchToken, DownloadRejectionRegistry
+from dayu.fins.download_contract import FinsDownloadDocumentDisposition
 from dayu.fins.downloaders.sec_downloader import RemoteFileDescriptor, SecDownloadCancelledError
+from dayu.fins.pipelines.sec_download_disposition import project_sec_filing_disposition
 from dayu.fins.pipelines.download_events import DownloadEvent, DownloadEventType
 from dayu.fins.pipelines.sec_filing_collection import FilingRecord
 from dayu.fins.pipelines.sec_sc13_filtering import (
@@ -35,10 +37,7 @@ from dayu.fins.storage import (
 )
 from dayu.fins._log import Log
 
-_FILING_STATUS_DOWNLOADED: Final[str] = "downloaded"
-_FILING_STATUS_SKIPPED: Final[str] = "skipped"
 _FILING_STATUS_FAILED: Final[str] = "failed"
-_FILING_REASON_6K_FILTERED: Final[str] = "6k_filtered"
 _INTEGRITY_FAILED_REASON: Final[str] = "source_integrity_failed"
 _INTEGRITY_FAILED_MESSAGE: Final[str] = "本地来源完整性状态阻止文档处理"
 
@@ -840,16 +839,16 @@ def _build_sec_download_result(
         原 SEC 结果形状；本函数不产生事件或完成日志。
 
     Raises:
-        KeyError: 确认行缺少必填 status 时抛出。
-        ValueError: 宿主结果构造校验失败时原样传播。
+        ValueError: 确认行分类非法或宿主结果构造校验失败时抛出。
     """
 
+    dispositions = tuple(project_sec_filing_disposition(item) for item in filing_results)
     summary: dict[str, JsonValue] = {
         "total": len(filing_results),
-        "downloaded": sum(1 for item in filing_results if item["status"] == _FILING_STATUS_DOWNLOADED),
-        "skipped": sum(1 for item in filing_results if item["status"] == _FILING_STATUS_SKIPPED and not _is_rejected_filing_result(item)),
-        "rejected": sum(1 for item in filing_results if _is_rejected_filing_result(item)),
-        "failed": sum(1 for item in filing_results if item["status"] == _FILING_STATUS_FAILED),
+        "downloaded": dispositions.count(FinsDownloadDocumentDisposition.DOWNLOADED),
+        "skipped": dispositions.count(FinsDownloadDocumentDisposition.SKIPPED),
+        "rejected": dispositions.count(FinsDownloadDocumentDisposition.REJECTED),
+        "failed": dispositions.count(FinsDownloadDocumentDisposition.FAILED),
         "elapsed_ms": elapsed_ms,
         "reused_downloads": 0,
         "converted": 0,
@@ -1036,7 +1035,7 @@ def _cancelled_pipeline_completed_event(
         `PIPELINE_COMPLETED` 取消事件。
 
     Raises:
-        无。
+        ValueError: 日期窗口、确认行分类或结果构造校验失败时抛出。
     """
 
     form_windows = host._resolve_form_windows(
@@ -1044,32 +1043,16 @@ def _cancelled_pipeline_completed_event(
         start_date=start_date,
         end_date=end_date,
     )
-    summary = {
-        "total": len(filing_results),
-        "downloaded": sum(1 for item in filing_results if item["status"] == _FILING_STATUS_DOWNLOADED),
-        "skipped": sum(1 for item in filing_results if item["status"] == _FILING_STATUS_SKIPPED),
-        "rejected": sum(1 for item in filing_results if _is_rejected_filing_result(item)),
-        "failed": sum(1 for item in filing_results if item["status"] == _FILING_STATUS_FAILED),
-        "elapsed_ms": elapsed_ms,
-        "reused_downloads": 0,
-        "converted": 0,
-    }
-    final_result = host._build_result(
-        action="download",
-        ticker=normalized_ticker,
-        market_profile={"market": normalized_market},
-        filters=cast(
-            JsonValue,
-            {
-                "forms": sorted(form_windows.keys()),
-                "start_dates": {key: value.isoformat() for key, value in sorted(form_windows.items())},
-                "end_date": end_date.isoformat(),
-                "overwrite": overwrite,
-            },
-        ),
-        warnings=cast(JsonValue, list(warnings)),
-        filings=cast(JsonValue, list(filing_results)),
-        summary=cast(JsonValue, summary),
+    final_result = _build_sec_download_result(
+        host=host,
+        normalized_ticker=normalized_ticker,
+        normalized_market=normalized_market,
+        form_windows=form_windows,
+        end_date=end_date,
+        overwrite=overwrite,
+        warnings=warnings,
+        filing_results=filing_results,
+        elapsed_ms=elapsed_ms,
         status="cancelled",
     )
     return DownloadEvent(
@@ -1077,26 +1060,6 @@ def _cancelled_pipeline_completed_event(
         ticker=normalized_ticker,
         payload={"result": final_result},
     )
-
-
-def _is_rejected_filing_result(item: dict[str, JsonValue]) -> bool:
-    """判断 filing 结果是否代表 rejected artifact。
-
-    Args:
-        item: SEC filing 下载结果。
-
-    Returns:
-        6-K 预筛未命中并写入 rejected artifact 时返回 ``True``。
-
-    Raises:
-        无。
-    """
-
-    if item["status"] != _FILING_STATUS_SKIPPED:
-        return False
-    skip_reason = str(item.get("skip_reason", "")).strip()
-    reason_code = str(item.get("reason_code", "")).strip()
-    return skip_reason == _FILING_REASON_6K_FILTERED or reason_code == _FILING_REASON_6K_FILTERED
 
 
 def _filter_filings_to_windows(

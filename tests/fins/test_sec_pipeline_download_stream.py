@@ -65,7 +65,12 @@ from dayu.fins.pipelines.sec_pipeline import (
 )
 from dayu.fins.pipelines.sec_download_workflow import SecDownloadIntegrityAbort
 from dayu.fins.ticker_normalization import normalize_ticker
-from tests.fins.test_sec_pipeline_download import _seed_complete_sec_source
+from tests.fins.test_sec_pipeline_download import (
+    _seed_complete_sec_source,
+    _QuantityDownloader,
+    _quantity_pipeline,
+    _quantity_request,
+)
 from dayu.fins.processors.registry import build_fins_processor_registry
 from dayu.fins.storage.fs_source_document_repository import FsSourceDocumentRepository
 from dayu.fins.storage import (
@@ -1559,6 +1564,9 @@ def test_sec_integrity_abort_adapter_preserves_cause_and_summary(tmp_path: Path,
     assert isinstance(raw_summary, dict)
     assert set(raw_summary) == {"total", "downloaded", "skipped", "rejected", "failed", "elapsed_ms", "reused_downloads", "converted"}
     summary = failure.persisted_summary
+    assert (raw_summary["downloaded"], raw_summary["skipped"], raw_summary["rejected"], raw_summary["failed"]) == (
+        summary.downloaded_count, summary.skipped_count, summary.rejected_count, summary.failed_count,
+    )
     assert summary.downloaded_count == 1
     assert summary.rejected_count == summary.failed_count == (0 if scenario == "postrepair" else 1)
     assert summary.terminal_disposition is (FinsDownloadTerminalDisposition.SUCCEEDED if scenario == "postrepair" else FinsDownloadTerminalDisposition.PARTIAL_FAILURE)
@@ -1641,6 +1649,76 @@ def test_sec_loop_tail_cancel_preserves_shared_result_status(tmp_path: Path, che
     assert _INTEGRITY_SECOND[4:].replace("-", "") not in downloader.requested
     assert _INTEGRITY_TAIL[4:].replace("-", "") not in downloader.requested
     assert len([e for e in events if e.event_type is DownloadEventType.PIPELINE_COMPLETED]) == 1
+
+
+async def _consume_quantity_cancel(
+    pipeline: SecPipeline, events: list[DownloadEvent], control: _SecCancelControl,
+) -> None:
+    """在真实首个确认事件后请求取消，不替代工作流裁决。
+
+    参数：pipeline 为真实流水线，events 为事件容器，control 为事件边界取消器。
+    返回：无。异常：工作流异常原样传播。
+    """
+
+    async for event in pipeline.download_stream(
+        ticker="TCOM", form_type="6-K", start_date="2025-08-01", end_date="2025-08-03",
+        start_is_explicit=True, cancel_checker=control,
+    ):
+        events.append(event)
+        control.observe(event)
+
+
+def test_sec_cancel_after_rejection_preserves_only_confirmed_prefix(tmp_path: Path) -> None:
+    """真实拒绝后取消只保留拒绝前缀，下一候选没有虚构结果。
+
+    参数：tmp_path 为隔离工作区。返回：无。
+    异常：确认行或取消终态漂移时抛出 AssertionError。
+    """
+
+    downloader = _QuantityDownloader(1, reject=True)
+    pipeline = _quantity_pipeline(tmp_path, downloader)
+    control = _SecCancelControl("between_filings")
+    events: list[DownloadEvent] = []
+    asyncio.run(_consume_quantity_cancel(pipeline, events, control))
+    result = _event_pipeline_result(events[-1])
+    typed = _summary_from_pipeline_result(
+        cast(dict[str, JsonValue], result), request=_quantity_request(), source_repository=pipeline.source_repository,
+    )
+    assert result["status"] == "cancelled"
+    assert typed.rejected_count == result["summary"]["rejected"] == result["summary"]["total"] == 1
+    assert typed.downloaded_count == typed.skipped_count == typed.failed_count == 0
+    assert result["summary"]["skipped"] == result["summary"]["downloaded"] == result["summary"]["failed"] == 0
+    assert len(result["filings"]) == 1
+    assert result["filings"][0]["reason_code"] == "6k_filtered"
+    assert any("有效落盘数 0 低于期望 3" in warning for warning in result["warnings"])
+    assert downloader.list_filing_files_call_count == 1
+    assert len([event for event in events if event.event_type is DownloadEventType.PIPELINE_COMPLETED]) == 1
+
+
+def test_sec_early_cancel_builder_counts_same_confirmed_rows_exclusively(tmp_path: Path) -> None:
+    """以真实行验证早期取消 builder 契约，不宣称非空行在早期调用点可达。
+
+    参数：tmp_path 为隔离工作区。返回：无。
+    异常：正常与取消快照、原字段或互斥计数漂移时抛出 AssertionError。
+    """
+
+    pipeline = _quantity_pipeline(tmp_path, _QuantityDownloader(2, reject=True))
+    result = pipeline.download(
+        ticker="TCOM", form_type="6-K", start_date="2025-08-01", end_date="2025-08-03", start_is_explicit=True,
+    )
+    event = _sec_download_workflow._cancelled_pipeline_completed_event(
+        host=cast(_sec_download_workflow.SecDownloadWorkflowHost, pipeline), normalized_ticker="TCOM",
+        normalized_market="US", form_type="6-K", start_date="2025-08-01", end_date=date(2025, 8, 3),
+        overwrite=False, warnings=tuple(result["warnings"]), filing_results=tuple(result["filings"]),
+        elapsed_ms=result["summary"]["elapsed_ms"],
+    )
+    cancelled = _event_pipeline_result(event)
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["summary"] == result["summary"]
+    assert cancelled["filings"] == result["filings"]
+    assert cancelled["warnings"] == result["warnings"]
+    assert (cancelled["summary"]["total"], cancelled["summary"]["downloaded"], cancelled["summary"]["skipped"],
+            cancelled["summary"]["rejected"], cancelled["summary"]["failed"]) == (3, 2, 0, 1, 0)
 
 
 def test_sec_postrepair_clean_cancel_preserves_confirmed_repair(tmp_path: Path) -> None:

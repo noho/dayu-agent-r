@@ -12,6 +12,8 @@ import datetime as dt
 
 
 from dayu.fins.domain.document_models import DownloadRejectionRegistry
+from dayu.fins.download_contract import FinsDownloadDocumentDisposition
+from dayu.fins.pipelines.sec_download_disposition import project_sec_filing_disposition
 from dayu.fins.pipelines.sec_filing_collection import FilingRecord
 
 # ---------- 数量诊断常量 ----------
@@ -53,7 +55,7 @@ def warn_insufficient_filings(
     - 若该组中没有任何 form 出现在本次 form_windows 中，跳过该组检查。
 
     有效下载规则：
-    - 统计 status 为 downloaded 或 skipped（已存在）的 filing 数量，两者都算"有效下载"。
+    - 按确认行统一分类统计 downloaded 或 skipped（已存在）；rejected/failed 不计有效。
     - 6-K 额外区分：若 rejection_registry 中存在 6-K 记录（有 submission 但全被过滤），
       warning 中会注明，方便排查分类规则是否漏判。
 
@@ -66,20 +68,25 @@ def warn_insufficient_filings(
         warning 文本列表（无问题时为空列表）。
 
     Raises:
-        无。
+        ValueError: 确认行的状态或参与分类的原因字段非法时抛出。
     """
 
     warnings: list[str] = []
     requested_forms = set(form_windows)
+    effective_results = tuple(
+        item
+        for item in filing_results
+        if project_sec_filing_disposition(item)
+        in {FinsDownloadDocumentDisposition.DOWNLOADED, FinsDownloadDocumentDisposition.SKIPPED}
+    )
 
     # 年报组：10-K + 20-F 合并检查
     requested_annual = _ANNUAL_FORMS & requested_forms
     if requested_annual:
         actual = sum(
             1
-            for item in filing_results
+            for item in effective_results
             if item.get("form_type") in _ANNUAL_FORMS
-            and item.get("status") in {"downloaded", "skipped"}
         )
         if actual < _MIN_ANNUAL_COUNT:
             label = "/".join(sorted(requested_annual))
@@ -93,9 +100,8 @@ def warn_insufficient_filings(
     if requested_quarterly:
         actual = sum(
             1
-            for item in filing_results
+            for item in effective_results
             if item.get("form_type") in _QUARTERLY_FORMS
-            and item.get("status") in {"downloaded", "skipped"}
         )
         if actual < _MIN_QUARTERLY_COUNT:
             label = "/".join(sorted(requested_quarterly))
@@ -127,9 +133,8 @@ def warn_insufficient_filings(
     if "DEF 14A" in requested_forms:
         actual = sum(
             1
-            for item in filing_results
+            for item in effective_results
             if item.get("form_type") == "DEF 14A"
-            and item.get("status") in {"downloaded", "skipped"}
         )
         if actual < _MIN_DEF14A_COUNT:
             warnings.append(
